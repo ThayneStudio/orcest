@@ -1,0 +1,15 @@
+[Unit]
+Description=Orcest Worker
+After=network.target
+
+[Service]
+Type=simple
+User=orcest
+WorkingDirectory=/opt/orcest
+ExecStart=/usr/local/bin/orcest work --id %H --config /opt/orcest/worker.yaml
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
