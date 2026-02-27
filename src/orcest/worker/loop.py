@@ -1,0 +1,178 @@
+"""Worker main loop: block on Redis stream, acquire lock, run Claude, publish result.
+
+The central worker loop reads tasks from the Redis stream via XREADGROUP,
+acquires a distributed lock per PR, runs Claude to produce fixes, and
+publishes results back to a results stream for the orchestrator.
+"""
+
+import logging
+import signal
+import sys
+import time
+
+from orcest.shared.config import WorkerConfig
+from orcest.shared.coordination import RedisLock, make_pr_lock_key
+from orcest.shared.logging import setup_logging
+from orcest.shared.models import ResultStatus, Task, TaskResult
+from orcest.shared.redis_client import RedisClient
+from orcest.worker.claude_runner import ClaudeResult, run_claude
+from orcest.worker.heartbeat import Heartbeat
+from orcest.worker.workspace import Workspace
+
+TASKS_STREAM = "tasks"
+RESULTS_STREAM = "results"
+CONSUMER_GROUP = "workers"
+
+
+def run_worker(config: WorkerConfig) -> None:
+    """Main worker entry point. Blocks indefinitely."""
+    logger = setup_logging("worker", config.worker_id)
+    redis = RedisClient(config.redis)
+
+    # Verify Redis connection
+    if not redis.health_check():
+        logger.error("Cannot connect to Redis. Exiting.")
+        sys.exit(1)
+
+    # Ensure consumer group exists
+    redis.ensure_consumer_group(TASKS_STREAM, CONSUMER_GROUP)
+
+    # Graceful shutdown
+    shutdown = False
+
+    def handle_signal(signum: int, frame: object) -> None:
+        nonlocal shutdown
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        shutdown = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    workspace = Workspace(config.workspace_dir)
+
+    logger.info(f"Worker {config.worker_id} started. Waiting for tasks...")
+
+    while not shutdown:
+        # Block waiting for tasks (5 second timeout to check shutdown flag)
+        entries = redis.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=config.worker_id,
+            stream=TASKS_STREAM,
+            count=1,
+            block_ms=5000,
+        )
+
+        if not entries:
+            continue  # Timeout, loop back to check shutdown
+
+        entry_id, fields = entries[0]
+        task = Task.from_dict(fields)
+
+        logger.info(
+            f"Received task {task.id}: {task.type.value} "
+            f"for {task.resource_type} #{task.resource_id}"
+        )
+
+        # Try to acquire lock
+        lock_key = make_pr_lock_key(task.resource_id)
+        lock = RedisLock(
+            redis,
+            lock_key,
+            ttl=config.claude.timeout + 60,
+            owner=config.worker_id,
+        )
+
+        if not lock.acquire():
+            logger.warning(
+                f"Lock {lock_key} already held, skipping task {task.id}"
+            )
+            # ACK the message so it's not redelivered to us
+            # (another worker has the lock and presumably the same task)
+            redis.xack(TASKS_STREAM, CONSUMER_GROUP, entry_id)
+            continue
+
+        logger.info(f"Acquired lock {lock_key}")
+
+        # Start heartbeat
+        heartbeat = Heartbeat(lock, logger=logger)
+        heartbeat.start()
+
+        result = _execute_task(task, config, workspace, logger)
+
+        # Stop heartbeat and release lock
+        heartbeat.stop()
+        lock.release()
+        logger.info(f"Released lock {lock_key}")
+
+        # Publish result
+        redis.xadd(RESULTS_STREAM, result.to_dict())
+        logger.info(
+            f"Published result for task {task.id}: {result.status.value}"
+        )
+
+        # ACK the task message
+        redis.xack(TASKS_STREAM, CONSUMER_GROUP, entry_id)
+
+    logger.info("Worker shut down cleanly.")
+
+
+def _execute_task(
+    task: Task,
+    config: WorkerConfig,
+    workspace: Workspace,
+    logger: logging.Logger,
+) -> TaskResult:
+    """Execute a single task: clone, run Claude, return result."""
+    start = time.monotonic()
+
+    try:
+        # Setup workspace
+        logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
+        work_dir = workspace.setup(task.repo, task.branch, task.token)
+
+        # Run Claude
+        claude_result: ClaudeResult = run_claude(
+            prompt=task.prompt,
+            work_dir=work_dir,
+            token=task.token,
+            timeout=config.claude.timeout,
+            max_retries=config.claude.max_retries,
+            logger=logger,
+        )
+
+        duration = int(time.monotonic() - start)
+
+        if claude_result.success:
+            status = ResultStatus.COMPLETED
+        elif "usage limit" in claude_result.summary.lower():
+            status = ResultStatus.USAGE_EXHAUSTED
+        else:
+            status = ResultStatus.FAILED
+
+        return TaskResult(
+            task_id=task.id,
+            worker_id=config.worker_id,
+            status=status,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            branch=task.branch,
+            summary=claude_result.summary,
+            duration_seconds=duration,
+        )
+
+    except Exception as e:
+        duration = int(time.monotonic() - start)
+        logger.error(f"Task execution failed: {e}", exc_info=True)
+        return TaskResult(
+            task_id=task.id,
+            worker_id=config.worker_id,
+            status=ResultStatus.FAILED,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            branch=task.branch,
+            summary=f"Worker exception: {e}",
+            duration_seconds=duration,
+        )
+
+    finally:
+        workspace.cleanup()
