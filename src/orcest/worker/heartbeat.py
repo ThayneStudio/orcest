@@ -31,13 +31,22 @@ class Heartbeat:
             logger: Optional logger.
         """
         self.lock = lock
-        self.interval = interval or (lock.ttl / 3)
+        self.interval = lock.ttl / 3 if interval is None else interval
         self.logger = logger
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Start the heartbeat thread."""
+        """Start the heartbeat thread.
+
+        Raises RuntimeError if a heartbeat thread is already running.
+        Call stop() before starting a new heartbeat.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError(
+                f"Heartbeat thread for {self.lock.key} is already running. "
+                "Call stop() before starting a new heartbeat."
+            )
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
