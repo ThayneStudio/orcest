@@ -5,6 +5,7 @@ and returns a list of PRState objects with recommended actions. The orchestrator
 main loop acts on these recommendations.
 """
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
@@ -12,6 +13,8 @@ from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import make_pr_lock_key
 from orcest.shared.redis_client import RedisClient
+
+logger = logging.getLogger(__name__)
 
 
 class PRAction(str, Enum):
@@ -83,8 +86,18 @@ def discover_actionable_prs(
             ))
             continue
 
-        # Check CI status
-        checks = gh.get_ci_status(repo, number, token)
+        # Check CI status -- wrapped in try/except so a single PR's
+        # failure does not crash discovery for all other PRs.
+        try:
+            checks = gh.get_ci_status(repo, number, token)
+        except Exception:
+            logger.warning(
+                "Failed to fetch CI status for PR #%d, skipping",
+                number,
+                exc_info=True,
+            )
+            continue
+
         ci_failures = [
             c for c in checks
             if c.get("conclusion") == "failure"

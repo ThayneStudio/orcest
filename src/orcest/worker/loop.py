@@ -97,20 +97,34 @@ def run_worker(config: WorkerConfig) -> None:
         heartbeat = Heartbeat(lock, logger=logger)
         heartbeat.start()
 
-        result = _execute_task(task, config, workspace, logger)
+        try:
+            result = _execute_task(task, config, workspace, logger)
+        except BaseException:
+            # KeyboardInterrupt, SystemExit, or any other BaseException
+            # that _execute_task's except Exception doesn't catch.
+            # Ensure heartbeat and lock are cleaned up before re-raising.
+            heartbeat.stop()
+            lock.release()
+            logger.warning(f"Released lock {lock_key} after unexpected interruption")
+            raise
+        else:
+            # Normal path: stop heartbeat and release lock
+            heartbeat.stop()
+            lock.release()
+            logger.info(f"Released lock {lock_key}")
 
-        # Stop heartbeat and release lock
-        heartbeat.stop()
-        lock.release()
-        logger.info(f"Released lock {lock_key}")
+        # Publish result and ACK (only reached on normal execution)
+        try:
+            redis.xadd(RESULTS_STREAM, result.to_dict())
+            logger.info(
+                f"Published result for task {task.id}: {result.status.value}"
+            )
+        except Exception:
+            logger.error(
+                f"Failed to publish result for task {task.id}", exc_info=True
+            )
+            # Continue to ACK -- the task can be retried via XPENDING if needed
 
-        # Publish result
-        redis.xadd(RESULTS_STREAM, result.to_dict())
-        logger.info(
-            f"Published result for task {task.id}: {result.status.value}"
-        )
-
-        # ACK the task message
         redis.xack(TASKS_STREAM, CONSUMER_GROUP, entry_id)
 
     logger.info("Worker shut down cleanly.")

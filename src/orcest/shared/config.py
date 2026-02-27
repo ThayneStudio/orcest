@@ -7,6 +7,7 @@ and deployment-specific values.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -61,30 +62,67 @@ class WorkerConfig:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
 
-def _load_yaml(path: str | Path) -> dict:
-    """Load a YAML file and return a dict. Returns empty dict if file not found."""
+def _safe_int(value: Any, field_name: str) -> int:
+    """Convert a value to int with a clear error message on failure.
+
+    Handles the common YAML edge cases: int already, numeric string,
+    None, or truly unconvertible values.
+    """
+    if value is None:
+        raise ValueError(f"Config field '{field_name}' is null/missing but an integer is required.")
+    try:
+        return int(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Config field '{field_name}' has value {value!r} which cannot be converted to int."
+        ) from exc
+
+
+def _load_yaml(path: str | Path) -> dict[str, Any]:
+    """Load a YAML file and return a dict.
+
+    Returns empty dict if the file does not exist. Raises ValueError
+    if the file exists but contains invalid YAML or a non-mapping root.
+    """
     path = Path(path)
     if not path.exists():
         return {}
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Failed to parse YAML config file '{path}': {exc}") from exc
+    if data is None:
+        # Empty file or file with only comments
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Config file '{path}' must contain a YAML mapping at the top level, "
+            f"got {type(data).__name__}."
+        )
+    return data
 
 
-def _build_redis_config(raw: dict) -> RedisConfig:
+def _safe_dict(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """Extract a sub-dict from raw config, returning {} if the key is missing or not a dict."""
+    value = raw.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _build_redis_config(raw: dict[str, Any]) -> RedisConfig:
     """Build RedisConfig from a raw dict with env var overrides."""
-    redis_raw = raw.get("redis", {}) if isinstance(raw.get("redis"), dict) else {}
+    redis_raw = _safe_dict(raw, "redis")
 
     host = os.environ.get("ORCEST_REDIS_HOST", redis_raw.get("host", "localhost"))
-    port_str = os.environ.get("ORCEST_REDIS_PORT", str(redis_raw.get("port", 6379)))
-    db = redis_raw.get("db", 0)
+    port_raw = os.environ.get("ORCEST_REDIS_PORT", redis_raw.get("port", 6379))
+    db_raw = redis_raw.get("db", 0)
     # Password comes from env var only -- never stored in YAML
     password = os.environ.get("ORCEST_REDIS_PASSWORD")
 
     return RedisConfig(
-        host=host,
-        port=int(port_str),
-        db=int(db),
+        host=str(host),
+        port=_safe_int(port_raw, "redis.port"),
+        db=_safe_int(db_raw, "redis.db"),
         password=password,
     )
 
@@ -96,7 +134,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         - github.repo must be non-empty (from YAML or ORCEST_REPO env var)
 
     Raises:
-        ValueError: If required fields are missing or empty.
+        ValueError: If required fields are missing or empty, if the YAML
+            file is malformed, or if numeric fields contain non-numeric values.
     """
     raw = _load_yaml(path)
 
@@ -104,28 +143,28 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     redis_config = _build_redis_config(raw)
 
     # GitHub
-    github_raw = raw.get("github", {}) if isinstance(raw.get("github"), dict) else {}
+    github_raw = _safe_dict(raw, "github")
     github_token = os.environ.get("GITHUB_TOKEN", github_raw.get("token", ""))
     github_repo = os.environ.get("ORCEST_REPO", github_raw.get("repo", ""))
 
     github_config = GithubConfig(
-        token=github_token,
-        repo=github_repo,
+        token=str(github_token),
+        repo=str(github_repo),
     )
 
     # Polling
-    polling_raw = raw.get("polling", {}) if isinstance(raw.get("polling"), dict) else {}
+    polling_raw = _safe_dict(raw, "polling")
     polling_config = PollingConfig(
-        interval=int(polling_raw.get("interval", 60)),
+        interval=_safe_int(polling_raw.get("interval", 60), "polling.interval"),
     )
 
     # Labels
-    labels_raw = raw.get("labels", {}) if isinstance(raw.get("labels"), dict) else {}
+    labels_raw = _safe_dict(raw, "labels")
     labels_config = LabelConfig(
-        queued=labels_raw.get("queued", "orcest:queued"),
-        in_progress=labels_raw.get("in_progress", "orcest:in-progress"),
-        blocked=labels_raw.get("blocked", "orcest:blocked"),
-        needs_human=labels_raw.get("needs_human", "orcest:needs-human"),
+        queued=str(labels_raw.get("queued", "orcest:queued")),
+        in_progress=str(labels_raw.get("in_progress", "orcest:in-progress")),
+        blocked=str(labels_raw.get("blocked", "orcest:blocked")),
+        needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),
     )
 
     config = OrchestratorConfig(
@@ -151,7 +190,8 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         - worker_id must be non-empty
 
     Raises:
-        ValueError: If required fields are missing or empty.
+        ValueError: If required fields are missing or empty, if the YAML
+            file is malformed, or if numeric fields contain non-numeric values.
     """
     raw = _load_yaml(path)
 
@@ -159,17 +199,19 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     redis_config = _build_redis_config(raw)
 
     # Worker-level fields
-    worker_id = os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0"))
-    workspace_dir = os.environ.get(
-        "ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces")
+    worker_id = str(
+        os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0"))
+    )
+    workspace_dir = str(
+        os.environ.get("ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces"))
     )
 
     # Claude
-    claude_raw = raw.get("claude", {}) if isinstance(raw.get("claude"), dict) else {}
+    claude_raw = _safe_dict(raw, "claude")
     claude_config = ClaudeConfig(
-        timeout=int(claude_raw.get("timeout", 1800)),
-        max_retries=int(claude_raw.get("max_retries", 3)),
-        retry_backoff=int(claude_raw.get("retry_backoff", 10)),
+        timeout=_safe_int(claude_raw.get("timeout", 1800), "claude.timeout"),
+        max_retries=_safe_int(claude_raw.get("max_retries", 3), "claude.max_retries"),
+        retry_backoff=_safe_int(claude_raw.get("retry_backoff", 10), "claude.retry_backoff"),
     )
 
     config = WorkerConfig(

@@ -4,6 +4,8 @@ Thin wrapper around redis-py providing connection pooling and typed
 stream operations with simplified return types.
 """
 
+from __future__ import annotations
+
 import redis
 
 from orcest.shared.config import RedisConfig
@@ -20,23 +22,28 @@ class RedisClient:
             password=config.password,
             decode_responses=True,
         )
-        self._client = redis.Redis(connection_pool=self._pool)
+        self._client: redis.Redis[str] = redis.Redis(connection_pool=self._pool)
 
     @property
-    def client(self) -> redis.Redis:
+    def client(self) -> redis.Redis[str]:
         """Raw redis client for operations not covered by helpers."""
         return self._client
+
+    def close(self) -> None:
+        """Close the connection pool and release all connections."""
+        self._pool.disconnect()
 
     def health_check(self) -> bool:
         """Returns True if Redis is reachable."""
         try:
             return self._client.ping()
-        except redis.ConnectionError:
+        except (redis.ConnectionError, redis.TimeoutError, redis.AuthenticationError):
             return False
 
     def xadd(self, stream: str, fields: dict[str, str]) -> str:
         """Add entry to stream. Returns the entry ID."""
-        return self._client.xadd(stream, fields)
+        entry_id: str = self._client.xadd(stream, fields)  # type: ignore[assignment]
+        return entry_id
 
     def xreadgroup(
         self,
@@ -44,12 +51,22 @@ class RedisClient:
         consumer: str,
         stream: str,
         count: int = 1,
-        block_ms: int = 5000,
+        block_ms: int | None = 5000,
     ) -> list[tuple[str, dict[str, str]]]:
         """Read new entries from a consumer group.
 
         Returns list of (entry_id, fields) tuples.
-        Returns empty list on timeout.
+        Returns empty list on timeout or when no entries are available.
+
+        Args:
+            group: Consumer group name.
+            consumer: Consumer name within the group.
+            stream: Stream name to read from.
+            count: Maximum number of entries to return.
+            block_ms: Milliseconds to block waiting for data.
+                ``None`` means non-blocking (return immediately).
+                ``0`` means block indefinitely.
+                A positive integer means block for that many milliseconds.
         """
         result = self._client.xreadgroup(
             groupname=group,
@@ -60,12 +77,13 @@ class RedisClient:
         )
         if not result:
             return []
-        # result shape: [(stream_name, [(id, fields), ...])]
+        # result shape: [[stream_name, [(id, fields), ...]]]
         return result[0][1]
 
     def xack(self, stream: str, group: str, entry_id: str) -> int:
         """Acknowledge a stream entry. Returns number acknowledged."""
-        return self._client.xack(stream, group, entry_id)
+        result: int = self._client.xack(stream, group, entry_id)  # type: ignore[assignment]
+        return result
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.

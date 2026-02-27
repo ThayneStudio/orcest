@@ -15,7 +15,7 @@ from orcest.orchestrator.pr_ops import PRAction, discover_actionable_prs
 from orcest.orchestrator.task_publisher import publish_fix_task
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import TaskResult
+from orcest.shared.models import ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
@@ -130,7 +130,7 @@ def _consume_results(
     """Consume any pending results from workers.
 
     Non-blocking: reads all available results without waiting.
-    Uses block_ms=0 for immediate return when no results are pending.
+    Uses block_ms=None for immediate return when no results are pending.
     """
     while True:
         entries = redis.xreadgroup(
@@ -138,7 +138,7 @@ def _consume_results(
             consumer="orchestrator-main",
             stream=RESULTS_STREAM,
             count=10,
-            block_ms=0,  # Non-blocking
+            block_ms=None,  # Non-blocking: return immediately
         )
 
         if not entries:
@@ -159,8 +159,9 @@ def _handle_result(
     """Process a single task result.
 
     Posts a comment on the PR with the result summary and manages labels:
-    - Removes queued/in-progress labels
-    - Adds needs-human label on failure
+    - completed: removes queued/in-progress labels
+    - failed: removes queued/in-progress labels, adds needs-human
+    - usage_exhausted: keeps in-progress label (will resume)
     """
     logger.info(
         f"Result for task {result.task_id}: {result.status.value} "
@@ -173,21 +174,22 @@ def _handle_result(
     pr_number = result.resource_id
 
     # Format result comment for the PR
-    if result.status.value == "completed":
+    if result.status == ResultStatus.COMPLETED:
         body = (
             f"**orcest** task `{result.task_id}` completed "
             f"({result.duration_seconds}s, "
             f"worker: {result.worker_id}).\n\n"
             f"Summary: {result.summary}"
         )
-    elif result.status.value == "failed":
+    elif result.status == ResultStatus.FAILED:
         body = (
             f"**orcest** task `{result.task_id}` failed "
             f"({result.duration_seconds}s, "
             f"worker: {result.worker_id}).\n\n"
-            f"Summary: {result.summary}"
+            f"Summary: {result.summary}\n\n"
+            f"Labeling as `orcest:needs-human` for manual review."
         )
-    elif result.status.value == "usage_exhausted":
+    elif result.status == ResultStatus.USAGE_EXHAUSTED:
         body = (
             f"**orcest** task `{result.task_id}` paused "
             f"(Claude usage limit reached, "
@@ -209,13 +211,23 @@ def _handle_result(
             f"Failed to post comment on PR #{pr_number}: {e}"
         )
 
-    # Manage labels: remove queued/in-progress, add needs-human on failure
+    # Manage labels based on result status.
+    # Label lifecycle (from spec section 5):
+    #   completed      -> remove queued + in-progress
+    #   failed         -> remove queued + in-progress, add needs-human
+    #   usage_exhausted -> keep in-progress (will resume when capacity available)
     try:
-        gh.remove_label(repo, pr_number, labels.queued, token)
-        gh.remove_label(repo, pr_number, labels.in_progress, token)
+        if result.status == ResultStatus.USAGE_EXHAUSTED:
+            # Keep in-progress label so PR is not re-enqueued.
+            # Swap queued -> in-progress if still queued.
+            gh.remove_label(repo, pr_number, labels.queued, token)
+            gh.add_label(repo, pr_number, labels.in_progress, token)
+        else:
+            gh.remove_label(repo, pr_number, labels.queued, token)
+            gh.remove_label(repo, pr_number, labels.in_progress, token)
 
-        if result.status.value == "failed":
-            gh.add_label(repo, pr_number, labels.needs_human, token)
+            if result.status == ResultStatus.FAILED:
+                gh.add_label(repo, pr_number, labels.needs_human, token)
     except Exception as e:
         logger.error(
             f"Failed to manage labels on PR #{pr_number}: {e}"
