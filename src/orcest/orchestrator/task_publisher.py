@@ -149,12 +149,20 @@ def _render_fix_prompt(
         sections.append("Address all review feedback above.")
         sections.append("")
 
+    truncated = len(diff) > 10000
     sections.extend([
         "## Current Diff (against base branch)",
         "",
         "```diff",
-        diff[:10000],  # Truncate very large diffs
+        diff[:10000],
         "```",
+    ])
+    if truncated:
+        sections.append(
+            f"*Note: diff truncated from {len(diff)} to 10,000 characters. "
+            f"Review the full files in the repository for complete context.*"
+        )
+    sections.extend([
         "",
         "## Instructions",
         "",
