@@ -39,19 +39,34 @@ def work(worker_id, config, runner):
 
 
 @main.command()
+@click.argument("redis_host", required=False, default=None)
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
 @click.option("--once", is_flag=True, help="Print status once and exit (no TUI).")
 @click.option("--interval", default=3.0, type=float, help="TUI refresh interval in seconds.")
-def status(config, once, interval):
+def status(redis_host, config, once, interval):
     """Show system status: workers, queue depth, active tasks.
 
-    Launches a live TUI dashboard by default. Use --once for single-shot output.
+    Connects to Redis directly via REDIS_HOST (e.g. 10.20.0.19 or 10.20.0.19:6380),
+    or falls back to --config file. Launches a live TUI dashboard by default.
+    Use --once for single-shot output.
     """
-    from orcest.shared.config import load_orchestrator_config
+    from orcest.shared.config import RedisConfig
     from orcest.shared.redis_client import RedisClient
 
-    cfg = load_orchestrator_config(config)
-    redis = RedisClient(cfg.redis)
+    if redis_host:
+        if ":" in redis_host:
+            host, port_str = redis_host.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host, port = redis_host, 6379
+        redis_cfg = RedisConfig(host=host, port=port, db=0)
+    else:
+        from orcest.shared.config import load_orchestrator_config
+
+        cfg = load_orchestrator_config(config)
+        redis_cfg = cfg.redis
+
+    redis = RedisClient(redis_cfg)
 
     if not redis.health_check():
         redis.close()
@@ -309,3 +324,180 @@ def provision(host, user, worker_config, env_file):
     console.print(f"\n[bold]Worker provisioned on {host}.[/bold]")
     console.print("\n  To authenticate Claude Code, run:")
     console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")
+
+
+@main.command("provision-orchestrator")
+@click.argument("host")
+@click.option("--user", default="root", help="SSH user for the target host.")
+@click.option(
+    "--orch-config", default="config/orchestrator.yaml",
+    help="Orchestrator config to deploy.",
+)
+@click.option(
+    "--env-file", default="provision/.env.orchestrator",
+    help="Env file with GITHUB_TOKEN.",
+)
+def provision_orchestrator(host, user, orch_config, env_file):
+    """Provision an orchestrator VM via SSH.
+
+    Installs Docker, uploads the compose stack, config, and env to the target
+    host, builds the orchestrator image, and starts the services.
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    console = Console()
+    ssh_target = f"{user}@{host}" if user else host
+
+    def _ssh(cmd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["ssh", ssh_target, cmd],
+            capture_output=True, text=True,
+        )
+
+    def _scp(src: str, dest: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["scp", src, f"{ssh_target}:{dest}"],
+            capture_output=True, text=True,
+        )
+
+    # Verify files exist locally
+    required_files = {
+        "provision/setup-orchestrator.sh": "setup script",
+        "docker-compose.yml": "Docker Compose file",
+        "Dockerfile": "Dockerfile",
+        "pyproject.toml": "pyproject.toml",
+        orch_config: "orchestrator config",
+        env_file: "env file",
+    }
+    for path, desc in required_files.items():
+        if not os.path.isfile(path):
+            console.print(f"[red]Missing {desc}:[/red] {path}")
+            sys.exit(1)
+    if not os.path.isdir("src"):
+        console.print("[red]Missing src/ directory[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Provisioning orchestrator on {host}[/bold]\n")
+
+    # Step 1: Upload and run setup script
+    console.print("  Copying setup script...", end=" ")
+    result = _scp("provision/setup-orchestrator.sh", "/tmp/orcest-setup.sh")
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    console.print("  Running setup script (this may take a few minutes)...\n")
+    result = subprocess.run(
+        ["ssh", ssh_target, "sudo bash /tmp/orcest-setup.sh"],
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print("\n  Setup script [red]failed[/red]")
+        sys.exit(1)
+    console.print("\n  Setup script [green]ok[/green]")
+
+    # Step 2: Create and upload source tarball
+    console.print("  Creating source tarball...", end=" ")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tarball = tmp.name
+    tar_result = subprocess.run(
+        ["tar", "czf", tarball,
+         "Dockerfile", "docker-compose.yml", "pyproject.toml", "src/"],
+        capture_output=True, text=True,
+    )
+    if tar_result.returncode != 0:
+        console.print(f"[red]failed[/red]: {tar_result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    console.print("  Uploading source...", end=" ")
+    result = _scp(tarball, "/tmp/orcest-source.tar.gz")
+    os.unlink(tarball)
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    console.print("  Extracting source...", end=" ")
+    result = _ssh(
+        "sudo -u orcest tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/"
+    )
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    # Step 3: Copy config
+    console.print("  Copying orchestrator config...", end=" ")
+    _ssh("sudo -u orcest mkdir -p /opt/orcest/config")
+    result = _scp(orch_config, "/tmp/orcest-config.yaml")
+    if result.returncode == 0:
+        result = _ssh(
+            "sudo cp /tmp/orcest-config.yaml /opt/orcest/config/orchestrator.yaml && "
+            "sudo chown orcest:orcest /opt/orcest/config/orchestrator.yaml"
+        )
+    console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
+
+    # Step 4: Copy env file
+    console.print("  Copying env file...", end=" ")
+    result = _scp(env_file, "/tmp/orcest-env")
+    if result.returncode == 0:
+        result = _ssh(
+            "sudo cp /tmp/orcest-env /opt/orcest/.env && "
+            "sudo chmod 600 /opt/orcest/.env && "
+            "sudo chown orcest:orcest /opt/orcest/.env"
+        )
+    console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
+
+    # Step 5: Build and start Docker Compose
+    console.print("  Building orchestrator image (this may take a minute)...\n")
+    result = subprocess.run(
+        ["ssh", ssh_target,
+         "sudo -u orcest bash -c 'cd /opt/orcest && docker compose build'"],
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print("\n  Docker build [red]failed[/red]")
+        sys.exit(1)
+    console.print("\n  Docker build [green]ok[/green]")
+
+    console.print("  Starting services...", end=" ")
+    result = _ssh(
+        "sudo -u orcest bash -c "
+        "'cd /opt/orcest && docker compose down 2>/dev/null; docker compose up -d'"
+    )
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    # Step 6: Verify
+    console.print("  Checking services...", end=" ")
+    result = _ssh(
+        "sudo -u orcest bash -c "
+        "'cd /opt/orcest && docker compose ps --format json'"
+    )
+    if result.returncode == 0:
+        console.print("[green]ok[/green]")
+    else:
+        console.print("[yellow]could not verify[/yellow]")
+
+    console.print("  Pinging Redis...", end=" ")
+    result = _ssh(
+        "sudo -u orcest bash -c "
+        "'cd /opt/orcest && docker compose exec -T redis redis-cli ping'"
+    )
+    if result.stdout.strip() == "PONG":
+        console.print("[green]PONG[/green]")
+    else:
+        console.print("[yellow]no response (services may still be starting)[/yellow]")
+
+    console.print(f"\n[bold]Orchestrator provisioned on {host}.[/bold]")
+    console.print(f"\n  Redis is accessible at {host}:6379")
+    console.print(f"  Workers should set redis.host to {host} in their config.")
+    console.print("\n  To check logs:")
+    console.print(f"  ssh {ssh_target} 'cd /opt/orcest && sudo -u orcest docker compose logs -f'")
