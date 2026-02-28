@@ -197,8 +197,37 @@ def provision(host, user, worker_config, env_file):
             console.print(f"[red]Missing {desc}:[/red] {path}")
             sys.exit(1)
 
-    # Step 1: Copy and run setup script
+    # Step 1: Build wheel, copy files, run setup script
     console.print(f"\n[bold]Provisioning worker on {host}[/bold]\n")
+
+    # Find the project root (where pyproject.toml lives)
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    console.print("  Building orcest wheel...", end=" ")
+    build_result = subprocess.run(
+        ["python3", "-m", "build", "--wheel", "--outdir", "/tmp/orcest-dist"],
+        cwd=project_root,
+        capture_output=True, text=True,
+    )
+    if build_result.returncode != 0:
+        console.print(f"[red]failed[/red]")
+        console.print(build_result.stderr)
+        sys.exit(1)
+    # Find the built wheel
+    import glob
+    wheels = glob.glob("/tmp/orcest-dist/*.whl")
+    if not wheels:
+        console.print("[red]failed[/red]: no wheel produced")
+        sys.exit(1)
+    wheel_path = wheels[-1]
+    console.print(f"[green]ok[/green] ({os.path.basename(wheel_path)})")
+
+    console.print("  Uploading wheel...", end=" ")
+    _ssh("mkdir -p /tmp/orcest-wheel")
+    result = _scp(wheel_path, "/tmp/orcest-wheel/")
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
 
     console.print("  Copying setup script...", end=" ")
     result = _scp("provision/setup-worker.sh", "/tmp/orcest-setup.sh")
@@ -207,13 +236,15 @@ def provision(host, user, worker_config, env_file):
         sys.exit(1)
     console.print("[green]ok[/green]")
 
-    console.print("  Running setup script...", end=" ")
-    result = _ssh("sudo bash /tmp/orcest-setup.sh")
+    console.print("  Running setup script (this may take a few minutes)...\n")
+    result = subprocess.run(
+        ["ssh", ssh_target, "sudo bash /tmp/orcest-setup.sh"],
+        text=True,
+    )
     if result.returncode != 0:
-        console.print("[red]failed[/red]")
-        console.print(result.stderr)
+        console.print("\n  Setup script [red]failed[/red]")
         sys.exit(1)
-    console.print("[green]ok[/green]")
+    console.print("\n  Setup script [green]ok[/green]")
 
     # Step 2: Copy config and env files
     console.print("  Copying worker config...", end=" ")
@@ -231,19 +262,7 @@ def provision(host, user, worker_config, env_file):
              "sudo chown orcest:orcest /opt/orcest/.env")
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
-    # Step 3: Claude Code login (interactive — needs terminal)
-    console.print("\n  [bold]Logging in to Claude Code as orcest user...[/bold]")
-    console.print("  Follow the URL below, authorize, and paste the code back.\n")
-    result = subprocess.run(
-        ["ssh", "-t", ssh_target, "sudo -u orcest claude login"],
-    )
-    if result.returncode == 0:
-        console.print("\n  Claude Code login [green]ok[/green]")
-    else:
-        console.print("\n  Claude Code login [yellow]skipped or failed[/yellow]")
-        console.print(f"  You can run manually: ssh {ssh_target} 'sudo -u orcest claude login'")
-
-    # Step 4: Install and start systemd service
+    # Step 3: Install and start systemd service
     console.print("  Installing systemd service...", end=" ")
     result = _scp("provision/systemd/orcest-worker.service",
                    "/tmp/orcest-worker.service")
@@ -265,6 +284,8 @@ def provision(host, user, worker_config, env_file):
         console.print(f"[green]{status}[/green]")
     else:
         console.print(f"[yellow]{status}[/yellow]")
-        console.print("  Check logs: ssh {ssh_target} journalctl -u orcest-worker -f")
+        console.print(f"  Check logs: ssh {ssh_target} journalctl -u orcest-worker -f")
 
     console.print(f"\n[bold]Worker provisioned on {host}.[/bold]")
+    console.print(f"\n  To authenticate Claude Code, run:")
+    console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")

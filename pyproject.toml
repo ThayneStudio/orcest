@@ -27,6 +27,7 @@ dev = [
     "pytest-timeout>=2.3",
     "fakeredis[lua]>=2.21",
     "ruff>=0.4",
+    "build>=1.0",
 ]
 
 [tool.ruff]
