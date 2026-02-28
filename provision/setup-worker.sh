@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # Setup script for orcest worker VMs.
 # Run on the target VM to install dependencies and configure the worker service.
+# Tested on Ubuntu 24.04 (Noble) cloud images.
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
 echo "=== Orcest Worker Setup ==="
 
-# Install Python 3.12+
-if ! command -v python3.12 &>/dev/null; then
-    echo "Installing Python 3.12..."
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq python3.12 python3.12-venv python3-pip
-fi
+# Always run apt-get update first
+echo "Updating package lists..."
+sudo apt-get update -qq
+
+# Install all apt packages in one shot (idempotent — apt skips already-installed)
+echo "Installing system packages..."
+sudo apt-get install -y -qq \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    curl
 
 # Install Node.js (required for Claude CLI)
 if ! command -v node &>/dev/null; then
@@ -38,11 +45,6 @@ if ! command -v gh &>/dev/null; then
     sudo apt-get install -y -qq gh
 fi
 
-# Install git
-if ! command -v git &>/dev/null; then
-    sudo apt-get install -y -qq git
-fi
-
 # Create orcest user (if not exists)
 if ! id -u orcest &>/dev/null; then
     echo "Creating orcest user..."
@@ -55,9 +57,27 @@ sudo mkdir -p "$WORKSPACE_DIR"
 sudo mkdir -p "$WORKSPACE_DIR/workspaces"
 sudo chown -R orcest:orcest "$WORKSPACE_DIR"
 
-# Install orcest package
-echo "Installing orcest..."
-sudo python3 -m pip install --break-system-packages git+https://github.com/ThayneStudio/orcest.git || \
-    sudo python3 -m pip install git+https://github.com/ThayneStudio/orcest.git
+# Install orcest package (wheel is uploaded separately by `orcest provision`)
+WHEEL=$(find /tmp/orcest-wheel/ -name '*.whl' 2>/dev/null | head -1)
+if [[ -n "$WHEEL" ]]; then
+    echo "Installing orcest from wheel: $(basename "$WHEEL")"
+    sudo python3 -m pip install --break-system-packages "$WHEEL"
+else
+    echo "No wheel found at /tmp/orcest-wheel/ — skipping orcest install."
+    echo "The provision command will install it in the next step."
+fi
 
+# Verify dependencies
+echo ""
+echo "Verifying installation..."
+for cmd in python3 node claude gh git orcest; do
+    if command -v "$cmd" &>/dev/null; then
+        echo "  $cmd: ok"
+    else
+        echo "  $cmd: MISSING"
+        exit 1
+    fi
+done
+
+echo ""
 echo "=== Setup complete ==="
