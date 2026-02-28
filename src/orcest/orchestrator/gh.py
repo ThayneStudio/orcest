@@ -182,6 +182,32 @@ def get_check_run_logs(
     ], token)
 
 
+def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
+    """Get failed step logs for a GitHub Actions workflow run.
+
+    Uses ``gh run view --log-failed`` which returns plain text output
+    of only the failed steps.  This avoids downloading and unzipping
+    the full log archive.
+
+    Returns empty string on any failure -- log fetching should never
+    block task creation.
+    """
+    _validate_repo(repo)
+    try:
+        return _run_gh([
+            "run", "view", str(run_id),
+            "--repo", repo,
+            "--log-failed",
+        ], token)
+    except Exception:
+        logger.warning(
+            "Failed to fetch failed-step logs for run %d in %s",
+            run_id, repo,
+            exc_info=True,
+        )
+        return ""
+
+
 def add_label(repo: str, number: int, label: str, token: str) -> None:
     """Add a label to a PR/issue."""
     _validate_repo(repo)
