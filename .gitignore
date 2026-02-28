@@ -25,6 +25,7 @@ config/worker.yaml
 # Environment files with secrets
 .env
 provision/.env
+provision/.env.orchestrator
 
 # OS
 .DS_Store
