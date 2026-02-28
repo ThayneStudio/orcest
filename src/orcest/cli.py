@@ -40,8 +40,13 @@ def work(worker_id, config, runner):
 
 @main.command()
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
-def status(config):
-    """Show system status: workers, queue depth, active tasks."""
+@click.option("--once", is_flag=True, help="Print status once and exit (no TUI).")
+@click.option("--interval", default=3.0, type=float, help="TUI refresh interval in seconds.")
+def status(config, once, interval):
+    """Show system status: workers, queue depth, active tasks.
+
+    Launches a live TUI dashboard by default. Use --once for single-shot output.
+    """
     from orcest.shared.config import load_orchestrator_config
     from orcest.shared.redis_client import RedisClient
 
@@ -49,17 +54,34 @@ def status(config):
     redis = RedisClient(cfg.redis)
 
     if not redis.health_check():
+        redis.close()
         click.echo("Error: Cannot connect to Redis.", err=True)
         raise SystemExit(1)
+
+    try:
+        if once:
+            _status_once(redis)
+        else:
+            if interval <= 0:
+                click.echo("Error: --interval must be positive.", err=True)
+                raise SystemExit(1)
+            from orcest.dashboard import run_dashboard
+
+            run_dashboard(redis, refresh_interval=interval)
+    finally:
+        redis.close()
+
+
+def _status_once(redis):
+    """Print system status once and exit (original behavior)."""
+    import redis as redis_lib
 
     console = Console()
     client = redis.client
 
-    # Queue depth — scan for all tasks:* streams
     task_streams = list(client.scan_iter(match="tasks:*"))
     results_len = client.xlen("results") or 0
 
-    # Active locks
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
     for key in lock_keys:
@@ -68,16 +90,14 @@ def status(config):
         pr_num = key.split(":")[-1]
         locks.append({"pr": pr_num, "owner": owner, "ttl": ttl})
 
-    # Consumer group info
     groups = []
     for stream_key in task_streams:
         try:
             for g in client.xinfo_groups(stream_key):
                 groups.append({"stream": stream_key, **g})
-        except Exception:
-            pass
+        except redis_lib.ResponseError:
+            pass  # Stream has no consumer groups
 
-    # Display
     console.print("\n[bold]Orcest System Status[/bold]\n")
 
     table = Table(title="Queue Depths")
@@ -131,8 +151,8 @@ def init(config):
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
     ]
 
-    env = {"GITHUB_TOKEN": cfg.github.token, "GH_TOKEN": cfg.github.token}
-    env.update({k: v for k, v in __import__("os").environ.items()})
+    env = dict(__import__("os").environ)
+    env.update({"GITHUB_TOKEN": cfg.github.token, "GH_TOKEN": cfg.github.token})
 
     for name, color, description in labels:
         console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
@@ -209,7 +229,7 @@ def provision(host, user, worker_config, env_file):
         capture_output=True, text=True,
     )
     if build_result.returncode != 0:
-        console.print(f"[red]failed[/red]")
+        console.print("[red]failed[/red]")
         console.print(build_result.stderr)
         sys.exit(1)
     # Find the built wheel
@@ -287,5 +307,5 @@ def provision(host, user, worker_config, env_file):
         console.print(f"  Check logs: ssh {ssh_target} journalctl -u orcest-worker -f")
 
     console.print(f"\n[bold]Worker provisioned on {host}.[/bold]")
-    console.print(f"\n  To authenticate Claude Code, run:")
+    console.print("\n  To authenticate Claude Code, run:")
     console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")
