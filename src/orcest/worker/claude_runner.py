@@ -154,6 +154,7 @@ def run_claude(
         "--verbose",
         "--output-format",
         "stream-json",
+        "--dangerouslySkipPermissions",
         "-p",
         prompt,
     ]
