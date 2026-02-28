@@ -227,7 +227,7 @@ def test_run_claude_command_args(mock_popen, mocker, tmp_path):
         "--verbose",
         "--output-format",
         "stream-json",
-        "--dangerouslySkipPermissions",
+        "--dangerously-skip-permissions",
         "-p",
         PROMPT,
     ]
