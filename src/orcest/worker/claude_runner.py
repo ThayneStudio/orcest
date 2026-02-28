@@ -151,6 +151,7 @@ def run_claude(
     cmd = [
         "claude",
         "--print",
+        "--verbose",
         "--output-format",
         "stream-json",
         "-p",
