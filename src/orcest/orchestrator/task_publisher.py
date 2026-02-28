@@ -127,7 +127,7 @@ def publish_fix_task(
     redis.xadd(tasks_stream, task.to_dict())
 
     # Track attempt count for re-enqueue throttling
-    attempt_num = increment_attempts(redis, pr_state.number, pr_state.head_sha)
+    increment_attempts(redis, pr_state.number, pr_state.head_sha)
 
     # Update GitHub visibility
     gh.add_label(repo, pr_state.number, label_config.queued, token)

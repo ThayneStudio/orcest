@@ -1,13 +1,13 @@
 ---
 name: review
-description: Use when the user wants to review staged or unstaged git changes before committing, or asks to review local modifications
+description: Use when the user wants to review and fix staged or unstaged git changes before committing, or asks to review local modifications
 argument-hint: "[number-of-agents]"
-allowed-tools: Bash, Read, Grep, Glob, Task
+allowed-tools: Bash, Read, Grep, Glob, Task, Edit, Write
 ---
 
-# Parallel Code Review of Local Changes
+# Parallel Code Review and Fix of Local Changes
 
-Review all staged and unstaged git changes by dispatching parallel review agents — one per logical file group.
+Review all staged and unstaged git changes by dispatching parallel review agents — one per logical file group. Then fix all issues found.
 
 **Requested agent count:** $ARGUMENTS
 
@@ -57,7 +57,7 @@ Each agent prompt MUST include:
 **Agent prompt template:**
 
 ```
-Review the following git changes for code quality issues.
+Review the following git changes for code quality issues, then FIX every issue you find.
 
 Files to review: {file_list}
 
@@ -75,14 +75,18 @@ Review checklist:
 5. **Edge cases**: Empty inputs, boundary values, concurrent access
 6. **Naming/clarity**: Misleading names, confusing logic that needs comments
 
-For each issue found, report:
-- Severity: critical / important / minor
-- File and line number
-- What the issue is
-- Suggested fix (brief)
+For each issue found:
+1. Report it with:
+   - Severity: critical / important / minor
+   - File and line number
+   - What the issue is
+2. Fix it immediately by editing the file. Apply the minimal change needed — do not refactor surrounding code.
 
 If a file looks correct, say so — don't invent issues. Be precise, not verbose.
-Return your findings as a structured list.
+
+After reviewing and fixing all files, return:
+- A structured list of all issues found and fixed
+- Any issues you chose NOT to fix, with reasoning (e.g. architectural changes that need discussion)
 ```
 
 ### 4. Present consolidated results
@@ -95,19 +99,30 @@ After all agents return, present a single summary:
 ## Review Summary
 
 **Files reviewed:** N files across M groups
-**Issues found:** X critical, Y important, Z minor
+**Issues found and fixed:** X critical, Y important, Z minor
 
-### Critical Issues
-- `file:line` — description (suggested fix)
+### Critical Issues (fixed)
+- `file:line` — description — what was changed
 
-### Important Issues
-- `file:line` — description (suggested fix)
+### Important Issues (fixed)
+- `file:line` — description — what was changed
 
-### Minor Issues
-- `file:line` — description (suggested fix)
+### Minor Issues (fixed)
+- `file:line` — description — what was changed
+
+### Issues NOT fixed (need discussion)
+- `file:line` — description — why it was skipped
 
 ### Files with no issues
 - file1, file2, ...
 ```
 
 Sort issues by severity (critical first), then by file path. Deduplicate if multiple agents flagged the same issue. If no issues found in any category, say "None" instead of omitting the section.
+
+### 5. Verify fixes
+
+After all agents have applied their fixes, run the project's linter and tests to make sure the fixes don't break anything:
+- Run linter (e.g. `make lint`)
+- Run fast tests (e.g. `make test-unit`)
+
+If any fixes caused new failures, fix those immediately before presenting the final summary.
