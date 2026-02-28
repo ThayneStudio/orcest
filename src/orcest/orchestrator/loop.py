@@ -11,7 +11,7 @@ import sys
 import time
 
 from orcest.orchestrator import gh
-from orcest.orchestrator.pr_ops import PRAction, discover_actionable_prs
+from orcest.orchestrator.pr_ops import PRAction, clear_attempts, discover_actionable_prs
 from orcest.orchestrator.task_publisher import publish_fix_task
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.logging import setup_logging
@@ -85,6 +85,7 @@ def _poll_cycle(
         token=config.github.token,
         redis=redis,
         label_config=config.labels,
+        max_attempts=config.max_attempts,
     )
 
     # Step 3: Enqueue tasks for actionable PRs
@@ -111,6 +112,30 @@ def _poll_cycle(
             logger.debug(
                 f"PR #{pr_state.number}: locked, skipping"
             )
+        elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:
+            logger.warning(
+                f"PR #{pr_state.number}: max attempts reached, "
+                f"adding needs-human label"
+            )
+            try:
+                gh.add_label(
+                    config.github.repo, pr_state.number,
+                    config.labels.needs_human, config.github.token,
+                )
+                gh.post_comment(
+                    config.github.repo, pr_state.number,
+                    f"**orcest** has exhausted its retry budget "
+                    f"({config.max_attempts} attempts) for this PR. "
+                    f"Labeling as `{config.labels.needs_human}` for "
+                    f"manual review.\n\nPush a new commit to reset "
+                    f"the counter and allow orcest to try again.",
+                    config.github.token,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to label PR #{pr_state.number} as "
+                    f"needs-human: {e}"
+                )
         elif pr_state.action == PRAction.SKIP_LABELED:
             logger.debug(
                 f"PR #{pr_state.number}: already labeled, skipping"
@@ -211,6 +236,10 @@ def _handle_result(
         logger.error(
             f"Failed to post comment on PR #{pr_number}: {e}"
         )
+
+    # Clear attempt counter on success so future failures start fresh
+    if result.status == ResultStatus.COMPLETED:
+        clear_attempts(redis, pr_number)
 
     # Manage labels based on result status.
     # Label lifecycle (from spec section 5):
