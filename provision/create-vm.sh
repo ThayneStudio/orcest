@@ -63,6 +63,7 @@ SOCKETS="${ORCEST_VM_SOCKETS:-2}"
 DISK_SIZE="${ORCEST_VM_DISK:-10G}"
 CI_USER="${ORCEST_VM_USER:-thayne}"
 BRIDGE="${ORCEST_VM_BRIDGE:-vmbr0}"
+VLAN="${ORCEST_VM_VLAN:-}"
 
 # Find SSH public key (prefer .pub files over authorized_keys)
 SSH_KEY=""
@@ -121,7 +122,7 @@ qm create "$VMID" \
     --memory "$MEMORY" \
     --cores "$CORES" \
     --sockets "$SOCKETS" \
-    --net0 "virtio,bridge=${BRIDGE}" \
+    --net0 "virtio,bridge=${BRIDGE}${VLAN:+,tag=${VLAN}}" \
     --serial0 socket \
     --vga serial0 \
     --agent enabled=1
