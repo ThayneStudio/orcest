@@ -43,4 +43,4 @@ markers = [
     "integration: tests requiring real Redis",
     "stress: high-concurrency tests requiring real Redis (slow)",
 ]
-addopts = "-m unit --timeout=30"
+addopts = "--timeout=60"

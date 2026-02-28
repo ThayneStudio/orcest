@@ -128,3 +128,64 @@ class TestLocking:
         new_lock = RedisLock(real_redis_client, key, ttl=30, owner="late")
         assert new_lock.acquire() is True
         new_lock.release()
+
+    def test_no_overlapping_work_on_same_pr(self, real_redis_client: RedisClient) -> None:
+        """Workers holding locks for the same PR never overlap in time."""
+        key = make_pr_lock_key(1)
+        windows: list[tuple[str, float, float]] = []
+        windows_lock = threading.Lock()
+        barrier = threading.Barrier(5)
+
+        def _worker(owner: str) -> None:
+            lock = RedisLock(real_redis_client, key, ttl=5, owner=owner)
+            barrier.wait()
+            for _ in range(2):  # Each worker attempts 2 acquisitions
+                if lock.acquire():
+                    hb = Heartbeat(lock, interval=0.5)
+                    hb.start()
+                    start = time.monotonic()
+                    time.sleep(0.1)  # Simulate work
+                    end = time.monotonic()
+                    hb.stop()
+                    lock.release()
+                    with windows_lock:
+                        windows.append((owner, start, end))
+
+        threads = [threading.Thread(target=_worker, args=(f"w-{i}",)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Verify no two windows overlap
+        sorted_windows = sorted(windows, key=lambda w: w[1])
+        for i in range(len(sorted_windows) - 1):
+            _, _, end_i = sorted_windows[i]
+            _, start_next, _ = sorted_windows[i + 1]
+            assert end_i <= start_next, (
+                f"Overlap detected: window {i} ended at {end_i}, "
+                f"window {i+1} started at {start_next}"
+            )
+
+    def test_lock_expires_after_worker_death(self, real_redis_client: RedisClient) -> None:
+        """A crashed worker's lock expires, allowing another worker to proceed."""
+        key = make_pr_lock_key(1)
+        lock1 = RedisLock(real_redis_client, key, ttl=2, owner="w1")
+        assert lock1.acquire() is True
+
+        # Start heartbeat, then simulate crash (stop heartbeat but don't release)
+        hb = Heartbeat(lock1, interval=0.5)
+        hb.start()
+        hb.stop()  # Crash: heartbeat dies but lock not released
+
+        # Lock should still be held immediately
+        assert real_redis_client.client.exists(key) == 1
+
+        # Wait for TTL to expire
+        time.sleep(3)
+        assert real_redis_client.client.exists(key) == 0
+
+        # Another worker can now acquire
+        lock2 = RedisLock(real_redis_client, key, ttl=30, owner="w2")
+        assert lock2.acquire() is True
+        lock2.release()

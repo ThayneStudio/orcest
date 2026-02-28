@@ -14,8 +14,6 @@ from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
-TASKS_STREAM = "tasks"
-
 
 def publish_fix_task(
     pr_state: PRState,
@@ -23,6 +21,7 @@ def publish_fix_task(
     token: str,
     redis: RedisClient,
     label_config: LabelConfig,
+    default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a fix task for a PR.
@@ -82,8 +81,9 @@ def publish_fix_task(
         branch=pr_state.branch,
     )
 
-    # Publish to Redis stream
-    redis.xadd(TASKS_STREAM, task.to_dict())
+    # Publish to backend-specific stream
+    tasks_stream = f"tasks:{default_runner}"
+    redis.xadd(tasks_stream, task.to_dict())
 
     # Update GitHub visibility
     gh.add_label(repo, pr_state.number, label_config.queued, token)

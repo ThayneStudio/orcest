@@ -88,7 +88,9 @@ def test_load_worker_config_from_yaml(tmp_path: Path):
         "  port: 6381\n"
         "worker_id: worker-5\n"
         "workspace_dir: /data/workspaces\n"
-        "claude:\n"
+        "backend: noop\n"
+        "runner:\n"
+        "  type: noop\n"
         "  timeout: 900\n"
         "  max_retries: 5\n"
         "  retry_backoff: 20\n"
@@ -100,9 +102,11 @@ def test_load_worker_config_from_yaml(tmp_path: Path):
     assert config.redis.port == 6381
     assert config.worker_id == "worker-5"
     assert config.workspace_dir == "/data/workspaces"
-    assert config.claude.timeout == 900
-    assert config.claude.max_retries == 5
-    assert config.claude.retry_backoff == 20
+    assert config.backend == "noop"
+    assert config.runner.type == "noop"
+    assert config.runner.timeout == 900
+    assert config.runner.max_retries == 5
+    assert config.runner.retry_backoff == 20
 
 
 def test_load_worker_config_env_overrides(

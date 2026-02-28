@@ -40,10 +40,12 @@ class LabelConfig:
 
 
 @dataclass
-class ClaudeConfig:
+class RunnerConfig:
+    type: str = "claude"
     timeout: int = 1800  # 30 minutes
     max_retries: int = 3
     retry_backoff: int = 10  # seconds between retries
+    extra: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -52,6 +54,7 @@ class OrchestratorConfig:
     github: GithubConfig = field(default_factory=GithubConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
+    default_runner: str = "claude"
 
 
 @dataclass
@@ -59,7 +62,8 @@ class WorkerConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     worker_id: str = "worker-0"
     workspace_dir: str = "/tmp/orcest-workspaces"
-    claude: ClaudeConfig = field(default_factory=ClaudeConfig)
+    backend: str = "claude"
+    runner: RunnerConfig = field(default_factory=RunnerConfig)
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -167,11 +171,17 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),
     )
 
+    # Default runner backend
+    default_runner = str(
+        os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude"))
+    )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
         polling=polling_config,
         labels=labels_config,
+        default_runner=default_runner,
     )
 
     # Validate required fields
@@ -206,19 +216,26 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         os.environ.get("ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces"))
     )
 
-    # Claude
-    claude_raw = _safe_dict(raw, "claude")
-    claude_config = ClaudeConfig(
-        timeout=_safe_int(claude_raw.get("timeout", 1800), "claude.timeout"),
-        max_retries=_safe_int(claude_raw.get("max_retries", 3), "claude.max_retries"),
-        retry_backoff=_safe_int(claude_raw.get("retry_backoff", 10), "claude.retry_backoff"),
+    # Runner (construct first so backend can default from runner.type)
+    runner_raw = _safe_dict(raw, "runner")
+    runner_extra_raw = _safe_dict(runner_raw, "extra")
+    runner_config = RunnerConfig(
+        type=str(runner_raw.get("type", "claude")),
+        timeout=_safe_int(runner_raw.get("timeout", 1800), "runner.timeout"),
+        max_retries=_safe_int(runner_raw.get("max_retries", 3), "runner.max_retries"),
+        retry_backoff=_safe_int(runner_raw.get("retry_backoff", 10), "runner.retry_backoff"),
+        extra={str(k): str(v) for k, v in runner_extra_raw.items()},
     )
+
+    # Backend — default from runner.type when not explicitly set
+    backend = str(raw.get("backend", runner_config.type))
 
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
         workspace_dir=workspace_dir,
-        claude=claude_config,
+        backend=backend,
+        runner=runner_config,
     )
 
     # Validate required fields

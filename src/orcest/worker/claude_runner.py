@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from orcest.worker.runner import RunnerResult
+
 # Patterns that indicate Claude usage/rate limit exhaustion.
 # Checked against both stderr and stdout (case-insensitive).
 _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
@@ -65,6 +67,7 @@ class ClaudeResult:
     summary: str
     duration_seconds: int
     raw_output: str
+    usage_exhausted: bool = False
 
 
 def _build_env(token: str) -> dict[str, str]:
@@ -197,6 +200,7 @@ def run_claude(
                         summary="Claude usage limit reached",
                         duration_seconds=duration,
                         raw_output=stderr,
+                        usage_exhausted=True,
                     )
 
         except subprocess.TimeoutExpired:
@@ -236,6 +240,42 @@ def run_claude(
         duration_seconds=duration,
         raw_output="",
     )
+
+
+class ClaudeRunner:
+    """Runner implementation that executes tasks via the Claude CLI."""
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        retry_backoff: int = 10,
+    ):
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+
+    def run(
+        self,
+        prompt: str,
+        work_dir: Path,
+        token: str,
+        timeout: int,
+        logger: logging.Logger | None = None,
+    ) -> RunnerResult:
+
+        result = run_claude(
+            prompt=prompt,
+            work_dir=work_dir,
+            token=token,
+            timeout=timeout,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+            logger=logger,
+        )
+        return RunnerResult(
+            success=result.success,
+            summary=result.summary,
+            usage_exhausted=result.usage_exhausted,
+        )
 
 
 def _extract_summary(stream_json_output: str) -> str:

@@ -100,6 +100,7 @@ def _poll_cycle(
                 token=config.github.token,
                 redis=redis,
                 label_config=config.labels,
+                default_runner=config.default_runner,
                 logger=logger,
             )
         elif pr_state.action == PRAction.SKIP_GREEN:
@@ -192,7 +193,7 @@ def _handle_result(
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
         body = (
             f"**orcest** task `{result.task_id}` paused "
-            f"(Claude usage limit reached, "
+            f"(usage limit reached, "
             f"worker: {result.worker_id}).\n\n"
             f"Work saved on branch `{result.branch}`. "
             f"Will resume when capacity is available."

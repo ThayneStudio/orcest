@@ -22,6 +22,10 @@ env/
 config/orchestrator.yaml
 config/worker.yaml
 
+# Environment files with secrets
+.env
+provision/.env
+
 # OS
 .DS_Store
 Thumbs.db

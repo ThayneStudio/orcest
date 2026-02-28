@@ -8,10 +8,15 @@ worker_id: "worker-0"
 # Directory for temporary repo clones
 workspace_dir: "/tmp/orcest-workspaces"
 
-claude:
-  # Timeout in seconds for a single Claude invocation
+# Which task stream to subscribe to (tasks:claude, tasks:gemini, etc.)
+backend: "claude"
+
+runner:
+  # Runner implementation (claude, noop, etc.)
+  type: claude
+  # Timeout in seconds for a single runner invocation
   timeout: 1800
-  # Max retries on Claude crash
+  # Max retries on runner crash
   max_retries: 3
   # Seconds between retries
   retry_backoff: 10

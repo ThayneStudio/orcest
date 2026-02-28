@@ -10,6 +10,7 @@ ExecStart=/usr/local/bin/orcest work --id %H --config /opt/orcest/worker.yaml
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/orcest/.env
 
 [Install]
 WantedBy=multi-user.target

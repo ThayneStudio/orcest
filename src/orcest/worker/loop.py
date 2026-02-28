@@ -15,11 +15,10 @@ from orcest.shared.coordination import RedisLock, make_pr_lock_key
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, Task, TaskResult
 from orcest.shared.redis_client import RedisClient
-from orcest.worker.claude_runner import ClaudeResult, run_claude
 from orcest.worker.heartbeat import Heartbeat
+from orcest.worker.runner import Runner, RunnerResult, create_runner
 from orcest.worker.workspace import Workspace
 
-TASKS_STREAM = "tasks"
 RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
 
@@ -28,6 +27,8 @@ def run_worker(config: WorkerConfig) -> None:
     """Main worker entry point. Blocks indefinitely."""
     logger = setup_logging("worker", config.worker_id)
     redis = RedisClient(config.redis)
+    runner = create_runner(config.runner)
+    tasks_stream = f"tasks:{config.backend}"
 
     # Verify Redis connection
     if not redis.health_check():
@@ -35,7 +36,7 @@ def run_worker(config: WorkerConfig) -> None:
         sys.exit(1)
 
     # Ensure consumer group exists
-    redis.ensure_consumer_group(TASKS_STREAM, CONSUMER_GROUP)
+    redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
 
     # Graceful shutdown
     shutdown = False
@@ -50,14 +51,17 @@ def run_worker(config: WorkerConfig) -> None:
 
     workspace = Workspace(config.workspace_dir)
 
-    logger.info(f"Worker {config.worker_id} started. Waiting for tasks...")
+    logger.info(
+        f"Worker {config.worker_id} started (backend={config.backend}, "
+        f"runner={config.runner.type}). Waiting for tasks..."
+    )
 
     while not shutdown:
         # Block waiting for tasks (5 second timeout to check shutdown flag)
         entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
             consumer=config.worker_id,
-            stream=TASKS_STREAM,
+            stream=tasks_stream,
             count=1,
             block_ms=5000,
         )
@@ -78,7 +82,7 @@ def run_worker(config: WorkerConfig) -> None:
         lock = RedisLock(
             redis,
             lock_key,
-            ttl=config.claude.timeout + 60,
+            ttl=config.runner.timeout + 60,
             owner=config.worker_id,
         )
 
@@ -88,7 +92,7 @@ def run_worker(config: WorkerConfig) -> None:
             )
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
-            redis.xack(TASKS_STREAM, CONSUMER_GROUP, entry_id)
+            redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
             continue
 
         logger.info(f"Acquired lock {lock_key}")
@@ -98,7 +102,7 @@ def run_worker(config: WorkerConfig) -> None:
         heartbeat.start()
 
         try:
-            result = _execute_task(task, config, workspace, logger)
+            result = _execute_task(task, config, runner, workspace, logger)
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
             # that _execute_task's except Exception doesn't catch.
@@ -125,7 +129,7 @@ def run_worker(config: WorkerConfig) -> None:
             )
             # Continue to ACK -- the task can be retried via XPENDING if needed
 
-        redis.xack(TASKS_STREAM, CONSUMER_GROUP, entry_id)
+        redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
 
     logger.info("Worker shut down cleanly.")
 
@@ -133,10 +137,11 @@ def run_worker(config: WorkerConfig) -> None:
 def _execute_task(
     task: Task,
     config: WorkerConfig,
+    runner: Runner,
     workspace: Workspace,
     logger: logging.Logger,
 ) -> TaskResult:
-    """Execute a single task: clone, run Claude, return result."""
+    """Execute a single task: clone, run runner, return result."""
     start = time.monotonic()
 
     try:
@@ -144,21 +149,20 @@ def _execute_task(
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
         work_dir = workspace.setup(task.repo, task.branch, task.token)
 
-        # Run Claude
-        claude_result: ClaudeResult = run_claude(
+        # Run the configured backend
+        runner_result: RunnerResult = runner.run(
             prompt=task.prompt,
             work_dir=work_dir,
             token=task.token,
-            timeout=config.claude.timeout,
-            max_retries=config.claude.max_retries,
+            timeout=config.runner.timeout,
             logger=logger,
         )
 
         duration = int(time.monotonic() - start)
 
-        if claude_result.success:
+        if runner_result.success:
             status = ResultStatus.COMPLETED
-        elif "usage limit" in claude_result.summary.lower():
+        elif runner_result.usage_exhausted:
             status = ResultStatus.USAGE_EXHAUSTED
         else:
             status = ResultStatus.FAILED
@@ -170,7 +174,7 @@ def _execute_task(
             resource_type=task.resource_type,
             resource_id=task.resource_id,
             branch=task.branch,
-            summary=claude_result.summary,
+            summary=runner_result.summary,
             duration_seconds=duration,
         )
 
