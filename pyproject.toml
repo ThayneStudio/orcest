@@ -23,6 +23,9 @@ where = ["src"]
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-mock>=3.14",
+    "pytest-timeout>=2.3",
+    "fakeredis[lua]>=2.21",
     "ruff>=0.4",
 ]
 
@@ -35,3 +38,9 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "unit: fast tests using fakeredis/mocks only",
+    "integration: tests requiring real Redis",
+    "stress: high-concurrency tests requiring real Redis (slow)",
+]
+addopts = "-m unit --timeout=30"

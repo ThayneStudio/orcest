@@ -203,11 +203,14 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
         ], token)
     except GhCliError as exc:
         # gh pr edit --remove-label exits non-zero when the label isn't
-        # present. We swallow that specific case but log it for debugging.
-        logger.debug(
-            "remove_label swallowed error for PR #%d label %r: %s",
-            number, label, exc.stderr,
-        )
+        # present. We swallow that specific case but re-raise others.
+        if "not found" in (exc.stderr or "").lower():
+            logger.debug(
+                "remove_label: label %r not on PR #%d, ignoring",
+                label, number,
+            )
+        else:
+            raise
 
 
 def post_comment(repo: str, number: int, body: str, token: str) -> None:
