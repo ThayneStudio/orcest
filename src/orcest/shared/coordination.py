@@ -65,6 +65,9 @@ class RedisLock:
         """Release the lock, but only if we still own it.
 
         Uses a Lua script for atomic check-and-delete.
+        Returns True if the lock was actually deleted (we were the owner).
+        Always clears _held since after calling release() we no longer
+        consider ourselves the holder regardless of outcome.
         """
         result = self._release_script(
             keys=[self.key], args=[self.owner]

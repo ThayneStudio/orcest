@@ -100,7 +100,7 @@ def discover_actionable_prs(
 
         ci_failures = [
             c for c in checks
-            if c.get("conclusion") == "failure"
+            if (c.get("conclusion") or "").upper() == "FAILURE"
         ]
 
         # Check review state
