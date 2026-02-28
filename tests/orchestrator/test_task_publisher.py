@@ -20,6 +20,7 @@ def _make_pr_state(
         number=number,
         title=title,
         branch=branch,
+        head_sha="abc123",
         action=PRAction.ENQUEUE_FIX,
         ci_failures=ci_failures or [],
         review_comments=[],
