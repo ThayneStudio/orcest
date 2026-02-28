@@ -149,6 +149,14 @@ qm set "$VMID" --ciuser "$CI_USER"
 qm set "$VMID" --sshkey "$SSH_KEY"
 qm set "$VMID" --ipconfig0 ip=dhcp
 
+# Show MAC address for DHCP reservation
+MAC=$(qm config "$VMID" | grep -oP 'virtio=\K[A-F0-9:]+' -i)
+echo ""
+echo "  MAC address: ${MAC}"
+echo ""
+echo "Set up a static DHCP reservation now if desired."
+read -rp "Press Enter to boot the VM (or Ctrl-C to abort)..."
+
 # Start
 echo "Starting VM..."
 qm start "$VMID"
