@@ -52,8 +52,9 @@ _ENV_ALLOWLIST: set[str] = {
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
-    # Claude CLI auth (if using API key instead of OAuth)
+    # Claude CLI auth
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 }
