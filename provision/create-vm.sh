@@ -129,8 +129,9 @@ VM_CREATED=true
 
 # Import disk (no --format flag; Proxmox auto-selects raw for LVM, qcow2 for directory)
 echo "Importing disk..."
-IMPORT_OUTPUT=$(qm importdisk "$VMID" "${IMG_CACHE}/${CLOUD_IMG}" "$STORAGE" 2>&1)
-DISK_REF=$(echo "$IMPORT_OUTPUT" | grep -oP "unused0:\s*\K\S+" || echo "${STORAGE}:vm-${VMID}-disk-0")
+qm importdisk "$VMID" "${IMG_CACHE}/${CLOUD_IMG}" "$STORAGE"
+# The imported disk appears as unused0 in the VM config
+DISK_REF=$(qm config "$VMID" | grep -oP 'unused0:\s*\K\S+')
 echo "  Disk: ${DISK_REF}"
 
 # Attach disk + cloud-init drive
