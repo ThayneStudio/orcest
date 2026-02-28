@@ -231,7 +231,19 @@ def provision(host, user, worker_config, env_file):
              "sudo chown orcest:orcest /opt/orcest/.env")
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
-    # Step 3: Install and start systemd service
+    # Step 3: Claude Code login (interactive — needs terminal)
+    console.print("\n  [bold]Logging in to Claude Code as orcest user...[/bold]")
+    console.print("  Follow the URL below, authorize, and paste the code back.\n")
+    result = subprocess.run(
+        ["ssh", "-t", ssh_target, "sudo -u orcest claude login"],
+    )
+    if result.returncode == 0:
+        console.print("\n  Claude Code login [green]ok[/green]")
+    else:
+        console.print("\n  Claude Code login [yellow]skipped or failed[/yellow]")
+        console.print(f"  You can run manually: ssh {ssh_target} 'sudo -u orcest claude login'")
+
+    # Step 4: Install and start systemd service
     console.print("  Installing systemd service...", end=" ")
     result = _scp("provision/systemd/orcest-worker.service",
                    "/tmp/orcest-worker.service")
@@ -245,7 +257,7 @@ def provision(host, user, worker_config, env_file):
     result = _ssh("sudo systemctl restart orcest-worker")
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
-    # Step 4: Verify
+    # Step 5: Verify
     console.print("  Checking service status...", end=" ")
     result = _ssh("systemctl is-active orcest-worker")
     status = result.stdout.strip()
