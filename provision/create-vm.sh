@@ -21,6 +21,7 @@ STORAGE="${3:-local-lvm}"
 
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 CLOUD_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
+IMG_CACHE="/var/cache/cloud-images"
 
 MEMORY=16384    # 16 GB
 CORES=4
@@ -53,10 +54,13 @@ echo "  User:    $CI_USER"
 echo "  SSH key: $SSH_KEY"
 echo ""
 
-# Download cloud image if not present
-if [[ ! -f "$CLOUD_IMG" ]]; then
-    echo "Downloading cloud image..."
-    wget -q --show-progress "$CLOUD_URL"
+# Download cloud image if not cached
+mkdir -p "$IMG_CACHE"
+if [[ ! -f "${IMG_CACHE}/${CLOUD_IMG}" ]]; then
+    echo "Downloading cloud image to ${IMG_CACHE}/..."
+    wget -q --show-progress -O "${IMG_CACHE}/${CLOUD_IMG}" "$CLOUD_URL"
+else
+    echo "Using cached image: ${IMG_CACHE}/${CLOUD_IMG}"
 fi
 
 # Create VM
@@ -71,7 +75,7 @@ qm create "$VMID" \
 
 # Import disk
 echo "Importing disk..."
-qm importdisk "$VMID" "$CLOUD_IMG" "$STORAGE" --format qcow2
+qm importdisk "$VMID" "${IMG_CACHE}/${CLOUD_IMG}" "$STORAGE" --format qcow2
 
 # Attach disk + cloud-init drive
 echo "Configuring VM..."
