@@ -1,7 +1,8 @@
 """Repository workspace management for worker task execution.
 
-Handles shallow cloning, branch checkout, and cleanup. Each task gets its
-own temporary directory under base_dir to prevent state leakage between tasks.
+Handles cloning, branch checkout, git credential setup, and cleanup.
+Each task gets its own temporary directory under base_dir to prevent
+state leakage between tasks.
 """
 
 import logging
@@ -15,6 +16,20 @@ logger = logging.getLogger(__name__)
 # Timeout for git clone operations (seconds). Prevents the worker from
 # hanging indefinitely on network issues.
 _CLONE_TIMEOUT_SECONDS = 300
+
+
+def _git_config(repo_dir: Path, key: str, value: str) -> None:
+    """Set a git config value in the given repo. Non-fatal on failure."""
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", key, value],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        logger.warning("Failed to set git config %s in %s", key, repo_dir)
 
 
 class WorkspaceError(Exception):
@@ -75,13 +90,9 @@ class Workspace:
 
         clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
 
-        # Shallow clone for speed
         cmd: list[str] = [
             "git",
             "clone",
-            "--depth",
-            "1",
-            "--single-branch",
         ]
         if branch:
             cmd.extend(["--branch", branch])
@@ -138,6 +149,16 @@ class Workspace:
                 "(will be cleaned up with workspace directory)",
                 repo,
             )
+
+        # Configure a credential helper so git push works via the
+        # GITHUB_TOKEN env var (which the runner forwards to Claude).
+        # This avoids storing the token in plaintext in .git/config.
+        _git_config(repo_dir, "credential.helper",
+                     "!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f")
+
+        # Set git identity so Claude's commits have a valid author.
+        _git_config(repo_dir, "user.name", "orcest-bot")
+        _git_config(repo_dir, "user.email", "orcest-bot@users.noreply.github.com")
 
         self._work_dir = repo_dir
         return self._work_dir

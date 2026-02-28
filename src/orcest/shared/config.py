@@ -55,6 +55,7 @@ class OrchestratorConfig:
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
     default_runner: str = "claude"
+    max_attempts: int = 3  # Max task attempts per PR before needs-human
 
 
 @dataclass
@@ -176,12 +177,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude"))
     )
 
+    # Max attempts per PR before labeling needs-human
+    max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
         polling=polling_config,
         labels=labels_config,
         default_runner=default_runner,
+        max_attempts=max_attempts,
     )
 
     # Validate required fields

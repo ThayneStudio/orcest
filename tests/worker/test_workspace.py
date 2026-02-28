@@ -41,8 +41,8 @@ def test_setup_clones_repo(mocker, tmp_path):
 
 
 @pytest.mark.unit
-def test_setup_shallow_clone_args(mocker, tmp_path):
-    """setup() uses --depth 1 --single-branch for a shallow clone."""
+def test_setup_full_clone(mocker, tmp_path):
+    """setup() does a full clone (no --depth or --single-branch)."""
     mock_run = mocker.patch(
         "orcest.worker.workspace.subprocess.run",
         return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
@@ -51,10 +51,8 @@ def test_setup_shallow_clone_args(mocker, tmp_path):
     ws.setup(REPO, BRANCH, TOKEN)
 
     clone_args = mock_run.call_args_list[0][0][0]
-    assert "--depth" in clone_args
-    depth_idx = clone_args.index("--depth")
-    assert clone_args[depth_idx + 1] == "1"
-    assert "--single-branch" in clone_args
+    assert "--depth" not in clone_args
+    assert "--single-branch" not in clone_args
 
 
 @pytest.mark.unit
@@ -103,7 +101,8 @@ def test_setup_strips_credentials(mocker, tmp_path):
     ws.setup(REPO, BRANCH, TOKEN)
 
     # Second subprocess.run call should be the remote set-url
-    assert mock_run.call_count == 2
+    # (followed by 3 git config calls: credential helper, user.name, user.email)
+    assert mock_run.call_count == 5
     seturl_args = mock_run.call_args_list[1][0][0]
     assert "remote" in seturl_args
     assert "set-url" in seturl_args

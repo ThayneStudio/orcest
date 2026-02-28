@@ -9,7 +9,7 @@ import logging
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
-from orcest.orchestrator.pr_ops import PRState
+from orcest.orchestrator.pr_ops import PRState, increment_attempts
 from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
@@ -84,6 +84,9 @@ def publish_fix_task(
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
     redis.xadd(tasks_stream, task.to_dict())
+
+    # Track attempt count for re-enqueue throttling
+    attempt_num = increment_attempts(redis, pr_state.number, pr_state.head_sha)
 
     # Update GitHub visibility
     gh.add_label(repo, pr_state.number, label_config.queued, token)

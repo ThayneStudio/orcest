@@ -224,8 +224,10 @@ def test_run_claude_command_args(mock_popen, mocker, tmp_path):
     assert cmd == [
         "claude",
         "--print",
+        "--verbose",
         "--output-format",
         "stream-json",
+        "--dangerouslySkipPermissions",
         "-p",
         PROMPT,
     ]

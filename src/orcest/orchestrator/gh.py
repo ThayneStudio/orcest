@@ -126,7 +126,7 @@ def list_open_prs(repo: str, token: str) -> list[dict]:
         "pr", "list",
         "--repo", repo,
         "--state", "open",
-        "--json", "number,title,headRefName,author,createdAt,"
+        "--json", "number,title,headRefName,headRefOid,author,createdAt,"
                   "labels,reviewDecision",
         "--limit", "100",
     ], token)

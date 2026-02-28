@@ -27,6 +27,7 @@ def _make_pr_state(
         number=number,
         title=f"PR #{number}",
         branch=f"fix/{number}",
+        head_sha="abc123",
         action=action,
         ci_failures=[{"name": "ruff", "conclusion": "failure"}],
         review_comments=[],
