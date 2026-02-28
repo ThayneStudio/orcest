@@ -61,7 +61,7 @@ sudo chown -R orcest:orcest "$WORKSPACE_DIR"
 WHEEL=$(find /tmp/orcest-wheel/ -name '*.whl' 2>/dev/null | head -1)
 if [[ -n "$WHEEL" ]]; then
     echo "Installing orcest from wheel: $(basename "$WHEEL")"
-    sudo python3 -m pip install --break-system-packages "$WHEEL"
+    sudo python3 -m pip install --break-system-packages --ignore-installed "$WHEEL"
 else
     echo "No wheel found at /tmp/orcest-wheel/ — skipping orcest install."
     echo "The provision command will install it in the next step."

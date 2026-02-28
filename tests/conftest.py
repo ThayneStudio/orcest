@@ -158,6 +158,7 @@ def gh_mock(mocker):
         "get_ci_status",
         "get_pr_diff",
         "get_check_run_logs",
+        "get_failed_run_logs",
         "add_label",
         "remove_label",
         "post_comment",

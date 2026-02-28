@@ -6,6 +6,7 @@ adding labels and posting comments when tasks are queued.
 """
 
 import logging
+import re
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
@@ -13,6 +14,27 @@ from orcest.orchestrator.pr_ops import PRState, increment_attempts
 from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
+
+_RUN_ID_RE = re.compile(
+    r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)"
+)
+
+# Per-check log excerpt limit (errors are at the end of logs)
+_PER_CHECK_LOG_LIMIT = 5000
+# Total log budget across all checks in a single prompt
+_TOTAL_LOG_BUDGET = 15000
+
+
+def _extract_run_id(details_url: str) -> int | None:
+    """Extract the workflow run ID from a GitHub Actions detailsUrl.
+
+    Expected format:
+        https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
+
+    Returns None if the URL doesn't match (e.g. third-party CI).
+    """
+    m = _RUN_ID_RE.search(details_url)
+    return int(m.group(1)) if m else None
 
 
 def publish_fix_task(
@@ -36,19 +58,37 @@ def publish_fix_task(
     # Gather context
     diff = gh.get_pr_diff(repo, pr_state.number, token)
 
-    # Classify CI failures
+    # Fetch CI logs and classify failures
     failure_summaries: list[dict] = []
+    ci_logs: dict[str, str] = {}  # check_name -> log_text
+    run_logs_cache: dict[int, str] = {}  # run_id -> log_text (dedup)
     task_type = TaskType.FIX_PR
 
     for check in pr_state.ci_failures:
-        classification = classify_ci_failure(
-            check.get("name", ""),
-            "",  # logs -- Phase 1 may not fetch full logs
-        )
+        details_url = check.get("detailsUrl", "")
+        check_name = check.get("name", "unknown")
+        log_text = ""
+
+        # Try to fetch logs from GitHub Actions run
+        run_id = _extract_run_id(details_url)
+        if run_id is not None:
+            if run_id not in run_logs_cache:
+                try:
+                    run_logs_cache[run_id] = gh.get_failed_run_logs(
+                        repo, run_id, token
+                    )
+                except Exception:
+                    # Never let log fetching break task creation
+                    run_logs_cache[run_id] = ""
+            log_text = run_logs_cache[run_id]
+
+        ci_logs[check_name] = log_text
+
+        classification = classify_ci_failure(check_name, log_text)
         failure_summaries.append({
-            "name": check.get("name", "unknown"),
+            "name": check_name,
             "classification": classification.value,
-            "details_url": check.get("detailsUrl", ""),
+            "details_url": details_url,
         })
 
         if classification == CIFailureType.CODE:
@@ -68,6 +108,7 @@ def publish_fix_task(
         diff=diff,
         ci_failures=failure_summaries,
         review_summary=review_summary,
+        ci_logs=ci_logs,
     )
 
     # Create task
@@ -113,11 +154,15 @@ def _render_fix_prompt(
     diff: str,
     ci_failures: list[dict],
     review_summary: str,
+    ci_logs: dict[str, str] | None = None,
 ) -> str:
     """Render the prompt that Claude will receive.
 
     Uses simple string formatting (no Jinja2 dependency).
     Diff is truncated to 10,000 characters to keep prompt size manageable.
+    CI log excerpts are included when available, with each log capped at
+    the last ~5000 characters (errors are at the end) and total log
+    content capped at ~15000 characters.
     """
     sections: list[str] = [
         f"# Fix PR #{pr_number}: {pr_title}",
@@ -131,12 +176,31 @@ def _render_fix_prompt(
     if ci_failures:
         sections.append("## CI Failures")
         sections.append("")
+        log_budget = _TOTAL_LOG_BUDGET
         for f in ci_failures:
             sections.append(
                 f"- **{f['name']}** ({f['classification']})"
             )
             if f.get("details_url"):
                 sections.append(f"  Details: {f['details_url']}")
+            # Include log excerpt if available
+            if ci_logs:
+                log_text = ci_logs.get(f["name"], "")
+                if log_text and log_budget > 0:
+                    max_len = min(_PER_CHECK_LOG_LIMIT, log_budget)
+                    excerpt = log_text[-max_len:]
+                    if len(log_text) > max_len:
+                        excerpt = (
+                            f"... (truncated, showing last {max_len} chars)\n"
+                            + excerpt
+                        )
+                    sections.append("")
+                    sections.append(f"  **Log output for {f['name']}:**")
+                    sections.append("")
+                    sections.append("  ```")
+                    sections.append(excerpt)
+                    sections.append("  ```")
+                    log_budget -= len(excerpt)
         sections.append("")
         sections.append(
             "Fix the CI failures listed above. Read the error "
