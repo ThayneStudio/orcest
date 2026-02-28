@@ -1,9 +1,10 @@
 """Tests for orcest.orchestrator.task_publisher.publish_fix_task().
 
 Verifies task creation, Redis stream publishing, GitHub label/comment
-side effects, and prompt diff truncation.
+side effects, prompt diff truncation, and CI log fetching/rendering.
 """
 
+from orcest.orchestrator.gh import GhCliError
 from orcest.orchestrator.pr_ops import PRAction, PRState
 from orcest.orchestrator.task_publisher import publish_fix_task
 from orcest.shared.models import Task, TaskType
@@ -154,3 +155,184 @@ def test_prompt_truncates_long_diff(gh_mock, fake_redis_client, label_config):
     assert "x" * 10000 in task.prompt
     # And the truncation notice should appear
     assert "truncated from 15000 to 10,000" in task.prompt
+
+
+# --- CI log fetching tests ---
+
+
+def _make_ci_failures_with_urls(
+    run_ids: list[int | None],
+    names: list[str] | None = None,
+) -> list[dict]:
+    """Build a ci_failures list with GitHub Actions detailsUrl values.
+
+    Pass None as a run_id to simulate a third-party CI URL.
+    """
+    failures = []
+    for i, run_id in enumerate(run_ids):
+        name = (names[i] if names else None) or f"check-{i}"
+        if run_id is not None:
+            url = (
+                f"https://github.com/org/repo/actions/runs/{run_id}"
+                f"/job/{9000 + i}"
+            )
+        else:
+            url = "https://circleci.com/gh/org/repo/12345"
+        failures.append({
+            "name": name,
+            "conclusion": "FAILURE",
+            "detailsUrl": url,
+        })
+    return failures
+
+
+def test_publish_fetches_ci_logs_from_details_url(
+    gh_mock, fake_redis_client, label_config,
+):
+    """When a check has a detailsUrl with a run_id, logs are fetched and
+    included in the prompt."""
+    _setup_gh_defaults(gh_mock)
+    sample_logs = "Step 4/5\nERROR: pytest FAILED test_foo.py::test_bar"
+    gh_mock.get_failed_run_logs.return_value = sample_logs
+
+    ci_failures = _make_ci_failures_with_urls(
+        run_ids=[77001], names=["tests"]
+    )
+    pr_state = _make_pr_state(number=50, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        default_runner="claude",
+    )
+
+    # Verify get_failed_run_logs was called with the correct run ID
+    gh_mock.get_failed_run_logs.assert_called_once_with(
+        "test-org/test-repo", 77001, "fake-token"
+    )
+    # Log content should appear in the prompt
+    assert "pytest FAILED test_foo.py::test_bar" in task.prompt
+    # Check that the log section header is present
+    assert "Log output for tests" in task.prompt
+
+
+def test_publish_deduplicates_run_log_fetches(
+    gh_mock, fake_redis_client, label_config,
+):
+    """Two checks sharing the same run_id only trigger one log fetch."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "some log output"
+
+    # Two checks, same run_id
+    ci_failures = _make_ci_failures_with_urls(
+        run_ids=[55555, 55555], names=["lint", "typecheck"]
+    )
+    pr_state = _make_pr_state(number=51, ci_failures=ci_failures)
+
+    publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        default_runner="claude",
+    )
+
+    # Should only fetch once despite two checks
+    gh_mock.get_failed_run_logs.assert_called_once_with(
+        "test-org/test-repo", 55555, "fake-token"
+    )
+
+
+def test_publish_graceful_on_log_fetch_failure(
+    gh_mock, fake_redis_client, label_config,
+):
+    """If log fetching raises an exception, task creation still succeeds."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.side_effect = GhCliError(
+        "gh command failed (exit 1): not found", stderr="not found"
+    )
+
+    ci_failures = _make_ci_failures_with_urls(
+        run_ids=[99999], names=["tests"]
+    )
+    pr_state = _make_pr_state(number=52, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        default_runner="claude",
+    )
+
+    # Task should still be created despite log fetch failure
+    assert isinstance(task, Task)
+    assert task.resource_id == 52
+    # The check name should still appear in the prompt
+    assert "tests" in task.prompt
+
+
+def test_publish_handles_non_github_actions_url(
+    gh_mock, fake_redis_client, label_config,
+):
+    """Third-party CI URLs (no run_id) don't trigger log fetching."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = ""
+
+    # run_id=None produces a non-GitHub-Actions URL
+    ci_failures = _make_ci_failures_with_urls(
+        run_ids=[None], names=["circleci/build"]
+    )
+    pr_state = _make_pr_state(number=53, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        default_runner="claude",
+    )
+
+    # get_failed_run_logs should NOT be called for non-GitHub-Actions URLs
+    gh_mock.get_failed_run_logs.assert_not_called()
+    # Task should still be created
+    assert isinstance(task, Task)
+    assert "circleci/build" in task.prompt
+
+
+def test_prompt_truncates_long_ci_logs(
+    gh_mock, fake_redis_client, label_config,
+):
+    """CI logs longer than 5000 chars are truncated to the last 5000."""
+    _setup_gh_defaults(gh_mock)
+    # Create a log that's well over the per-check limit
+    long_log = "x" * 3000 + "REAL_ERROR_AT_END" + "y" * 3000
+    gh_mock.get_failed_run_logs.return_value = long_log
+
+    ci_failures = _make_ci_failures_with_urls(
+        run_ids=[88888], names=["tests"]
+    )
+    pr_state = _make_pr_state(number=54, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        default_runner="claude",
+    )
+
+    # The full log (6017 chars) should NOT appear verbatim
+    assert long_log not in task.prompt
+    # The end of the log (where errors are) should be present
+    assert "REAL_ERROR_AT_END" in task.prompt
+    assert "y" * 3000 in task.prompt
+    # Truncation indicator should appear
+    assert "truncated" in task.prompt

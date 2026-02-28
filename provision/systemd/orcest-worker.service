@@ -1,6 +1,8 @@
 [Unit]
 Description=Orcest Worker
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -9,6 +11,8 @@ WorkingDirectory=/opt/orcest
 ExecStart=/usr/local/bin/orcest work --id %H --config /opt/orcest/worker.yaml
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=120
+MemoryMax=4G
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/orcest/.env
 
