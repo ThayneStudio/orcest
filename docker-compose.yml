@@ -15,7 +15,7 @@ services:
     volumes:
       - ./config:/app/config:ro
     environment:
-      - ORCEST_CONFIG=/app/config/orchestrator.yaml
+      - GITHUB_TOKEN
     restart: unless-stopped
 
 volumes:

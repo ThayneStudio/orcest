@@ -13,6 +13,9 @@ polling:
   # Seconds between GitHub polling cycles
   interval: 60
 
+# Default runner backend for new tasks
+default_runner: "claude"
+
 labels:
   queued: "orcest:queued"
   in_progress: "orcest:in-progress"

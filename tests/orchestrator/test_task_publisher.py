@@ -5,7 +5,7 @@ side effects, and prompt diff truncation.
 """
 
 from orcest.orchestrator.pr_ops import PRAction, PRState
-from orcest.orchestrator.task_publisher import TASKS_STREAM, publish_fix_task
+from orcest.orchestrator.task_publisher import publish_fix_task
 from orcest.shared.models import Task, TaskType
 
 
@@ -46,6 +46,7 @@ def test_publish_creates_task(gh_mock, fake_redis_client, label_config):
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
+        default_runner="claude",
     )
 
     assert isinstance(task, Task)
@@ -68,10 +69,12 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client, label_config):
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
+        default_runner="claude",
     )
 
     # Read all entries from the tasks stream
-    entries = fake_redis_client.client.xrange(TASKS_STREAM)
+    default_runner = "claude"
+    entries = fake_redis_client.client.xrange(f"tasks:{default_runner}")
     assert len(entries) >= 1
 
     # The last entry should match our task
@@ -92,6 +95,7 @@ def test_publish_adds_label(gh_mock, fake_redis_client, label_config):
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
+        default_runner="claude",
     )
 
     gh_mock.add_label.assert_called_once_with(
@@ -113,6 +117,7 @@ def test_publish_posts_comment(gh_mock, fake_redis_client, label_config):
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
+        default_runner="claude",
     )
 
     gh_mock.post_comment.assert_called_once()
@@ -139,6 +144,7 @@ def test_prompt_truncates_long_diff(gh_mock, fake_redis_client, label_config):
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
+        default_runner="claude",
     )
 
     # The full 15,000-char diff should NOT appear in the prompt

@@ -26,14 +26,17 @@ src/orcest/
 # Install in dev mode
 pip install -e ".[dev]"
 
-# Run tests
-pytest
+# Run all tests (starts Redis via Docker, runs everything, stops Redis)
+make test
+
+# Run unit tests only (no Redis needed)
+make test-unit
 
 # Lint
-ruff check src/
+make lint
 
 # Format
-ruff format src/
+make format
 ```
 
 ## Conventions
