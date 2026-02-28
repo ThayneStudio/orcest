@@ -12,6 +12,7 @@ import redis
 from orcest.shared.coordination import RedisLock, make_pr_lock_key
 from orcest.shared.models import ResultStatus, Task, TaskResult
 from orcest.shared.redis_client import RedisClient
+from orcest.worker.heartbeat import Heartbeat
 
 
 def simulate_worker(
@@ -55,33 +56,38 @@ def simulate_worker(
             redis_client.xack(tasks_stream, consumer_group, entry_id)
             continue
 
-        time.sleep(work_duration)
+        heartbeat = Heartbeat(pr_lock, interval=pr_lock.ttl / 3)
+        heartbeat.start()
 
-        with dict_lock:
-            if task.id in tasks_processed:
-                errors.append(
-                    f"DUPLICATE: task {task.id} processed by both "
-                    f"{tasks_processed[task.id]} and {worker_id}"
-                )
-            tasks_processed[task.id] = worker_id
-
-        result = TaskResult(
-            task_id=task.id,
-            worker_id=worker_id,
-            status=ResultStatus.COMPLETED,
-            resource_type=task.resource_type,
-            resource_id=task.resource_id,
-            branch=task.branch,
-            summary="no-op",
-            duration_seconds=0,
-        )
         try:
-            redis_client.xadd(results_stream, result.to_dict())
-        except Exception as exc:
-            errors.append(f"Worker {worker_id} failed to publish result: {exc}")
+            time.sleep(work_duration)
+
+            with dict_lock:
+                if task.id in tasks_processed:
+                    errors.append(
+                        f"DUPLICATE: task {task.id} processed by both "
+                        f"{tasks_processed[task.id]} and {worker_id}"
+                    )
+                tasks_processed[task.id] = worker_id
+
+            result = TaskResult(
+                task_id=task.id,
+                worker_id=worker_id,
+                status=ResultStatus.COMPLETED,
+                resource_type=task.resource_type,
+                resource_id=task.resource_id,
+                branch=task.branch,
+                summary="no-op",
+                duration_seconds=0,
+            )
+            try:
+                redis_client.xadd(results_stream, result.to_dict())
+            except Exception as exc:
+                errors.append(
+                    f"Worker {worker_id} failed to publish result: {exc}"
+                )
+                continue
+        finally:
+            heartbeat.stop()
             redis_client.xack(tasks_stream, consumer_group, entry_id)
             pr_lock.release()
-            continue
-
-        redis_client.xack(tasks_stream, consumer_group, entry_id)
-        pr_lock.release()

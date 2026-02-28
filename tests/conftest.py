@@ -9,12 +9,12 @@ import pytest
 import redis
 
 from orcest.shared.config import (
-    ClaudeConfig,
     GithubConfig,
     LabelConfig,
     OrchestratorConfig,
     PollingConfig,
     RedisConfig,
+    RunnerConfig,
     WorkerConfig,
 )
 from orcest.shared.models import Task, TaskType
@@ -109,7 +109,7 @@ def worker_config(redis_config):
         redis=redis_config,
         worker_id="test-worker-0",
         workspace_dir="/tmp/orcest-test-workspaces",
-        claude=ClaudeConfig(timeout=10, max_retries=1, retry_backoff=0),
+        runner=RunnerConfig(timeout=10, max_retries=1, retry_backoff=0),
     )
 
 

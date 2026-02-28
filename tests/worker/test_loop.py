@@ -8,16 +8,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from orcest.shared.config import ClaudeConfig, RedisConfig, WorkerConfig
+from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
-from orcest.worker.claude_runner import ClaudeResult
 from orcest.worker.loop import (
     CONSUMER_GROUP,
     RESULTS_STREAM,
-    TASKS_STREAM,
     _execute_task,
     run_worker,
 )
+from orcest.worker.runner import RunnerResult
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures local to this module
@@ -31,7 +30,7 @@ def local_worker_config(tmp_path):
         redis=RedisConfig(host="localhost", port=6379, db=0),
         worker_id="test-worker-1",
         workspace_dir=str(tmp_path / "workspaces"),
-        claude=ClaudeConfig(timeout=10, max_retries=1, retry_backoff=0),
+        runner=RunnerConfig(timeout=10, max_retries=1, retry_backoff=0),
     )
 
 
@@ -41,7 +40,7 @@ def sample_task():
     return Task.create(
         task_type=TaskType.FIX_PR,
         repo="owner/repo",
-        token="ghp_fake_token",
+        token="test-token-loop",
         resource_type="pr",
         resource_id=42,
         prompt="Fix the failing CI checks",
@@ -58,22 +57,12 @@ def mock_workspace(mocker):
     return ws
 
 
-def _success_claude_result() -> ClaudeResult:
-    return ClaudeResult(
-        success=True,
-        summary="All checks fixed",
-        duration_seconds=5,
-        raw_output="{}",
-    )
+def _success_runner_result() -> RunnerResult:
+    return RunnerResult(success=True, summary="All checks fixed")
 
 
-def _failure_claude_result() -> ClaudeResult:
-    return ClaudeResult(
-        success=False,
-        summary="Could not resolve merge conflict",
-        duration_seconds=3,
-        raw_output="{}",
-    )
+def _failure_runner_result() -> RunnerResult:
+    return RunnerResult(success=False, summary="Could not resolve merge conflict")
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +74,13 @@ def _failure_claude_result() -> ClaudeResult:
 class TestExecuteTask:
     """Tests for the _execute_task internal helper."""
 
-    def test_worker_processes_task(self, mocker, local_worker_config, sample_task, mock_workspace):
-        """_execute_task returns a COMPLETED TaskResult on Claude success."""
-        mocker.patch(
-            "orcest.worker.loop.run_claude",
-            return_value=_success_claude_result(),
-        )
+    def test_worker_processes_task(self, local_worker_config, sample_task, mock_workspace):
+        """_execute_task returns a COMPLETED TaskResult on runner success."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _success_runner_result()
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_workspace, logging.getLogger("test")
+            sample_task, local_worker_config, mock_runner, mock_workspace, logging.getLogger("test")
         )
 
         assert isinstance(result, TaskResult)
@@ -108,17 +95,15 @@ class TestExecuteTask:
         )
         mock_workspace.cleanup.assert_called_once()
 
-    def test_worker_handles_claude_failure(
-        self, mocker, local_worker_config, sample_task, mock_workspace
+    def test_worker_handles_runner_failure(
+        self, local_worker_config, sample_task, mock_workspace
     ):
-        """_execute_task returns a FAILED TaskResult when Claude fails."""
-        mocker.patch(
-            "orcest.worker.loop.run_claude",
-            return_value=_failure_claude_result(),
-        )
+        """_execute_task returns a FAILED TaskResult when the runner fails."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _failure_runner_result()
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_workspace, logging.getLogger("test")
+            sample_task, local_worker_config, mock_runner, mock_workspace, logging.getLogger("test")
         )
 
         assert result.status == ResultStatus.FAILED
@@ -126,19 +111,16 @@ class TestExecuteTask:
         assert "merge conflict" in result.summary.lower()
 
     def test_worker_handles_usage_exhaustion(
-        self, mocker, local_worker_config, sample_task, mock_workspace
+        self, local_worker_config, sample_task, mock_workspace
     ):
-        """_execute_task returns USAGE_EXHAUSTED when Claude reports limits."""
-        exhausted = ClaudeResult(
-            success=False,
-            summary="Claude usage limit reached",
-            duration_seconds=1,
-            raw_output="",
+        """_execute_task returns USAGE_EXHAUSTED when the runner reports limits."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = RunnerResult(
+            success=False, summary="limit reached", usage_exhausted=True
         )
-        mocker.patch("orcest.worker.loop.run_claude", return_value=exhausted)
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_workspace, logging.getLogger("test")
+            sample_task, local_worker_config, mock_runner, mock_workspace, logging.getLogger("test")
         )
 
         assert result.status == ResultStatus.USAGE_EXHAUSTED
@@ -148,9 +130,10 @@ class TestExecuteTask:
     ):
         """If workspace.setup() raises, the result is FAILED and cleanup runs."""
         mock_workspace.setup.side_effect = RuntimeError("clone failed")
+        mock_runner = MagicMock()
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_workspace, logging.getLogger("test")
+            sample_task, local_worker_config, mock_runner, mock_workspace, logging.getLogger("test")
         )
 
         assert result.status == ResultStatus.FAILED
@@ -167,7 +150,7 @@ class TestExecuteTask:
 class TestRunWorker:
     """Integration-level tests for the run_worker main loop.
 
-    These tests mock Redis, Workspace, and run_claude to verify the
+    These tests mock Redis, Workspace, and the runner to verify the
     loop's orchestration logic: stream reading, locking, result
     publishing, and ACK handling.
     """
@@ -223,12 +206,13 @@ class TestRunWorker:
 
         mocker.patch("orcest.worker.loop.signal.signal", side_effect=fake_signal)
 
-        # Patch run_claude
-        mock_run_claude = mocker.patch("orcest.worker.loop.run_claude")
+        # Patch create_runner to return a mock runner
+        mock_runner = MagicMock()
+        mocker.patch("orcest.worker.loop.create_runner", return_value=mock_runner)
 
         return {
             "workspace": mock_ws,
-            "run_claude": mock_run_claude,
+            "runner": mock_runner,
             "signal_handlers": signal_handlers,
         }
 
@@ -256,13 +240,13 @@ class TestRunWorker:
         """run_worker reads a task from the stream, executes it, and publishes."""
         mock_redis = self._build_mock_redis(mocker, sample_task)
         mocks = self._setup_run_worker(mocker, worker_config, sample_task, mock_redis)
-        mocks["run_claude"].return_value = _success_claude_result()
+        mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
 
-        # Verify run_claude was called
-        mocks["run_claude"].assert_called_once()
+        # Verify runner was called
+        mocks["runner"].run.assert_called_once()
         # Verify result was published to the results stream
         mock_redis.xadd.assert_called_once()
         call_args = mock_redis.xadd.call_args
@@ -275,7 +259,7 @@ class TestRunWorker:
         """run_worker acquires a Redis lock keyed by the task's resource_id."""
         mock_redis = self._build_mock_redis(mocker, sample_task)
         mocks = self._setup_run_worker(mocker, worker_config, sample_task, mock_redis)
-        mocks["run_claude"].return_value = _success_claude_result()
+        mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
@@ -286,10 +270,10 @@ class TestRunWorker:
         lock_key = set_call[0][0]
         assert lock_key == f"lock:pr:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
-        assert set_call[1]["ex"] == worker_config.claude.timeout + 60
+        assert set_call[1]["ex"] == worker_config.runner.timeout + 60
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
-        """When the lock is already held, run_claude is NOT called and the
+        """When the lock is already held, the runner is NOT called and the
         task is ACKed so it is not redelivered.
         """
         mock_redis = self._build_mock_redis(mocker, sample_task)
@@ -302,10 +286,13 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        # run_claude should NOT have been called
-        mocks["run_claude"].assert_not_called()
+        # runner should NOT have been called
+        mocks["runner"].run.assert_not_called()
         # The task must still be ACKed (to avoid redelivery)
-        mock_redis.xack.assert_called_once_with(TASKS_STREAM, CONSUMER_GROUP, "entry-1")
+        expected_stream = f"tasks:{worker_config.backend}"
+        mock_redis.xack.assert_called_once_with(
+            expected_stream, CONSUMER_GROUP, "entry-1"
+        )
         # No result should be published
         mock_redis.xadd.assert_not_called()
 
@@ -315,7 +302,7 @@ class TestRunWorker:
         """
         mock_redis = self._build_mock_redis(mocker, sample_task)
         mocks = self._setup_run_worker(mocker, worker_config, sample_task, mock_redis)
-        mocks["run_claude"].return_value = _success_claude_result()
+        mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
@@ -330,11 +317,11 @@ class TestRunWorker:
         assert parsed.worker_id == worker_config.worker_id
         assert parsed.resource_id == sample_task.resource_id
 
-    def test_worker_handles_claude_failure(self, mocker, worker_config, sample_task):
-        """When run_claude returns success=False, the result has FAILED status."""
+    def test_worker_handles_runner_failure(self, mocker, worker_config, sample_task):
+        """When the runner returns success=False, the result has FAILED status."""
         mock_redis = self._build_mock_redis(mocker, sample_task)
         mocks = self._setup_run_worker(mocker, worker_config, sample_task, mock_redis)
-        mocks["run_claude"].return_value = _failure_claude_result()
+        mocks["runner"].run.return_value = _failure_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
