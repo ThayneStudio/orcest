@@ -172,8 +172,17 @@ def publish_fix_task(
         if classification == CIFailureType.CODE:
             task_type = TaskType.FIX_CI
 
-    # Use review threads from pr_state (already populated by discover_actionable_prs)
-    review_threads = pr_state.review_threads if not pr_state.ci_failures else []
+    # Use review threads from pr_state (populated by discover_actionable_prs for
+    # CHANGES_REQUESTED). For CI failures, fetch inline review comments from the
+    # REST API since discover_actionable_prs does not populate review_threads there.
+    if pr_state.ci_failures:
+        try:
+            raw_inline = gh.get_pr_review_comments(repo, pr_state.number, token)
+            review_threads = _group_inline_comments(raw_inline)
+        except Exception:
+            review_threads = []
+    else:
+        review_threads = pr_state.review_threads
 
     # Render prompt
     prompt = _render_fix_prompt(
@@ -390,6 +399,25 @@ def _slugify(text: str, max_len: int = 40) -> str:
     """Convert text to a branch-name-safe slug."""
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:max_len].rstrip("-")
+
+
+def _group_inline_comments(comments: list[dict]) -> list[dict]:
+    """Group flat inline review comments by (path, line) into thread-like dicts.
+
+    Input dicts have keys: path, line, author, body (as returned by
+    gh.get_pr_review_comments). Output dicts match the format expected by
+    _render_review_threads: {path, line, comments: [{author, body}]}.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for c in comments:
+        key = (c.get("path", ""), c.get("line"))
+        if key not in groups:
+            groups[key] = []
+        groups[key].append({"author": c.get("author", ""), "body": c.get("body", "")})
+    return [
+        {"path": path, "line": line, "comments": thread_comments}
+        for (path, line), thread_comments in groups.items()
+    ]
 
 
 def _render_issue_prompt(
