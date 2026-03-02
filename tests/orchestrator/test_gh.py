@@ -527,6 +527,34 @@ def test_get_pr_malformed_json_raises(mocker):
 # ---------------------------------------------------------------------------
 
 
+def test_list_open_prs_custom_limit(mocker):
+    """list_open_prs passes the custom limit value to the gh CLI."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+    )
+    list_open_prs(REPO, TOKEN, limit=250)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--limit" in args_passed
+    limit_idx = args_passed.index("--limit")
+    assert args_passed[limit_idx + 1] == "250"
+
+
+def test_list_open_prs_default_limit(mocker):
+    """list_open_prs defaults to limit 100 when not specified."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+    )
+    list_open_prs(REPO, TOKEN)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--limit" in args_passed
+    limit_idx = args_passed.index("--limit")
+    assert args_passed[limit_idx + 1] == "100"
+
+
 def test_list_open_prs_malformed_json(mocker):
     """list_open_prs with invalid JSON stdout -> JSONDecodeError."""
     mocker.patch(
