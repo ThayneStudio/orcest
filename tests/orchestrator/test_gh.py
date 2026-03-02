@@ -925,9 +925,7 @@ def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
                                     "isResolved": False,
                                     "comments": {
                                         "pageInfo": {"hasNextPage": False},
-                                        "nodes": [
-                                            {"body": "Also fix", "author": {"login": "bob"}}
-                                        ],
+                                        "nodes": [{"body": "Also fix", "author": {"login": "bob"}}],
                                     },
                                 },
                             ],
