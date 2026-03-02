@@ -106,10 +106,15 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             lock_key = make_issue_lock_key(task.resource_id)
         else:
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
+        ttl = (
+            config.runner.timeout * config.runner.max_retries
+            + config.runner.retry_backoff * (config.runner.max_retries - 1)
+            + 120
+        )
         lock = RedisLock(
             redis,
             lock_key,
-            ttl=config.runner.timeout + 60,
+            ttl=ttl,
             owner=config.worker_id,
         )
 
