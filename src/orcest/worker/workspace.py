@@ -153,8 +153,11 @@ class Workspace:
         # Configure a credential helper so git push works via the
         # GITHUB_TOKEN env var (which the runner forwards to Claude).
         # This avoids storing the token in plaintext in .git/config.
-        _git_config(repo_dir, "credential.helper",
-                     "!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f")
+        _git_config(
+            repo_dir,
+            "credential.helper",
+            "!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f",
+        )
 
         # Set git identity so Claude's commits have a valid author.
         _git_config(repo_dir, "user.name", "orcest-bot")

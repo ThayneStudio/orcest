@@ -84,9 +84,7 @@ For each issue found:
 
 If a file looks correct, say so — don't invent issues. Be precise, not verbose.
 
-After reviewing and fixing all files, return:
-- A structured list of all issues found and fixed
-- Any issues you chose NOT to fix, with reasoning (e.g. architectural changes that need discussion)
+After reviewing and fixing all files, return a structured list of all issues found and fixed. If you encounter an issue that cannot be fixed (e.g., requires architectural changes or discussion), note it clearly with an explanation.
 ```
 
 ### 4. Present consolidated results
@@ -110,8 +108,8 @@ After all agents return, present a single summary:
 ### Minor Issues (fixed)
 - `file:line` — description — what was changed
 
-### Issues NOT fixed (need discussion)
-- `file:line` — description — why it was skipped
+### Issues requiring discussion (not fixed)
+- `file:line` — description — why it was not fixed
 
 ### Files with no issues
 - file1, file2, ...

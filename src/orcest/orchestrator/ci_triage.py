@@ -12,10 +12,11 @@ from enum import Enum
 
 class CIFailureType(str, Enum):
     """Classification of a CI failure."""
-    TRANSIENT = "transient"     # Network timeout, flaky test
-    CODE = "code"               # Lint error, test failure, type error
-    DEPENDENCY = "dependency"   # Pip/npm install failure
-    UNKNOWN = "unknown"         # Needs Claude classification (Phase 2)
+
+    TRANSIENT = "transient"  # Network timeout, flaky test
+    CODE = "code"  # Lint error, test failure, type error
+    DEPENDENCY = "dependency"  # Pip/npm install failure
+    UNKNOWN = "unknown"  # Needs Claude classification (Phase 2)
 
 
 # Pattern -> classification mapping

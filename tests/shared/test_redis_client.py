@@ -1,5 +1,7 @@
 """Tests for orcest.shared.redis_client using fakeredis."""
 
+import pytest
+
 # Tests use the fake_redis_client fixture from conftest.py
 
 
@@ -102,3 +104,243 @@ def test_close_is_idempotent(fake_redis_client):
     """Calling close() twice raises no error."""
     fake_redis_client.close()
     fake_redis_client.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests for xadd_capped and xread_after helpers
+# ---------------------------------------------------------------------------
+
+
+def test_xadd_capped_basic(fake_redis_client):
+    """xadd_capped adds entries that are readable."""
+    stream = "output:worker-1"
+    entry_id = fake_redis_client.xadd_capped(stream, {"line": "hello"})
+    assert isinstance(entry_id, str)
+    assert len(entry_id) > 0
+
+    # Entry should be in the stream
+    length = fake_redis_client.client.xlen(stream)
+    assert length == 1
+
+
+def test_xadd_capped_trims(fake_redis_client):
+    """xadd_capped trims the stream when it exceeds maxlen."""
+    stream = "output:worker-1"
+    maxlen = 10
+    for i in range(30):
+        fake_redis_client.xadd_capped(stream, {"line": f"line-{i}"}, maxlen=maxlen)
+
+    length = fake_redis_client.client.xlen(stream)
+    # With approximate trimming, length should be at or near maxlen.
+    # Assert both an upper bound (trimming happened) and that the stream
+    # is not empty (entries were added).
+    assert length <= maxlen + 5, f"expected at most ~{maxlen} entries, got {length}"
+    assert length >= 1, "stream should not be empty after 30 inserts"
+
+
+def test_xadd_capped_rejects_zero_maxlen(fake_redis_client):
+    """xadd_capped raises ValueError when maxlen is not positive."""
+    with pytest.raises(ValueError, match="maxlen must be positive"):
+        fake_redis_client.xadd_capped("output:worker-1", {"line": "x"}, maxlen=0)
+    with pytest.raises(ValueError, match="maxlen must be positive"):
+        fake_redis_client.xadd_capped("output:worker-1", {"line": "x"}, maxlen=-1)
+
+
+def test_xadd_capped_rejects_empty_fields(fake_redis_client):
+    """xadd_capped raises ValueError when fields is empty."""
+    with pytest.raises(ValueError, match="fields must be a non-empty dict"):
+        fake_redis_client.xadd_capped("output:worker-1", {})
+
+
+def test_xread_after_returns_new_entries(fake_redis_client):
+    """xread_after returns entries after the given ID."""
+    stream = "output:worker-1"
+
+    # Add some entries
+    id1 = fake_redis_client.xadd_capped(stream, {"line": "line-1"})
+    fake_redis_client.xadd_capped(stream, {"line": "line-2"})
+    id3 = fake_redis_client.xadd_capped(stream, {"line": "line-3"})
+
+    # Read all from beginning
+    entries = fake_redis_client.xread_after(stream, "0-0")
+    assert len(entries) == 3
+    assert entries[0][1]["line"] == "line-1"
+    assert entries[2][1]["line"] == "line-3"
+
+    # Read only entries after id1
+    entries = fake_redis_client.xread_after(stream, id1)
+    assert len(entries) == 2
+    assert entries[0][1]["line"] == "line-2"
+    assert entries[1][1]["line"] == "line-3"
+
+    # Read after id3 -> nothing new
+    entries = fake_redis_client.xread_after(stream, id3)
+    assert entries == []
+
+
+def test_xread_after_empty_stream(fake_redis_client):
+    """xread_after on nonexistent stream returns empty list."""
+    entries = fake_redis_client.xread_after("nonexistent-stream", "0-0")
+    assert entries == []
+
+
+def test_xread_after_rejects_zero_count(fake_redis_client):
+    """xread_after raises ValueError when count is not positive."""
+    with pytest.raises(ValueError, match="count must be positive"):
+        fake_redis_client.xread_after("output:worker-1", count=0)
+    with pytest.raises(ValueError, match="count must be positive"):
+        fake_redis_client.xread_after("output:worker-1", count=-1)
+
+
+def test_xread_after_returns_empty_on_connection_error(fake_redis_client, mocker, caplog):
+    """xread_after returns [] and logs a warning on ConnectionError."""
+    import logging
+
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xread",
+        side_effect=_redis.ConnectionError("connection lost"),
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
+        entries = fake_redis_client.xread_after("output:worker-1", "0-0")
+    assert entries == []
+    assert any("xread_after failed" in record.message for record in caplog.records)
+
+
+def test_xread_after_returns_empty_on_timeout_error(fake_redis_client, mocker, caplog):
+    """xread_after returns [] and logs a warning on TimeoutError."""
+    import logging
+
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xread",
+        side_effect=_redis.TimeoutError("read timed out"),
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
+        entries = fake_redis_client.xread_after("output:worker-1", "0-0")
+    assert entries == []
+    assert any("xread_after failed" in record.message for record in caplog.records)
+
+
+def test_xread_after_returns_empty_on_response_error(fake_redis_client, mocker, caplog):
+    """xread_after returns [] and logs a warning on ResponseError (e.g. WRONGTYPE)."""
+    import logging
+
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xread",
+        side_effect=_redis.ResponseError("WRONGTYPE Operation against a key"),
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
+        entries = fake_redis_client.xread_after("output:worker-1", "0-0")
+    assert entries == []
+    assert any("xread_after failed" in record.message for record in caplog.records)
+
+
+def test_xread_after_returns_empty_on_auth_error(fake_redis_client, mocker, caplog):
+    """xread_after returns [] and logs a warning on AuthenticationError."""
+    import logging
+
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xread",
+        side_effect=_redis.AuthenticationError("invalid password"),
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
+        entries = fake_redis_client.xread_after("output:worker-1", "0-0")
+    assert entries == []
+    assert any("xread_after failed" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Tests for health_check error handling
+# ---------------------------------------------------------------------------
+
+
+def test_health_check_connection_error(fake_redis_client, mocker):
+    """health_check returns False when ping() raises ConnectionError."""
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "ping",
+        side_effect=_redis.ConnectionError("refused"),
+    )
+    assert fake_redis_client.health_check() is False
+
+
+def test_health_check_timeout_error(fake_redis_client, mocker):
+    """health_check returns False when ping() raises TimeoutError."""
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "ping",
+        side_effect=_redis.TimeoutError("timed out"),
+    )
+    assert fake_redis_client.health_check() is False
+
+
+def test_health_check_auth_error(fake_redis_client, mocker):
+    """health_check returns False when ping() raises AuthenticationError."""
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "ping",
+        side_effect=_redis.AuthenticationError("invalid password"),
+    )
+    assert fake_redis_client.health_check() is False
+
+
+def test_health_check_response_error(fake_redis_client, mocker):
+    """health_check returns False when ping() raises ResponseError (e.g. NOPERM)."""
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "ping",
+        side_effect=_redis.ResponseError("NOPERM this user has no permissions"),
+    )
+    assert fake_redis_client.health_check() is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for ensure_consumer_group error handling
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
+    """Non-BUSYGROUP ResponseError from xgroup_create is re-raised."""
+    import redis as _redis
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xgroup_create",
+        side_effect=_redis.ResponseError("WRONGTYPE Operation against a key"),
+    )
+    with pytest.raises(_redis.ResponseError, match="WRONGTYPE"):
+        fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+
+# ---------------------------------------------------------------------------
+# Tests for xack edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_xack_nonexistent_entry_returns_zero(fake_redis_client):
+    """Acking an entry ID that doesn't exist returns 0."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    result = fake_redis_client.xack(stream, group, "9999999999999-0")
+    assert result == 0

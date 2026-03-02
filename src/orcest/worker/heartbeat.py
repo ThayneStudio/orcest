@@ -74,6 +74,5 @@ class Heartbeat:
                     self.logger.debug(f"Heartbeat: refreshed {self.lock.key}")
                 else:
                     self.logger.warning(
-                        f"Heartbeat: failed to refresh {self.lock.key} "
-                        f"(lock lost?)"
+                        f"Heartbeat: failed to refresh {self.lock.key} (lock lost?)"
                     )

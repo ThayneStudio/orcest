@@ -214,9 +214,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     redis_config = _build_redis_config(raw)
 
     # Worker-level fields
-    worker_id = str(
-        os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0"))
-    )
+    worker_id = str(os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0")))
     workspace_dir = str(
         os.environ.get("ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces"))
     )
