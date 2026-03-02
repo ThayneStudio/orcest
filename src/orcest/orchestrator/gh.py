@@ -465,6 +465,49 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     return results
 
 
+def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
+    """Get inline review comments for a PR.
+
+    Uses the /pulls/{number}/comments REST endpoint to fetch line-specific
+    review comments left by reviewers. Unlike get_unresolved_review_threads,
+    this returns all inline comments (not just unresolved ones) and uses the
+    REST API rather than GraphQL.
+
+    Returns list of dicts with keys: path, line, author, body.
+    """
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "api",
+            f"repos/{repo}/pulls/{number}/comments",
+            "-F",
+            "per_page=100",  # max single-page fetch; 100+ comments silently truncated
+        ],
+        token,
+    )
+    if not output:
+        return []
+    comments = json.loads(output)
+    if len(comments) == 100:
+        logging.getLogger(__name__).warning(
+            "get_pr_review_comments: received exactly 100 comments for PR #%s/%s; "
+            "results may be truncated (pagination not implemented)",
+            repo,
+            number,
+        )
+    results = []
+    for comment in comments:
+        results.append(
+            {
+                "path": comment.get("path", ""),
+                "line": comment.get("line") or comment.get("original_line"),
+                "author": (comment.get("user") or {}).get("login", ""),
+                "body": comment.get("body", ""),
+            }
+        )
+    return results
+
+
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
     """List open issues with a specific label.
 
