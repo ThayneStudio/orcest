@@ -473,28 +473,35 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
     this returns all inline comments (not just unresolved ones) and uses the
     REST API rather than GraphQL.
 
+    Fetches all pages of results using --paginate.
+
     Returns list of dicts with keys: path, line, author, body.
     """
     _validate_repo(repo)
     output = _run_gh(
         [
             "api",
+            "--paginate",
             f"repos/{repo}/pulls/{number}/comments",
             "-F",
-            "per_page=100",  # max single-page fetch; 100+ comments silently truncated
+            "per_page=100",  # fetch 100 per page for efficiency
         ],
         token,
     )
     if not output:
         return []
-    comments = json.loads(output)
-    if len(comments) == 100:
-        logging.getLogger(__name__).warning(
-            "get_pr_review_comments: received exactly 100 comments for PR #%s/%s; "
-            "results may be truncated (pagination not implemented)",
-            repo,
-            number,
-        )
+    # --paginate concatenates one JSON array per page: [page1][page2]...
+    # Parse all pages and flatten into a single list.
+    comments: list[dict] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    text = output.strip()
+    while idx < len(text):
+        page, end_idx = decoder.raw_decode(text, idx)
+        comments.extend(page)
+        idx = end_idx
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
     results = []
     for comment in comments:
         results.append(
