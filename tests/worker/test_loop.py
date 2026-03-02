@@ -484,7 +484,13 @@ class TestRunWorker:
         lock_key = set_call[0][0]
         assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
-        assert set_call[1]["ex"] == worker_config.runner.timeout + 60
+        runner = worker_config.runner
+        expected_ttl = (
+            runner.timeout * runner.max_retries
+            + runner.retry_backoff * (runner.max_retries - 1)
+            + 120
+        )
+        assert set_call[1]["ex"] == expected_ttl
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
