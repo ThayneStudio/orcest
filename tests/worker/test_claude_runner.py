@@ -676,6 +676,32 @@ def test_extract_summary_result_key():
     assert result == "Task completed successfully"
 
 
+@pytest.mark.unit
+def test_extract_summary_multi_result_returns_last():
+    """Multi-result stream -> last top-level 'result' value is returned.
+
+    Regression test for the fix in PR #59: _extract_summary must scan all
+    lines and return the *last* result object, not the first one encountered.
+    """
+    lines = [
+        json.dumps({"result": "intermediate result"}) + "\n",
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "some assistant text"}],
+                },
+            }
+        )
+        + "\n",
+        json.dumps({"result": "final summary"}) + "\n",
+    ]
+    output = "".join(lines)
+    result = _extract_summary(output)
+    assert result == "final summary"
+
+
 # ---------------------------------------------------------------------------
 # _extract_summary: multi-result stream -> last result wins (regression #111)
 # ---------------------------------------------------------------------------
