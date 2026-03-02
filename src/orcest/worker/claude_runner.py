@@ -8,6 +8,7 @@ Timeouts and usage exhaustion are NOT retried.
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -22,11 +23,18 @@ from orcest.worker.runner import RunnerResult
 # Checked against stderr only (case-insensitive).
 _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
     ("usage", "limit"),
-    ("rate", "limit"),
     ("quota", "exceeded"),
     ("token limit", ""),
     ("billing", "limit"),
 ]
+
+# Anchored regex for rate-limit errors: requires the error indicator to appear
+# at end of a line so that user-authored code mentioning "rate limit" in its
+# output (stdout) does not trigger a false positive if ever passed here.
+_RATE_LIMIT_RE = re.compile(
+    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Environment variables that are safe to forward to the Claude subprocess.
 # We use an allowlist rather than os.environ.copy() to avoid leaking secrets
@@ -98,6 +106,8 @@ def _is_usage_exhausted(stderr: str) -> bool:
     tokens, or billing (e.g. implementing a rate-limiter or auth system).
     Returns True if any pattern matches.
     """
+    if _RATE_LIMIT_RE.search(stderr):
+        return True
     text = stderr.lower()
     for primary, secondary in _USAGE_EXHAUSTION_PATTERNS:
         # When secondary is empty, only the primary keyword is required.
