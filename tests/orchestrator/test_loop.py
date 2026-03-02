@@ -163,6 +163,7 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
         orchestrator_config.github.repo,
         40,
         orchestrator_config.github.token,
+        delete_branch=orchestrator_config.delete_branch_on_merge,
     )
     # On successful merge, should post a confirmation comment
     gh_mock.post_comment.assert_called_once()
@@ -540,6 +541,7 @@ def test_poll_cycle_merge_comment_failure_logged(
         orchestrator_config.github.repo,
         80,
         orchestrator_config.github.token,
+        delete_branch=orchestrator_config.delete_branch_on_merge,
     )
     # post_comment was attempted (and failed)
     gh_mock.post_comment.assert_called_once()

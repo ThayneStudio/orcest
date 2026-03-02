@@ -57,6 +57,7 @@ class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per PR before needs-human
+    delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
 
 
 @dataclass
@@ -182,6 +183,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
+    # Whether to delete the head branch after merging
+    delete_branch_on_merge = bool(raw.get("delete_branch_on_merge", True))
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -189,6 +193,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         labels=labels_config,
         default_runner=default_runner,
         max_attempts=max_attempts,
+        delete_branch_on_merge=delete_branch_on_merge,
     )
 
     # Validate required fields
