@@ -45,7 +45,7 @@ def simulate_worker(
         entry_id, fields = entries[0]
         task = Task.from_dict(fields)
 
-        lock_key = make_pr_lock_key(task.resource_id)
+        lock_key = make_pr_lock_key(task.repo, task.resource_id)
         pr_lock = RedisLock(redis_client, lock_key, ttl=60, owner=worker_id)
 
         if not pr_lock.acquire():
