@@ -112,6 +112,8 @@ def _status_once(redis):
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
+        except redis_lib.RedisError as e:
+            console.print(f"  [yellow]Could not read groups for {stream_key}: {e}[/yellow]")
 
     console.print("\n[bold]Orcest System Status[/bold]\n")
 
