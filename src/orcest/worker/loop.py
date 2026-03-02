@@ -130,8 +130,9 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         logger.info(f"Acquired lock {lock_key}")
 
-        # Start heartbeat
-        heartbeat = Heartbeat(lock, logger=logger)
+        # Start heartbeat; signal lock_lost if the lock cannot be refreshed
+        lock_lost = threading.Event()
+        heartbeat = Heartbeat(lock, logger=logger, on_lock_lost=lock_lost.set)
         heartbeat.start()
 
         try:
@@ -142,7 +143,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 workspace,
                 redis,
                 logger,
-                shutdown_event,
+                abort_event=lock_lost,
             )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
@@ -156,7 +157,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # Normal path: stop heartbeat and release lock
             heartbeat.stop()
             lock.release()
-            logger.info(f"Released lock {lock_key}")
+            if lock_lost.is_set():
+                logger.warning(
+                    f"Lock {lock_key} was lost during task execution; task aborted"
+                )
+            else:
+                logger.info(f"Released lock {lock_key}")
 
         # Publish result, then ACK only if publish succeeded.
         # If publish fails, leave the message pending so XPENDING recovery
@@ -190,7 +196,7 @@ def _execute_task(
     workspace: Workspace,
     redis: RedisClient,
     logger: logging.Logger,
-    shutdown_event: threading.Event | None = None,
+    abort_event: threading.Event | None = None,
 ) -> TaskResult:
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
@@ -239,7 +245,7 @@ def _execute_task(
             timeout=config.runner.timeout,
             logger=logger,
             on_output=on_output,
-            shutdown_event=shutdown_event,
+            abort_event=abort_event,
         )
 
         duration = int(time.monotonic() - start)
