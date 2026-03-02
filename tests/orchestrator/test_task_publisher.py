@@ -905,18 +905,18 @@ def test_publish_and_notify_xadd_failure(
     fake_redis_client,
     label_config,
 ):
-    """When redis.xadd raises (Redis down after task construction), the
+    """When redis.xadd_capped raises (Redis down after task construction), the
     exception should propagate."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=604)
 
-    # Sabotage xadd to simulate Redis failure
-    original_xadd = fake_redis_client.xadd
+    # Sabotage xadd_capped to simulate Redis failure
+    original_xadd_capped = fake_redis_client.xadd_capped
 
-    def broken_xadd(stream, fields):
+    def broken_xadd_capped(stream, fields, maxlen=2000):
         raise ConnectionError("Redis connection lost")
 
-    fake_redis_client.xadd = broken_xadd
+    fake_redis_client.xadd_capped = broken_xadd_capped
 
     try:
         with pytest.raises(ConnectionError, match="Redis connection lost"):
@@ -929,7 +929,7 @@ def test_publish_and_notify_xadd_failure(
                 default_runner="claude",
             )
     finally:
-        fake_redis_client.xadd = original_xadd
+        fake_redis_client.xadd_capped = original_xadd_capped
 
 
 def test_render_review_threads_missing_body():
