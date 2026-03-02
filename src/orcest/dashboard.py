@@ -2,7 +2,7 @@
 
 Provides a top-like full-screen terminal interface that auto-refreshes
 every few seconds, showing queue depths, active locks, consumer groups,
-and recent task results.
+and recent task results.  Press 'w' to view live worker output.
 
 Usage:
     orcest status          # launches the TUI
@@ -11,11 +11,13 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import redis as redis_lib
+from rich.markup import escape as rich_escape
 
 from orcest.shared.redis_client import RedisClient
 
@@ -74,6 +76,27 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
             fetched_at=datetime.now(timezone.utc),
         )
 
+    try:
+        return _fetch_snapshot_inner(redis, max_results)
+    except (
+        redis_lib.ConnectionError, redis_lib.TimeoutError,
+        redis_lib.AuthenticationError,
+    ):
+        logger.warning("Redis disconnected during snapshot fetch", exc_info=True)
+        return SystemSnapshot(
+            redis_ok=False,
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+
+def _fetch_snapshot_inner(
+    redis: RedisClient, max_results: int
+) -> SystemSnapshot:
+    """Build the snapshot after health_check has passed.
+
+    Separated from fetch_snapshot so the outer function can catch
+    connection-level errors that occur after the health check.
+    """
     client = redis.client
 
     # Queue depths
@@ -158,6 +181,90 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
     )
 
 
+def discover_workers(redis: RedisClient) -> list[str]:
+    """Return sorted list of worker IDs that have output streams."""
+    try:
+        client = redis.client
+        streams = list(client.scan_iter(match="output:*"))
+        return sorted(s.removeprefix("output:") for s in streams)
+    except (
+        redis_lib.ConnectionError, redis_lib.TimeoutError,
+        redis_lib.ResponseError, redis_lib.AuthenticationError,
+    ):
+        logger.warning("discover_workers failed", exc_info=True)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Output formatter — testable without Textual
+# ---------------------------------------------------------------------------
+
+
+def format_stream_json_line(line: str) -> str | None:
+    """Parse a Claude stream-json line into readable output.
+
+    Returns a formatted string for display, or None to skip the line.
+    Handles assistant text, tool use summaries, and task boundary markers.
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+
+    if not isinstance(obj, dict):
+        return None
+
+    # Task boundary markers (published by worker loop)
+    msg_type = obj.get("type")
+    if msg_type == "task_start":
+        resource = rich_escape(str(obj.get("resource", "?")))
+        task_id = rich_escape(str(obj.get("task_id", "?")))
+        return f"{'─' * 3} Task {task_id}: {resource} {'─' * 40}"
+    if msg_type == "task_end":
+        status = rich_escape(str(obj.get("status", "?")))
+        task_id = rich_escape(str(obj.get("task_id", "?")))
+        return f"{'─' * 3} End {task_id}: {status} {'─' * 42}"
+
+    # Assistant messages with content blocks
+    if obj.get("role") != "assistant" or not isinstance(obj.get("content"), list):
+        return None
+
+    parts: list[str] = []
+    for block in obj["content"]:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+
+        if block_type == "text":
+            text = block.get("text", "")
+            if text:
+                parts.append(rich_escape(text))
+
+        elif block_type == "tool_use":
+            name = str(block.get("name", "?"))
+            inp = block.get("input", {})
+            if not isinstance(inp, dict):
+                inp = {}
+            if name == "Bash":
+                cmd = str(inp.get("command", "?"))[:120]
+                parts.append(f"  $ {rich_escape(cmd)}")
+            elif name in ("Read", "Edit", "Write"):
+                path = rich_escape(str(inp.get("file_path", "?")))
+                parts.append(f"  {name} {path}")
+            elif name == "Glob":
+                parts.append(f"  Glob {rich_escape(str(inp.get('pattern', '?')))}")
+            elif name == "Grep":
+                parts.append(f"  Grep {rich_escape(str(inp.get('pattern', '?')))}")
+            else:
+                parts.append(f"  {rich_escape(name)}")
+
+    return "\n".join(parts) if parts else None
+
+
 # ---------------------------------------------------------------------------
 # TUI layer
 # ---------------------------------------------------------------------------
@@ -165,6 +272,8 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
 
 def _format_ttl(seconds: int) -> str:
     """Format TTL seconds into human-readable string."""
+    if seconds == -1:
+        return "no TTL"
     if seconds < 0:
         return "expired"
     if seconds < 60:
@@ -180,11 +289,17 @@ def _format_ttl(seconds: int) -> str:
 
 def _format_duration(seconds: int) -> str:
     """Format duration seconds into human-readable string."""
+    if seconds < 0:
+        seconds = 0
     if seconds < 60:
         return f"{seconds}s"
     minutes = seconds // 60
     secs = seconds % 60
-    return f"{minutes}m {secs}s"
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m"
 
 
 def _status_style(status: str) -> str:
@@ -203,9 +318,10 @@ def _status_style(status: str) -> str:
 
 def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
     """Launch the Textual TUI dashboard."""
+    from rich.text import Text
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
-    from textual.widgets import DataTable, Footer, Header, Static
+    from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
     class OrcestDashboard(App):
         """Live TUI dashboard for orcest system monitoring."""
@@ -239,25 +355,64 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             height: 1fr;
             max-height: 100%;
         }
+        #overview-container {
+            height: 1fr;
+        }
+        #worker-container {
+            height: 1fr;
+            display: none;
+        }
+        #worker-container.visible {
+            display: block;
+        }
+        #overview-container.hidden {
+            display: none;
+        }
+        #worker-header {
+            height: 1;
+            background: $primary;
+            color: $text;
+            padding: 0 1;
+        }
+        #worker-log {
+            height: 1fr;
+            margin: 0 1;
+        }
         """
 
         BINDINGS = [
             ("q", "quit", "Quit"),
             ("r", "refresh", "Refresh"),
+            ("w", "toggle_worker", "Worker output"),
+            ("escape", "back_to_overview", "Back"),
         ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._worker_view = False
+            self._worker_ids: list[str] = []
+            self._worker_idx = 0
+            self._current_worker_id: str | None = None
+            self._last_ids: dict[str, str] = {}
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             yield Static("", id="health-bar")
-            with VerticalScroll():
+            with VerticalScroll(id="overview-container"):
                 yield Static("Queue Depths", classes="section-title")
                 yield DataTable(id="queues-table")
                 yield Static("Active Locks", classes="section-title")
                 yield DataTable(id="locks-table")
-                yield Static("Workers (Consumer Groups)", classes="section-title")
+                yield Static(
+                    "Workers (Consumer Groups)",
+                    classes="section-title",
+                )
                 yield DataTable(id="groups-table")
                 yield Static("Recent Results", classes="section-title")
                 yield DataTable(id="results-table")
+            with VerticalScroll(id="worker-container"):
+                yield Static("", id="worker-header")
+                yield RichLog(id="worker-log", wrap=True, markup=True)
             yield Footer()
 
         def on_mount(self) -> None:
@@ -271,12 +426,30 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             groups.add_columns("Stream", "Group", "Consumers", "Pending")
 
             results = self.query_one("#results-table", DataTable)
-            results.add_columns("Status", "Type", "Resource", "Worker", "Duration", "Summary")
+            results.add_columns(
+                "Status", "Type", "Resource",
+                "Worker", "Duration", "Summary",
+            )
 
             self._update_display()
             self.set_interval(refresh_interval, self._update_display)
 
         def _update_display(self) -> None:
+            # In worker view, skip the full snapshot (avoids unnecessary
+            # scan_iter / xlen / xrevrange calls) and only health-check.
+            if self._worker_view:
+                redis_ok = redis.health_check()
+                health = self.query_one("#health-bar", Static)
+                if redis_ok:
+                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                    health.update(f" REDIS OK | Refreshed {ts}")
+                    health.remove_class("disconnected")
+                    self._update_worker_output()
+                else:
+                    health.update(" REDIS DISCONNECTED")
+                    health.add_class("disconnected")
+                return
+
             snapshot = fetch_snapshot(redis)
 
             # Health bar
@@ -290,6 +463,9 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 health.add_class("disconnected")
                 return
 
+            self._update_overview(snapshot)
+
+        def _update_overview(self, snapshot: SystemSnapshot) -> None:
             # Queue depths
             queues = self.query_one("#queues-table", DataTable)
             queues.clear()
@@ -305,7 +481,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if snapshot.locks:
                 for lock in snapshot.locks:
                     locks_table.add_row(
-                        f"#{lock.pr}", lock.owner, _format_ttl(lock.ttl)
+                        f"#{lock.pr}", lock.owner,
+                        _format_ttl(lock.ttl),
                     )
             else:
                 locks_table.add_row("--", "No active locks", "--")
@@ -316,7 +493,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if snapshot.consumer_groups:
                 for g in snapshot.consumer_groups:
                     groups_table.add_row(
-                        g.stream, g.name, str(g.consumers), str(g.pending)
+                        g.stream, g.name,
+                        str(g.consumers), str(g.pending),
                     )
             else:
                 groups_table.add_row("--", "No groups", "--", "--")
@@ -326,9 +504,13 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             results_table.clear()
             if snapshot.recent_results:
                 for r in snapshot.recent_results:
-                    summary = (r.summary[:80] + "...") if len(r.summary) > 80 else r.summary
+                    summary = (
+                        (r.summary[:80] + "...")
+                        if len(r.summary) > 80
+                        else r.summary
+                    )
                     results_table.add_row(
-                        r.status.upper(),
+                        Text(r.status.upper(), style=_status_style(r.status)),
                         r.resource_type,
                         f"#{r.resource_id}",
                         r.worker_id,
@@ -336,7 +518,129 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                         summary,
                     )
             else:
-                results_table.add_row("--", "--", "--", "--", "--", "No results yet")
+                results_table.add_row(
+                    "--", "--", "--", "--", "--", "No results yet",
+                )
+
+        def _update_worker_output(self) -> None:
+            """Read new output entries from the current worker's stream."""
+            if not self._worker_ids:
+                return
+            if self._worker_idx >= len(self._worker_ids):
+                self._worker_idx = 0
+                self._current_worker_id = self._worker_ids[0]
+                # Update header so the displayed worker name matches
+                self._update_worker_header()
+
+            worker_id = self._worker_ids[self._worker_idx]
+            stream = f"output:{worker_id}"
+            last_id = self._last_ids.get(worker_id, "0-0")
+
+            # xread_after already catches Redis errors internally and
+            # returns [].  No outer try/except needed here.
+            entries = redis.xread_after(stream, last_id)
+            if not entries:
+                return
+
+            log = self.query_one("#worker-log", RichLog)
+            for entry_id, fields in entries:
+                self._last_ids[worker_id] = entry_id
+                # Task boundary markers have "type" field
+                if "type" in fields:
+                    line_data = json.dumps(fields)
+                else:
+                    line_data = fields.get("line", "")
+                formatted = format_stream_json_line(line_data)
+                if formatted:
+                    log.write(formatted)
+
+        def _update_worker_header(self) -> None:
+            """Refresh the worker-header label to match current index."""
+            if self._worker_ids and self._worker_idx < len(self._worker_ids):
+                wid = rich_escape(self._worker_ids[self._worker_idx])
+                header = self.query_one("#worker-header", Static)
+                idx = self._worker_idx + 1
+                total = len(self._worker_ids)
+                header.update(
+                    f" Worker: {wid} ({idx}/{total})"
+                    " | w: next worker | Escape: back"
+                )
+
+        def _show_worker_view(self) -> None:
+            """Switch to worker output view."""
+            self._worker_view = True
+            overview = self.query_one("#overview-container")
+            overview.add_class("hidden")
+            worker = self.query_one("#worker-container")
+            worker.add_class("visible")
+            self._update_worker_header()
+
+        def _show_overview(self) -> None:
+            """Switch back to overview."""
+            self._worker_view = False
+            overview = self.query_one("#overview-container")
+            overview.remove_class("hidden")
+            worker = self.query_one("#worker-container")
+            worker.remove_class("visible")
+
+        def _resolve_worker_index(self) -> None:
+            """Set _worker_idx from _current_worker_id.
+
+            If the previously selected worker disappeared from the
+            refreshed list, fall back to index 0 and update
+            _current_worker_id to stay consistent.
+            """
+            if (
+                self._current_worker_id is not None
+                and self._current_worker_id in self._worker_ids
+            ):
+                self._worker_idx = self._worker_ids.index(
+                    self._current_worker_id
+                )
+            else:
+                self._worker_idx = 0
+                self._current_worker_id = (
+                    self._worker_ids[0] if self._worker_ids else None
+                )
+
+        def action_toggle_worker(self) -> None:
+            """Toggle into worker view or cycle to next worker."""
+            # Refresh worker list
+            self._worker_ids = discover_workers(redis)
+            if not self._worker_ids:
+                return  # No workers with output
+
+            if self._worker_view:
+                # Resolve current position after refresh
+                self._resolve_worker_index()
+                prev_worker = self._current_worker_id
+                # Cycle to next worker
+                self._worker_idx = (
+                    (self._worker_idx + 1) % len(self._worker_ids)
+                )
+                self._current_worker_id = self._worker_ids[self._worker_idx]
+                if self._current_worker_id != prev_worker:
+                    # Clear log for new worker
+                    log = self.query_one("#worker-log", RichLog)
+                    log.clear()
+                    # Reset cursor to stream start for this worker
+                    self._last_ids.pop(self._current_worker_id, None)
+                self._show_worker_view()
+                self._update_worker_output()
+            else:
+                # Enter worker view
+                self._worker_idx = 0
+                self._current_worker_id = self._worker_ids[self._worker_idx]
+                log = self.query_one("#worker-log", RichLog)
+                log.clear()
+                self._last_ids.pop(self._current_worker_id, None)
+                self._show_worker_view()
+                self._update_worker_output()
+
+        def action_back_to_overview(self) -> None:
+            if self._worker_view:
+                self._show_overview()
+                self._update_display()
 
         def action_refresh(self) -> None:
             self._update_display()

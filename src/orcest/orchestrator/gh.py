@@ -43,6 +43,9 @@ def _validate_repo(repo: str) -> None:
         )
 
 
+_GH_TIMEOUT_SECONDS = 120
+
+
 def _run_gh(args: list[str], token: str) -> str:
     """Execute a gh CLI command and return stdout.
 
@@ -64,11 +67,20 @@ def _run_gh(args: list[str], token: str) -> str:
             text=True,
             env=env,
             check=True,
+            timeout=_GH_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         raise GhNotInstalledError(
             "gh CLI not found on PATH. Install it from https://cli.github.com/"
         ) from None
+    except subprocess.TimeoutExpired as exc:
+        # Truncate args to avoid dumping entire GraphQL queries into logs
+        brief = " ".join(args[:4])
+        if len(args) > 4:
+            brief += " ..."
+        raise GhCliError(
+            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise GhCliError(
             f"gh command failed (exit {exc.returncode}): {exc.stderr.strip()}",
@@ -99,11 +111,20 @@ def _run_gh_bytes(args: list[str], token: str) -> bytes:
             capture_output=True,
             env=env,
             check=True,
+            timeout=_GH_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         raise GhNotInstalledError(
             "gh CLI not found on PATH. Install it from https://cli.github.com/"
         ) from None
+    except subprocess.TimeoutExpired as exc:
+        # Truncate args to avoid dumping entire GraphQL queries into logs
+        brief = " ".join(args[:4])
+        if len(args) > 4:
+            brief += " ..."
+        raise GhCliError(
+            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
+        ) from exc
     except subprocess.CalledProcessError as exc:
         stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
         raise GhCliError(
@@ -119,15 +140,15 @@ def list_open_prs(repo: str, token: str) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
-    author, createdAt, labels, reviewDecision.
+    headRefOid, isDraft, author, createdAt, labels, reviewDecision.
     """
     _validate_repo(repo)
     output = _run_gh([
         "pr", "list",
         "--repo", repo,
         "--state", "open",
-        "--json", "number,title,headRefName,headRefOid,author,createdAt,"
-                  "labels,reviewDecision",
+        "--json", "number,title,headRefName,headRefOid,isDraft,author,"
+                  "createdAt,labels,reviewDecision",
         "--limit", "100",
     ], token)
     return json.loads(output) if output else []
@@ -256,11 +277,181 @@ def post_comment(repo: str, number: int, body: str, token: str) -> None:
         ], token)
 
 
-def get_review_comments(repo: str, number: int, token: str) -> list[dict]:
-    """Get review comments on a PR."""
+_VALID_MERGE_METHODS = {"squash", "merge", "rebase"}
+
+
+def merge_pr(
+    repo: str, number: int, token: str, method: str = "squash"
+) -> None:
+    """Merge a PR. Raises GhCliError on failure."""
+    if method not in _VALID_MERGE_METHODS:
+        raise ValueError(
+            f"Invalid merge method: {method!r}. "
+            f"Must be one of {sorted(_VALID_MERGE_METHODS)}."
+        )
     _validate_repo(repo)
-    output = _run_gh([
-        "api",
-        f"repos/{repo}/pulls/{number}/reviews",
+    _run_gh([
+        "pr", "merge", str(number),
+        "--repo", repo,
+        f"--{method}",
+        "--delete-branch",
     ], token)
-    return json.loads(output) if output else []
+
+
+def get_unresolved_review_threads(
+    repo: str, number: int, token: str
+) -> list[dict]:
+    """Get unresolved review threads on a PR.
+
+    Uses the GitHub GraphQL API to fetch review threads and filters
+    to only those that are not yet resolved.
+
+    Returns list of dicts with keys: id, path, line, comments.
+    Each comment dict has keys: author, body.
+    """
+    _validate_repo(repo)
+    owner, name = repo.split("/", 1)
+
+    query = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          id
+          path
+          line
+          isResolved
+          comments(first: 10) {
+            pageInfo { hasNextPage }
+            nodes {
+              body
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+    output = _run_gh([
+        "api", "graphql",
+        "-f", f"owner={owner}",
+        "-f", f"repo={name}",
+        "-F", f"number={number}",
+        "-f", f"query={query}",
+    ], token)
+
+    if not output:
+        raise GhCliError(
+            f"GraphQL query returned empty response for PR #{number} in {repo}"
+        )
+
+    data = json.loads(output)
+
+    # GraphQL can return HTTP 200 with errors in the body. Raise so
+    # callers don't mistake a failed query for "no threads" (which
+    # could trigger an incorrect auto-merge).
+    if "errors" in data:
+        msgs = [e.get("message", str(e)) for e in data["errors"]]
+        raise GhCliError(
+            f"GraphQL errors fetching review threads: {'; '.join(msgs)}"
+        )
+
+    repo_data = (data.get("data") or {}).get("repository")
+    if not repo_data:
+        raise GhCliError(
+            f"GraphQL returned null repository for {repo!r} — "
+            "check that the repo exists and the token has access"
+        )
+    pr_node = repo_data.get("pullRequest")
+    if not pr_node:
+        raise GhCliError(
+            f"GraphQL returned null pullRequest for PR #{number} in {repo}"
+        )
+    review_threads = pr_node.get("reviewThreads") or {}
+    threads = review_threads.get("nodes") or []
+
+    # If there are more threads than our page size (100), we risk missing
+    # unresolved ones. Raise rather than silently returning an incomplete
+    # list, which could trigger an incorrect auto-merge.
+    page_info = review_threads.get("pageInfo") or {}
+    if page_info.get("hasNextPage"):
+        raise GhCliError(
+            f"PR #{number} in {repo} has more than 100 review threads; "
+            "pagination not implemented — cannot guarantee all unresolved "
+            "threads have been fetched"
+        )
+
+    results = []
+    for thread in threads:
+        if thread.get("isResolved"):
+            continue
+        comments_data = thread.get("comments") or {}
+        comment_page = comments_data.get("pageInfo") or {}
+        if comment_page.get("hasNextPage"):
+            thread_id = thread.get("id", "<unknown>")
+            logger.warning(
+                "Review thread %s has more than 10 comments; "
+                "later comments were not fetched",
+                thread_id,
+            )
+        comments = []
+        for comment in comments_data.get("nodes") or []:
+            author_info = comment.get("author") or {}
+            comments.append({
+                "author": author_info.get("login", ""),
+                "body": comment.get("body", ""),
+            })
+        results.append({
+            "id": thread.get("id", ""),
+            "path": thread.get("path", ""),
+            "line": thread.get("line"),
+            "comments": comments,
+        })
+
+    return results
+
+
+def resolve_review_thread(thread_id: str, token: str) -> None:
+    """Resolve a review thread on a PR.
+
+    Uses the GitHub GraphQL API resolveReviewThread mutation.
+    The thread_id should be the GraphQL node ID from
+    get_unresolved_review_threads.
+    """
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ValueError(f"thread_id must be a non-empty string, got {thread_id!r}")
+    mutation = """
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+"""
+
+    output = _run_gh([
+        "api", "graphql",
+        "-f", f"threadId={thread_id}",
+        "-f", f"query={mutation}",
+    ], token)
+
+    if not output:
+        raise GhCliError(
+            f"GraphQL mutation returned empty response for thread {thread_id!r}"
+        )
+
+    data = json.loads(output)
+    if "errors" in data:
+        msgs = [e.get("message", str(e)) for e in data["errors"]]
+        raise GhCliError(
+            f"GraphQL errors resolving review thread: {'; '.join(msgs)}"
+        )

@@ -8,6 +8,8 @@ a runner (how to execute tasks).
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -35,6 +37,7 @@ class Runner(Protocol):
         token: str,
         timeout: int,
         logger: logging.Logger | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> RunnerResult: ...
 
 
@@ -47,6 +50,17 @@ def create_runner(config: RunnerConfig) -> Runner:
     elif config.type == "noop":
         from orcest.worker.noop_runner import NoopRunner
 
-        return NoopRunner(float(config.extra.get("duration", "0.01")))
+        duration_str = config.extra.get("duration", "0.01")
+        try:
+            duration = float(duration_str)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"NoopRunner 'duration' must be numeric, got {duration_str!r}"
+            ) from e
+        if math.isnan(duration) or math.isinf(duration) or duration < 0:
+            raise ValueError(
+                f"NoopRunner 'duration' must be a finite non-negative number, got {duration}"
+            )
+        return NoopRunner(duration)
     else:
         raise ValueError(f"Unknown runner type: {config.type!r}")

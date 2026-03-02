@@ -12,7 +12,7 @@ import time
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.pr_ops import PRAction, clear_attempts, discover_actionable_prs
-from orcest.orchestrator.task_publisher import publish_fix_task
+from orcest.orchestrator.task_publisher import publish_fix_task, publish_followup_task
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, TaskResult
@@ -88,22 +88,119 @@ def _poll_cycle(
         max_attempts=config.max_attempts,
     )
 
-    # Step 3: Enqueue tasks for actionable PRs
+    # Step 3: Act on PRs
+    enqueued = 0
+    merged = 0
     for pr_state in pr_states:
-        if pr_state.action == PRAction.ENQUEUE_FIX:
+        if pr_state.action == PRAction.MERGE:
+            logger.info(
+                f"PR #{pr_state.number} ({pr_state.title}): merging"
+            )
+            try:
+                gh.merge_pr(
+                    config.github.repo, pr_state.number,
+                    config.github.token,
+                )
+                merged += 1
+            except Exception as e:
+                logger.error(
+                    f"Failed to merge PR #{pr_state.number}: {e}",
+                    exc_info=True,
+                )
+                labeled = False
+                try:
+                    gh.add_label(
+                        config.github.repo, pr_state.number,
+                        config.labels.needs_human, config.github.token,
+                    )
+                    labeled = True
+                except Exception as label_err:
+                    logger.error(
+                        f"Failed to label PR #{pr_state.number} after "
+                        f"merge failure: {label_err}",
+                        exc_info=True,
+                    )
+                try:
+                    # Truncate error message to avoid leaking verbose
+                    # subprocess stderr (which could contain internal details)
+                    # into a public PR comment.
+                    safe_err = str(e)[:200]
+                    label_note = (
+                        f"Labeling as `{config.labels.needs_human}` for manual review."
+                        if labeled
+                        else
+                        f"Failed to add `{config.labels.needs_human}` "
+                        f"label — please triage manually."
+                    )
+                    gh.post_comment(
+                        config.github.repo, pr_state.number,
+                        f"**orcest** failed to merge this PR: {safe_err}\n\n"
+                        f"{label_note}",
+                        config.github.token,
+                    )
+                except Exception as comment_err:
+                    logger.error(
+                        f"Failed to comment on PR #{pr_state.number} "
+                        f"after merge failure: {comment_err}",
+                        exc_info=True,
+                    )
+            else:
+                try:
+                    gh.post_comment(
+                        config.github.repo, pr_state.number,
+                        "**orcest** merged this PR.",
+                        config.github.token,
+                    )
+                except Exception as comment_err:
+                    logger.warning(
+                        f"Merged PR #{pr_state.number} but failed to "
+                        f"post comment: {comment_err}",
+                        exc_info=True,
+                    )
+        elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info(
                 f"PR #{pr_state.number} ({pr_state.title}): "
                 f"enqueueing fix task"
             )
-            publish_fix_task(
-                pr_state=pr_state,
-                repo=config.github.repo,
-                token=config.github.token,
-                redis=redis,
-                label_config=config.labels,
-                default_runner=config.default_runner,
-                logger=logger,
+            try:
+                publish_fix_task(
+                    pr_state=pr_state,
+                    repo=config.github.repo,
+                    token=config.github.token,
+                    redis=redis,
+                    label_config=config.labels,
+                    default_runner=config.default_runner,
+                    logger=logger,
+                )
+                enqueued += 1
+            except Exception as e:
+                logger.error(
+                    f"Failed to publish fix task for PR "
+                    f"#{pr_state.number}: {e}",
+                    exc_info=True,
+                )
+        elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
+            logger.info(
+                f"PR #{pr_state.number} ({pr_state.title}): "
+                f"enqueueing followup triage"
             )
+            try:
+                publish_followup_task(
+                    pr_state=pr_state,
+                    repo=config.github.repo,
+                    token=config.github.token,
+                    redis=redis,
+                    label_config=config.labels,
+                    default_runner=config.default_runner,
+                    logger=logger,
+                )
+                enqueued += 1
+            except Exception as e:
+                logger.error(
+                    f"Failed to publish followup task for PR "
+                    f"#{pr_state.number}: {e}",
+                    exc_info=True,
+                )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug(
                 f"PR #{pr_state.number}: CI green, skipping"
@@ -117,34 +214,64 @@ def _poll_cycle(
                 f"PR #{pr_state.number}: max attempts reached, "
                 f"adding needs-human label"
             )
+            labeled = False
             try:
                 gh.add_label(
                     config.github.repo, pr_state.number,
                     config.labels.needs_human, config.github.token,
                 )
+                labeled = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to label PR #{pr_state.number} as "
+                    f"needs-human: {e}",
+                    exc_info=True,
+                )
+            try:
+                label_note = (
+                    f"Labeling as `{config.labels.needs_human}` for "
+                    f"manual review."
+                    if labeled
+                    else
+                    f"Failed to add `{config.labels.needs_human}` "
+                    f"label — please triage manually."
+                )
                 gh.post_comment(
                     config.github.repo, pr_state.number,
                     f"**orcest** has exhausted its retry budget "
                     f"({config.max_attempts} attempts) for this PR. "
-                    f"Labeling as `{config.labels.needs_human}` for "
-                    f"manual review.\n\nPush a new commit to reset "
+                    f"{label_note}\n\nPush a new commit to reset "
                     f"the counter and allow orcest to try again.",
                     config.github.token,
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to label PR #{pr_state.number} as "
-                    f"needs-human: {e}"
+                    f"Failed to comment on PR #{pr_state.number} "
+                    f"about max attempts: {e}",
+                    exc_info=True,
                 )
+        elif pr_state.action == PRAction.SKIP_DRAFT:
+            logger.debug(
+                f"PR #{pr_state.number}: draft, skipping"
+            )
+        elif pr_state.action == PRAction.SKIP_PENDING:
+            logger.debug(
+                f"PR #{pr_state.number}: CI pending, skipping"
+            )
         elif pr_state.action == PRAction.SKIP_LABELED:
             logger.debug(
                 f"PR #{pr_state.number}: already labeled, skipping"
             )
+        else:
+            logger.warning(
+                f"PR #{pr_state.number}: unhandled action "
+                f"{pr_state.action!r}, skipping"
+            )
 
     logger.info(
         f"Poll cycle complete. "
-        f"{sum(1 for p in pr_states if p.action == PRAction.ENQUEUE_FIX)} "
-        f"tasks enqueued, {len(pr_states)} PRs checked."
+        f"{enqueued} tasks enqueued, {merged} merged, "
+        f"{len(pr_states)} PRs checked."
     )
 
 
@@ -171,9 +298,23 @@ def _consume_results(
             break
 
         for entry_id, fields in entries:
-            result = TaskResult.from_dict(fields)
-            _handle_result(config, redis, result, logger)
-            redis.xack(RESULTS_STREAM, RESULTS_GROUP, entry_id)
+            try:
+                result = TaskResult.from_dict(fields)
+                _handle_result(config, redis, result, logger)
+            except Exception as e:
+                logger.error(
+                    f"Failed to process result entry {entry_id}: {e}",
+                    exc_info=True,
+                )
+            # Always ACK to prevent infinite reprocessing of
+            # malformed or unhandleable entries.
+            try:
+                redis.xack(RESULTS_STREAM, RESULTS_GROUP, entry_id)
+            except Exception as ack_err:
+                logger.error(
+                    f"Failed to ACK result entry {entry_id}: {ack_err}",
+                    exc_info=True,
+                )
 
 
 def _handle_result(
@@ -199,34 +340,133 @@ def _handle_result(
     labels = config.labels
     pr_number = result.resource_id
 
-    # Format result comment for the PR
+    # Clear attempt counter on success so future failures start fresh.
+    # Wrapped in try/except so a Redis hiccup does not prevent label
+    # management and comment posting below.
+    if result.status == ResultStatus.COMPLETED:
+        try:
+            clear_attempts(redis, pr_number)
+        except Exception as e:
+            logger.error(
+                f"Failed to clear attempt counter for PR #{pr_number}: {e}",
+                exc_info=True,
+            )
+
+    # Manage labels based on result status.
+    # Label lifecycle (from spec section 5):
+    #   completed      -> remove queued + in-progress
+    #   failed         -> remove queued + in-progress, add needs-human
+    #   usage_exhausted -> keep in-progress (will resume when capacity available)
+    #
+    # Each label operation is independent so that a failure in one
+    # (e.g. transient GitHub API error) does not prevent the others.
+    labeled = False
+    if result.status == ResultStatus.USAGE_EXHAUSTED:
+        # Keep in-progress label so PR is not re-enqueued.
+        # Swap queued -> in-progress if still queued.
+        try:
+            gh.remove_label(repo, pr_number, labels.queued, token)
+        except Exception as e:
+            logger.error(
+                f"Failed to remove queued label on PR #{pr_number}: {e}",
+                exc_info=True,
+            )
+        try:
+            gh.add_label(repo, pr_number, labels.in_progress, token)
+        except Exception as e:
+            logger.error(
+                f"Failed to add in-progress label on PR #{pr_number}: {e}",
+                exc_info=True,
+            )
+    else:
+        try:
+            gh.remove_label(repo, pr_number, labels.queued, token)
+        except Exception as e:
+            logger.error(
+                f"Failed to remove queued label on PR #{pr_number}: {e}",
+                exc_info=True,
+            )
+        try:
+            gh.remove_label(repo, pr_number, labels.in_progress, token)
+        except Exception as e:
+            logger.error(
+                f"Failed to remove in-progress label on PR "
+                f"#{pr_number}: {e}",
+                exc_info=True,
+            )
+
+        if result.status == ResultStatus.FAILED:
+            try:
+                gh.add_label(
+                    repo, pr_number, labels.needs_human, token,
+                )
+                labeled = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to add needs-human label on PR "
+                    f"#{pr_number}: {e}",
+                    exc_info=True,
+                )
+        elif result.status == ResultStatus.BLOCKED:
+            try:
+                gh.add_label(
+                    repo, pr_number, labels.blocked, token,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to add blocked label on PR "
+                    f"#{pr_number}: {e}",
+                    exc_info=True,
+                )
+
+    # Format result comment for the PR (after label management so
+    # the comment accurately reflects whether labeling succeeded).
+    # Truncate summary to avoid posting excessively long PR comments
+    # (e.g. if a worker exception stringifies into a large traceback).
+    safe_summary = result.summary[:500] if result.summary else ""
+
     if result.status == ResultStatus.COMPLETED:
         body = (
             f"**orcest** task `{result.task_id}` completed "
             f"({result.duration_seconds}s, "
             f"worker: {result.worker_id}).\n\n"
-            f"Summary: {result.summary}"
+            f"Summary: {safe_summary}"
         )
     elif result.status == ResultStatus.FAILED:
+        label_note = (
+            f"Labeling as `{labels.needs_human}` for manual review."
+            if labeled
+            else
+            f"Failed to add `{labels.needs_human}` "
+            f"label — please triage manually."
+        )
         body = (
             f"**orcest** task `{result.task_id}` failed "
             f"({result.duration_seconds}s, "
             f"worker: {result.worker_id}).\n\n"
-            f"Summary: {result.summary}\n\n"
-            f"Labeling as `orcest:needs-human` for manual review."
+            f"Summary: {safe_summary}\n\n"
+            f"{label_note}"
         )
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
+        branch_note = (
+            f"Work saved on branch `{result.branch}`. "
+            if result.branch
+            else "Work saved. "
+        )
         body = (
             f"**orcest** task `{result.task_id}` paused "
             f"(usage limit reached, "
             f"worker: {result.worker_id}).\n\n"
-            f"Work saved on branch `{result.branch}`. "
+            f"{branch_note}"
             f"Will resume when capacity is available."
         )
     else:
         body = (
             f"**orcest** task `{result.task_id}`: "
-            f"{result.status.value}"
+            f"{result.status.value} "
+            f"({result.duration_seconds}s, "
+            f"worker: {result.worker_id}).\n\n"
+            f"Summary: {safe_summary}"
         )
 
     # Post comment on the PR
@@ -234,33 +474,8 @@ def _handle_result(
         gh.post_comment(repo, pr_number, body, token)
     except Exception as e:
         logger.error(
-            f"Failed to post comment on PR #{pr_number}: {e}"
-        )
-
-    # Clear attempt counter on success so future failures start fresh
-    if result.status == ResultStatus.COMPLETED:
-        clear_attempts(redis, pr_number)
-
-    # Manage labels based on result status.
-    # Label lifecycle (from spec section 5):
-    #   completed      -> remove queued + in-progress
-    #   failed         -> remove queued + in-progress, add needs-human
-    #   usage_exhausted -> keep in-progress (will resume when capacity available)
-    try:
-        if result.status == ResultStatus.USAGE_EXHAUSTED:
-            # Keep in-progress label so PR is not re-enqueued.
-            # Swap queued -> in-progress if still queued.
-            gh.remove_label(repo, pr_number, labels.queued, token)
-            gh.add_label(repo, pr_number, labels.in_progress, token)
-        else:
-            gh.remove_label(repo, pr_number, labels.queued, token)
-            gh.remove_label(repo, pr_number, labels.in_progress, token)
-
-            if result.status == ResultStatus.FAILED:
-                gh.add_label(repo, pr_number, labels.needs_human, token)
-    except Exception as e:
-        logger.error(
-            f"Failed to manage labels on PR #{pr_number}: {e}"
+            f"Failed to post comment on PR #{pr_number}: {e}",
+            exc_info=True,
         )
 
     logger.info(f"Result comment: {body[:100]}...")

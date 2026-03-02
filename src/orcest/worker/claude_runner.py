@@ -10,7 +10,9 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +98,7 @@ def _is_usage_exhausted(stderr: str, stdout: str) -> bool:
     """
     combined = (stderr + "\n" + stdout).lower()
     for primary, secondary in _USAGE_EXHAUSTION_PATTERNS:
+        # When secondary is empty, only the primary keyword is required.
         if primary in combined and (not secondary or secondary in combined):
             return True
     return False
@@ -116,6 +119,49 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Close stdout and stderr pipes to avoid file descriptor leaks.
+
+    Safe to call multiple times; idempotent.
+    """
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None and hasattr(pipe, "close"):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _drain_stderr(
+    proc: subprocess.Popen[str],
+) -> tuple[list[str], threading.Thread]:
+    """Read stderr in a background thread to avoid pipe deadlock.
+
+    Returns a (lines, thread) tuple.  The caller should
+    ``thread.join(timeout=...)`` before reading the list.
+
+    Thread safety note: if ``join()`` times out while the thread is
+    still appending, reading ``lines`` is safe on CPython (the GIL
+    serialises ``list.append`` and ``list.__iter__``).  In the worst
+    case we get a partial stderr, which is acceptable.
+    """
+    lines: list[str] = []
+
+    def _reader() -> None:
+        if proc.stderr is None:  # pragma: no cover
+            return
+        try:
+            for line in proc.stderr:
+                lines.append(line)
+        except (OSError, ValueError):
+            # Pipe closed or invalid -- nothing more to read.
+            pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    return lines, thread
+
+
 def run_claude(
     prompt: str,
     work_dir: Path,
@@ -124,10 +170,15 @@ def run_claude(
     max_retries: int = 3,
     retry_backoff: int = 10,
     logger: logging.Logger | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> ClaudeResult:
     """Execute Claude CLI and return parsed result.
 
     Runs: claude --print --output-format stream-json -p <prompt>
+
+    Stdout is read line-by-line so that on_output can stream each line
+    to external consumers (e.g. Redis) as it arrives.  Stderr is drained
+    in a background thread to prevent pipe deadlock.
 
     The prompt is passed as a subprocess argument (list form), so it is
     never interpreted by a shell.  No prompt-injection risk exists at the
@@ -139,13 +190,17 @@ def run_claude(
         work_dir: Working directory (cloned repo).
         token: GitHub token (passed as GITHUB_TOKEN env var).
         timeout: Max seconds to wait for Claude.
-        max_retries: Number of retry attempts on crash.
+        max_retries: Maximum number of total attempts (including the first).
         retry_backoff: Seconds between retries.
         logger: Optional logger for status messages.
+        on_output: Optional callback invoked with each stdout line.
 
     Returns:
         ClaudeResult with success flag, summary, and timing.
     """
+    if max_retries < 1:
+        raise ValueError(f"max_retries must be >= 1, got {max_retries}")
+
     env = _build_env(token)
 
     cmd = [
@@ -160,15 +215,21 @@ def run_claude(
     ]
 
     start_time = time.monotonic()
+    # Initialise outside the loop so the "all retries exhausted" fallthrough
+    # can report output from the last attempt.
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
 
     for attempt in range(1, max_retries + 1):
         proc: subprocess.Popen[str] | None = None
-        try:
-            if logger:
-                logger.info(f"Claude attempt {attempt}/{max_retries}")
+        attempt_start = time.monotonic()
 
-            # start_new_session=True puts the child in its own process
-            # group so we can kill the entire tree on timeout.
+        if logger:
+            logger.info(f"Claude attempt {attempt}/{max_retries}")
+
+        # start_new_session=True puts the child in its own process
+        # group so we can kill the entire tree on timeout.
+        try:
             proc = subprocess.Popen(
                 cmd,
                 cwd=work_dir,
@@ -178,56 +239,266 @@ def run_claude(
                 text=True,
                 start_new_session=True,
             )
-            stdout, stderr = proc.communicate(timeout=timeout)
-
+        except (OSError, ValueError) as e:
+            # Process creation failed (e.g. claude binary not found,
+            # or invalid Popen arguments).  Not retryable.
             duration = int(time.monotonic() - start_time)
+            if logger:
+                logger.error(f"Failed to start Claude: {e}")
+            return ClaudeResult(
+                success=False,
+                summary=f"Failed to start: {e}",
+                duration_seconds=duration,
+                raw_output="",
+            )
 
-            if proc.returncode == 0:
-                summary = _extract_summary(stdout)
-                return ClaudeResult(
-                    success=True,
-                    summary=summary,
-                    duration_seconds=duration,
-                    raw_output=stdout,
-                )
-            else:
+        # Drain stderr in background to avoid pipe deadlock
+        try:
+            stderr_lines, stderr_thread = _drain_stderr(proc)
+        except RuntimeError:
+            # Thread creation failed (e.g. system resource limit).
+            # Kill the process and treat as a retryable crash.
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass  # Zombie; will be reaped on process exit
+            _close_pipes(proc)
+            if attempt < max_retries:
                 if logger:
                     logger.warning(
-                        f"Claude exited with code {proc.returncode}: "
-                        f"{stderr[:500]}"
+                        "Failed to create stderr drain thread; "
+                        f"retrying in {retry_backoff}s...",
                     )
-                # Check for usage exhaustion -- do NOT retry
-                if _is_usage_exhausted(stderr, stdout):
-                    return ClaudeResult(
-                        success=False,
-                        summary="Claude usage limit reached",
-                        duration_seconds=duration,
-                        raw_output=stderr,
-                        usage_exhausted=True,
-                    )
+                time.sleep(retry_backoff)
+            continue
 
-        except subprocess.TimeoutExpired:
+        # Read stdout line-by-line, streaming to on_output
+        stdout_lines = []
+        timed_out = False
+        if proc.stdout is None:  # pragma: no cover
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            _close_pipes(proc)
+            raise RuntimeError("Popen stdout pipe is None despite PIPE flag")
+
+        # Watchdog: kill the process tree if no output arrives
+        # within the timeout.  Without this, the ``for line in
+        # proc.stdout`` loop would block indefinitely when the
+        # subprocess hangs without closing its stdout pipe.
+        # We compute remaining time here (main thread) so the
+        # watchdog thread doesn't need to call time.monotonic().
+        watchdog_cancelled = threading.Event()
+        watchdog_killed = threading.Event()
+        watchdog_remaining = max(
+            0.0, timeout - (time.monotonic() - attempt_start)
+        )
+
+        def _watchdog(
+            _proc: subprocess.Popen[str] = proc,
+            _remaining: float = watchdog_remaining,
+            _cancelled: threading.Event = watchdog_cancelled,
+            _killed: threading.Event = watchdog_killed,
+        ) -> None:
+            if _remaining > 0:
+                _cancelled.wait(timeout=_remaining)
+            if not _cancelled.is_set():
+                # Timeout expired -- kill the process so the stdout
+                # iterator unblocks with EOF / BrokenPipeError.
+                _killed.set()
+                _kill_process_tree(_proc)
+
+        watchdog_thread = threading.Thread(
+            target=_watchdog, daemon=True
+        )
+        try:
+            watchdog_thread.start()
+        except RuntimeError:
+            # Thread creation failed -- kill the process and retry.
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if attempt < max_retries:
+                if logger:
+                    logger.warning(
+                        "Failed to create watchdog thread; "
+                        f"retrying in {retry_backoff}s...",
+                    )
+                time.sleep(retry_backoff)
+            continue
+
+        try:
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                if on_output:
+                    try:
+                        on_output(line)
+                    except Exception:
+                        # Callback failure is non-fatal; log once
+                        # and disable permanently (across retries)
+                        # to avoid repeated errors.
+                        if logger:
+                            logger.warning(
+                                "on_output callback raised; "
+                                "disabling streaming for remaining attempts",
+                                exc_info=True,
+                            )
+                        on_output = None
+                if time.monotonic() - attempt_start >= timeout:
+                    timed_out = True
+                    break
+        except Exception as stdout_exc:
+            # If stdout iteration raises (broken pipe, etc.), kill
+            # the process tree and treat it as a retryable crash
+            # rather than propagating the exception to the caller.
+            watchdog_cancelled.set()
+            watchdog_thread.join(timeout=5)
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+            # If the watchdog killed the process, this is a timeout
+            # -- not a retryable crash.
+            if watchdog_killed.is_set():
+                duration = int(time.monotonic() - start_time)
+                if logger:
+                    logger.error(f"Claude timed out after {timeout}s")
+                return ClaudeResult(
+                    success=False,
+                    summary=f"Timed out after {timeout}s",
+                    duration_seconds=duration,
+                    raw_output="".join(stdout_lines),
+                )
+
+            if logger:
+                logger.warning(
+                    f"stdout read failed: {stdout_exc}",
+                    exc_info=True,
+                )
+            # Skip the normal returncode analysis and go straight
+            # to the retry backoff at the bottom of the loop.
+            if attempt < max_retries:
+                if logger:
+                    logger.info(f"Retrying in {retry_backoff}s...")
+                time.sleep(retry_backoff)
+            continue
+
+        # Cancel the watchdog -- stdout reading finished (normally
+        # or via the per-line timeout check).
+        watchdog_cancelled.set()
+        watchdog_thread.join(timeout=5)
+
+        # Detect timeout: either the per-line check fired, or the
+        # watchdog killed the process (stdout hit EOF).
+        if not timed_out and watchdog_killed.is_set():
+            timed_out = True
+
+        if timed_out:
             duration = int(time.monotonic() - start_time)
             if logger:
                 logger.error(f"Claude timed out after {timeout}s")
-            # Kill the entire process tree, not just the leader.
-            if proc is not None:
-                _kill_process_tree(proc)
-                # Drain pipes to avoid ResourceWarning / zombie.
-                # The secondary communicate() can itself time out if a
-                # child somehow survived SIGKILL (e.g. D-state / NFS),
-                # so we catch that rather than propagating.
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # _kill_process_tree already sent SIGKILL to the
+                # process group; this direct kill is a last-ditch
+                # attempt in case the pgid lookup failed above.
+                proc.kill()
                 try:
-                    proc.communicate(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    proc.kill()  # Last-ditch direct kill
-            # Timeout is NOT retried -- suggests the task is too large
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass  # Zombie; will be reaped on process exit
             return ClaudeResult(
                 success=False,
                 summary=f"Timed out after {timeout}s",
                 duration_seconds=duration,
-                raw_output="",
+                raw_output="".join(stdout_lines),
             )
+
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Process stuck in uninterruptible state (D-state / NFS).
+                # Nothing more we can do; proceed with what we have.
+                if logger:
+                    logger.warning(
+                        "Process did not exit after SIGKILL; "
+                        "proceeding with partial output"
+                    )
+        stderr_thread.join(timeout=5)
+        _close_pipes(proc)
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+        duration = int(time.monotonic() - start_time)
+
+        if proc.returncode == 0:
+            summary = _extract_summary(stdout)
+            return ClaudeResult(
+                success=True,
+                summary=summary,
+                duration_seconds=duration,
+                raw_output=stdout,
+            )
+        else:
+            rc = proc.returncode
+            if logger:
+                if rc is None:
+                    logger.warning(
+                        "Claude process did not exit; "
+                        f"stderr: {stderr[:500]}"
+                    )
+                else:
+                    logger.warning(
+                        f"Claude exited with code {rc}: "
+                        f"{stderr[:500]}"
+                    )
+            # Process stuck in D-state -- do NOT retry; the zombie
+            # would leak resources and a fresh attempt is unlikely
+            # to help if the system is in this state.
+            if rc is None:
+                return ClaudeResult(
+                    success=False,
+                    summary="Process did not exit (stuck in D-state)",
+                    duration_seconds=duration,
+                    raw_output=stderr or stdout,
+                )
+            # Check for usage exhaustion -- do NOT retry
+            if _is_usage_exhausted(stderr, stdout):
+                return ClaudeResult(
+                    success=False,
+                    summary="Claude usage limit reached",
+                    duration_seconds=duration,
+                    raw_output=stderr,
+                    usage_exhausted=True,
+                )
 
         # Retry with backoff on non-zero exit (crash)
         if attempt < max_retries:
@@ -235,13 +506,16 @@ def run_claude(
                 logger.info(f"Retrying in {retry_backoff}s...")
             time.sleep(retry_backoff)
 
-    # All retries exhausted
+    # All retries exhausted -- include stderr from the most recent
+    # attempt that successfully started a drain thread.
     duration = int(time.monotonic() - start_time)
+    last_stderr = "".join(stderr_lines) if stderr_lines else ""
+    last_stdout = "".join(stdout_lines) if stdout_lines else ""
     return ClaudeResult(
         success=False,
         summary=f"Failed after {max_retries} attempts",
         duration_seconds=duration,
-        raw_output="",
+        raw_output=last_stderr or last_stdout,
     )
 
 
@@ -263,6 +537,7 @@ class ClaudeRunner:
         token: str,
         timeout: int,
         logger: logging.Logger | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> RunnerResult:
 
         result = run_claude(
@@ -273,6 +548,7 @@ class ClaudeRunner:
             max_retries=self.max_retries,
             retry_backoff=self.retry_backoff,
             logger=logger,
+            on_output=on_output,
         )
         return RunnerResult(
             success=result.success,
@@ -313,8 +589,10 @@ def _extract_summary(stream_json_output: str) -> str:
         except (json.JSONDecodeError, ValueError):
             continue
 
-        # Forward-compat: top-level "result" key (--output-format json)
-        if "result" in obj and isinstance(obj["result"], str):
+        # Forward-compat: top-level "result" key (--output-format json).
+        # Guard with ``"role" not in obj`` so that an assistant message
+        # that happens to contain a "result" key isn't misinterpreted.
+        if "result" in obj and isinstance(obj["result"], str) and "role" not in obj:
             return obj["result"][:500]
 
         # stream-json assistant message with content array
