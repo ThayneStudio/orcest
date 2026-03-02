@@ -155,10 +155,15 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         logger.info(f"Acquired lock {lock_key}")
 
-        # Start heartbeat; signal lock_lost if the lock cannot be refreshed
+        # Start heartbeat; signal lock_lost if the lock cannot be refreshed.
+        # Use an explicit interval independent of lock.ttl so the orphaned-lock
+        # window stays bounded even when the TTL grows large (see issue #121).
         lock_lost = threading.Event()
         heartbeat = Heartbeat(
-            lock, interval=HEARTBEAT_INTERVAL, logger=logger, on_lock_lost=lock_lost.set
+            lock,
+            interval=HEARTBEAT_INTERVAL,
+            logger=logger,
+            on_lock_lost=lock_lost.set,
         )
         heartbeat.start()
 
