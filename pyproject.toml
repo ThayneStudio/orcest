@@ -29,6 +29,7 @@ dev = [
     "fakeredis[lua]>=2.21",
     "ruff>=0.4",
     "build>=1.0",
+    "pip-tools>=7.0",
 ]
 
 [tool.ruff]
