@@ -54,7 +54,9 @@ class RedisClient:
     def __enter__(self) -> "RedisClient":
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+    ) -> None:
         self.close()
 
     def health_check(self) -> bool:
