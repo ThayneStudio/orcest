@@ -93,52 +93,6 @@ def _run_gh(args: list[str], token: str) -> str:
     return result.stdout.strip()
 
 
-def _run_gh_bytes(args: list[str], token: str) -> bytes:
-    """Execute a gh CLI command and return raw stdout bytes.
-
-    Same as _run_gh but does not decode output. Useful for endpoints
-    that return binary data (e.g., log zip files).
-
-    Raises:
-        GhNotInstalledError: If the gh CLI binary is not on PATH.
-        GhCliError: On non-zero exit, with stderr included in the message.
-    """
-    env = os.environ.copy()
-    env["GITHUB_TOKEN"] = token
-    env["GH_TOKEN"] = token
-
-    try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True,
-            env=env,
-            check=True,
-            timeout=_GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        raise GhNotInstalledError(
-            "gh CLI not found on PATH. Install it from https://cli.github.com/"
-        ) from None
-    except subprocess.TimeoutExpired as exc:
-        # Truncate args to avoid dumping entire GraphQL queries into logs
-        brief = " ".join(args[:4])
-        if len(args) > 4:
-            brief += " ..."
-        raise GhCliError(
-            f"gh command timed out after {exc.timeout}s: gh {brief}",
-            stderr="",
-            returncode=None,
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-        raise GhCliError(
-            f"gh command failed (exit {exc.returncode}): {stderr_text.strip()}",
-            stderr=stderr_text,
-            returncode=exc.returncode,
-        ) from exc
-
-    return result.stdout
-
 
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
@@ -230,21 +184,6 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
         token,
     )
 
-
-def get_check_run_logs(repo: str, run_id: int, token: str) -> bytes:
-    """Get logs for a specific check run.
-
-    Uses gh api to fetch the logs. The GitHub API returns a zip file,
-    so this returns raw bytes that the caller must unzip.
-    """
-    _validate_repo(repo)
-    return _run_gh_bytes(
-        [
-            "api",
-            f"repos/{repo}/actions/runs/{run_id}/logs",
-        ],
-        token,
-    )
 
 
 def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:

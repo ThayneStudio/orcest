@@ -15,7 +15,6 @@ from orcest.orchestrator.gh import (
     GhCliError,
     GhNotInstalledError,
     add_label,
-    get_check_run_logs,
     get_ci_status,
     get_failed_run_logs,
     get_pr,
@@ -634,57 +633,6 @@ def test_get_pr_diff_failure_raises(mocker):
 
 
 # ---------------------------------------------------------------------------
-# get_check_run_logs (_run_gh_bytes path)
-# ---------------------------------------------------------------------------
-
-
-def test_get_check_run_logs_success(mocker):
-    """get_check_run_logs returns raw bytes from _run_gh_bytes."""
-    zip_bytes = b"PK\x03\x04fake-zip-content"
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        return_value=subprocess.CompletedProcess(
-            args=["gh"], returncode=0, stdout=zip_bytes, stderr=b""
-        ),
-    )
-    result = get_check_run_logs(REPO, 12345, TOKEN)
-    assert result == zip_bytes
-    assert isinstance(result, bytes)
-
-
-def test_get_check_run_logs_failure_raises(mocker):
-    """CalledProcessError in _run_gh_bytes -> GhCliError."""
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["gh", "api"],
-            stderr=b"403 Forbidden",
-        ),
-    )
-    with pytest.raises(GhCliError, match="403 Forbidden"):
-        get_check_run_logs(REPO, 12345, TOKEN)
-
-
-def test_get_check_run_logs_malformed_utf8_stderr(mocker):
-    """_run_gh_bytes uses errors='replace' when decoding stderr bytes."""
-    # Build stderr with invalid UTF-8 byte sequences
-    bad_stderr = b"Error: \xff\xfe bad bytes"
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["gh", "api"],
-            stderr=bad_stderr,
-        ),
-    )
-    with pytest.raises(GhCliError) as exc_info:
-        get_check_run_logs(REPO, 12345, TOKEN)
-    # The replacement character should appear instead of raising UnicodeDecodeError
-    assert "\ufffd" in exc_info.value.stderr
-
-
-# ---------------------------------------------------------------------------
 # get_failed_run_logs
 # ---------------------------------------------------------------------------
 
@@ -1054,14 +1002,3 @@ def test_run_gh_timeout_raises_gh_cli_error(mocker):
         list_open_prs(REPO, TOKEN)
 
 
-def test_run_gh_bytes_timeout_raises_gh_cli_error(mocker):
-    """subprocess.TimeoutExpired in _run_gh_bytes -> GhCliError."""
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(
-            cmd=["gh", "api"],
-            timeout=120,
-        ),
-    )
-    with pytest.raises(GhCliError, match="timed out"):
-        get_check_run_logs(REPO, 12345, TOKEN)
