@@ -50,30 +50,33 @@ def _publish_and_notify(
     """Publish a task to Redis and update GitHub visibility.
 
     Shared by publish_fix_task and publish_followup_task to avoid
-    duplicating the publish -> label -> comment -> log sequence.
+    duplicating the increment -> publish -> label -> comment -> log sequence.
 
-    The task is published to Redis first. If labeling or commenting
-    fails afterwards, the error is logged but the task is not lost.
+    The attempt counter is incremented before publishing to Redis so that a
+    crash between the two operations still counts the attempt, preventing
+    unbounded retries.  If labeling or commenting fails afterwards, the error
+    is logged but the task is not lost.
     """
     task_type = task.type
-
-    # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
-    redis.xadd(tasks_stream, task.to_dict())
-
-    # Track attempt count for re-enqueue throttling.
-    # Wrapped in try/except because the task is already in Redis -- a
-    # failed increment is harmless (next cycle may re-enqueue, but the
-    # max-attempts check in discover_actionable_prs prevents runaway loops).
     _log = logger or logging.getLogger(__name__)
+
+    # Increment attempt count BEFORE publishing to Redis to eliminate the
+    # check-then-act race: if the orchestrator crashes between xadd and
+    # increment, the attempt would never be counted, allowing unbounded
+    # retries.  An increment without a subsequent xadd is safe — the
+    # max-attempts guard in discover_actionable_prs prevents runaway loops.
     try:
         increment_attempts(redis, pr_state.number, pr_state.head_sha)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for PR #{pr_state.number} "
-            f"(task {task.id} already published to Redis)",
+            f"before publishing task {task.id} to Redis",
             exc_info=True,
         )
+
+    # Publish to backend-specific stream
+    tasks_stream = f"tasks:{default_runner}"
+    redis.xadd(tasks_stream, task.to_dict())
 
     # Update GitHub visibility -- wrapped in try/except because the task
     # is already published to Redis. If labeling fails, the next poll cycle
@@ -334,19 +337,20 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
-    redis.xadd(tasks_stream, task.to_dict())
-
-    # Track attempt count
+    # Increment attempt count BEFORE publishing to Redis (same rationale as
+    # _publish_and_notify: prevents unbounded retries on orchestrator crash).
     try:
         increment_issue_attempts(redis, issue_state.number)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for issue #{issue_state.number} "
-            f"(task {task.id} already published to Redis)",
+            f"before publishing task {task.id} to Redis",
             exc_info=True,
         )
+
+    # Publish to backend-specific stream
+    tasks_stream = f"tasks:{default_runner}"
+    redis.xadd(tasks_stream, task.to_dict())
 
     # Update GitHub visibility on the issue
     _label_ok = True
