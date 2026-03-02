@@ -1,0 +1,33 @@
+click==8.3.1
+    # via orcest (pyproject.toml)
+linkify-it-py==2.1.0
+    # via markdown-it-py
+markdown-it-py==4.0.0
+    # via
+    #   mdit-py-plugins
+    #   rich
+    #   textual
+mdit-py-plugins==0.5.0
+    # via textual
+mdurl==0.1.2
+    # via markdown-it-py
+platformdirs==4.9.2
+    # via textual
+pygments==2.19.2
+    # via
+    #   rich
+    #   textual
+pyyaml==6.0.3
+    # via orcest (pyproject.toml)
+redis==7.2.1
+    # via orcest (pyproject.toml)
+rich==14.3.3
+    # via
+    #   orcest (pyproject.toml)
+    #   textual
+textual==8.0.1
+    # via orcest (pyproject.toml)
+typing-extensions==4.15.0
+    # via textual
+uc-micro-py==2.0.0
+    # via linkify-it-py
