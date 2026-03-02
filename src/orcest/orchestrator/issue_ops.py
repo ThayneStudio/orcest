@@ -17,9 +17,6 @@ from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
 
-# Sentinel value for issue attempt tracking (issues don't have a head_sha).
-_ISSUE_SHA_SENTINEL = "issue"
-
 
 class IssueAction(str, Enum):
     """What the orchestrator should do with an issue."""
@@ -66,7 +63,6 @@ def increment_attempts(redis: RedisClient, issue_number: int) -> int:
     key = _make_attempts_key(issue_number)
     pipe = redis.client.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
-    pipe.hset(key, "head_sha", _ISSUE_SHA_SENTINEL)
     pipe.expire(key, 7 * 24 * 3600)
     results = pipe.execute()
     return results[0]
@@ -107,7 +103,7 @@ def discover_actionable_issues(
         number: int = issue_data["number"]
         title: str = issue_data["title"]
         body: str = issue_data.get("body") or ""
-        issue_labels: list[str] = [lbl.get("name", "") for lbl in (issue_data.get("labels") or [])]
+        issue_labels: list[str] = [lbl["name"] for lbl in (issue_data.get("labels") or [])]
 
         # Skip if already labeled by orcest (queued/in-progress/etc)
         if any(label in orcest_labels for label in issue_labels):
