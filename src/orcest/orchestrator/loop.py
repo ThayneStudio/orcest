@@ -93,6 +93,16 @@ def _poll_cycle(
     )
 
     # Step 3: Act on PRs
+    # Sort: merges first (quick wins), then fixes/followups oldest-first
+    # (lowest PR number = longest waiting). Skips don't matter but sort
+    # them last so actionable items are processed first.
+    _ACTION_PRIORITY = {
+        PRAction.MERGE: 0,
+        PRAction.ENQUEUE_FIX: 1,
+        PRAction.ENQUEUE_FOLLOWUP: 1,
+    }
+    pr_states.sort(key=lambda ps: (_ACTION_PRIORITY.get(ps.action, 9), ps.number))
+
     enqueued = 0
     merged = 0
     for pr_state in pr_states:
