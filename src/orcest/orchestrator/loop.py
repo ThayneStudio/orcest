@@ -103,6 +103,7 @@ def _poll_cycle(
                     config.github.repo,
                     pr_state.number,
                     config.github.token,
+                    delete_branch=config.delete_branch_on_merge,
                 )
                 merged += 1
             except Exception as e:
