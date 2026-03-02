@@ -667,7 +667,7 @@ class TestRunWorker:
         mock_redis.xreadgroup.assert_not_called()
 
     def test_worker_result_publish_failure_does_not_ack(self, mocker, worker_config, sample_task):
-        """When redis.xadd for the results stream raises, xack must NOT be called.
+        """When redis.xadd_capped for the results stream raises, xack must NOT be called.
         The message stays in XPENDING so it can be re-delivered and the result
         is not silently lost."""
         mock_redis = self._build_mock_redis()
