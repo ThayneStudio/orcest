@@ -353,6 +353,7 @@ def run_claude(
                                 "disabling streaming for remaining attempts",
                                 exc_info=True,
                             )
+                        # Disable streaming for all remaining retry attempts to avoid log spam
                         on_output = None
                 if time.monotonic() - attempt_start >= timeout:
                     timed_out = True
