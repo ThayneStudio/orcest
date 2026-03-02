@@ -1,8 +1,21 @@
 """CLI entry point for orcest."""
 
+import re
+
 import click
 from rich.console import Console
 from rich.table import Table
+
+_SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _validate_ssh_input(value: str, label: str) -> None:
+    """Raise click.BadParameter if value contains shell metacharacters."""
+    if not _SSH_INPUT_RE.match(value):
+        raise click.BadParameter(
+            f"Invalid {label} {value!r}: only alphanumerics, dots, hyphens,"
+            " and underscores are allowed."
+        )
 
 
 @click.group()
@@ -220,6 +233,9 @@ def provision(host, user, worker_config, env_file):
     import subprocess
     import sys
 
+    _validate_ssh_input(host, "host")
+    _validate_ssh_input(user, "user")
+
     console = Console()
     ssh_target = f"{user}@{host}" if user else host
 
@@ -373,6 +389,9 @@ def provision_orchestrator(host, user, orch_config, env_file):
     import subprocess
     import sys
     import tempfile
+
+    _validate_ssh_input(host, "host")
+    _validate_ssh_input(user, "user")
 
     console = Console()
     ssh_target = f"{user}@{host}" if user else host
