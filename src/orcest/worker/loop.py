@@ -185,6 +185,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         else:
             # Normal path: stop heartbeat and release lock
             heartbeat.stop()
+            # safe no-op if lock already expired — release() verifies owner token via Lua
             lock.release()
             if lock_lost.is_set():
                 logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
