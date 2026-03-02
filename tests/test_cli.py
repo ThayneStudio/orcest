@@ -1,11 +1,13 @@
 """Tests for the orcest CLI entry points (src/orcest/cli.py)."""
 
-from unittest.mock import MagicMock
+import io
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
+from rich.console import Console
 
-from orcest.cli import main
+from orcest.cli import _status_once, main
 
 
 @pytest.fixture
@@ -93,6 +95,44 @@ def test_status_host_with_port(mocker, runner, fake_redis_client):
     config_arg = mock_redis_cls.call_args[0][0]
     assert config_arg.host == "10.0.0.1"
     assert config_arg.port == 6380
+
+
+def test_status_once_normal(fake_redis_client):
+    """_status_once runs without error on an empty Redis."""
+    _status_once(fake_redis_client)
+
+
+def test_status_once_wrongtype_tasks_key_does_not_raise(fake_redis_client):
+    """_status_once handles WRONGTYPE on a tasks:* key without crashing."""
+    # A non-stream value at a tasks:* key triggers WRONGTYPE on xlen
+    fake_redis_client.client.set("tasks:not-a-stream", "some-value")
+    _status_once(fake_redis_client)
+
+
+def test_status_once_wrongtype_results_key_does_not_raise(fake_redis_client):
+    """_status_once handles WRONGTYPE on the results key without crashing."""
+    # A non-stream value at results triggers WRONGTYPE on xlen
+    fake_redis_client.client.set("results", "some-value")
+    _status_once(fake_redis_client)
+
+
+def test_status_once_wrongtype_both_does_not_raise(fake_redis_client):
+    """_status_once handles WRONGTYPE on both tasks:* and results keys."""
+    fake_redis_client.client.set("tasks:bad-key", "oops")
+    fake_redis_client.client.set("results", "also-bad")
+    _status_once(fake_redis_client)
+
+
+def test_status_once_wrongtype_tasks_key_shows_not_a_stream(fake_redis_client, capsys):
+    """A WRONGTYPE tasks:* key is reported as '(not a stream)' in output."""
+    fake_redis_client.client.set("tasks:bad-key", "oops")
+    # _status_once uses Rich console which writes to stdout
+    buf = io.StringIO()
+    with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
+        _status_once(fake_redis_client)
+
+    output = buf.getvalue()
+    assert "(not a stream)" in output
 
 
 # ---------------------------------------------------------------------------
