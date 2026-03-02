@@ -80,9 +80,9 @@ class RedisLock:
         return self._held
 
 
-def make_pr_lock_key(pr_number: int) -> str:
+def make_pr_lock_key(repo: str, pr_number: int) -> str:
     """Generate the Redis key for a PR lock."""
-    return f"lock:pr:{pr_number}"
+    return f"lock:pr:{repo}:{pr_number}"
 
 
 def make_issue_lock_key(issue_number: int) -> str:
