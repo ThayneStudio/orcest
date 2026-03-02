@@ -193,6 +193,7 @@ def run_claude(
     retry_backoff: int = 10,
     logger: logging.Logger | None = None,
     on_output: Callable[[str], None] | None = None,
+    shutdown_event: threading.Event | None = None,
 ) -> ClaudeResult:
     """Execute Claude CLI and return parsed result.
 
@@ -216,12 +217,19 @@ def run_claude(
         retry_backoff: Seconds between retries.
         logger: Optional logger for status messages.
         on_output: Optional callback invoked with each stdout line.
+        shutdown_event: Optional event that, when set, interrupts retry backoff
+            so the worker can respond to SIGTERM without waiting the full delay.
 
     Returns:
         ClaudeResult with success flag, summary, and timing.
     """
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
+
+    # Use a dedicated event for interruptible backoff sleeps.  If no
+    # external shutdown event is provided, create a local one that is
+    # never set so event.wait(timeout=N) behaves like time.sleep(N).
+    _shutdown = shutdown_event if shutdown_event is not None else threading.Event()
 
     env = _build_env(token)
 
@@ -295,7 +303,7 @@ def run_claude(
                     logger.warning(
                         f"Failed to create stderr drain thread; retrying in {retry_backoff}s...",
                     )
-                time.sleep(retry_backoff)
+                _shutdown.wait(timeout=retry_backoff)
             continue
 
         # Read stdout line-by-line, streaming to on_output
@@ -356,7 +364,7 @@ def run_claude(
                     logger.warning(
                         f"Failed to create watchdog thread; retrying in {retry_backoff}s...",
                     )
-                time.sleep(retry_backoff)
+                _shutdown.wait(timeout=retry_backoff)
             continue
 
         try:
@@ -417,7 +425,7 @@ def run_claude(
             if attempt < max_retries:
                 if logger:
                     logger.info(f"Retrying in {retry_backoff}s...")
-                time.sleep(retry_backoff)
+                _shutdown.wait(timeout=retry_backoff)
             continue
 
         # Cancel the watchdog -- stdout reading finished (normally
@@ -514,7 +522,7 @@ def run_claude(
         if attempt < max_retries:
             if logger:
                 logger.info(f"Retrying in {retry_backoff}s...")
-            time.sleep(retry_backoff)
+            _shutdown.wait(timeout=retry_backoff)
 
     # All retries exhausted -- include stderr from the most recent
     # attempt that successfully started a drain thread.
@@ -548,6 +556,7 @@ class ClaudeRunner:
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
+        shutdown_event: threading.Event | None = None,
     ) -> RunnerResult:
 
         result = run_claude(
@@ -559,6 +568,7 @@ class ClaudeRunner:
             retry_backoff=self.retry_backoff,
             logger=logger,
             on_output=on_output,
+            shutdown_event=shutdown_event,
         )
         return RunnerResult(
             success=result.success,

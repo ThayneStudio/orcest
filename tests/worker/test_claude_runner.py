@@ -164,7 +164,7 @@ def test_run_claude_failure_retries(mock_popen, mocker, tmp_path):
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0),
     )
 
-    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2)
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
 
     assert result.success is True
     assert mock_cls.call_count == 2
@@ -547,7 +547,7 @@ def test_run_claude_all_retries_exhausted(mock_popen, mocker, tmp_path):
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0),
     )
 
-    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2)
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
 
     assert result.success is False
     assert "Failed after 2 attempts" in result.summary
