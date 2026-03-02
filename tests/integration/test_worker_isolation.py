@@ -385,13 +385,15 @@ class TestWorkerIsolation:
         )
         noop_sleep_patcher.start()
 
+        stop_event = threading.Event()
+
         try:
             # Run workers in threads
             errors: list[str] = []
 
             def run_with_client(cfg: WorkerConfig) -> None:
                 try:
-                    run_worker(cfg)
+                    run_worker(cfg, stop_event)
                 except SystemExit:
                     # run_worker calls sys.exit(1) on Redis health check
                     # failure. SystemExit is a BaseException, not Exception,
@@ -405,7 +407,6 @@ class TestWorkerIsolation:
                 t = threading.Thread(
                     target=run_with_client,
                     args=(cfg,),
-                    daemon=True,
                     name=cfg.worker_id,
                 )
                 threads.append(t)
@@ -431,6 +432,11 @@ class TestWorkerIsolation:
                     break
                 original_sleep(0.2)
         finally:
+            # Signal workers to stop and wait for them to exit so they
+            # release Redis connections before the fixture calls flushdb().
+            stop_event.set()
+            for t in threads:
+                t.join(timeout=10)
             # Cleanup patchers
             workspace_patcher.stop()
             logging_patcher.stop()
@@ -541,12 +547,14 @@ class TestWorkerIsolation:
         signal_patcher = unittest.mock.patch("orcest.worker.loop.signal.signal")
         signal_patcher.start()
 
+        stop_event = threading.Event()
+
         try:
             errors: list[str] = []
 
             def run_worker_thread(config: WorkerConfig) -> None:
                 try:
-                    run_worker(config)
+                    run_worker(config, stop_event)
                 except SystemExit:
                     errors.append("sys.exit called (Redis health check failed?)")
                 except Exception as e:
@@ -555,7 +563,6 @@ class TestWorkerIsolation:
             t = threading.Thread(
                 target=run_worker_thread,
                 args=(cfg,),
-                daemon=True,
                 name="skip-test-worker",
             )
             t.start()
@@ -571,6 +578,10 @@ class TestWorkerIsolation:
             # Allow time for the worker to also process (skip) the locked task
             time.sleep(1)
         finally:
+            # Signal the worker to stop and wait for it to exit so it releases
+            # its Redis connection before the fixture calls flushdb().
+            stop_event.set()
+            t.join(timeout=10)
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
