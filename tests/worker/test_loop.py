@@ -83,8 +83,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert isinstance(result, TaskResult)
@@ -99,9 +103,7 @@ class TestExecuteTask:
         )
         mock_workspace.cleanup.assert_called_once()
 
-    def test_worker_handles_runner_failure(
-        self, local_worker_config, sample_task, mock_workspace
-    ):
+    def test_worker_handles_runner_failure(self, local_worker_config, sample_task, mock_workspace):
         """_execute_task returns a FAILED TaskResult when the runner fails."""
         mock_runner = MagicMock()
         mock_runner.run.return_value = _failure_runner_result()
@@ -110,8 +112,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.FAILED
@@ -131,8 +137,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.USAGE_EXHAUSTED
@@ -148,8 +158,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.FAILED
@@ -176,21 +190,21 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.COMPLETED
 
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
-        mock_redis.xadd_capped.assert_any_call(
-            stream, {"line": '{"role": "assistant"}\n'}
-        )
+        mock_redis.xadd_capped.assert_any_call(stream, {"line": '{"role": "assistant"}\n'})
 
-    def test_task_start_end_markers(
-        self, local_worker_config, sample_task, mock_workspace
-    ):
+    def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
         """task_start and task_end markers are published to Redis."""
         mock_runner = MagicMock()
         mock_runner.run.return_value = _success_runner_result()
@@ -199,8 +213,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.COMPLETED
@@ -233,8 +251,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.return_value = "1-0"
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         assert result.status == ResultStatus.FAILED
@@ -273,8 +295,12 @@ class TestExecuteTask:
 
         with caplog.at_level(logging.WARNING):
             result = _execute_task(
-                sample_task, local_worker_config, mock_runner,
-                mock_workspace, mock_redis, logging.getLogger("test"),
+                sample_task,
+                local_worker_config,
+                mock_runner,
+                mock_workspace,
+                mock_redis,
+                logging.getLogger("test"),
             )
 
         assert result.status == ResultStatus.COMPLETED
@@ -282,8 +308,7 @@ class TestExecuteTask:
         # Count how many "Failed to publish output line" warnings were logged.
         # The first error should be logged; subsequent ones should be suppressed.
         output_warnings = [
-            r for r in caplog.records
-            if "Failed to publish output line" in r.message
+            r for r in caplog.records if "Failed to publish output line" in r.message
         ]
         assert len(output_warnings) == 1
 
@@ -309,8 +334,12 @@ class TestExecuteTask:
         mock_redis.xadd_capped.side_effect = xadd_capped_side_effect
 
         result = _execute_task(
-            sample_task, local_worker_config, mock_runner,
-            mock_workspace, mock_redis, logging.getLogger("test"),
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
         )
 
         # Task should complete successfully despite task_start failure
@@ -475,9 +504,7 @@ class TestRunWorker:
         mocks["runner"].run.assert_not_called()
         # The task must still be ACKed (to avoid redelivery)
         expected_stream = f"tasks:{worker_config.backend}"
-        mock_redis.xack.assert_called_once_with(
-            expected_stream, CONSUMER_GROUP, "entry-1"
-        )
+        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-1")
         # No result should be published
         mock_redis.xadd.assert_not_called()
 
@@ -532,9 +559,7 @@ class TestRunWorker:
         # Should never attempt to read from the stream
         mock_redis.xreadgroup.assert_not_called()
 
-    def test_worker_result_publish_failure_still_acks(
-        self, mocker, worker_config, sample_task
-    ):
+    def test_worker_result_publish_failure_still_acks(self, mocker, worker_config, sample_task):
         """When redis.xadd for the results stream raises, xack is still called."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
@@ -548,13 +573,9 @@ class TestRunWorker:
 
         # Despite the xadd failure, xack must still be called to avoid redelivery
         expected_stream = f"tasks:{worker_config.backend}"
-        mock_redis.xack.assert_called_once_with(
-            expected_stream, CONSUMER_GROUP, "entry-1"
-        )
+        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-1")
 
-    def test_worker_malformed_task_acks_and_continues(
-        self, mocker, worker_config
-    ):
+    def test_worker_malformed_task_acks_and_continues(self, mocker, worker_config):
         """When a stream entry cannot be deserialized, the worker ACKs it
         (to prevent infinite redelivery) and continues to the next entry."""
         mock_redis = self._build_mock_redis()
@@ -569,6 +590,7 @@ class TestRunWorker:
             if call_count == 1:
                 return [("entry-bad", {"garbage": "data"})]
             import signal as sig
+
             handler = mocks["signal_handlers"].get(sig.SIGTERM)
             if handler:
                 handler(sig.SIGTERM, None)
@@ -582,6 +604,4 @@ class TestRunWorker:
         mocks["runner"].run.assert_not_called()
         # The malformed entry must still be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
-        mock_redis.xack.assert_called_once_with(
-            expected_stream, CONSUMER_GROUP, "entry-bad"
-        )
+        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-bad")

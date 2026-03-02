@@ -79,7 +79,8 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
     try:
         return _fetch_snapshot_inner(redis, max_results)
     except (
-        redis_lib.ConnectionError, redis_lib.TimeoutError,
+        redis_lib.ConnectionError,
+        redis_lib.TimeoutError,
         redis_lib.AuthenticationError,
     ):
         logger.warning("Redis disconnected during snapshot fetch", exc_info=True)
@@ -89,9 +90,7 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
         )
 
 
-def _fetch_snapshot_inner(
-    redis: RedisClient, max_results: int
-) -> SystemSnapshot:
+def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapshot:
     """Build the snapshot after health_check has passed.
 
     Separated from fetch_snapshot so the outer function can catch
@@ -127,12 +126,14 @@ def _fetch_snapshot_inner(
     for stream_key in sorted(task_streams):
         try:
             for g in client.xinfo_groups(stream_key):
-                consumer_groups.append(ConsumerGroupInfo(
-                    stream=stream_key,
-                    name=g["name"],
-                    consumers=g["consumers"],
-                    pending=g["pending"],
-                ))
+                consumer_groups.append(
+                    ConsumerGroupInfo(
+                        stream=stream_key,
+                        name=g["name"],
+                        consumers=g["consumers"],
+                        pending=g["pending"],
+                    )
+                )
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
 
@@ -144,15 +145,17 @@ def _fetch_snapshot_inner(
         entries = []
     for _entry_id, fields in entries:
         try:
-            recent_results.append(RecentResult(
-                task_id=fields.get("task_id", ""),
-                worker_id=fields.get("worker_id", ""),
-                status=fields.get("status", ""),
-                resource_type=fields.get("resource_type", ""),
-                resource_id=fields.get("resource_id", ""),
-                duration_seconds=int(fields.get("duration_seconds", 0)),
-                summary=fields.get("summary", ""),
-            ))
+            recent_results.append(
+                RecentResult(
+                    task_id=fields.get("task_id", ""),
+                    worker_id=fields.get("worker_id", ""),
+                    status=fields.get("status", ""),
+                    resource_type=fields.get("resource_type", ""),
+                    resource_id=fields.get("resource_id", ""),
+                    duration_seconds=int(fields.get("duration_seconds", 0)),
+                    summary=fields.get("summary", ""),
+                )
+            )
         except (ValueError, TypeError):
             logger.debug("Skipping malformed result entry: %s", _entry_id)
 
@@ -188,8 +191,10 @@ def discover_workers(redis: RedisClient) -> list[str]:
         streams = list(client.scan_iter(match="output:*"))
         return sorted(s.removeprefix("output:") for s in streams)
     except (
-        redis_lib.ConnectionError, redis_lib.TimeoutError,
-        redis_lib.ResponseError, redis_lib.AuthenticationError,
+        redis_lib.ConnectionError,
+        redis_lib.TimeoutError,
+        redis_lib.ResponseError,
+        redis_lib.AuthenticationError,
     ):
         logger.warning("discover_workers failed", exc_info=True)
         return []
@@ -427,8 +432,12 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
 
             results = self.query_one("#results-table", DataTable)
             results.add_columns(
-                "Status", "Type", "Resource",
-                "Worker", "Duration", "Summary",
+                "Status",
+                "Type",
+                "Resource",
+                "Worker",
+                "Duration",
+                "Summary",
             )
 
             self._update_display()
@@ -481,7 +490,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if snapshot.locks:
                 for lock in snapshot.locks:
                     locks_table.add_row(
-                        f"#{lock.pr}", lock.owner,
+                        f"#{lock.pr}",
+                        lock.owner,
                         _format_ttl(lock.ttl),
                     )
             else:
@@ -493,8 +503,10 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if snapshot.consumer_groups:
                 for g in snapshot.consumer_groups:
                     groups_table.add_row(
-                        g.stream, g.name,
-                        str(g.consumers), str(g.pending),
+                        g.stream,
+                        g.name,
+                        str(g.consumers),
+                        str(g.pending),
                     )
             else:
                 groups_table.add_row("--", "No groups", "--", "--")
@@ -504,11 +516,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             results_table.clear()
             if snapshot.recent_results:
                 for r in snapshot.recent_results:
-                    summary = (
-                        (r.summary[:80] + "...")
-                        if len(r.summary) > 80
-                        else r.summary
-                    )
+                    summary = (r.summary[:80] + "...") if len(r.summary) > 80 else r.summary
                     results_table.add_row(
                         Text(r.status.upper(), style=_status_style(r.status)),
                         r.resource_type,
@@ -519,7 +527,12 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                     )
             else:
                 results_table.add_row(
-                    "--", "--", "--", "--", "--", "No results yet",
+                    "--",
+                    "--",
+                    "--",
+                    "--",
+                    "--",
+                    "No results yet",
                 )
 
         def _update_worker_output(self) -> None:
@@ -561,10 +574,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 header = self.query_one("#worker-header", Static)
                 idx = self._worker_idx + 1
                 total = len(self._worker_ids)
-                header.update(
-                    f" Worker: {wid} ({idx}/{total})"
-                    " | w: next worker | Escape: back"
-                )
+                header.update(f" Worker: {wid} ({idx}/{total}) | w: next worker | Escape: back")
 
         def _show_worker_view(self) -> None:
             """Switch to worker output view."""
@@ -590,18 +600,11 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             refreshed list, fall back to index 0 and update
             _current_worker_id to stay consistent.
             """
-            if (
-                self._current_worker_id is not None
-                and self._current_worker_id in self._worker_ids
-            ):
-                self._worker_idx = self._worker_ids.index(
-                    self._current_worker_id
-                )
+            if self._current_worker_id is not None and self._current_worker_id in self._worker_ids:
+                self._worker_idx = self._worker_ids.index(self._current_worker_id)
             else:
                 self._worker_idx = 0
-                self._current_worker_id = (
-                    self._worker_ids[0] if self._worker_ids else None
-                )
+                self._current_worker_id = self._worker_ids[0] if self._worker_ids else None
 
         def action_toggle_worker(self) -> None:
             """Toggle into worker view or cycle to next worker."""
@@ -615,9 +618,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 self._resolve_worker_index()
                 prev_worker = self._current_worker_id
                 # Cycle to next worker
-                self._worker_idx = (
-                    (self._worker_idx + 1) % len(self._worker_ids)
-                )
+                self._worker_idx = (self._worker_idx + 1) % len(self._worker_ids)
                 self._current_worker_id = self._worker_ids[self._worker_idx]
                 if self._current_worker_id != prev_worker:
                     # Clear log for new worker

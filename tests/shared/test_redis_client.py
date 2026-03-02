@@ -199,7 +199,8 @@ def test_xread_after_returns_empty_on_connection_error(fake_redis_client, mocker
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "xread",
+        fake_redis_client._client,
+        "xread",
         side_effect=_redis.ConnectionError("connection lost"),
     )
     with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
@@ -215,7 +216,8 @@ def test_xread_after_returns_empty_on_timeout_error(fake_redis_client, mocker, c
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "xread",
+        fake_redis_client._client,
+        "xread",
         side_effect=_redis.TimeoutError("read timed out"),
     )
     with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
@@ -231,7 +233,8 @@ def test_xread_after_returns_empty_on_response_error(fake_redis_client, mocker, 
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "xread",
+        fake_redis_client._client,
+        "xread",
         side_effect=_redis.ResponseError("WRONGTYPE Operation against a key"),
     )
     with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
@@ -247,7 +250,8 @@ def test_xread_after_returns_empty_on_auth_error(fake_redis_client, mocker, capl
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "xread",
+        fake_redis_client._client,
+        "xread",
         side_effect=_redis.AuthenticationError("invalid password"),
     )
     with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
@@ -266,7 +270,8 @@ def test_health_check_connection_error(fake_redis_client, mocker):
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "ping",
+        fake_redis_client._client,
+        "ping",
         side_effect=_redis.ConnectionError("refused"),
     )
     assert fake_redis_client.health_check() is False
@@ -277,7 +282,8 @@ def test_health_check_timeout_error(fake_redis_client, mocker):
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "ping",
+        fake_redis_client._client,
+        "ping",
         side_effect=_redis.TimeoutError("timed out"),
     )
     assert fake_redis_client.health_check() is False
@@ -288,7 +294,8 @@ def test_health_check_auth_error(fake_redis_client, mocker):
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "ping",
+        fake_redis_client._client,
+        "ping",
         side_effect=_redis.AuthenticationError("invalid password"),
     )
     assert fake_redis_client.health_check() is False
@@ -299,7 +306,8 @@ def test_health_check_response_error(fake_redis_client, mocker):
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "ping",
+        fake_redis_client._client,
+        "ping",
         side_effect=_redis.ResponseError("NOPERM this user has no permissions"),
     )
     assert fake_redis_client.health_check() is False
@@ -315,7 +323,8 @@ def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
     import redis as _redis
 
     mocker.patch.object(
-        fake_redis_client._client, "xgroup_create",
+        fake_redis_client._client,
+        "xgroup_create",
         side_effect=_redis.ResponseError("WRONGTYPE Operation against a key"),
     )
     with pytest.raises(_redis.ResponseError, match="WRONGTYPE"):

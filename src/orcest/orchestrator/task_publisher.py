@@ -15,9 +15,7 @@ from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
-_RUN_ID_RE = re.compile(
-    r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)"
-)
+_RUN_ID_RE = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)")
 
 # Per-check log excerpt limit (errors are at the end of logs)
 _PER_CHECK_LOG_LIMIT = 5000
@@ -91,9 +89,9 @@ def _publish_and_notify(
         )
     try:
         gh.post_comment(
-            repo, pr_state.number,
-            f"**orcest** queued task `{task.id}` ({task_type.value}) "
-            f"for this PR.",
+            repo,
+            pr_state.number,
+            f"**orcest** queued task `{task.id}` ({task_type.value}) for this PR.",
             token,
         )
     except Exception:
@@ -105,10 +103,7 @@ def _publish_and_notify(
         )
 
     if _label_ok and _comment_ok:
-        _log.info(
-            f"Published {task_type.value} task {task.id} "
-            f"for PR #{pr_state.number}"
-        )
+        _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
     else:
         _log.warning(
             f"Published {task_type.value} task {task.id} "
@@ -155,9 +150,7 @@ def publish_fix_task(
         if run_id is not None:
             if run_id not in run_logs_cache:
                 try:
-                    run_logs_cache[run_id] = gh.get_failed_run_logs(
-                        repo, run_id, token
-                    )
+                    run_logs_cache[run_id] = gh.get_failed_run_logs(repo, run_id, token)
                 except Exception:
                     # Never let log fetching break task creation
                     run_logs_cache[run_id] = ""
@@ -166,11 +159,13 @@ def publish_fix_task(
         ci_logs[check_name] = log_text
 
         classification = classify_ci_failure(check_name, log_text)
-        failure_summaries.append({
-            "name": check_name,
-            "classification": classification.value,
-            "details_url": details_url,
-        })
+        failure_summaries.append(
+            {
+                "name": check_name,
+                "classification": classification.value,
+                "details_url": details_url,
+            }
+        )
 
         if classification == CIFailureType.CODE:
             task_type = TaskType.FIX_CI
@@ -322,19 +317,21 @@ def _render_followup_prompt(
     sections.append("")
     sections.extend(_render_review_threads(review_threads))
 
-    sections.extend([
-        "## Instructions",
-        "",
-        "1. Read each unresolved review thread above.",
-        f"2. Create GitHub issues for follow-up work "
-        f"(`gh issue create --repo {repo} --title \"...\" --body \"...\"`) "
-        f"-- group related items into single issues where appropriate.",
-        "3. Reply to each thread with a comment linking to the created issue.",
-        "4. Resolve each thread after creating the issue.",
-        "5. Do NOT make code changes -- this is triage only.",
-        "6. Do NOT call `gh pr review --approve` or `--request-changes` "
-        "-- you are not authorized to change review status.",
-    ])
+    sections.extend(
+        [
+            "## Instructions",
+            "",
+            "1. Read each unresolved review thread above.",
+            f"2. Create GitHub issues for follow-up work "
+            f'(`gh issue create --repo {repo} --title "..." --body "..."`) '
+            f"-- group related items into single issues where appropriate.",
+            "3. Reply to each thread with a comment linking to the created issue.",
+            "4. Resolve each thread after creating the issue.",
+            "5. Do NOT make code changes -- this is triage only.",
+            "6. Do NOT call `gh pr review --approve` or `--request-changes` "
+            "-- you are not authorized to change review status.",
+        ]
+    )
 
     return "\n".join(sections)
 
@@ -370,9 +367,7 @@ def _render_fix_prompt(
         sections.append("")
         log_budget = _TOTAL_LOG_BUDGET
         for failure in ci_failures:
-            sections.append(
-                f"- **{failure['name']}** ({failure['classification']})"
-            )
+            sections.append(f"- **{failure['name']}** ({failure['classification']})")
             if failure.get("details_url"):
                 sections.append(f"  Details: {failure['details_url']}")
             # Include log excerpt if available
@@ -382,10 +377,7 @@ def _render_fix_prompt(
                     max_len = min(_PER_CHECK_LOG_LIMIT, log_budget)
                     excerpt = log_text[-max_len:]
                     if len(log_text) > max_len:
-                        excerpt = (
-                            f"... (truncated, showing last {max_len} chars)\n"
-                            + excerpt
-                        )
+                        excerpt = f"... (truncated, showing last {max_len} chars)\n" + excerpt
                     sections.append("")
                     sections.append(f"  **Log output for {failure['name']}:**")
                     sections.append("")
@@ -408,38 +400,39 @@ def _render_fix_prompt(
         sections.extend(_render_review_threads(review_threads))
         sections.append("Address all review feedback above.")
         if ci_is_green:
-            sections.append(
-                "After fixing each item, resolve the corresponding "
-                "review thread."
-            )
+            sections.append("After fixing each item, resolve the corresponding review thread.")
         sections.append("")
 
     truncated = len(diff) > 10000
-    sections.extend([
-        "## Current Diff (against base branch)",
-        "",
-        "```diff",
-        diff[:10000],
-        "```",
-    ])
+    sections.extend(
+        [
+            "## Current Diff (against base branch)",
+            "",
+            "```diff",
+            diff[:10000],
+            "```",
+        ]
+    )
     if truncated:
         sections.append(
             f"*Note: diff truncated from {len(diff)} to 10,000 characters. "
             f"Review the full files in the repository for complete context.*"
         )
-    sections.extend([
-        "",
-        "## Instructions",
-        "",
-        "1. Read the CI failure details and/or review feedback carefully.",
-        "2. Make the minimal changes needed to fix the issues.",
-        "3. Run the project's linter/tests to verify your fix.",
-        "4. Commit your changes with a descriptive message.",
-        "5. Push to the branch.",
-        "6. Do NOT call `gh pr review --approve` or `--request-changes` "
-        "-- you are not authorized to change review status.",
-        "",
-        "Push to the existing branch. Do not create new PRs.",
-    ])
+    sections.extend(
+        [
+            "",
+            "## Instructions",
+            "",
+            "1. Read the CI failure details and/or review feedback carefully.",
+            "2. Make the minimal changes needed to fix the issues.",
+            "3. Run the project's linter/tests to verify your fix.",
+            "4. Commit your changes with a descriptive message.",
+            "5. Push to the branch.",
+            "6. Do NOT call `gh pr review --approve` or `--request-changes` "
+            "-- you are not authorized to change review status.",
+            "",
+            "Push to the existing branch. Do not create new PRs.",
+        ]
+    )
 
     return "\n".join(sections)

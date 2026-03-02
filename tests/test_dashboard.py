@@ -64,15 +64,18 @@ def test_active_locks(fake_redis_client):
 def test_recent_results(fake_redis_client):
     """Reads recent results in reverse chronological order."""
     for i in range(5):
-        fake_redis_client.xadd("results", {
-            "task_id": f"task-{i}",
-            "worker_id": "w1",
-            "status": "completed",
-            "resource_type": "pr",
-            "resource_id": str(i),
-            "duration_seconds": "30",
-            "summary": f"Fixed PR {i}",
-        })
+        fake_redis_client.xadd(
+            "results",
+            {
+                "task_id": f"task-{i}",
+                "worker_id": "w1",
+                "status": "completed",
+                "resource_type": "pr",
+                "resource_id": str(i),
+                "duration_seconds": "30",
+                "summary": f"Fixed PR {i}",
+            },
+        )
 
     snap = fetch_snapshot(fake_redis_client, max_results=3)
 
@@ -123,11 +126,13 @@ def test_connection_lost_during_fetch(fake_redis_client, mocker):
 
 def _assistant_msg(*content_blocks: dict) -> str:
     """Build a stream-json assistant message line."""
-    return json.dumps({
-        "type": "message",
-        "role": "assistant",
-        "content": list(content_blocks),
-    })
+    return json.dumps(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": list(content_blocks),
+        }
+    )
 
 
 @pytest.mark.unit
@@ -142,93 +147,111 @@ class TestFormatStreamJsonLine:
 
     def test_format_tool_use_bash(self):
         """Bash tool use shows '$ command'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Bash",
-            "input": {"command": "npm test"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "npm test"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  $ npm test"
 
     def test_format_tool_use_bash_truncates_long_command(self):
         """Bash command is truncated to 120 chars."""
         long_cmd = "x" * 200
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Bash",
-            "input": {"command": long_cmd},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": long_cmd},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == f"  $ {'x' * 120}"
 
     def test_format_tool_use_read(self):
         """Read tool shows 'Read /path'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Read",
-            "input": {"file_path": "/src/main.py"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"file_path": "/src/main.py"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  Read /src/main.py"
 
     def test_format_tool_use_edit(self):
         """Edit tool shows 'Edit /path'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Edit",
-            "input": {"file_path": "/src/main.py"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Edit",
+                "input": {"file_path": "/src/main.py"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  Edit /src/main.py"
 
     def test_format_tool_use_write(self):
         """Write tool shows 'Write /path'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Write",
-            "input": {"file_path": "/src/new_file.py"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Write",
+                "input": {"file_path": "/src/new_file.py"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  Write /src/new_file.py"
 
     def test_format_tool_use_glob(self):
         """Glob tool shows 'Glob pattern'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Glob",
-            "input": {"pattern": "**/*.py"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Glob",
+                "input": {"pattern": "**/*.py"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  Glob **/*.py"
 
     def test_format_tool_use_grep(self):
         """Grep tool shows 'Grep pattern'."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Grep",
-            "input": {"pattern": "def main"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Grep",
+                "input": {"pattern": "def main"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  Grep def main"
 
     def test_format_tool_use_generic(self):
         """Unknown tool name shows just the tool name."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "WebSearch",
-            "input": {"query": "python docs"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "WebSearch",
+                "input": {"query": "python docs"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result == "  WebSearch"
 
     def test_format_tool_use_non_dict_input(self):
         """Tool use with non-dict input does not crash."""
         for bad_input in ("a string", ["a", "list"], 42, None):
-            line = _assistant_msg({
-                "type": "tool_use",
-                "name": "Bash",
-                "input": bad_input,
-            })
+            line = _assistant_msg(
+                {
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": bad_input,
+                }
+            )
             result = format_stream_json_line(line)
             assert result is not None  # falls through to "$ ?"
 
@@ -261,11 +284,13 @@ class TestFormatStreamJsonLine:
 
     def test_format_task_start_marker(self):
         """task_start marker renders as separator line."""
-        line = json.dumps({
-            "type": "task_start",
-            "task_id": "abc123",
-            "resource": "pr #42",
-        })
+        line = json.dumps(
+            {
+                "type": "task_start",
+                "task_id": "abc123",
+                "resource": "pr #42",
+            }
+        )
         result = format_stream_json_line(line)
         assert result is not None
         assert "abc123" in result
@@ -274,11 +299,13 @@ class TestFormatStreamJsonLine:
 
     def test_format_task_end_marker(self):
         """task_end marker renders as separator line with status."""
-        line = json.dumps({
-            "type": "task_end",
-            "task_id": "abc123",
-            "status": "completed",
-        })
+        line = json.dumps(
+            {
+                "type": "task_end",
+                "task_id": "abc123",
+                "status": "completed",
+            }
+        )
         result = format_stream_json_line(line)
         assert result is not None
         assert "abc123" in result
@@ -307,11 +334,13 @@ class TestFormatStreamJsonLine:
 
     def test_format_escapes_rich_markup_in_bash_command(self):
         """Rich markup in Bash commands is escaped."""
-        line = _assistant_msg({
-            "type": "tool_use",
-            "name": "Bash",
-            "input": {"command": "echo '[red]error[/red]'"},
-        })
+        line = _assistant_msg(
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "echo '[red]error[/red]'"},
+            }
+        )
         result = format_stream_json_line(line)
         assert result is not None
         assert "\\[red]" in result
@@ -319,11 +348,13 @@ class TestFormatStreamJsonLine:
 
     def test_format_escapes_rich_markup_in_task_start(self):
         """Rich markup in task_start fields is escaped."""
-        line = json.dumps({
-            "type": "task_start",
-            "task_id": "[bold]id",
-            "resource": "[red]res",
-        })
+        line = json.dumps(
+            {
+                "type": "task_start",
+                "task_id": "[bold]id",
+                "resource": "[red]res",
+            }
+        )
         result = format_stream_json_line(line)
         assert result is not None
         assert "\\[bold]" in result
@@ -331,10 +362,12 @@ class TestFormatStreamJsonLine:
 
     def test_format_stream_json_line_content_not_list(self):
         """Assistant message where content is a string instead of a list returns None."""
-        line = json.dumps({
-            "role": "assistant",
-            "content": "just a plain string",
-        })
+        line = json.dumps(
+            {
+                "role": "assistant",
+                "content": "just a plain string",
+            }
+        )
         assert format_stream_json_line(line) is None
 
     def test_format_stream_json_line_empty_text_block(self):
@@ -431,9 +464,7 @@ class TestDiscoverWorkers:
         result = discover_workers(fake_redis_client)
         assert result == ["worker-1", "worker-2"]
 
-    def test_discover_workers_connection_error_returns_empty(
-        self, fake_redis_client, mocker
-    ):
+    def test_discover_workers_connection_error_returns_empty(self, fake_redis_client, mocker):
         """Returns empty list when scan_iter raises ConnectionError."""
         mocker.patch.object(
             fake_redis_client.client,

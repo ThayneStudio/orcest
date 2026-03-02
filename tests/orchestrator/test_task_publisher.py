@@ -174,22 +174,23 @@ def _make_ci_failures_with_urls(
     for i, run_id in enumerate(run_ids):
         name = (names[i] if names else None) or f"check-{i}"
         if run_id is not None:
-            url = (
-                f"https://github.com/org/repo/actions/runs/{run_id}"
-                f"/job/{9000 + i}"
-            )
+            url = f"https://github.com/org/repo/actions/runs/{run_id}/job/{9000 + i}"
         else:
             url = "https://circleci.com/gh/org/repo/12345"
-        failures.append({
-            "name": name,
-            "conclusion": "FAILURE",
-            "detailsUrl": url,
-        })
+        failures.append(
+            {
+                "name": name,
+                "conclusion": "FAILURE",
+                "detailsUrl": url,
+            }
+        )
     return failures
 
 
 def test_publish_fetches_ci_logs_from_details_url(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """When a check has a detailsUrl with a run_id, logs are fetched and
     included in the prompt."""
@@ -197,9 +198,7 @@ def test_publish_fetches_ci_logs_from_details_url(
     sample_logs = "Step 4/5\nERROR: pytest FAILED test_foo.py::test_bar"
     gh_mock.get_failed_run_logs.return_value = sample_logs
 
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[77001], names=["tests"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[77001], names=["tests"])
     pr_state = _make_pr_state(number=50, ci_failures=ci_failures)
 
     task = publish_fix_task(
@@ -212,9 +211,7 @@ def test_publish_fetches_ci_logs_from_details_url(
     )
 
     # Verify get_failed_run_logs was called with the correct run ID
-    gh_mock.get_failed_run_logs.assert_called_once_with(
-        "test-org/test-repo", 77001, "fake-token"
-    )
+    gh_mock.get_failed_run_logs.assert_called_once_with("test-org/test-repo", 77001, "fake-token")
     # Log content should appear in the prompt
     assert "pytest FAILED test_foo.py::test_bar" in task.prompt
     # Check that the log section header is present
@@ -222,16 +219,16 @@ def test_publish_fetches_ci_logs_from_details_url(
 
 
 def test_publish_deduplicates_run_log_fetches(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Two checks sharing the same run_id only trigger one log fetch."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = "some log output"
 
     # Two checks, same run_id
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[55555, 55555], names=["lint", "typecheck"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[55555, 55555], names=["lint", "typecheck"])
     pr_state = _make_pr_state(number=51, ci_failures=ci_failures)
 
     publish_fix_task(
@@ -244,13 +241,13 @@ def test_publish_deduplicates_run_log_fetches(
     )
 
     # Should only fetch once despite two checks
-    gh_mock.get_failed_run_logs.assert_called_once_with(
-        "test-org/test-repo", 55555, "fake-token"
-    )
+    gh_mock.get_failed_run_logs.assert_called_once_with("test-org/test-repo", 55555, "fake-token")
 
 
 def test_publish_graceful_on_log_fetch_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """If log fetching raises an exception, task creation still succeeds."""
     _setup_gh_defaults(gh_mock)
@@ -258,9 +255,7 @@ def test_publish_graceful_on_log_fetch_failure(
         "gh command failed (exit 1): not found", stderr="not found"
     )
 
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[99999], names=["tests"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[99999], names=["tests"])
     pr_state = _make_pr_state(number=52, ci_failures=ci_failures)
 
     task = publish_fix_task(
@@ -280,16 +275,16 @@ def test_publish_graceful_on_log_fetch_failure(
 
 
 def test_publish_handles_non_github_actions_url(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Third-party CI URLs (no run_id) don't trigger log fetching."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
 
     # run_id=None produces a non-GitHub-Actions URL
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[None], names=["circleci/build"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[None], names=["circleci/build"])
     pr_state = _make_pr_state(number=53, ci_failures=ci_failures)
 
     task = publish_fix_task(
@@ -309,7 +304,9 @@ def test_publish_handles_non_github_actions_url(
 
 
 def test_prompt_truncates_long_ci_logs(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """CI logs longer than 5000 chars are truncated to the last 5000."""
     _setup_gh_defaults(gh_mock)
@@ -317,9 +314,7 @@ def test_prompt_truncates_long_ci_logs(
     long_log = "x" * 3000 + "REAL_ERROR_AT_END" + "y" * 3000
     gh_mock.get_failed_run_logs.return_value = long_log
 
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[88888], names=["tests"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[88888], names=["tests"])
     pr_state = _make_pr_state(number=54, ci_failures=ci_failures)
 
     task = publish_fix_task(
@@ -367,14 +362,18 @@ def _make_sample_threads() -> list[dict]:
 
 
 def test_publish_review_fix_includes_thread_details(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Review fix prompt includes file path, line number, author, and body
     from each review thread."""
     _setup_gh_defaults(gh_mock)
     threads = _make_sample_threads()
     pr_state = _make_pr_state(
-        number=200, ci_failures=[], review_threads=threads,
+        number=200,
+        ci_failures=[],
+        review_threads=threads,
     )
 
     task = publish_fix_task(
@@ -399,14 +398,18 @@ def test_publish_review_fix_includes_thread_details(
 
 
 def test_publish_review_fix_resolve_instructions(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Review fix prompt includes thread resolution instruction and
     prohibits calling gh pr review."""
     _setup_gh_defaults(gh_mock)
     threads = _make_sample_threads()
     pr_state = _make_pr_state(
-        number=201, ci_failures=[], review_threads=threads,
+        number=201,
+        ci_failures=[],
+        review_threads=threads,
     )
 
     task = publish_fix_task(
@@ -423,7 +426,9 @@ def test_publish_review_fix_resolve_instructions(
 
 
 def test_publish_followup_triage_prompt(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Followup triage prompt contains triage instructions, gh issue create,
     prohibition on code changes, and thread details."""
@@ -466,14 +471,19 @@ def test_publish_followup_triage_prompt(
 
 
 def test_publish_ci_fix_no_thread_details(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """CI fix prompt does NOT contain review thread sections."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
     ci_failures = [
-        {"name": "pytest", "conclusion": "FAILURE",
-         "detailsUrl": "https://circleci.com/gh/org/repo/999"},
+        {
+            "name": "pytest",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://circleci.com/gh/org/repo/999",
+        },
     ]
     pr_state = _make_pr_state(number=203, ci_failures=ci_failures)
 
@@ -494,7 +504,9 @@ def test_publish_ci_fix_no_thread_details(
 
 
 def test_ci_failures_suppress_review_threads_in_prompt(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """When both CI failures and review threads are present, the prompt
     should contain CI failure details but NOT review thread sections.
@@ -503,12 +515,17 @@ def test_ci_failures_suppress_review_threads_in_prompt(
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
     ci_failures = [
-        {"name": "pytest", "conclusion": "FAILURE",
-         "detailsUrl": "https://circleci.com/gh/org/repo/999"},
+        {
+            "name": "pytest",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://circleci.com/gh/org/repo/999",
+        },
     ]
     threads = _make_sample_threads()
     pr_state = _make_pr_state(
-        number=204, ci_failures=ci_failures, review_threads=threads,
+        number=204,
+        ci_failures=ci_failures,
+        review_threads=threads,
     )
 
     task = publish_fix_task(
@@ -533,7 +550,9 @@ def test_ci_failures_suppress_review_threads_in_prompt(
 
 
 def test_publish_fix_task_survives_label_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """publish_fix_task returns a task even when add_label raises, because
     the task is already in Redis and must not be lost."""
@@ -558,7 +577,9 @@ def test_publish_fix_task_survives_label_failure(
 
 
 def test_publish_fix_task_survives_comment_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """publish_fix_task returns a task even when post_comment raises."""
     _setup_gh_defaults(gh_mock)
@@ -581,7 +602,9 @@ def test_publish_fix_task_survives_comment_failure(
 
 
 def test_publish_followup_task_survives_label_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """publish_followup_task returns a task even when add_label raises."""
     _setup_gh_defaults(gh_mock)
@@ -611,7 +634,9 @@ def test_publish_followup_task_survives_label_failure(
 
 
 def test_publish_followup_task_survives_comment_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """publish_followup_task returns a task even when post_comment raises."""
     _setup_gh_defaults(gh_mock)
@@ -646,7 +671,9 @@ def test_publish_followup_task_survives_comment_failure(
 
 
 def test_review_fix_prompt_handles_missing_thread_fields(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Review threads with None line numbers and missing fields render safely
     when published through publish_fix_task."""
@@ -663,7 +690,9 @@ def test_review_fix_prompt_handles_missing_thread_fields(
         },
     ]
     pr_state = _make_pr_state(
-        number=400, ci_failures=[], review_threads=threads,
+        number=400,
+        ci_failures=[],
+        review_threads=threads,
     )
 
     task = publish_fix_task(
@@ -682,7 +711,9 @@ def test_review_fix_prompt_handles_missing_thread_fields(
 
 
 def test_publish_followup_task_rejects_empty_threads(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """publish_followup_task raises ValueError when review_threads is empty,
     because there is nothing to triage."""
@@ -713,7 +744,9 @@ def test_publish_followup_task_rejects_empty_threads(
 
 
 def test_publish_fix_task_sets_fix_ci_type(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """When CI failure is classified as CIFailureType.CODE, the task type
     should be TaskType.FIX_CI."""
@@ -723,9 +756,7 @@ def test_publish_fix_task_sets_fix_ci_type(
         "Collecting tests...\nERROR: SyntaxError: invalid syntax\n"
     )
 
-    ci_failures = _make_ci_failures_with_urls(
-        run_ids=[12345], names=["tests"]
-    )
+    ci_failures = _make_ci_failures_with_urls(run_ids=[12345], names=["tests"])
     pr_state = _make_pr_state(number=600, ci_failures=ci_failures)
 
     task = publish_fix_task(
@@ -746,9 +777,7 @@ def test_extract_run_id_direct():
     from orcest.orchestrator.task_publisher import _extract_run_id
 
     # Valid GitHub Actions URL extracts the integer run ID
-    assert _extract_run_id(
-        "https://github.com/org/repo/actions/runs/123456/job/789"
-    ) == 123456
+    assert _extract_run_id("https://github.com/org/repo/actions/runs/123456/job/789") == 123456
 
     # Non-matching URL returns None
     assert _extract_run_id("https://circleci.com/gh/org/repo/12345") is None
@@ -758,7 +787,9 @@ def test_extract_run_id_direct():
 
 
 def test_publish_fix_task_diff_fetch_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """When gh.get_pr_diff raises GhCliError, the exception propagates
     (publish_fix_task does not catch it)."""
@@ -780,7 +811,9 @@ def test_publish_fix_task_diff_fetch_failure(
 
 
 def test_publish_fix_task_log_budget_exhaustion(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """Multiple CI checks that collectively exhaust the 15k total budget.
     The last check should get truncated or empty log in the prompt.
@@ -833,7 +866,10 @@ def test_publish_fix_task_log_budget_exhaustion(
 
 
 def test_publish_and_notify_both_label_and_comment_fail(
-    gh_mock, fake_redis_client, label_config, caplog,
+    gh_mock,
+    fake_redis_client,
+    label_config,
+    caplog,
 ):
     """Both add_label and post_comment raise simultaneously. The warning
     log should indicate both failed."""
@@ -865,7 +901,9 @@ def test_publish_and_notify_both_label_and_comment_fail(
 
 
 def test_publish_and_notify_xadd_failure(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """When redis.xadd raises (Redis down after task construction), the
     exception should propagate."""
@@ -874,8 +912,10 @@ def test_publish_and_notify_xadd_failure(
 
     # Sabotage xadd to simulate Redis failure
     original_xadd = fake_redis_client.xadd
+
     def broken_xadd(stream, fields):
         raise ConnectionError("Redis connection lost")
+
     fake_redis_client.xadd = broken_xadd
 
     try:

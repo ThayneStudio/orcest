@@ -212,9 +212,7 @@ def test_run_claude_usage_exhausted_no_retry(mock_popen, mocker, tmp_path):
     mock_cls, mock_proc = mock_popen
 
     mock_proc.stdout = iter([])
-    mock_proc.stderr = iter(
-        ["Error: usage limit reached for this billing period\n"]
-    )
+    mock_proc.stderr = iter(["Error: usage limit reached for this billing period\n"])
     mock_proc.returncode = 1
 
     mocker.patch("orcest.worker.claude_runner.time.sleep")
@@ -352,9 +350,7 @@ def test_on_output_called_per_line(mock_popen, mocker, tmp_path):
     )
 
     captured: list[str] = []
-    result = run_claude(
-        PROMPT, tmp_path, TOKEN, max_retries=1, on_output=captured.append
-    )
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, on_output=captured.append)
 
     assert result.success is True
     assert len(captured) == 3
@@ -395,9 +391,7 @@ def test_timeout_during_streaming_calls_on_output(mock_popen, mocker, tmp_path):
     mock_proc.stdout = iter(lines)
     mock_proc.stderr = iter([])
 
-    kill_mock = mocker.patch(
-        "orcest.worker.claude_runner._kill_process_tree"
-    )
+    kill_mock = mocker.patch("orcest.worker.claude_runner._kill_process_tree")
 
     mocker.patch("orcest.worker.claude_runner.time.sleep")
     # start_time=0, attempt_start=0, watchdog_remaining_calc=0(->60s left),
@@ -410,8 +404,12 @@ def test_timeout_during_streaming_calls_on_output(mock_popen, mocker, tmp_path):
 
     captured: list[str] = []
     result = run_claude(
-        PROMPT, tmp_path, TOKEN,
-        timeout=60, max_retries=1, on_output=captured.append,
+        PROMPT,
+        tmp_path,
+        TOKEN,
+        timeout=60,
+        max_retries=1,
+        on_output=captured.append,
     )
 
     assert result.success is False
@@ -447,7 +445,11 @@ def test_on_output_exception_disables_callback(mock_popen, mocker, tmp_path):
             raise RuntimeError("callback exploded")
 
     result = run_claude(
-        PROMPT, tmp_path, TOKEN, max_retries=1, on_output=bad_callback,
+        PROMPT,
+        tmp_path,
+        TOKEN,
+        max_retries=1,
+        on_output=bad_callback,
     )
 
     # Task should still succeed -- callback failure is non-fatal
@@ -464,9 +466,7 @@ def test_stderr_captured_via_thread(mock_popen, mocker, tmp_path):
     _, mock_proc = mock_popen
 
     mock_proc.stdout = iter([])
-    mock_proc.stderr = iter(
-        ["rate limit exceeded\n"]
-    )
+    mock_proc.stderr = iter(["rate limit exceeded\n"])
     mock_proc.returncode = 1
 
     mocker.patch("orcest.worker.claude_runner.time.sleep")

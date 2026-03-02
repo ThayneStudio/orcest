@@ -160,7 +160,9 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     _poll_cycle(orchestrator_config, fake_redis_client, logger)
 
     gh_mock.merge_pr.assert_called_once_with(
-        orchestrator_config.github.repo, 40, orchestrator_config.github.token,
+        orchestrator_config.github.repo,
+        40,
+        orchestrator_config.github.token,
     )
     # On successful merge, should post a confirmation comment
     gh_mock.post_comment.assert_called_once()
@@ -169,7 +171,10 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
 
 
 def test_poll_cycle_merge_failure_labels_needs_human(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """When merge fails, the PR is labeled needs-human and a comment is posted."""
     pr_state = PRState(
@@ -197,7 +202,8 @@ def test_poll_cycle_merge_failure_labels_needs_human(
 
     # Should label needs-human after merge failure
     gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo, 41,
+        orchestrator_config.github.repo,
+        41,
         orchestrator_config.labels.needs_human,
         orchestrator_config.github.token,
     )
@@ -209,7 +215,10 @@ def test_poll_cycle_merge_failure_labels_needs_human(
 
 
 def test_poll_cycle_skip_max_attempts_labels_and_comments(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """SKIP_MAX_ATTEMPTS adds needs-human label and posts an explanatory comment."""
     pr_state = _make_pr_state(number=50, action=PRAction.SKIP_MAX_ATTEMPTS)
@@ -227,7 +236,8 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
 
     # Should add needs-human label
     gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo, 50,
+        orchestrator_config.github.repo,
+        50,
         orchestrator_config.labels.needs_human,
         orchestrator_config.github.token,
     )
@@ -327,7 +337,9 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(
-        status=ResultStatus.USAGE_EXHAUSTED, pr_number=60, branch="fix/widget",
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=60,
+        branch="fix/widget",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
@@ -358,13 +370,17 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
 
 
 def test_consume_results_usage_exhausted_no_branch(
-    fake_redis_client, orchestrator_config, gh_mock,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """A USAGE_EXHAUSTED result with no branch uses generic 'Work saved.' note."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(
-        status=ResultStatus.USAGE_EXHAUSTED, pr_number=61, branch="",
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=61,
+        branch="",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
@@ -418,7 +434,10 @@ def test_consume_results_empty(fake_redis_client, orchestrator_config, gh_mock):
 
 
 def test_consume_results_xack_failure_continues(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """When redis.xack raises, processing continues (entry was handled, just not acked)."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
@@ -428,7 +447,9 @@ def test_consume_results_xack_failure_continues(
 
     # Make xack raise an exception
     mocker.patch.object(
-        fake_redis_client, "xack", side_effect=RuntimeError("ACK failed"),
+        fake_redis_client,
+        "xack",
+        side_effect=RuntimeError("ACK failed"),
     )
 
     logger = logging.getLogger("test")
@@ -442,7 +463,9 @@ def test_consume_results_xack_failure_continues(
 
 
 def test_consume_results_blocked_status_posts_comment(
-    fake_redis_client, orchestrator_config, gh_mock,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """A result with BLOCKED status still posts a comment (falls to else branch)."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
@@ -480,7 +503,10 @@ def test_consume_results_blocked_status_posts_comment(
 
 
 def test_poll_cycle_merge_comment_failure_logged(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """Merge succeeds but post_comment raises -- merge still happened, comment just failed."""
     pr_state = PRState(
@@ -511,14 +537,19 @@ def test_poll_cycle_merge_comment_failure_logged(
 
     # merge_pr was still called successfully
     gh_mock.merge_pr.assert_called_once_with(
-        orchestrator_config.github.repo, 80, orchestrator_config.github.token,
+        orchestrator_config.github.repo,
+        80,
+        orchestrator_config.github.token,
     )
     # post_comment was attempted (and failed)
     gh_mock.post_comment.assert_called_once()
 
 
 def test_poll_cycle_merge_fail_label_fail(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """Merge fails AND add_label('orcest:needs-human') raises -- labeled=False in comment."""
     pr_state = PRState(
@@ -555,7 +586,10 @@ def test_poll_cycle_merge_fail_label_fail(
 
 
 def test_poll_cycle_enqueue_fix_publish_failure(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """publish_fix_task raises -- exception is logged, loop continues (no crash)."""
     pr_state = _make_pr_state(number=82, action=PRAction.ENQUEUE_FIX)
@@ -579,7 +613,10 @@ def test_poll_cycle_enqueue_fix_publish_failure(
 
 
 def test_poll_cycle_enqueue_followup_publish_failure(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """publish_followup_task raises -- exception is logged, loop continues."""
     pr_state = PRState(
@@ -612,7 +649,10 @@ def test_poll_cycle_enqueue_followup_publish_failure(
 
 
 def test_poll_cycle_skip_max_attempts_label_failure(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """add_label raises during SKIP_MAX_ATTEMPTS -- labeled=False variant of the comment."""
     pr_state = _make_pr_state(number=84, action=PRAction.SKIP_MAX_ATTEMPTS)
@@ -642,7 +682,10 @@ def test_poll_cycle_skip_max_attempts_label_failure(
 
 
 def test_poll_cycle_skip_draft_action(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """Explicit test for SKIP_DRAFT action -- PR is not published/enqueued."""
     pr_state = _make_pr_state(number=85, action=PRAction.SKIP_DRAFT, ci_failures=[])
@@ -667,7 +710,10 @@ def test_poll_cycle_skip_draft_action(
 
 
 def test_poll_cycle_skip_pending_action(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """Explicit test for SKIP_PENDING action -- PR is not published/enqueued."""
     pr_state = _make_pr_state(number=86, action=PRAction.SKIP_PENDING, ci_failures=[])
@@ -697,7 +743,9 @@ def test_poll_cycle_skip_pending_action(
 
 
 def test_handle_result_failed_label_failure(
-    fake_redis_client, orchestrator_config, gh_mock,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """FAILED result where add_label raises -- comment says 'Failed to add'."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
@@ -719,7 +767,10 @@ def test_handle_result_failed_label_failure(
 
 
 def test_handle_result_post_comment_failure(
-    mocker, fake_redis_client, orchestrator_config, gh_mock,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
 ):
     """When post_comment raises in _handle_result, it should be logged (no crash)."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)

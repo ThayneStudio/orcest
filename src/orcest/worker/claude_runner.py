@@ -271,8 +271,7 @@ def run_claude(
             if attempt < max_retries:
                 if logger:
                     logger.warning(
-                        "Failed to create stderr drain thread; "
-                        f"retrying in {retry_backoff}s...",
+                        f"Failed to create stderr drain thread; retrying in {retry_backoff}s...",
                     )
                 time.sleep(retry_backoff)
             continue
@@ -298,9 +297,7 @@ def run_claude(
         # watchdog thread doesn't need to call time.monotonic().
         watchdog_cancelled = threading.Event()
         watchdog_killed = threading.Event()
-        watchdog_remaining = max(
-            0.0, timeout - (time.monotonic() - attempt_start)
-        )
+        watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
 
         def _watchdog(
             _proc: subprocess.Popen[str] = proc,
@@ -316,9 +313,7 @@ def run_claude(
                 _killed.set()
                 _kill_process_tree(_proc)
 
-        watchdog_thread = threading.Thread(
-            target=_watchdog, daemon=True
-        )
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
         try:
             watchdog_thread.start()
         except RuntimeError:
@@ -337,8 +332,7 @@ def run_claude(
             if attempt < max_retries:
                 if logger:
                     logger.warning(
-                        "Failed to create watchdog thread; "
-                        f"retrying in {retry_backoff}s...",
+                        f"Failed to create watchdog thread; retrying in {retry_backoff}s...",
                     )
                 time.sleep(retry_backoff)
             continue
@@ -449,8 +443,7 @@ def run_claude(
                 # Nothing more we can do; proceed with what we have.
                 if logger:
                     logger.warning(
-                        "Process did not exit after SIGKILL; "
-                        "proceeding with partial output"
+                        "Process did not exit after SIGKILL; proceeding with partial output"
                     )
         stderr_thread.join(timeout=5)
         _close_pipes(proc)
@@ -471,15 +464,9 @@ def run_claude(
             rc = proc.returncode
             if logger:
                 if rc is None:
-                    logger.warning(
-                        "Claude process did not exit; "
-                        f"stderr: {stderr[:500]}"
-                    )
+                    logger.warning(f"Claude process did not exit; stderr: {stderr[:500]}")
                 else:
-                    logger.warning(
-                        f"Claude exited with code {rc}: "
-                        f"{stderr[:500]}"
-                    )
+                    logger.warning(f"Claude exited with code {rc}: {stderr[:500]}")
             # Process stuck in D-state -- do NOT retry; the zombie
             # would leak resources and a fresh attempt is unlikely
             # to help if the system is in this state.

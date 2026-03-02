@@ -403,7 +403,10 @@ class TestWorkerIsolation:
             threads = []
             for cfg in configs:
                 t = threading.Thread(
-                    target=run_with_client, args=(cfg,), daemon=True, name=cfg.worker_id,
+                    target=run_with_client,
+                    args=(cfg,),
+                    daemon=True,
+                    name=cfg.worker_id,
                 )
                 threads.append(t)
 
@@ -439,9 +442,7 @@ class TestWorkerIsolation:
         # only one worker processes a task for a given PR at a time, and
         # redundant tasks for the same PR are discarded.
         results_count = redis.client.xlen(results_stream)
-        assert results_count >= 1, (
-            f"Expected at least 1 result, got {results_count}"
-        )
+        assert results_count >= 1, f"Expected at least 1 result, got {results_count}"
         assert errors == [], f"Worker errors: {errors}"
         assert active_count["max"] <= 1, (
             f"Concurrent executions detected! max={active_count['max']}"
@@ -552,7 +553,10 @@ class TestWorkerIsolation:
                     errors.append(str(e))
 
             t = threading.Thread(
-                target=run_worker_thread, args=(cfg,), daemon=True, name="skip-test-worker",
+                target=run_worker_thread,
+                args=(cfg,),
+                daemon=True,
+                name="skip-test-worker",
             )
             t.start()
 

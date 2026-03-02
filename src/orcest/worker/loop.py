@@ -101,17 +101,13 @@ def run_worker(config: WorkerConfig) -> None:
         )
 
         if not lock.acquire():
-            logger.warning(
-                f"Lock {lock_key} already held, skipping task {task.id}"
-            )
+            logger.warning(f"Lock {lock_key} already held, skipping task {task.id}")
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
             try:
                 redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
             except Exception:
-                logger.error(
-                    f"Failed to ACK skipped task {task.id}", exc_info=True
-                )
+                logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
             continue
 
         logger.info(f"Acquired lock {lock_key}")
@@ -122,7 +118,12 @@ def run_worker(config: WorkerConfig) -> None:
 
         try:
             result = _execute_task(
-                task, config, runner, workspace, redis, logger,
+                task,
+                config,
+                runner,
+                workspace,
+                redis,
+                logger,
             )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
@@ -141,13 +142,9 @@ def run_worker(config: WorkerConfig) -> None:
         # Publish result and ACK (only reached on normal execution)
         try:
             redis.xadd(RESULTS_STREAM, result.to_dict())
-            logger.info(
-                f"Published result for task {task.id}: {result.status.value}"
-            )
+            logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
-            logger.error(
-                f"Failed to publish result for task {task.id}", exc_info=True
-            )
+            logger.error(f"Failed to publish result for task {task.id}", exc_info=True)
             # Continue to ACK to avoid redelivery -- the orchestrator will
             # detect the missing result and may re-enqueue if needed
 
@@ -177,11 +174,14 @@ def _execute_task(
     try:
         # Publish task start marker (non-critical; don't fail the task)
         try:
-            redis.xadd_capped(output_stream, {
-                "type": "task_start",
-                "task_id": task.id,
-                "resource": f"{task.resource_type} #{task.resource_id}",
-            })
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_start",
+                    "task_id": task.id,
+                    "resource": f"{task.resource_type} #{task.resource_id}",
+                },
+            )
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
@@ -202,8 +202,7 @@ def _execute_task(
                 output_errors += 1
                 if output_errors == 1:
                     logger.warning(
-                        "Failed to publish output line to Redis "
-                        "(further errors suppressed)",
+                        "Failed to publish output line to Redis (further errors suppressed)",
                         exc_info=True,
                     )
 
@@ -227,11 +226,14 @@ def _execute_task(
             status = ResultStatus.FAILED
 
         try:
-            redis.xadd_capped(output_stream, {
-                "type": "task_end",
-                "task_id": task.id,
-                "status": status.value,
-            })
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_end",
+                    "task_id": task.id,
+                    "status": status.value,
+                },
+            )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 
@@ -251,11 +253,14 @@ def _execute_task(
         logger.error(f"Task execution failed: {e}", exc_info=True)
 
         try:
-            redis.xadd_capped(output_stream, {
-                "type": "task_end",
-                "task_id": task.id,
-                "status": ResultStatus.FAILED.value,
-            })
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_end",
+                    "task_id": task.id,
+                    "status": ResultStatus.FAILED.value,
+                },
+            )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 

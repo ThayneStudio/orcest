@@ -18,35 +18,43 @@ logger = logging.getLogger(__name__)
 
 # Terminal CheckRun conclusions that indicate CI is not green.
 # "neutral" and "skipped" are excluded as non-blocking outcomes.
-_FAILURE_CONCLUSIONS = frozenset({
-    "FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE",
-    "STARTUP_FAILURE",
-})
+_FAILURE_CONCLUSIONS = frozenset(
+    {
+        "FAILURE",
+        "CANCELLED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "STALE",
+        "STARTUP_FAILURE",
+    }
+)
 
 
 class PRAction(str, Enum):
     """What the orchestrator should do with a PR."""
-    MERGE = "merge"                  # Ready to merge (CI green + approved + no unresolved threads)
-    ENQUEUE_FIX = "enqueue_fix"      # CI failing or review feedback
+
+    MERGE = "merge"  # Ready to merge (CI green + approved + no unresolved threads)
+    ENQUEUE_FIX = "enqueue_fix"  # CI failing or review feedback
     ENQUEUE_FOLLOWUP = "enqueue_followup"  # Approved but unresolved threads — triage into issues
-    SKIP_LOCKED = "skip_locked"      # Another worker already on it
-    SKIP_LABELED = "skip_labeled"    # Already queued/in-progress
-    SKIP_GREEN = "skip_green"        # CI passing, nothing to do
-    SKIP_DRAFT = "skip_draft"        # Draft PR, ignore
-    SKIP_PENDING = "skip_pending"    # CI checks still running
+    SKIP_LOCKED = "skip_locked"  # Another worker already on it
+    SKIP_LABELED = "skip_labeled"  # Already queued/in-progress
+    SKIP_GREEN = "skip_green"  # CI passing, nothing to do
+    SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
+    SKIP_PENDING = "skip_pending"  # CI checks still running
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"  # Exhausted retry budget
 
 
 @dataclass
 class PRState:
     """Analyzed state of a PR."""
+
     number: int
     title: str
     branch: str
     head_sha: str
     action: PRAction
-    ci_failures: list[dict]          # Failed check runs
-    review_threads: list[dict]       # Actionable review comments
+    ci_failures: list[dict]  # Failed check runs
+    review_threads: list[dict]  # Actionable review comments
     labels: list[str]
 
 
@@ -140,36 +148,55 @@ def discover_actionable_prs(
         title: str = pr_data["title"]
         branch: str = pr_data["headRefName"]
         head_sha: str = pr_data.get("headRefOid", "")
-        pr_labels: list[str] = [
-            lbl.get("name", "") for lbl in (pr_data.get("labels") or [])
-        ]
+        pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
         # Skip if already labeled by orcest
         if any(label in orcest_labels for label in pr_labels):
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.SKIP_LABELED,
-                ci_failures=[], review_threads=[], labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_LABELED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
             continue
 
         # Skip draft PRs
         if pr_data.get("isDraft"):
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.SKIP_DRAFT,
-                ci_failures=[], review_threads=[], labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_DRAFT,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
             continue
 
         # Skip if locked in Redis
         lock_key = make_pr_lock_key(number)
         if redis.client.exists(lock_key):
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.SKIP_LOCKED,
-                ci_failures=[], review_threads=[], labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_LOCKED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
             continue
 
         # Check CI status -- wrapped in try/except so a single PR's
@@ -185,12 +212,10 @@ def discover_actionable_prs(
             continue
 
         ci_failures = [
-            c for c in checks
+            c
+            for c in checks
             if (c.get("conclusion") or "").upper() in _FAILURE_CONCLUSIONS
-            or (
-                not c.get("conclusion")
-                and (c.get("state") or "").upper() in ("FAILURE", "ERROR")
-            )
+            or (not c.get("conclusion") and (c.get("state") or "").upper() in ("FAILURE", "ERROR"))
         ]
         # A check is pending if it hasn't reached a terminal state.
         # statusCheckRollup can include both CheckRun objects (which have
@@ -198,7 +223,8 @@ def discover_actionable_prs(
         # - CheckRun: pending when "conclusion" is absent/empty (still running)
         # - StatusContext: pending when "state" is absent, empty, or "PENDING"
         ci_pending = [
-            c for c in checks
+            c
+            for c in checks
             if not c.get("conclusion")
             and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
         ]
@@ -209,13 +235,21 @@ def discover_actionable_prs(
             # rather than waiting for other checks to finish.
             logger.debug(
                 "PR #%d has %d check(s) still pending, skipping",
-                number, len(ci_pending),
+                number,
+                len(ci_pending),
             )
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.SKIP_PENDING,
-                ci_failures=[], review_threads=[], labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_PENDING,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
             continue
 
         # Check review state
@@ -227,65 +261,87 @@ def discover_actionable_prs(
             if attempts >= max_attempts:
                 logger.warning(
                     "PR #%d has reached %d attempts (max %d), skipping",
-                    number, attempts, max_attempts,
+                    number,
+                    attempts,
+                    max_attempts,
                 )
-                results.append(PRState(
-                    number=number, title=title, branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_MAX_ATTEMPTS,
-                    ci_failures=ci_failures, review_threads=[],
-                    labels=pr_labels,
-                ))
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_MAX_ATTEMPTS,
+                        ci_failures=ci_failures,
+                        review_threads=[],
+                        labels=pr_labels,
+                    )
+                )
                 continue
 
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.ENQUEUE_FIX,
-                ci_failures=ci_failures, review_threads=[],
-                labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.ENQUEUE_FIX,
+                    ci_failures=ci_failures,
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
         elif review_decision == "CHANGES_REQUESTED":
             # CI green but reviewer requested changes — enqueue fix
             attempts = get_attempt_count(redis, number, head_sha)
             if attempts >= max_attempts:
                 logger.warning(
                     "PR #%d has reached %d attempts (max %d), skipping",
-                    number, attempts, max_attempts,
+                    number,
+                    attempts,
+                    max_attempts,
                 )
-                results.append(PRState(
-                    number=number, title=title, branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_MAX_ATTEMPTS,
-                    ci_failures=[], review_threads=[],
-                    labels=pr_labels,
-                ))
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_MAX_ATTEMPTS,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                    )
+                )
                 continue
 
             # Fetch unresolved review threads for worker prompt context
             try:
-                threads = gh.get_unresolved_review_threads(
-                    repo, number, token
-                )
+                threads = gh.get_unresolved_review_threads(repo, number, token)
             except Exception:
                 logger.warning(
-                    "Failed to fetch review threads for PR #%d, "
-                    "enqueuing without thread details",
-                    number, exc_info=True,
+                    "Failed to fetch review threads for PR #%d, enqueuing without thread details",
+                    number,
+                    exc_info=True,
                 )
                 threads = []
 
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.ENQUEUE_FIX,
-                ci_failures=[], review_threads=threads,
-                labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.ENQUEUE_FIX,
+                    ci_failures=[],
+                    review_threads=threads,
+                    labels=pr_labels,
+                )
+            )
         elif review_decision == "APPROVED":
             # CI green + approved — check for unresolved threads
             try:
-                threads = gh.get_unresolved_review_threads(
-                    repo, number, token
-                )
+                threads = gh.get_unresolved_review_threads(repo, number, token)
             except Exception:
                 # Cannot verify thread state — do NOT merge. Fall through
                 # to SKIP_GREEN so the PR stays visible and gets retried
@@ -293,13 +349,21 @@ def discover_actionable_prs(
                 logger.warning(
                     "Failed to fetch review threads for PR #%d, "
                     "skipping merge until threads can be verified",
-                    number, exc_info=True,
+                    number,
+                    exc_info=True,
                 )
-                results.append(PRState(
-                    number=number, title=title, branch=branch,
-                    head_sha=head_sha, action=PRAction.SKIP_GREEN,
-                    ci_failures=[], review_threads=[], labels=pr_labels,
-                ))
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_GREEN,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                    )
+                )
                 continue
 
             if threads:
@@ -308,43 +372,68 @@ def discover_actionable_prs(
                 if attempts >= max_attempts:
                     logger.warning(
                         "PR #%d has reached %d attempts (max %d), skipping",
-                        number, attempts, max_attempts,
+                        number,
+                        attempts,
+                        max_attempts,
                     )
-                    results.append(PRState(
-                        number=number, title=title, branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_ATTEMPTS,
-                        ci_failures=[], review_threads=[],
-                        labels=pr_labels,
-                    ))
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_MAX_ATTEMPTS,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                        )
+                    )
                     continue
 
                 logger.info(
-                    "PR #%d is approved but has %d unresolved thread(s), "
-                    "enqueuing followup triage",
-                    number, len(threads),
+                    "PR #%d is approved but has %d unresolved thread(s), enqueuing followup triage",
+                    number,
+                    len(threads),
                 )
-                results.append(PRState(
-                    number=number, title=title, branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.ENQUEUE_FOLLOWUP,
-                    ci_failures=[], review_threads=threads,
-                    labels=pr_labels,
-                ))
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.ENQUEUE_FOLLOWUP,
+                        ci_failures=[],
+                        review_threads=threads,
+                        labels=pr_labels,
+                    )
+                )
             else:
                 # All clear — merge
-                results.append(PRState(
-                    number=number, title=title, branch=branch,
-                    head_sha=head_sha, action=PRAction.MERGE,
-                    ci_failures=[], review_threads=[],
-                    labels=pr_labels,
-                ))
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.MERGE,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                    )
+                )
         else:
             # CI green, no actionable review state
-            results.append(PRState(
-                number=number, title=title, branch=branch,
-                head_sha=head_sha, action=PRAction.SKIP_GREEN,
-                ci_failures=[], review_threads=[], labels=pr_labels,
-            ))
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_GREEN,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
 
     return results

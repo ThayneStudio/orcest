@@ -21,9 +21,7 @@ class NoopRunner:
 
     def __init__(self, duration: float = 0.01):
         if math.isnan(duration) or math.isinf(duration) or duration < 0:
-            raise ValueError(
-                f"duration must be a finite non-negative number, got {duration}"
-            )
+            raise ValueError(f"duration must be a finite non-negative number, got {duration}")
         self.duration = duration
 
     def run(
@@ -44,7 +42,5 @@ class NoopRunner:
                 on_output("noop\n")
             except Exception:
                 if logger:
-                    logger.warning(
-                        "on_output callback raised; ignoring", exc_info=True
-                    )
+                    logger.warning("on_output callback raised; ignoring", exc_info=True)
         return RunnerResult(success=True, summary="noop")

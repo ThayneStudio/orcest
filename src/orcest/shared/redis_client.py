@@ -94,9 +94,7 @@ class RedisClient:
         result: int = self._client.xack(stream, group, entry_id)  # type: ignore[assignment]
         return result
 
-    def xadd_capped(
-        self, stream: str, fields: dict[str, str], maxlen: int = 2000
-    ) -> str:
+    def xadd_capped(self, stream: str, fields: dict[str, str], maxlen: int = 2000) -> str:
         """Add entry to a capped stream (approximate MAXLEN).
 
         Args:
@@ -133,9 +131,7 @@ class RedisClient:
         if count < 1:
             raise ValueError(f"count must be positive, got {count}")
         try:
-            result = self._client.xread(
-                {stream: last_id}, count=count, block=None
-            )
+            result = self._client.xread({stream: last_id}, count=count, block=None)
         except (
             redis.ConnectionError,
             redis.TimeoutError,
@@ -144,7 +140,9 @@ class RedisClient:
         ):
             logger.warning(
                 "xread_after failed for stream %s (last_id=%s)",
-                stream, last_id, exc_info=True,
+                stream,
+                last_id,
+                exc_info=True,
             )
             return []
         if not result:
@@ -158,9 +156,7 @@ class RedisClient:
         Idempotent -- safe to call on every startup.
         """
         try:
-            self._client.xgroup_create(
-                name=stream, groupname=group, id="0", mkstream=True
-            )
+            self._client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
         except redis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise

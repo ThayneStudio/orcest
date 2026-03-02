@@ -257,42 +257,44 @@ def test_gh_error_raises_gh_cli_error(mocker):
 
 def test_get_unresolved_review_threads(mocker):
     """Only unresolved threads are returned, with correct structure."""
-    graphql_response = json.dumps({
-        "data": {
-            "repository": {
-                "pullRequest": {
-                    "reviewThreads": {
-                        "pageInfo": {"hasNextPage": False},
-                        "nodes": [
-                            {
-                                "id": "PRRT_resolved",
-                                "path": "src/old.py",
-                                "line": 10,
-                                "isResolved": True,
-                                "comments": {
-                                    "nodes": [
-                                        {"body": "Looks good now", "author": {"login": "alice"}}
-                                    ]
+    graphql_response = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_resolved",
+                                    "path": "src/old.py",
+                                    "line": 10,
+                                    "isResolved": True,
+                                    "comments": {
+                                        "nodes": [
+                                            {"body": "Looks good now", "author": {"login": "alice"}}
+                                        ]
+                                    },
                                 },
-                            },
-                            {
-                                "id": "PRRT_unresolved",
-                                "path": "src/foo.py",
-                                "line": 42,
-                                "isResolved": False,
-                                "comments": {
-                                    "nodes": [
-                                        {"body": "Fix this", "author": {"login": "reviewer1"}},
-                                        {"body": "Agreed", "author": {"login": "reviewer2"}},
-                                    ]
+                                {
+                                    "id": "PRRT_unresolved",
+                                    "path": "src/foo.py",
+                                    "line": 42,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "nodes": [
+                                            {"body": "Fix this", "author": {"login": "reviewer1"}},
+                                            {"body": "Agreed", "author": {"login": "reviewer2"}},
+                                        ]
+                                    },
                                 },
-                            },
-                        ]
+                            ],
+                        }
                     }
                 }
             }
         }
-    })
+    )
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=graphql_response,
@@ -312,41 +314,39 @@ def test_get_unresolved_review_threads(mocker):
 
 def test_get_unresolved_threads_all_resolved(mocker):
     """When all threads are resolved, an empty list is returned."""
-    graphql_response = json.dumps({
-        "data": {
-            "repository": {
-                "pullRequest": {
-                    "reviewThreads": {
-                        "pageInfo": {"hasNextPage": False},
-                        "nodes": [
-                            {
-                                "id": "PRRT_1",
-                                "path": "a.py",
-                                "line": 1,
-                                "isResolved": True,
-                                "comments": {
-                                    "nodes": [
-                                        {"body": "Done", "author": {"login": "bob"}}
-                                    ]
+    graphql_response = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_1",
+                                    "path": "a.py",
+                                    "line": 1,
+                                    "isResolved": True,
+                                    "comments": {
+                                        "nodes": [{"body": "Done", "author": {"login": "bob"}}]
+                                    },
                                 },
-                            },
-                            {
-                                "id": "PRRT_2",
-                                "path": "b.py",
-                                "line": 5,
-                                "isResolved": True,
-                                "comments": {
-                                    "nodes": [
-                                        {"body": "Fixed", "author": {"login": "carol"}}
-                                    ]
+                                {
+                                    "id": "PRRT_2",
+                                    "path": "b.py",
+                                    "line": 5,
+                                    "isResolved": True,
+                                    "comments": {
+                                        "nodes": [{"body": "Fixed", "author": {"login": "carol"}}]
+                                    },
                                 },
-                            },
-                        ]
+                            ],
+                        }
                     }
                 }
             }
         }
-    })
+    )
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=graphql_response,
@@ -418,9 +418,7 @@ def test_resolve_review_thread_graphql_error(mocker):
     """resolve_review_thread raises GhCliError when GraphQL returns errors."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "errors": [{"message": "Could not resolve to a node"}]
-        }),
+        return_value=json.dumps({"errors": [{"message": "Could not resolve to a node"}]}),
     )
     with pytest.raises(GhCliError, match="Could not resolve to a node"):
         resolve_review_thread("bad-id", TOKEN)
@@ -430,9 +428,7 @@ def test_get_unresolved_review_threads_null_repository(mocker):
     """Raises GhCliError when GraphQL returns null repository."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {"repository": None}
-        }),
+        return_value=json.dumps({"data": {"repository": None}}),
     )
     with pytest.raises(GhCliError, match="null repository"):
         get_unresolved_review_threads(REPO, 5, TOKEN)
@@ -442,9 +438,7 @@ def test_get_unresolved_review_threads_null_pull_request(mocker):
     """Raises GhCliError when GraphQL returns null pullRequest."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {"repository": {"pullRequest": None}}
-        }),
+        return_value=json.dumps({"data": {"repository": {"pullRequest": None}}}),
     )
     with pytest.raises(GhCliError, match="null pullRequest"):
         get_unresolved_review_threads(REPO, 999, TOKEN)
@@ -464,9 +458,7 @@ def test_get_unresolved_review_threads_graphql_error(mocker):
     """get_unresolved_review_threads raises GhCliError on GraphQL errors."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "errors": [{"message": "rate limited"}]
-        }),
+        return_value=json.dumps({"errors": [{"message": "rate limited"}]}),
     )
     with pytest.raises(GhCliError, match="rate limited"):
         get_unresolved_review_threads(REPO, 5, TOKEN)
@@ -512,9 +504,7 @@ def test_get_pr_empty_output_raises(mocker):
     """get_pr returns empty string -> raises GhCliError."""
     mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
-        return_value=subprocess.CompletedProcess(
-            args=["gh"], returncode=0, stdout="", stderr=""
-        ),
+        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="", stderr=""),
     )
     with pytest.raises(GhCliError, match="empty output"):
         get_pr(REPO, 1, TOKEN)
@@ -792,15 +782,17 @@ def test_get_unresolved_threads_null_review_threads(mocker):
     """reviewThreads is None -> returns empty list (no crash)."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "reviewThreads": None,
+        return_value=json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": None,
+                        }
                     }
                 }
             }
-        }),
+        ),
     )
     result = get_unresolved_review_threads(REPO, 5, TOKEN)
     assert result == []
@@ -810,30 +802,32 @@ def test_get_unresolved_threads_null_comment_author(mocker):
     """Comment with author=None -> author defaults to empty string."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "reviewThreads": {
-                            "pageInfo": {"hasNextPage": False},
-                            "nodes": [
-                                {
-                                    "id": "PRRT_1",
-                                    "path": "file.py",
-                                    "line": 10,
-                                    "isResolved": False,
-                                    "comments": {
-                                        "nodes": [
-                                            {"body": "Ghost comment", "author": None},
-                                        ]
+        return_value=json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [
+                                    {
+                                        "id": "PRRT_1",
+                                        "path": "file.py",
+                                        "line": 10,
+                                        "isResolved": False,
+                                        "comments": {
+                                            "nodes": [
+                                                {"body": "Ghost comment", "author": None},
+                                            ]
+                                        },
                                     },
-                                },
-                            ]
+                                ],
+                            }
                         }
                     }
                 }
             }
-        }),
+        ),
     )
     result = get_unresolved_review_threads(REPO, 5, TOKEN)
     assert len(result) == 1
@@ -845,34 +839,37 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
     """Logs a warning when a review thread has more than 10 comments."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "reviewThreads": {
-                            "pageInfo": {"hasNextPage": False},
-                            "nodes": [
-                                {
-                                    "id": "PRRT_many_comments",
-                                    "path": "big.py",
-                                    "line": 1,
-                                    "isResolved": False,
-                                    "comments": {
-                                        "pageInfo": {"hasNextPage": True},
-                                        "nodes": [
-                                            {"body": f"Comment {i}", "author": {"login": "u"}}
-                                            for i in range(10)
-                                        ],
+        return_value=json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [
+                                    {
+                                        "id": "PRRT_many_comments",
+                                        "path": "big.py",
+                                        "line": 1,
+                                        "isResolved": False,
+                                        "comments": {
+                                            "pageInfo": {"hasNextPage": True},
+                                            "nodes": [
+                                                {"body": f"Comment {i}", "author": {"login": "u"}}
+                                                for i in range(10)
+                                            ],
+                                        },
                                     },
-                                },
-                            ],
+                                ],
+                            }
                         }
                     }
                 }
             }
-        }),
+        ),
     )
     import logging
+
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
 
@@ -888,30 +885,30 @@ def test_get_unresolved_threads_pagination_raises(mocker):
     """Raises GhCliError when reviewThreads has more pages than we fetch."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        return_value=json.dumps({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "reviewThreads": {
-                            "pageInfo": {"hasNextPage": True},
-                            "nodes": [
-                                {
-                                    "id": "PRRT_1",
-                                    "path": "a.py",
-                                    "line": 1,
-                                    "isResolved": False,
-                                    "comments": {
-                                        "nodes": [
-                                            {"body": "Fix", "author": {"login": "alice"}}
-                                        ]
+        return_value=json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": True},
+                                "nodes": [
+                                    {
+                                        "id": "PRRT_1",
+                                        "path": "a.py",
+                                        "line": 1,
+                                        "isResolved": False,
+                                        "comments": {
+                                            "nodes": [{"body": "Fix", "author": {"login": "alice"}}]
+                                        },
                                     },
-                                },
-                            ],
+                                ],
+                            }
                         }
                     }
                 }
             }
-        }),
+        ),
     )
     with pytest.raises(GhCliError, match="more than 100 review threads"):
         get_unresolved_review_threads(REPO, 5, TOKEN)

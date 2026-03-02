@@ -54,9 +54,7 @@ def create_runner(config: RunnerConfig) -> Runner:
         try:
             duration = float(duration_str)
         except (ValueError, TypeError) as e:
-            raise ValueError(
-                f"NoopRunner 'duration' must be numeric, got {duration_str!r}"
-            ) from e
+            raise ValueError(f"NoopRunner 'duration' must be numeric, got {duration_str!r}") from e
         if math.isnan(duration) or math.isinf(duration) or duration < 0:
             raise ValueError(
                 f"NoopRunner 'duration' must be a finite non-negative number, got {duration}"

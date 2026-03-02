@@ -194,8 +194,12 @@ def test_enqueue_review_feedback(gh_mock, fake_redis_client, label_config):
         {"name": "tests", "conclusion": "success"},
     ]
     threads = [
-        {"id": "PRRT_1", "path": "src/foo.py", "line": 42,
-         "comments": [{"author": "reviewer1", "body": "Fix this"}]},
+        {
+            "id": "PRRT_1",
+            "path": "src/foo.py",
+            "line": 42,
+            "comments": [{"author": "reviewer1", "body": "Fix this"}],
+        },
     ]
     gh_mock.get_unresolved_review_threads.return_value = threads
 
@@ -211,7 +215,9 @@ def test_enqueue_review_feedback(gh_mock, fake_redis_client, label_config):
     assert pr.action == PRAction.ENQUEUE_FIX
     assert pr.number == 60
     gh_mock.get_unresolved_review_threads.assert_called_once_with(
-        "test-org/test-repo", 60, "fake-token",
+        "test-org/test-repo",
+        60,
+        "fake-token",
     )
     assert pr.review_threads == threads
 
@@ -246,8 +252,12 @@ def test_followup_when_approved_with_threads(gh_mock, fake_redis_client, label_c
         {"name": "tests", "conclusion": "success"},
     ]
     threads = [
-        {"id": "PRRT_10", "path": "lib/bar.py", "line": 99,
-         "comments": [{"author": "lead", "body": "Consider refactoring"}]},
+        {
+            "id": "PRRT_10",
+            "path": "lib/bar.py",
+            "line": 99,
+            "comments": [{"author": "lead", "body": "Consider refactoring"}],
+        },
     ]
     gh_mock.get_unresolved_review_threads.return_value = threads
 
@@ -506,7 +516,9 @@ def test_approved_thread_fetch_failure_skips_merge(gh_mock, fake_redis_client, l
 
 
 def test_changes_requested_thread_fetch_failure_still_enqueues(
-    gh_mock, fake_redis_client, label_config,
+    gh_mock,
+    fake_redis_client,
+    label_config,
 ):
     """CHANGES_REQUESTED + CI green + thread fetch raises -> ENQUEUE_FIX with empty threads."""
     gh_mock.list_open_prs.return_value = [
@@ -570,8 +582,12 @@ def test_followup_respects_max_attempts(gh_mock, fake_redis_client, label_config
         {"name": "tests", "conclusion": "success"},
     ]
     gh_mock.get_unresolved_review_threads.return_value = [
-        {"id": "PRRT_99", "path": "x.py", "line": 1,
-         "comments": [{"author": "rev", "body": "fix"}]},
+        {
+            "id": "PRRT_99",
+            "path": "x.py",
+            "line": 1,
+            "comments": [{"author": "rev", "body": "fix"}],
+        },
     ]
 
     for _ in range(3):
@@ -652,10 +668,13 @@ def test_get_attempt_count_corrupt_count_returns_zero(fake_redis_client):
     """Non-integer 'count' value in the Redis hash returns 0 (ValueError caught)."""
     pr_number = 210
     key = f"pr:{pr_number}:attempts"
-    fake_redis_client.client.hset(key, mapping={
-        "count": "not-a-number",
-        "head_sha": "abc123",
-    })
+    fake_redis_client.client.hset(
+        key,
+        mapping={
+            "count": "not-a-number",
+            "head_sha": "abc123",
+        },
+    )
 
     count = get_attempt_count(fake_redis_client, pr_number, "abc123")
     assert count == 0

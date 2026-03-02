@@ -143,27 +143,41 @@ def list_open_prs(repo: str, token: str) -> list[dict]:
     headRefOid, isDraft, author, createdAt, labels, reviewDecision.
     """
     _validate_repo(repo)
-    output = _run_gh([
-        "pr", "list",
-        "--repo", repo,
-        "--state", "open",
-        "--json", "number,title,headRefName,headRefOid,isDraft,author,"
-                  "createdAt,labels,reviewDecision",
-        "--limit", "100",
-    ], token)
+    output = _run_gh(
+        [
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision",
+            "--limit",
+            "100",
+        ],
+        token,
+    )
     return json.loads(output) if output else []
 
 
 def get_pr(repo: str, number: int, token: str) -> dict:
     """Get detailed PR info."""
     _validate_repo(repo)
-    output = _run_gh([
-        "pr", "view", str(number),
-        "--repo", repo,
-        "--json", "number,title,body,headRefName,baseRefName,state,"
-                  "author,labels,reviewDecision,reviews,"
-                  "statusCheckRollup,commits,additions,deletions",
-    ], token)
+    output = _run_gh(
+        [
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,headRefName,baseRefName,state,"
+            "author,labels,reviewDecision,reviews,"
+            "statusCheckRollup,commits,additions,deletions",
+        ],
+        token,
+    )
     if not output:
         raise GhCliError(f"gh pr view returned empty output for PR #{number}")
     return json.loads(output)
@@ -182,25 +196,32 @@ def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
 def get_pr_diff(repo: str, number: int, token: str) -> str:
     """Get the diff for a PR."""
     _validate_repo(repo)
-    return _run_gh([
-        "pr", "diff", str(number),
-        "--repo", repo,
-    ], token)
+    return _run_gh(
+        [
+            "pr",
+            "diff",
+            str(number),
+            "--repo",
+            repo,
+        ],
+        token,
+    )
 
 
-def get_check_run_logs(
-    repo: str, run_id: int, token: str
-) -> bytes:
+def get_check_run_logs(repo: str, run_id: int, token: str) -> bytes:
     """Get logs for a specific check run.
 
     Uses gh api to fetch the logs. The GitHub API returns a zip file,
     so this returns raw bytes that the caller must unzip.
     """
     _validate_repo(repo)
-    return _run_gh_bytes([
-        "api",
-        f"repos/{repo}/actions/runs/{run_id}/logs",
-    ], token)
+    return _run_gh_bytes(
+        [
+            "api",
+            f"repos/{repo}/actions/runs/{run_id}/logs",
+        ],
+        token,
+    )
 
 
 def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
@@ -215,15 +236,22 @@ def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
     """
     _validate_repo(repo)
     try:
-        return _run_gh([
-            "run", "view", str(run_id),
-            "--repo", repo,
-            "--log-failed",
-        ], token)
+        return _run_gh(
+            [
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                repo,
+                "--log-failed",
+            ],
+            token,
+        )
     except Exception:
         logger.warning(
             "Failed to fetch failed-step logs for run %d in %s",
-            run_id, repo,
+            run_id,
+            repo,
             exc_info=True,
         )
         return ""
@@ -232,29 +260,44 @@ def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
 def add_label(repo: str, number: int, label: str, token: str) -> None:
     """Add a label to a PR/issue."""
     _validate_repo(repo)
-    _run_gh([
-        "pr", "edit", str(number),
-        "--repo", repo,
-        "--add-label", label,
-    ], token)
+    _run_gh(
+        [
+            "pr",
+            "edit",
+            str(number),
+            "--repo",
+            repo,
+            "--add-label",
+            label,
+        ],
+        token,
+    )
 
 
 def remove_label(repo: str, number: int, label: str, token: str) -> None:
     """Remove a label from a PR/issue. Silently succeeds if not present."""
     _validate_repo(repo)
     try:
-        _run_gh([
-            "pr", "edit", str(number),
-            "--repo", repo,
-            "--remove-label", label,
-        ], token)
+        _run_gh(
+            [
+                "pr",
+                "edit",
+                str(number),
+                "--repo",
+                repo,
+                "--remove-label",
+                label,
+            ],
+            token,
+        )
     except GhCliError as exc:
         # gh pr edit --remove-label exits non-zero when the label isn't
         # present. We swallow that specific case but re-raise others.
         if "not found" in (exc.stderr or "").lower():
             logger.debug(
                 "remove_label: label %r not on PR #%d, ignoring",
-                label, number,
+                label,
+                number,
             )
         else:
             raise
@@ -270,37 +313,45 @@ def post_comment(repo: str, number: int, body: str, token: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=True) as f:
         f.write(body)
         f.flush()
-        _run_gh([
-            "pr", "comment", str(number),
-            "--repo", repo,
-            "--body-file", f.name,
-        ], token)
+        _run_gh(
+            [
+                "pr",
+                "comment",
+                str(number),
+                "--repo",
+                repo,
+                "--body-file",
+                f.name,
+            ],
+            token,
+        )
 
 
 _VALID_MERGE_METHODS = {"squash", "merge", "rebase"}
 
 
-def merge_pr(
-    repo: str, number: int, token: str, method: str = "squash"
-) -> None:
+def merge_pr(repo: str, number: int, token: str, method: str = "squash") -> None:
     """Merge a PR. Raises GhCliError on failure."""
     if method not in _VALID_MERGE_METHODS:
         raise ValueError(
-            f"Invalid merge method: {method!r}. "
-            f"Must be one of {sorted(_VALID_MERGE_METHODS)}."
+            f"Invalid merge method: {method!r}. Must be one of {sorted(_VALID_MERGE_METHODS)}."
         )
     _validate_repo(repo)
-    _run_gh([
-        "pr", "merge", str(number),
-        "--repo", repo,
-        f"--{method}",
-        "--delete-branch",
-    ], token)
+    _run_gh(
+        [
+            "pr",
+            "merge",
+            str(number),
+            "--repo",
+            repo,
+            f"--{method}",
+            "--delete-branch",
+        ],
+        token,
+    )
 
 
-def get_unresolved_review_threads(
-    repo: str, number: int, token: str
-) -> list[dict]:
+def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[dict]:
     """Get unresolved review threads on a PR.
 
     Uses the GitHub GraphQL API to fetch review threads and filters
@@ -339,18 +390,24 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }
 """
 
-    output = _run_gh([
-        "api", "graphql",
-        "-f", f"owner={owner}",
-        "-f", f"repo={name}",
-        "-F", f"number={number}",
-        "-f", f"query={query}",
-    ], token)
+    output = _run_gh(
+        [
+            "api",
+            "graphql",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={name}",
+            "-F",
+            f"number={number}",
+            "-f",
+            f"query={query}",
+        ],
+        token,
+    )
 
     if not output:
-        raise GhCliError(
-            f"GraphQL query returned empty response for PR #{number} in {repo}"
-        )
+        raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
 
     data = json.loads(output)
 
@@ -359,9 +416,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
     # could trigger an incorrect auto-merge).
     if "errors" in data:
         msgs = [e.get("message", str(e)) for e in data["errors"]]
-        raise GhCliError(
-            f"GraphQL errors fetching review threads: {'; '.join(msgs)}"
-        )
+        raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
 
     repo_data = (data.get("data") or {}).get("repository")
     if not repo_data:
@@ -371,9 +426,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
         )
     pr_node = repo_data.get("pullRequest")
     if not pr_node:
-        raise GhCliError(
-            f"GraphQL returned null pullRequest for PR #{number} in {repo}"
-        )
+        raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
     review_threads = pr_node.get("reviewThreads") or {}
     threads = review_threads.get("nodes") or []
 
@@ -397,23 +450,26 @@ query($owner: String!, $repo: String!, $number: Int!) {
         if comment_page.get("hasNextPage"):
             thread_id = thread.get("id", "<unknown>")
             logger.warning(
-                "Review thread %s has more than 10 comments; "
-                "later comments were not fetched",
+                "Review thread %s has more than 10 comments; later comments were not fetched",
                 thread_id,
             )
         comments = []
         for comment in comments_data.get("nodes") or []:
             author_info = comment.get("author") or {}
-            comments.append({
-                "author": author_info.get("login", ""),
-                "body": comment.get("body", ""),
-            })
-        results.append({
-            "id": thread.get("id", ""),
-            "path": thread.get("path", ""),
-            "line": thread.get("line"),
-            "comments": comments,
-        })
+            comments.append(
+                {
+                    "author": author_info.get("login", ""),
+                    "body": comment.get("body", ""),
+                }
+            )
+        results.append(
+            {
+                "id": thread.get("id", ""),
+                "path": thread.get("path", ""),
+                "line": thread.get("line"),
+                "comments": comments,
+            }
+        )
 
     return results
 
@@ -438,20 +494,22 @@ mutation($threadId: ID!) {
 }
 """
 
-    output = _run_gh([
-        "api", "graphql",
-        "-f", f"threadId={thread_id}",
-        "-f", f"query={mutation}",
-    ], token)
+    output = _run_gh(
+        [
+            "api",
+            "graphql",
+            "-f",
+            f"threadId={thread_id}",
+            "-f",
+            f"query={mutation}",
+        ],
+        token,
+    )
 
     if not output:
-        raise GhCliError(
-            f"GraphQL mutation returned empty response for thread {thread_id!r}"
-        )
+        raise GhCliError(f"GraphQL mutation returned empty response for thread {thread_id!r}")
 
     data = json.loads(output)
     if "errors" in data:
         msgs = [e.get("message", str(e)) for e in data["errors"]]
-        raise GhCliError(
-            f"GraphQL errors resolving review thread: {'; '.join(msgs)}"
-        )
+        raise GhCliError(f"GraphQL errors resolving review thread: {'; '.join(msgs)}")
