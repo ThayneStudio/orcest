@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -311,6 +312,52 @@ class TestExecuteTask:
             r for r in caplog.records if "Failed to publish output line" in r.message
         ]
         assert len(output_warnings) == 1
+
+    def test_abort_event_passed_to_runner(self, local_worker_config, sample_task, mock_workspace):
+        """_execute_task passes abort_event to runner.run()."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _success_runner_result()
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        abort_event = threading.Event()
+
+        _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+            abort_event=abort_event,
+        )
+
+        call_kwargs = mock_runner.run.call_args[1]
+        assert call_kwargs.get("abort_event") is abort_event
+
+    def test_lock_lost_returns_failed(self, local_worker_config, sample_task, mock_workspace):
+        """When abort_event is pre-set, runner returns failure and result is FAILED."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _failure_runner_result()
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        abort_event = threading.Event()
+        abort_event.set()  # Simulate lock already lost
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+            abort_event=abort_event,
+        )
+
+        assert result.status == ResultStatus.FAILED
 
     def test_worker_task_start_publish_failure_continues(
         self, local_worker_config, sample_task, mock_workspace
