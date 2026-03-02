@@ -17,9 +17,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 WORKDIR /app
 
-# Install orcest
+# Install dependencies in a separate layer for better cache reuse
 COPY pyproject.toml .
+RUN pip install --no-cache-dir "redis>=5.0" "pyyaml>=6.0" "click>=8.1" "rich>=13.0" "textual>=0.75"
+
+# Install orcest package (source only, deps already installed)
 COPY src/ src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 ENTRYPOINT ["orcest", "orchestrate"]
