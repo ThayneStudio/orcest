@@ -749,6 +749,19 @@ def test_merge_pr_merge_method(mocker):
     assert "--delete-branch" in args_passed
 
 
+def test_merge_pr_no_delete_branch(mocker):
+    """merge_pr with delete_branch=False omits --delete-branch flag."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="",
+    )
+    merge_pr(REPO, 10, TOKEN, delete_branch=False)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--delete-branch" not in args_passed
+    assert "--squash" in args_passed
+
+
 # ---------------------------------------------------------------------------
 # resolve_review_thread — non-string thread_id
 # ---------------------------------------------------------------------------
