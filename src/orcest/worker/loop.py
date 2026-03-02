@@ -196,7 +196,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # If publish fails, leave the message pending so XPENDING recovery
         # can re-deliver it. Duplicate work risk < silent result loss.
         try:
-            redis.xadd(RESULTS_STREAM, result.to_dict())
+            redis.xadd_capped(RESULTS_STREAM, result.to_dict())
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
             logger.error(
