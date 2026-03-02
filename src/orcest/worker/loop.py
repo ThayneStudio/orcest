@@ -134,7 +134,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         ttl = (
             config.runner.timeout * config.runner.max_retries
             + config.runner.retry_backoff * (config.runner.max_retries - 1)
-            + 120
+            + 120  # 2-minute safety buffer
         )
         lock = RedisLock(
             redis,
