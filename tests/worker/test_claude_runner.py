@@ -676,32 +676,6 @@ def test_extract_summary_result_key():
     assert result == "Task completed successfully"
 
 
-@pytest.mark.unit
-def test_extract_summary_multi_result_returns_last():
-    """Multi-result stream -> last top-level 'result' value is returned.
-
-    Regression test for the fix in PR #59: _extract_summary must scan all
-    lines and return the *last* result object, not the first one encountered.
-    """
-    lines = [
-        json.dumps({"result": "intermediate result"}) + "\n",
-        json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "some assistant text"}],
-                },
-            }
-        )
-        + "\n",
-        json.dumps({"result": "final summary"}) + "\n",
-    ]
-    output = "".join(lines)
-    result = _extract_summary(output)
-    assert result == "final summary"
-
-
 # ---------------------------------------------------------------------------
 # _extract_summary: multi-result stream -> last result wins (regression #111)
 # ---------------------------------------------------------------------------
@@ -711,7 +685,7 @@ def test_extract_summary_multi_result_returns_last():
 def test_extract_summary_last_result_in_multi_result_stream():
     """Multi-result stream -> last top-level 'result' value is returned.
 
-    Regression test for PR #59: _extract_summary must scan all lines and
+    Regression test for issue #111: _extract_summary must scan all lines and
     return the *last* result, not early-return on the first one.
     """
     lines = [
@@ -839,12 +813,10 @@ def test_is_usage_exhausted_all_patterns():
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_stdout_not_checked():
-    """Pattern appearing only in stdout must NOT trigger usage exhaustion."""
-    # Simulates Claude working on rate-limiting code whose output mentions "rate limit"
+def test_is_usage_exhausted_rate_limit_mid_sentence():
+    """'exceeded' mid-sentence (not EOL) must not trigger the anchored regex."""
     assert _is_usage_exhausted("") is False
-    # The real false-positive case: "rate limit" appears in work output (stdout),
-    # but stderr is clean — must not trigger exhaustion.
+    # "exceeded" here is not at end-of-line — the \s*$ anchor rejects it.
     assert _is_usage_exhausted("rate limit exceeded in user-authored code") is False
 
 
