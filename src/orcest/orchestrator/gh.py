@@ -79,7 +79,9 @@ def _run_gh(args: list[str], token: str) -> str:
         if len(args) > 4:
             brief += " ..."
         raise GhCliError(
-            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
+            f"gh command timed out after {exc.timeout}s: gh {brief}",
+            stderr="",
+            returncode=None,
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise GhCliError(
@@ -123,7 +125,9 @@ def _run_gh_bytes(args: list[str], token: str) -> bytes:
         if len(args) > 4:
             brief += " ..."
         raise GhCliError(
-            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
+            f"gh command timed out after {exc.timeout}s: gh {brief}",
+            stderr="",
+            returncode=None,
         ) from exc
     except subprocess.CalledProcessError as exc:
         stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
