@@ -49,6 +49,12 @@ class RedisClient:
         """Close the connection pool and release all connections."""
         self._pool.disconnect()
 
+    def __enter__(self) -> "RedisClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def health_check(self) -> bool:
         """Returns True if Redis is reachable."""
         try:
