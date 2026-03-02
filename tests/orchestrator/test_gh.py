@@ -6,6 +6,7 @@ The mock target is the *module-level* import inside ``gh.py``, i.e.
 """
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -868,7 +869,6 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
             }
         ),
     )
-    import logging
 
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
@@ -883,8 +883,6 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
 
 def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
     """Fetches all pages and returns threads from every page when hasNextPage is True."""
-    import logging
-
     page1 = json.dumps(
         {
             "data": {
@@ -956,8 +954,6 @@ def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
 
 def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
     """Stops pagination and logs a warning when hasNextPage=True but endCursor is absent."""
-    import logging
-
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
