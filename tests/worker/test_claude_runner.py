@@ -3,8 +3,8 @@
 Mocks ``subprocess.Popen`` so that no real ``claude`` process is spawned.
 The mock target is ``orcest.worker.claude_runner.subprocess.Popen``.
 
-Also mocks ``time.sleep`` and ``time.monotonic`` to avoid real delays
-and to control timing for duration calculations.
+Also mocks ``time.monotonic`` to avoid real delays and to control
+timing for duration calculations.
 """
 
 import json
@@ -111,7 +111,6 @@ def test_run_claude_success(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -156,7 +155,6 @@ def test_run_claude_failure_retries(mock_popen, mocker, tmp_path):
 
     mock_cls.side_effect = popen_side_effect
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt1_start, watchdog_remaining1, duration1,
@@ -188,7 +186,6 @@ def test_run_claude_timeout_no_retry(mock_popen, mocker, tmp_path):
 
     # start_time, attempt_start, watchdog_remaining, check_line1,
     # check_line2, check_line3(>timeout), duration
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 120.0, 200.0, 200.0),
@@ -215,7 +212,6 @@ def test_run_claude_usage_exhausted_no_retry(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter(["Error: usage limit reached for this billing period\n"])
     mock_proc.returncode = 1
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, duration
@@ -246,7 +242,6 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
     monkeypatch.setenv("SECRET_KEY", "super_secret_value")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -278,7 +273,6 @@ def test_run_claude_command_args(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -342,7 +336,6 @@ def test_on_output_called_per_line(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, 3x timeout_check, duration
@@ -369,7 +362,6 @@ def test_on_output_none_still_works(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -393,7 +385,6 @@ def test_timeout_during_streaming_calls_on_output(mock_popen, mocker, tmp_path):
 
     kill_mock = mocker.patch("orcest.worker.claude_runner._kill_process_tree")
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     # start_time=0, attempt_start=0, watchdog_remaining_calc=0(->60s left),
     # check_line1=10(<60 ok), check_line2=70(>=60 timeout; line2 is still
     # appended and on_output called BEFORE the timeout check fires), duration=70
@@ -430,7 +421,6 @@ def test_on_output_exception_disables_callback(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, 3x timeout_check, duration
@@ -469,7 +459,6 @@ def test_stderr_captured_via_thread(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter(["rate limit exceeded\n"])
     mock_proc.returncode = 1
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, duration
@@ -495,7 +484,6 @@ def test_run_claude_popen_oserror(mocker, tmp_path):
         side_effect=OSError("No such file or directory: 'claude'"),
     )
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, duration
@@ -538,7 +526,6 @@ def test_run_claude_all_retries_exhausted(mock_popen, mocker, tmp_path):
 
     mock_cls.side_effect = popen_side_effect
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt1_start, watchdog_remaining1, duration1,
@@ -577,7 +564,6 @@ def test_run_claude_wait_timeout_after_stdout(mock_popen, mocker, tmp_path):
     ]
 
     kill_mock = mocker.patch("orcest.worker.claude_runner._kill_process_tree")
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line),
@@ -613,7 +599,6 @@ def test_run_claude_returncode_none_no_retry(mock_popen, mocker, tmp_path):
     ]
 
     mocker.patch("orcest.worker.claude_runner._kill_process_tree")
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -643,7 +628,6 @@ def test_run_claude_with_logger(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -828,7 +812,6 @@ def test_claude_runner_class_run(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
