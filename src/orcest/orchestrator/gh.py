@@ -330,25 +330,40 @@ def post_comment(repo: str, number: int, body: str, token: str) -> None:
 _VALID_MERGE_METHODS = {"squash", "merge", "rebase"}
 
 
-def merge_pr(repo: str, number: int, token: str, method: str = "squash") -> None:
-    """Merge a PR. Raises GhCliError on failure."""
+def merge_pr(
+    repo: str,
+    number: int,
+    token: str,
+    method: str = "squash",
+    delete_branch: bool = True,
+) -> None:
+    """Merge a PR. Raises GhCliError on failure.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        number: PR number to merge.
+        token: GitHub token.
+        method: Merge method — one of 'squash', 'merge', or 'rebase'.
+        delete_branch: Whether to delete the head branch after merging.
+            Defaults to True. Set to False if branch protection rules
+            prevent deletion or if you prefer to keep branches post-merge.
+    """
     if method not in _VALID_MERGE_METHODS:
         raise ValueError(
             f"Invalid merge method: {method!r}. Must be one of {sorted(_VALID_MERGE_METHODS)}."
         )
     _validate_repo(repo)
-    _run_gh(
-        [
-            "pr",
-            "merge",
-            str(number),
-            "--repo",
-            repo,
-            f"--{method}",
-            "--delete-branch",
-        ],
-        token,
-    )
+    args = [
+        "pr",
+        "merge",
+        str(number),
+        "--repo",
+        repo,
+        f"--{method}",
+    ]
+    if delete_branch:
+        args.append("--delete-branch")
+    _run_gh(args, token)
 
 
 def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[dict]:
