@@ -1,5 +1,7 @@
 """Tests for orcest.shared.coordination using fakeredis."""
 
+import pytest
+
 from orcest.shared.coordination import RedisLock, make_pr_lock_key
 
 
@@ -80,3 +82,17 @@ def test_release_by_non_owner_preserves_held_state(fake_redis_client):
     assert lock2.is_held is False
     lock2.release()
     assert lock2.is_held is False
+
+
+def test_context_manager_acquires_and_releases(fake_redis_client):
+    with RedisLock(fake_redis_client, "test-lock") as lock:
+        assert lock.is_held is True
+    assert lock.is_held is False
+
+
+def test_context_manager_raises_when_lock_held(fake_redis_client):
+    lock1 = RedisLock(fake_redis_client, "test-lock", owner="owner-1")
+    lock1.acquire()
+    with pytest.raises(RuntimeError, match="Failed to acquire lock"):
+        with RedisLock(fake_redis_client, "test-lock", owner="owner-2"):
+            pass
