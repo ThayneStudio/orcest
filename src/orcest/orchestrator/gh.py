@@ -262,7 +262,7 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
 
 
 def post_comment(repo: str, number: int, body: str, token: str) -> None:
-    """Post a comment on a PR.
+    """Post a comment on a PR or issue.
 
     Uses --body-file with a temp file to avoid argument length limits
     and to prevent any interpretation of special characters in the body.
