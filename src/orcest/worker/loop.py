@@ -56,6 +56,27 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
     return combined
 
 
+def _any_event(*events: threading.Event) -> threading.Event:
+    """Return an event that is set when any of *events* is set.
+
+    A daemon thread is started for each source event.  The combined
+    event is set the moment the first source fires.  Callers should
+    arrange for each source event to be set eventually (e.g. as a
+    cleanup step) so that watch threads terminate promptly rather than
+    accumulating across task iterations.
+    """
+    combined = threading.Event()
+
+    def _watch(src: threading.Event) -> None:
+        src.wait()
+        combined.set()
+
+    for e in events:
+        threading.Thread(target=_watch, args=(e,), daemon=True).start()
+
+    return combined
+
+
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -228,6 +249,11 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
             else:
                 logger.info(f"Released lock {lock_key}")
+        finally:
+            # Terminate _any_event watch threads so they don't accumulate
+            # across tasks.  Setting lock_lost is idempotent when it was
+            # already set by the heartbeat callback.
+            lock_lost.set()
 
         # Publish result, then ACK only if publish succeeded.
         # If publish fails, the result is lost — there is no XPENDING

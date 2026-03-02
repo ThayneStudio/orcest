@@ -16,6 +16,7 @@ from orcest.worker.loop import (
     CONSUMER_GROUP,
     HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
+    _any_event,
     _execute_task,
     _make_abort_event,
     run_worker,
@@ -115,6 +116,48 @@ class TestMakeAbortEvent:
         assert not abort.is_set()
         shutdown_event.set()
         assert abort.wait(timeout=1), "abort event must wake when shutdown_event fires"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _any_event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAnyEvent:
+    """Tests for the _any_event helper."""
+
+    def test_fires_when_first_source_set(self):
+        """Combined event fires when the first source event is set."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _any_event(e1, e2)
+        assert not combined.is_set()
+        e1.set()
+        assert combined.wait(timeout=1.0)
+
+    def test_fires_when_second_source_set(self):
+        """Combined event fires when the second source event is set."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _any_event(e1, e2)
+        assert not combined.is_set()
+        e2.set()
+        assert combined.wait(timeout=1.0)
+
+    def test_already_set_source_fires_immediately(self):
+        """Combined event is set immediately if a source is already set."""
+        e1 = threading.Event()
+        e1.set()
+        combined = _any_event(e1, threading.Event())
+        assert combined.wait(timeout=1.0)
+
+    def test_not_set_when_no_source_fires(self):
+        """Combined event stays unset when no source fires."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _any_event(e1, e2)
+        assert not combined.wait(timeout=0.05)
+        # Cleanup: set both so daemon watch threads terminate
+        e1.set()
+        e2.set()
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +823,47 @@ class TestRunWorker:
         # The pending entry must be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
+
+    def test_abort_event_fires_on_sigterm(self, mocker, worker_config, sample_task):
+        """The abort_event passed to _execute_task is set when SIGTERM fires,
+        so that retry-backoff sleeps are interrupted promptly on shutdown."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        captured_abort_event: list[threading.Event | None] = [None]
+
+        def fake_execute_task(*args, abort_event=None, **kwargs):
+            captured_abort_event[0] = abort_event
+            # Simulate SIGTERM arriving while the task is running
+            import signal as sig
+
+            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            if handler:
+                handler(sig.SIGTERM, None)
+            task = args[0]
+            from orcest.shared.models import TaskResult
+
+            return TaskResult(
+                task_id=task.id,
+                worker_id=worker_config.worker_id,
+                status=ResultStatus.COMPLETED,
+                resource_type=task.resource_type,
+                resource_id=task.resource_id,
+                branch=task.branch,
+                summary="ok",
+                duration_seconds=0,
+            )
+
+        mocker.patch("orcest.worker.loop._execute_task", side_effect=fake_execute_task)
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        assert captured_abort_event[0] is not None, "abort_event was not passed to _execute_task"
+        # The watcher thread should have set the combined event after SIGTERM
+        assert captured_abort_event[0].wait(timeout=1.0), (
+            "abort_event not set after SIGTERM; SIGTERM would not interrupt retry-backoff sleeps"
+        )
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task
