@@ -558,10 +558,11 @@ class TestRunWorker:
         # Verify runner was called
         mocks["runner"].run.assert_called_once()
         # Verify result was published to the results stream
-        mock_redis.xadd.assert_called_once()
-        call_args = mock_redis.xadd.call_args
-        assert call_args[0][0] == RESULTS_STREAM
-        result_fields = call_args[0][1]
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.COMPLETED.value
         assert result_fields["task_id"] == sample_task.id
 
@@ -622,9 +623,11 @@ class TestRunWorker:
         run_worker(worker_config)
 
         # Verify the published result
-        mock_redis.xadd.assert_called_once()
-        stream, result_dict = mock_redis.xadd.call_args[0]
-        assert stream == RESULTS_STREAM
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_dict = results_calls[0][0][1]
         parsed = TaskResult.from_dict(result_dict)
         assert parsed.status == ResultStatus.COMPLETED
         assert parsed.task_id == sample_task.id
@@ -640,9 +643,11 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        mock_redis.xadd.assert_called_once()
-        stream, result_dict = mock_redis.xadd.call_args[0]
-        assert stream == RESULTS_STREAM
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_dict = results_calls[0][0][1]
         parsed = TaskResult.from_dict(result_dict)
         assert parsed.status == ResultStatus.FAILED
         assert "merge conflict" in parsed.summary.lower()
@@ -671,7 +676,12 @@ class TestRunWorker:
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         # Make the results-stream publish fail
-        mock_redis.xadd.side_effect = ConnectionError("Redis unavailable")
+        def _xadd_capped_side_effect(stream, data):
+            if stream == RESULTS_STREAM:
+                raise ConnectionError("Redis unavailable")
+            return "1-0"
+
+        mock_redis.xadd_capped.side_effect = _xadd_capped_side_effect
 
         run_worker(worker_config)
 
