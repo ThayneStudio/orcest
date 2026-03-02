@@ -25,7 +25,7 @@ RUN python3 -c "import tomllib, subprocess, sys; data = tomllib.load(open('pypro
 
 # Install orcest package (source only, deps already installed)
 COPY src/ src/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps . && chown -R orcest:orcest /home/orcest/app
 
 USER orcest
 
