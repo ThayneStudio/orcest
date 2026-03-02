@@ -677,7 +677,7 @@ class TestRunWorker:
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         # Make the results-stream publish fail
-        def _xadd_capped_side_effect(stream, data):
+        def _xadd_capped_side_effect(stream, data, **kwargs):
             if stream == RESULTS_STREAM:
                 raise ConnectionError("Redis unavailable")
             return "1-0"
