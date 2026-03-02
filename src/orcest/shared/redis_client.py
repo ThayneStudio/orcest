@@ -26,7 +26,7 @@ class RedisClient:
             password=config.password,
             decode_responses=True,
         )
-        self._client: redis.Redis[str] = redis.Redis(connection_pool=self._pool)  # type: ignore[type-arg]
+        self._client: redis.Redis = redis.Redis(connection_pool=self._pool)
 
     @classmethod
     def from_client(cls, client: redis.Redis[str]) -> "RedisClient":
@@ -41,7 +41,7 @@ class RedisClient:
         return instance
 
     @property
-    def client(self) -> redis.Redis[str]:  # type: ignore[type-arg]
+    def client(self) -> redis.Redis:
         """Raw redis client for operations not covered by helpers."""
         return self._client
 
