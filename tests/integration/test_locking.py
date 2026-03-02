@@ -164,7 +164,7 @@ class TestLocking:
             _, start_next, _ = sorted_windows[i + 1]
             assert end_i <= start_next, (
                 f"Overlap detected: window {i} ended at {end_i}, "
-                f"window {i+1} started at {start_next}"
+                f"window {i + 1} started at {start_next}"
             )
 
     def test_lock_expires_after_worker_death(self, real_redis_client: RedisClient) -> None:

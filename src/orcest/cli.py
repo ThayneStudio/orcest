@@ -173,12 +173,23 @@ def init(config):
         console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
         try:
             subprocess.run(
-                ["gh", "label", "create", name,
-                 "--repo", cfg.github.repo,
-                 "--color", color,
-                 "--description", description,
-                 "--force"],
-                capture_output=True, text=True, check=True, env=env,
+                [
+                    "gh",
+                    "label",
+                    "create",
+                    name,
+                    "--repo",
+                    cfg.github.repo,
+                    "--color",
+                    color,
+                    "--description",
+                    description,
+                    "--force",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=env,
             )
             console.print("[green]ok[/green]")
         except subprocess.CalledProcessError as exc:
@@ -211,13 +222,15 @@ def provision(host, user, worker_config, env_file):
     def _ssh(cmd: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["ssh", ssh_target, cmd],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     def _scp(src: str, dest: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["scp", src, f"{ssh_target}:{dest}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     # Verify files exist locally
@@ -241,7 +254,8 @@ def provision(host, user, worker_config, env_file):
     build_result = subprocess.run(
         ["python3", "-m", "build", "--wheel", "--outdir", "/tmp/orcest-dist"],
         cwd=project_root,
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if build_result.returncode != 0:
         console.print("[red]failed[/red]")
@@ -249,6 +263,7 @@ def provision(host, user, worker_config, env_file):
         sys.exit(1)
     # Find the built wheel
     import glob
+
     wheels = glob.glob("/tmp/orcest-dist/*.whl")
     if not wheels:
         console.print("[red]failed[/red]: no wheel produced")
@@ -285,26 +300,31 @@ def provision(host, user, worker_config, env_file):
     console.print("  Copying worker config...", end=" ")
     result = _scp(worker_config, "/tmp/orcest-worker.yaml")
     if result.returncode == 0:
-        _ssh("sudo cp /tmp/orcest-worker.yaml /opt/orcest/worker.yaml && "
-             "sudo chown orcest:orcest /opt/orcest/worker.yaml")
+        _ssh(
+            "sudo cp /tmp/orcest-worker.yaml /opt/orcest/worker.yaml && "
+            "sudo chown orcest:orcest /opt/orcest/worker.yaml"
+        )
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
     console.print("  Copying env file...", end=" ")
     result = _scp(env_file, "/tmp/orcest-env")
     if result.returncode == 0:
-        _ssh("sudo cp /tmp/orcest-env /opt/orcest/.env && "
-             "sudo chmod 600 /opt/orcest/.env && "
-             "sudo chown orcest:orcest /opt/orcest/.env")
+        _ssh(
+            "sudo cp /tmp/orcest-env /opt/orcest/.env && "
+            "sudo chmod 600 /opt/orcest/.env && "
+            "sudo chown orcest:orcest /opt/orcest/.env"
+        )
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
     # Step 3: Install and start systemd service
     console.print("  Installing systemd service...", end=" ")
-    result = _scp("provision/systemd/orcest-worker.service",
-                   "/tmp/orcest-worker.service")
+    result = _scp("provision/systemd/orcest-worker.service", "/tmp/orcest-worker.service")
     if result.returncode == 0:
-        _ssh("sudo cp /tmp/orcest-worker.service /etc/systemd/system/ && "
-             "sudo systemctl daemon-reload && "
-             "sudo systemctl enable orcest-worker")
+        _ssh(
+            "sudo cp /tmp/orcest-worker.service /etc/systemd/system/ && "
+            "sudo systemctl daemon-reload && "
+            "sudo systemctl enable orcest-worker"
+        )
     console.print("[green]ok[/green]" if result.returncode == 0 else "[red]failed[/red]")
 
     console.print("  Starting worker service...", end=" ")
@@ -330,11 +350,13 @@ def provision(host, user, worker_config, env_file):
 @click.argument("host")
 @click.option("--user", default="root", help="SSH user for the target host.")
 @click.option(
-    "--orch-config", default="config/orchestrator.yaml",
+    "--orch-config",
+    default="config/orchestrator.yaml",
     help="Orchestrator config to deploy.",
 )
 @click.option(
-    "--env-file", default="provision/.env.orchestrator",
+    "--env-file",
+    default="provision/.env.orchestrator",
     help="Env file with GITHUB_TOKEN.",
 )
 def provision_orchestrator(host, user, orch_config, env_file):
@@ -354,13 +376,15 @@ def provision_orchestrator(host, user, orch_config, env_file):
     def _ssh(cmd: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["ssh", ssh_target, cmd],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     def _scp(src: str, dest: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["scp", src, f"{ssh_target}:{dest}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     # Verify files exist locally
@@ -405,9 +429,9 @@ def provision_orchestrator(host, user, orch_config, env_file):
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         tarball = tmp.name
     tar_result = subprocess.run(
-        ["tar", "czf", tarball,
-         "Dockerfile", "docker-compose.yml", "pyproject.toml", "src/"],
-        capture_output=True, text=True,
+        ["tar", "czf", tarball, "Dockerfile", "docker-compose.yml", "pyproject.toml", "src/"],
+        capture_output=True,
+        text=True,
     )
     if tar_result.returncode != 0:
         console.print(f"[red]failed[/red]: {tar_result.stderr.strip()}")
@@ -423,9 +447,7 @@ def provision_orchestrator(host, user, orch_config, env_file):
     console.print("[green]ok[/green]")
 
     console.print("  Extracting source...", end=" ")
-    result = _ssh(
-        "sudo -u orcest tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/"
-    )
+    result = _ssh("sudo -u orcest tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/")
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
         sys.exit(1)
@@ -456,8 +478,7 @@ def provision_orchestrator(host, user, orch_config, env_file):
     # Step 5: Build and start Docker Compose
     console.print("  Building orchestrator image (this may take a minute)...\n")
     result = subprocess.run(
-        ["ssh", ssh_target,
-         "sudo -u orcest bash -c 'cd /opt/orcest && docker compose build'"],
+        ["ssh", ssh_target, "sudo -u orcest bash -c 'cd /opt/orcest && docker compose build'"],
         text=True,
     )
     if result.returncode != 0:
@@ -477,10 +498,7 @@ def provision_orchestrator(host, user, orch_config, env_file):
 
     # Step 6: Verify
     console.print("  Checking services...", end=" ")
-    result = _ssh(
-        "sudo -u orcest bash -c "
-        "'cd /opt/orcest && docker compose ps --format json'"
-    )
+    result = _ssh("sudo -u orcest bash -c 'cd /opt/orcest && docker compose ps --format json'")
     if result.returncode == 0:
         console.print("[green]ok[/green]")
     else:
@@ -488,8 +506,7 @@ def provision_orchestrator(host, user, orch_config, env_file):
 
     console.print("  Pinging Redis...", end=" ")
     result = _ssh(
-        "sudo -u orcest bash -c "
-        "'cd /opt/orcest && docker compose exec -T redis redis-cli ping'"
+        "sudo -u orcest bash -c 'cd /opt/orcest && docker compose exec -T redis redis-cli ping'"
     )
     if result.stdout.strip() == "PONG":
         console.print("[green]PONG[/green]")
