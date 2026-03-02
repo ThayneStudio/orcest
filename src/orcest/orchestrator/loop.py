@@ -18,6 +18,7 @@ from orcest.orchestrator.task_publisher import (
     publish_fix_task,
     publish_followup_task,
     publish_issue_task,
+    publish_rebase_task,
 )
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.logging import setup_logging
@@ -116,47 +117,80 @@ def _poll_cycle(
                 )
                 merged += 1
             except Exception as e:
+                err_msg = str(e)
                 logger.error(
-                    f"Failed to merge PR #{pr_state.number}: {e}",
+                    f"Failed to merge PR #{pr_state.number}: {err_msg}",
                     exc_info=True,
                 )
-                labeled = False
-                try:
-                    gh.add_label(
-                        config.github.repo,
-                        pr_state.number,
-                        config.labels.needs_human,
-                        config.github.token,
+                # If the error looks like a merge conflict, enqueue a
+                # rebase task so a worker can resolve it automatically.
+                is_conflict = (
+                    "is not mergeable" in err_msg
+                    or "cannot be cleanly created" in err_msg
+                )
+                if is_conflict:
+                    logger.info(
+                        f"PR #{pr_state.number}: merge conflict detected, "
+                        f"enqueueing rebase task"
                     )
-                    labeled = True
-                except Exception as label_err:
-                    logger.error(
-                        f"Failed to label PR #{pr_state.number} after merge failure: {label_err}",
-                        exc_info=True,
-                    )
-                try:
-                    # Truncate error message to avoid leaking verbose
-                    # subprocess stderr (which could contain internal details)
-                    # into a public PR comment.
-                    safe_err = str(e)[:200]
-                    label_note = (
-                        f"Labeling as `{config.labels.needs_human}` for manual review."
-                        if labeled
-                        else f"Failed to add `{config.labels.needs_human}` "
-                        f"label — please triage manually."
-                    )
-                    gh.post_comment(
-                        config.github.repo,
-                        pr_state.number,
-                        f"**orcest** failed to merge this PR: {safe_err}\n\n{label_note}",
-                        config.github.token,
-                    )
-                except Exception as comment_err:
-                    logger.error(
-                        f"Failed to comment on PR #{pr_state.number} "
-                        f"after merge failure: {comment_err}",
-                        exc_info=True,
-                    )
+                    try:
+                        publish_rebase_task(
+                            pr_state=pr_state,
+                            repo=config.github.repo,
+                            token=config.github.token,
+                            redis=redis,
+                            label_config=config.labels,
+                            default_runner=config.default_runner,
+                            merge_error=err_msg[:200],
+                            logger=logger,
+                        )
+                        enqueued += 1
+                    except Exception as rebase_err:
+                        logger.error(
+                            f"Failed to enqueue rebase task for PR #{pr_state.number}: "
+                            f"{rebase_err}",
+                            exc_info=True,
+                        )
+                        # Fall through to needs-human labeling
+                        is_conflict = False
+
+                if not is_conflict:
+                    labeled = False
+                    try:
+                        gh.add_label(
+                            config.github.repo,
+                            pr_state.number,
+                            config.labels.needs_human,
+                            config.github.token,
+                        )
+                        labeled = True
+                    except Exception as label_err:
+                        logger.error(
+                            f"Failed to label PR #{pr_state.number} after merge failure: "
+                            f"{label_err}",
+                            exc_info=True,
+                        )
+                    try:
+                        safe_err = err_msg[:200]
+                        label_note = (
+                            f"Labeling as `{config.labels.needs_human}` for manual review."
+                            if labeled
+                            else f"Failed to add `{config.labels.needs_human}` "
+                            f"label — please triage manually."
+                        )
+                        gh.post_comment(
+                            config.github.repo,
+                            pr_state.number,
+                            f"**orcest** failed to merge this PR: {safe_err}\n\n"
+                            f"{label_note}",
+                            config.github.token,
+                        )
+                    except Exception as comment_err:
+                        logger.error(
+                            f"Failed to comment on PR #{pr_state.number} "
+                            f"after merge failure: {comment_err}",
+                            exc_info=True,
+                        )
             else:
                 try:
                     gh.post_comment(
@@ -259,15 +293,16 @@ def _poll_cycle(
     # Step 4: Discover issues needing implementation
     # Prioritize existing PRs over new issue work using two checks:
     #
-    # (a) GitHub state: any PRs with actionable states this cycle
+    # (a) GitHub state: PRs being actively worked on or just enqueued.
+    #     SKIP_LABELED with needs-human/blocked labels does NOT count —
+    #     those PRs are explicitly parked and shouldn't block issue work.
+    _active_labels = {config.labels.queued, config.labels.in_progress}
     pr_work_pending = any(
         pr_state.action
-        in (
-            PRAction.ENQUEUE_FIX,
-            PRAction.ENQUEUE_FOLLOWUP,
-            PRAction.SKIP_LOCKED,
-            PRAction.SKIP_LABELED,
-            PRAction.SKIP_MAX_ATTEMPTS,
+        in (PRAction.ENQUEUE_FIX, PRAction.ENQUEUE_FOLLOWUP, PRAction.SKIP_LOCKED)
+        or (
+            pr_state.action == PRAction.SKIP_LABELED
+            and any(lbl in _active_labels for lbl in pr_state.labels)
         )
         for pr_state in pr_states
     )

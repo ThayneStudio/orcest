@@ -273,6 +273,54 @@ def publish_followup_task(
     return task
 
 
+def publish_rebase_task(
+    pr_state: PRState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    label_config: LabelConfig,
+    default_runner: str,
+    merge_error: str = "",
+    logger: logging.Logger | None = None,
+) -> Task:
+    """Create and publish a rebase task for a PR with merge conflicts.
+
+    Enqueued when ``gh pr merge`` fails due to merge conflicts. The worker
+    will rebase the branch onto the base branch and resolve any conflicts,
+    then push. The orchestrator will attempt to merge again on the next cycle.
+    """
+    prompt = _render_rebase_prompt(
+        pr_number=pr_state.number,
+        pr_title=pr_state.title,
+        branch=pr_state.branch,
+        repo=repo,
+        merge_error=merge_error,
+    )
+
+    task = Task.create(
+        task_type=TaskType.REBASE_PR,
+        repo=repo,
+        token=token,
+        resource_type="pr",
+        resource_id=pr_state.number,
+        prompt=prompt,
+        branch=pr_state.branch,
+    )
+
+    _publish_and_notify(
+        task=task,
+        pr_state=pr_state,
+        repo=repo,
+        token=token,
+        redis=redis,
+        label_config=label_config,
+        default_runner=default_runner,
+        logger=logger,
+    )
+
+    return task
+
+
 def publish_issue_task(
     issue_state: IssueState,
     repo: str,
@@ -498,6 +546,58 @@ def _render_followup_prompt(
             "-- you are not authorized to change review status.",
         ]
     )
+
+    return "\n".join(sections)
+
+
+def _render_rebase_prompt(
+    pr_number: int,
+    pr_title: str,
+    branch: str,
+    repo: str,
+    merge_error: str = "",
+) -> str:
+    """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
+    sections: list[str] = [
+        f"# Rebase PR #{pr_number}: {pr_title}",
+        "",
+        f"You are on branch `{branch}`.",
+        "This PR has merge conflicts that prevent it from being merged.",
+        "",
+    ]
+
+    if merge_error:
+        sections.append("## Merge Error")
+        sections.append("")
+        sections.append(f"```\n{merge_error[:500]}\n```")
+        sections.append("")
+
+    sections.extend([
+        "## Instructions",
+        "",
+        "1. Fetch the latest base branch (`master` or `main`):",
+        "   ```",
+        "   git fetch origin master",
+        "   ```",
+        "2. Rebase your branch onto the base branch:",
+        "   ```",
+        "   git rebase origin/master",
+        "   ```",
+        "3. If there are merge conflicts:",
+        "   - Read the conflicting files to understand both sides",
+        "   - Resolve each conflict by keeping the intent of both changes",
+        "   - Stage resolved files with `git add`",
+        "   - Continue the rebase with `git rebase --continue`",
+        "4. After the rebase is complete, force-push to update the PR:",
+        "   ```",
+        "   git push --force-with-lease",
+        "   ```",
+        "5. Verify the branch is clean and the rebase succeeded.",
+        "",
+        "Do NOT create new commits — only rebase existing ones.",
+        "Do NOT squash commits during the rebase.",
+        "Push to the existing branch. Do not create new PRs.",
+    ])
 
     return "\n".join(sections)
 

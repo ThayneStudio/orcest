@@ -38,6 +38,12 @@ def run_worker(config: WorkerConfig) -> None:
     # Ensure consumer group exists
     redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
 
+    # Drain pending tasks from previous worker lifecycle.
+    # If this worker was killed mid-execution, the task was delivered but
+    # never ACKed.  Publish a FAILED result so the orchestrator cleans up
+    # labels, then ACK to avoid re-processing stale work.
+    _drain_pending_tasks(redis, tasks_stream, config, logger)
+
     # Graceful shutdown
     shutdown = False
 
@@ -160,6 +166,77 @@ def run_worker(config: WorkerConfig) -> None:
             )
 
     logger.info("Worker shut down cleanly.")
+
+
+def _drain_pending_tasks(
+    redis: RedisClient,
+    tasks_stream: str,
+    config: WorkerConfig,
+    logger: logging.Logger,
+) -> None:
+    """Drain pending (unACKed) tasks left over from a previous worker lifecycle.
+
+    When a worker is killed mid-execution (e.g. systemd restart), the task
+    it was processing remains delivered-but-unACKed in the consumer group.
+    On restart, XREADGROUP with ``">"`` skips these entries, so they'd be
+    stuck forever — and the orchestrator never receives a result, leaving
+    labels orphaned.
+
+    This function reads all pending entries (ID ``"0"``), publishes a FAILED
+    result for each so the orchestrator can clean up, and ACKs them.
+    """
+    drained = 0
+    while True:
+        entries = redis.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=config.worker_id,
+            stream=tasks_stream,
+            count=10,
+            block_ms=None,
+            pending=True,
+        )
+        if not entries:
+            break
+        for entry_id, fields in entries:
+            drained += 1
+            try:
+                task = Task.from_dict(fields)
+                logger.warning(
+                    f"Recovering pending task {task.id} ({task.type.value} "
+                    f"for {task.resource_type} #{task.resource_id}) — "
+                    f"publishing FAILED result"
+                )
+                result = TaskResult(
+                    task_id=task.id,
+                    worker_id=config.worker_id,
+                    status=ResultStatus.FAILED,
+                    resource_type=task.resource_type,
+                    resource_id=task.resource_id,
+                    branch=task.branch,
+                    summary="Worker restarted mid-execution; task was not completed.",
+                    duration_seconds=0,
+                )
+                try:
+                    redis.xadd(RESULTS_STREAM, result.to_dict())
+                except Exception:
+                    logger.error(
+                        f"Failed to publish recovery result for task {task.id}",
+                        exc_info=True,
+                    )
+            except (KeyError, ValueError) as e:
+                logger.error(
+                    f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
+                    exc_info=True,
+                )
+            try:
+                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+            except Exception:
+                logger.error(
+                    f"Failed to ACK pending entry {entry_id}",
+                    exc_info=True,
+                )
+    if drained:
+        logger.info(f"Drained {drained} pending task(s) from previous lifecycle")
 
 
 def _execute_task(
