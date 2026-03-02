@@ -136,11 +136,16 @@ def _run_gh_bytes(args: list[str], token: str) -> bytes:
     return result.stdout
 
 
-def list_open_prs(repo: str, token: str) -> list[dict]:
+def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
     headRefOid, isDraft, author, createdAt, labels, reviewDecision.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        token: GitHub token.
+        limit: Maximum number of PRs to fetch. Defaults to 100.
     """
     _validate_repo(repo)
     output = _run_gh(
@@ -154,7 +159,7 @@ def list_open_prs(repo: str, token: str) -> list[dict]:
             "--json",
             "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision",
             "--limit",
-            "100",
+            str(limit),
         ],
         token,
     )
