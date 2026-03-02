@@ -74,7 +74,7 @@ def classify_ci_failure(
     Returns:
         CIFailureType classification.
     """
-    text = f"{check_name}\n{logs}".lower()
+    text = f"{check_name}\n{logs}"
 
     for pattern in TRANSIENT_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
