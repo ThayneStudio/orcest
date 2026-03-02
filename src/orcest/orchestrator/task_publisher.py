@@ -76,7 +76,7 @@ def _publish_and_notify(
 
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict())
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=1000)
 
     # Update GitHub visibility -- wrapped in try/except because the task
     # is already published to Redis. If labeling fails, the next poll cycle
@@ -350,7 +350,7 @@ def _publish_issue_and_notify(
 
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict())
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=1000)
 
     # Update GitHub visibility on the issue
     _label_ok = True
