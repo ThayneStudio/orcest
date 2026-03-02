@@ -135,6 +135,17 @@ def test_status_once_wrongtype_tasks_key_shows_not_a_stream(fake_redis_client):
     assert "(not a stream)" in output
 
 
+def test_status_once_wrongtype_results_key_shows_not_a_stream(fake_redis_client):
+    """A WRONGTYPE results key is reported as '(not a stream)' in the results row."""
+    fake_redis_client.client.set("results", "some-value")
+    buf = io.StringIO()
+    with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
+        _status_once(fake_redis_client)
+
+    output = buf.getvalue()
+    assert "(not a stream)" in output
+
+
 # ---------------------------------------------------------------------------
 # orchestrate command
 # ---------------------------------------------------------------------------

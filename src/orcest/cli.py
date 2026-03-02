@@ -112,7 +112,7 @@ def _status_once(redis):
         results_len = client.xlen("results") or 0
     except redis_lib.ResponseError:
         # WRONGTYPE: results key exists but is not a stream
-        results_len = 0
+        results_len = "(not a stream)"
 
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
