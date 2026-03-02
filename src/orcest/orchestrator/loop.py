@@ -247,17 +247,38 @@ def _poll_cycle(
             logger.warning(f"PR #{pr_state.number}: unhandled action {pr_state.action!r}, skipping")
 
     # Step 4: Discover issues needing implementation
-    try:
-        issue_states = discover_actionable_issues(
-            repo=config.github.repo,
-            token=config.github.token,
-            redis=redis,
-            label_config=config.labels,
-            max_attempts=config.max_attempts,
+    # Prioritize existing PRs over new issue work. If any PRs need fixes
+    # (enqueued this cycle, locked by a worker, or labeled in-progress),
+    # skip issue discovery so workers focus on clearing the PR backlog.
+    # PRs only waiting for CI (SKIP_PENDING/SKIP_GREEN) don't block issues.
+    pr_work_pending = any(
+        pr_state.action
+        in (
+            PRAction.ENQUEUE_FIX,
+            PRAction.ENQUEUE_FOLLOWUP,
+            PRAction.SKIP_LOCKED,
+            PRAction.SKIP_LABELED,
+            PRAction.SKIP_MAX_ATTEMPTS,
         )
-    except Exception as e:
-        logger.error(f"Issue discovery failed: {e}", exc_info=True)
-        issue_states = []
+        for pr_state in pr_states
+    )
+
+    issue_states: list = []
+    if pr_work_pending:
+        logger.info(
+            "PRs need attention, deferring issue discovery until PR backlog clears"
+        )
+    else:
+        try:
+            issue_states = discover_actionable_issues(
+                repo=config.github.repo,
+                token=config.github.token,
+                redis=redis,
+                label_config=config.labels,
+                max_attempts=config.max_attempts,
+            )
+        except Exception as e:
+            logger.error(f"Issue discovery failed: {e}", exc_info=True)
 
     # Step 5: Act on issues
     for issue_state in issue_states:
