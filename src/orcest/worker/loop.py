@@ -70,7 +70,21 @@ def run_worker(config: WorkerConfig) -> None:
             continue  # Timeout, loop back to check shutdown
 
         entry_id, fields = entries[0]
-        task = Task.from_dict(fields)
+        try:
+            task = Task.from_dict(fields)
+        except (KeyError, ValueError) as e:
+            logger.error(
+                f"Malformed task entry {entry_id}: {e}; ACKing to skip",
+                exc_info=True,
+            )
+            try:
+                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+            except Exception:
+                logger.error(
+                    f"Failed to ACK malformed entry {entry_id}",
+                    exc_info=True,
+                )
+            continue
 
         logger.info(
             f"Received task {task.id}: {task.type.value} "
@@ -87,12 +101,13 @@ def run_worker(config: WorkerConfig) -> None:
         )
 
         if not lock.acquire():
-            logger.warning(
-                f"Lock {lock_key} already held, skipping task {task.id}"
-            )
+            logger.warning(f"Lock {lock_key} already held, skipping task {task.id}")
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
-            redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+            try:
+                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+            except Exception:
+                logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
             continue
 
         logger.info(f"Acquired lock {lock_key}")
@@ -102,7 +117,14 @@ def run_worker(config: WorkerConfig) -> None:
         heartbeat.start()
 
         try:
-            result = _execute_task(task, config, runner, workspace, logger)
+            result = _execute_task(
+                task,
+                config,
+                runner,
+                workspace,
+                redis,
+                logger,
+            )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
             # that _execute_task's except Exception doesn't catch.
@@ -120,16 +142,19 @@ def run_worker(config: WorkerConfig) -> None:
         # Publish result and ACK (only reached on normal execution)
         try:
             redis.xadd(RESULTS_STREAM, result.to_dict())
-            logger.info(
-                f"Published result for task {task.id}: {result.status.value}"
-            )
+            logger.info(f"Published result for task {task.id}: {result.status.value}")
+        except Exception:
+            logger.error(f"Failed to publish result for task {task.id}", exc_info=True)
+            # Continue to ACK to avoid redelivery -- the orchestrator will
+            # detect the missing result and may re-enqueue if needed
+
+        try:
+            redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
         except Exception:
             logger.error(
-                f"Failed to publish result for task {task.id}", exc_info=True
+                f"Failed to ACK task {task.id} (will be redelivered)",
+                exc_info=True,
             )
-            # Continue to ACK -- the task can be retried via XPENDING if needed
-
-        redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
 
     logger.info("Worker shut down cleanly.")
 
@@ -139,15 +164,47 @@ def _execute_task(
     config: WorkerConfig,
     runner: Runner,
     workspace: Workspace,
+    redis: RedisClient,
     logger: logging.Logger,
 ) -> TaskResult:
-    """Execute a single task: clone, run runner, return result."""
+    """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
+    output_stream = f"output:{config.worker_id}"
 
     try:
+        # Publish task start marker (non-critical; don't fail the task)
+        try:
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_start",
+                    "task_id": task.id,
+                    "resource": f"{task.resource_type} #{task.resource_id}",
+                },
+            )
+        except Exception:
+            logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
+
         # Setup workspace
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
         work_dir = workspace.setup(task.repo, task.branch, task.token)
+
+        output_errors = 0
+
+        def on_output(line: str) -> None:
+            nonlocal output_errors
+            try:
+                redis.xadd_capped(output_stream, {"line": line})
+            except Exception:
+                # Non-critical: don't kill the task over a streaming failure.
+                # Log the first occurrence so operators know Redis output
+                # streaming is degraded.
+                output_errors += 1
+                if output_errors == 1:
+                    logger.warning(
+                        "Failed to publish output line to Redis (further errors suppressed)",
+                        exc_info=True,
+                    )
 
         # Run the configured backend
         runner_result: RunnerResult = runner.run(
@@ -156,6 +213,7 @@ def _execute_task(
             token=task.token,
             timeout=config.runner.timeout,
             logger=logger,
+            on_output=on_output,
         )
 
         duration = int(time.monotonic() - start)
@@ -166,6 +224,18 @@ def _execute_task(
             status = ResultStatus.USAGE_EXHAUSTED
         else:
             status = ResultStatus.FAILED
+
+        try:
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_end",
+                    "task_id": task.id,
+                    "status": status.value,
+                },
+            )
+        except Exception:
+            logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 
         return TaskResult(
             task_id=task.id,
@@ -181,6 +251,19 @@ def _execute_task(
     except Exception as e:
         duration = int(time.monotonic() - start)
         logger.error(f"Task execution failed: {e}", exc_info=True)
+
+        try:
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_end",
+                    "task_id": task.id,
+                    "status": ResultStatus.FAILED.value,
+                },
+            )
+        except Exception:
+            logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
+
         return TaskResult(
             task_id=task.id,
             worker_id=config.worker_id,
@@ -193,4 +276,7 @@ def _execute_task(
         )
 
     finally:
-        workspace.cleanup()
+        try:
+            workspace.cleanup()
+        except Exception:
+            logger.warning("Workspace cleanup failed", exc_info=True)

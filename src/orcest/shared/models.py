@@ -16,6 +16,7 @@ class TaskType(str, Enum):
     CLASSIFY_CI = "classify_ci"  # Phase 2
     IMPLEMENT_ISSUE = "implement_issue"  # Phase 2
     IMPROVE_CODEBASE = "improve"  # Phase 3
+    TRIAGE_FOLLOWUPS = "triage_followups"  # Triage unresolved review threads into issues
 
 
 class ResultStatus(str, Enum):

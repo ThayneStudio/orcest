@@ -1,5 +1,7 @@
 """Unit tests for Task and TaskResult dataclasses."""
 
+import pytest
+
 from orcest.shared.models import (
     ResultStatus,
     Task,
@@ -101,3 +103,36 @@ def test_task_result_to_dict_from_dict_round_trip():
 def test_result_status_enum_round_trip():
     for member in ResultStatus:
         assert ResultStatus(member.value) is member
+
+
+def test_task_from_dict_missing_key_raises():
+    task = _make_task()
+    d = task.to_dict()
+    del d["repo"]
+    with pytest.raises(KeyError):
+        Task.from_dict(d)
+
+
+def test_task_from_dict_invalid_type_raises():
+    task = _make_task()
+    d = task.to_dict()
+    d["type"] = "invalid_type"
+    with pytest.raises(ValueError):
+        Task.from_dict(d)
+
+
+def test_task_result_from_dict_invalid_status_raises():
+    result = _make_task_result()
+    d = result.to_dict()
+    d["status"] = "invalid_status"
+    with pytest.raises(ValueError):
+        TaskResult.from_dict(d)
+
+
+def test_task_result_branch_none_roundtrip():
+    result = _make_task_result(branch=None)
+    d = result.to_dict()
+    assert d["branch"] == ""
+
+    rebuilt = TaskResult.from_dict(d)
+    assert rebuilt.branch is None

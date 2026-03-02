@@ -58,7 +58,7 @@ class TestWorkerIsolation:
         runner = NoopRunner(duration=noop_duration)
         original_run = runner.run
 
-        def instrumented_run(prompt, work_dir, token, timeout, logger=None):
+        def instrumented_run(prompt, work_dir, token, timeout, logger=None, on_output=None):
             """Wrap NoopRunner.run to track concurrent executions."""
             with count_lock:
                 active_count["value"] += 1
@@ -70,16 +70,13 @@ class TestWorkerIsolation:
                     token=token,
                     timeout=timeout,
                     logger=logger,
+                    on_output=on_output,
                 )
             finally:
                 with count_lock:
                     active_count["value"] -= 1
 
         runner.run = instrumented_run  # type: ignore[assignment]
-
-        # Mock workspace to avoid real git clones
-        mock_workspace = unittest.mock.MagicMock(spec=Workspace)
-        mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
 
         config = WorkerConfig(
             worker_id="isolation-test",
@@ -111,6 +108,12 @@ class TestWorkerIsolation:
 
         def worker_fn(worker_id: str, task: Task) -> None:
             """Acquire lock, run _execute_task, release lock."""
+            # Each thread gets its own mock workspace to avoid thread-safety
+            # issues with MagicMock (its internal call tracking is not
+            # thread-safe).
+            mock_workspace = unittest.mock.MagicMock(spec=Workspace)
+            mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
+
             lock_key = make_pr_lock_key(task.resource_id)
             lock = RedisLock(redis, lock_key, ttl=30, owner=worker_id)
 
@@ -121,7 +124,7 @@ class TestWorkerIsolation:
             heartbeat = Heartbeat(lock, interval=5)
             heartbeat.start()
             try:
-                result = _execute_task(task, config, runner, mock_workspace, test_logger)
+                result = _execute_task(task, config, runner, mock_workspace, redis, test_logger)
                 with results_lock:
                     results.append((worker_id, task.id, result))
             except Exception as e:
@@ -135,7 +138,11 @@ class TestWorkerIsolation:
 
         def contending_worker(worker_id: str, assigned_tasks: list[Task]) -> None:
             """Worker that processes its assigned tasks sequentially."""
-            barrier.wait()
+            try:
+                barrier.wait(timeout=10)
+            except threading.BrokenBarrierError:
+                errors.append(f"{worker_id}: barrier broken (thread start synchronization failed)")
+                return
             for task in assigned_tasks:
                 worker_fn(worker_id, task)
 
@@ -149,6 +156,7 @@ class TestWorkerIsolation:
             threading.Thread(
                 target=contending_worker,
                 args=(wid, wtasks),
+                name=wid,
             )
             for wid, wtasks in worker_tasks.items()
         ]
@@ -156,6 +164,9 @@ class TestWorkerIsolation:
             t.start()
         for t in threads:
             t.join(timeout=30)
+
+        hung = [t.name for t in threads if t.is_alive()]
+        assert not hung, f"Threads still alive after join timeout: {hung}"
 
         # Assertions
         assert errors == [], f"Worker errors: {errors}"
@@ -184,7 +195,7 @@ class TestWorkerIsolation:
         runner = NoopRunner(duration=noop_duration)
         original_run = runner.run
 
-        def instrumented_run(prompt, work_dir, token, timeout, logger=None):
+        def instrumented_run(prompt, work_dir, token, timeout, logger=None, on_output=None):
             with count_lock:
                 active_count["value"] += 1
                 active_count["max"] = max(active_count["max"], active_count["value"])
@@ -195,15 +206,13 @@ class TestWorkerIsolation:
                     token=token,
                     timeout=timeout,
                     logger=logger,
+                    on_output=on_output,
                 )
             finally:
                 with count_lock:
                     active_count["value"] -= 1
 
         runner.run = instrumented_run  # type: ignore[assignment]
-
-        mock_workspace = unittest.mock.MagicMock(spec=Workspace)
-        mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
 
         config = WorkerConfig(
             worker_id="isolation-test",
@@ -217,6 +226,12 @@ class TestWorkerIsolation:
         barrier = threading.Barrier(num_threads)
 
         def worker_fn(worker_id: str, pr_number: int) -> None:
+            # Each thread gets its own mock workspace to avoid thread-safety
+            # issues with MagicMock (its internal call tracking is not
+            # thread-safe).
+            mock_workspace = unittest.mock.MagicMock(spec=Workspace)
+            mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
+
             task = Task.create(
                 task_type=TaskType.FIX_CI,
                 repo="owner/testrepo",
@@ -237,7 +252,7 @@ class TestWorkerIsolation:
             heartbeat.start()
             try:
                 barrier.wait(timeout=5)  # Synchronize start
-                _execute_task(task, config, runner, mock_workspace, test_logger)
+                _execute_task(task, config, runner, mock_workspace, redis, test_logger)
             except Exception as e:
                 errors.append(f"{worker_id}: {e}")
             finally:
@@ -245,12 +260,16 @@ class TestWorkerIsolation:
                 lock.release()
 
         threads = [
-            threading.Thread(target=worker_fn, args=(f"w-{i}", i + 1)) for i in range(num_threads)
+            threading.Thread(target=worker_fn, args=(f"w-{i}", i + 1), name=f"w-{i}")
+            for i in range(num_threads)
         ]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=30)
+
+        hung = [t.name for t in threads if t.is_alive()]
+        assert not hung, f"Threads still alive after join timeout: {hung}"
 
         assert errors == [], f"Worker errors: {errors}"
         # With different PRs, workers SHOULD be able to run concurrently
@@ -314,16 +333,19 @@ class TestWorkerIsolation:
         configs = []
         for i in range(num_workers):
             rc = make_real_redis_client()
+            conn_kwargs = rc.client.connection_pool.connection_kwargs
             parsed = {
-                "host": rc.client.connection_pool.connection_kwargs.get("host", "localhost"),
-                "port": rc.client.connection_pool.connection_kwargs.get("port", 6379),
-                "db": rc.client.connection_pool.connection_kwargs.get("db", 15),
+                "host": conn_kwargs.get("host", "localhost"),
+                "port": conn_kwargs.get("port", 6379),
+                "db": conn_kwargs.get("db", 15),
+                "password": conn_kwargs.get("password"),
             }
             cfg = WorkerConfig(
                 redis=RedisConfig(
                     host=parsed["host"],
                     port=parsed["port"],
                     db=parsed["db"],
+                    password=parsed["password"],
                 ),
                 worker_id=f"test-worker-{i}",
                 workspace_dir="/tmp/orcest-test-isolation",
@@ -336,12 +358,19 @@ class TestWorkerIsolation:
             )
             configs.append(cfg)
 
-        # Patchers for things that don't work in threads or need mocking
+        # Patchers for things that don't work in threads or need mocking.
+        # Use side_effect (not return_value) so each thread gets its own
+        # MagicMock instance -- MagicMock's internal call tracking is not
+        # thread-safe.
         workspace_patcher = unittest.mock.patch("orcest.worker.loop.Workspace")
         mock_ws_cls = workspace_patcher.start()
-        mock_ws = unittest.mock.MagicMock()
-        mock_ws.setup.return_value = Path("/tmp/fake-workspace")
-        mock_ws_cls.return_value = mock_ws
+
+        def _make_mock_ws(*args, **kwargs):
+            ws = unittest.mock.MagicMock(spec=Workspace)
+            ws.setup.return_value = Path("/tmp/fake-workspace")
+            return ws
+
+        mock_ws_cls.side_effect = _make_mock_ws
 
         logging_patcher = unittest.mock.patch("orcest.worker.loop.setup_logging")
         mock_logging = logging_patcher.start()
@@ -363,12 +392,22 @@ class TestWorkerIsolation:
             def run_with_client(cfg: WorkerConfig) -> None:
                 try:
                     run_worker(cfg)
+                except SystemExit:
+                    # run_worker calls sys.exit(1) on Redis health check
+                    # failure. SystemExit is a BaseException, not Exception,
+                    # so catch it explicitly to avoid silent thread death.
+                    errors.append(f"{cfg.worker_id}: sys.exit called (Redis health check failed?)")
                 except Exception as e:
                     errors.append(f"{cfg.worker_id}: {e}")
 
             threads = []
             for cfg in configs:
-                t = threading.Thread(target=run_with_client, args=(cfg,), daemon=True)
+                t = threading.Thread(
+                    target=run_with_client,
+                    args=(cfg,),
+                    daemon=True,
+                    name=cfg.worker_id,
+                )
                 threads.append(t)
 
             for t in threads:
@@ -380,9 +419,9 @@ class TestWorkerIsolation:
             # With 0.1s noop sleep, this is very fast.
             #
             # IMPORTANT: use original_sleep for the test's own waits.
-            # The noop_sleep_patcher patches the global time module (since
-            # modules are singletons), so time.sleep here would go through
-            # instrumented_sleep and inflate the concurrency counter.
+            # The noop_sleep_patcher patches time.sleep as imported in the
+            # noop_runner module; using original_sleep here avoids any
+            # ambiguity about which sleep is being called.
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 results_count = redis.client.xlen(results_stream)
@@ -403,9 +442,7 @@ class TestWorkerIsolation:
         # only one worker processes a task for a given PR at a time, and
         # redundant tasks for the same PR are discarded.
         results_count = redis.client.xlen(results_stream)
-        assert results_count >= 1, (
-            f"Expected at least 1 result, got {results_count}"
-        )
+        assert results_count >= 1, f"Expected at least 1 result, got {results_count}"
         assert errors == [], f"Worker errors: {errors}"
         assert active_count["max"] <= 1, (
             f"Concurrent executions detected! max={active_count['max']}"
@@ -463,16 +500,19 @@ class TestWorkerIsolation:
 
         # Build config for a single worker
         rc = make_real_redis_client()
+        conn_kwargs = rc.client.connection_pool.connection_kwargs
         parsed = {
-            "host": rc.client.connection_pool.connection_kwargs.get("host", "localhost"),
-            "port": rc.client.connection_pool.connection_kwargs.get("port", 6379),
-            "db": rc.client.connection_pool.connection_kwargs.get("db", 15),
+            "host": conn_kwargs.get("host", "localhost"),
+            "port": conn_kwargs.get("port", 6379),
+            "db": conn_kwargs.get("db", 15),
+            "password": conn_kwargs.get("password"),
         }
         cfg = WorkerConfig(
             redis=RedisConfig(
                 host=parsed["host"],
                 port=parsed["port"],
                 db=parsed["db"],
+                password=parsed["password"],
             ),
             worker_id="skip-test-worker",
             workspace_dir="/tmp/orcest-test-isolation",
@@ -486,9 +526,13 @@ class TestWorkerIsolation:
 
         workspace_patcher = unittest.mock.patch("orcest.worker.loop.Workspace")
         mock_ws_cls = workspace_patcher.start()
-        mock_ws = unittest.mock.MagicMock()
-        mock_ws.setup.return_value = Path("/tmp/fake-workspace")
-        mock_ws_cls.return_value = mock_ws
+
+        def _make_mock_ws(*args, **kwargs):
+            ws = unittest.mock.MagicMock(spec=Workspace)
+            ws.setup.return_value = Path("/tmp/fake-workspace")
+            return ws
+
+        mock_ws_cls.side_effect = _make_mock_ws
 
         logging_patcher = unittest.mock.patch("orcest.worker.loop.setup_logging")
         mock_logging = logging_patcher.start()
@@ -503,10 +547,17 @@ class TestWorkerIsolation:
             def run_worker_thread(config: WorkerConfig) -> None:
                 try:
                     run_worker(config)
+                except SystemExit:
+                    errors.append("sys.exit called (Redis health check failed?)")
                 except Exception as e:
                     errors.append(str(e))
 
-            t = threading.Thread(target=run_worker_thread, args=(cfg,), daemon=True)
+            t = threading.Thread(
+                target=run_worker_thread,
+                args=(cfg,),
+                daemon=True,
+                name="skip-test-worker",
+            )
             t.start()
 
             # Wait for the unlocked task to produce a result

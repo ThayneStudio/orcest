@@ -6,9 +6,13 @@ stream operations with simplified return types.
 
 from __future__ import annotations
 
+import logging
+
 import redis
 
 from orcest.shared.config import RedisConfig
+
+logger = logging.getLogger(__name__)
 
 
 class RedisClient:
@@ -37,7 +41,12 @@ class RedisClient:
         """Returns True if Redis is reachable."""
         try:
             return self._client.ping()
-        except (redis.ConnectionError, redis.TimeoutError, redis.AuthenticationError):
+        except (
+            redis.ConnectionError,
+            redis.TimeoutError,
+            redis.ResponseError,
+            redis.AuthenticationError,
+        ):
             return False
 
     def xadd(self, stream: str, fields: dict[str, str]) -> str:
@@ -85,6 +94,61 @@ class RedisClient:
         result: int = self._client.xack(stream, group, entry_id)  # type: ignore[assignment]
         return result
 
+    def xadd_capped(self, stream: str, fields: dict[str, str], maxlen: int = 2000) -> str:
+        """Add entry to a capped stream (approximate MAXLEN).
+
+        Args:
+            stream: Stream name.
+            fields: Field dict to add.
+            maxlen: Approximate maximum stream length. Must be positive.
+        """
+        if maxlen < 1:
+            raise ValueError(f"maxlen must be positive, got {maxlen}")
+        if not fields:
+            raise ValueError("fields must be a non-empty dict")
+        entry_id: str = self._client.xadd(  # type: ignore[assignment]
+            stream, fields, maxlen=maxlen, approximate=True
+        )
+        return entry_id
+
+    def xread_after(
+        self,
+        stream: str,
+        last_id: str = "0-0",
+        count: int = 100,
+    ) -> list[tuple[str, dict[str, str]]]:
+        """Read entries from a stream after last_id (non-blocking).
+
+        Returns list of (entry_id, fields) tuples.
+        Returns empty list if the stream doesn't exist, has no new entries,
+        or a Redis error occurs (logged as a warning).
+
+        Args:
+            stream: Stream name.
+            last_id: Read entries after this ID. Defaults to ``"0-0"`` (all).
+            count: Maximum number of entries to return. Must be positive.
+        """
+        if count < 1:
+            raise ValueError(f"count must be positive, got {count}")
+        try:
+            result = self._client.xread({stream: last_id}, count=count, block=None)
+        except (
+            redis.ConnectionError,
+            redis.TimeoutError,
+            redis.ResponseError,
+            redis.AuthenticationError,
+        ):
+            logger.warning(
+                "xread_after failed for stream %s (last_id=%s)",
+                stream,
+                last_id,
+                exc_info=True,
+            )
+            return []
+        if not result:
+            return []
+        return result[0][1]
+
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
 
@@ -92,9 +156,7 @@ class RedisClient:
         Idempotent -- safe to call on every startup.
         """
         try:
-            self._client.xgroup_create(
-                name=stream, groupname=group, id="0", mkstream=True
-            )
+            self._client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
         except redis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise

@@ -83,9 +83,7 @@ def simulate_worker(
             try:
                 redis_client.xadd(results_stream, result.to_dict())
             except Exception as exc:
-                errors.append(
-                    f"Worker {worker_id} failed to publish result: {exc}"
-                )
+                errors.append(f"Worker {worker_id} failed to publish result: {exc}")
                 continue
         finally:
             heartbeat.stop()

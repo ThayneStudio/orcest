@@ -46,18 +46,12 @@ class RedisLock:
         # call.  register_script returns a Script object that uses EVALSHA
         # with automatic EVAL fallback, so the Redis server caches the
         # compiled script by SHA.
-        self._release_script = self.redis.client.register_script(
-            _RELEASE_SCRIPT
-        )
-        self._refresh_script = self.redis.client.register_script(
-            _REFRESH_SCRIPT
-        )
+        self._release_script = self.redis.client.register_script(_RELEASE_SCRIPT)
+        self._refresh_script = self.redis.client.register_script(_REFRESH_SCRIPT)
 
     def acquire(self) -> bool:
         """Attempt to acquire the lock. Returns True if successful."""
-        result = self.redis.client.set(
-            self.key, self.owner, nx=True, ex=self.ttl
-        )
+        result = self.redis.client.set(self.key, self.owner, nx=True, ex=self.ttl)
         self._held = result is not None
         return self._held
 
@@ -69,9 +63,7 @@ class RedisLock:
         Always clears _held since after calling release() we no longer
         consider ourselves the holder regardless of outcome.
         """
-        result = self._release_script(
-            keys=[self.key], args=[self.owner]
-        )
+        result = self._release_script(keys=[self.key], args=[self.owner])
         self._held = False
         return result == 1
 
@@ -80,9 +72,7 @@ class RedisLock:
 
         Uses a Lua script for atomic check-and-expire.
         """
-        result = self._refresh_script(
-            keys=[self.key], args=[self.owner, str(self.ttl)]
-        )
+        result = self._refresh_script(keys=[self.key], args=[self.owner, str(self.ttl)])
         return result == 1
 
     @property
