@@ -103,7 +103,7 @@ def discover_actionable_issues(
         number: int = issue_data["number"]
         title: str = issue_data["title"]
         body: str = issue_data.get("body") or ""
-        issue_labels: list[str] = [lbl["name"] for lbl in (issue_data.get("labels") or [])]
+        issue_labels: list[str] = [lbl.get("name", "") for lbl in (issue_data.get("labels") or [])]
 
         # Skip if already labeled by orcest (queued/in-progress/etc)
         if any(label in orcest_labels for label in issue_labels):
