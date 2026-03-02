@@ -444,7 +444,7 @@ def _handle_result(
                 clear_attempts(redis, resource_id)
         except Exception as e:
             logger.error(
-                "Failed to clear attempt counter for %s #%s: %s",
+                "Failed to clear attempt counter for %s #%d: %s",
                 resource_label,
                 resource_id,
                 e,
@@ -458,7 +458,7 @@ def _handle_result(
             _remove_label(repo, resource_id, labels.queued, token)
         except Exception as e:
             logger.error(
-                "Failed to remove queued label on %s #%s: %s",
+                "Failed to remove queued label on %s #%d: %s",
                 resource_label,
                 resource_id,
                 e,
@@ -468,7 +468,7 @@ def _handle_result(
             _add_label(repo, resource_id, labels.in_progress, token)
         except Exception as e:
             logger.error(
-                "Failed to add in-progress label on %s #%s: %s",
+                "Failed to add in-progress label on %s #%d: %s",
                 resource_label,
                 resource_id,
                 e,
@@ -479,7 +479,7 @@ def _handle_result(
             _remove_label(repo, resource_id, labels.queued, token)
         except Exception as e:
             logger.error(
-                "Failed to remove queued label on %s #%s: %s",
+                "Failed to remove queued label on %s #%d: %s",
                 resource_label,
                 resource_id,
                 e,
@@ -489,7 +489,7 @@ def _handle_result(
             _remove_label(repo, resource_id, labels.in_progress, token)
         except Exception as e:
             logger.error(
-                "Failed to remove in-progress label on %s #%s: %s",
+                "Failed to remove in-progress label on %s #%d: %s",
                 resource_label,
                 resource_id,
                 e,
@@ -502,7 +502,7 @@ def _handle_result(
                 labeled = True
             except Exception as e:
                 logger.error(
-                    "Failed to add needs-human label on %s #%s: %s",
+                    "Failed to add needs-human label on %s #%d: %s",
                     resource_label,
                     resource_id,
                     e,
@@ -513,7 +513,7 @@ def _handle_result(
                 _add_label(repo, resource_id, labels.blocked, token)
             except Exception as e:
                 logger.error(
-                    "Failed to add blocked label on %s #%s: %s",
+                    "Failed to add blocked label on %s #%d: %s",
                     resource_label,
                     resource_id,
                     e,
@@ -568,7 +568,7 @@ def _handle_result(
         _post_comment(repo, resource_id, body, token)
     except Exception as e:
         logger.error(
-            "Failed to post comment on %s #%s: %s",
+            "Failed to post comment on %s #%d: %s",
             resource_label,
             resource_id,
             e,
