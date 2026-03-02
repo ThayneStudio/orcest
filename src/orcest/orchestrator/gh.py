@@ -80,8 +80,6 @@ def _run_gh(args: list[str], token: str) -> str:
             brief += " ..."
         raise GhCliError(
             f"gh command timed out after {exc.timeout}s: gh {brief}",
-            stderr="",
-            returncode=None,
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise GhCliError(
