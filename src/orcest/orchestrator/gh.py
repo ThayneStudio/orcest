@@ -497,10 +497,11 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
         )
     results = []
     for comment in comments:
+        line = comment.get("line")
         results.append(
             {
                 "path": comment.get("path", ""),
-                "line": comment.get("line") or comment.get("original_line"),
+                "line": line if line is not None else comment.get("original_line"),
                 "author": (comment.get("user") or {}).get("login", ""),
                 "body": comment.get("body", ""),
             }
