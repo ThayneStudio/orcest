@@ -38,8 +38,13 @@ def setup_logging(
     fmt = f"[{component}:{identifier}] %(message)s"
     handler.setFormatter(logging.Formatter(fmt))
 
+    numeric_level = getattr(logging, level.upper(), None)
+    if numeric_level is None or not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {level!r}")
+
     logger = logging.getLogger(f"orcest.{component}.{identifier}")
-    logger.setLevel(getattr(logging, level.upper()))
+    logger.setLevel(numeric_level)
+    logger.handlers.clear()
     logger.addHandler(handler)
 
     # Prevent propagation to root logger (avoids duplicate output)
