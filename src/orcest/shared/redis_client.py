@@ -67,24 +67,9 @@ class RedisClient:
         ):
             return False
 
-    def xadd(
-        self,
-        stream: str,
-        fields: dict[str, str],
-        maxlen: int | None = None,
-        approximate: bool = True,
-    ) -> str:
-        """Add entry to stream. Returns the entry ID.
-
-        Args:
-            stream: Stream name.
-            fields: Field dict to add.
-            maxlen: If set, trim the stream to approximately this length.
-            approximate: Use ``~`` (approximate) trimming when True (default).
-        """
-        entry_id: str = self._client.xadd(  # type: ignore[assignment]
-            stream, fields, maxlen=maxlen, approximate=approximate
-        )
+    def xadd(self, stream: str, fields: dict[str, str]) -> str:
+        """Add entry to stream. Returns the entry ID."""
+        entry_id: str = self._client.xadd(stream, fields)  # type: ignore[assignment]
         return entry_id
 
     def xreadgroup(
