@@ -57,11 +57,15 @@ sudo mkdir -p "$WORKSPACE_DIR"
 sudo mkdir -p "$WORKSPACE_DIR/workspaces"
 sudo chown -R orcest:orcest "$WORKSPACE_DIR"
 
+# Create virtualenv for orcest
+echo "Creating virtualenv at $WORKSPACE_DIR/venv..."
+sudo -u orcest python3 -m venv "$WORKSPACE_DIR/venv"
+
 # Install orcest package (wheel is uploaded separately by `orcest provision`)
 WHEEL=$(find /tmp/orcest-wheel/ -name '*.whl' 2>/dev/null | head -1)
 if [[ -n "$WHEEL" ]]; then
     echo "Installing orcest from wheel: $(basename "$WHEEL")"
-    sudo python3 -m pip install --break-system-packages --ignore-installed "$WHEEL"
+    sudo -u orcest "$WORKSPACE_DIR/venv/bin/pip" install "$WHEEL"
 else
     echo "No wheel found at /tmp/orcest-wheel/ — skipping orcest install."
     echo "The provision command will install it in the next step."
@@ -70,7 +74,7 @@ fi
 # Verify dependencies
 echo ""
 echo "Verifying installation..."
-for cmd in python3 node claude gh git orcest; do
+for cmd in python3 node claude gh git; do
     if command -v "$cmd" &>/dev/null; then
         echo "  $cmd: ok"
     else
@@ -78,6 +82,13 @@ for cmd in python3 node claude gh git orcest; do
         exit 1
     fi
 done
+ORCEST_BIN="$WORKSPACE_DIR/venv/bin/orcest"
+if [[ -x "$ORCEST_BIN" ]]; then
+    echo "  orcest: ok"
+else
+    echo "  orcest: MISSING"
+    exit 1
+fi
 
 echo ""
 echo "=== Setup complete ==="
