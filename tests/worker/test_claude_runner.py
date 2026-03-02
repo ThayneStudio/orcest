@@ -677,6 +677,28 @@ def test_extract_summary_result_key():
 
 
 # ---------------------------------------------------------------------------
+# _extract_summary: multi-result stream -> last result wins (regression #111)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_extract_summary_last_result_in_multi_result_stream():
+    """Multi-result stream -> last top-level 'result' value is returned.
+
+    Regression test for PR #59: _extract_summary must scan all lines and
+    return the *last* result, not early-return on the first one.
+    """
+    lines = [
+        json.dumps({"result": "intermediate result"}) + "\n",
+        _stream_json_assistant("assistant message in between") + "\n",
+        json.dumps({"result": "final summary"}) + "\n",
+    ]
+    output = "".join(lines)
+    result = _extract_summary(output)
+    assert result == "final summary"
+
+
+# ---------------------------------------------------------------------------
 # _extract_summary: assistant message with "result" key not misinterpreted
 # ---------------------------------------------------------------------------
 
