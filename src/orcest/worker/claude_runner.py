@@ -106,18 +106,38 @@ def _is_usage_exhausted(stderr: str) -> bool:
     return False
 
 
-def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
     """Kill a subprocess and all its children via process group signal.
 
     Because we launch with start_new_session=True, the subprocess is
-    the leader of its own process group.  Sending SIGKILL to the group
+    the leader of its own process group.  Sending signals to the group
     ensures child processes (e.g. Node.js subprocesses spawned by Claude
     CLI) are also terminated.
+
+    Sends SIGTERM first to allow Claude to exit cleanly, waits up to
+    ``sigterm_timeout`` seconds, then sends SIGKILL if still alive.
     """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError):
         # Process already exited or we lost permission -- nothing to do.
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    try:
+        proc.wait(timeout=sigterm_timeout)
+        # Leader exited; fall through to SIGKILL the group for any remaining children.
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Process already exited between SIGTERM and SIGKILL -- nothing to do.
         pass
 
 
