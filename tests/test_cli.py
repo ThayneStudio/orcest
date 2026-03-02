@@ -123,7 +123,7 @@ def test_status_once_wrongtype_both_does_not_raise(fake_redis_client):
     _status_once(fake_redis_client)
 
 
-def test_status_once_wrongtype_tasks_key_shows_not_a_stream(fake_redis_client, capsys):
+def test_status_once_wrongtype_tasks_key_shows_not_a_stream(fake_redis_client):
     """A WRONGTYPE tasks:* key is reported as '(not a stream)' in output."""
     fake_redis_client.client.set("tasks:bad-key", "oops")
     # _status_once uses Rich console which writes to stdout
