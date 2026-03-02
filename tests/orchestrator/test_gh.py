@@ -6,6 +6,7 @@ The mock target is the *module-level* import inside ``gh.py``, i.e.
 """
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -909,7 +910,6 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
             }
         ),
     )
-    import logging
 
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
@@ -922,8 +922,79 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
     assert any("more than 10 comments" in msg for msg in caplog.messages)
 
 
-def test_get_unresolved_threads_pagination_raises(mocker):
-    """Raises GhCliError when reviewThreads has more pages than we fetch."""
+def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
+    """Fetches all pages and returns threads from every page when hasNextPage is True."""
+    page1 = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor_abc"},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_page1",
+                                    "path": "a.py",
+                                    "line": 1,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [{"body": "Fix", "author": {"login": "alice"}}],
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    page2 = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_page2",
+                                    "path": "b.py",
+                                    "line": 2,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [{"body": "Also fix", "author": {"login": "bob"}}],
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[page1, page2],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        result = get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    # Threads from both pages are returned
+    assert len(result) == 2
+    assert result[0]["id"] == "PRRT_page1"
+    assert result[1]["id"] == "PRRT_page2"
+    # Warning logged about additional pages
+    assert any("more than 100 review threads" in msg for msg in caplog.messages)
+    # Second call includes the cursor
+    second_args = mock_run.call_args_list[1][0][0]
+    assert "after=cursor_abc" in " ".join(second_args)
+
+
+def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
+    """Stops pagination and logs a warning when hasNextPage=True but endCursor is absent."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
@@ -940,7 +1011,10 @@ def test_get_unresolved_threads_pagination_raises(mocker):
                                         "line": 1,
                                         "isResolved": False,
                                         "comments": {
-                                            "nodes": [{"body": "Fix", "author": {"login": "alice"}}]
+                                            "pageInfo": {"hasNextPage": False},
+                                            "nodes": [
+                                                {"body": "Fix", "author": {"login": "alice"}}
+                                            ],
                                         },
                                     },
                                 ],
@@ -951,8 +1025,15 @@ def test_get_unresolved_threads_pagination_raises(mocker):
             }
         ),
     )
-    with pytest.raises(GhCliError, match="more than 100 review threads"):
-        get_unresolved_review_threads(REPO, 5, TOKEN)
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        result = get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    # The fetched thread is still returned
+    assert len(result) == 1
+    assert result[0]["id"] == "PRRT_1"
+    # Both the "more than 100" and "endCursor missing" warnings are logged
+    assert any("more than 100 review threads" in msg for msg in caplog.messages)
+    assert any("endCursor is missing" in msg for msg in caplog.messages)
 
 
 # ---------------------------------------------------------------------------
