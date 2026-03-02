@@ -13,6 +13,7 @@ from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
     CONSUMER_GROUP,
+    HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
     _execute_task,
     _make_abort_event,
@@ -708,6 +709,33 @@ class TestRunWorker:
         # The malformed entry must still be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-bad")
+
+    def test_heartbeat_uses_explicit_interval_not_lock_ttl(
+        self, mocker, worker_config, sample_task
+    ):
+        """Heartbeat must be started with HEARTBEAT_INTERVAL, not lock.ttl / 3.
+
+        Regression test for issue #121: after PR #83 raised the lock TTL to
+        ~5540 s, the default heartbeat interval (ttl/3 ~= 1847 s) caused
+        crashed workers to hold stale locks for up to ~92 minutes.  The fix
+        passes an explicit HEARTBEAT_INTERVAL so refresh cadence is decoupled
+        from TTL size.
+        """
+        mock_redis = self._build_mock_redis()
+        mock_heartbeat_cls = MagicMock()
+        mock_heartbeat_instance = MagicMock()
+        mock_heartbeat_cls.return_value = mock_heartbeat_instance
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocker.patch("orcest.worker.loop.Heartbeat", mock_heartbeat_cls)
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        mock_heartbeat_cls.assert_called_once()
+        _, kwargs = mock_heartbeat_cls.call_args
+        assert "interval" in kwargs, "Heartbeat must receive an explicit interval kwarg"
+        assert kwargs["interval"] == HEARTBEAT_INTERVAL
 
     def test_worker_base_exception_releases_lock_and_stops_heartbeat(
         self, mocker, worker_config, sample_task
