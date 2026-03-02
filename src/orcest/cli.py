@@ -108,7 +108,11 @@ def _status_once(redis):
     client = redis.client
 
     task_streams = list(client.scan_iter(match="tasks:*"))
-    results_len = client.xlen("results") or 0
+    try:
+        results_len = client.xlen("results") or 0
+    except redis_lib.ResponseError:
+        # WRONGTYPE: results key exists but is not a stream
+        results_len = 0
 
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
@@ -134,7 +138,11 @@ def _status_once(redis):
     table.add_column("Stream", style="cyan")
     table.add_column("Pending", style="yellow")
     for stream_key in sorted(task_streams):
-        table.add_row(stream_key, str(client.xlen(stream_key) or 0))
+        try:
+            table.add_row(stream_key, str(client.xlen(stream_key) or 0))
+        except redis_lib.ResponseError:
+            # WRONGTYPE: key exists but is not a stream
+            table.add_row(stream_key, "(not a stream)")
     if not task_streams:
         table.add_row("tasks:*", "0")
     table.add_row("results", str(results_len))
