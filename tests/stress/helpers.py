@@ -77,7 +77,7 @@ def simulate_worker(
                 duration_seconds=0,
             )
             try:
-                redis_client.xadd(results_stream, result.to_dict())
+                redis_client.xadd_capped(results_stream, result.to_dict())
             except Exception as exc:
                 errors.append(f"Worker {worker_id} failed to publish result: {exc}")
                 continue
