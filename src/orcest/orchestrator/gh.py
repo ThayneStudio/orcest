@@ -505,13 +505,20 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
             "api",
             f"repos/{repo}/pulls/{number}/comments",
             "-F",
-            "per_page=100",
+            "per_page=100",  # max single-page fetch; 100+ comments silently truncated
         ],
         token,
     )
     if not output:
         return []
     comments = json.loads(output)
+    if len(comments) == 100:
+        logging.getLogger(__name__).warning(
+            "get_pr_review_comments: received exactly 100 comments for PR #%s/%s; "
+            "results may be truncated (pagination not implemented)",
+            repo,
+            number,
+        )
     results = []
     for comment in comments:
         results.append(

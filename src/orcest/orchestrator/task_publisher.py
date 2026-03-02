@@ -175,11 +175,17 @@ def publish_fix_task(
     # Use review threads from pr_state (populated by discover_actionable_prs for
     # CHANGES_REQUESTED). For CI failures, fetch inline review comments from the
     # REST API since discover_actionable_prs does not populate review_threads there.
+    _log = logger or logging.getLogger(__name__)
     if pr_state.ci_failures:
         try:
             raw_inline = gh.get_pr_review_comments(repo, pr_state.number, token)
             review_threads = _group_inline_comments(raw_inline)
-        except Exception:
+        except Exception as exc:
+            _log.warning(
+                "Failed to fetch inline review comments for PR #%s; proceeding without them: %s",
+                pr_state.number,
+                exc,
+            )
             review_threads = []
     else:
         review_threads = pr_state.review_threads
