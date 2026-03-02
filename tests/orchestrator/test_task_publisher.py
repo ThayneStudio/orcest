@@ -911,7 +911,10 @@ def test_publish_and_notify_xadd_failure(
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=604)
 
-    # Sabotage xadd_capped to simulate Redis failure
+    # Patch xadd_capped (not xadd): task_publisher calls redis.xadd_capped()
+    # directly, and xadd_capped calls self._client.xadd internally, bypassing
+    # the RedisClient.xadd wrapper.  Patching the lower-level xadd would have
+    # no effect on the publisher's code path.
     original_xadd_capped = fake_redis_client.xadd_capped
 
     def broken_xadd_capped(stream, fields, maxlen=2000):
