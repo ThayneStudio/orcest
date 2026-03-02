@@ -19,10 +19,13 @@ RUN useradd --create-home --shell /bin/false orcest
 
 WORKDIR /home/orcest/app
 
-# Install orcest
+# Install dependencies in a separate layer for better cache reuse
 COPY pyproject.toml .
+RUN python3 -c "import tomllib, subprocess, sys; data = tomllib.load(open('pyproject.toml', 'rb')); deps = data['project']['dependencies']; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + deps)"
+
+# Install orcest package (source only, deps already installed)
 COPY src/ src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 USER orcest
 
