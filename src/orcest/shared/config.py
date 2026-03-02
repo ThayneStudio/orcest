@@ -37,6 +37,7 @@ class LabelConfig:
     in_progress: str = "orcest:in-progress"
     blocked: str = "orcest:blocked"
     needs_human: str = "orcest:needs-human"
+    ready: str = "orcest:ready"
 
 
 @dataclass
@@ -170,6 +171,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         in_progress=str(labels_raw.get("in_progress", "orcest:in-progress")),
         blocked=str(labels_raw.get("blocked", "orcest:blocked")),
         needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),
+        ready=str(labels_raw.get("ready", "orcest:ready")),
     )
 
     # Default runner backend

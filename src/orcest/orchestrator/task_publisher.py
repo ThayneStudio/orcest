@@ -10,6 +10,8 @@ import re
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
+from orcest.orchestrator.issue_ops import IssueState
+from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
 from orcest.orchestrator.pr_ops import PRState, increment_attempts
 from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
@@ -269,6 +271,166 @@ def publish_followup_task(
     )
 
     return task
+
+
+def publish_issue_task(
+    issue_state: IssueState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    label_config: LabelConfig,
+    default_runner: str,
+    logger: logging.Logger | None = None,
+) -> Task:
+    """Create and publish an implementation task for a GitHub issue.
+
+    Steps:
+    1. Render prompt from issue title and body
+    2. Publish to Redis stream
+    3. Add orcest:queued label and post comment on issue
+    """
+    prompt = _render_issue_prompt(
+        issue_number=issue_state.number,
+        issue_title=issue_state.title,
+        issue_body=issue_state.body,
+        repo=repo,
+    )
+
+    task = Task.create(
+        task_type=TaskType.IMPLEMENT_ISSUE,
+        repo=repo,
+        token=token,
+        resource_type="issue",
+        resource_id=issue_state.number,
+        prompt=prompt,
+        branch=None,
+    )
+
+    _publish_issue_and_notify(
+        task=task,
+        issue_state=issue_state,
+        repo=repo,
+        token=token,
+        redis=redis,
+        label_config=label_config,
+        default_runner=default_runner,
+        logger=logger,
+    )
+
+    return task
+
+
+def _publish_issue_and_notify(
+    task: Task,
+    issue_state: IssueState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    label_config: LabelConfig,
+    default_runner: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Publish a task to Redis and update GitHub visibility on the issue."""
+    task_type = task.type
+    _log = logger or logging.getLogger(__name__)
+
+    # Publish to backend-specific stream
+    tasks_stream = f"tasks:{default_runner}"
+    redis.xadd(tasks_stream, task.to_dict())
+
+    # Track attempt count
+    try:
+        increment_issue_attempts(redis, issue_state.number)
+    except Exception:
+        _log.error(
+            f"Failed to increment attempt counter for issue #{issue_state.number} "
+            f"(task {task.id} already published to Redis)",
+            exc_info=True,
+        )
+
+    # Update GitHub visibility on the issue
+    _label_ok = True
+    _comment_ok = True
+    try:
+        gh.add_issue_label(repo, issue_state.number, label_config.queued, token)
+    except Exception:
+        _label_ok = False
+        _log.error(
+            f"Failed to add queued label to issue #{issue_state.number} "
+            f"(task {task.id} already published to Redis)",
+            exc_info=True,
+        )
+    try:
+        gh.post_issue_comment(
+            repo,
+            issue_state.number,
+            f"**orcest** queued task `{task.id}` ({task_type.value}) for this issue.",
+            token,
+        )
+    except Exception:
+        _comment_ok = False
+        _log.error(
+            f"Failed to post comment on issue #{issue_state.number} "
+            f"(task {task.id} already published to Redis)",
+            exc_info=True,
+        )
+
+    if _label_ok and _comment_ok:
+        _log.info(
+            f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
+        )
+    else:
+        _log.warning(
+            f"Published {task_type.value} task {task.id} "
+            f"for issue #{issue_state.number} (GitHub visibility partially failed: "
+            f"label={'ok' if _label_ok else 'FAILED'}, "
+            f"comment={'ok' if _comment_ok else 'FAILED'})"
+        )
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Convert text to a branch-name-safe slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].rstrip("-")
+
+
+def _render_issue_prompt(
+    issue_number: int,
+    issue_title: str,
+    issue_body: str,
+    repo: str,
+) -> str:
+    """Render the prompt for implementing a GitHub issue."""
+    branch_name = f"issue-{issue_number}-{_slugify(issue_title)}"
+
+    sections: list[str] = [
+        f"# Implement Issue #{issue_number}: {issue_title}",
+        "",
+        "You are on the default branch (main/master).",
+        "",
+        "## Issue Description",
+        "",
+        issue_body or "(No description provided.)",
+        "",
+        "## Instructions",
+        "",
+        "1. Read the issue description carefully.",
+        f"2. Create a new branch: `git checkout -b {branch_name}`",
+        "3. Read the repo's CLAUDE.md (if it exists) for project conventions.",
+        "4. Implement the requested changes.",
+        "5. Run the project's linter and tests to verify your changes.",
+        "6. Commit your changes with a descriptive message referencing the issue.",
+        f"7. Push the branch: `git push -u origin {branch_name}`",
+        f'8. Open a PR: `gh pr create --repo {repo} --title "{issue_title}" '
+        f'--body "Closes #{issue_number}" --head {branch_name}`',
+        "",
+        "Important:",
+        "- Make minimal, focused changes.",
+        "- Do NOT close the issue directly -- the PR will close it on merge.",
+        "- Do NOT call `gh pr review` -- you are not authorized to change review status.",
+    ]
+
+    return "\n".join(sections)
 
 
 def _render_review_threads(threads: list[dict]) -> list[str]:
