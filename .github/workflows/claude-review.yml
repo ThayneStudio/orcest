@@ -1,0 +1,55 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          include_fix_links: true
+          prompt: |
+            You are a code reviewer for PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            Instructions:
+            1. Run `gh pr view ${{ github.event.pull_request.number }}` to get the PR title, author, and description.
+            2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changes.
+            3. Read the repository's CLAUDE.md for project conventions.
+            4. Review the changes for:
+               - Code quality and best practices
+               - Potential bugs or issues
+               - Performance considerations
+               - Security concerns
+            5. For specific code issues, use the `mcp__github_inline_comment__create_inline_comment` tool to leave inline comments on the relevant lines. If the inline comment tool is unavailable, include file-specific feedback in your review body instead.
+            6. Be concise — focus only on actionable feedback for actual changes in this PR.
+            7. After reviewing, submit your final verdict:
+               - If the changes look good with no blocking issues: `gh pr review ${{ github.event.pull_request.number }} --approve --body "YOUR_SUMMARY"`
+               - If there are issues that must be fixed: `gh pr review ${{ github.event.pull_request.number }} --request-changes --body "YOUR_SUMMARY"`
+
+            Do NOT use `gh pr comment`. Use only inline comments for specific feedback and `gh pr review` for the final verdict.
+
+          claude_args: '--allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*)"'
+        env:
+          GH_TOKEN: ${{ github.token }}
