@@ -157,7 +157,9 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         # Start heartbeat; signal lock_lost if the lock cannot be refreshed
         lock_lost = threading.Event()
-        heartbeat = Heartbeat(lock, interval=HEARTBEAT_INTERVAL, logger=logger, on_lock_lost=lock_lost.set)
+        heartbeat = Heartbeat(
+            lock, interval=HEARTBEAT_INTERVAL, logger=logger, on_lock_lost=lock_lost.set
+        )
         heartbeat.start()
 
         # Combine lock_lost and shutdown_event so that either a lost lock *or*
