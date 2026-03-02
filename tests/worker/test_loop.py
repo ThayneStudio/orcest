@@ -559,8 +559,10 @@ class TestRunWorker:
         # Should never attempt to read from the stream
         mock_redis.xreadgroup.assert_not_called()
 
-    def test_worker_result_publish_failure_still_acks(self, mocker, worker_config, sample_task):
-        """When redis.xadd for the results stream raises, xack is still called."""
+    def test_worker_result_publish_failure_does_not_ack(self, mocker, worker_config, sample_task):
+        """When redis.xadd for the results stream raises, xack must NOT be called.
+        The message stays in XPENDING so it can be re-delivered and the result
+        is not silently lost."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
@@ -571,9 +573,8 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        # Despite the xadd failure, xack must still be called to avoid redelivery
-        expected_stream = f"tasks:{worker_config.backend}"
-        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-1")
+        # xack must NOT be called — leave the message in XPENDING for re-delivery
+        mock_redis.xack.assert_not_called()
 
     def test_worker_malformed_task_acks_and_continues(self, mocker, worker_config):
         """When a stream entry cannot be deserialized, the worker ACKs it

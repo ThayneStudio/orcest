@@ -142,14 +142,19 @@ def run_worker(config: WorkerConfig) -> None:
             lock.release()
             logger.info(f"Released lock {lock_key}")
 
-        # Publish result and ACK (only reached on normal execution)
+        # Publish result, then ACK only if publish succeeded.
+        # If publish fails, leave the message pending so XPENDING recovery
+        # can re-deliver it. Duplicate work risk < silent result loss.
         try:
             redis.xadd(RESULTS_STREAM, result.to_dict())
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
-            logger.error(f"Failed to publish result for task {task.id}", exc_info=True)
-            # Continue to ACK to avoid redelivery -- the orchestrator will
-            # detect the missing result and may re-enqueue if needed
+            logger.error(
+                f"Failed to publish result for task {task.id}; not ACKing so it "
+                "remains in XPENDING for re-delivery",
+                exc_info=True,
+            )
+            continue
 
         try:
             redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
