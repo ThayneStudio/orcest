@@ -8,6 +8,7 @@ publishes results back to a results stream for the orchestrator.
 import logging
 import signal
 import sys
+import threading
 import time
 
 from orcest.shared.config import WorkerConfig
@@ -40,11 +41,13 @@ def run_worker(config: WorkerConfig) -> None:
 
     # Graceful shutdown
     shutdown = False
+    shutdown_event = threading.Event()
 
     def handle_signal(signum: int, frame: object) -> None:
         nonlocal shutdown
         logger.info(f"Received signal {signum}, shutting down gracefully...")
         shutdown = True
+        shutdown_event.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -127,6 +130,7 @@ def run_worker(config: WorkerConfig) -> None:
                 workspace,
                 redis,
                 logger,
+                shutdown_event,
             )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
@@ -169,6 +173,7 @@ def _execute_task(
     workspace: Workspace,
     redis: RedisClient,
     logger: logging.Logger,
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
@@ -217,6 +222,7 @@ def _execute_task(
             timeout=config.runner.timeout,
             logger=logger,
             on_output=on_output,
+            shutdown_event=shutdown_event,
         )
 
         duration = int(time.monotonic() - start)
