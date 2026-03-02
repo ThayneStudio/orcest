@@ -474,6 +474,119 @@ query($owner: String!, $repo: String!, $number: Int!) {
     return results
 
 
+def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
+    """List open issues with a specific label.
+
+    Returns list of dicts with keys: number, title, body, labels.
+    """
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--json",
+            "number,title,body,labels",
+            "--limit",
+            "100",
+        ],
+        token,
+    )
+    return json.loads(output) if output else []
+
+
+def get_issue(repo: str, number: int, token: str) -> dict:
+    """Get detailed issue info."""
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "issue",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,labels,assignees",
+        ],
+        token,
+    )
+    if not output:
+        raise GhCliError(f"gh issue view returned empty output for issue #{number}")
+    return json.loads(output)
+
+
+def add_issue_label(repo: str, number: int, label: str, token: str) -> None:
+    """Add a label to an issue."""
+    _validate_repo(repo)
+    _run_gh(
+        [
+            "issue",
+            "edit",
+            str(number),
+            "--repo",
+            repo,
+            "--add-label",
+            label,
+        ],
+        token,
+    )
+
+
+def remove_issue_label(repo: str, number: int, label: str, token: str) -> None:
+    """Remove a label from an issue. Silently succeeds if not present."""
+    _validate_repo(repo)
+    try:
+        _run_gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                repo,
+                "--remove-label",
+                label,
+            ],
+            token,
+        )
+    except GhCliError as exc:
+        if "not found" in (exc.stderr or "").lower():
+            logger.debug(
+                "remove_issue_label: label %r not on issue #%d, ignoring",
+                label,
+                number,
+            )
+        else:
+            raise
+
+
+def post_issue_comment(repo: str, number: int, body: str, token: str) -> None:
+    """Post a comment on an issue.
+
+    Uses --body-file with a temp file to avoid argument length limits.
+    """
+    _validate_repo(repo)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=True) as f:
+        f.write(body)
+        f.flush()
+        _run_gh(
+            [
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                repo,
+                "--body-file",
+                f.name,
+            ],
+            token,
+        )
+
+
 def resolve_review_thread(thread_id: str, token: str) -> None:
     """Resolve a review thread on a PR.
 

@@ -11,7 +11,7 @@ import sys
 import time
 
 from orcest.shared.config import WorkerConfig
-from orcest.shared.coordination import RedisLock, make_pr_lock_key
+from orcest.shared.coordination import RedisLock, make_issue_lock_key, make_pr_lock_key
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, Task, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -91,8 +91,11 @@ def run_worker(config: WorkerConfig) -> None:
             f"for {task.resource_type} #{task.resource_id}"
         )
 
-        # Try to acquire lock
-        lock_key = make_pr_lock_key(task.resource_id)
+        # Try to acquire lock (use resource-type-aware key)
+        if task.resource_type == "issue":
+            lock_key = make_issue_lock_key(task.resource_id)
+        else:
+            lock_key = make_pr_lock_key(task.resource_id)
         lock = RedisLock(
             redis,
             lock_key,

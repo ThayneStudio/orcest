@@ -83,3 +83,8 @@ class RedisLock:
 def make_pr_lock_key(pr_number: int) -> str:
     """Generate the Redis key for a PR lock."""
     return f"lock:pr:{pr_number}"
+
+
+def make_issue_lock_key(issue_number: int) -> str:
+    """Generate the Redis key for an issue lock."""
+    return f"lock:issue:{issue_number}"
