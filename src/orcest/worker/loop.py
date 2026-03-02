@@ -24,6 +24,30 @@ RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
 
 
+def _make_abort_event(*events: threading.Event) -> threading.Event:
+    """Return an Event that is set when any of the given events fires.
+
+    Used to combine ``lock_lost`` and ``shutdown_event`` so that either a
+    lost heartbeat lock *or* a SIGTERM will interrupt retry-backoff sleeps
+    inside ``run_claude``.  Background daemon threads watch each input event
+    and set the combined event when any one of them fires.
+    """
+    combined = threading.Event()
+    # Short-circuit if any event is already set.
+    for ev in events:
+        if ev.is_set():
+            combined.set()
+            return combined
+
+    def _watch(ev: threading.Event) -> None:
+        ev.wait()
+        combined.set()
+
+    for ev in events:
+        threading.Thread(target=_watch, args=(ev,), daemon=True).start()
+    return combined
+
+
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -135,6 +159,11 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         heartbeat = Heartbeat(lock, logger=logger, on_lock_lost=lock_lost.set)
         heartbeat.start()
 
+        # Combine lock_lost and shutdown_event so that either a lost lock *or*
+        # a SIGTERM immediately wakes retry-backoff sleeps inside run_claude.
+        # Before PR #98 the abort_event was shutdown_event directly; after that
+        # refactor it became lock_lost alone, losing the SIGTERM fast-exit path.
+        abort_event = _make_abort_event(lock_lost, shutdown_event)
         try:
             result = _execute_task(
                 task,
@@ -143,7 +172,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 workspace,
                 redis,
                 logger,
-                abort_event=lock_lost,
+                abort_event=abort_event,
             )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
