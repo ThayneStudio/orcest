@@ -128,7 +128,7 @@ def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0
 
     try:
         proc.wait(timeout=sigterm_timeout)
-        return  # Exited cleanly after SIGTERM
+        # Leader exited; fall through to SIGKILL the group for any remaining children.
     except subprocess.TimeoutExpired:
         pass
 
