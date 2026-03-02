@@ -257,10 +257,9 @@ def _poll_cycle(
             logger.warning(f"PR #{pr_state.number}: unhandled action {pr_state.action!r}, skipping")
 
     # Step 4: Discover issues needing implementation
-    # Prioritize existing PRs over new issue work. If any PRs need fixes
-    # (enqueued this cycle, locked by a worker, or labeled in-progress),
-    # skip issue discovery so workers focus on clearing the PR backlog.
-    # PRs only waiting for CI (SKIP_PENDING/SKIP_GREEN) don't block issues.
+    # Prioritize existing PRs over new issue work using two checks:
+    #
+    # (a) GitHub state: any PRs with actionable states this cycle
     pr_work_pending = any(
         pr_state.action
         in (
@@ -272,11 +271,19 @@ def _poll_cycle(
         )
         for pr_state in pr_states
     )
+    # (b) Queue depth: tasks already waiting in Redis (from previous cycles)
+    tasks_stream = f"tasks:{config.default_runner}"
+    queue_depth = redis.stream_queue_depth(tasks_stream, "workers")
 
     issue_states: list = []
     if pr_work_pending:
         logger.info(
             "PRs need attention, deferring issue discovery until PR backlog clears"
+        )
+    elif queue_depth > 0:
+        logger.info(
+            f"Task queue has {queue_depth} pending entries, "
+            f"deferring issue discovery until queue drains"
         )
     else:
         try:

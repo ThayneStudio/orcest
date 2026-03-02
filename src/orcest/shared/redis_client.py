@@ -149,6 +149,23 @@ class RedisClient:
             return []
         return result[0][1]
 
+    def stream_queue_depth(self, stream: str, group: str) -> int:
+        """Get total unprocessed entries for a consumer group.
+
+        Returns the sum of pending (delivered but not ACKed) and lag
+        (not yet delivered). Returns 0 if the stream or group doesn't exist.
+        """
+        try:
+            groups = self._client.xinfo_groups(stream)
+        except redis.ResponseError:
+            return 0
+        for g in groups:
+            if g.get("name") == group:
+                pending = g.get("pending", 0)
+                lag = g.get("lag", 0)
+                return pending + lag
+        return 0
+
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
 
