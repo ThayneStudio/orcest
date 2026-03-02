@@ -115,6 +115,13 @@ else
     echo "Using cached image: ${IMG_CACHE}/${CLOUD_IMG}"
 fi
 
+# --- Verify cloud image checksum ---
+echo "Verifying image checksum..."
+wget -q --max-redirect=0 \
+    "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS" \
+    -O "${IMG_CACHE}/SHA256SUMS"
+(cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
+
 # --- Create VM ---
 echo "Creating VM ${VMID}..."
 qm create "$VMID" \
