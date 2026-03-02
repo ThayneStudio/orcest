@@ -567,6 +567,7 @@ def _extract_summary(stream_json_output: str) -> str:
 
     lines = stream_json_output.strip().splitlines()
     last_text = ""
+    last_result = ""
 
     for line in lines:
         line = line.strip()
@@ -581,7 +582,7 @@ def _extract_summary(stream_json_output: str) -> str:
         # Guard with ``"role" not in obj`` so that an assistant message
         # that happens to contain a "result" key isn't misinterpreted.
         if "result" in obj and isinstance(obj["result"], str) and "role" not in obj:
-            return obj["result"][:500]
+            last_result = obj["result"]
 
         # stream-json assistant message with content array
         # stream-json wraps messages: {"type":"assistant","message":{"role":...,"content":[...]}}
@@ -596,4 +597,6 @@ def _extract_summary(stream_json_output: str) -> str:
         # stream-json system message (final line, has cost_usd)
         # -- not useful for summary, skip
 
+    if last_result:
+        return last_result[:500]
     return last_text[:500] if last_text else "No summary available"
