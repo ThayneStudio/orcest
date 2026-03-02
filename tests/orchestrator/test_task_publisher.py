@@ -997,9 +997,7 @@ def test_publish_ci_fix_includes_inline_review_comments(
     )
 
     # get_pr_review_comments should be called for CI fix tasks
-    gh_mock.get_pr_review_comments.assert_called_once_with(
-        "test-org/test-repo", 700, "fake-token"
-    )
+    gh_mock.get_pr_review_comments.assert_called_once_with("test-org/test-repo", 700, "fake-token")
     # Inline comment content should appear in the prompt
     assert "src/foo.py" in task.prompt
     assert "42" in task.prompt
