@@ -35,6 +35,8 @@ class RedisClient:
         Useful in tests to inject a fakeredis instance without opening a real
         connection.
         """
+        # NOTE: __init__ is intentionally skipped via object.__new__. If __init__
+        # gains new instance attributes, mirror them here to avoid AttributeError.
         instance: RedisClient = object.__new__(cls)
         instance._client = client
         instance._pool = client.connection_pool
