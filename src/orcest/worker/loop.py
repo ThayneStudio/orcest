@@ -158,9 +158,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             heartbeat.stop()
             lock.release()
             if lock_lost.is_set():
-                logger.warning(
-                    f"Lock {lock_key} was lost during task execution; task aborted"
-                )
+                logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
             else:
                 logger.info(f"Released lock {lock_key}")
 
