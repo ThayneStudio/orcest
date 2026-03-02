@@ -79,11 +79,10 @@ def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
         # New commits pushed — reset counter.
         # TOCTOU note: the hgetall → delete sequence is not atomic. A second
         # concurrent caller could observe the same stale SHA and also call
-        # delete, resulting in a double-delete (benign) or, if a crash occurs
-        # between delete and the caller's subsequent write, an incorrect count.
-        # This is intentional: the system is single-orchestrator by design, so
-        # the race cannot occur in practice. A Lua script would provide
-        # atomicity if multi-instance support is ever added.
+        # delete, resulting in a double-delete (benign). This is intentional:
+        # the system is single-orchestrator by design, so the race cannot
+        # occur in practice. A Lua script would provide atomicity if
+        # multi-instance support is ever added.
         redis.client.delete(key)
         return 0
     try:
