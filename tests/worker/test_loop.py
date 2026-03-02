@@ -772,6 +772,7 @@ class TestRunWorker:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 return [("entry-1", task_fields)]
+            # Loop exits via KeyboardInterrupt before a second xreadgroup call
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
