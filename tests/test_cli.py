@@ -50,17 +50,17 @@ def test_status_redis_connection_failure(mocker, runner):
     result = runner.invoke(main, ["status", "localhost", "--once"])
 
     assert result.exit_code == 1
-    assert "Cannot connect to Redis" in result.output
+    assert "Cannot connect to Redis" in result.stderr
 
 
-def test_status_negative_interval_exits_error(mocker, runner, fake_redis_client):
+def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
     """status --interval=0 exits 1 before launching the TUI."""
     mocker.patch("orcest.shared.redis_client.RedisClient", return_value=fake_redis_client)
 
     result = runner.invoke(main, ["status", "localhost", "--interval", "0"])
 
     assert result.exit_code == 1
-    assert "interval must be positive" in result.output
+    assert "interval must be positive" in result.stderr
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
