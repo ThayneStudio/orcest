@@ -19,7 +19,7 @@ from pathlib import Path
 from orcest.worker.runner import RunnerResult
 
 # Patterns that indicate Claude usage/rate limit exhaustion.
-# Checked against both stderr and stdout (case-insensitive).
+# Checked against stderr only (case-insensitive).
 _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
     ("usage", "limit"),
     ("rate", "limit"),
@@ -90,16 +90,18 @@ def _build_env(token: str) -> dict[str, str]:
     return env
 
 
-def _is_usage_exhausted(stderr: str, stdout: str) -> bool:
-    """Check whether the output indicates Claude usage/rate limit exhaustion.
+def _is_usage_exhausted(stderr: str) -> bool:
+    """Check whether stderr indicates Claude usage/rate limit exhaustion.
 
-    Examines both stderr and stdout (case-insensitive) against known
-    patterns. Returns True if any pattern matches.
+    Examines only stderr (case-insensitive) against known patterns to avoid
+    false positives when Claude is working on code that mentions rate limiting,
+    tokens, or billing (e.g. implementing a rate-limiter or auth system).
+    Returns True if any pattern matches.
     """
-    combined = (stderr + "\n" + stdout).lower()
+    text = stderr.lower()
     for primary, secondary in _USAGE_EXHAUSTION_PATTERNS:
         # When secondary is empty, only the primary keyword is required.
-        if primary in combined and (not secondary or secondary in combined):
+        if primary in text and (not secondary or secondary in text):
             return True
     return False
 
@@ -479,7 +481,7 @@ def run_claude(
                     raw_output=stderr or stdout,
                 )
             # Check for usage exhaustion -- do NOT retry
-            if _is_usage_exhausted(stderr, stdout):
+            if _is_usage_exhausted(stderr):
                 return ClaudeResult(
                     success=False,
                     summary="Claude usage limit reached",

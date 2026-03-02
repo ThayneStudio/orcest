@@ -788,31 +788,29 @@ def test_extract_summary_non_text_content_blocks():
 def test_is_usage_exhausted_all_patterns():
     """Test all 5 pattern pairs from _USAGE_EXHAUSTION_PATTERNS."""
     # ("usage", "limit")
-    assert _is_usage_exhausted("usage limit reached", "") is True
+    assert _is_usage_exhausted("usage limit reached") is True
     # ("rate", "limit")
-    assert _is_usage_exhausted("rate limit exceeded", "") is True
+    assert _is_usage_exhausted("rate limit exceeded") is True
     # ("quota", "exceeded")
-    assert _is_usage_exhausted("quota exceeded for account", "") is True
+    assert _is_usage_exhausted("quota exceeded for account") is True
     # ("token limit", "")
-    assert _is_usage_exhausted("token limit hit", "") is True
+    assert _is_usage_exhausted("token limit hit") is True
     # ("billing", "limit")
-    assert _is_usage_exhausted("billing limit reached", "") is True
+    assert _is_usage_exhausted("billing limit reached") is True
     # No match
-    assert _is_usage_exhausted("everything is fine", "") is False
+    assert _is_usage_exhausted("everything is fine") is False
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: pattern in stdout (not stderr)
+# _is_usage_exhausted: pattern in stdout is NOT detected (only stderr checked)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_in_stdout():
-    """Pattern in stdout (not stderr) -> still detected."""
-    # stderr is empty, pattern is in stdout
-    assert _is_usage_exhausted("", "rate limit exceeded") is True
-    # Both empty -> not detected
-    assert _is_usage_exhausted("", "") is False
+def test_is_usage_exhausted_stdout_not_checked():
+    """Pattern appearing only in stdout must NOT trigger usage exhaustion."""
+    # Simulates Claude working on rate-limiting code whose output mentions "rate limit"
+    assert _is_usage_exhausted("") is False
 
 
 # ---------------------------------------------------------------------------
