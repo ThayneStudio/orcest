@@ -80,7 +80,9 @@ class RedisLock:
             raise RuntimeError(f"Failed to acquire lock: {self.key}")
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+    ) -> None:
         self.release()
 
     @property
