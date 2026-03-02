@@ -3,17 +3,53 @@
 import io
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 from rich.console import Console
 
-from orcest.cli import _status_once, main
+from orcest.cli import _status_once, _validate_ssh_input, main
 
 
 @pytest.fixture
 def runner():
     """Click test runner."""
     return CliRunner()
+
+
+# ---------------------------------------------------------------------------
+# _validate_ssh_input
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "root",
+        "myhost.example.com",
+        "192.168.1.1",
+        "host-name_1",
+    ],
+)
+def test_validate_ssh_input_valid(value):
+    """Valid SSH host/user values pass without raising."""
+    _validate_ssh_input(value, "host")  # should not raise
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "host;rm -rf /",
+        "user name",
+        "host$(id)",
+        "",
+        "host\neval",
+    ],
+)
+def test_validate_ssh_input_invalid(value):
+    """Invalid SSH host/user values raise click.BadParameter."""
+    with pytest.raises(click.BadParameter):
+        _validate_ssh_input(value, "host")
 
 
 # ---------------------------------------------------------------------------
