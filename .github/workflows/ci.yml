@@ -34,7 +34,7 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]" mypy
+      - run: pip install -e ".[dev]"
       - run: mypy src/
 
   test:
