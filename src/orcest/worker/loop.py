@@ -22,6 +22,7 @@ from orcest.worker.workspace import Workspace
 
 RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
+HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
 
 
 def _make_abort_event(*events: threading.Event) -> threading.Event:
@@ -154,9 +155,16 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         logger.info(f"Acquired lock {lock_key}")
 
-        # Start heartbeat; signal lock_lost if the lock cannot be refreshed
+        # Start heartbeat; signal lock_lost if the lock cannot be refreshed.
+        # Use an explicit interval independent of lock.ttl so the orphaned-lock
+        # window stays bounded even when the TTL grows large (see issue #121).
         lock_lost = threading.Event()
-        heartbeat = Heartbeat(lock, logger=logger, on_lock_lost=lock_lost.set)
+        heartbeat = Heartbeat(
+            lock,
+            interval=HEARTBEAT_INTERVAL,
+            logger=logger,
+            on_lock_lost=lock_lost.set,
+        )
         heartbeat.start()
 
         # Combine lock_lost and shutdown_event so that either a lost lock *or*
