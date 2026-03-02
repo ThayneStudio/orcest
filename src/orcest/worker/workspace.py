@@ -179,6 +179,6 @@ class Workspace:
             shutil.rmtree(
                 temp,
                 onexc=lambda func, path, exc: logger.warning(
-                    "Failed to remove workspace path %s: %s", path, exc
+                    "Failed to remove workspace path %s via %s: %s", path, func.__name__, exc
                 ),
             )
