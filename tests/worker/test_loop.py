@@ -15,6 +15,7 @@ from orcest.worker.loop import (
     CONSUMER_GROUP,
     RESULTS_STREAM,
     _execute_task,
+    _make_abort_event,
     run_worker,
 )
 from orcest.worker.runner import RunnerResult
@@ -64,6 +65,54 @@ def _success_runner_result() -> RunnerResult:
 
 def _failure_runner_result() -> RunnerResult:
     return RunnerResult(success=False, summary="Could not resolve merge conflict")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _make_abort_event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMakeAbortEvent:
+    """Tests for the _make_abort_event combined-event helper."""
+
+    def test_fires_when_first_event_set(self):
+        """Combined event fires when the first input event fires."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _make_abort_event(e1, e2)
+        assert not combined.is_set()
+        e1.set()
+        assert combined.wait(timeout=1), "combined should fire when e1 fires"
+
+    def test_fires_when_second_event_set(self):
+        """Combined event fires when the second input event fires."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _make_abort_event(e1, e2)
+        assert not combined.is_set()
+        e2.set()
+        assert combined.wait(timeout=1), "combined should fire when e2 fires"
+
+    def test_already_set_short_circuits(self):
+        """Combined event is immediately set when any input is already set."""
+        e1, e2 = threading.Event(), threading.Event()
+        e1.set()
+        combined = _make_abort_event(e1, e2)
+        assert combined.is_set()
+
+    def test_shutdown_event_wakes_abort_sleep(self):
+        """SIGTERM (shutdown_event) wakes the abort event used in retry-backoff sleeps.
+
+        This is the regression test for issue #148: after PR #98 changed
+        abort_event from shutdown_event to lock_lost, SIGTERM no longer
+        interrupted retry-backoff sleeps.  _make_abort_event restores that.
+        """
+        shutdown_event = threading.Event()
+        lock_lost = threading.Event()
+        abort = _make_abort_event(lock_lost, shutdown_event)
+
+        assert not abort.is_set()
+        shutdown_event.set()
+        assert abort.wait(timeout=1), "abort event must wake when shutdown_event fires"
 
 
 # ---------------------------------------------------------------------------
