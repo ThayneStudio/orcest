@@ -15,11 +15,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN useradd --create-home --shell /bin/false orcest
+
+WORKDIR /home/orcest/app
 
 # Install orcest
 COPY pyproject.toml .
 COPY src/ src/
 RUN pip install --no-cache-dir .
+
+USER orcest
 
 ENTRYPOINT ["orcest", "orchestrate"]
