@@ -75,6 +75,14 @@ class RedisLock:
         result = self._refresh_script(keys=[self.key], args=[self.owner, str(self.ttl)])
         return result == 1
 
+    def __enter__(self) -> "RedisLock":
+        if not self.acquire():
+            raise RuntimeError(f"Failed to acquire lock: {self.key}")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
     @property
     def is_held(self) -> bool:
         return self._held
