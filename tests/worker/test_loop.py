@@ -482,7 +482,7 @@ class TestRunWorker:
         mock_redis.client.set.assert_called_once()
         set_call = mock_redis.client.set.call_args
         lock_key = set_call[0][0]
-        assert lock_key == f"lock:pr:{sample_task.resource_id}"
+        assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
         assert set_call[1]["ex"] == worker_config.runner.timeout + 60
 

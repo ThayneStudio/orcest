@@ -18,7 +18,7 @@ class TestLocking:
 
     def test_acquire_release_real_redis(self, real_redis_client: RedisClient) -> None:
         """Basic acquire / release cycle; key removed after release."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock = RedisLock(real_redis_client, key, ttl=30, owner="w1")
 
         assert lock.acquire() is True
@@ -29,7 +29,7 @@ class TestLocking:
 
     def test_contention_two_workers(self, real_redis_client: RedisClient) -> None:
         """Second worker cannot acquire until the first releases."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock1 = RedisLock(real_redis_client, key, ttl=30, owner="w1")
         lock2 = RedisLock(real_redis_client, key, ttl=30, owner="w2")
 
@@ -41,7 +41,7 @@ class TestLocking:
 
     def test_lua_release_atomicity(self, real_redis_client: RedisClient) -> None:
         """A non-owner cannot release the lock; key retains owner."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock1 = RedisLock(real_redis_client, key, ttl=30, owner="w1")
         lock2 = RedisLock(real_redis_client, key, ttl=30, owner="w2")
 
@@ -55,7 +55,7 @@ class TestLocking:
 
     def test_lua_refresh_atomicity(self, real_redis_client: RedisClient) -> None:
         """Only the owner can refresh the TTL."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock1 = RedisLock(real_redis_client, key, ttl=30, owner="w1")
         lock2 = RedisLock(real_redis_client, key, ttl=30, owner="w2")
 
@@ -65,7 +65,7 @@ class TestLocking:
 
     def test_ttl_expiry(self, real_redis_client: RedisClient) -> None:
         """Lock disappears after TTL expires."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock = RedisLock(real_redis_client, key, ttl=1, owner="w1")
         assert lock.acquire() is True
 
@@ -79,7 +79,7 @@ class TestLocking:
 
     def test_heartbeat_prevents_expiry(self, real_redis_client: RedisClient) -> None:
         """Heartbeat keeps the lock alive past its natural TTL."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock = RedisLock(real_redis_client, key, ttl=2, owner="w1")
         assert lock.acquire() is True
 
@@ -98,7 +98,7 @@ class TestLocking:
 
     def test_thread_contention(self, real_redis_client: RedisClient) -> None:
         """Exactly one of N concurrent threads acquires the lock."""
-        key = make_pr_lock_key(42)
+        key = make_pr_lock_key("owner/repo", 42)
         n_threads = 10
         barrier = threading.Barrier(n_threads)
         results_lock = threading.Lock()
@@ -131,7 +131,7 @@ class TestLocking:
 
     def test_no_overlapping_work_on_same_pr(self, real_redis_client: RedisClient) -> None:
         """Workers holding locks for the same PR never overlap in time."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         windows: list[tuple[str, float, float]] = []
         windows_lock = threading.Lock()
         barrier = threading.Barrier(5)
@@ -169,7 +169,7 @@ class TestLocking:
 
     def test_lock_expires_after_worker_death(self, real_redis_client: RedisClient) -> None:
         """A crashed worker's lock expires, allowing another worker to proceed."""
-        key = make_pr_lock_key(1)
+        key = make_pr_lock_key("owner/repo", 1)
         lock1 = RedisLock(real_redis_client, key, ttl=2, owner="w1")
         assert lock1.acquire() is True
 

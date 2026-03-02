@@ -196,7 +196,7 @@ def discover_actionable_prs(
             continue
 
         # Skip if locked in Redis
-        lock_key = make_pr_lock_key(number)
+        lock_key = make_pr_lock_key(repo, number)
         if redis.client.exists(lock_key):
             results.append(
                 PRState(
