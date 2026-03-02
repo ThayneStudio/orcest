@@ -16,7 +16,7 @@ import pytest
 
 from orcest.shared.models import Task, TaskResult, TaskType
 from orcest.shared.redis_client import RedisClient
-from tests.stress.conftest import simulate_worker
+from tests.stress.helpers import simulate_worker
 
 
 @pytest.mark.stress
