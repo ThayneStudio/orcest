@@ -96,3 +96,12 @@ def test_context_manager_raises_when_lock_held(fake_redis_client):
     with pytest.raises(RuntimeError, match="Failed to acquire lock"):
         with RedisLock(fake_redis_client, "test-lock", owner="owner-2"):
             pass
+
+
+def test_context_manager_releases_on_exception(fake_redis_client):
+    with pytest.raises(ValueError):
+        with RedisLock(fake_redis_client, "test-lock") as lock:
+            raise ValueError("boom")
+    assert lock.is_held is False
+    # Key should be gone — a new lock can acquire immediately
+    assert RedisLock(fake_redis_client, "test-lock").acquire() is True
