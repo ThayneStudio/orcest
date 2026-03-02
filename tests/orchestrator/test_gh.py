@@ -1000,5 +1000,3 @@ def test_run_gh_timeout_raises_gh_cli_error(mocker):
     )
     with pytest.raises(GhCliError, match="timed out"):
         list_open_prs(REPO, TOKEN)
-
-

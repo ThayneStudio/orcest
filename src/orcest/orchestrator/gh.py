@@ -93,7 +93,6 @@ def _run_gh(args: list[str], token: str) -> str:
     return result.stdout.strip()
 
 
-
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
@@ -183,7 +182,6 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
         ],
         token,
     )
-
 
 
 def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
