@@ -484,12 +484,16 @@ def _render_followup_prompt(
             "## Instructions",
             "",
             "1. Read each unresolved review thread above.",
-            f"2. Create GitHub issues for follow-up work "
+            "2. For each thread, determine if it is actionable (requests a change "
+            "or raises a genuine concern) or non-actionable (purely positive "
+            "feedback, acknowledgment, or praise).",
+            "3. For non-actionable threads, resolve them directly without creating issues.",
+            f"4. For actionable threads, create GitHub issues for follow-up work "
             f'(`gh issue create --repo {repo} --title "..." --body "..."`) '
             f"-- group related items into single issues where appropriate.",
-            "3. Reply to each thread with a comment linking to the created issue.",
-            "4. Resolve each thread after creating the issue.",
-            "5. Do NOT make code changes -- this is triage only.",
+            "5. Reply to each actionable thread with a comment linking to the created issue, "
+            "then resolve the thread.",
+            "6. Do NOT make code changes -- this is triage only.",
             "6. Do NOT call `gh pr review --approve` or `--request-changes` "
             "-- you are not authorized to change review status.",
         ]
@@ -554,15 +558,16 @@ def _render_fix_prompt(
         )
         sections.append("")
 
-    ci_is_green = not ci_failures
-
     if review_threads:
         sections.append("## Review Feedback")
         sections.append("")
         sections.extend(_render_review_threads(review_threads))
-        sections.append("Address all review feedback above.")
-        if ci_is_green:
-            sections.append("After fixing each item, resolve the corresponding review thread.")
+        sections.append("Address the review feedback above. For each thread:")
+        sections.append("- If it requests a code change, make the fix and resolve the thread.")
+        sections.append(
+            "- If it is purely positive feedback or has no actionable request, "
+            "resolve the thread without making changes."
+        )
         sections.append("")
 
     truncated = len(diff) > 10000
