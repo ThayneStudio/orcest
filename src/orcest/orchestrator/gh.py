@@ -364,11 +364,11 @@ def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[di
     owner, name = repo.split("/", 1)
 
     query = """
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
-        pageInfo { hasNextPage }
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           path
@@ -390,8 +390,11 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }
 """
 
-    output = _run_gh(
-        [
+    all_thread_nodes: list[dict] = []
+    cursor: str | None = None
+
+    while True:
+        args = [
             "api",
             "graphql",
             "-f",
@@ -402,47 +405,60 @@ query($owner: String!, $repo: String!, $number: Int!) {
             f"number={number}",
             "-f",
             f"query={query}",
-        ],
-        token,
-    )
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"after={cursor}"])
 
-    if not output:
-        raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
+        output = _run_gh(args, token)
 
-    data = json.loads(output)
+        if not output:
+            raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
 
-    # GraphQL can return HTTP 200 with errors in the body. Raise so
-    # callers don't mistake a failed query for "no threads" (which
-    # could trigger an incorrect auto-merge).
-    if "errors" in data:
-        msgs = [e.get("message", str(e)) for e in data["errors"]]
-        raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
+        data = json.loads(output)
 
-    repo_data = (data.get("data") or {}).get("repository")
-    if not repo_data:
-        raise GhCliError(
-            f"GraphQL returned null repository for {repo!r} — "
-            "check that the repo exists and the token has access"
-        )
-    pr_node = repo_data.get("pullRequest")
-    if not pr_node:
-        raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
-    review_threads = pr_node.get("reviewThreads") or {}
-    threads = review_threads.get("nodes") or []
+        # GraphQL can return HTTP 200 with errors in the body. Raise so
+        # callers don't mistake a failed query for "no threads" (which
+        # could trigger an incorrect auto-merge).
+        if "errors" in data:
+            msgs = [e.get("message", str(e)) for e in data["errors"]]
+            raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
 
-    # If there are more threads than our page size (100), we risk missing
-    # unresolved ones. Raise rather than silently returning an incomplete
-    # list, which could trigger an incorrect auto-merge.
-    page_info = review_threads.get("pageInfo") or {}
-    if page_info.get("hasNextPage"):
-        raise GhCliError(
-            f"PR #{number} in {repo} has more than 100 review threads; "
-            "pagination not implemented — cannot guarantee all unresolved "
-            "threads have been fetched"
-        )
+        repo_data = (data.get("data") or {}).get("repository")
+        if not repo_data:
+            raise GhCliError(
+                f"GraphQL returned null repository for {repo!r} — "
+                "check that the repo exists and the token has access"
+            )
+        pr_node = repo_data.get("pullRequest")
+        if not pr_node:
+            raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
+        review_threads = pr_node.get("reviewThreads") or {}
+        all_thread_nodes.extend(review_threads.get("nodes") or [])
+
+        page_info = review_threads.get("pageInfo") or {}
+        if page_info.get("hasNextPage"):
+            if cursor is None:
+                logger.warning(
+                    "PR #%d in %s has more than 100 review threads; fetching additional pages",
+                    number,
+                    repo,
+                )
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                # Safety guard: hasNextPage is True but no cursor returned.
+                logger.warning(
+                    "PR #%d in %s: hasNextPage is True but endCursor is missing; "
+                    "stopping pagination with %d threads fetched so far",
+                    number,
+                    repo,
+                    len(all_thread_nodes),
+                )
+                break
+        else:
+            break
 
     results = []
-    for thread in threads:
+    for thread in all_thread_nodes:
         if thread.get("isResolved"):
             continue
         comments_data = thread.get("comments") or {}
