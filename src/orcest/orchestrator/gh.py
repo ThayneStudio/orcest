@@ -262,7 +262,7 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
 
 
 def post_comment(repo: str, number: int, body: str, token: str) -> None:
-    """Post a comment on a PR/issue.
+    """Post a comment on a PR.
 
     Uses --body-file with a temp file to avoid argument length limits
     and to prevent any interpretation of special characters in the body.
@@ -553,26 +553,6 @@ def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
         token,
     )
     return json.loads(output) if output else []
-
-
-def get_issue(repo: str, number: int, token: str) -> dict:
-    """Get detailed issue info."""
-    _validate_repo(repo)
-    output = _run_gh(
-        [
-            "issue",
-            "view",
-            str(number),
-            "--repo",
-            repo,
-            "--json",
-            "number,title,body,labels,assignees",
-        ],
-        token,
-    )
-    if not output:
-        raise GhCliError(f"gh issue view returned empty output for issue #{number}")
-    return json.loads(output)
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:
