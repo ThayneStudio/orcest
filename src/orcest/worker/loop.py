@@ -127,7 +127,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
-            lock_key = make_issue_lock_key(task.resource_id)
+            lock_key = make_issue_lock_key(task.repo, task.resource_id)
         else:
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
         ttl = (
