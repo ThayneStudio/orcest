@@ -25,4 +25,4 @@ format:
 	ruff format src/ tests/
 
 lock:
-	pip-compile pyproject.toml --output-file requirements.lock --no-header --strip-extras
+	pip-compile pyproject.toml --output-file requirements.lock --strip-extras
