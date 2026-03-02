@@ -26,10 +26,10 @@ class RedisClient:
             password=config.password,
             decode_responses=True,
         )
-        self._client: redis.Redis[str] = redis.Redis(connection_pool=self._pool)
+        self._client: redis.Redis = redis.Redis(connection_pool=self._pool)
 
     @classmethod
-    def from_client(cls, client: redis.Redis[str]) -> "RedisClient":
+    def from_client(cls, client: redis.Redis) -> "RedisClient":
         """Create a RedisClient wrapping a pre-built redis client.
 
         Useful in tests to inject a fakeredis instance without opening a real
@@ -41,7 +41,7 @@ class RedisClient:
         return instance
 
     @property
-    def client(self) -> redis.Redis[str]:
+    def client(self) -> redis.Redis:
         """Raw redis client for operations not covered by helpers."""
         return self._client
 
@@ -58,7 +58,7 @@ class RedisClient:
     def health_check(self) -> bool:
         """Returns True if Redis is reachable."""
         try:
-            return self._client.ping()
+            return self._client.ping()  # type: ignore[return-value]
         except (
             redis.ConnectionError,
             redis.TimeoutError,
@@ -69,7 +69,7 @@ class RedisClient:
 
     def xadd(self, stream: str, fields: dict[str, str]) -> str:
         """Add entry to stream. Returns the entry ID."""
-        entry_id: str = self._client.xadd(stream, fields)  # type: ignore[assignment]
+        entry_id: str = self._client.xadd(stream, fields)  # type: ignore[assignment, arg-type]
         return entry_id
 
     def xreadgroup(
@@ -105,7 +105,7 @@ class RedisClient:
         if not result:
             return []
         # result shape: [[stream_name, [(id, fields), ...]]]
-        return result[0][1]
+        return result[0][1]  # type: ignore[index]
 
     def xack(self, stream: str, group: str, entry_id: str) -> int:
         """Acknowledge a stream entry. Returns number acknowledged."""
@@ -124,9 +124,7 @@ class RedisClient:
             raise ValueError(f"maxlen must be positive, got {maxlen}")
         if not fields:
             raise ValueError("fields must be a non-empty dict")
-        entry_id: str = self._client.xadd(  # type: ignore[assignment]
-            stream, fields, maxlen=maxlen, approximate=True
-        )
+        entry_id: str = self._client.xadd(stream, fields, maxlen=maxlen, approximate=True)  # type: ignore[assignment, arg-type]
         return entry_id
 
     def xread_after(
@@ -165,7 +163,7 @@ class RedisClient:
             return []
         if not result:
             return []
-        return result[0][1]
+        return result[0][1]  # type: ignore[index]
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.

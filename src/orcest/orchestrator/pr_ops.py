@@ -8,6 +8,7 @@ main loop acts on these recommendations.
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
@@ -70,7 +71,7 @@ def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
     the counter is reset to 0.
     """
     key = _make_attempts_key(pr_number)
-    data = redis.client.hgetall(key)
+    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
     if not data:
         return 0
     stored_sha = data.get("head_sha", "")

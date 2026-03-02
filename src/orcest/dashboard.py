@@ -15,6 +15,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import redis as redis_lib
 from rich.markup import escape as rich_escape
@@ -100,15 +101,15 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
 
     # Queue depths
     task_streams = list(client.scan_iter(match="tasks:*"))
-    queue_depths = {}
+    queue_depths: dict[str, int] = {}
     for stream_key in sorted(task_streams):
         try:
-            queue_depths[stream_key] = client.xlen(stream_key) or 0
+            queue_depths[stream_key] = cast(int, client.xlen(stream_key)) or 0
         except redis_lib.ResponseError:
             pass  # Key exists but is not a stream
 
     try:
-        results_depth = client.xlen("results") or 0
+        results_depth: int = cast(int, client.xlen("results")) or 0
     except redis_lib.ResponseError:
         results_depth = 0
 
@@ -116,8 +117,8 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
     for key in lock_keys:
-        owner = client.get(key) or "(expired)"
-        ttl = client.ttl(key)
+        owner: str = cast(str, client.get(key)) or "(expired)"
+        ttl: int = cast(int, client.ttl(key))
         pr_num = key.removeprefix("lock:pr:")
         locks.append(LockInfo(pr=pr_num, owner=owner, ttl=ttl))
 
@@ -125,7 +126,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     consumer_groups = []
     for stream_key in sorted(task_streams):
         try:
-            for g in client.xinfo_groups(stream_key):
+            for g in cast(list[Any], client.xinfo_groups(stream_key)):
                 consumer_groups.append(
                     ConsumerGroupInfo(
                         stream=stream_key,
@@ -140,7 +141,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Recent results (most recent first)
     recent_results = []
     try:
-        entries = client.xrevrange("results", count=max_results)
+        entries: list[Any] = cast(list[Any], client.xrevrange("results", count=max_results))
     except redis_lib.ResponseError:
         entries = []
     for _entry_id, fields in entries:
@@ -163,7 +164,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     attempt_counts = {}
     attempt_keys = list(client.scan_iter(match="pr:*:attempts"))
     for key in attempt_keys:
-        data = client.hgetall(key)
+        data: dict[str, str] = cast(dict[str, str], client.hgetall(key))
         if data:
             # Key format: "pr:<number>:attempts"
             pr_num = key.removeprefix("pr:").removesuffix(":attempts")

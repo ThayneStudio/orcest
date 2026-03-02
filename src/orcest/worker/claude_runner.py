@@ -329,9 +329,10 @@ def run_claude(
         watchdog_cancelled = threading.Event()
         watchdog_killed = threading.Event()
         watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
+        assert proc is not None
 
         def _watchdog(
-            _proc: subprocess.Popen[str] = proc,
+            _proc: subprocess.Popen[str] = proc,  # type: ignore[assignment]
             _remaining: float = watchdog_remaining,
             _cancelled: threading.Event = watchdog_cancelled,
             _killed: threading.Event = watchdog_killed,
