@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ class Heartbeat:
         lock: RedisLock,
         interval: float | None = None,
         logger: logging.Logger | None = None,
+        on_lock_lost: Callable[[], None] | None = None,
     ):
         """
         Args:
@@ -29,10 +31,13 @@ class Heartbeat:
             interval: Refresh interval in seconds.
                       Defaults to lock.ttl / 3.
             logger: Optional logger.
+            on_lock_lost: Optional callback invoked when lock refresh fails.
+                          Called once from the heartbeat thread before it stops.
         """
         self.lock = lock
         self.interval = lock.ttl / 3 if interval is None else interval
         self.logger = logger
+        self._on_lock_lost = on_lock_lost
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -76,3 +81,8 @@ class Heartbeat:
                     self.logger.warning(
                         f"Heartbeat: failed to refresh {self.lock.key} (lock lost?)"
                     )
+            if not refreshed:
+                if self._on_lock_lost is not None:
+                    self._on_lock_lost()
+                self._stop_event.set()
+                break

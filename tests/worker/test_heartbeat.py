@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import pytest
@@ -98,3 +99,44 @@ class TestHeartbeat:
             assert hb._thread.daemon is True
         finally:
             hb.stop()
+
+    def test_heartbeat_on_lock_lost_callback_called(self, mock_lock):
+        """When lock refresh fails, on_lock_lost is called once."""
+        mock_lock.refresh.return_value = False
+        lock_lost = threading.Event()
+
+        hb = Heartbeat(mock_lock, interval=0.1, on_lock_lost=lock_lost.set)
+        hb.start()
+
+        assert lock_lost.wait(timeout=5), "on_lock_lost was not called within 5 seconds"
+        hb.stop()
+
+    def test_heartbeat_stops_after_lock_lost(self, mock_lock):
+        """After lock refresh fails, the heartbeat thread stops itself."""
+        mock_lock.refresh.return_value = False
+        lock_lost = threading.Event()
+
+        hb = Heartbeat(mock_lock, interval=0.1, on_lock_lost=lock_lost.set)
+        hb.start()
+        thread = hb._thread
+
+        # Wait for the callback to fire
+        assert lock_lost.wait(timeout=5), "on_lock_lost was not called within 5 seconds"
+        # Give the thread time to exit naturally
+        assert thread is not None
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "Heartbeat thread should have stopped after lock loss"
+        hb.stop()
+
+    def test_heartbeat_no_callback_still_stops_on_lock_lost(self, mock_lock):
+        """Even without a callback, heartbeat stops itself when lock is lost."""
+        mock_lock.refresh.return_value = False
+
+        hb = Heartbeat(mock_lock, interval=0.1)
+        hb.start()
+        thread = hb._thread
+
+        assert thread is not None
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "Heartbeat thread should stop after failed refresh"
+        hb.stop()

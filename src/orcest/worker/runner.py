@@ -39,7 +39,7 @@ class Runner(Protocol):
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
-        shutdown_event: threading.Event | None = None,
+        abort_event: threading.Event | None = None,
     ) -> RunnerResult: ...
 
 
