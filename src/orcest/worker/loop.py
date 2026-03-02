@@ -8,6 +8,7 @@ publishes results back to a results stream for the orchestrator.
 import logging
 import signal
 import sys
+import threading
 import time
 
 from orcest.shared.config import WorkerConfig
@@ -23,8 +24,15 @@ RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
 
 
-def run_worker(config: WorkerConfig) -> None:
-    """Main worker entry point. Blocks indefinitely."""
+def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
+    """Main worker entry point. Blocks indefinitely.
+
+    Args:
+        config: Worker configuration.
+        stop_event: Optional event to signal graceful shutdown from outside
+            (e.g. from a test harness). When set, the worker exits its loop
+            after the current iteration completes.
+    """
     logger = setup_logging("worker", config.worker_id)
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
@@ -56,7 +64,7 @@ def run_worker(config: WorkerConfig) -> None:
         f"runner={config.runner.type}). Waiting for tasks..."
     )
 
-    while not shutdown:
+    while not shutdown and (stop_event is None or not stop_event.is_set()):
         # Block waiting for tasks (5 second timeout to check shutdown flag)
         entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
