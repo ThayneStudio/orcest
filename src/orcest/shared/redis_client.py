@@ -29,7 +29,7 @@ class RedisClient:
         self._client: redis.Redis = redis.Redis(connection_pool=self._pool)
 
     @classmethod
-    def from_client(cls, client: redis.Redis[str]) -> "RedisClient":
+    def from_client(cls, client: redis.Redis) -> "RedisClient":
         """Create a RedisClient wrapping a pre-built redis client.
 
         Useful in tests to inject a fakeredis instance without opening a real
