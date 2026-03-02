@@ -14,7 +14,8 @@ def _validate_ssh_input(value: str, label: str) -> None:
     if not _SSH_INPUT_RE.match(value):
         raise click.BadParameter(
             f"Invalid {label} {value!r}: only alphanumerics, dots, hyphens,"
-            " and underscores are allowed."
+            " and underscores are allowed.",
+            param_hint=label,
         )
 
 
