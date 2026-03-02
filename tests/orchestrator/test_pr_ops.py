@@ -65,7 +65,7 @@ def test_skip_locked_pr(gh_mock, fake_redis_client, label_config):
         _make_pr_data(number=42, labels=[]),
     ]
     # Set the lock that discover_actionable_prs checks via redis.client.exists
-    fake_redis_client.client.set(make_pr_lock_key(42), "worker-7")
+    fake_redis_client.client.set(make_pr_lock_key("test-org/test-repo", 42), "worker-7")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",

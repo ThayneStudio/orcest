@@ -114,7 +114,7 @@ class TestWorkerIsolation:
             mock_workspace = unittest.mock.MagicMock(spec=Workspace)
             mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
 
-            lock_key = make_pr_lock_key(task.resource_id)
+            lock_key = make_pr_lock_key(task.repo, task.resource_id)
             lock = RedisLock(redis, lock_key, ttl=30, owner=worker_id)
 
             if not lock.acquire():
@@ -241,7 +241,7 @@ class TestWorkerIsolation:
                 prompt=f"Task for PR {pr_number}",
                 branch=f"fix-pr-{pr_number}",
             )
-            lock_key = make_pr_lock_key(task.resource_id)
+            lock_key = make_pr_lock_key(task.repo, task.resource_id)
             lock = RedisLock(redis, lock_key, ttl=30, owner=worker_id)
 
             if not lock.acquire():
@@ -470,7 +470,7 @@ class TestWorkerIsolation:
         pr_number = 77
 
         # Pre-acquire the lock for this PR (simulating another worker)
-        lock_key = make_pr_lock_key(pr_number)
+        lock_key = make_pr_lock_key("owner/testrepo", pr_number)
         blocker_lock = RedisLock(redis, lock_key, ttl=60, owner="blocker-worker")
         assert blocker_lock.acquire() is True
 

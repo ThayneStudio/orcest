@@ -58,7 +58,7 @@ def test_refresh_by_non_owner_fails(fake_redis_client):
 
 def test_make_pr_lock_key_format():
     """make_pr_lock_key produces the expected key pattern."""
-    assert make_pr_lock_key(42) == "lock:pr:42"
+    assert make_pr_lock_key("owner/repo", 42) == "lock:pr:owner/repo:42"
 
 
 def test_acquire_sets_ttl(fake_redis_client):
