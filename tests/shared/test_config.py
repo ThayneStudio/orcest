@@ -140,3 +140,29 @@ def test_load_orchestrator_config_missing_file(tmp_path: Path):
     # then validates that github.repo is non-empty and raises ValueError.
     with pytest.raises(ValueError, match="github.repo is required"):
         load_orchestrator_config(missing)
+
+
+def test_delete_branch_on_merge_defaults_to_true(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.delete_branch_on_merge is True
+
+
+def test_delete_branch_on_merge_false_from_yaml(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\ndelete_branch_on_merge: false\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.delete_branch_on_merge is False
+
+
+def test_delete_branch_on_merge_quoted_string_raises(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text('github:\n  repo: acme/widgets\ndelete_branch_on_merge: "false"\n')
+
+    with pytest.raises(ValueError, match="delete_branch_on_merge"):
+        load_orchestrator_config(cfg_file)
