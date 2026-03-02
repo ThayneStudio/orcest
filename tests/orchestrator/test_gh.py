@@ -124,7 +124,7 @@ def test_get_ci_status_returns_failed_checks(mocker):
         "title": "broken",
         "statusCheckRollup": checks,
     }
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data), stderr=""
@@ -135,6 +135,11 @@ def test_get_ci_status_returns_failed_checks(mocker):
     failed = [c for c in result if c["conclusion"] == "FAILURE"]
     assert len(failed) == 1
     assert failed[0]["name"] == "tests"
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
 
 # ---------------------------------------------------------------------------
@@ -576,23 +581,31 @@ def test_get_ci_status_missing_rollup(mocker):
     """statusCheckRollup absent/None -> returns []."""
     # Case 1: key absent entirely
     pr_data_no_key = {"number": 10, "title": "no checks"}
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data_no_key), stderr=""
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
     # Case 2: key present but None
     pr_data_none = {"number": 10, "title": "null checks", "statusCheckRollup": None}
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data_none), stderr=""
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
 
 # ---------------------------------------------------------------------------
