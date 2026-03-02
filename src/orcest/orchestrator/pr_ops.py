@@ -125,8 +125,8 @@ def discover_actionable_prs(
     """Discover PRs that need action.
 
     Filter cascade (ordered by cost, cheapest first):
-    1. Skip PRs with orcest labels (already being handled)
-    2. Skip draft PRs
+    1. Skip draft PRs (single boolean field, cheapest check)
+    2. Skip PRs with orcest labels (already being handled)
     3. Skip PRs with active Redis locks (worker in progress)
     4. Fetch CI status; skip if checks are still pending
     5. Route by CI + review state: failures -> fix, changes requested -> fix,
@@ -150,6 +150,22 @@ def discover_actionable_prs(
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
+        # Skip draft PRs -- cheapest check, single boolean field
+        if pr_data.get("isDraft"):
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_DRAFT,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
+            continue
+
         # Skip if already labeled by orcest
         if any(label in orcest_labels for label in pr_labels):
             results.append(
@@ -159,22 +175,6 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.SKIP_LABELED,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                )
-            )
-            continue
-
-        # Skip draft PRs
-        if pr_data.get("isDraft"):
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_DRAFT,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
