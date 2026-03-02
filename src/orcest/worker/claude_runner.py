@@ -332,7 +332,7 @@ def run_claude(
         assert proc is not None
 
         def _watchdog(
-            _proc: subprocess.Popen[str] = proc,
+            _proc: subprocess.Popen[str] = proc,  # type: ignore[assignment]
             _remaining: float = watchdog_remaining,
             _cancelled: threading.Event = watchdog_cancelled,
             _killed: threading.Event = watchdog_killed,

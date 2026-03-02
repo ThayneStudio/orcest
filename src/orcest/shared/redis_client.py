@@ -124,9 +124,7 @@ class RedisClient:
             raise ValueError(f"maxlen must be positive, got {maxlen}")
         if not fields:
             raise ValueError("fields must be a non-empty dict")
-        entry_id: str = self._client.xadd(  # type: ignore[assignment, arg-type]
-            stream, fields, maxlen=maxlen, approximate=True
-        )
+        entry_id: str = self._client.xadd(stream, fields, maxlen=maxlen, approximate=True)  # type: ignore[assignment, arg-type]
         return entry_id
 
     def xread_after(
