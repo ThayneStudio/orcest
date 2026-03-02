@@ -15,7 +15,7 @@ TimeoutStopSec=120
 MemoryMax=4G
 Environment=PYTHONUNBUFFERED=1
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 ReadWritePaths=/opt/orcest/workspaces
 PrivateTmp=yes
 NoNewPrivileges=yes
