@@ -155,6 +155,7 @@ def _status_once(redis):
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for repo/token).")
 def init(config):
     """Initialize the target repo: create orcest labels."""
+    import os
     import subprocess
 
     from orcest.shared.config import load_orchestrator_config
@@ -168,8 +169,9 @@ def init(config):
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
     ]
 
-    env = dict(__import__("os").environ)
-    env.update({"GITHUB_TOKEN": cfg.github.token, "GH_TOKEN": cfg.github.token})
+    env = dict(os.environ)
+    env["GITHUB_TOKEN"] = cfg.github.token
+    env["GH_TOKEN"] = cfg.github.token
 
     for name, color, description in labels:
         console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
