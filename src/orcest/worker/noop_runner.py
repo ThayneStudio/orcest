@@ -38,7 +38,7 @@ class NoopRunner:
         sleep_duration = max(0.0, min(self.duration, max(timeout, 0)))
         if logger:
             logger.debug(f"NoopRunner sleeping {sleep_duration}s")
-        time.sleep(sleep_duration)
+        (shutdown_event or threading.Event()).wait(timeout=sleep_duration)
         if on_output:
             try:
                 on_output("noop\n")

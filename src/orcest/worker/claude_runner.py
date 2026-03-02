@@ -500,7 +500,7 @@ def run_claude(
         if attempt < max_retries:
             if logger:
                 logger.info(f"Retrying in {retry_backoff}s...")
-            time.sleep(retry_backoff)
+            _shutdown.wait(timeout=retry_backoff)
 
     # All retries exhausted -- include stderr from the most recent
     # attempt that successfully started a drain thread.
