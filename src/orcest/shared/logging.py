@@ -44,6 +44,10 @@ def setup_logging(
 
     logger = logging.getLogger(f"orcest.{component}.{identifier}")
     logger.setLevel(numeric_level)
+    # setup_logging is the sole entry point for logger configuration, so no
+    # external handlers are expected to exist. If external handler injection
+    # is ever needed (e.g. telemetry, test hooks), replace this with selective
+    # removal of only RichHandler instances added by setup_logging.
     logger.handlers.clear()
     logger.addHandler(handler)
 
