@@ -605,3 +605,49 @@ class TestRunWorker:
         # The malformed entry must still be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-bad")
+
+    def test_worker_base_exception_releases_lock_and_stops_heartbeat(
+        self, mocker, worker_config, sample_task
+    ):
+        """When _execute_task raises a BaseException (e.g. KeyboardInterrupt),
+        heartbeat.stop() and lock.release() are called before the exception
+        propagates out of run_worker."""
+        mock_redis = self._build_mock_redis()
+
+        # Capture the mocked heartbeat and lock so we can assert on them.
+        mock_heartbeat = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+
+        mocker.patch("orcest.worker.loop.RedisClient", return_value=mock_redis)
+        mocker.patch(
+            "orcest.worker.loop.setup_logging",
+            return_value=logging.getLogger("test.run_worker"),
+        )
+        mocker.patch("orcest.worker.loop.Workspace")
+        mocker.patch("orcest.worker.loop.create_runner")
+        mocker.patch("orcest.worker.loop.Heartbeat", return_value=mock_heartbeat)
+        mocker.patch("orcest.worker.loop.RedisLock", return_value=mock_lock)
+        mocker.patch(
+            "orcest.worker.loop._execute_task",
+            side_effect=KeyboardInterrupt(),
+        )
+        mocker.patch("orcest.worker.loop.signal.signal")
+
+        task_fields = sample_task.to_dict()
+        call_count = {"n": 0}
+
+        def xreadgroup_side_effect(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return [("entry-1", task_fields)]
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        with pytest.raises(KeyboardInterrupt):
+            run_worker(worker_config)
+
+        # Both cleanup methods must be invoked before the exception propagates.
+        mock_heartbeat.stop.assert_called_once()
+        mock_lock.release.assert_called_once()
