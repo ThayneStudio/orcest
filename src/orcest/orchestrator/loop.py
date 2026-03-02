@@ -263,8 +263,7 @@ def _poll_cycle(
     for issue_state in issue_states:
         if issue_state.action == IssueAction.ENQUEUE_IMPLEMENT:
             logger.info(
-                f"Issue #{issue_state.number} ({issue_state.title}): "
-                f"enqueueing implementation task"
+                f"Issue #{issue_state.number} ({issue_state.title}): enqueueing implementation task"
             )
             try:
                 publish_issue_task(
@@ -284,8 +283,7 @@ def _poll_cycle(
                 )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             logger.warning(
-                f"Issue #{issue_state.number}: max attempts reached, "
-                f"adding needs-human label"
+                f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
             )
             try:
                 gh.add_issue_label(
@@ -310,8 +308,7 @@ def _poll_cycle(
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to comment on issue #{issue_state.number} "
-                    f"about max attempts: {e}",
+                    f"Failed to comment on issue #{issue_state.number} about max attempts: {e}",
                     exc_info=True,
                 )
         elif issue_state.action == IssueAction.SKIP_LOCKED:

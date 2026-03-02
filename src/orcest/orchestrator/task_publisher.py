@@ -376,9 +376,7 @@ def _publish_issue_and_notify(
         )
 
     if _label_ok and _comment_ok:
-        _log.info(
-            f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
-        )
+        _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
     else:
         _log.warning(
             f"Published {task_type.value} task {task.id} "
