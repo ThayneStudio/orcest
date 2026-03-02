@@ -123,7 +123,7 @@ def discover_actionable_issues(
             continue
 
         # Skip if locked in Redis
-        lock_key = make_issue_lock_key(number)
+        lock_key = make_issue_lock_key(repo, number)
         if redis.client.exists(lock_key):
             results.append(
                 IssueState(

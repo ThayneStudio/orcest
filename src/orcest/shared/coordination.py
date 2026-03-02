@@ -93,6 +93,6 @@ def make_pr_lock_key(repo: str, pr_number: int) -> str:
     return f"lock:pr:{repo}:{pr_number}"
 
 
-def make_issue_lock_key(issue_number: int) -> str:
+def make_issue_lock_key(repo: str, issue_number: int) -> str:
     """Generate the Redis key for an issue lock."""
-    return f"lock:issue:{issue_number}"
+    return f"lock:issue:{repo}:{issue_number}"
