@@ -61,8 +61,9 @@ class RedisClient:
         stream: str,
         count: int = 1,
         block_ms: int | None = 5000,
+        pending: bool = False,
     ) -> list[tuple[str, dict[str, str]]]:
-        """Read new entries from a consumer group.
+        """Read entries from a consumer group.
 
         Returns list of (entry_id, fields) tuples.
         Returns empty list on timeout or when no entries are available.
@@ -76,11 +77,14 @@ class RedisClient:
                 ``None`` means non-blocking (return immediately).
                 ``0`` means block indefinitely.
                 A positive integer means block for that many milliseconds.
+            pending: If True, read pending entries (delivered but not ACKed)
+                instead of new ones. Uses ID ``"0"`` instead of ``">"``.
         """
+        entry_id = "0" if pending else ">"
         result = self._client.xreadgroup(
             groupname=group,
             consumername=consumer,
-            streams={stream: ">"},
+            streams={stream: entry_id},
             count=count,
             block=block_ms,
         )

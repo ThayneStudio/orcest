@@ -373,15 +373,50 @@ def _consume_results(
     """Consume any pending results from workers.
 
     Non-blocking: reads all available results without waiting.
-    Uses block_ms=None for immediate return when no results are pending.
+
+    First drains pending entries (delivered but not ACKed — can happen if
+    the orchestrator was restarted mid-cycle), then reads new entries.
+    This prevents orphaned labels from results that were read but never
+    processed after a restart.
     """
+    # Phase 1: Drain pending (unACKed) entries from previous runs
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
             consumer="orchestrator-main",
             stream=RESULTS_STREAM,
             count=10,
-            block_ms=None,  # Non-blocking: return immediately
+            block_ms=None,
+            pending=True,
+        )
+        if not entries:
+            break
+        for entry_id, fields in entries:
+            try:
+                result = TaskResult.from_dict(fields)
+                _handle_result(config, redis, result, logger)
+                logger.info(f"Recovered pending result {entry_id}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to process pending result {entry_id}: {e}",
+                    exc_info=True,
+                )
+            try:
+                redis.xack(RESULTS_STREAM, RESULTS_GROUP, entry_id)
+            except Exception as ack_err:
+                logger.error(
+                    f"Failed to ACK pending result {entry_id}: {ack_err}",
+                    exc_info=True,
+                )
+
+    # Phase 2: Read new entries
+    while True:
+        entries = redis.xreadgroup(
+            group=RESULTS_GROUP,
+            consumer="orchestrator-main",
+            stream=RESULTS_STREAM,
+            count=10,
+            block_ms=None,
         )
 
         if not entries:
