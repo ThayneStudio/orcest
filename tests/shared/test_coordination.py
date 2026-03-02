@@ -2,7 +2,7 @@
 
 import pytest
 
-from orcest.shared.coordination import RedisLock, make_pr_lock_key
+from orcest.shared.coordination import RedisLock, make_issue_lock_key, make_pr_lock_key
 
 
 def test_acquire_succeeds_on_free_key(fake_redis_client):
@@ -61,6 +61,11 @@ def test_refresh_by_non_owner_fails(fake_redis_client):
 def test_make_pr_lock_key_format():
     """make_pr_lock_key produces the expected key pattern."""
     assert make_pr_lock_key("owner/repo", 42) == "lock:pr:owner/repo:42"
+
+
+def test_make_issue_lock_key_format():
+    """make_issue_lock_key produces the expected key pattern."""
+    assert make_issue_lock_key("owner/repo", 7) == "lock:issue:owner/repo:7"
 
 
 def test_acquire_sets_ttl(fake_redis_client):
