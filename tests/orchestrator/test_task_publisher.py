@@ -914,7 +914,7 @@ def test_publish_and_notify_xadd_failure(
     # Sabotage xadd_capped to simulate Redis failure
     original_xadd_capped = fake_redis_client.xadd_capped
 
-    def broken_xadd_capped(stream, fields, maxlen=2000):
+    def broken_xadd_capped(stream, fields, **kwargs):
         raise ConnectionError("Redis connection lost")
 
     fake_redis_client.xadd_capped = broken_xadd_capped
