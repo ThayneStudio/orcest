@@ -193,9 +193,23 @@ def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
 
     Returns list of dicts with: name, status, conclusion, detailsUrl.
     """
-    pr = get_pr(repo, pr_number, token)
-    checks = pr.get("statusCheckRollup") or []
-    return checks
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--json",
+            "statusCheckRollup",
+        ],
+        token,
+    )
+    if not output:
+        return []
+    data = json.loads(output)
+    return data.get("statusCheckRollup") or []
 
 
 def get_pr_diff(repo: str, number: int, token: str) -> str:
