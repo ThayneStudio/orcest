@@ -788,31 +788,34 @@ def test_extract_summary_non_text_content_blocks():
 def test_is_usage_exhausted_all_patterns():
     """Test all 5 pattern pairs from _USAGE_EXHAUSTION_PATTERNS."""
     # ("usage", "limit")
-    assert _is_usage_exhausted("usage limit reached", "") is True
+    assert _is_usage_exhausted("usage limit reached") is True
     # ("rate", "limit")
-    assert _is_usage_exhausted("rate limit exceeded", "") is True
+    assert _is_usage_exhausted("rate limit exceeded") is True
     # ("quota", "exceeded")
-    assert _is_usage_exhausted("quota exceeded for account", "") is True
+    assert _is_usage_exhausted("quota exceeded for account") is True
     # ("token limit", "")
-    assert _is_usage_exhausted("token limit hit", "") is True
+    assert _is_usage_exhausted("token limit hit") is True
     # ("billing", "limit")
-    assert _is_usage_exhausted("billing limit reached", "") is True
+    assert _is_usage_exhausted("billing limit reached") is True
     # No match
-    assert _is_usage_exhausted("everything is fine", "") is False
+    assert _is_usage_exhausted("everything is fine") is False
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: pattern in stdout (not stderr)
+# _is_usage_exhausted: stdout NOT checked (false positive prevention)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_in_stdout():
-    """Pattern in stdout (not stderr) -> still detected."""
-    # stderr is empty, pattern is in stdout
-    assert _is_usage_exhausted("", "rate limit exceeded") is True
-    # Both empty -> not detected
-    assert _is_usage_exhausted("", "") is False
+def test_is_usage_exhausted_stdout_not_checked():
+    """Only stderr is checked — stdout is excluded to prevent false positives.
+
+    Claude's stream-json stdout contains ``"usage": {...}`` in every API
+    response message.  If "limit" also appears anywhere in Claude's text
+    or prompt, the ("usage", "limit") pattern would match incorrectly.
+    """
+    # Empty stderr -> not detected regardless of stdout content
+    assert _is_usage_exhausted("") is False
 
 
 # ---------------------------------------------------------------------------

@@ -90,16 +90,17 @@ def _build_env(token: str) -> dict[str, str]:
     return env
 
 
-def _is_usage_exhausted(stderr: str, stdout: str) -> bool:
-    """Check whether the output indicates Claude usage/rate limit exhaustion.
+def _is_usage_exhausted(stderr: str) -> bool:
+    """Check whether stderr indicates Claude usage/rate limit exhaustion.
 
-    Examines both stderr and stdout (case-insensitive) against known
-    patterns. Returns True if any pattern matches.
+    Only examines stderr (case-insensitive).  Stdout is intentionally
+    excluded because stream-json output contains ``"usage": {...}`` in
+    every API response message, causing false positives when the word
+    "limit" also appears anywhere in Claude's text output or the prompt.
     """
-    combined = (stderr + "\n" + stdout).lower()
+    text = stderr.lower()
     for primary, secondary in _USAGE_EXHAUSTION_PATTERNS:
-        # When secondary is empty, only the primary keyword is required.
-        if primary in combined and (not secondary or secondary in combined):
+        if primary in text and (not secondary or secondary in text):
             return True
     return False
 
@@ -478,7 +479,7 @@ def run_claude(
                     raw_output=stderr or stdout,
                 )
             # Check for usage exhaustion -- do NOT retry
-            if _is_usage_exhausted(stderr, stdout):
+            if _is_usage_exhausted(stderr):
                 return ClaudeResult(
                     success=False,
                     summary="Claude usage limit reached",
