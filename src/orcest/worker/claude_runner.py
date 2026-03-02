@@ -305,6 +305,8 @@ def run_claude(
                         f"Failed to create stderr drain thread; retrying in {retry_backoff}s...",
                     )
                 _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         # Read stdout line-by-line, streaming to on_output
@@ -367,6 +369,8 @@ def run_claude(
                         f"Failed to create watchdog thread; retrying in {retry_backoff}s...",
                     )
                 _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         try:
@@ -451,6 +455,8 @@ def run_claude(
                 if logger:
                     logger.info(f"Retrying in {retry_backoff}s...")
                 _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         # Cancel the watchdog -- stdout reading finished (normally
@@ -548,6 +554,8 @@ def run_claude(
             if logger:
                 logger.info(f"Retrying in {retry_backoff}s...")
             _abort.wait(timeout=retry_backoff)
+            if _abort.is_set():
+                break
 
     # All retries exhausted -- include stderr from the most recent
     # attempt that successfully started a drain thread.
