@@ -104,8 +104,13 @@ def _poll_cycle(
     }
     pr_states.sort(key=lambda ps: (_ACTION_PRIORITY.get(ps.action, 9), ps.number))
 
+    # Pre-compute queue depth for orphan detection and issue gating.
+    tasks_stream = f"tasks:{config.default_runner}"
+    queue_depth = redis.stream_queue_depth(tasks_stream, "workers")
+
     enqueued = 0
     merged = 0
+    orphans_cleaned: set[int] = set()
     for pr_state in pr_states:
         if pr_state.action == PRAction.MERGE:
             logger.info(f"PR #{pr_state.number} ({pr_state.title}): merging")
@@ -286,7 +291,32 @@ def _poll_cycle(
         elif pr_state.action == PRAction.SKIP_PENDING:
             logger.debug(f"PR #{pr_state.number}: CI pending, skipping")
         elif pr_state.action == PRAction.SKIP_LABELED:
-            logger.debug(f"PR #{pr_state.number}: already labeled, skipping")
+            # Detect orphaned orcest:queued labels.  When the task queue is
+            # completely empty (no pending, no undelivered entries), any
+            # orcest:queued label is stale — the task was lost (Redis restart,
+            # worker crash, etc.).  Strip the label so the PR is re-evaluated
+            # on the next poll cycle.
+            if config.labels.queued in pr_state.labels and queue_depth == 0:
+                logger.warning(
+                    f"PR #{pr_state.number}: orphaned {config.labels.queued} "
+                    f"label (task queue empty), removing"
+                )
+                try:
+                    gh.remove_label(
+                        config.github.repo,
+                        pr_state.number,
+                        config.labels.queued,
+                        config.github.token,
+                    )
+                    orphans_cleaned.add(pr_state.number)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to remove orphaned label from "
+                        f"PR #{pr_state.number}: {e}",
+                        exc_info=True,
+                    )
+            else:
+                logger.debug(f"PR #{pr_state.number}: already labeled, skipping")
         else:
             logger.warning(f"PR #{pr_state.number}: unhandled action {pr_state.action!r}, skipping")
 
@@ -296,19 +326,18 @@ def _poll_cycle(
     # (a) GitHub state: PRs being actively worked on or just enqueued.
     #     SKIP_LABELED with needs-human/blocked labels does NOT count —
     #     those PRs are explicitly parked and shouldn't block issue work.
+    #     PRs whose orphaned labels were just cleaned also don't count.
     _active_labels = {config.labels.queued, config.labels.in_progress}
     pr_work_pending = any(
         pr_state.action
         in (PRAction.ENQUEUE_FIX, PRAction.ENQUEUE_FOLLOWUP, PRAction.SKIP_LOCKED)
         or (
             pr_state.action == PRAction.SKIP_LABELED
+            and pr_state.number not in orphans_cleaned
             and any(lbl in _active_labels for lbl in pr_state.labels)
         )
         for pr_state in pr_states
     )
-    # (b) Queue depth: tasks already waiting in Redis (from previous cycles)
-    tasks_stream = f"tasks:{config.default_runner}"
-    queue_depth = redis.stream_queue_depth(tasks_stream, "workers")
 
     issue_states: list = []
     if pr_work_pending:

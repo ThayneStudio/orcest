@@ -166,7 +166,8 @@ class RedisClient:
         for g in groups:
             if g.get("name") == group:
                 pending = g.get("pending", 0)
-                lag = g.get("lag", 0)
+                # lag can be -1 (unknown) on empty streams; treat as 0.
+                lag = max(g.get("lag") or 0, 0)
                 return pending + lag
         return 0
 

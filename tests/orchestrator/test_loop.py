@@ -792,3 +792,122 @@ def test_handle_result_post_comment_failure(
     removed_labels = {call[0][2] for call in remove_calls}
     assert orchestrator_config.labels.queued in removed_labels
     assert orchestrator_config.labels.in_progress in removed_labels
+
+
+# ---------------------------------------------------------------------------
+# Orphaned label detection tests
+# ---------------------------------------------------------------------------
+
+
+def test_poll_cycle_removes_orphaned_queued_label(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """SKIP_LABELED with orcest:queued and empty queue → label removed."""
+    pr_state = PRState(
+        number=99,
+        title="PR #99",
+        branch="feat/99",
+        head_sha="abc123",
+        action=PRAction.SKIP_LABELED,
+        ci_failures=[],
+        review_threads=[],
+        labels=[orchestrator_config.labels.queued],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    # Task stream is empty (queue_depth == 0)
+    fake_redis_client.ensure_consumer_group("tasks:claude", "workers")
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger)
+
+    # Should remove the orphaned queued label
+    gh_mock.remove_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        99,
+        orchestrator_config.labels.queued,
+        orchestrator_config.github.token,
+    )
+
+
+def test_poll_cycle_keeps_queued_label_when_queue_not_empty(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """SKIP_LABELED with orcest:queued but tasks in queue → label kept."""
+    pr_state = PRState(
+        number=100,
+        title="PR #100",
+        branch="feat/100",
+        head_sha="abc123",
+        action=PRAction.SKIP_LABELED,
+        ci_failures=[],
+        review_threads=[],
+        labels=[orchestrator_config.labels.queued],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    fake_redis_client.ensure_consumer_group("tasks:claude", "workers")
+    # FakeRedis doesn't track lag correctly, so mock queue_depth > 0
+    mocker.patch.object(fake_redis_client, "stream_queue_depth", return_value=3)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger)
+
+    # Should NOT remove the label (queue has tasks)
+    gh_mock.remove_label.assert_not_called()
+
+
+def test_poll_cycle_orphan_cleanup_unblocks_issue_discovery(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """After cleaning orphaned labels, pr_work_pending should be False."""
+    pr_state = PRState(
+        number=101,
+        title="PR #101",
+        branch="feat/101",
+        head_sha="abc123",
+        action=PRAction.SKIP_LABELED,
+        ci_failures=[],
+        review_threads=[],
+        labels=[orchestrator_config.labels.queued],
+    )
+
+    mock_discover_issues = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_issues",
+        return_value=[],
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    fake_redis_client.ensure_consumer_group("tasks:claude", "workers")
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger)
+
+    # Orphaned label was cleaned, so issue discovery should proceed
+    mock_discover_issues.assert_called_once()
