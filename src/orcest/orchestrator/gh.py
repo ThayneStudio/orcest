@@ -367,8 +367,11 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 
     all_thread_nodes: list[dict] = []
     cursor: str | None = None
+    MAX_PAGES = 50  # safety cap; 50 × 100 = 5 000 threads
+    page_count = 0
 
-    while True:
+    while page_count < MAX_PAGES:
+        page_count += 1
         args = [
             "api",
             "graphql",
@@ -431,6 +434,18 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
                 break
         else:
             break
+    else:
+        # Loop exhausted MAX_PAGES without a natural break.
+        page_info = review_threads.get("pageInfo") or {}  # type: ignore[possibly-undefined]
+        if page_info.get("hasNextPage"):
+            logger.warning(
+                "PR #%d in %s: reached MAX_PAGES (%d) pagination limit; "
+                "some review threads may have been truncated (%d fetched so far)",
+                number,
+                repo,
+                MAX_PAGES,
+                len(all_thread_nodes),
+            )
 
     results = []
     for thread in all_thread_nodes:
