@@ -234,12 +234,14 @@ def format_stream_json_line(line: str) -> str | None:
         task_id = rich_escape(str(obj.get("task_id", "?")))
         return f"{'─' * 3} End {task_id}: {status} {'─' * 42}"
 
-    # Assistant messages with content blocks
-    if obj.get("role") != "assistant" or not isinstance(obj.get("content"), list):
+    # Assistant messages with content blocks.
+    # stream-json wraps messages: {"type":"assistant","message":{"role":...,"content":[...]}}
+    msg = obj.get("message", obj)
+    if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
         return None
 
     parts: list[str] = []
-    for block in obj["content"]:
+    for block in msg["content"]:
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")

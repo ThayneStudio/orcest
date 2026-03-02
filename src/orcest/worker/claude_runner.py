@@ -583,8 +583,10 @@ def _extract_summary(stream_json_output: str) -> str:
             return obj["result"][:500]
 
         # stream-json assistant message with content array
-        if obj.get("role") == "assistant" and isinstance(obj.get("content"), list):
-            for block in obj["content"]:
+        # stream-json wraps messages: {"type":"assistant","message":{"role":...,"content":[...]}}
+        msg = obj.get("message", obj)
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            for block in msg["content"]:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text = block.get("text", "")
                     if text:
