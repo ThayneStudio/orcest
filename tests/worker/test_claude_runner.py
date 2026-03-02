@@ -773,7 +773,7 @@ def test_is_usage_exhausted_all_patterns():
     """Test all 5 pattern pairs from _USAGE_EXHAUSTION_PATTERNS."""
     # ("usage", "limit")
     assert _is_usage_exhausted("usage limit reached") is True
-    # ("rate", "limit")
+    # _RATE_LIMIT_RE (anchored regex)
     assert _is_usage_exhausted("rate limit exceeded") is True
     # ("quota", "exceeded")
     assert _is_usage_exhausted("quota exceeded for account") is True
@@ -795,6 +795,9 @@ def test_is_usage_exhausted_stdout_not_checked():
     """Pattern appearing only in stdout must NOT trigger usage exhaustion."""
     # Simulates Claude working on rate-limiting code whose output mentions "rate limit"
     assert _is_usage_exhausted("") is False
+    # The real false-positive case: "rate limit" appears in work output (stdout),
+    # but stderr is clean — must not trigger exhaustion.
+    assert _is_usage_exhausted("rate limit exceeded in user-authored code") is False
 
 
 # ---------------------------------------------------------------------------
