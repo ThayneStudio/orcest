@@ -1044,12 +1044,8 @@ def test_get_pr_review_comments_multi_page_concatenated(mocker):
 
 def test_get_pr_review_comments_pages_separated_by_newlines(mocker):
     """Pages separated by newlines are handled by the whitespace-skipping loop."""
-    page1 = json.dumps(
-        [{"path": "x.py", "line": 5, "user": {"login": "carol"}, "body": "First"}]
-    )
-    page2 = json.dumps(
-        [{"path": "y.py", "line": 6, "user": {"login": "dave"}, "body": "Second"}]
-    )
+    page1 = json.dumps([{"path": "x.py", "line": 5, "user": {"login": "carol"}, "body": "First"}])
+    page2 = json.dumps([{"path": "y.py", "line": 6, "user": {"login": "dave"}, "body": "Second"}])
     mocker.patch("orcest.orchestrator.gh._run_gh", return_value=page1 + "\n" + page2)
 
     result = get_pr_review_comments(REPO, 3, TOKEN)
