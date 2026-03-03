@@ -13,17 +13,18 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner that captures stderr separately from stdout.
+    """CliRunner for Click 8.2+, where stderr is always captured separately.
 
-    Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
-    parameter entirely.  ``CliRunner(mix_stderr=False)`` raises
-    ``TypeError`` on Click 8.2+.  Plain ``CliRunner()`` is correct —
-    Click 8.2+ always captures stderr separately, unconditionally.
+    Root cause of the CI failure: Click 8.2 removed ``mix_stderr`` entirely.
+    ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+.
 
-    ``result.stderr`` is populated by ``click.echo(..., err=True)`` calls.
+    In Click 8.2+, plain ``CliRunner()`` is correct:
+    - ``result.stderr`` captures output from ``click.echo(..., err=True)``
+    - ``result.stdout`` captures stdout-only output (e.g. Rich Console)
+    - ``result.output`` is a legacy alias that merges both streams; tests
+      here intentionally use ``result.stdout``/``result.stderr`` instead.
+
     ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
-    ``test_status_once_with_redis_host`` confirms Rich Console() writes to
-    ``result.stdout``, ruling it out as a root cause.
     """
     return CliRunner()
 
@@ -99,9 +100,9 @@ def test_main_help(runner):
     """Main group --help exits 0 and lists subcommands."""
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert "orchestrate" in result.output
-    assert "work" in result.output
-    assert "status" in result.output
+    assert "orchestrate" in result.stdout
+    assert "work" in result.stdout
+    assert "status" in result.stdout
 
 
 def test_work_missing_required_id(runner):
