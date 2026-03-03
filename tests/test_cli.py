@@ -13,26 +13,58 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner with stdout and stderr captured as separate streams.
+    """Click test runner with stderr captured as a separate stream.
 
     Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
-    parameter from ``CliRunner.__init__``.  Passing
-    ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+.
+    parameter from ``CliRunner`` entirely.  ``CliRunner(mix_stderr=False)``
+    raises ``TypeError`` on Click 8.2+, which is what was failing in CI.
 
-    In Click 8.2+, ``mix_stderr`` was dropped because stderr separation
-    became *unconditional* — ``CliRunner()`` always keeps stdout and stderr
-    as independent byte streams, equivalent to the old ``mix_stderr=False``:
+    Despite ``CliRunner()`` looking like the old ``mix_stderr=True``
+    invocation, the behaviour is the *opposite*.  Click 8.2 removed the
+    parameter because the old mix-by-default behaviour was a design
+    mistake; stderr separation is now *unconditional*:
 
     * ``result.stdout`` — only what was written to ``sys.stdout``
     * ``result.stderr`` — only what was written to ``sys.stderr``
-    * ``result.output`` — both interleaved (as a terminal user would see)
+    * ``result.output`` — both interleaved (backward-compat alias)
 
-    We verified that ``click.echo(..., err=True)`` in ``cli.py`` goes to
-    ``result.stderr`` (not stdout), and that Rich's ``Console()`` inside
-    ``_status_once`` writes to the Click-captured ``sys.stdout`` and
-    therefore appears in ``result.stdout``, not ``result.stderr``.
+    The ``click.echo(..., err=True)`` calls in ``cli.py`` write to
+    ``sys.stderr``, so they appear in ``result.stderr``.  Assertions such
+    as ``assert "Cannot connect to Redis" in result.stderr`` are therefore
+    still meaningful — stderr is captured separately, not merged.
+
+    Rich's ``Console()`` in ``_status_once`` is not involved in the error
+    paths exercised by the stderr-asserting tests here; the command exits
+    before reaching ``_status_once``, so it is not the root cause.
     """
     return CliRunner()
+
+
+# ---------------------------------------------------------------------------
+# Verify that the runner fixture separates stderr from stdout (Click 8.2+)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_separates_stderr_from_stdout(runner):
+    """CliRunner captures stderr and stdout as independent streams.
+
+    Click 8.2 removed ``mix_stderr`` and made separation unconditional.
+    This test guards against regressions where stderr leaks into stdout or
+    ``result.stderr`` is empty, which would make all stderr assertions below
+    meaningless.
+    """
+
+    @click.command()
+    def _probe():
+        click.echo("stdout-only")
+        click.echo("stderr-only", err=True)
+
+    result = runner.invoke(_probe)
+    assert result.exit_code == 0
+    assert "stdout-only" in result.stdout
+    assert "stderr-only" not in result.stdout
+    assert "stderr-only" in result.stderr
+    assert "stdout-only" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
