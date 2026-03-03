@@ -54,7 +54,7 @@ def runner():
 def test_runner_separates_stderr_from_stdout(runner):
     """CliRunner captures stderr and stdout as independent streams.
 
-    Click 8.2 removed ``mix_stderr`` and made separation unconditional.
+    Click 8.3 removed ``mix_stderr`` and made separation unconditional.
     This test guards against regressions where stderr leaks into stdout or
     ``result.stderr`` is empty, which would make all stderr assertions below
     meaningless.
