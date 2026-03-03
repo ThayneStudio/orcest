@@ -92,6 +92,10 @@ def _safe_bool(value: Any, field_name: str) -> bool:
     because ``bool("false")`` returns ``True``.  Raise a clear error
     instead so the user can fix their config.
     """
+    if value is None:
+        raise ValueError(
+            f"Config field '{field_name}' is null/missing but a boolean is required."
+        )
     if not isinstance(value, bool):
         raise ValueError(
             f"Config field '{field_name}' has value {value!r} which is not a boolean. "
