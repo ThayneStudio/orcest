@@ -532,6 +532,17 @@ def _handle_result(
                 exc_info=True,
             )
 
+        # Remove orcest:ready label from completed issues so they are not
+        # re-discovered on the next poll cycle.
+        if is_issue:
+            try:
+                gh.remove_issue_label(repo, resource_id, labels.ready, token)
+            except Exception as e:
+                logger.error(
+                    f"Failed to remove ready label from issue #{resource_id}: {e}",
+                    exc_info=True,
+                )
+
     # Manage labels based on result status.
     # Only terminal statuses (FAILED, BLOCKED) add labels.
     # USAGE_EXHAUSTED does nothing — task stays parked via attempt counter.
