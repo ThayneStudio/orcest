@@ -315,7 +315,7 @@ def discover_actionable_prs(
             c
             for c in checks
             if not c.get("conclusion")
-            # "" catches CheckRun objects with no state yet (pre-terminal, not just PENDING/EXPECTED)
+            # "" catches CheckRun objects with no state yet (pre-terminal, not PENDING/EXPECTED)
             and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
         ]
 
