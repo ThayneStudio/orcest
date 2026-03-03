@@ -15,25 +15,36 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 def runner():
     """CliRunner with separate stderr/stdout capture (Click 8.2+).
 
-    Click 8.2 removed the ``mix_stderr`` parameter from ``CliRunner.__init__``
-    entirely and made stream separation unconditional.  ``CliRunner()`` in
-    Click 8.2+ is **not** equivalent to the old ``CliRunner(mix_stderr=True)``
-    — ``mix_stderr`` was deleted, not defaulted to ``True``.
+    **Click 8.2 removed ``mix_stderr`` entirely.**  Passing
+    ``mix_stderr=False`` (or any value) to ``CliRunner.__init__`` raises
+    ``TypeError: unexpected keyword argument 'mix_stderr'`` on Click 8.2+.
+    ``mix_stderr`` was *deleted*, not given a new default.
 
-    In Click 8.2+ ``result.stderr`` is always independently populated by
-    anything written to ``sys.stderr`` (e.g. ``click.echo(..., err=True)``),
-    so all error-message assertions below on ``result.stderr`` are fully
+    In Click 8.2+ ``CliRunner()`` **always** separates the streams — it is
+    equivalent to the old ``CliRunner(mix_stderr=False)``, **not**
+    ``CliRunner(mix_stderr=True)``.  Both ``result.stdout`` and
+    ``result.stderr`` are independently populated:
+
+    * ``result.stdout`` — only text written to ``sys.stdout``
+    * ``result.stderr`` — only text written to ``sys.stderr``
+    * ``result.output`` — both combined (legacy alias, kept for compat)
+
+    All error-message assertions below on ``result.stderr`` remain fully
     meaningful.  ``test_runner_separates_stderr_from_stdout`` verifies this
-    empirically.
+    empirically on every test run.
 
-    Root cause of the original CI failure: the test suite used
-    ``CliRunner(mix_stderr=False)`` while ``pyproject.toml`` required only
-    ``click>=8.1``.  When Click 8.2 was installed in CI the test run aborted
-    with ``TypeError: CliRunner.__init__() got an unexpected keyword argument
-    'mix_stderr'``.  Fix: require ``click>=8.2`` and drop the removed argument.
-    A Rich ``Console()`` writing to real stderr was investigated and ruled out
-    — all ``Console()`` instances are created inside the invoked command after
-    Click has patched ``sys.stderr``.
+    Root cause of the original CI failure: ``pyproject.toml`` allowed
+    ``click>=8.1``, so CI could install Click 8.2 which removed ``mix_stderr``,
+    causing ``CliRunner(mix_stderr=False)`` to raise ``TypeError`` and abort
+    the entire test suite.  Fix: require ``click>=8.2`` and drop the now-
+    nonexistent keyword argument.
+
+    Rich ``Console()`` writing to real stderr was also investigated and ruled
+    out — every ``Console()`` in ``cli.py`` is constructed *inside* the
+    command function body, so Click has already patched ``sys.stderr`` (and
+    ``sys.stdout``) before the ``Console`` object is created.  ``_status_once``
+    additionally passes ``file=sys.stdout`` explicitly to keep Rich output out
+    of stderr even when Click's stream patching is not in effect.
     """
     return CliRunner()
 
