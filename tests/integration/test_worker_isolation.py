@@ -437,6 +437,8 @@ class TestWorkerIsolation:
             stop_event.set()
             for t in threads:
                 t.join(timeout=10)
+                if t.is_alive():
+                    raise RuntimeError(f"Worker thread {t.name!r} did not stop within 10 s")
             # Cleanup patchers
             workspace_patcher.stop()
             logging_patcher.stop()
@@ -582,6 +584,8 @@ class TestWorkerIsolation:
             # its Redis connection before the fixture calls flushdb().
             stop_event.set()
             t.join(timeout=10)
+            if t.is_alive():
+                raise RuntimeError(f"Worker thread {t.name!r} did not stop within 10 s")
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
