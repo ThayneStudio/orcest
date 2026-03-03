@@ -22,7 +22,9 @@ WORKDIR /home/orcest/app
 # Install dependencies in a separate layer for better cache reuse
 COPY pyproject.toml .
 RUN python3 - <<'PYEOF'
-import tomllib, subprocess, sys
+import subprocess
+import sys
+import tomllib
 with open('pyproject.toml', 'rb') as f:
     deps = tomllib.load(f)['project']['dependencies']
 subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + deps)
