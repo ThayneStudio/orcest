@@ -315,6 +315,7 @@ def discover_actionable_prs(
             c
             for c in checks
             if not c.get("conclusion")
+            # "" covers StatusContext with absent/empty state (CheckRuns pass via conclusion guard)
             and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
         ]
 
