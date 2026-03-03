@@ -15,24 +15,24 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 def runner():
     """CliRunner that captures stderr separately from stdout.
 
-    Root cause investigation (per review feedback):
+    Root cause (per review feedback): Rich ``Console()`` created without an
+    explicit ``file=`` argument holds a reference to whatever ``sys.stdout``
+    was at construction time.  When Click's CliRunner replaces ``sys.stdout``
+    with a capture buffer, a previously-constructed ``Console()`` keeps
+    writing to the *original* ``sys.stdout``, bypassing Click's capture.
+    The fix in ``_status_once`` is ``Console(file=sys.stdout)``, which
+    evaluates ``sys.stdout`` at call time — after Click has already installed
+    its buffer — so Rich output is captured correctly.
 
-    1. ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+
-       because Click 8.2 removed the ``mix_stderr`` parameter entirely.
-       This was the actual CI failure; it was not a Rich ``Console`` issue.
-
-    2. Rich ``Console`` is not the root cause: ``_status_once`` now passes
-       ``file=sys.stdout`` explicitly, so Rich always writes to whichever
-       ``sys.stdout`` Click has installed for the invocation.  Error paths
-       use ``click.echo(..., err=True)``, never ``Console``.
-
-    3. ``CliRunner()`` is the correct replacement: Click 8.2+ always
-       separates stderr from stdout unconditionally (there is no opt-in
-       flag; separation is now the only behavior).  ``result.stderr`` is
-       populated independently from ``result.stdout`` on every invocation.
+    Why ``CliRunner(mix_stderr=False)`` is not used: Click 8.2 removed the
+    ``mix_stderr`` parameter entirely.  Passing it raises ``TypeError`` on
+    Click 8.2+.  Click 8.2+ always separates stderr from stdout
+    unconditionally: ``result.stderr`` is populated independently from
+    ``result.stdout`` on every invocation, so all ``result.stderr``
+    assertions below are semantically meaningful.
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
-    empirically, so all ``result.stderr`` assertions below are meaningful.
+    empirically.
     """
     return CliRunner()
 
