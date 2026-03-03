@@ -24,6 +24,7 @@ from orcest.worker.workspace import Workspace
 RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
+_STREAM_MAXLEN = 2000
 
 
 def _make_abort_event(*events: threading.Event) -> threading.Event:
@@ -228,7 +229,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # reconciliation for RESULTS_STREAM. The task entry stays unACKed so
         # _drain_pending_tasks will publish a FAILED result on the next restart.
         try:
-            redis.xadd_capped(RESULTS_STREAM, result.to_dict())
+            redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
             logger.error(
@@ -343,6 +344,7 @@ def _execute_task(
                     "task_id": task.id,
                     "resource": f"{task.resource_type} #{task.resource_id}",
                 },
+                maxlen=_STREAM_MAXLEN,
             )
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
@@ -356,7 +358,7 @@ def _execute_task(
         def on_output(line: str) -> None:
             nonlocal output_errors
             try:
-                redis.xadd_capped(output_stream, {"line": line})
+                redis.xadd_capped(output_stream, {"line": line}, maxlen=_STREAM_MAXLEN)
             except Exception:
                 # Non-critical: don't kill the task over a streaming failure.
                 # Log the first occurrence so operators know Redis output
@@ -396,6 +398,7 @@ def _execute_task(
                     "task_id": task.id,
                     "status": status.value,
                 },
+                maxlen=_STREAM_MAXLEN,
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
@@ -423,6 +426,7 @@ def _execute_task(
                     "task_id": task.id,
                     "status": ResultStatus.FAILED.value,
                 },
+                maxlen=_STREAM_MAXLEN,
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)

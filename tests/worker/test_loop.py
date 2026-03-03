@@ -12,6 +12,7 @@ import pytest
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
+    _STREAM_MAXLEN,
     CONSUMER_GROUP,
     HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
@@ -253,7 +254,9 @@ class TestExecuteTask:
 
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
-        mock_redis.xadd_capped.assert_any_call(stream, {"line": '{"role": "assistant"}\n'})
+        mock_redis.xadd_capped.assert_any_call(
+            stream, {"line": '{"role": "assistant"}\n'}, maxlen=_STREAM_MAXLEN
+        )
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
         """task_start and task_end markers are published to Redis."""
@@ -337,7 +340,7 @@ class TestExecuteTask:
         mock_redis = MagicMock()
 
         # task_start marker succeeds, then all output lines fail
-        def xadd_capped_side_effect(stream, data):
+        def xadd_capped_side_effect(stream, data, **kwargs):
             if "line" in data:
                 raise ConnectionError("Redis down")
             return "1-0"
@@ -422,7 +425,7 @@ class TestExecuteTask:
         # Fail on task_start marker, succeed on everything else
         first_call = [True]
 
-        def xadd_capped_side_effect(stream, data):
+        def xadd_capped_side_effect(stream, data, **kwargs):
             if first_call[0] and data.get("type") == "task_start":
                 first_call[0] = False
                 raise ConnectionError("Redis unavailable")
