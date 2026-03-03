@@ -13,24 +13,23 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner with separate stderr capture.
+    """Click test runner.
 
-    The original code used ``CliRunner(mix_stderr=False)`` to capture stderr
-    separately.  Click 8.2 removed the ``mix_stderr`` parameter from
-    ``CliRunner`` entirely — passing it raises ``TypeError``, which was the
-    root cause of the CI failure (not a Rich ``Console`` routing issue).
+    Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
+    parameter from ``CliRunner``.  Passing ``CliRunner(mix_stderr=False)``
+    raises ``TypeError`` in Click 8.2+, which is why the original code broke.
 
-    In Click 8.2+, stdout, stderr, and output are *always* captured as
-    independent streams:
+    In Click 8.2+, ``CliRunner()`` always captures stdout and stderr as
+    independent streams — there is no merging regardless of any parameter:
 
-    * ``result.stdout``  — only what was written to stdout
-    * ``result.stderr``  — only what was written to stderr
-    * ``result.output``  — interleaved stdout + stderr (for terminal fidelity)
+    * ``result.stdout`` — only what was written to stdout
+    * ``result.stderr`` — only what was written to stderr
+    * ``result.output`` — both interleaved (for terminal fidelity)
 
     The assertions below use ``result.stderr`` to verify that error messages
-    are routed to stderr.  This is equivalent to (and replaces) the old
-    ``mix_stderr=False`` approach: if a message appears in ``result.stderr``
-    it genuinely went to stderr, not to stdout.
+    written via ``click.echo(..., err=True)`` genuinely go to stderr and
+    are absent from ``result.stdout``.  This is the same semantic guarantee
+    that ``mix_stderr=False`` provided in older Click versions.
     """
     return CliRunner()
 
