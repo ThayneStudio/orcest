@@ -7,7 +7,7 @@ stream operations with simplified return types.
 from __future__ import annotations
 
 import logging
-from typing import cast
+from typing import Any, cast
 
 import redis
 
@@ -181,10 +181,10 @@ class RedisClient:
         (not yet delivered). Returns 0 if the stream or group doesn't exist.
         """
         try:
-            groups = cast(list, self._client.xinfo_groups(stream))
+            groups = cast(list[dict[str, Any]], self._client.xinfo_groups(stream))
         except redis.ResponseError:
             return 0
-        for g in groups:  # type: ignore[union-attr]
+        for g in groups:
             if g.get("name") == group:
                 pending = g.get("pending", 0)
                 # lag can be -1 (unknown) on empty streams; treat as 0.
