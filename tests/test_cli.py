@@ -13,18 +13,27 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner for Click 8.2+, where stderr is always captured separately.
+    """CliRunner with stderr always captured separately (Click 8.2+ behaviour).
 
-    Root cause of the CI failure: Click 8.2 removed ``mix_stderr`` entirely.
-    ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+.
+    **Why not ``CliRunner(mix_stderr=False)``?**
+    Click 8.1 and earlier had a ``mix_stderr`` parameter that defaulted to
+    ``True``, merging stderr into ``result.output`` and leaving
+    ``result.stderr`` empty.  The idiomatic fix was ``CliRunner(mix_stderr=False)``.
 
-    In Click 8.2+, plain ``CliRunner()`` is correct:
-    - ``result.stderr`` captures output from ``click.echo(..., err=True)``
-    - ``result.stdout`` captures stdout-only output (e.g. Rich Console)
-    - ``result.output`` is a legacy alias that merges both streams; tests
-      here intentionally use ``result.stdout``/``result.stderr`` instead.
+    Click 8.2 *removed* ``mix_stderr`` entirely and changed the default so
+    that stderr is *always* captured as a separate stream.  Passing
+    ``mix_stderr=False`` now raises ``TypeError`` — that is the root cause of
+    the original CI failure.  The correct call for Click 8.2+ is plain
+    ``CliRunner()`` (no arguments); it does **not** behave like the old
+    ``mix_stderr=True`` default.
 
-    ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
+    Click 8.2+ invariants relied on by this test module:
+    - ``result.stderr`` captures ``click.echo(..., err=True)`` output
+    - ``result.stdout`` captures stdout-only output (e.g. Rich ``Console()``)
+    - ``result.output`` is a mix of both (as a user sees in a terminal)
+
+    ``test_runner_separates_stderr_from_stdout`` verifies these invariants
+    empirically so that all ``result.stderr`` assertions below are meaningful.
     """
     return CliRunner()
 
