@@ -183,7 +183,7 @@ class RedisClient:
             groups = self._client.xinfo_groups(stream)
         except redis.ResponseError:
             return 0
-        for g in groups:
+        for g in groups:  # type: ignore[union-attr]
             if g.get("name") == group:
                 pending = g.get("pending", 0)
                 # lag can be -1 (unknown) on empty streams; treat as 0.

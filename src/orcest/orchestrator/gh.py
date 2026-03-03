@@ -95,7 +95,8 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
-    headRefOid, isDraft, author, createdAt, labels, reviewDecision.
+    headRefOid, isDraft, author, createdAt, labels, reviewDecision,
+    mergeable.
 
     Args:
         repo: Repository in 'owner/repo' format.
@@ -112,7 +113,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
             "--state",
             "open",
             "--json",
-            "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision",
+            "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision,mergeable",
             "--limit",
             str(limit),
         ],
@@ -529,7 +530,6 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
     return results
 
 
-
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
     """List open issues with a specific label.
 
@@ -574,7 +574,6 @@ def get_issue(repo: str, number: int, token: str) -> dict:
     if not output:
         raise GhCliError(f"gh issue view returned empty output for issue #{number}")
     return json.loads(output)
-
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:

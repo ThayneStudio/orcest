@@ -770,5 +770,3 @@ def test_handle_result_post_comment_failure(
     # COMPLETED has no label operations
     gh_mock.remove_label.assert_not_called()
     gh_mock.add_label.assert_not_called()
-
-

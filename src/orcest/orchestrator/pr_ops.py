@@ -38,6 +38,7 @@ class PRAction(str, Enum):
     MERGE = "merge"  # Ready to merge (CI green + approved + no unresolved threads)
     ENQUEUE_FIX = "enqueue_fix"  # CI failing or review feedback
     ENQUEUE_FOLLOWUP = "enqueue_followup"  # Approved but unresolved threads — triage into issues
+    ENQUEUE_REBASE = "enqueue_rebase"  # PR has merge conflicts; worker should rebase
     SKIP_LOCKED = "skip_locked"  # Another worker already on it
     SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
     SKIP_ACTIVE = "skip_active"  # Previously attempted, awaiting external change (new commits)
@@ -45,6 +46,7 @@ class PRAction(str, Enum):
     SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
     SKIP_PENDING = "skip_pending"  # CI checks still running
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"  # Exhausted retry budget
+    SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
 
 
 @dataclass
@@ -144,8 +146,9 @@ def discover_actionable_prs(
     2. Skip PRs with terminal orcest labels (blocked/needs-human)
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs that have been attempted but haven't changed (attempt count > 0)
-    5. Fetch CI status; skip if checks are still pending
-    6. Route by CI + review state: failures -> fix, changes requested -> fix,
+    5. Route PRs with merge conflicts (mergeable == CONFLICTING) to ENQUEUE_REBASE
+    6. Fetch CI status; skip if checks are still pending or absent
+    7. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
     """
     prs = gh.list_open_prs(repo, token)
@@ -244,6 +247,28 @@ def discover_actionable_prs(
             )
             continue
 
+        # Route conflicting PRs to rebase before the expensive CI fetch.
+        # mergeable is fetched as part of list_open_prs (no extra API call).
+        # UNKNOWN means GitHub hasn't computed mergeability yet — ignore it.
+        if pr_data.get("mergeable") == "CONFLICTING":
+            logger.info(
+                "PR #%d has merge conflicts (mergeable=CONFLICTING), enqueuing rebase",
+                number,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.ENQUEUE_REBASE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
+            continue
+
         # Check CI status -- wrapped in try/except so a single PR's
         # failure does not crash discovery for all other PRs.
         try:
@@ -253,6 +278,25 @@ def discover_actionable_prs(
                 "Failed to fetch CI status for PR #%d, skipping",
                 number,
                 exc_info=True,
+            )
+            continue
+
+        # No CI checks at all — distinct from green (all checks passed).
+        # This can happen when CI is not configured, or (commonly) when the
+        # PR has merge conflicts and GitHub never triggered CI on it.
+        if not checks:
+            logger.debug("PR #%d has no CI checks, skipping", number)
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_NO_CHECKS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
             )
             continue
 

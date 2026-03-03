@@ -820,9 +820,7 @@ class TestRunWorker:
             side_effect=KeyboardInterrupt(),
         )
 
-        self._configure_one_iteration(
-            mock_redis, sample_task, mocks["signal_handlers"]
-        )
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         with pytest.raises(KeyboardInterrupt):
             run_worker(worker_config)

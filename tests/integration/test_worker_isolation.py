@@ -446,9 +446,7 @@ class TestWorkerIsolation:
             signal_patcher.stop()
             noop_sleep_patcher.stop()
             if hung_threads:
-                raise RuntimeError(
-                    f"Worker thread(s) {hung_threads!r} did not stop within 10 s"
-                )
+                raise RuntimeError(f"Worker thread(s) {hung_threads!r} did not stop within 10 s")
 
         # Workers that can't acquire the PR lock correctly skip the task
         # (ACK without processing). This IS the locking mechanism working:
