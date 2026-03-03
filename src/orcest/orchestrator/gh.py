@@ -95,7 +95,8 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
-    headRefOid, isDraft, author, createdAt, labels, reviewDecision.
+    headRefOid, isDraft, author, createdAt, labels, reviewDecision,
+    mergeable.
 
     Args:
         repo: Repository in 'owner/repo' format.
@@ -112,7 +113,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
             "--state",
             "open",
             "--json",
-            "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision",
+            "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision,mergeable",
             "--limit",
             str(limit),
         ],

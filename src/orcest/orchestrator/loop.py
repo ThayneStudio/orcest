@@ -102,6 +102,7 @@ def _poll_cycle(
         PRAction.MERGE: 0,
         PRAction.ENQUEUE_FIX: 1,
         PRAction.ENQUEUE_FOLLOWUP: 1,
+        PRAction.ENQUEUE_REBASE: 1,
     }
     pr_states.sort(key=lambda ps: (_ACTION_PRIORITY.get(ps.action, 9), ps.number))
 
@@ -249,6 +250,29 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+        elif pr_state.action == PRAction.ENQUEUE_REBASE:
+            logger.info(
+                "PR #%d (%s): merge conflicts detected, enqueueing rebase task",
+                pr_state.number,
+                pr_state.title,
+            )
+            try:
+                publish_rebase_task(
+                    pr_state=pr_state,
+                    repo=config.github.repo,
+                    token=config.github.token,
+                    redis=redis,
+                    default_runner=config.default_runner,
+                    logger=logger,
+                )
+                enqueued += 1
+            except Exception as e:
+                logger.error(
+                    "Failed to publish rebase task for PR #%d: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_LOCKED:
@@ -304,6 +328,8 @@ def _poll_cycle(
             logger.debug(f"PR #{pr_state.number}: task in flight, skipping")
         elif pr_state.action == PRAction.SKIP_LABELED:
             logger.debug(f"PR #{pr_state.number}: terminal label, skipping")
+        elif pr_state.action == PRAction.SKIP_NO_CHECKS:
+            logger.debug(f"PR #{pr_state.number}: no CI checks, skipping")
         else:
             logger.warning(
                 "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action
@@ -317,6 +343,7 @@ def _poll_cycle(
         in (
             PRAction.ENQUEUE_FIX,
             PRAction.ENQUEUE_FOLLOWUP,
+            PRAction.ENQUEUE_REBASE,
             PRAction.SKIP_LOCKED,
             PRAction.SKIP_ACTIVE,
         )
