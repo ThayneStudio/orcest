@@ -14,7 +14,7 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 @pytest.fixture
 def runner():
     """Click test runner."""
-    return CliRunner()
+    return CliRunner(mix_stderr=False)
 
 
 # ---------------------------------------------------------------------------

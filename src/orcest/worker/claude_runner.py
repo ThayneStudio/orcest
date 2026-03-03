@@ -111,9 +111,10 @@ def _build_env(token: str) -> dict[str, str]:
 def _is_usage_exhausted(stderr: str) -> bool:
     """Check whether stderr indicates Claude usage/rate limit exhaustion.
 
-    Examines only stderr (case-insensitive) against known patterns to avoid
-    false positives when Claude is working on code that mentions rate limiting,
-    tokens, or billing (e.g. implementing a rate-limiter or auth system).
+    Only examines stderr (case-insensitive).  Stdout is intentionally
+    excluded because stream-json output contains ``"usage": {...}`` in
+    every API response message, causing false positives when the word
+    "limit" also appears anywhere in Claude's text output or the prompt.
     Returns True if any pattern matches.
     """
     if _RATE_LIMIT_RE.search(stderr):
