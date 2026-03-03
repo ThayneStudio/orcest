@@ -22,18 +22,24 @@ def runner():
 
         TypeError: CliRunner.__init__() got an unexpected keyword argument 'mix_stderr'
 
-    Fix: ``CliRunner()`` without arguments.  In Click 8.2+, stderr separation
-    is *unconditional* — ``CliRunner()`` is equivalent to the former
-    ``CliRunner(mix_stderr=False)``.  ``result.stderr`` is always populated
-    independently of ``result.stdout``, so all ``result.stderr`` assertions
-    below remain semantically correct.
+    In Click 8.2+, stderr separation is *unconditional* — ``CliRunner()``
+    is equivalent to the former ``CliRunner(mix_stderr=False)``:
+
+    * ``result.stdout`` — only what was written to ``sys.stdout``
+    * ``result.stderr`` — only what was written to ``sys.stderr``
+    * ``result.output`` — both interleaved (as a terminal user would see)
+
+    All error-message assertions in this file use ``result.stderr``,
+    **not** ``result.output``, so they continue to verify that
+    ``click.echo(..., err=True)`` routes errors to stderr rather than stdout.
 
     The ``test_runner_separates_stderr_from_stdout`` test verifies this
     empirically and will fail immediately if Click ever merges the streams.
 
-    Rich Console: the ``status`` error paths use ``click.echo(..., err=True)``
-    exclusively (no Rich object on those paths).  ``_status_once`` uses
-    ``Console(file=sys.stdout)`` to pin Rich table output to captured stdout.
+    Rich Console: ``_status_once`` uses ``Console(file=sys.stdout)`` to pin
+    Rich table output explicitly to captured stdout, keeping it out of
+    ``result.stderr``.  The error paths in ``status`` use only
+    ``click.echo(..., err=True)`` — no Rich Console object is involved.
     """
     return CliRunner()
 
