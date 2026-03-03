@@ -224,15 +224,16 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 logger.info(f"Released lock {lock_key}")
 
         # Publish result, then ACK only if publish succeeded.
-        # If publish fails, leave the message pending so XPENDING recovery
-        # can re-deliver it. Duplicate work risk < silent result loss.
+        # If publish fails, the result is lost — there is no XPENDING
+        # reconciliation for RESULTS_STREAM. The task entry stays unACKed so
+        # _drain_pending_tasks will publish a FAILED result on the next restart.
         try:
             redis.xadd_capped(RESULTS_STREAM, result.to_dict())
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
             logger.error(
-                f"Failed to publish result for task {task.id}; not ACKing so it "
-                "remains in XPENDING for re-delivery",
+                f"Failed to publish result for task {task.id}; result lost — "
+                "task remains pending for _drain_pending_tasks on next restart",
                 exc_info=True,
             )
             continue
