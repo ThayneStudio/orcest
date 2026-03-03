@@ -93,7 +93,9 @@ def _safe_bool(value: Any, field_name: str) -> bool:
     instead so the user can fix their config.
     """
     if value is None:
-        raise ValueError(f"Config field '{field_name}' is explicitly set to null but a boolean is required.")
+        raise ValueError(
+            f"Config field '{field_name}' is explicitly set to null but a boolean is required."
+        )
     if not isinstance(value, bool):
         raise ValueError(
             f"Config field '{field_name}' has value {value!r} which is not a boolean. "
