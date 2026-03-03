@@ -13,28 +13,31 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner with separate stderr and stdout capture.
+    """Click test runner — stderr and stdout are always captured separately.
 
-    **Root cause of the CI failure**: Click 8.2 removed the ``mix_stderr``
-    parameter from ``CliRunner.__init__`` entirely.  ``CliRunner(mix_stderr=False)``
-    raises ``TypeError: unexpected keyword argument 'mix_stderr'`` on Click 8.2+;
-    that TypeError was why the CI run failed.
+    ``CliRunner(mix_stderr=False)`` was the original intent, but Click 8.2
+    removed ``mix_stderr`` entirely.  Passing it now raises::
 
-    **Rich Console fix**: ``_status_once`` in ``cli.py`` uses
-    ``Console(file=sys.stdout)`` to route Rich output explicitly to Click's
-    captured stdout rather than relying on the default lazy ``sys.stdout``
-    lookup.  Both approaches work correctly when the Console is constructed
-    inside the command handler (after Click has already installed its capture
-    buffer), but ``Console(file=sys.stdout)`` is unambiguous.
+        TypeError: CliRunner.__init__() got an unexpected keyword argument 'mix_stderr'
 
-    **Stream separation in Click 8.2+**: ``CliRunner()`` unconditionally
-    separates stderr from stdout — ``result.stderr`` is populated independently
-    of ``result.stdout`` on every invocation.  All ``result.stderr`` assertions
-    below are therefore semantically meaningful.
+    That TypeError was the actual CI failure.  There is no Rich ``Console``
+    root cause: the ``status`` error paths use ``click.echo(..., err=True)``
+    exclusively, so no Rich object is involved.
 
-    ``test_runner_separates_stderr_from_stdout`` verifies these invariants
-    empirically.
+    Click 8.2 also made stderr separation *unconditional* — ``CliRunner()``
+    without arguments is now the equivalent of the former
+    ``CliRunner(mix_stderr=False)``.  ``result.stderr`` is always populated
+    independently of ``result.stdout``.  All ``result.stderr`` assertions
+    below are therefore semantically equivalent to the original test intent.
+
+    ``test_runner_separates_stderr_from_stdout`` demonstrates this empirically:
+    it fails immediately if Click ever merges the streams.
+
+    Rich Console fix: ``_status_once`` uses ``Console(file=sys.stdout)`` so
+    that Rich output is pinned to the captured stdout rather than relying on
+    the lazy ``sys.stdout`` lookup (defensive, not required by the tests).
     """
+    # mix_stderr was removed in Click 8.2; separation is now the only mode.
     return CliRunner()
 
 
@@ -60,8 +63,13 @@ def test_runner_separates_stderr_from_stdout(runner):
     result = runner.invoke(_probe)
     assert result.exit_code == 0
     assert "stdout-only" in result.stdout
-    assert "stderr-only" not in result.stdout
-    assert "stderr-only" in result.stderr
+    assert "stderr-only" not in result.stdout, (
+        "stderr leaked into stdout — CliRunner is merging streams (mix_stderr=True behaviour)"
+    )
+    assert "stderr-only" in result.stderr, (
+        "result.stderr is empty — Click may have reverted to mix_stderr=True default; "
+        "all result.stderr assertions in this file would be meaningless"
+    )
     assert "stdout-only" not in result.stderr
 
 
