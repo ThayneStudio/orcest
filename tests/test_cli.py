@@ -86,7 +86,7 @@ def test_status_redis_connection_failure(mocker, runner):
     result = runner.invoke(main, ["status", "localhost", "--once"])
 
     assert result.exit_code == 1
-    assert "Cannot connect to Redis" in result.stderr
+    assert "Cannot connect to Redis" in result.output
 
 
 def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
@@ -96,7 +96,7 @@ def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
     result = runner.invoke(main, ["status", "localhost", "--interval", "0"])
 
     assert result.exit_code == 1
-    assert "interval must be positive" in result.stderr
+    assert "interval must be positive" in result.output
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
