@@ -132,13 +132,11 @@ def _poll_cycle(
                 # If the error looks like a merge conflict, enqueue a
                 # rebase task so a worker can resolve it automatically.
                 is_conflict = (
-                    "is not mergeable" in err_msg
-                    or "cannot be cleanly created" in err_msg
+                    "is not mergeable" in err_msg or "cannot be cleanly created" in err_msg
                 )
                 if is_conflict:
                     logger.info(
-                        f"PR #{pr_state.number}: merge conflict detected, "
-                        f"enqueueing rebase task"
+                        f"PR #{pr_state.number}: merge conflict detected, enqueueing rebase task"
                     )
                     try:
                         publish_rebase_task(
@@ -187,8 +185,7 @@ def _poll_cycle(
                         gh.post_comment(
                             config.github.repo,
                             pr_state.number,
-                            f"**orcest** failed to merge this PR: {safe_err}\n\n"
-                            f"{label_note}",
+                            f"**orcest** failed to merge this PR: {safe_err}\n\n{label_note}",
                             config.github.token,
                         )
                     except Exception as comment_err:
@@ -352,9 +349,7 @@ def _poll_cycle(
 
     issue_states: list = []
     if pr_work_pending:
-        logger.info(
-            "PRs need attention, deferring issue discovery until PR backlog clears"
-        )
+        logger.info("PRs need attention, deferring issue discovery until PR backlog clears")
     elif issue_queue_depth > 0:
         logger.info(
             f"Issue task queue has {issue_queue_depth} pending entries, "
@@ -376,8 +371,7 @@ def _poll_cycle(
     for issue_state in issue_states:
         if issue_state.action == IssueAction.ENQUEUE_IMPLEMENT:
             logger.info(
-                f"Issue #{issue_state.number} ({issue_state.title}): "
-                f"enqueueing implementation task"
+                f"Issue #{issue_state.number} ({issue_state.title}): enqueueing implementation task"
             )
             try:
                 publish_issue_task(
@@ -396,8 +390,7 @@ def _poll_cycle(
                 )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             logger.warning(
-                f"Issue #{issue_state.number}: max attempts reached, "
-                f"adding needs-human label"
+                f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
             )
             labeled = False
             try:
@@ -430,8 +423,7 @@ def _poll_cycle(
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to comment on issue #{issue_state.number} "
-                    f"about max attempts: {e}",
+                    f"Failed to comment on issue #{issue_state.number} about max attempts: {e}",
                     exc_info=True,
                 )
         elif issue_state.action == IssueAction.SKIP_LOCKED:
@@ -442,8 +434,7 @@ def _poll_cycle(
             logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
         else:
             logger.warning(
-                f"Issue #{issue_state.number}: unhandled action "
-                f"{issue_state.action!r}, skipping"
+                f"Issue #{issue_state.number}: unhandled action {issue_state.action!r}, skipping"
             )
 
     logger.info(
