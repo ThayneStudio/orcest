@@ -167,3 +167,11 @@ def test_delete_branch_on_merge_quoted_string_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="delete_branch_on_merge"):
         load_orchestrator_config(cfg_file)
+
+
+def test_delete_branch_on_merge_null_raises(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\ndelete_branch_on_merge: null\n")
+
+    with pytest.raises(ValueError, match="null/missing"):
+        load_orchestrator_config(cfg_file)
