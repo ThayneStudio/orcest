@@ -13,31 +13,28 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner — stderr and stdout are always captured separately.
+    """Click test runner that captures stderr and stdout separately.
 
-    ``CliRunner(mix_stderr=False)`` was the original intent, but Click 8.2
-    removed ``mix_stderr`` entirely.  Passing it now raises::
+    Root cause of the original CI failure:
+    ``CliRunner(mix_stderr=False)`` raised ``TypeError`` in Click 8.2 because
+    the ``mix_stderr`` parameter was **removed** (not just re-defaulted).
+    Passing it now raises::
 
         TypeError: CliRunner.__init__() got an unexpected keyword argument 'mix_stderr'
 
-    That TypeError was the actual CI failure.  There is no Rich ``Console``
-    root cause: the ``status`` error paths use ``click.echo(..., err=True)``
-    exclusively, so no Rich object is involved.
-
-    Click 8.2 also made stderr separation *unconditional* — ``CliRunner()``
-    without arguments is now the equivalent of the former
+    Fix: ``CliRunner()`` without arguments.  In Click 8.2+, stderr separation
+    is *unconditional* — ``CliRunner()`` is equivalent to the former
     ``CliRunner(mix_stderr=False)``.  ``result.stderr`` is always populated
-    independently of ``result.stdout``.  All ``result.stderr`` assertions
-    below are therefore semantically equivalent to the original test intent.
+    independently of ``result.stdout``, so all ``result.stderr`` assertions
+    below remain semantically correct.
 
-    ``test_runner_separates_stderr_from_stdout`` demonstrates this empirically:
-    it fails immediately if Click ever merges the streams.
+    The ``test_runner_separates_stderr_from_stdout`` test verifies this
+    empirically and will fail immediately if Click ever merges the streams.
 
-    Rich Console fix: ``_status_once`` uses ``Console(file=sys.stdout)`` so
-    that Rich output is pinned to the captured stdout rather than relying on
-    the lazy ``sys.stdout`` lookup (defensive, not required by the tests).
+    Rich Console: the ``status`` error paths use ``click.echo(..., err=True)``
+    exclusively (no Rich object on those paths).  ``_status_once`` uses
+    ``Console(file=sys.stdout)`` to pin Rich table output to captured stdout.
     """
-    # mix_stderr was removed in Click 8.2; separation is now the only mode.
     return CliRunner()
 
 
