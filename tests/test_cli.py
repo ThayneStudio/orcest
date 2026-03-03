@@ -13,26 +13,18 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner that captures stderr separately from stdout (Click 8.2+).
+    """CliRunner that captures stderr separately from stdout.
 
-    **Root cause of original CI failure**: Click 8.2 removed the ``mix_stderr``
-    parameter from ``CliRunner`` entirely.  ``CliRunner(mix_stderr=False)``
-    raises ``TypeError`` on Click 8.2+ and cannot be used.
+    Root cause of the original CI failure: Click 8.2 removed the
+    ``mix_stderr`` parameter entirely.  ``CliRunner(mix_stderr=False)``
+    raises ``TypeError`` on Click 8.2+ so it cannot be used.  ``CliRunner()``
+    is the correct replacement: Click 8.2+ always separates stderr from stdout
+    unconditionally, matching the old ``CliRunner(mix_stderr=False)`` semantics.
 
-    **Why not a Rich Console writing to real stderr?** The ``status`` error
-    paths use ``click.echo(..., err=True)``, not a Rich ``Console``.  The
-    ``Console()`` in ``_status_once`` is constructed inside the running
-    command, after CliRunner has already patched ``sys.stdout``, so it writes
-    to the captured stream and appears in ``result.stdout`` — not the real
-    stderr.  ``test_status_once_with_redis_host`` confirms this.
-
-    ``CliRunner()`` in Click 8.2+ always captures stderr and stdout as
-    independent streams — equivalent to the old ``CliRunner(mix_stderr=False)``
-    behaviour:
-
-    - ``result.stderr`` captures ``click.echo(..., err=True)`` output
-    - ``result.stdout`` captures stdout-only output (e.g. Rich ``Console()``)
-    - ``result.output`` contains both (terminal-like view)
+    The ``status`` error paths use ``click.echo(..., err=True)``, not a Rich
+    ``Console``, so they are captured in ``result.stderr`` as expected.  Rich's
+    ``Console()`` in ``_status_once`` writes to ``sys.stdout``, which CliRunner
+    captures in ``result.stdout``.
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
     empirically, so all ``result.stderr`` assertions below are meaningful.
