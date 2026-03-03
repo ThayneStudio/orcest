@@ -808,7 +808,7 @@ def test_publish_and_notify_xadd_failure(
 
     # Patch xadd_capped (not xadd): task_publisher calls redis.xadd_capped()
     # directly, and xadd_capped calls self._client.xadd internally, bypassing
-    # the RedisClient.xadd wrapper.  Patching the lower-level xadd would have
+    # the RedisClient.xadd wrapper. Patching the lower-level xadd would have
     # no effect on the publisher's code path.
     original_xadd_capped = fake_redis_client.xadd_capped
 
