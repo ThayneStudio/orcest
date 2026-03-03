@@ -253,7 +253,7 @@ class TestExecuteTask:
 
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
-        mock_redis.xadd_capped.assert_any_call(stream, {"line": '{"role": "assistant"}\n'})
+        mock_redis.xadd_capped.assert_any_call(stream, {"line": '{"role": "assistant"}\n'}, maxlen=2000)
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
         """task_start and task_end markers are published to Redis."""

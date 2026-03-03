@@ -228,7 +228,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # reconciliation for RESULTS_STREAM. The task entry stays unACKed so
         # _drain_pending_tasks will publish a FAILED result on the next restart.
         try:
-            redis.xadd_capped(RESULTS_STREAM, result.to_dict())
+            redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=2000)
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
             logger.error(
@@ -343,6 +343,7 @@ def _execute_task(
                     "task_id": task.id,
                     "resource": f"{task.resource_type} #{task.resource_id}",
                 },
+                maxlen=2000,
             )
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
@@ -356,7 +357,7 @@ def _execute_task(
         def on_output(line: str) -> None:
             nonlocal output_errors
             try:
-                redis.xadd_capped(output_stream, {"line": line})
+                redis.xadd_capped(output_stream, {"line": line}, maxlen=2000)
             except Exception:
                 # Non-critical: don't kill the task over a streaming failure.
                 # Log the first occurrence so operators know Redis output
@@ -396,6 +397,7 @@ def _execute_task(
                     "task_id": task.id,
                     "status": status.value,
                 },
+                maxlen=2000,
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
@@ -423,6 +425,7 @@ def _execute_task(
                     "task_id": task.id,
                     "status": ResultStatus.FAILED.value,
                 },
+                maxlen=2000,
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
