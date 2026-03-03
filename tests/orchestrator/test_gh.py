@@ -1050,6 +1050,40 @@ def test_get_pr_review_comments_pages_separated_by_newlines(mocker):
     assert result[1] == {"path": "y.py", "line": 6, "author": "dave", "body": "Second"}
 
 
+def test_get_pr_review_comments_line_null_falls_back_to_original_line(mocker):
+    """When 'line' is null (outdated diff hunk), original_line is used instead."""
+    raw = json.dumps(
+        [
+            {
+                "path": "src/foo.py",
+                "line": None,
+                "original_line": 42,
+                "user": {"login": "alice"},
+                "body": "Outdated",
+            }
+        ]
+    )
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
+
+    result = get_pr_review_comments(REPO, 1, TOKEN)
+
+    assert len(result) == 1
+    assert result[0] == {"path": "src/foo.py", "line": 42, "author": "alice", "body": "Outdated"}
+
+
+def test_get_pr_review_comments_null_user(mocker):
+    """When 'user' is null (deleted account), author falls back to empty string."""
+    raw = json.dumps(
+        [{"path": "src/foo.py", "line": 10, "user": None, "body": "Ghost comment"}]
+    )
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
+
+    result = get_pr_review_comments(REPO, 1, TOKEN)
+
+    assert len(result) == 1
+    assert result[0] == {"path": "src/foo.py", "line": 10, "author": "", "body": "Ghost comment"}
+
+
 # ---------------------------------------------------------------------------
 # Timeout handling
 # ---------------------------------------------------------------------------
