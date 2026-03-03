@@ -435,13 +435,20 @@ class TestWorkerIsolation:
             # Signal workers to stop and wait for them to exit so they
             # release Redis connections before the fixture calls flushdb().
             stop_event.set()
+            hung_threads = []
             for t in threads:
                 t.join(timeout=10)
-            # Cleanup patchers
+                if t.is_alive():
+                    hung_threads.append(t.name)
+            # Cleanup patchers unconditionally before raising
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
             noop_sleep_patcher.stop()
+            if hung_threads:
+                raise RuntimeError(
+                    f"Worker thread(s) {hung_threads!r} did not stop within 10 s"
+                )
 
         # Workers that can't acquire the PR lock correctly skip the task
         # (ACK without processing). This IS the locking mechanism working:
@@ -582,12 +589,15 @@ class TestWorkerIsolation:
             # its Redis connection before the fixture calls flushdb().
             stop_event.set()
             t.join(timeout=10)
+            thread_hung = t.is_alive()
+            # Cleanup unconditionally before raising — release the blocker
+            # lock first so the thread can unblock if it's waiting on it.
+            blocker_lock.release()
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
-
-            # Release the blocker lock
-            blocker_lock.release()
+            if thread_hung:
+                raise RuntimeError(f"Worker thread {t.name!r} did not stop within 10 s")
 
         # The results stream should have exactly 1 result (the unlocked task)
         results_count = redis.client.xlen(results_stream)
