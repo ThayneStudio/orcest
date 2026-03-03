@@ -997,6 +997,49 @@ def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
     assert any("endCursor is missing" in msg for msg in caplog.messages)
 
 
+def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
+    """Logs a warning when MAX_PAGES is exhausted and hasNextPage is still True."""
+    # Build a page response with hasNextPage=True and a valid cursor so the
+    # loop keeps iterating until it hits the MAX_PAGES (50) safety cap.
+    # The while...else branch fires when page_count reaches MAX_PAGES.
+    page = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor_xyz"},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_1",
+                                    "path": "a.py",
+                                    "line": 1,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [{"body": "Fix", "author": {"login": "alice"}}],
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[page] * 50,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        result = get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    assert any("reached MAX_PAGES" in msg for msg in caplog.messages)
+    # All 50 pages of threads are collected before truncation
+    assert len(result) == 50
+
+
 # ---------------------------------------------------------------------------
 # Timeout handling
 # ---------------------------------------------------------------------------
