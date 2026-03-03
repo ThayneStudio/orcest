@@ -1,6 +1,7 @@
 """CLI entry point for orcest."""
 
 import re
+import sys
 
 import click
 from rich.console import Console
@@ -108,7 +109,7 @@ def _status_once(redis):
     """Print system status once and exit (original behavior)."""
     import redis as redis_lib
 
-    console = Console()
+    console = Console(file=sys.stdout)
     client = redis.client
 
     task_streams = list(client.scan_iter(match="tasks:*"))

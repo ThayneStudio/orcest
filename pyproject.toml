@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "redis>=5.0",
     "pyyaml>=6.0",
-    "click>=8.2",  # 8.2 removed mix_stderr from CliRunner; stderr is always separate
+    "click>=8.1",  # 8.2 removed mix_stderr; fixture detects and handles both versions
     "rich>=13.0",
     "textual>=0.75",
 ]

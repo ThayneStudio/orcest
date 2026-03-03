@@ -13,8 +13,62 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner."""
-    return CliRunner()
+    """CliRunner that always captures stdout and stderr as independent streams.
+
+    Click 8.1.x defaults ``mix_stderr=True`` (merges stderr into stdout), so
+    we pass ``mix_stderr=False`` explicitly.  Click 8.2 removed the parameter
+    entirely and made stream separation unconditional, so we fall back to a
+    plain ``CliRunner()`` when the keyword argument is rejected.
+
+    Either way, ``result.stderr`` is populated only by text written to stderr
+    and all assertions on it remain meaningful.
+    ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
+    """
+    try:
+        return CliRunner(mix_stderr=False)
+    except TypeError as exc:
+        # Intentionally narrow: only suppress the TypeError caused by Click 8.2+
+        # removing the mix_stderr parameter.  The check relies on CPython's error
+        # message including the parameter name verbatim (e.g. "got an unexpected
+        # keyword argument 'mix_stderr'").  Any other TypeError — a typo, a broken
+        # plugin wrapping CliRunner.__init__, etc. — propagates so it is never
+        # silently swallowed.
+        if "mix_stderr" not in str(exc):
+            raise
+        # Click 8.2+ removed mix_stderr; streams are always separated.
+        return CliRunner()
+
+
+# ---------------------------------------------------------------------------
+# Verify that the runner fixture separates stderr from stdout (Click 8.2+)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_separates_stderr_from_stdout(runner):
+    """CliRunner captures stderr and stdout as independent streams.
+
+    Click 8.2 removed ``mix_stderr`` and made separation unconditional.
+    This test guards against regressions where stderr leaks into stdout or
+    ``result.stderr`` is empty, which would make all stderr assertions below
+    meaningless.
+    """
+
+    @click.command()
+    def _probe():
+        click.echo("stdout-only")
+        click.echo("stderr-only", err=True)
+
+    result = runner.invoke(_probe)
+    assert result.exit_code == 0
+    assert "stdout-only" in result.stdout
+    assert "stderr-only" not in result.stdout, (
+        "stderr leaked into stdout — CliRunner is merging streams (mix_stderr=True behaviour)"
+    )
+    assert "stderr-only" in result.stderr, (
+        "result.stderr is empty — Click may have reverted to mix_stderr=True default; "
+        "all result.stderr assertions in this file would be meaningless"
+    )
+    assert "stdout-only" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -61,9 +115,9 @@ def test_main_help(runner):
     """Main group --help exits 0 and lists subcommands."""
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert "orchestrate" in result.output
-    assert "work" in result.output
-    assert "status" in result.output
+    assert "orchestrate" in result.stdout
+    assert "work" in result.stdout
+    assert "status" in result.stdout
 
 
 def test_work_missing_required_id(runner):
@@ -87,6 +141,7 @@ def test_status_redis_connection_failure(mocker, runner):
 
     assert result.exit_code == 1
     assert "Cannot connect to Redis" in result.stderr
+    assert "Cannot connect to Redis" not in result.stdout
 
 
 def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
@@ -97,16 +152,23 @@ def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
 
     assert result.exit_code == 1
     assert "interval must be positive" in result.stderr
+    assert "interval must be positive" not in result.stdout
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
-    """status <host> --once succeeds and prints the status table header."""
+    """status <host> --once succeeds and prints the status table header.
+
+    Rich's Console() inside _status_once writes to sys.stdout, which Click
+    captures in result.stdout.  We assert on result.stdout (not just
+    result.output) to confirm that Rich output is not leaking to stderr.
+    """
     mocker.patch("orcest.shared.redis_client.RedisClient", return_value=fake_redis_client)
 
     result = runner.invoke(main, ["status", "localhost:6379", "--once"])
 
     assert result.exit_code == 0
-    assert "Queue Depths" in result.output
+    assert "Queue Depths" in result.stdout
+    assert "Queue Depths" not in result.stderr
 
 
 def test_status_host_without_port_defaults_6379(mocker, runner, fake_redis_client):
