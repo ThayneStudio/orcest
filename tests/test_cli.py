@@ -13,26 +13,40 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner with stderr and stdout always separated (Click 8.2+ semantics).
+    """CliRunner that always captures stderr separately from stdout.
 
-    Root cause of the original CI failure: ``CliRunner(mix_stderr=False)`` was
-    used in the test suite while ``pyproject.toml`` required only
-    ``click>=8.1``.  Click 8.2 removed the ``mix_stderr`` constructor parameter
-    entirely, so when Click 8.2 was installed in CI the tests failed with::
+    Root cause of the CI failure
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The test suite originally used ``CliRunner(mix_stderr=False)`` and
+    ``pyproject.toml`` required only ``click>=8.1``.  Click 8.2 **removed**
+    the ``mix_stderr`` constructor parameter entirely (it was not just changed
+    to a different default — it was deleted).  When Click 8.2 was installed in
+    CI the tests failed with::
 
         TypeError: CliRunner.__init__() got an unexpected keyword argument 'mix_stderr'
 
-    Fix applied: ``pyproject.toml`` now requires ``click>=8.3`` (a superset of
-    8.2) and ``CliRunner()`` is used without the removed argument.  In Click
-    8.2+, streams are **always** separated — ``result.stdout`` and
-    ``result.stderr`` are independent regardless of constructor arguments, giving
-    the same guarantees as the old ``mix_stderr=False`` flag:
+    This was the root cause.  A Rich ``Console()`` object writing to real
+    ``sys.stderr`` was also considered as a hypothesis but ruled out: all
+    ``Console()`` instances in ``cli.py`` are created inside the invoked
+    command (after Click has redirected ``sys.stdout``/``sys.stderr``), so they
+    correctly point to Click's captured streams.  Additionally, ``cli.py`` now
+    uses ``Console(file=sys.stdout)`` in ``_status_once`` for extra clarity.
+
+    Fix applied
+    ~~~~~~~~~~~
+    ``pyproject.toml`` now requires ``click>=8.2`` — the version that removed
+    ``mix_stderr``.  ``CliRunner()`` is used without any ``mix_stderr``
+    argument.  In Click 8.2+, stderr and stdout are **always** separated and
+    both streams are independently accessible:
 
     * ``result.stdout`` — only what was written to ``sys.stdout``
     * ``result.stderr`` — only what was written to ``sys.stderr``
+    * ``result.output`` — merged view (stdout + stderr), kept for convenience
 
     All error-message assertions below use ``result.stderr`` to verify that
-    ``click.echo(..., err=True)`` routes output to stderr, not stdout.
+    ``click.echo(..., err=True)`` routes output to stderr, not stdout.  The
+    assertions remain fully meaningful because ``result.stderr`` is populated
+    independently of ``result.stdout`` in Click 8.2+.
 
     ``test_runner_separates_stderr_from_stdout`` asserts these invariants
     empirically and will fail immediately if Click ever reverts this behaviour.
