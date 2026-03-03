@@ -15,16 +15,22 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 def runner():
     """Click test runner with separate stderr capture.
 
-    Click 8.2 removed the ``mix_stderr`` parameter from ``CliRunner``
-    entirely.  Passing ``CliRunner(mix_stderr=False)`` raises ``TypeError``
-    on Click 8.2+; that ``TypeError`` was the root cause of the CI failure.
+    The original code used ``CliRunner(mix_stderr=False)`` to capture stderr
+    separately.  Click 8.2 removed the ``mix_stderr`` parameter from
+    ``CliRunner`` entirely — passing it raises ``TypeError``, which was the
+    root cause of the CI failure (not a Rich ``Console`` routing issue).
 
-    Despite removing the parameter, Click 8.2+ *always* captures stderr
-    separately: ``result.stderr`` contains only what was written to stderr
-    (e.g. via ``click.echo(..., err=True)``), while ``result.output``
-    contains everything written to stdout.  The assertions on
-    ``result.stderr`` in the tests below therefore correctly verify that
-    error messages are routed to stderr and not to stdout.
+    In Click 8.2+, stdout, stderr, and output are *always* captured as
+    independent streams:
+
+    * ``result.stdout``  — only what was written to stdout
+    * ``result.stderr``  — only what was written to stderr
+    * ``result.output``  — interleaved stdout + stderr (for terminal fidelity)
+
+    The assertions below use ``result.stderr`` to verify that error messages
+    are routed to stderr.  This is equivalent to (and replaces) the old
+    ``mix_stderr=False`` approach: if a message appears in ``result.stderr``
+    it genuinely went to stderr, not to stdout.
     """
     return CliRunner()
 
@@ -99,6 +105,7 @@ def test_status_redis_connection_failure(mocker, runner):
 
     assert result.exit_code == 1
     assert "Cannot connect to Redis" in result.stderr
+    assert "Cannot connect to Redis" not in result.stdout
 
 
 def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
@@ -109,6 +116,7 @@ def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
 
     assert result.exit_code == 1
     assert "interval must be positive" in result.stderr
+    assert "interval must be positive" not in result.stdout
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
