@@ -23,7 +23,7 @@ _PER_CHECK_LOG_LIMIT = 5000
 # Total log budget across all checks in a single prompt
 _TOTAL_LOG_BUDGET = 15000
 
-# Tasks stream cap: 1000 entries (half the xadd_capped default of 2000).
+# Tasks stream cap: 1000 entries.
 # The tasks stream holds pending work items; at typical throughput the queue
 # depth stays well below 100, so 1000 gives ample headroom while keeping
 # Redis memory usage predictable.

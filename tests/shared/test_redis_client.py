@@ -114,7 +114,7 @@ def test_close_is_idempotent(fake_redis_client):
 def test_xadd_capped_basic(fake_redis_client):
     """xadd_capped adds entries that are readable."""
     stream = "output:worker-1"
-    entry_id = fake_redis_client.xadd_capped(stream, {"line": "hello"})
+    entry_id = fake_redis_client.xadd_capped(stream, {"line": "hello"}, maxlen=2000)
     assert isinstance(entry_id, str)
     assert len(entry_id) > 0
 
@@ -149,7 +149,7 @@ def test_xadd_capped_rejects_zero_maxlen(fake_redis_client):
 def test_xadd_capped_rejects_empty_fields(fake_redis_client):
     """xadd_capped raises ValueError when fields is empty."""
     with pytest.raises(ValueError, match="fields must be a non-empty dict"):
-        fake_redis_client.xadd_capped("output:worker-1", {})
+        fake_redis_client.xadd_capped("output:worker-1", {}, maxlen=2000)
 
 
 def test_xread_after_returns_new_entries(fake_redis_client):
@@ -157,9 +157,9 @@ def test_xread_after_returns_new_entries(fake_redis_client):
     stream = "output:worker-1"
 
     # Add some entries
-    id1 = fake_redis_client.xadd_capped(stream, {"line": "line-1"})
-    fake_redis_client.xadd_capped(stream, {"line": "line-2"})
-    id3 = fake_redis_client.xadd_capped(stream, {"line": "line-3"})
+    id1 = fake_redis_client.xadd_capped(stream, {"line": "line-1"}, maxlen=2000)
+    fake_redis_client.xadd_capped(stream, {"line": "line-2"}, maxlen=2000)
+    id3 = fake_redis_client.xadd_capped(stream, {"line": "line-3"}, maxlen=2000)
 
     # Read all from beginning
     entries = fake_redis_client.xread_after(stream, "0-0")

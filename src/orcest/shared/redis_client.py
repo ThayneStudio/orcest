@@ -121,7 +121,7 @@ class RedisClient:
         result: int = self._client.xack(stream, group, entry_id)  # type: ignore[assignment]
         return result
 
-    def xadd_capped(self, stream: str, fields: dict[str, str], maxlen: int = 2000) -> str:
+    def xadd_capped(self, stream: str, fields: dict[str, str], maxlen: int) -> str:
         """Add entry to a capped stream (approximate MAXLEN).
 
         Args:
