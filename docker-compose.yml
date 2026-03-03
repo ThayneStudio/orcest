@@ -24,7 +24,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/home/orcest/app/config:ro
     environment:
       - GITHUB_TOKEN
     restart: unless-stopped
