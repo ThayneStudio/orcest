@@ -7,6 +7,7 @@ stream operations with simplified return types.
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import redis
 
@@ -180,7 +181,7 @@ class RedisClient:
         (not yet delivered). Returns 0 if the stream or group doesn't exist.
         """
         try:
-            groups = self._client.xinfo_groups(stream)
+            groups = cast(list, self._client.xinfo_groups(stream))
         except redis.ResponseError:
             return 0
         for g in groups:
