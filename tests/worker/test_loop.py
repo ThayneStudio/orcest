@@ -339,7 +339,7 @@ class TestExecuteTask:
         mock_redis = MagicMock()
 
         # task_start marker succeeds, then all output lines fail
-        def xadd_capped_side_effect(stream, data):
+        def xadd_capped_side_effect(stream, data, **kwargs):
             if "line" in data:
                 raise ConnectionError("Redis down")
             return "1-0"
@@ -424,7 +424,7 @@ class TestExecuteTask:
         # Fail on task_start marker, succeed on everything else
         first_call = [True]
 
-        def xadd_capped_side_effect(stream, data):
+        def xadd_capped_side_effect(stream, data, **kwargs):
             if first_call[0] and data.get("type") == "task_start":
                 first_call[0] = False
                 raise ConnectionError("Redis unavailable")
