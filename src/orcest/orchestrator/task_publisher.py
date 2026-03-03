@@ -27,7 +27,7 @@ _TOTAL_LOG_BUDGET = 15000
 # The tasks stream holds pending work items; at typical throughput the queue
 # depth stays well below 100, so 1000 gives ample headroom while keeping
 # Redis memory usage predictable.
-TASKS_STREAM_MAXLEN = 1000
+_TASKS_STREAM_MAXLEN = 1000
 
 
 def _extract_run_id(details_url: str) -> int | None:
@@ -80,7 +80,7 @@ def _publish_and_notify(
 
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
 
     # Post comment on PR for visibility
     try:
@@ -386,7 +386,7 @@ def _publish_issue_and_notify(
 
     # Publish to issue-specific stream (lower priority than PR tasks)
     tasks_stream = f"tasks:issue:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
 
     # Post comment on issue for visibility
     try:
