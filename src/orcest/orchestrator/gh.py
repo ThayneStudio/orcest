@@ -529,6 +529,7 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
     return results
 
 
+
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
     """List open issues with a specific label.
 
@@ -553,6 +554,27 @@ def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
         token,
     )
     return json.loads(output) if output else []
+
+
+def get_issue(repo: str, number: int, token: str) -> dict:
+    """Get detailed issue info."""
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "issue",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,labels,assignees",
+        ],
+        token,
+    )
+    if not output:
+        raise GhCliError(f"gh issue view returned empty output for issue #{number}")
+    return json.loads(output)
+
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:

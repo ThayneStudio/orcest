@@ -528,14 +528,22 @@ class TestRunWorker:
         }
 
     def _configure_one_iteration(self, mock_redis, task, signal_handlers):
-        """Configure xreadgroup to return one task, then trigger shutdown."""
+        """Configure xreadgroup to return one task, then trigger shutdown.
+
+        Pending drain calls (pending=True) always return empty so the
+        drain completes immediately.  The first non-pending call returns
+        the task; subsequent calls trigger SIGTERM.
+        """
         task_fields = task.to_dict()
-        call_count = 0
+        normal_call_count = 0
 
         def xreadgroup_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            nonlocal normal_call_count
+            # Pending drain phase — return empty so it finishes quickly
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            if normal_call_count == 1:
                 return [("entry-1", task_fields)]
             # On subsequent calls, trigger SIGTERM handler to exit loop
             import signal as sig
@@ -696,12 +704,14 @@ class TestRunWorker:
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
 
         # Return a malformed entry (missing required fields), then trigger shutdown
-        call_count = 0
+        normal_call_count = 0
 
         def xreadgroup_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            nonlocal normal_call_count
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            if normal_call_count == 1:
                 return [("entry-bad", {"garbage": "data"})]
             import signal as sig
 
@@ -719,6 +729,48 @@ class TestRunWorker:
         # The malformed entry must still be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-bad")
+
+    def test_worker_drains_pending_on_startup(self, mocker, worker_config, sample_task):
+        """On startup, pending (unACKed) tasks from a previous lifecycle are
+        drained: a FAILED result is published and the entry is ACKed."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        task_fields = sample_task.to_dict()
+        pending_calls = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal pending_calls
+            if kwargs.get("pending", False):
+                pending_calls += 1
+                if pending_calls == 1:
+                    return [("pending-1", task_fields)]
+                return []
+            # No new tasks — trigger shutdown immediately
+            import signal as sig
+
+            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            if handler:
+                handler(sig.SIGTERM, None)
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner should NOT have been called (pending tasks are not re-executed)
+        mocks["runner"].run.assert_not_called()
+        # A FAILED result should have been published for the pending task
+        mock_redis.xadd.assert_called_once()
+        stream, result_dict = mock_redis.xadd.call_args[0]
+        assert stream == RESULTS_STREAM
+        parsed = TaskResult.from_dict(result_dict)
+        assert parsed.status == ResultStatus.FAILED
+        assert parsed.task_id == sample_task.id
+        assert "restarted" in parsed.summary.lower()
+        # The pending entry must be ACKed
+        expected_stream = f"tasks:{worker_config.backend}"
+        mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task
@@ -760,32 +812,17 @@ class TestRunWorker:
         mock_lock = MagicMock()
         mock_lock.acquire.return_value = True
 
-        mocker.patch("orcest.worker.loop.RedisClient", return_value=mock_redis)
-        mocker.patch(
-            "orcest.worker.loop.setup_logging",
-            return_value=logging.getLogger("test.run_worker"),
-        )
-        mocker.patch("orcest.worker.loop.Workspace")
-        mocker.patch("orcest.worker.loop.create_runner")
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocker.patch("orcest.worker.loop.Heartbeat", return_value=mock_heartbeat)
         mocker.patch("orcest.worker.loop.RedisLock", return_value=mock_lock)
         mocker.patch(
             "orcest.worker.loop._execute_task",
             side_effect=KeyboardInterrupt(),
         )
-        mocker.patch("orcest.worker.loop.signal.signal")
 
-        task_fields = sample_task.to_dict()
-        call_count = {"n": 0}
-
-        def xreadgroup_side_effect(**kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return [("entry-1", task_fields)]
-            # Loop exits via KeyboardInterrupt before a second xreadgroup call
-            return []
-
-        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+        self._configure_one_iteration(
+            mock_redis, sample_task, mocks["signal_handlers"]
+        )
 
         with pytest.raises(KeyboardInterrupt):
             run_worker(worker_config)

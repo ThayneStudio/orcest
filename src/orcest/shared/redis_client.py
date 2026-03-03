@@ -83,8 +83,9 @@ class RedisClient:
         stream: str,
         count: int = 1,
         block_ms: int | None = 5000,
+        pending: bool = False,
     ) -> list[tuple[str, dict[str, str]]]:
-        """Read new entries from a consumer group.
+        """Read entries from a consumer group.
 
         Returns list of (entry_id, fields) tuples.
         Returns empty list on timeout or when no entries are available.
@@ -98,11 +99,14 @@ class RedisClient:
                 ``None`` means non-blocking (return immediately).
                 ``0`` means block indefinitely.
                 A positive integer means block for that many milliseconds.
+            pending: If True, read pending entries (delivered but not ACKed)
+                instead of new ones. Uses ID ``"0"`` instead of ``">"``.
         """
+        entry_id = "0" if pending else ">"
         result = self._client.xreadgroup(
             groupname=group,
             consumername=consumer,
-            streams={stream: ">"},
+            streams={stream: entry_id},
             count=count,
             block=block_ms,
         )
@@ -168,6 +172,24 @@ class RedisClient:
         if not result:
             return []
         return result[0][1]  # type: ignore[index]
+
+    def stream_queue_depth(self, stream: str, group: str) -> int:
+        """Get total unprocessed entries for a consumer group.
+
+        Returns the sum of pending (delivered but not ACKed) and lag
+        (not yet delivered). Returns 0 if the stream or group doesn't exist.
+        """
+        try:
+            groups = self._client.xinfo_groups(stream)
+        except redis.ResponseError:
+            return 0
+        for g in groups:
+            if g.get("name") == group:
+                pending = g.get("pending", 0)
+                # lag can be -1 (unknown) on empty streams; treat as 0.
+                lag = max(g.get("lag") or 0, 0)
+                return pending + lag
+        return 0
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
