@@ -13,29 +13,17 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner with stderr captured as a separate stream.
+    """CliRunner that captures stderr separately from stdout.
 
     Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
-    parameter from ``CliRunner`` entirely.  ``CliRunner(mix_stderr=False)``
-    raises ``TypeError`` on Click 8.2+, which is what was failing in CI.
+    parameter entirely.  ``CliRunner(mix_stderr=False)`` raises
+    ``TypeError`` on Click 8.2+.  Plain ``CliRunner()`` is correct —
+    Click 8.2+ always captures stderr separately, unconditionally.
 
-    Despite ``CliRunner()`` looking like the old ``mix_stderr=True``
-    invocation, the behaviour is the *opposite*.  Click 8.2 removed the
-    parameter because the old mix-by-default behaviour was a design
-    mistake; stderr separation is now *unconditional*:
-
-    * ``result.stdout`` — only what was written to ``sys.stdout``
-    * ``result.stderr`` — only what was written to ``sys.stderr``
-    * ``result.output`` — both interleaved (backward-compat alias)
-
-    The ``click.echo(..., err=True)`` calls in ``cli.py`` write to
-    ``sys.stderr``, so they appear in ``result.stderr``.  Assertions such
-    as ``assert "Cannot connect to Redis" in result.stderr`` are therefore
-    still meaningful — stderr is captured separately, not merged.
-
-    Rich's ``Console()`` in ``_status_once`` is not involved in the error
-    paths exercised by the stderr-asserting tests here; the command exits
-    before reaching ``_status_once``, so it is not the root cause.
+    ``result.stderr`` is populated by ``click.echo(..., err=True)`` calls.
+    ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
+    ``test_status_once_with_redis_host`` confirms Rich Console() writes to
+    ``result.stdout``, ruling it out as a root cause.
     """
     return CliRunner()
 
