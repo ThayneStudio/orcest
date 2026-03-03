@@ -28,21 +28,21 @@ _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
     ("billing", "limit"),
 ]
 
-# Anchored regex for rate-limit errors.  Two intentional constraints:
+# Regex for rate-limit errors.  Two intentional constraints:
 #
 # 1. Word-order: the indicator (exceeded/reached/hit/error) must appear *after*
 #    "rate limit", so inverted-order phrases like "You've hit the rate limit"
 #    won't match.  False positives are the bigger risk; this is deliberate.
 #
-# 2. End-of-line anchor (\s*$): the indicator must be near the end of the line,
-#    which rejects casual mentions like "rate limit exceeded in user-authored code"
-#    while matching clean API error lines like "rate limit exceeded".
-#    Trade-off: messages with trailing context on the same line (e.g.
-#    "rate limit exceeded, retry after 60s") won't match.  The primary false-
-#    positive guard is that this regex is only ever checked against stderr
+# 2. Trailing lookahead (?:[^a-zA-Z]|$): the indicator must be followed by a
+#    non-alphabetic character or end-of-line.  This matches real API error
+#    messages that carry trailing context on the same line, e.g.
+#    "Rate limit exceeded. Retry after 60 seconds." or
+#    "Rate limit exceeded for your plan".  The primary false-positive guard
+#    is that this regex is only ever checked against stderr
 #    (see _is_usage_exhausted), not user-visible stdout.
 _RATE_LIMIT_RE = re.compile(
-    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)\s*$",
+    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)(?=[^a-zA-Z]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
