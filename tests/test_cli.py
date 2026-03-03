@@ -24,6 +24,7 @@ def runner():
     and all assertions on it remain meaningful.
     ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
     """
+    # Fixes #228: PR #223 dropped mix_stderr=False, breaking result.stderr assertions.
     try:
         return CliRunner(mix_stderr=False)
     except TypeError as exc:
