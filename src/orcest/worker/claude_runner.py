@@ -34,7 +34,7 @@ _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
 #    "rate limit", so inverted-order phrases like "You've hit the rate limit"
 #    won't match.  False positives are the bigger risk; this is deliberate.
 #
-# 2. Trailing lookahead (?:[^a-zA-Z]|$): the indicator must be followed by a
+# 2. Trailing lookahead (?=[^a-zA-Z]|$): the indicator must be followed by a
 #    non-alphabetic character or end-of-line.  This matches real API error
 #    messages that carry trailing context on the same line, e.g.
 #    "Rate limit exceeded. Retry after 60 seconds." or
