@@ -13,23 +13,24 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner.
+    """Click test runner with stdout and stderr captured as separate streams.
 
     Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
-    parameter from ``CliRunner``.  Passing ``CliRunner(mix_stderr=False)``
-    raises ``TypeError`` in Click 8.2+, which is why the original code broke.
+    parameter from ``CliRunner.__init__``.  Passing
+    ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+.
 
-    In Click 8.2+, ``CliRunner()`` always captures stdout and stderr as
-    independent streams — there is no merging regardless of any parameter:
+    In Click 8.2+, ``mix_stderr`` was dropped because stderr separation
+    became *unconditional* — ``CliRunner()`` always keeps stdout and stderr
+    as independent byte streams, equivalent to the old ``mix_stderr=False``:
 
-    * ``result.stdout`` — only what was written to stdout
-    * ``result.stderr`` — only what was written to stderr
-    * ``result.output`` — both interleaved (for terminal fidelity)
+    * ``result.stdout`` — only what was written to ``sys.stdout``
+    * ``result.stderr`` — only what was written to ``sys.stderr``
+    * ``result.output`` — both interleaved (as a terminal user would see)
 
-    The assertions below use ``result.stderr`` to verify that error messages
-    written via ``click.echo(..., err=True)`` genuinely go to stderr and
-    are absent from ``result.stdout``.  This is the same semantic guarantee
-    that ``mix_stderr=False`` provided in older Click versions.
+    We verified that ``click.echo(..., err=True)`` in ``cli.py`` goes to
+    ``result.stderr`` (not stdout), and that Rich's ``Console()`` inside
+    ``_status_once`` writes to the Click-captured ``sys.stdout`` and
+    therefore appears in ``result.stdout``, not ``result.stderr``.
     """
     return CliRunner()
 
@@ -119,13 +120,19 @@ def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
-    """status <host> --once succeeds and prints the status table header."""
+    """status <host> --once succeeds and prints the status table header.
+
+    Rich's Console() inside _status_once writes to sys.stdout, which Click
+    captures in result.stdout.  We assert on result.stdout (not just
+    result.output) to confirm that Rich output is not leaking to stderr.
+    """
     mocker.patch("orcest.shared.redis_client.RedisClient", return_value=fake_redis_client)
 
     result = runner.invoke(main, ["status", "localhost:6379", "--once"])
 
     assert result.exit_code == 0
-    assert "Queue Depths" in result.output
+    assert "Queue Depths" in result.stdout
+    assert "Queue Depths" not in result.stderr
 
 
 def test_status_host_without_port_defaults_6379(mocker, runner, fake_redis_client):
