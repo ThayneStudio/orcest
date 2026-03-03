@@ -403,9 +403,7 @@ def _publish_issue_and_notify(
             exc_info=True,
         )
 
-    _log.info(
-        f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
-    )
+    _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -563,32 +561,34 @@ def _render_rebase_prompt(
         sections.append(f"```\n{merge_error[:500]}\n```")
         sections.append("")
 
-    sections.extend([
-        "## Instructions",
-        "",
-        "1. Fetch the latest base branch (`master` or `main`):",
-        "   ```",
-        "   git fetch origin master",
-        "   ```",
-        "2. Rebase your branch onto the base branch:",
-        "   ```",
-        "   git rebase origin/master",
-        "   ```",
-        "3. If there are merge conflicts:",
-        "   - Read the conflicting files to understand both sides",
-        "   - Resolve each conflict by keeping the intent of both changes",
-        "   - Stage resolved files with `git add`",
-        "   - Continue the rebase with `git rebase --continue`",
-        "4. After the rebase is complete, force-push to update the PR:",
-        "   ```",
-        "   git push --force-with-lease",
-        "   ```",
-        "5. Verify the branch is clean and the rebase succeeded.",
-        "",
-        "Do NOT create new commits \u2014 only rebase existing ones.",
-        "Do NOT squash commits during the rebase.",
-        "Push to the existing branch. Do not create new PRs.",
-    ])
+    sections.extend(
+        [
+            "## Instructions",
+            "",
+            "1. Fetch the latest base branch (`master` or `main`):",
+            "   ```",
+            "   git fetch origin master",
+            "   ```",
+            "2. Rebase your branch onto the base branch:",
+            "   ```",
+            "   git rebase origin/master",
+            "   ```",
+            "3. If there are merge conflicts:",
+            "   - Read the conflicting files to understand both sides",
+            "   - Resolve each conflict by keeping the intent of both changes",
+            "   - Stage resolved files with `git add`",
+            "   - Continue the rebase with `git rebase --continue`",
+            "4. After the rebase is complete, force-push to update the PR:",
+            "   ```",
+            "   git push --force-with-lease",
+            "   ```",
+            "5. Verify the branch is clean and the rebase succeeded.",
+            "",
+            "Do NOT create new commits \u2014 only rebase existing ones.",
+            "Do NOT squash commits during the rebase.",
+            "Push to the existing branch. Do not create new PRs.",
+        ]
+    )
 
     return "\n".join(sections)
 
