@@ -23,6 +23,7 @@ def _make_pr_data(
     review_decision: str = "",
     head_sha: str = "",
     is_draft: bool = False,
+    mergeable: str = "MERGEABLE",
 ) -> dict:
     """Build a PR dict matching the shape returned by gh.list_open_prs."""
     return {
@@ -33,6 +34,7 @@ def _make_pr_data(
         "isDraft": is_draft,
         "labels": labels or [],
         "reviewDecision": review_decision,
+        "mergeable": mergeable,
     }
 
 
@@ -825,3 +827,117 @@ def test_discover_review_required_skips_green(gh_mock, fake_redis_client, label_
     assert results[0].number == 320
     # Review threads should not be fetched for REVIEW_REQUIRED
     gh_mock.get_unresolved_review_threads.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Merge conflict detection tests
+# ---------------------------------------------------------------------------
+
+
+def test_conflicting_pr_enqueues_rebase(gh_mock, fake_redis_client, label_config):
+    """A PR with mergeable=CONFLICTING is routed to ENQUEUE_REBASE, CI not fetched."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=400, labels=[], mergeable="CONFLICTING"),
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.ENQUEUE_REBASE
+    assert pr.number == 400
+    assert pr.ci_failures == []
+    assert pr.review_threads == []
+    # CI should not be fetched — merge conflict detected before that step
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_unknown_mergeable_falls_through_to_ci(gh_mock, fake_redis_client, label_config):
+    """A PR with mergeable=UNKNOWN continues normally to the CI check."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=401, labels=[], mergeable="UNKNOWN"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_GREEN
+    gh_mock.get_ci_status.assert_called_once()
+
+
+def test_mergeable_pr_falls_through_to_ci(gh_mock, fake_redis_client, label_config):
+    """A PR with mergeable=MERGEABLE continues normally to the CI check."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=402, labels=[], mergeable="MERGEABLE"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "https://ci/1"},
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    gh_mock.get_ci_status.assert_called_once()
+
+
+def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, label_config):
+    """A conflicting PR with attempt_count > 0 is SKIP_ACTIVE, not re-enqueued."""
+    pr_number = 403
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], mergeable="CONFLICTING", head_sha="sha1"),
+    ]
+    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_ACTIVE
+    gh_mock.get_ci_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SKIP_NO_CHECKS tests
+# ---------------------------------------------------------------------------
+
+
+def test_skip_no_checks_pr(gh_mock, fake_redis_client, label_config):
+    """A PR with zero CI checks is classified as SKIP_NO_CHECKS (not SKIP_GREEN)."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=410, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_NO_CHECKS
+    assert results[0].number == 410
