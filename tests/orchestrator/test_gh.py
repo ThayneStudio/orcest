@@ -1073,9 +1073,7 @@ def test_get_pr_review_comments_line_null_falls_back_to_original_line(mocker):
 
 def test_get_pr_review_comments_null_user(mocker):
     """When 'user' is null (deleted account), author falls back to empty string."""
-    raw = json.dumps(
-        [{"path": "src/foo.py", "line": 10, "user": None, "body": "Ghost comment"}]
-    )
+    raw = json.dumps([{"path": "src/foo.py", "line": 10, "user": None, "body": "Ghost comment"}])
     mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
 
     result = get_pr_review_comments(REPO, 1, TOKEN)
