@@ -19,6 +19,7 @@ from orcest.orchestrator.gh import (
     get_failed_run_logs,
     get_pr,
     get_pr_diff,
+    get_pr_review_comments,
     get_unresolved_review_threads,
     list_open_prs,
     merge_pr,
@@ -1038,6 +1039,90 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
     assert any("reached MAX_PAGES" in msg for msg in caplog.messages)
     # All 50 pages of threads are collected before truncation
     assert len(result) == 50
+
+
+# ---------------------------------------------------------------------------
+# get_pr_review_comments — raw_decode pagination parsing
+# ---------------------------------------------------------------------------
+
+
+def test_get_pr_review_comments_single_page(mocker):
+    """Single JSON array is parsed and comments are returned."""
+    raw = json.dumps(
+        [
+            {"path": "src/foo.py", "line": 10, "user": {"login": "alice"}, "body": "Looks good"},
+            {"path": "src/bar.py", "line": 20, "user": {"login": "bob"}, "body": "Fix this"},
+        ]
+    )
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
+
+    result = get_pr_review_comments(REPO, 1, TOKEN)
+
+    assert len(result) == 2
+    assert result[0] == {"path": "src/foo.py", "line": 10, "author": "alice", "body": "Looks good"}
+    assert result[1] == {"path": "src/bar.py", "line": 20, "author": "bob", "body": "Fix this"}
+
+
+def test_get_pr_review_comments_multi_page_concatenated(mocker):
+    """Two concatenated JSON arrays (no separator) are flattened into one list."""
+    page1 = json.dumps(
+        [{"path": "a.py", "line": 1, "user": {"login": "alice"}, "body": "Page 1 comment"}]
+    )
+    page2 = json.dumps(
+        [{"path": "b.py", "line": 2, "user": {"login": "bob"}, "body": "Page 2 comment"}]
+    )
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=page1 + page2)
+
+    result = get_pr_review_comments(REPO, 2, TOKEN)
+
+    assert len(result) == 2
+    assert result[0] == {"path": "a.py", "line": 1, "author": "alice", "body": "Page 1 comment"}
+    assert result[1] == {"path": "b.py", "line": 2, "author": "bob", "body": "Page 2 comment"}
+
+
+def test_get_pr_review_comments_pages_separated_by_newlines(mocker):
+    """Pages separated by newlines are handled by the whitespace-skipping loop."""
+    page1 = json.dumps([{"path": "x.py", "line": 5, "user": {"login": "carol"}, "body": "First"}])
+    page2 = json.dumps([{"path": "y.py", "line": 6, "user": {"login": "dave"}, "body": "Second"}])
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=page1 + "\n" + page2)
+
+    result = get_pr_review_comments(REPO, 3, TOKEN)
+
+    assert len(result) == 2
+    assert result[0] == {"path": "x.py", "line": 5, "author": "carol", "body": "First"}
+    assert result[1] == {"path": "y.py", "line": 6, "author": "dave", "body": "Second"}
+
+
+def test_get_pr_review_comments_line_null_falls_back_to_original_line(mocker):
+    """When 'line' is null (outdated diff hunk), original_line is used instead."""
+    raw = json.dumps(
+        [
+            {
+                "path": "src/foo.py",
+                "line": None,
+                "original_line": 42,
+                "user": {"login": "alice"},
+                "body": "Outdated",
+            }
+        ]
+    )
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
+
+    result = get_pr_review_comments(REPO, 1, TOKEN)
+
+    assert len(result) == 1
+    assert result[0] == {"path": "src/foo.py", "line": 42, "author": "alice", "body": "Outdated"}
+
+
+def test_get_pr_review_comments_null_user(mocker):
+    """When 'user' is null (deleted account), author falls back to empty string."""
+    raw = json.dumps([{"path": "src/foo.py", "line": 10, "user": None, "body": "Ghost comment"}])
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=raw)
+
+    result = get_pr_review_comments(REPO, 1, TOKEN)
+
+    assert len(result) == 1
+    assert result[0] == {"path": "src/foo.py", "line": 10, "author": "", "body": "Ghost comment"}
 
 
 # ---------------------------------------------------------------------------
