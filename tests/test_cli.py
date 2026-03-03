@@ -26,7 +26,9 @@ def runner():
     """
     try:
         return CliRunner(mix_stderr=False)
-    except TypeError:
+    except TypeError as exc:
+        if "mix_stderr" not in str(exc):
+            raise
         # Click 8.2+ removed mix_stderr; streams are always separated.
         return CliRunner()
 
