@@ -13,7 +13,15 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner (Click 8.2+ always captures stderr separately)."""
+    """Click test runner.
+
+    Click 8.2 removed the ``mix_stderr`` parameter and now always captures
+    stderr separately from stdout.  Using ``CliRunner(mix_stderr=False)``
+    raises ``TypeError`` on Click 8.2+, which was the root cause of the CI
+    failure.  ``CliRunner()`` here gives the correct behaviour: stderr is
+    available on ``result.stderr`` and stdout on ``result.stdout``/
+    ``result.output``, matching what ``click.echo(..., err=True)`` produces.
+    """
     return CliRunner()
 
 
