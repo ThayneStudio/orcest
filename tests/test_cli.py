@@ -13,27 +13,29 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner with stderr always captured separately (Click 8.2+ behaviour).
+    """CliRunner that captures stderr separately from stdout (Click 8.2+).
 
-    **Why not ``CliRunner(mix_stderr=False)``?**
-    Click 8.1 and earlier had a ``mix_stderr`` parameter that defaulted to
-    ``True``, merging stderr into ``result.output`` and leaving
-    ``result.stderr`` empty.  The idiomatic fix was ``CliRunner(mix_stderr=False)``.
+    **Root cause of original CI failure**: Click 8.2 removed the ``mix_stderr``
+    parameter from ``CliRunner`` entirely.  ``CliRunner(mix_stderr=False)``
+    raises ``TypeError`` on Click 8.2+ and cannot be used.
 
-    Click 8.2 *removed* ``mix_stderr`` entirely and changed the default so
-    that stderr is *always* captured as a separate stream.  Passing
-    ``mix_stderr=False`` now raises ``TypeError`` — that is the root cause of
-    the original CI failure.  The correct call for Click 8.2+ is plain
-    ``CliRunner()`` (no arguments); it does **not** behave like the old
-    ``mix_stderr=True`` default.
+    **Why not a Rich Console writing to real stderr?** The ``status`` error
+    paths use ``click.echo(..., err=True)``, not a Rich ``Console``.  The
+    ``Console()`` in ``_status_once`` is constructed inside the running
+    command, after CliRunner has already patched ``sys.stdout``, so it writes
+    to the captured stream and appears in ``result.stdout`` — not the real
+    stderr.  ``test_status_once_with_redis_host`` confirms this.
 
-    Click 8.2+ invariants relied on by this test module:
+    ``CliRunner()`` in Click 8.2+ always captures stderr and stdout as
+    independent streams — equivalent to the old ``CliRunner(mix_stderr=False)``
+    behaviour:
+
     - ``result.stderr`` captures ``click.echo(..., err=True)`` output
     - ``result.stdout`` captures stdout-only output (e.g. Rich ``Console()``)
-    - ``result.output`` is a mix of both (as a user sees in a terminal)
+    - ``result.output`` contains both (terminal-like view)
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
-    empirically so that all ``result.stderr`` assertions below are meaningful.
+    empirically, so all ``result.stderr`` assertions below are meaningful.
     """
     return CliRunner()
 
