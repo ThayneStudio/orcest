@@ -16,7 +16,7 @@ MemoryMax=4G
 Environment=PYTHONUNBUFFERED=1
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/orcest/workspaces
+ReadWritePaths=/opt/orcest/workspaces /home/orcest/.claude
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
