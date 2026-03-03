@@ -17,13 +17,17 @@ from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
 
+# Sentinel value for issue attempt tracking (issues don't have a head_sha).
+_ISSUE_SHA_SENTINEL = "issue"
+
 
 class IssueAction(str, Enum):
     """What the orchestrator should do with an issue."""
 
     ENQUEUE_IMPLEMENT = "enqueue_implement"
     SKIP_LOCKED = "skip_locked"
-    SKIP_LABELED = "skip_labeled"
+    SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
+    SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
 
 
@@ -63,6 +67,7 @@ def increment_attempts(redis: RedisClient, issue_number: int) -> int:
     key = _make_attempts_key(issue_number)
     pipe = redis.client.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
+    pipe.hset(key, "head_sha", _ISSUE_SHA_SENTINEL)
     pipe.expire(key, 7 * 24 * 3600)
     results = pipe.execute()
     return results[0]
@@ -84,17 +89,16 @@ def discover_actionable_issues(
 
     Filter cascade:
     1. Fetch issues with the `orcest:ready` label
-    2. Skip if any other orcest label is present (already being handled)
+    2. Skip if terminal orcest label present (blocked/needs-human)
     3. Skip if Redis lock exists (worker in progress)
-    4. Check attempt budget
-    5. Everything else -> ENQUEUE_IMPLEMENT
+    4. Skip if max attempts reached
+    5. Skip if task already in flight (attempts > 0)
+    6. Everything else -> ENQUEUE_IMPLEMENT
     """
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
 
-    orcest_labels = {
-        label_config.queued,
-        label_config.in_progress,
+    terminal_labels = {
         label_config.blocked,
         label_config.needs_human,
     }
@@ -103,10 +107,12 @@ def discover_actionable_issues(
         number: int = issue_data["number"]
         title: str = issue_data["title"]
         body: str = issue_data.get("body") or ""
-        issue_labels: list[str] = [lbl.get("name", "") for lbl in (issue_data.get("labels") or [])]
+        issue_labels: list[str] = [
+            lbl.get("name", "") for lbl in (issue_data.get("labels") or [])
+        ]
 
-        # Skip if already labeled by orcest (queued/in-progress/etc)
-        if any(label in orcest_labels for label in issue_labels):
+        # Skip if terminal orcest label present (blocked/needs-human)
+        if any(label in terminal_labels for label in issue_labels):
             results.append(
                 IssueState(
                     number=number,
@@ -132,13 +138,13 @@ def discover_actionable_issues(
             )
             continue
 
-        # Check attempt budget
-        attempts = get_attempt_count(redis, number)
-        if attempts >= max_attempts:
+        # Skip if task already in flight or max attempts reached
+        attempt_count = get_attempt_count(redis, number)
+        if attempt_count >= max_attempts:
             logger.warning(
                 "Issue #%d has reached %d attempts (max %d), skipping",
                 number,
-                attempts,
+                attempt_count,
                 max_attempts,
             )
             results.append(
@@ -147,6 +153,17 @@ def discover_actionable_issues(
                     title=title,
                     body=body,
                     action=IssueAction.SKIP_MAX_ATTEMPTS,
+                    labels=issue_labels,
+                )
+            )
+            continue
+        if attempt_count > 0:
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_ACTIVE,
                     labels=issue_labels,
                 )
             )

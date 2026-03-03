@@ -17,7 +17,6 @@ polling:
 default_runner: "claude"
 
 labels:
-  queued: "orcest:queued"
-  in_progress: "orcest:in-progress"
   blocked: "orcest:blocked"
   needs_human: "orcest:needs-human"
+  ready: "orcest:ready"

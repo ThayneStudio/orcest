@@ -275,7 +275,7 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 
 
 def test_consume_results_completed(fake_redis_client, orchestrator_config, gh_mock):
-    """A COMPLETED result removes queued and in-progress labels."""
+    """A COMPLETED result clears attempts and posts a comment."""
     # Set up consumer group and add a result to the stream
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
@@ -285,26 +285,18 @@ def test_consume_results_completed(fake_redis_client, orchestrator_config, gh_mo
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    labels = orchestrator_config.labels
     # Should post a comment about completion
     gh_mock.post_comment.assert_called_once()
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "completed" in comment_body
 
-    # Should remove both queued and in-progress labels
-    remove_calls = gh_mock.remove_label.call_args_list
-    removed_labels = {call[0][2] for call in remove_calls}
-    assert labels.queued in removed_labels
-    assert labels.in_progress in removed_labels
-
-    # Should NOT add needs-human label
-    add_calls = gh_mock.add_label.call_args_list
-    added_labels = {call[0][2] for call in add_calls}
-    assert labels.needs_human not in added_labels
+    # No label operations
+    gh_mock.remove_label.assert_not_called()
+    gh_mock.add_label.assert_not_called()
 
 
 def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock):
-    """A FAILED result removes queued/in-progress and adds needs-human."""
+    """A FAILED result adds needs-human label."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(status=ResultStatus.FAILED, pr_number=55)
@@ -321,20 +313,20 @@ def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock)
     assert "failed" in comment_body
     assert labels.needs_human in comment_body
 
-    # Should remove queued and in-progress
-    remove_calls = gh_mock.remove_label.call_args_list
-    removed_labels = {call[0][2] for call in remove_calls}
-    assert labels.queued in removed_labels
-    assert labels.in_progress in removed_labels
+    # No label removals
+    gh_mock.remove_label.assert_not_called()
 
     # Should add needs-human
-    add_calls = gh_mock.add_label.call_args_list
-    added_labels = {call[0][2] for call in add_calls}
-    assert labels.needs_human in added_labels
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        55,
+        labels.needs_human,
+        orchestrator_config.github.token,
+    )
 
 
 def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config, gh_mock):
-    """A USAGE_EXHAUSTED result removes queued and keeps in-progress."""
+    """A USAGE_EXHAUSTED result posts a comment but changes no labels."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(
@@ -347,27 +339,15 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    labels = orchestrator_config.labels
-
     # Should post a comment mentioning paused
     gh_mock.post_comment.assert_called_once()
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "paused" in comment_body
     assert "fix/widget" in comment_body
 
-    # Should remove queued label
-    remove_calls = gh_mock.remove_label.call_args_list
-    removed_labels = {call[0][2] for call in remove_calls}
-    assert labels.queued in removed_labels
-    # Should NOT remove in-progress
-    assert labels.in_progress not in removed_labels
-
-    # Should add in-progress label (swap queued -> in-progress)
-    add_calls = gh_mock.add_label.call_args_list
-    added_labels = {call[0][2] for call in add_calls}
-    assert labels.in_progress in added_labels
-    # Should NOT add needs-human
-    assert labels.needs_human not in added_labels
+    # No label operations for USAGE_EXHAUSTED
+    gh_mock.remove_label.assert_not_called()
+    gh_mock.add_label.assert_not_called()
 
 
 def test_consume_results_usage_exhausted_no_branch(
@@ -468,7 +448,7 @@ def test_consume_results_blocked_status_posts_comment(
     orchestrator_config,
     gh_mock,
 ):
-    """A result with BLOCKED status still posts a comment (falls to else branch)."""
+    """A result with BLOCKED status posts a comment and adds blocked label."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(status=ResultStatus.BLOCKED, pr_number=71)
@@ -485,17 +465,16 @@ def test_consume_results_blocked_status_posts_comment(
     assert result.summary in comment_body
     assert result.worker_id in comment_body
 
-    # BLOCKED falls into the else branch for label management:
-    # removes queued and in-progress, adds blocked label, does NOT add needs-human
-    remove_calls = gh_mock.remove_label.call_args_list
-    removed_labels = {call[0][2] for call in remove_calls}
-    assert orchestrator_config.labels.queued in removed_labels
-    assert orchestrator_config.labels.in_progress in removed_labels
+    # No label removals
+    gh_mock.remove_label.assert_not_called()
 
-    add_calls = gh_mock.add_label.call_args_list
-    added_labels = {call[0][2] for call in add_calls}
-    assert orchestrator_config.labels.blocked in added_labels
-    assert orchestrator_config.labels.needs_human not in added_labels
+    # Should add blocked label, NOT needs-human
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        71,
+        orchestrator_config.labels.blocked,
+        orchestrator_config.github.token,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +748,6 @@ def test_handle_result_failed_label_failure(
 
 
 def test_handle_result_post_comment_failure(
-    mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
@@ -789,8 +767,8 @@ def test_handle_result_post_comment_failure(
     # post_comment was attempted
     gh_mock.post_comment.assert_called_once()
 
-    # Label operations still proceeded (remove queued + in-progress)
-    remove_calls = gh_mock.remove_label.call_args_list
-    removed_labels = {call[0][2] for call in remove_calls}
-    assert orchestrator_config.labels.queued in removed_labels
-    assert orchestrator_config.labels.in_progress in removed_labels
+    # COMPLETED has no label operations
+    gh_mock.remove_label.assert_not_called()
+    gh_mock.add_label.assert_not_called()
+
+

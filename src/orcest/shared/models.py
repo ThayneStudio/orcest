@@ -17,6 +17,7 @@ class TaskType(str, Enum):
     IMPLEMENT_ISSUE = "implement_issue"  # Phase 2
     IMPROVE_CODEBASE = "improve"  # Phase 3
     TRIAGE_FOLLOWUPS = "triage_followups"  # Triage unresolved review threads into issues
+    REBASE_PR = "rebase_pr"  # Rebase branch to resolve merge conflicts
 
 
 class ResultStatus(str, Enum):

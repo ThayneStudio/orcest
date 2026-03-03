@@ -16,6 +16,7 @@ _ENV_VARS_TO_CLEAR = [
     "ORCEST_REDIS_PASSWORD",
     "GITHUB_TOKEN",
     "ORCEST_REPO",
+    "ORCEST_DEFAULT_RUNNER",
     "ORCEST_WORKER_ID",
     "ORCEST_WORKSPACE_DIR",
 ]
@@ -44,7 +45,7 @@ def test_load_orchestrator_config_from_yaml(tmp_path: Path):
         "polling:\n"
         "  interval: 30\n"
         "labels:\n"
-        "  queued: custom:queued\n"
+        "  blocked: custom:blocked\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -55,9 +56,9 @@ def test_load_orchestrator_config_from_yaml(tmp_path: Path):
     assert config.github.token == "ghp_yaml_token"
     assert config.github.repo == "acme/widgets"
     assert config.polling.interval == 30
-    assert config.labels.queued == "custom:queued"
+    assert config.labels.blocked == "custom:blocked"
     # Non-overridden label keeps its default
-    assert config.labels.in_progress == "orcest:in-progress"
+    assert config.labels.needs_human == "orcest:needs-human"
 
 
 def test_load_orchestrator_config_env_overrides(

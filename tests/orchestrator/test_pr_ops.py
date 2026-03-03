@@ -1,6 +1,6 @@
 """Tests for orcest.orchestrator.pr_ops.discover_actionable_prs().
 
-Exercises the filter cascade: labels -> locks -> CI status -> reviews.
+Exercises the filter cascade: labels -> drafts -> locks -> attempts -> CI status -> reviews.
 Each test uses the gh_mock fixture (all gh.* functions mocked) and
 fake_redis_client (fakeredis-backed RedisClient).
 """
@@ -37,11 +37,11 @@ def _make_pr_data(
 
 
 def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):
-    """A PR carrying an orcest label is classified as SKIP_LABELED."""
+    """A PR carrying a terminal orcest label is classified as SKIP_LABELED."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(
             number=10,
-            labels=[{"name": "orcest:queued"}],
+            labels=[{"name": "orcest:blocked"}],
         ),
     ]
 
@@ -321,13 +321,10 @@ def test_ci_failure_skips_review_check(gh_mock, fake_redis_client, label_config)
 
 
 def test_review_feedback_respects_max_attempts(gh_mock, fake_redis_client, label_config):
-    """CHANGES_REQUESTED + CI green + max attempts exhausted -> SKIP_MAX_ATTEMPTS."""
+    """Max attempts exhausted -> SKIP_MAX_ATTEMPTS (before CI/review check)."""
     pr_number = 110
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], review_decision="CHANGES_REQUESTED"),
-    ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "success"},
     ]
 
     # Seed Redis with attempts at the max (3), matching the default head_sha=""
@@ -343,7 +340,8 @@ def test_review_feedback_respects_max_attempts(gh_mock, fake_redis_client, label
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_MAX_ATTEMPTS
-    # Thread fetch should be skipped when max attempts are exhausted
+    # Max-attempts check fires early, before CI/review analysis
+    gh_mock.get_ci_status.assert_not_called()
     gh_mock.get_unresolved_review_threads.assert_not_called()
 
 
@@ -548,14 +546,11 @@ def test_changes_requested_thread_fetch_failure_still_enqueues(
 
 
 def test_ci_failure_respects_max_attempts(gh_mock, fake_redis_client, label_config):
-    """CI failure + max attempts exhausted -> SKIP_MAX_ATTEMPTS."""
+    """Max attempts exhausted -> SKIP_MAX_ATTEMPTS (before CI check)."""
     pr_number = 170
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
     ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "failure", "detailsUrl": "https://ci/1"},
-    ]
 
     for _ in range(3):
         increment_attempts(fake_redis_client, pr_number, head_sha="")
@@ -569,26 +564,16 @@ def test_ci_failure_respects_max_attempts(gh_mock, fake_redis_client, label_conf
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_MAX_ATTEMPTS
-    assert len(results[0].ci_failures) == 1
+    # Max-attempts check fires early, before CI analysis
+    gh_mock.get_ci_status.assert_not_called()
 
 
 def test_followup_respects_max_attempts(gh_mock, fake_redis_client, label_config):
-    """APPROVED + unresolved threads + max attempts exhausted -> SKIP_MAX_ATTEMPTS."""
+    """Max attempts exhausted -> SKIP_MAX_ATTEMPTS (before review check)."""
     pr_number = 180
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], review_decision="APPROVED"),
     ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "success"},
-    ]
-    gh_mock.get_unresolved_review_threads.return_value = [
-        {
-            "id": "PRRT_99",
-            "path": "x.py",
-            "line": 1,
-            "comments": [{"author": "rev", "body": "fix"}],
-        },
-    ]
 
     for _ in range(3):
         increment_attempts(fake_redis_client, pr_number, head_sha="")
@@ -602,9 +587,9 @@ def test_followup_respects_max_attempts(gh_mock, fake_redis_client, label_config
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_MAX_ATTEMPTS
-    # Threads are fetched before the attempt check in the APPROVED path
-    # (needed to distinguish MERGE vs ENQUEUE_FOLLOWUP)
-    gh_mock.get_unresolved_review_threads.assert_called_once()
+    # Max-attempts check fires early, before CI/review analysis
+    gh_mock.get_ci_status.assert_not_called()
+    gh_mock.get_unresolved_review_threads.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -744,11 +729,9 @@ def test_clear_attempts_deletes_key(fake_redis_client):
 # ---------------------------------------------------------------------------
 
 
-def test_discover_skips_all_four_labels(gh_mock, fake_redis_client, label_config):
-    """PRs with any of the four orcest labels are skipped as SKIP_LABELED."""
+def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config):
+    """PRs with terminal orcest labels (blocked/needs-human) are skipped as SKIP_LABELED."""
     gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=300, labels=[{"name": "orcest:queued"}]),
-        _make_pr_data(number=301, labels=[{"name": "orcest:in-progress"}]),
         _make_pr_data(number=302, labels=[{"name": "orcest:blocked"}]),
         _make_pr_data(number=303, labels=[{"name": "orcest:needs-human"}]),
     ]
@@ -760,10 +743,34 @@ def test_discover_skips_all_four_labels(gh_mock, fake_redis_client, label_config
         label_config=label_config,
     )
 
-    assert len(results) == 4
+    assert len(results) == 2
     for pr in results:
         assert pr.action == PRAction.SKIP_LABELED
     # CI should never be fetched for any of these
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_discover_skip_active_via_attempt_counter(gh_mock, fake_redis_client, label_config):
+    """A PR with attempts > 0 (task in flight) is classified as SKIP_ACTIVE."""
+    pr_number = 304
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha="sha1"),
+    ]
+
+    # Seed attempt counter so it's > 0
+    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_ACTIVE
+    assert results[0].number == pr_number
+    # CI should not be fetched for an active task
     gh_mock.get_ci_status.assert_not_called()
 
 
