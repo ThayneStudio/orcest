@@ -1,6 +1,6 @@
 """Tests for orcest.orchestrator.task_publisher.
 
-Verifies task creation, Redis stream publishing, GitHub label/comment
+Verifies task creation, Redis stream publishing, GitHub comment
 side effects, prompt diff truncation, CI log fetching/rendering, and
 review thread prompt rendering for both fix and followup tasks.
 """
@@ -36,11 +36,10 @@ def _make_pr_state(
 def _setup_gh_defaults(gh_mock):
     """Set sensible default return values for gh mock functions."""
     gh_mock.get_pr_diff.return_value = "diff --git a/foo.py b/foo.py\n+pass"
-    gh_mock.add_label.return_value = None
     gh_mock.post_comment.return_value = None
 
 
-def test_publish_creates_task(gh_mock, fake_redis_client, label_config):
+def test_publish_creates_task(gh_mock, fake_redis_client):
     """publish_fix_task returns a Task with the correct type, repo, and resource_id."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=42)
@@ -50,7 +49,6 @@ def test_publish_creates_task(gh_mock, fake_redis_client, label_config):
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -63,7 +61,7 @@ def test_publish_creates_task(gh_mock, fake_redis_client, label_config):
     assert task.type == TaskType.FIX_PR
 
 
-def test_publish_adds_to_stream(gh_mock, fake_redis_client, label_config):
+def test_publish_adds_to_stream(gh_mock, fake_redis_client):
     """After publishing, the Redis 'tasks' stream contains an entry."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=7)
@@ -73,7 +71,6 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client, label_config):
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -89,8 +86,8 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client, label_config):
     assert fields["resource_id"] == "7"
 
 
-def test_publish_adds_label(gh_mock, fake_redis_client, label_config):
-    """publish_fix_task calls gh.add_label with the 'queued' label."""
+def test_publish_does_not_add_label(gh_mock, fake_redis_client):
+    """publish_fix_task does not call gh.add_label (labels removed)."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=15)
 
@@ -99,19 +96,13 @@ def test_publish_adds_label(gh_mock, fake_redis_client, label_config):
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
-    gh_mock.add_label.assert_called_once_with(
-        "test-org/test-repo",
-        15,
-        label_config.queued,
-        "fake-token",
-    )
+    gh_mock.add_label.assert_not_called()
 
 
-def test_publish_posts_comment(gh_mock, fake_redis_client, label_config):
+def test_publish_posts_comment(gh_mock, fake_redis_client):
     """publish_fix_task calls gh.post_comment on the PR."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=20)
@@ -121,7 +112,6 @@ def test_publish_posts_comment(gh_mock, fake_redis_client, label_config):
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -133,12 +123,11 @@ def test_publish_posts_comment(gh_mock, fake_redis_client, label_config):
     assert task.id in call_args[0][2]
 
 
-def test_prompt_truncates_long_diff(gh_mock, fake_redis_client, label_config):
+def test_prompt_truncates_long_diff(gh_mock, fake_redis_client):
     """A diff longer than 10,000 characters is truncated in the prompt."""
     long_diff = "x" * 15000
+    _setup_gh_defaults(gh_mock)
     gh_mock.get_pr_diff.return_value = long_diff
-    gh_mock.add_label.return_value = None
-    gh_mock.post_comment.return_value = None
 
     pr_state = _make_pr_state(number=33)
 
@@ -147,7 +136,6 @@ def test_prompt_truncates_long_diff(gh_mock, fake_redis_client, label_config):
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -190,7 +178,6 @@ def _make_ci_failures_with_urls(
 def test_publish_fetches_ci_logs_from_details_url(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """When a check has a detailsUrl with a run_id, logs are fetched and
     included in the prompt."""
@@ -206,7 +193,6 @@ def test_publish_fetches_ci_logs_from_details_url(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -221,7 +207,6 @@ def test_publish_fetches_ci_logs_from_details_url(
 def test_publish_deduplicates_run_log_fetches(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Two checks sharing the same run_id only trigger one log fetch."""
     _setup_gh_defaults(gh_mock)
@@ -236,7 +221,6 @@ def test_publish_deduplicates_run_log_fetches(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -247,7 +231,6 @@ def test_publish_deduplicates_run_log_fetches(
 def test_publish_graceful_on_log_fetch_failure(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """If log fetching raises an exception, task creation still succeeds."""
     _setup_gh_defaults(gh_mock)
@@ -263,7 +246,6 @@ def test_publish_graceful_on_log_fetch_failure(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -277,7 +259,6 @@ def test_publish_graceful_on_log_fetch_failure(
 def test_publish_handles_non_github_actions_url(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Third-party CI URLs (no run_id) don't trigger log fetching."""
     _setup_gh_defaults(gh_mock)
@@ -292,7 +273,6 @@ def test_publish_handles_non_github_actions_url(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -306,7 +286,6 @@ def test_publish_handles_non_github_actions_url(
 def test_prompt_truncates_long_ci_logs(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """CI logs longer than 5000 chars are truncated to the last 5000."""
     _setup_gh_defaults(gh_mock)
@@ -322,7 +301,6 @@ def test_prompt_truncates_long_ci_logs(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -364,7 +342,6 @@ def _make_sample_threads() -> list[dict]:
 def test_publish_review_fix_includes_thread_details(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Review fix prompt includes file path, line number, author, and body
     from each review thread."""
@@ -381,7 +358,6 @@ def test_publish_review_fix_includes_thread_details(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -400,7 +376,6 @@ def test_publish_review_fix_includes_thread_details(
 def test_publish_review_fix_resolve_instructions(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Review fix prompt includes thread resolution instruction and
     prohibits calling gh pr review."""
@@ -417,7 +392,6 @@ def test_publish_review_fix_resolve_instructions(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -428,7 +402,6 @@ def test_publish_review_fix_resolve_instructions(
 def test_publish_followup_triage_prompt(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Followup triage prompt contains triage instructions, gh issue create,
     prohibition on code changes, and thread details."""
@@ -450,7 +423,6 @@ def test_publish_followup_triage_prompt(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -473,7 +445,6 @@ def test_publish_followup_triage_prompt(
 def test_publish_ci_fix_no_thread_details(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """CI fix prompt does NOT contain review thread sections."""
     _setup_gh_defaults(gh_mock)
@@ -492,7 +463,6 @@ def test_publish_ci_fix_no_thread_details(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -506,7 +476,6 @@ def test_publish_ci_fix_no_thread_details(
 def test_ci_failures_suppress_review_threads_in_prompt(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """When both CI failures and review threads are present, the prompt
     should contain CI failure details but NOT review thread sections.
@@ -533,7 +502,6 @@ def test_ci_failures_suppress_review_threads_in_prompt(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -549,15 +517,14 @@ def test_ci_failures_suppress_review_threads_in_prompt(
 # --- Resilience: GitHub label/comment failure after Redis publish ---
 
 
-def test_publish_fix_task_survives_label_failure(
+def test_publish_fix_task_survives_comment_failure(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
-    """publish_fix_task returns a task even when add_label raises, because
+    """publish_fix_task returns a task even when post_comment raises, because
     the task is already in Redis and must not be lost."""
     _setup_gh_defaults(gh_mock)
-    gh_mock.add_label.side_effect = RuntimeError("GitHub 500")
+    gh_mock.post_comment.side_effect = RuntimeError("GitHub 500")
     pr_state = _make_pr_state(number=300)
 
     task = publish_fix_task(
@@ -565,50 +532,26 @@ def test_publish_fix_task_survives_label_failure(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
     assert isinstance(task, Task)
     assert task.resource_id == 300
-    # Task should be in Redis despite label failure
+    # Task should be in Redis despite comment failure
     entries = fake_redis_client.client.xrange("tasks:claude")
     assert any(f["id"] == task.id for _, f in entries)
+    # No labels are added by publish
+    gh_mock.add_label.assert_not_called()
 
 
-def test_publish_fix_task_survives_comment_failure(
+def test_publish_followup_task_survives_comment_failure(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
-    """publish_fix_task returns a task even when post_comment raises."""
+    """publish_followup_task returns a task even when post_comment raises,
+    and no labels are added."""
     _setup_gh_defaults(gh_mock)
     gh_mock.post_comment.side_effect = RuntimeError("GitHub 500")
-    pr_state = _make_pr_state(number=301)
-
-    task = publish_fix_task(
-        pr_state=pr_state,
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-        default_runner="claude",
-    )
-
-    assert isinstance(task, Task)
-    assert task.resource_id == 301
-    # Label should still have been added (it's called before comment)
-    gh_mock.add_label.assert_called_once()
-
-
-def test_publish_followup_task_survives_label_failure(
-    gh_mock,
-    fake_redis_client,
-    label_config,
-):
-    """publish_followup_task returns a task even when add_label raises."""
-    _setup_gh_defaults(gh_mock)
-    gh_mock.add_label.side_effect = RuntimeError("GitHub 500")
     pr_state = PRState(
         number=302,
         title="Followup test",
@@ -625,46 +568,13 @@ def test_publish_followup_task_survives_label_failure(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
     assert isinstance(task, Task)
     assert task.type == TaskType.TRIAGE_FOLLOWUPS
-
-
-def test_publish_followup_task_survives_comment_failure(
-    gh_mock,
-    fake_redis_client,
-    label_config,
-):
-    """publish_followup_task returns a task even when post_comment raises."""
-    _setup_gh_defaults(gh_mock)
-    gh_mock.post_comment.side_effect = RuntimeError("GitHub 500")
-    pr_state = PRState(
-        number=303,
-        title="Followup test",
-        branch="feat/test",
-        head_sha="abc123",
-        action=PRAction.ENQUEUE_FOLLOWUP,
-        ci_failures=[],
-        review_threads=_make_sample_threads(),
-        labels=[],
-    )
-
-    task = publish_followup_task(
-        pr_state=pr_state,
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-        default_runner="claude",
-    )
-
-    assert isinstance(task, Task)
-    assert task.type == TaskType.TRIAGE_FOLLOWUPS
-    # Label should still have been added (it's called before comment)
-    gh_mock.add_label.assert_called_once()
+    # No labels are added by publish
+    gh_mock.add_label.assert_not_called()
 
 
 # --- _render_review_threads edge cases ---
@@ -673,7 +583,6 @@ def test_publish_followup_task_survives_comment_failure(
 def test_review_fix_prompt_handles_missing_thread_fields(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Review threads with None line numbers and missing fields render safely
     when published through publish_fix_task."""
@@ -700,7 +609,6 @@ def test_review_fix_prompt_handles_missing_thread_fields(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -713,7 +621,6 @@ def test_review_fix_prompt_handles_missing_thread_fields(
 def test_publish_followup_task_rejects_empty_threads(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """publish_followup_task raises ValueError when review_threads is empty,
     because there is nothing to triage."""
@@ -735,7 +642,6 @@ def test_publish_followup_task_rejects_empty_threads(
             repo="test-org/test-repo",
             token="fake-token",
             redis=fake_redis_client,
-            label_config=label_config,
             default_runner="claude",
         )
 
@@ -746,7 +652,6 @@ def test_publish_followup_task_rejects_empty_threads(
 def test_publish_fix_task_sets_fix_ci_type(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """When CI failure is classified as CIFailureType.CODE, the task type
     should be TaskType.FIX_CI."""
@@ -764,7 +669,6 @@ def test_publish_fix_task_sets_fix_ci_type(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -789,7 +693,6 @@ def test_extract_run_id_direct():
 def test_publish_fix_task_diff_fetch_failure(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """When gh.get_pr_diff raises GhCliError, the exception propagates
     (publish_fix_task does not catch it)."""
@@ -805,7 +708,6 @@ def test_publish_fix_task_diff_fetch_failure(
             repo="test-org/test-repo",
             token="fake-token",
             redis=fake_redis_client,
-            label_config=label_config,
             default_runner="claude",
         )
 
@@ -813,7 +715,6 @@ def test_publish_fix_task_diff_fetch_failure(
 def test_publish_fix_task_log_budget_exhaustion(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """Multiple CI checks that collectively exhaust the 15k total budget.
     The last check should get truncated or empty log in the prompt.
@@ -851,7 +752,6 @@ def test_publish_fix_task_log_budget_exhaustion(
         repo="test-org/test-repo",
         token="fake-token",
         redis=fake_redis_client,
-        label_config=label_config,
         default_runner="claude",
     )
 
@@ -865,45 +765,40 @@ def test_publish_fix_task_log_budget_exhaustion(
     assert "D" * 100 not in task.prompt
 
 
-def test_publish_and_notify_both_label_and_comment_fail(
+def test_publish_and_notify_comment_fail(
     gh_mock,
     fake_redis_client,
-    label_config,
     caplog,
 ):
-    """Both add_label and post_comment raise simultaneously. The warning
-    log should indicate both failed."""
+    """post_comment raises. Task should still be published to Redis."""
     import logging
 
     _setup_gh_defaults(gh_mock)
-    gh_mock.add_label.side_effect = RuntimeError("label fail")
     gh_mock.post_comment.side_effect = RuntimeError("comment fail")
     pr_state = _make_pr_state(number=603)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.ERROR):
         task = publish_fix_task(
             pr_state=pr_state,
             repo="test-org/test-repo",
             token="fake-token",
             redis=fake_redis_client,
-            label_config=label_config,
             default_runner="claude",
         )
 
-    # Task is still published to Redis despite both failures
+    # Task is still published to Redis despite comment failure
     assert isinstance(task, Task)
     entries = fake_redis_client.client.xrange("tasks:claude")
     assert any(f["id"] == task.id for _, f in entries)
 
-    # The warning log should show both label and comment as FAILED
-    warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("label=FAILED" in m and "comment=FAILED" in m for m in warning_msgs)
+    # The error log should mention comment failure
+    error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("Failed to post comment" in m for m in error_msgs)
 
 
 def test_publish_and_notify_xadd_failure(
     gh_mock,
     fake_redis_client,
-    label_config,
 ):
     """When redis.xadd raises (Redis down after task construction), the
     exception should propagate."""
@@ -925,7 +820,6 @@ def test_publish_and_notify_xadd_failure(
                 repo="test-org/test-repo",
                 token="fake-token",
                 redis=fake_redis_client,
-                label_config=label_config,
                 default_runner="claude",
             )
     finally:

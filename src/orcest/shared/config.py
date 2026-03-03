@@ -33,8 +33,6 @@ class PollingConfig:
 
 @dataclass
 class LabelConfig:
-    queued: str = "orcest:queued"
-    in_progress: str = "orcest:in-progress"
     blocked: str = "orcest:blocked"
     needs_human: str = "orcest:needs-human"
     ready: str = "orcest:ready"
@@ -167,8 +165,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Labels
     labels_raw = _safe_dict(raw, "labels")
     labels_config = LabelConfig(
-        queued=str(labels_raw.get("queued", "orcest:queued")),
-        in_progress=str(labels_raw.get("in_progress", "orcest:in-progress")),
         blocked=str(labels_raw.get("blocked", "orcest:blocked")),
         needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),
         ready=str(labels_raw.get("ready", "orcest:ready")),

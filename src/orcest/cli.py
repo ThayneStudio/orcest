@@ -56,7 +56,11 @@ def status(redis_host, config, once, interval):
     if redis_host:
         if ":" in redis_host:
             host, port_str = redis_host.rsplit(":", 1)
-            port = int(port_str)
+            try:
+                port = int(port_str)
+            except ValueError:
+                click.echo(f"Error: Invalid port number: {port_str}", err=True)
+                raise SystemExit(1)
         else:
             host, port = redis_host, 6379
         redis_cfg = RedisConfig(host=host, port=port, db=0)
@@ -153,6 +157,7 @@ def _status_once(redis):
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for repo/token).")
 def init(config):
     """Initialize the target repo: create orcest labels."""
+    import os
     import subprocess
 
     from orcest.shared.config import load_orchestrator_config
@@ -160,15 +165,15 @@ def init(config):
     cfg = load_orchestrator_config(config)
     console = Console()
     labels = [
-        (cfg.labels.queued, "0e8a16", "Task queued for orcest processing"),
-        (cfg.labels.in_progress, "1d76db", "Orcest worker is processing this"),
         (cfg.labels.blocked, "d93f0b", "Blocked — waiting for dependency"),
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
+        (cfg.labels.ready, "0e8a16", "Issue is ready for orcest to implement"),
     ]
 
-    env = dict(__import__("os").environ)
+    env = dict(os.environ)
     env.update({"GITHUB_TOKEN": cfg.github.token, "GH_TOKEN": cfg.github.token})
 
+    failures = 0
     for name, color, description in labels:
         console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
         try:
@@ -194,10 +199,14 @@ def init(config):
             console.print("[green]ok[/green]")
         except subprocess.CalledProcessError as exc:
             console.print(f"[red]failed[/red]: {exc.stderr.strip()}")
+            failures += 1
         except FileNotFoundError:
             console.print("[red]gh CLI not found[/red]")
             raise SystemExit(1)
 
+    if failures:
+        console.print(f"\n[red]{failures} label(s) failed[/red] on [bold]{cfg.github.repo}[/bold].")
+        raise SystemExit(1)
     console.print(f"\nLabels ready on [bold]{cfg.github.repo}[/bold].")
 
 

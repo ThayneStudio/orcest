@@ -2,7 +2,7 @@
 
 Renders prompts from PR context (diffs, CI failures, review threads) and
 publishes tasks to the Redis stream. Also handles GitHub visibility by
-adding labels and posting comments when tasks are queued.
+posting comments when tasks are queued.
 """
 
 import logging
@@ -13,7 +13,6 @@ from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import IssueState
 from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
 from orcest.orchestrator.pr_ops import PRState, increment_attempts
-from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -43,19 +42,19 @@ def _publish_and_notify(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
 
     Shared by publish_fix_task and publish_followup_task to avoid
-    duplicating the publish -> label -> comment -> log sequence.
+    duplicating the publish -> comment -> log sequence.
 
-    The task is published to Redis first. If labeling or commenting
-    fails afterwards, the error is logged but the task is not lost.
+    The task is published to Redis first. If commenting fails
+    afterwards, the error is logged but the task is not lost.
     """
     task_type = task.type
+    _log = logger or logging.getLogger(__name__)
 
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
@@ -65,7 +64,6 @@ def _publish_and_notify(
     # Wrapped in try/except because the task is already in Redis -- a
     # failed increment is harmless (next cycle may re-enqueue, but the
     # max-attempts check in discover_actionable_prs prevents runaway loops).
-    _log = logger or logging.getLogger(__name__)
     try:
         increment_attempts(redis, pr_state.number, pr_state.head_sha)
     except Exception:
@@ -75,20 +73,7 @@ def _publish_and_notify(
             exc_info=True,
         )
 
-    # Update GitHub visibility -- wrapped in try/except because the task
-    # is already published to Redis. If labeling fails, the next poll cycle
-    # won't see SKIP_LABELED, but that is safer than losing the task.
-    _label_ok = True
-    _comment_ok = True
-    try:
-        gh.add_label(repo, pr_state.number, label_config.queued, token)
-    except Exception:
-        _label_ok = False
-        _log.error(
-            f"Failed to add queued label to PR #{pr_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
+    # Post comment on PR for visibility
     try:
         gh.post_comment(
             repo,
@@ -97,22 +82,13 @@ def _publish_and_notify(
             token,
         )
     except Exception:
-        _comment_ok = False
         _log.error(
             f"Failed to post comment on PR #{pr_state.number} "
             f"(task {task.id} already published to Redis)",
             exc_info=True,
         )
 
-    if _label_ok and _comment_ok:
-        _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
-    else:
-        _log.warning(
-            f"Published {task_type.value} task {task.id} "
-            f"for PR #{pr_state.number} (GitHub visibility partially failed: "
-            f"label={'ok' if _label_ok else 'FAILED'}, "
-            f"comment={'ok' if _comment_ok else 'FAILED'})"
-        )
+    _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
 
 
 def publish_fix_task(
@@ -120,7 +96,6 @@ def publish_fix_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -131,7 +106,7 @@ def publish_fix_task(
     2. Classify CI failures
     3. Render prompt
     4. Publish to Redis stream
-    5. Add label and post comment on PR
+    5. Post comment on PR
     """
     # Gather context
     diff = gh.get_pr_diff(repo, pr_state.number, token)
@@ -203,7 +178,6 @@ def publish_fix_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -216,7 +190,6 @@ def publish_followup_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -229,7 +202,7 @@ def publish_followup_task(
     Steps:
     1. Render followup prompt from review threads
     2. Publish to Redis stream
-    3. Add label and post comment on PR
+    3. Post comment on PR
     """
     task_type = TaskType.TRIAGE_FOLLOWUPS
 
@@ -265,7 +238,6 @@ def publish_followup_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -278,7 +250,6 @@ def publish_rebase_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     merge_error: str = "",
     logger: logging.Logger | None = None,
@@ -313,7 +284,6 @@ def publish_rebase_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -326,7 +296,6 @@ def publish_issue_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -335,7 +304,7 @@ def publish_issue_task(
     Steps:
     1. Render prompt from issue title and body
     2. Publish to Redis stream
-    3. Add orcest:queued label and post comment on issue
+    3. Post comment on issue
     """
     prompt = _render_issue_prompt(
         issue_number=issue_state.number,
@@ -360,7 +329,6 @@ def publish_issue_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -374,7 +342,6 @@ def _publish_issue_and_notify(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> None:
@@ -382,8 +349,8 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
+    # Publish to issue-specific stream (lower priority than PR tasks)
+    tasks_stream = f"tasks:issue:{default_runner}"
     redis.xadd(tasks_stream, task.to_dict())
 
     # Track attempt count
@@ -396,18 +363,7 @@ def _publish_issue_and_notify(
             exc_info=True,
         )
 
-    # Update GitHub visibility on the issue
-    _label_ok = True
-    _comment_ok = True
-    try:
-        gh.add_issue_label(repo, issue_state.number, label_config.queued, token)
-    except Exception:
-        _label_ok = False
-        _log.error(
-            f"Failed to add queued label to issue #{issue_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
+    # Post comment on issue for visibility
     try:
         gh.post_issue_comment(
             repo,
@@ -416,24 +372,15 @@ def _publish_issue_and_notify(
             token,
         )
     except Exception:
-        _comment_ok = False
         _log.error(
             f"Failed to post comment on issue #{issue_state.number} "
             f"(task {task.id} already published to Redis)",
             exc_info=True,
         )
 
-    if _label_ok and _comment_ok:
-        _log.info(
-            f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
-        )
-    else:
-        _log.warning(
-            f"Published {task_type.value} task {task.id} "
-            f"for issue #{issue_state.number} (GitHub visibility partially failed: "
-            f"label={'ok' if _label_ok else 'FAILED'}, "
-            f"comment={'ok' if _comment_ok else 'FAILED'})"
-        )
+    _log.info(
+        f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
+    )
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -542,7 +489,7 @@ def _render_followup_prompt(
             "5. Reply to each actionable thread with a comment linking to the created issue, "
             "then resolve the thread.",
             "6. Do NOT make code changes -- this is triage only.",
-            "6. Do NOT call `gh pr review --approve` or `--request-changes` "
+            "7. Do NOT call `gh pr review --approve` or `--request-changes` "
             "-- you are not authorized to change review status.",
         ]
     )

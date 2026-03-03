@@ -1,6 +1,7 @@
 """PR discovery and state management.
 
-Discovers open PRs, applies a filter cascade (labels -> locks -> CI -> reviews),
+Discovers open PRs, applies a filter cascade
+(labels -> drafts -> locks -> attempts -> CI -> reviews),
 and returns a list of PRState objects with recommended actions. The orchestrator
 main loop acts on these recommendations.
 """
@@ -37,7 +38,8 @@ class PRAction(str, Enum):
     ENQUEUE_FIX = "enqueue_fix"  # CI failing or review feedback
     ENQUEUE_FOLLOWUP = "enqueue_followup"  # Approved but unresolved threads — triage into issues
     SKIP_LOCKED = "skip_locked"  # Another worker already on it
-    SKIP_LABELED = "skip_labeled"  # Already queued/in-progress
+    SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
+    SKIP_ACTIVE = "skip_active"  # Previously attempted, awaiting external change (new commits)
     SKIP_GREEN = "skip_green"  # CI passing, nothing to do
     SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
     SKIP_PENDING = "skip_pending"  # CI checks still running
@@ -125,20 +127,18 @@ def discover_actionable_prs(
     """Discover PRs that need action.
 
     Filter cascade (ordered by cost, cheapest first):
-    1. Skip PRs with orcest labels (already being handled)
+    1. Skip PRs with terminal orcest labels (blocked/needs-human)
     2. Skip draft PRs
     3. Skip PRs with active Redis locks (worker in progress)
-    4. Fetch CI status; skip if checks are still pending
-    5. Route by CI + review state: failures -> fix, changes requested -> fix,
+    4. Skip PRs that have been attempted but haven't changed (attempt count > 0)
+    5. Fetch CI status; skip if checks are still pending
+    6. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
-    6. Within each enqueue branch, check attempt budget before enqueuing
     """
     prs = gh.list_open_prs(repo, token)
     results: list[PRState] = []
 
-    orcest_labels = {
-        label_config.queued,
-        label_config.in_progress,
+    terminal_labels = {
         label_config.blocked,
         label_config.needs_human,
     }
@@ -150,8 +150,8 @@ def discover_actionable_prs(
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
-        # Skip if already labeled by orcest
-        if any(label in orcest_labels for label in pr_labels):
+        # Skip if terminal orcest label present (blocked/needs-human)
+        if any(label in terminal_labels for label in pr_labels):
             results.append(
                 PRState(
                     number=number,
@@ -192,6 +192,38 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.SKIP_LOCKED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
+            continue
+
+        # Skip if previously attempted on this SHA (awaiting new commits)
+        # or max attempts reached.
+        attempt_count = get_attempt_count(redis, number, head_sha)
+        if attempt_count >= max_attempts:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_ATTEMPTS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
+            continue
+        if attempt_count > 0:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_ACTIVE,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
@@ -257,28 +289,6 @@ def discover_actionable_prs(
 
         if ci_failures:
             # CI failing — enqueue fix (priority over review state)
-            attempts = get_attempt_count(redis, number, head_sha)
-            if attempts >= max_attempts:
-                logger.warning(
-                    "PR #%d has reached %d attempts (max %d), skipping",
-                    number,
-                    attempts,
-                    max_attempts,
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_ATTEMPTS,
-                        ci_failures=ci_failures,
-                        review_threads=[],
-                        labels=pr_labels,
-                    )
-                )
-                continue
-
             results.append(
                 PRState(
                     number=number,
@@ -293,28 +303,6 @@ def discover_actionable_prs(
             )
         elif review_decision == "CHANGES_REQUESTED":
             # CI green but reviewer requested changes — enqueue fix
-            attempts = get_attempt_count(redis, number, head_sha)
-            if attempts >= max_attempts:
-                logger.warning(
-                    "PR #%d has reached %d attempts (max %d), skipping",
-                    number,
-                    attempts,
-                    max_attempts,
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_ATTEMPTS,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                    )
-                )
-                continue
-
             # Fetch unresolved review threads for worker prompt context
             try:
                 threads = gh.get_unresolved_review_threads(repo, number, token)
@@ -368,28 +356,6 @@ def discover_actionable_prs(
 
             if threads:
                 # Approved but unresolved threads — triage into issues
-                attempts = get_attempt_count(redis, number, head_sha)
-                if attempts >= max_attempts:
-                    logger.warning(
-                        "PR #%d has reached %d attempts (max %d), skipping",
-                        number,
-                        attempts,
-                        max_attempts,
-                    )
-                    results.append(
-                        PRState(
-                            number=number,
-                            title=title,
-                            branch=branch,
-                            head_sha=head_sha,
-                            action=PRAction.SKIP_MAX_ATTEMPTS,
-                            ci_failures=[],
-                            review_threads=[],
-                            labels=pr_labels,
-                        )
-                    )
-                    continue
-
                 logger.info(
                     "PR #%d is approved but has %d unresolved thread(s), enqueuing followup triage",
                     number,

@@ -104,13 +104,12 @@ def _poll_cycle(
     }
     pr_states.sort(key=lambda ps: (_ACTION_PRIORITY.get(ps.action, 9), ps.number))
 
-    # Pre-compute queue depth for orphan detection and issue gating.
-    tasks_stream = f"tasks:{config.default_runner}"
-    queue_depth = redis.stream_queue_depth(tasks_stream, "workers")
+    # Pre-compute issue queue depth for gating issue discovery.
+    issue_tasks_stream = f"tasks:issue:{config.default_runner}"
+    issue_queue_depth = redis.stream_queue_depth(issue_tasks_stream, "workers")
 
     enqueued = 0
     merged = 0
-    orphans_cleaned: set[int] = set()
     for pr_state in pr_states:
         if pr_state.action == PRAction.MERGE:
             logger.info(f"PR #{pr_state.number} ({pr_state.title}): merging")
@@ -144,7 +143,6 @@ def _poll_cycle(
                             repo=config.github.repo,
                             token=config.github.token,
                             redis=redis,
-                            label_config=config.labels,
                             default_runner=config.default_runner,
                             merge_error=err_msg[:200],
                             logger=logger,
@@ -217,7 +215,6 @@ def _poll_cycle(
                     repo=config.github.repo,
                     token=config.github.token,
                     redis=redis,
-                    label_config=config.labels,
                     default_runner=config.default_runner,
                     logger=logger,
                 )
@@ -235,7 +232,6 @@ def _poll_cycle(
                     repo=config.github.repo,
                     token=config.github.token,
                     redis=redis,
-                    label_config=config.labels,
                     default_runner=config.default_runner,
                     logger=logger,
                 )
@@ -290,51 +286,23 @@ def _poll_cycle(
             logger.debug(f"PR #{pr_state.number}: draft, skipping")
         elif pr_state.action == PRAction.SKIP_PENDING:
             logger.debug(f"PR #{pr_state.number}: CI pending, skipping")
+        elif pr_state.action == PRAction.SKIP_ACTIVE:
+            logger.debug(f"PR #{pr_state.number}: task in flight, skipping")
         elif pr_state.action == PRAction.SKIP_LABELED:
-            # Detect orphaned orcest:queued labels.  When the task queue is
-            # completely empty (no pending, no undelivered entries), any
-            # orcest:queued label is stale — the task was lost (Redis restart,
-            # worker crash, etc.).  Strip the label so the PR is re-evaluated
-            # on the next poll cycle.
-            if config.labels.queued in pr_state.labels and queue_depth == 0:
-                logger.warning(
-                    f"PR #{pr_state.number}: orphaned {config.labels.queued} "
-                    f"label (task queue empty), removing"
-                )
-                try:
-                    gh.remove_label(
-                        config.github.repo,
-                        pr_state.number,
-                        config.labels.queued,
-                        config.github.token,
-                    )
-                    orphans_cleaned.add(pr_state.number)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to remove orphaned label from "
-                        f"PR #{pr_state.number}: {e}",
-                        exc_info=True,
-                    )
-            else:
-                logger.debug(f"PR #{pr_state.number}: already labeled, skipping")
+            logger.debug(f"PR #{pr_state.number}: terminal label, skipping")
         else:
             logger.warning(f"PR #{pr_state.number}: unhandled action {pr_state.action!r}, skipping")
 
     # Step 4: Discover issues needing implementation
-    # Prioritize existing PRs over new issue work using two checks:
-    #
-    # (a) GitHub state: PRs being actively worked on or just enqueued.
-    #     SKIP_LABELED with needs-human/blocked labels does NOT count —
-    #     those PRs are explicitly parked and shouldn't block issue work.
-    #     PRs whose orphaned labels were just cleaned also don't count.
-    _active_labels = {config.labels.queued, config.labels.in_progress}
+    # Prioritize existing PRs over new issue work. PRs with terminal
+    # labels (needs-human/blocked) are parked and don't block issue work.
     pr_work_pending = any(
         pr_state.action
-        in (PRAction.ENQUEUE_FIX, PRAction.ENQUEUE_FOLLOWUP, PRAction.SKIP_LOCKED)
-        or (
-            pr_state.action == PRAction.SKIP_LABELED
-            and pr_state.number not in orphans_cleaned
-            and any(lbl in _active_labels for lbl in pr_state.labels)
+        in (
+            PRAction.ENQUEUE_FIX,
+            PRAction.ENQUEUE_FOLLOWUP,
+            PRAction.SKIP_LOCKED,
+            PRAction.SKIP_ACTIVE,
         )
         for pr_state in pr_states
     )
@@ -344,9 +312,9 @@ def _poll_cycle(
         logger.info(
             "PRs need attention, deferring issue discovery until PR backlog clears"
         )
-    elif queue_depth > 0:
+    elif issue_queue_depth > 0:
         logger.info(
-            f"Task queue has {queue_depth} pending entries, "
+            f"Issue task queue has {issue_queue_depth} pending entries, "
             f"deferring issue discovery until queue drains"
         )
     else:
@@ -374,7 +342,6 @@ def _poll_cycle(
                     repo=config.github.repo,
                     token=config.github.token,
                     redis=redis,
-                    label_config=config.labels,
                     default_runner=config.default_runner,
                     logger=logger,
                 )
@@ -389,6 +356,7 @@ def _poll_cycle(
                 f"Issue #{issue_state.number}: max attempts reached, "
                 f"adding needs-human label"
             )
+            labeled = False
             try:
                 gh.add_issue_label(
                     config.github.repo,
@@ -396,18 +364,25 @@ def _poll_cycle(
                     config.labels.needs_human,
                     config.github.token,
                 )
+                labeled = True
             except Exception as e:
                 logger.error(
                     f"Failed to label issue #{issue_state.number} as needs-human: {e}",
                     exc_info=True,
                 )
             try:
+                label_note = (
+                    f"Labeling as `{config.labels.needs_human}` for manual review."
+                    if labeled
+                    else f"Failed to add `{config.labels.needs_human}` "
+                    f"label — please triage manually."
+                )
                 gh.post_issue_comment(
                     config.github.repo,
                     issue_state.number,
                     f"**orcest** has exhausted its retry budget "
                     f"({config.max_attempts} attempts) for this issue. "
-                    f"Labeling as `{config.labels.needs_human}` for manual review.",
+                    f"{label_note}",
                     config.github.token,
                 )
             except Exception as e:
@@ -418,8 +393,15 @@ def _poll_cycle(
                 )
         elif issue_state.action == IssueAction.SKIP_LOCKED:
             logger.debug(f"Issue #{issue_state.number}: locked, skipping")
+        elif issue_state.action == IssueAction.SKIP_ACTIVE:
+            logger.debug(f"Issue #{issue_state.number}: task in flight, skipping")
         elif issue_state.action == IssueAction.SKIP_LABELED:
-            logger.debug(f"Issue #{issue_state.number}: already labeled, skipping")
+            logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
+        else:
+            logger.warning(
+                f"Issue #{issue_state.number}: unhandled action "
+                f"{issue_state.action!r}, skipping"
+            )
 
     logger.info(
         f"Poll cycle complete. "
@@ -516,9 +498,10 @@ def _handle_result(
 
     Posts a comment on the resource (PR or issue) with the result summary
     and manages labels:
-    - completed: removes queued/in-progress labels
-    - failed: removes queued/in-progress labels, adds needs-human
-    - usage_exhausted: keeps in-progress label (will resume)
+    - completed: clears attempt counter
+    - failed: adds needs-human label
+    - blocked: adds blocked label
+    - usage_exhausted: no label changes (task stays parked as SKIP_ACTIVE)
     """
     logger.info(
         f"Result for task {result.task_id}: {result.status.value} "
@@ -534,7 +517,6 @@ def _handle_result(
 
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
-    _remove_label = gh.remove_issue_label if is_issue else gh.remove_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
 
     # Clear attempt counter on success so future failures start fresh.
@@ -551,55 +533,27 @@ def _handle_result(
             )
 
     # Manage labels based on result status.
+    # Only terminal statuses (FAILED, BLOCKED) add labels.
+    # USAGE_EXHAUSTED does nothing — task stays parked via attempt counter.
     labeled = False
-    if result.status == ResultStatus.USAGE_EXHAUSTED:
+    if result.status == ResultStatus.FAILED:
         try:
-            _remove_label(repo, resource_id, labels.queued, token)
+            _add_label(repo, resource_id, labels.needs_human, token)
+            labeled = True
         except Exception as e:
             logger.error(
-                f"Failed to remove queued label on {resource_label} #{resource_id}: {e}",
+                f"Failed to add needs-human label on {resource_label} #{resource_id}: {e}",
                 exc_info=True,
             )
+    elif result.status == ResultStatus.BLOCKED:
         try:
-            _add_label(repo, resource_id, labels.in_progress, token)
+            _add_label(repo, resource_id, labels.blocked, token)
+            labeled = True
         except Exception as e:
             logger.error(
-                f"Failed to add in-progress label on {resource_label} #{resource_id}: {e}",
+                f"Failed to add blocked label on {resource_label} #{resource_id}: {e}",
                 exc_info=True,
             )
-    else:
-        try:
-            _remove_label(repo, resource_id, labels.queued, token)
-        except Exception as e:
-            logger.error(
-                f"Failed to remove queued label on {resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
-        try:
-            _remove_label(repo, resource_id, labels.in_progress, token)
-        except Exception as e:
-            logger.error(
-                f"Failed to remove in-progress label on {resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
-
-        if result.status == ResultStatus.FAILED:
-            try:
-                _add_label(repo, resource_id, labels.needs_human, token)
-                labeled = True
-            except Exception as e:
-                logger.error(
-                    f"Failed to add needs-human label on {resource_label} #{resource_id}: {e}",
-                    exc_info=True,
-                )
-        elif result.status == ResultStatus.BLOCKED:
-            try:
-                _add_label(repo, resource_id, labels.blocked, token)
-            except Exception as e:
-                logger.error(
-                    f"Failed to add blocked label on {resource_label} #{resource_id}: {e}",
-                    exc_info=True,
-                )
 
     # Format result comment
     safe_summary = result.summary[:500] if result.summary else ""
@@ -619,6 +573,19 @@ def _handle_result(
         )
         body = (
             f"**orcest** task `{result.task_id}` failed "
+            f"({result.duration_seconds}s, "
+            f"worker: {result.worker_id}).\n\n"
+            f"Summary: {safe_summary}\n\n"
+            f"{label_note}"
+        )
+    elif result.status == ResultStatus.BLOCKED:
+        label_note = (
+            f"Labeling as `{labels.blocked}` — waiting for external input."
+            if labeled
+            else f"Failed to add `{labels.blocked}` label — please triage manually."
+        )
+        body = (
+            f"**orcest** task `{result.task_id}` is blocked "
             f"({result.duration_seconds}s, "
             f"worker: {result.worker_id}).\n\n"
             f"Summary: {safe_summary}\n\n"

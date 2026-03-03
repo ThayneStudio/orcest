@@ -1,8 +1,9 @@
-"""Worker main loop: block on Redis stream, acquire lock, run Claude, publish result.
+"""Worker main loop: block on Redis streams, acquire lock, run Claude, publish result.
 
-The central worker loop reads tasks from the Redis stream via XREADGROUP,
-acquires a distributed lock per PR, runs Claude to produce fixes, and
-publishes results back to a results stream for the orchestrator.
+The central worker loop reads tasks from Redis streams via XREADGROUP
+(PR tasks with priority, then issue tasks), acquires a distributed lock
+per resource, runs Claude, and publishes results back to a results stream
+for the orchestrator.
 """
 
 import logging
@@ -28,21 +29,24 @@ def run_worker(config: WorkerConfig) -> None:
     logger = setup_logging("worker", config.worker_id)
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
-    tasks_stream = f"tasks:{config.backend}"
+    pr_tasks_stream = f"tasks:{config.backend}"
+    issue_tasks_stream = f"tasks:issue:{config.backend}"
 
     # Verify Redis connection
     if not redis.health_check():
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
 
-    # Ensure consumer group exists
-    redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
+    # Ensure consumer groups exist on both streams
+    redis.ensure_consumer_group(pr_tasks_stream, CONSUMER_GROUP)
+    redis.ensure_consumer_group(issue_tasks_stream, CONSUMER_GROUP)
 
     # Drain pending tasks from previous worker lifecycle.
     # If this worker was killed mid-execution, the task was delivered but
     # never ACKed.  Publish a FAILED result so the orchestrator cleans up
     # labels, then ACK to avoid re-processing stale work.
-    _drain_pending_tasks(redis, tasks_stream, config, logger)
+    _drain_pending_tasks(redis, pr_tasks_stream, config, logger)
+    _drain_pending_tasks(redis, issue_tasks_stream, config, logger)
 
     # Graceful shutdown
     shutdown = False
@@ -63,14 +67,27 @@ def run_worker(config: WorkerConfig) -> None:
     )
 
     while not shutdown:
-        # Block waiting for tasks (5 second timeout to check shutdown flag)
+        # PR tasks have priority — non-blocking check first
         entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
             consumer=config.worker_id,
-            stream=tasks_stream,
+            stream=pr_tasks_stream,
             count=1,
-            block_ms=5000,
+            block_ms=None,
         )
+        current_stream = pr_tasks_stream
+        if not entries:
+            if shutdown:
+                break
+            # No PR work — block on issue stream (5s timeout to recheck PRs)
+            entries = redis.xreadgroup(
+                group=CONSUMER_GROUP,
+                consumer=config.worker_id,
+                stream=issue_tasks_stream,
+                count=1,
+                block_ms=5000,
+            )
+            current_stream = issue_tasks_stream
 
         if not entries:
             continue  # Timeout, loop back to check shutdown
@@ -84,7 +101,7 @@ def run_worker(config: WorkerConfig) -> None:
                 exc_info=True,
             )
             try:
-                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
                 logger.error(
                     f"Failed to ACK malformed entry {entry_id}",
@@ -114,7 +131,7 @@ def run_worker(config: WorkerConfig) -> None:
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
             try:
-                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
                 logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
             continue
@@ -158,7 +175,7 @@ def run_worker(config: WorkerConfig) -> None:
             # detect the missing result and may re-enqueue if needed
 
         try:
-            redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+            redis.xack(current_stream, CONSUMER_GROUP, entry_id)
         except Exception:
             logger.error(
                 f"Failed to ACK task {task.id} (will be redelivered)",
