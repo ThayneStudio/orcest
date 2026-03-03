@@ -12,6 +12,7 @@ import pytest
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
+    _STREAM_MAXLEN,
     CONSUMER_GROUP,
     HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
@@ -254,7 +255,7 @@ class TestExecuteTask:
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
         mock_redis.xadd_capped.assert_any_call(
-            stream, {"line": '{"role": "assistant"}\n'}, maxlen=2000
+            stream, {"line": '{"role": "assistant"}\n'}, maxlen=_STREAM_MAXLEN
         )
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
