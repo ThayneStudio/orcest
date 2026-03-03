@@ -13,7 +13,7 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """Click test runner."""
+    """Click test runner (Click 8.2+ always captures stderr separately)."""
     return CliRunner()
 
 
@@ -86,7 +86,7 @@ def test_status_redis_connection_failure(mocker, runner):
     result = runner.invoke(main, ["status", "localhost", "--once"])
 
     assert result.exit_code == 1
-    assert "Cannot connect to Redis" in result.output
+    assert "Cannot connect to Redis" in result.stderr
 
 
 def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
@@ -96,7 +96,7 @@ def test_status_zero_interval_exits_error(mocker, runner, fake_redis_client):
     result = runner.invoke(main, ["status", "localhost", "--interval", "0"])
 
     assert result.exit_code == 1
-    assert "interval must be positive" in result.output
+    assert "interval must be positive" in result.stderr
 
 
 def test_status_once_with_redis_host(mocker, runner, fake_redis_client):
