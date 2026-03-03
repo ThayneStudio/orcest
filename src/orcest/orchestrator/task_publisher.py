@@ -74,9 +74,11 @@ def _publish_and_notify(
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for PR #{pr_state.number} "
-            f"before publishing task {task.id} to Redis",
+            f"before publishing task {task.id} to Redis; skipping publish to "
+            f"avoid an un-counted attempt — will retry next poll cycle",
             exc_info=True,
         )
+        return
 
     # Publish to backend-specific stream
     tasks_stream = f"tasks:{default_runner}"
@@ -380,9 +382,11 @@ def _publish_issue_and_notify(
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for issue #{issue_state.number} "
-            f"before publishing task {task.id} to Redis",
+            f"before publishing task {task.id} to Redis; skipping publish to "
+            f"avoid an un-counted attempt — will retry next poll cycle",
             exc_info=True,
         )
+        return
 
     # Publish to issue-specific stream (lower priority than PR tasks)
     tasks_stream = f"tasks:issue:{default_runner}"
