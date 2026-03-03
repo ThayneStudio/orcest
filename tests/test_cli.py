@@ -13,24 +13,24 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner that captures stderr separately from stdout.
+    """CliRunner with separate stderr and stdout capture.
 
-    Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
-    parameter entirely.  ``CliRunner(mix_stderr=False)`` raises
-    ``TypeError`` on Click 8.2+; this is why the previous CI run failed,
-    not a Rich ``Console`` routing issue.
+    **Root cause of the CI failure**: Click 8.2 removed the ``mix_stderr``
+    parameter from ``CliRunner.__init__`` entirely.  ``CliRunner(mix_stderr=False)``
+    raises ``TypeError: unexpected keyword argument 'mix_stderr'`` on Click 8.2+;
+    that TypeError was why the CI run failed.
 
-    In Click 8.2+, ``CliRunner()`` always separates stderr from stdout
-    unconditionally: ``result.stderr`` is populated independently from
-    ``result.stdout`` on every invocation, so all ``result.stderr``
-    assertions below are semantically meaningful.
+    **Rich Console fix**: ``_status_once`` in ``cli.py`` uses
+    ``Console(file=sys.stdout)`` to route Rich output explicitly to Click's
+    captured stdout rather than relying on the default lazy ``sys.stdout``
+    lookup.  Both approaches work correctly when the Console is constructed
+    inside the command handler (after Click has already installed its capture
+    buffer), but ``Console(file=sys.stdout)`` is unambiguous.
 
-    ``_status_once`` in ``cli.py`` uses ``Console(file=sys.stdout)`` per
-    review feedback.  Note: Rich's ``Console()`` evaluates ``sys.stdout``
-    lazily (at print time), so it would also follow Click's sys.stdout patch
-    correctly; ``Console(file=sys.stdout)`` captures the reference eagerly
-    at construction time but is equivalent here since the Console is built
-    inside the function after Click has already installed its capture buffer.
+    **Stream separation in Click 8.2+**: ``CliRunner()`` unconditionally
+    separates stderr from stdout — ``result.stderr`` is populated independently
+    of ``result.stdout`` on every invocation.  All ``result.stderr`` assertions
+    below are therefore semantically meaningful.
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
     empirically.
