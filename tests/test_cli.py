@@ -27,6 +27,12 @@ def runner():
     try:
         return CliRunner(mix_stderr=False)
     except TypeError as exc:
+        # Intentionally narrow: only suppress the TypeError caused by Click 8.2+
+        # removing the mix_stderr parameter.  The check relies on CPython's error
+        # message including the parameter name verbatim (e.g. "got an unexpected
+        # keyword argument 'mix_stderr'").  Any other TypeError — a typo, a broken
+        # plugin wrapping CliRunner.__init__, etc. — propagates so it is never
+        # silently swallowed.
         if "mix_stderr" not in str(exc):
             raise
         # Click 8.2+ removed mix_stderr; streams are always separated.
