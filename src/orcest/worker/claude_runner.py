@@ -42,7 +42,7 @@ _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
 #    is that this regex is only ever checked against stderr
 #    (see _is_usage_exhausted), not user-visible stdout.
 _RATE_LIMIT_RE = re.compile(
-    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)(?:[^a-zA-Z]|$)",
+    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)(?=[^a-zA-Z]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 

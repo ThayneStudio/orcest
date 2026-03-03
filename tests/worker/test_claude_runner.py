@@ -827,7 +827,7 @@ def test_is_usage_exhausted_stdout_not_checked():
 @pytest.mark.unit
 def test_is_usage_exhausted_rate_limit_mid_sentence():
     """'rate limit exceeded' followed by non-alpha trailing text still matches."""
-    # Space after "exceeded" is a non-alpha character -> matches the lookahead.
+    # Space after "exceeded" is a non-alpha character -> matches the lookahead (?=[^a-zA-Z]|$).
     assert _is_usage_exhausted("rate limit exceeded in user-authored code") is True
 
 
