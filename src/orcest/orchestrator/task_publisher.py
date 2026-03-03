@@ -2,7 +2,7 @@
 
 Renders prompts from PR context (diffs, CI failures, review threads) and
 publishes tasks to the Redis stream. Also handles GitHub visibility by
-adding labels and posting comments when tasks are queued.
+posting comments when tasks are queued.
 """
 
 import logging
@@ -13,7 +13,6 @@ from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import IssueState
 from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
 from orcest.orchestrator.pr_ops import PRState, increment_attempts
-from orcest.shared.config import LabelConfig
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -49,19 +48,18 @@ def _publish_and_notify(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
 
     Shared by publish_fix_task and publish_followup_task to avoid
-    duplicating the increment -> publish -> label -> comment -> log sequence.
+    duplicating the increment -> publish -> comment -> log sequence.
 
     The attempt counter is incremented before publishing to Redis so that a
     crash between the two operations still counts the attempt, preventing
-    unbounded retries.  If labeling or commenting fails afterwards, the error
-    is logged but the task is not lost.
+    unbounded retries.  If commenting fails afterwards, the error is logged
+    but the task is not lost.
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
@@ -69,7 +67,7 @@ def _publish_and_notify(
     # Increment attempt count BEFORE publishing to Redis to eliminate the
     # check-then-act race: if the orchestrator crashes between xadd and
     # increment, the attempt would never be counted, allowing unbounded
-    # retries.  An increment without a subsequent xadd is safe — the
+    # retries.  An increment without a subsequent xadd is safe -- the
     # max-attempts guard in discover_actionable_prs prevents runaway loops.
     try:
         increment_attempts(redis, pr_state.number, pr_state.head_sha)
@@ -84,20 +82,7 @@ def _publish_and_notify(
     tasks_stream = f"tasks:{default_runner}"
     redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
 
-    # Update GitHub visibility -- wrapped in try/except because the task
-    # is already published to Redis. If labeling fails, the next poll cycle
-    # won't see SKIP_LABELED, but that is safer than losing the task.
-    _label_ok = True
-    _comment_ok = True
-    try:
-        gh.add_label(repo, pr_state.number, label_config.queued, token)
-    except Exception:
-        _label_ok = False
-        _log.error(
-            f"Failed to add queued label to PR #{pr_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
+    # Post comment on PR for visibility
     try:
         gh.post_comment(
             repo,
@@ -106,22 +91,13 @@ def _publish_and_notify(
             token,
         )
     except Exception:
-        _comment_ok = False
         _log.error(
             f"Failed to post comment on PR #{pr_state.number} "
             f"(task {task.id} already published to Redis)",
             exc_info=True,
         )
 
-    if _label_ok and _comment_ok:
-        _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
-    else:
-        _log.warning(
-            f"Published {task_type.value} task {task.id} "
-            f"for PR #{pr_state.number} (GitHub visibility partially failed: "
-            f"label={'ok' if _label_ok else 'FAILED'}, "
-            f"comment={'ok' if _comment_ok else 'FAILED'})"
-        )
+    _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
 
 
 def publish_fix_task(
@@ -129,7 +105,6 @@ def publish_fix_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -140,7 +115,7 @@ def publish_fix_task(
     2. Classify CI failures
     3. Render prompt
     4. Publish to Redis stream
-    5. Add label and post comment on PR
+    5. Post comment on PR
     """
     # Gather context
     diff = gh.get_pr_diff(repo, pr_state.number, token)
@@ -227,7 +202,6 @@ def publish_fix_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -240,7 +214,6 @@ def publish_followup_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -253,7 +226,7 @@ def publish_followup_task(
     Steps:
     1. Render followup prompt from review threads
     2. Publish to Redis stream
-    3. Add label and post comment on PR
+    3. Post comment on PR
     """
     task_type = TaskType.TRIAGE_FOLLOWUPS
 
@@ -289,7 +262,52 @@ def publish_followup_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
+        default_runner=default_runner,
+        logger=logger,
+    )
+
+    return task
+
+
+def publish_rebase_task(
+    pr_state: PRState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    default_runner: str,
+    merge_error: str = "",
+    logger: logging.Logger | None = None,
+) -> Task:
+    """Create and publish a rebase task for a PR with merge conflicts.
+
+    Enqueued when ``gh pr merge`` fails due to merge conflicts. The worker
+    will rebase the branch onto the base branch and resolve any conflicts,
+    then push. The orchestrator will attempt to merge again on the next cycle.
+    """
+    prompt = _render_rebase_prompt(
+        pr_number=pr_state.number,
+        pr_title=pr_state.title,
+        branch=pr_state.branch,
+        repo=repo,
+        merge_error=merge_error,
+    )
+
+    task = Task.create(
+        task_type=TaskType.REBASE_PR,
+        repo=repo,
+        token=token,
+        resource_type="pr",
+        resource_id=pr_state.number,
+        prompt=prompt,
+        branch=pr_state.branch,
+    )
+
+    _publish_and_notify(
+        task=task,
+        pr_state=pr_state,
+        repo=repo,
+        token=token,
+        redis=redis,
         default_runner=default_runner,
         logger=logger,
     )
@@ -302,7 +320,6 @@ def publish_issue_task(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> Task:
@@ -311,7 +328,7 @@ def publish_issue_task(
     Steps:
     1. Render prompt from issue title and body
     2. Publish to Redis stream
-    3. Add orcest:queued label and post comment on issue
+    3. Post comment on issue
     """
     prompt = _render_issue_prompt(
         issue_number=issue_state.number,
@@ -336,7 +353,6 @@ def publish_issue_task(
         repo=repo,
         token=token,
         redis=redis,
-        label_config=label_config,
         default_runner=default_runner,
         logger=logger,
     )
@@ -350,7 +366,6 @@ def _publish_issue_and_notify(
     repo: str,
     token: str,
     redis: RedisClient,
-    label_config: LabelConfig,
     default_runner: str,
     logger: logging.Logger | None = None,
 ) -> None:
@@ -369,22 +384,11 @@ def _publish_issue_and_notify(
             exc_info=True,
         )
 
-    # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
+    # Publish to issue-specific stream (lower priority than PR tasks)
+    tasks_stream = f"tasks:issue:{default_runner}"
     redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
 
-    # Update GitHub visibility on the issue
-    _label_ok = True
-    _comment_ok = True
-    try:
-        gh.add_issue_label(repo, issue_state.number, label_config.queued, token)
-    except Exception:
-        _label_ok = False
-        _log.error(
-            f"Failed to add queued label to issue #{issue_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
+    # Post comment on issue for visibility
     try:
         gh.post_issue_comment(
             repo,
@@ -393,22 +397,15 @@ def _publish_issue_and_notify(
             token,
         )
     except Exception:
-        _comment_ok = False
         _log.error(
             f"Failed to post comment on issue #{issue_state.number} "
             f"(task {task.id} already published to Redis)",
             exc_info=True,
         )
 
-    if _label_ok and _comment_ok:
-        _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
-    else:
-        _log.warning(
-            f"Published {task_type.value} task {task.id} "
-            f"for issue #{issue_state.number} (GitHub visibility partially failed: "
-            f"label={'ok' if _label_ok else 'FAILED'}, "
-            f"comment={'ok' if _comment_ok else 'FAILED'})"
-        )
+    _log.info(
+        f"Published {task_type.value} task {task.id} for issue #{issue_state.number}"
+    )
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -526,16 +523,72 @@ def _render_followup_prompt(
             "## Instructions",
             "",
             "1. Read each unresolved review thread above.",
-            f"2. Create GitHub issues for follow-up work "
+            "2. For each thread, determine if it is actionable (requests a change "
+            "or raises a genuine concern) or non-actionable (purely positive "
+            "feedback, acknowledgment, or praise).",
+            "3. For non-actionable threads, resolve them directly without creating issues.",
+            f"4. For actionable threads, create GitHub issues for follow-up work "
             f'(`gh issue create --repo {repo} --title "..." --body "..."`) '
             f"-- group related items into single issues where appropriate.",
-            "3. Reply to each thread with a comment linking to the created issue.",
-            "4. Resolve each thread after creating the issue.",
-            "5. Do NOT make code changes -- this is triage only.",
-            "6. Do NOT call `gh pr review --approve` or `--request-changes` "
+            "5. Reply to each actionable thread with a comment linking to the created issue, "
+            "then resolve the thread.",
+            "6. Do NOT make code changes -- this is triage only.",
+            "7. Do NOT call `gh pr review --approve` or `--request-changes` "
             "-- you are not authorized to change review status.",
         ]
     )
+
+    return "\n".join(sections)
+
+
+def _render_rebase_prompt(
+    pr_number: int,
+    pr_title: str,
+    branch: str,
+    repo: str,
+    merge_error: str = "",
+) -> str:
+    """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
+    sections: list[str] = [
+        f"# Rebase PR #{pr_number}: {pr_title}",
+        "",
+        f"You are on branch `{branch}`.",
+        "This PR has merge conflicts that prevent it from being merged.",
+        "",
+    ]
+
+    if merge_error:
+        sections.append("## Merge Error")
+        sections.append("")
+        sections.append(f"```\n{merge_error[:500]}\n```")
+        sections.append("")
+
+    sections.extend([
+        "## Instructions",
+        "",
+        "1. Fetch the latest base branch (`master` or `main`):",
+        "   ```",
+        "   git fetch origin master",
+        "   ```",
+        "2. Rebase your branch onto the base branch:",
+        "   ```",
+        "   git rebase origin/master",
+        "   ```",
+        "3. If there are merge conflicts:",
+        "   - Read the conflicting files to understand both sides",
+        "   - Resolve each conflict by keeping the intent of both changes",
+        "   - Stage resolved files with `git add`",
+        "   - Continue the rebase with `git rebase --continue`",
+        "4. After the rebase is complete, force-push to update the PR:",
+        "   ```",
+        "   git push --force-with-lease",
+        "   ```",
+        "5. Verify the branch is clean and the rebase succeeded.",
+        "",
+        "Do NOT create new commits \u2014 only rebase existing ones.",
+        "Do NOT squash commits during the rebase.",
+        "Push to the existing branch. Do not create new PRs.",
+    ])
 
     return "\n".join(sections)
 
@@ -596,15 +649,16 @@ def _render_fix_prompt(
         )
         sections.append("")
 
-    ci_is_green = not ci_failures
-
     if review_threads:
         sections.append("## Review Feedback")
         sections.append("")
         sections.extend(_render_review_threads(review_threads))
-        sections.append("Address all review feedback above.")
-        if ci_is_green:
-            sections.append("After fixing each item, resolve the corresponding review thread.")
+        sections.append("Address the review feedback above. For each thread:")
+        sections.append("- If it requests a code change, make the fix and resolve the thread.")
+        sections.append(
+            "- If it is purely positive feedback or has no actionable request, "
+            "resolve the thread without making changes."
+        )
         sections.append("")
 
     truncated = len(diff) > 10000

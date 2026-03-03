@@ -813,6 +813,18 @@ def test_is_usage_exhausted_all_patterns():
 
 
 @pytest.mark.unit
+def test_is_usage_exhausted_stdout_not_checked():
+    """Only stderr is checked — stdout is excluded to prevent false positives.
+
+    Claude's stream-json stdout contains ``"usage": {...}`` in every API
+    response message.  If "limit" also appears anywhere in Claude's text
+    or prompt, the ("usage", "limit") pattern would match incorrectly.
+    """
+    # Empty stderr -> not detected regardless of stdout content
+    assert _is_usage_exhausted("") is False
+
+
+@pytest.mark.unit
 def test_is_usage_exhausted_rate_limit_mid_sentence():
     """'exceeded' mid-sentence (not EOL) must not trigger the anchored regex."""
     assert _is_usage_exhausted("") is False
