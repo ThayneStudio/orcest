@@ -1,6 +1,5 @@
 """Tests for the orcest CLI entry points (src/orcest/cli.py)."""
 
-import inspect
 import io
 from unittest.mock import MagicMock, patch
 
@@ -25,10 +24,13 @@ def runner():
     and all assertions on it remain meaningful.
     ``test_runner_separates_stderr_from_stdout`` verifies this empirically.
     """
-    if "mix_stderr" in inspect.signature(CliRunner.__init__).parameters:
+    try:
         return CliRunner(mix_stderr=False)
-    # Click 8.2+ removed mix_stderr; streams are always separated.
-    return CliRunner()
+    except TypeError as exc:
+        if "mix_stderr" not in str(exc):
+            raise
+        # Click 8.2+ removed mix_stderr; streams are always separated.
+        return CliRunner()
 
 
 # ---------------------------------------------------------------------------
