@@ -344,3 +344,52 @@ def test_xack_nonexistent_entry_returns_zero(fake_redis_client):
 
     result = fake_redis_client.xack(stream, group, "9999999999999-0")
     assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for stream_queue_depth
+# ---------------------------------------------------------------------------
+
+
+def test_stream_queue_depth_returns_zero_for_nonexistent_stream(fake_redis_client):
+    """stream_queue_depth returns 0 when the stream does not exist."""
+    depth = fake_redis_client.stream_queue_depth("no-such-stream", "no-such-group")
+    assert depth == 0
+
+
+def test_stream_queue_depth_returns_zero_for_unknown_group(fake_redis_client):
+    """stream_queue_depth returns 0 when the group is not in the stream."""
+    stream = "test-stream"
+    fake_redis_client.ensure_consumer_group(stream, "other-group")
+    depth = fake_redis_client.stream_queue_depth(stream, "missing-group")
+    assert depth == 0
+
+
+def test_stream_queue_depth_counts_pending_entries(fake_redis_client):
+    """stream_queue_depth reflects entries delivered but not yet ACKed."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    # Add two entries then deliver them (but do not ACK).
+    fake_redis_client.xadd(stream, {"k": "v1"})
+    fake_redis_client.xadd(stream, {"k": "v2"})
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
+
+    depth = fake_redis_client.stream_queue_depth(stream, group)
+    assert depth >= 2
+
+
+def test_stream_queue_depth_zero_after_all_acked(fake_redis_client):
+    """stream_queue_depth returns 0 once all pending entries are ACKed."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    fake_redis_client.xadd(stream, {"k": "v"})
+    entries = fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
+    entry_id = entries[0][0]
+    fake_redis_client.xack(stream, group, entry_id)
+
+    depth = fake_redis_client.stream_queue_depth(stream, group)
+    assert depth == 0
