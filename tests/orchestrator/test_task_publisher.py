@@ -8,8 +8,13 @@ review thread prompt rendering for both fix and followup tasks.
 import pytest
 
 from orcest.orchestrator.gh import GhCliError
+from orcest.orchestrator.issue_ops import IssueAction, IssueState
 from orcest.orchestrator.pr_ops import PRAction, PRState
-from orcest.orchestrator.task_publisher import publish_fix_task, publish_followup_task
+from orcest.orchestrator.task_publisher import (
+    publish_fix_task,
+    publish_followup_task,
+    publish_issue_task,
+)
 from orcest.shared.models import Task, TaskType
 
 
@@ -1045,3 +1050,84 @@ def test_group_inline_comments_empty():
     from orcest.orchestrator.task_publisher import _group_inline_comments
 
     assert _group_inline_comments([]) == []
+
+
+# --- increment_attempts failure: Option A early-return behavior ---
+
+
+def test_publish_and_notify_skips_xadd_on_increment_failure(
+    gh_mock,
+    fake_redis_client,
+    mocker,
+    caplog,
+):
+    """When increment_attempts raises, _publish_and_notify returns early and
+    the task is NOT published to Redis (Option A: skip publish on counter failure)."""
+    import logging
+
+    _setup_gh_defaults(gh_mock)
+    mocker.patch(
+        "orcest.orchestrator.task_publisher.increment_attempts",
+        side_effect=ConnectionError("Redis down"),
+    )
+    pr_state = _make_pr_state(number=800)
+
+    with caplog.at_level(logging.ERROR):
+        task = publish_fix_task(
+            pr_state=pr_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    # Task should NOT be published to Redis
+    entries = fake_redis_client.client.xrange("tasks:claude")
+    assert not any(f["id"] == task.id for _, f in entries)
+
+    # Error should be logged with skip rationale
+    error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("Failed to increment attempt counter" in m for m in error_msgs)
+    assert any("skipping publish" in m for m in error_msgs)
+
+
+def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
+    gh_mock,
+    fake_redis_client,
+    mocker,
+    caplog,
+):
+    """When increment_issue_attempts raises, _publish_issue_and_notify returns
+    early and the task is NOT published to Redis (Option A)."""
+    import logging
+
+    _setup_gh_defaults(gh_mock)
+    mocker.patch(
+        "orcest.orchestrator.task_publisher.increment_issue_attempts",
+        side_effect=ConnectionError("Redis down"),
+    )
+    issue_state = IssueState(
+        number=801,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    with caplog.at_level(logging.ERROR):
+        task = publish_issue_task(
+            issue_state=issue_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    # Task should NOT be published to Redis
+    entries = fake_redis_client.client.xrange("tasks:issue:claude")
+    assert not any(f["id"] == task.id for _, f in entries)
+
+    # Error should be logged with skip rationale
+    error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("Failed to increment attempt counter" in m for m in error_msgs)
+    assert any("skipping publish" in m for m in error_msgs)
