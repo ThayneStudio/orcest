@@ -1017,9 +1017,7 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
                                     "isResolved": False,
                                     "comments": {
                                         "pageInfo": {"hasNextPage": False},
-                                        "nodes": [
-                                            {"body": "Fix", "author": {"login": "alice"}}
-                                        ],
+                                        "nodes": [{"body": "Fix", "author": {"login": "alice"}}],
                                     },
                                 },
                             ],
