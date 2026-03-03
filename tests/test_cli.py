@@ -15,21 +15,22 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 def runner():
     """CliRunner that captures stderr separately from stdout.
 
-    Root cause (per review feedback): Rich ``Console()`` created without an
-    explicit ``file=`` argument holds a reference to whatever ``sys.stdout``
-    was at construction time.  When Click's CliRunner replaces ``sys.stdout``
-    with a capture buffer, a previously-constructed ``Console()`` keeps
-    writing to the *original* ``sys.stdout``, bypassing Click's capture.
-    The fix in ``_status_once`` is ``Console(file=sys.stdout)``, which
-    evaluates ``sys.stdout`` at call time — after Click has already installed
-    its buffer — so Rich output is captured correctly.
+    Root cause of the CI failure: Click 8.2 removed the ``mix_stderr``
+    parameter entirely.  ``CliRunner(mix_stderr=False)`` raises
+    ``TypeError`` on Click 8.2+; this is why the previous CI run failed,
+    not a Rich ``Console`` routing issue.
 
-    Why ``CliRunner(mix_stderr=False)`` is not used: Click 8.2 removed the
-    ``mix_stderr`` parameter entirely.  Passing it raises ``TypeError`` on
-    Click 8.2+.  Click 8.2+ always separates stderr from stdout
+    In Click 8.2+, ``CliRunner()`` always separates stderr from stdout
     unconditionally: ``result.stderr`` is populated independently from
     ``result.stdout`` on every invocation, so all ``result.stderr``
     assertions below are semantically meaningful.
+
+    ``_status_once`` in ``cli.py`` uses ``Console(file=sys.stdout)`` per
+    review feedback.  Note: Rich's ``Console()`` evaluates ``sys.stdout``
+    lazily (at print time), so it would also follow Click's sys.stdout patch
+    correctly; ``Console(file=sys.stdout)`` captures the reference eagerly
+    at construction time but is equivalent here since the Console is built
+    inside the function after Click has already installed its capture buffer.
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
     empirically.
