@@ -484,10 +484,14 @@ class TestRunWorker:
 
         return mock_redis
 
-    def _setup_run_worker(self, mocker, worker_config, mock_redis):
+    def _setup_run_worker(self, mocker, worker_config, mock_redis, *, heartbeat_mock=None):
         """Patch all external dependencies of run_worker.
 
         Returns a dict of relevant mocks for assertions.
+
+        Pass ``heartbeat_mock`` to supply an explicit mock for the
+        ``orcest.worker.loop.Heartbeat`` class.  When omitted a plain
+        ``MagicMock()`` is used so the real thread is never spawned.
         """
         # Patch RedisClient constructor to return our mock
         mocker.patch("orcest.worker.loop.RedisClient", return_value=mock_redis)
@@ -517,9 +521,11 @@ class TestRunWorker:
         mock_runner = MagicMock()
         mocker.patch("orcest.worker.loop.create_runner", return_value=mock_runner)
 
-        # Patch Heartbeat to avoid spawning real daemon threads in unit tests
-        mock_heartbeat = MagicMock()
-        mocker.patch("orcest.worker.loop.Heartbeat", return_value=mock_heartbeat)
+        # Patch Heartbeat to avoid spawning real daemon threads in unit tests.
+        # Use the caller-supplied mock when provided so the dependency is explicit.
+        if heartbeat_mock is None:
+            heartbeat_mock = MagicMock()
+        mocker.patch("orcest.worker.loop.Heartbeat", heartbeat_mock)
 
         return {
             "workspace": mock_ws,
@@ -785,10 +791,9 @@ class TestRunWorker:
         """
         mock_redis = self._build_mock_redis()
         mock_heartbeat_cls = MagicMock()
-        mock_heartbeat_instance = MagicMock()
-        mock_heartbeat_cls.return_value = mock_heartbeat_instance
-        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
-        mocker.patch("orcest.worker.loop.Heartbeat", mock_heartbeat_cls)
+        mocks = self._setup_run_worker(
+            mocker, worker_config, mock_redis, heartbeat_mock=mock_heartbeat_cls
+        )
         mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
