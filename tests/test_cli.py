@@ -15,16 +15,21 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 def runner():
     """CliRunner that captures stderr separately from stdout.
 
-    Root cause of the original CI failure: Click 8.2 removed the
-    ``mix_stderr`` parameter entirely.  ``CliRunner(mix_stderr=False)``
-    raises ``TypeError`` on Click 8.2+ so it cannot be used.  ``CliRunner()``
-    is the correct replacement: Click 8.2+ always separates stderr from stdout
-    unconditionally, matching the old ``CliRunner(mix_stderr=False)`` semantics.
+    Root cause investigation (per review feedback):
 
-    The ``status`` error paths use ``click.echo(..., err=True)``, not a Rich
-    ``Console``, so they are captured in ``result.stderr`` as expected.  Rich's
-    ``Console()`` in ``_status_once`` writes to ``sys.stdout``, which CliRunner
-    captures in ``result.stdout``.
+    1. ``CliRunner(mix_stderr=False)`` raises ``TypeError`` on Click 8.2+
+       because Click 8.2 removed the ``mix_stderr`` parameter entirely.
+       This was the actual CI failure; it was not a Rich ``Console`` issue.
+
+    2. Rich ``Console`` is not the root cause: ``_status_once`` now passes
+       ``file=sys.stdout`` explicitly, so Rich always writes to whichever
+       ``sys.stdout`` Click has installed for the invocation.  Error paths
+       use ``click.echo(..., err=True)``, never ``Console``.
+
+    3. ``CliRunner()`` is the correct replacement: Click 8.2+ always
+       separates stderr from stdout unconditionally (there is no opt-in
+       flag; separation is now the only behavior).  ``result.stderr`` is
+       populated independently from ``result.stdout`` on every invocation.
 
     ``test_runner_separates_stderr_from_stdout`` verifies these invariants
     empirically, so all ``result.stderr`` assertions below are meaningful.
