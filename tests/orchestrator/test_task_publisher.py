@@ -5,6 +5,8 @@ side effects, prompt diff truncation, CI log fetching/rendering, and
 review thread prompt rendering for both fix and followup tasks.
 """
 
+import logging
+
 import pytest
 
 from orcest.orchestrator.gh import GhCliError
@@ -777,8 +779,6 @@ def test_publish_and_notify_comment_fail(
     caplog,
 ):
     """post_comment raises. Task should still be published to Redis."""
-    import logging
-
     _setup_gh_defaults(gh_mock)
     gh_mock.post_comment.side_effect = RuntimeError("comment fail")
     pr_state = _make_pr_state(number=603)
@@ -1063,8 +1063,6 @@ def test_publish_and_notify_skips_xadd_on_increment_failure(
 ):
     """When increment_attempts raises, _publish_and_notify returns early and
     the task is NOT published to Redis (Option A: skip publish on counter failure)."""
-    import logging
-
     _setup_gh_defaults(gh_mock)
     mocker.patch(
         "orcest.orchestrator.task_publisher.increment_attempts",
@@ -1099,8 +1097,6 @@ def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
 ):
     """When increment_issue_attempts raises, _publish_issue_and_notify returns
     early and the task is NOT published to Redis (Option A)."""
-    import logging
-
     _setup_gh_defaults(gh_mock)
     mocker.patch(
         "orcest.orchestrator.task_publisher.increment_issue_attempts",
