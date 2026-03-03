@@ -682,7 +682,7 @@ def test_extract_summary_result_key():
 
 
 @pytest.mark.unit
-def test_extract_summary_last_result_in_multi_result_stream():
+def test_extract_summary_last_result_in_multi_result_stream_regression_111():
     """Multi-result stream -> last top-level 'result' value is returned.
 
     Regression test for issue #111: _extract_summary must scan all lines and
