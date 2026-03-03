@@ -34,7 +34,7 @@ PYEOF
 
 # Install orcest package (source only, deps already installed)
 COPY --chown=orcest:orcest src/ src/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps . && chown -R orcest:orcest src/
 
 USER orcest
 
