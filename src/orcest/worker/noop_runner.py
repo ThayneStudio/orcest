@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
-import time
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,11 +32,15 @@ class NoopRunner:
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
+        abort_event: threading.Event | None = None,
     ) -> RunnerResult:
         sleep_duration = max(0.0, min(self.duration, max(timeout, 0)))
         if logger:
             logger.debug(f"NoopRunner sleeping {sleep_duration}s")
-        time.sleep(sleep_duration)
+        _abort = abort_event if abort_event is not None else threading.Event()
+        _abort.wait(timeout=sleep_duration)
+        if _abort.is_set():
+            return RunnerResult(success=False, summary="Aborted: lock lost")
         if on_output:
             try:
                 on_output("noop\n")

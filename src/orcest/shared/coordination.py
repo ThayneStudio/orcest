@@ -75,16 +75,26 @@ class RedisLock:
         result = self._refresh_script(keys=[self.key], args=[self.owner, str(self.ttl)])
         return result == 1
 
+    def __enter__(self) -> "RedisLock":
+        if not self.acquire():
+            raise RuntimeError(f"Failed to acquire lock: {self.key}")
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+    ) -> None:
+        self.release()
+
     @property
     def is_held(self) -> bool:
         return self._held
 
 
-def make_pr_lock_key(pr_number: int) -> str:
+def make_pr_lock_key(repo: str, pr_number: int) -> str:
     """Generate the Redis key for a PR lock."""
-    return f"lock:pr:{pr_number}"
+    return f"lock:pr:{repo}:{pr_number}"
 
 
-def make_issue_lock_key(issue_number: int) -> str:
+def make_issue_lock_key(repo: str, issue_number: int) -> str:
     """Generate the Redis key for an issue lock."""
-    return f"lock:issue:{issue_number}"
+    return f"lock:issue:{repo}:{issue_number}"

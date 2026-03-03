@@ -55,6 +55,7 @@ class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per PR before needs-human
+    delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
 
 
 @dataclass
@@ -80,6 +81,23 @@ def _safe_int(value: Any, field_name: str) -> int:
         raise ValueError(
             f"Config field '{field_name}' has value {value!r} which cannot be converted to int."
         ) from exc
+
+
+def _safe_bool(value: Any, field_name: str) -> bool:
+    """Validate that a config value is a native bool.
+
+    YAML parses unquoted ``true``/``false`` as Python bools directly.
+    If the value is a string (e.g. ``"false"``), it means the user quoted
+    it in YAML, which would silently misbehave with a bare ``bool()`` call
+    because ``bool("false")`` returns ``True``.  Raise a clear error
+    instead so the user can fix their config.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Config field '{field_name}' has value {value!r} which is not a boolean. "
+            "Use an unquoted YAML boolean (true or false)."
+        )
+    return value
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -178,6 +196,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
+    # Whether to delete the head branch after merging
+    delete_branch_on_merge = _safe_bool(
+        raw.get("delete_branch_on_merge", True), "delete_branch_on_merge"
+    )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -185,6 +208,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         labels=labels_config,
         default_runner=default_runner,
         max_attempts=max_attempts,
+        delete_branch_on_merge=delete_branch_on_merge,
     )
 
     # Validate required fields

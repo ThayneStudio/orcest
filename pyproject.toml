@@ -29,6 +29,9 @@ dev = [
     "fakeredis[lua]>=2.21",
     "ruff>=0.4",
     "build>=1.0",
+    "pip-tools>=7.0",
+    "mypy>=1.0",
+    "types-PyYAML",
 ]
 
 [tool.ruff]
@@ -37,6 +40,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

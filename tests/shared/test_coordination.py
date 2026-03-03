@@ -1,6 +1,8 @@
 """Tests for orcest.shared.coordination using fakeredis."""
 
-from orcest.shared.coordination import RedisLock, make_pr_lock_key
+import pytest
+
+from orcest.shared.coordination import RedisLock, make_issue_lock_key, make_pr_lock_key
 
 
 def test_acquire_succeeds_on_free_key(fake_redis_client):
@@ -58,7 +60,12 @@ def test_refresh_by_non_owner_fails(fake_redis_client):
 
 def test_make_pr_lock_key_format():
     """make_pr_lock_key produces the expected key pattern."""
-    assert make_pr_lock_key(42) == "lock:pr:42"
+    assert make_pr_lock_key("owner/repo", 42) == "lock:pr:owner/repo:42"
+
+
+def test_make_issue_lock_key_format():
+    """make_issue_lock_key produces the expected key pattern."""
+    assert make_issue_lock_key("owner/repo", 7) == "lock:issue:owner/repo:7"
 
 
 def test_acquire_sets_ttl(fake_redis_client):
@@ -80,3 +87,26 @@ def test_release_by_non_owner_preserves_held_state(fake_redis_client):
     assert lock2.is_held is False
     lock2.release()
     assert lock2.is_held is False
+
+
+def test_context_manager_acquires_and_releases(fake_redis_client):
+    with RedisLock(fake_redis_client, "test-lock") as lock:
+        assert lock.is_held is True
+    assert lock.is_held is False
+
+
+def test_context_manager_raises_when_lock_held(fake_redis_client):
+    lock1 = RedisLock(fake_redis_client, "test-lock", owner="owner-1")
+    lock1.acquire()
+    with pytest.raises(RuntimeError, match="Failed to acquire lock"):
+        with RedisLock(fake_redis_client, "test-lock", owner="owner-2"):
+            pass
+
+
+def test_context_manager_releases_on_exception(fake_redis_client):
+    with pytest.raises(ValueError):
+        with RedisLock(fake_redis_client, "test-lock") as lock:
+            raise ValueError("boom")
+    assert lock.is_held is False
+    # Key should be gone — a new lock can acquire immediately
+    assert RedisLock(fake_redis_client, "test-lock").acquire() is True

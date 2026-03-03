@@ -15,11 +15,23 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN useradd --create-home --shell /bin/false orcest
 
-# Install orcest
+WORKDIR /home/orcest/app
+
+# Install dependencies in a separate layer for better cache reuse
 COPY pyproject.toml .
+RUN python3 - <<'PYEOF'
+import tomllib, subprocess, sys
+with open('pyproject.toml', 'rb') as f:
+    deps = tomllib.load(f)['project']['dependencies']
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + deps)
+PYEOF
+
+# Install orcest package (source only, deps already installed)
 COPY src/ src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps . && chown -R orcest:orcest /home/orcest/app
+
+USER orcest
 
 ENTRYPOINT ["orcest", "orchestrate"]

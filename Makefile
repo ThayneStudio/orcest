@@ -1,4 +1,4 @@
-.PHONY: test test-unit redis-up redis-down lint format
+.PHONY: test test-unit redis-up redis-down lint format lock
 
 # Unit tests only (no Redis needed)
 test-unit:
@@ -23,3 +23,6 @@ lint:
 
 format:
 	ruff format src/ tests/
+
+lock:
+	pip-compile pyproject.toml --output-file requirements.lock --strip-extras

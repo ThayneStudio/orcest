@@ -176,4 +176,9 @@ class Workspace:
         self._work_dir = None
 
         if temp is not None:
-            shutil.rmtree(temp, ignore_errors=True)
+            shutil.rmtree(
+                temp,
+                onexc=lambda func, path, exc: logger.warning(
+                    "Failed to remove workspace path %s via %s: %s", path, func.__name__, exc
+                ),
+            )

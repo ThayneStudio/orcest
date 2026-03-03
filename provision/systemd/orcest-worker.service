@@ -8,12 +8,18 @@ StartLimitIntervalSec=300
 Type=simple
 User=orcest
 WorkingDirectory=/opt/orcest
-ExecStart=/usr/local/bin/orcest work --id %H --config /opt/orcest/worker.yaml
+ExecStart=/opt/orcest/venv/bin/orcest work --id %H --config /opt/orcest/worker.yaml
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
 MemoryMax=4G
 Environment=PYTHONUNBUFFERED=1
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/orcest/workspaces
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
 EnvironmentFile=/opt/orcest/.env
 
 [Install]

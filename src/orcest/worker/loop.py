@@ -9,6 +9,7 @@ for the orchestrator.
 import logging
 import signal
 import sys
+import threading
 import time
 
 from orcest.shared.config import WorkerConfig
@@ -22,10 +23,42 @@ from orcest.worker.workspace import Workspace
 
 RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
+HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
 
 
-def run_worker(config: WorkerConfig) -> None:
-    """Main worker entry point. Blocks indefinitely."""
+def _make_abort_event(*events: threading.Event) -> threading.Event:
+    """Return an Event that is set when any of the given events fires.
+
+    Used to combine ``lock_lost`` and ``shutdown_event`` so that either a
+    lost heartbeat lock *or* a SIGTERM will interrupt retry-backoff sleeps
+    inside ``run_claude``.  Background daemon threads watch each input event
+    and set the combined event when any one of them fires.
+    """
+    combined = threading.Event()
+    # Short-circuit if any event is already set.
+    for ev in events:
+        if ev.is_set():
+            combined.set()
+            return combined
+
+    def _watch(ev: threading.Event) -> None:
+        ev.wait()
+        combined.set()
+
+    for ev in events:
+        threading.Thread(target=_watch, args=(ev,), daemon=True).start()
+    return combined
+
+
+def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
+    """Main worker entry point. Blocks indefinitely.
+
+    Args:
+        config: Worker configuration.
+        stop_event: Optional event to signal graceful shutdown from outside
+            (e.g. from a test harness). When set, the worker exits its loop
+            after the current iteration completes.
+    """
     logger = setup_logging("worker", config.worker_id)
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
@@ -50,11 +83,13 @@ def run_worker(config: WorkerConfig) -> None:
 
     # Graceful shutdown
     shutdown = False
+    shutdown_event = threading.Event()
 
     def handle_signal(signum: int, frame: object) -> None:
         nonlocal shutdown
         logger.info(f"Received signal {signum}, shutting down gracefully...")
         shutdown = True
+        shutdown_event.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -66,7 +101,7 @@ def run_worker(config: WorkerConfig) -> None:
         f"runner={config.runner.type}). Waiting for tasks..."
     )
 
-    while not shutdown:
+    while not shutdown and (stop_event is None or not stop_event.is_set()):
         # PR tasks have priority — non-blocking check first
         entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
@@ -116,13 +151,18 @@ def run_worker(config: WorkerConfig) -> None:
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
-            lock_key = make_issue_lock_key(task.resource_id)
+            lock_key = make_issue_lock_key(task.repo, task.resource_id)
         else:
-            lock_key = make_pr_lock_key(task.resource_id)
+            lock_key = make_pr_lock_key(task.repo, task.resource_id)
+        ttl = (
+            config.runner.timeout * config.runner.max_retries
+            + config.runner.retry_backoff * (config.runner.max_retries - 1)
+            + 120  # 2-minute safety buffer
+        )
         lock = RedisLock(
             redis,
             lock_key,
-            ttl=config.runner.timeout + 60,
+            ttl=ttl,
             owner=config.worker_id,
         )
 
@@ -138,10 +178,23 @@ def run_worker(config: WorkerConfig) -> None:
 
         logger.info(f"Acquired lock {lock_key}")
 
-        # Start heartbeat
-        heartbeat = Heartbeat(lock, logger=logger)
+        # Start heartbeat; signal lock_lost if the lock cannot be refreshed.
+        # Use an explicit interval independent of lock.ttl so the orphaned-lock
+        # window stays bounded even when the TTL grows large (see issue #121).
+        lock_lost = threading.Event()
+        heartbeat = Heartbeat(
+            lock,
+            interval=HEARTBEAT_INTERVAL,
+            logger=logger,
+            on_lock_lost=lock_lost.set,
+        )
         heartbeat.start()
 
+        # Combine lock_lost and shutdown_event so that either a lost lock *or*
+        # a SIGTERM immediately wakes retry-backoff sleeps inside run_claude.
+        # Before PR #98 the abort_event was shutdown_event directly; after that
+        # refactor it became lock_lost alone, losing the SIGTERM fast-exit path.
+        abort_event = _make_abort_event(lock_lost, shutdown_event)
         try:
             result = _execute_task(
                 task,
@@ -150,6 +203,7 @@ def run_worker(config: WorkerConfig) -> None:
                 workspace,
                 redis,
                 logger,
+                abort_event=abort_event,
             )
         except BaseException:
             # KeyboardInterrupt, SystemExit, or any other BaseException
@@ -162,17 +216,26 @@ def run_worker(config: WorkerConfig) -> None:
         else:
             # Normal path: stop heartbeat and release lock
             heartbeat.stop()
+            # safe no-op if lock already expired — release() verifies owner token via Lua
             lock.release()
-            logger.info(f"Released lock {lock_key}")
+            if lock_lost.is_set():
+                logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
+            else:
+                logger.info(f"Released lock {lock_key}")
 
-        # Publish result and ACK (only reached on normal execution)
+        # Publish result, then ACK only if publish succeeded.
+        # If publish fails, leave the message pending so XPENDING recovery
+        # can re-deliver it. Duplicate work risk < silent result loss.
         try:
-            redis.xadd(RESULTS_STREAM, result.to_dict())
+            redis.xadd_capped(RESULTS_STREAM, result.to_dict())
             logger.info(f"Published result for task {task.id}: {result.status.value}")
         except Exception:
-            logger.error(f"Failed to publish result for task {task.id}", exc_info=True)
-            # Continue to ACK to avoid redelivery -- the orchestrator will
-            # detect the missing result and may re-enqueue if needed
+            logger.error(
+                f"Failed to publish result for task {task.id}; not ACKing so it "
+                "remains in XPENDING for re-delivery",
+                exc_info=True,
+            )
+            continue
 
         try:
             redis.xack(current_stream, CONSUMER_GROUP, entry_id)
@@ -263,6 +326,7 @@ def _execute_task(
     workspace: Workspace,
     redis: RedisClient,
     logger: logging.Logger,
+    abort_event: threading.Event | None = None,
 ) -> TaskResult:
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
@@ -311,6 +375,7 @@ def _execute_task(
             timeout=config.runner.timeout,
             logger=logger,
             on_output=on_output,
+            abort_event=abort_event,
         )
 
         duration = int(time.monotonic() - start)

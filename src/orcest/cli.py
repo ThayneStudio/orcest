@@ -1,8 +1,22 @@
 """CLI entry point for orcest."""
 
+import re
+
 import click
 from rich.console import Console
 from rich.table import Table
+
+_SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _validate_ssh_input(value: str, label: str) -> None:
+    """Raise click.BadParameter if value contains shell metacharacters."""
+    if not _SSH_INPUT_RE.match(value):
+        raise click.BadParameter(
+            f"Invalid {label} {value!r}: only alphanumerics, dots, hyphens,"
+            " and underscores are allowed.",
+            param_hint=label,
+        )
 
 
 @click.group()
@@ -99,7 +113,11 @@ def _status_once(redis):
     client = redis.client
 
     task_streams = list(client.scan_iter(match="tasks:*"))
-    results_len = client.xlen("results") or 0
+    try:
+        results_len = client.xlen("results") or 0
+    except redis_lib.ResponseError:
+        # WRONGTYPE: results key exists but is not a stream
+        results_len = "(not a stream)"
 
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
@@ -116,6 +134,8 @@ def _status_once(redis):
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
+        except redis_lib.RedisError as e:
+            console.print(f"  [yellow]Could not read groups for {stream_key}: {e}[/yellow]")
 
     console.print("\n[bold]Orcest System Status[/bold]\n")
 
@@ -123,7 +143,11 @@ def _status_once(redis):
     table.add_column("Stream", style="cyan")
     table.add_column("Pending", style="yellow")
     for stream_key in sorted(task_streams):
-        table.add_row(stream_key, str(client.xlen(stream_key) or 0))
+        try:
+            table.add_row(stream_key, str(client.xlen(stream_key) or 0))
+        except redis_lib.ResponseError:
+            # WRONGTYPE: key exists but is not a stream
+            table.add_row(stream_key, "(not a stream)")
     if not task_streams:
         table.add_row("tasks:*", "0")
     table.add_row("results", str(results_len))
@@ -171,7 +195,8 @@ def init(config):
     ]
 
     env = dict(os.environ)
-    env.update({"GITHUB_TOKEN": cfg.github.token, "GH_TOKEN": cfg.github.token})
+    env["GITHUB_TOKEN"] = cfg.github.token
+    env["GH_TOKEN"] = cfg.github.token
 
     failures = 0
     for name, color, description in labels:
@@ -224,6 +249,9 @@ def provision(host, user, worker_config, env_file):
     import os
     import subprocess
     import sys
+
+    _validate_ssh_input(host, "host")
+    _validate_ssh_input(user, "user")
 
     console = Console()
     ssh_target = f"{user}@{host}" if user else host
@@ -378,6 +406,9 @@ def provision_orchestrator(host, user, orch_config, env_file):
     import subprocess
     import sys
     import tempfile
+
+    _validate_ssh_input(host, "host")
+    _validate_ssh_input(user, "user")
 
     console = Console()
     ssh_target = f"{user}@{host}" if user else host

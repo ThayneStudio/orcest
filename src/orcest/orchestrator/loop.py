@@ -47,22 +47,23 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     def handle_signal(signum: int, frame: object) -> None:
         nonlocal shutdown
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        logger.info("Received signal %d, shutting down gracefully...", signum)
         shutdown = True
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
     logger.info(
-        f"Orchestrator started. Repo: {config.github.repo}, "
-        f"poll interval: {config.polling.interval}s"
+        "Orchestrator started. Repo: %s, poll interval: %ds",
+        config.github.repo,
+        config.polling.interval,
     )
 
     while not shutdown:
         try:
             _poll_cycle(config, redis, logger)
         except Exception as e:
-            logger.error(f"Poll cycle failed: {e}", exc_info=True)
+            logger.error("Poll cycle failed: %s", e, exc_info=True)
             # Continue after error -- don't crash the loop
 
         # Wait for next cycle (interruptible in 1-second chunks)
@@ -112,12 +113,13 @@ def _poll_cycle(
     merged = 0
     for pr_state in pr_states:
         if pr_state.action == PRAction.MERGE:
-            logger.info(f"PR #{pr_state.number} ({pr_state.title}): merging")
+            logger.info("PR #%d (%s): merging", pr_state.number, pr_state.title)
             try:
                 gh.merge_pr(
                     config.github.repo,
                     pr_state.number,
                     config.github.token,
+                    delete_branch=config.delete_branch_on_merge,
                 )
                 merged += 1
             except Exception as e:
@@ -204,11 +206,13 @@ def _poll_cycle(
                     )
                 except Exception as comment_err:
                     logger.warning(
-                        f"Merged PR #{pr_state.number} but failed to post comment: {comment_err}",
+                        "Merged PR #%d but failed to post comment: %s",
+                        pr_state.number,
+                        comment_err,
                         exc_info=True,
                     )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
-            logger.info(f"PR #{pr_state.number} ({pr_state.title}): enqueueing fix task")
+            logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
                 publish_fix_task(
                     pr_state=pr_state,
@@ -221,11 +225,13 @@ def _poll_cycle(
                 enqueued += 1
             except Exception as e:
                 logger.error(
-                    f"Failed to publish fix task for PR #{pr_state.number}: {e}",
+                    "Failed to publish fix task for PR #%d: %s",
+                    pr_state.number,
+                    e,
                     exc_info=True,
                 )
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
-            logger.info(f"PR #{pr_state.number} ({pr_state.title}): enqueueing followup triage")
+            logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
             try:
                 publish_followup_task(
                     pr_state=pr_state,
@@ -238,15 +244,19 @@ def _poll_cycle(
                 enqueued += 1
             except Exception as e:
                 logger.error(
-                    f"Failed to publish followup task for PR #{pr_state.number}: {e}",
+                    "Failed to publish followup task for PR #%d: %s",
+                    pr_state.number,
+                    e,
                     exc_info=True,
                 )
         elif pr_state.action == PRAction.SKIP_GREEN:
-            logger.debug(f"PR #{pr_state.number}: CI green, skipping")
+            logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_LOCKED:
-            logger.debug(f"PR #{pr_state.number}: locked, skipping")
+            logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:
-            logger.warning(f"PR #{pr_state.number}: max attempts reached, adding needs-human label")
+            logger.warning(
+                "PR #%d: max attempts reached, adding needs-human label", pr_state.number
+            )
             labeled = False
             try:
                 gh.add_label(
@@ -258,7 +268,9 @@ def _poll_cycle(
                 labeled = True
             except Exception as e:
                 logger.error(
-                    f"Failed to label PR #{pr_state.number} as needs-human: {e}",
+                    "Failed to label PR #%d as needs-human: %s",
+                    pr_state.number,
+                    e,
                     exc_info=True,
                 )
             try:
@@ -279,11 +291,13 @@ def _poll_cycle(
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to comment on PR #{pr_state.number} about max attempts: {e}",
+                    "Failed to comment on PR #%d about max attempts: %s",
+                    pr_state.number,
+                    e,
                     exc_info=True,
                 )
         elif pr_state.action == PRAction.SKIP_DRAFT:
-            logger.debug(f"PR #{pr_state.number}: draft, skipping")
+            logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:
             logger.debug(f"PR #{pr_state.number}: CI pending, skipping")
         elif pr_state.action == PRAction.SKIP_ACTIVE:
@@ -291,7 +305,9 @@ def _poll_cycle(
         elif pr_state.action == PRAction.SKIP_LABELED:
             logger.debug(f"PR #{pr_state.number}: terminal label, skipping")
         else:
-            logger.warning(f"PR #{pr_state.number}: unhandled action {pr_state.action!r}, skipping")
+            logger.warning(
+                "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action
+            )
 
     # Step 4: Discover issues needing implementation
     # Prioritize existing PRs over new issue work. PRs with terminal
@@ -474,7 +490,9 @@ def _consume_results(
                 _handle_result(config, redis, result, logger)
             except Exception as e:
                 logger.error(
-                    f"Failed to process result entry {entry_id}: {e}",
+                    "Failed to process result entry %s: %s",
+                    entry_id,
+                    e,
                     exc_info=True,
                 )
             # Always ACK to prevent infinite reprocessing of
@@ -483,7 +501,9 @@ def _consume_results(
                 redis.xack(RESULTS_STREAM, RESULTS_GROUP, entry_id)
             except Exception as ack_err:
                 logger.error(
-                    f"Failed to ACK result entry {entry_id}: {ack_err}",
+                    "Failed to ACK result entry %s: %s",
+                    entry_id,
+                    ack_err,
                     exc_info=True,
                 )
 
@@ -504,8 +524,11 @@ def _handle_result(
     - usage_exhausted: no label changes (task stays parked as SKIP_ACTIVE)
     """
     logger.info(
-        f"Result for task {result.task_id}: {result.status.value} "
-        f"(worker: {result.worker_id}, {result.duration_seconds}s)"
+        "Result for task %s: %s (worker: %s, %ss)",
+        result.task_id,
+        result.status.value,
+        result.worker_id,
+        result.duration_seconds,
     )
 
     repo = config.github.repo
@@ -631,4 +654,4 @@ def _handle_result(
             exc_info=True,
         )
 
-    logger.info(f"Result comment: {body[:100]}...")
+    logger.info("Result comment: %s...", body[:100])

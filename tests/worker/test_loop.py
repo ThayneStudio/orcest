@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,8 +13,10 @@ from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
     CONSUMER_GROUP,
+    HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
     _execute_task,
+    _make_abort_event,
     run_worker,
 )
 from orcest.worker.runner import RunnerResult
@@ -63,6 +66,54 @@ def _success_runner_result() -> RunnerResult:
 
 def _failure_runner_result() -> RunnerResult:
     return RunnerResult(success=False, summary="Could not resolve merge conflict")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _make_abort_event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMakeAbortEvent:
+    """Tests for the _make_abort_event combined-event helper."""
+
+    def test_fires_when_first_event_set(self):
+        """Combined event fires when the first input event fires."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _make_abort_event(e1, e2)
+        assert not combined.is_set()
+        e1.set()
+        assert combined.wait(timeout=1), "combined should fire when e1 fires"
+
+    def test_fires_when_second_event_set(self):
+        """Combined event fires when the second input event fires."""
+        e1, e2 = threading.Event(), threading.Event()
+        combined = _make_abort_event(e1, e2)
+        assert not combined.is_set()
+        e2.set()
+        assert combined.wait(timeout=1), "combined should fire when e2 fires"
+
+    def test_already_set_short_circuits(self):
+        """Combined event is immediately set when any input is already set."""
+        e1, e2 = threading.Event(), threading.Event()
+        e1.set()
+        combined = _make_abort_event(e1, e2)
+        assert combined.is_set()
+
+    def test_shutdown_event_wakes_abort_sleep(self):
+        """SIGTERM (shutdown_event) wakes the abort event used in retry-backoff sleeps.
+
+        This is the regression test for issue #148: after PR #98 changed
+        abort_event from shutdown_event to lock_lost, SIGTERM no longer
+        interrupted retry-backoff sleeps.  _make_abort_event restores that.
+        """
+        shutdown_event = threading.Event()
+        lock_lost = threading.Event()
+        abort = _make_abort_event(lock_lost, shutdown_event)
+
+        assert not abort.is_set()
+        shutdown_event.set()
+        assert abort.wait(timeout=1), "abort event must wake when shutdown_event fires"
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +363,52 @@ class TestExecuteTask:
         ]
         assert len(output_warnings) == 1
 
+    def test_abort_event_passed_to_runner(self, local_worker_config, sample_task, mock_workspace):
+        """_execute_task passes abort_event to runner.run()."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _success_runner_result()
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        abort_event = threading.Event()
+
+        _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+            abort_event=abort_event,
+        )
+
+        call_kwargs = mock_runner.run.call_args[1]
+        assert call_kwargs.get("abort_event") is abort_event
+
+    def test_lock_lost_returns_failed(self, local_worker_config, sample_task, mock_workspace):
+        """When abort_event is pre-set, runner returns failure and result is FAILED."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _failure_runner_result()
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        abort_event = threading.Event()
+        abort_event.set()  # Simulate lock already lost
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+            abort_event=abort_event,
+        )
+
+        assert result.status == ResultStatus.FAILED
+
     def test_worker_task_start_publish_failure_continues(
         self, local_worker_config, sample_task, mock_workspace
     ):
@@ -470,10 +567,11 @@ class TestRunWorker:
         # Verify runner was called
         mocks["runner"].run.assert_called_once()
         # Verify result was published to the results stream
-        mock_redis.xadd.assert_called_once()
-        call_args = mock_redis.xadd.call_args
-        assert call_args[0][0] == RESULTS_STREAM
-        result_fields = call_args[0][1]
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.COMPLETED.value
         assert result_fields["task_id"] == sample_task.id
 
@@ -490,9 +588,15 @@ class TestRunWorker:
         mock_redis.client.set.assert_called_once()
         set_call = mock_redis.client.set.call_args
         lock_key = set_call[0][0]
-        assert lock_key == f"lock:pr:{sample_task.resource_id}"
+        assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
-        assert set_call[1]["ex"] == worker_config.runner.timeout + 60
+        runner = worker_config.runner
+        expected_ttl = (
+            runner.timeout * runner.max_retries
+            + runner.retry_backoff * (runner.max_retries - 1)
+            + 120
+        )
+        assert set_call[1]["ex"] == expected_ttl
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
@@ -528,9 +632,11 @@ class TestRunWorker:
         run_worker(worker_config)
 
         # Verify the published result
-        mock_redis.xadd.assert_called_once()
-        stream, result_dict = mock_redis.xadd.call_args[0]
-        assert stream == RESULTS_STREAM
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_dict = results_calls[0][0][1]
         parsed = TaskResult.from_dict(result_dict)
         assert parsed.status == ResultStatus.COMPLETED
         assert parsed.task_id == sample_task.id
@@ -546,9 +652,11 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        mock_redis.xadd.assert_called_once()
-        stream, result_dict = mock_redis.xadd.call_args[0]
-        assert stream == RESULTS_STREAM
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_dict = results_calls[0][0][1]
         parsed = TaskResult.from_dict(result_dict)
         assert parsed.status == ResultStatus.FAILED
         assert "merge conflict" in parsed.summary.lower()
@@ -567,21 +675,27 @@ class TestRunWorker:
         # Should never attempt to read from the stream
         mock_redis.xreadgroup.assert_not_called()
 
-    def test_worker_result_publish_failure_still_acks(self, mocker, worker_config, sample_task):
-        """When redis.xadd for the results stream raises, xack is still called."""
+    def test_worker_result_publish_failure_does_not_ack(self, mocker, worker_config, sample_task):
+        """When redis.xadd_capped for the results stream raises, xack must NOT be called.
+        The message stays in XPENDING so it can be re-delivered and the result
+        is not silently lost."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         # Make the results-stream publish fail
-        mock_redis.xadd.side_effect = ConnectionError("Redis unavailable")
+        def _xadd_capped_side_effect(stream, data, **kwargs):
+            if stream == RESULTS_STREAM:
+                raise ConnectionError("Redis unavailable")
+            return "1-0"
+
+        mock_redis.xadd_capped.side_effect = _xadd_capped_side_effect
 
         run_worker(worker_config)
 
-        # Despite the xadd failure, xack must still be called to avoid redelivery
-        expected_stream = f"tasks:{worker_config.backend}"
-        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-1")
+        # xack must NOT be called — leave the message in XPENDING for re-delivery
+        mock_redis.xack.assert_not_called()
 
     def test_worker_malformed_task_acks_and_continues(self, mocker, worker_config):
         """When a stream entry cannot be deserialized, the worker ACKs it
@@ -657,3 +771,62 @@ class TestRunWorker:
         # The pending entry must be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
+
+    def test_heartbeat_uses_explicit_interval_not_lock_ttl(
+        self, mocker, worker_config, sample_task
+    ):
+        """Heartbeat must be started with HEARTBEAT_INTERVAL, not lock.ttl / 3.
+
+        Regression test for issue #121: after PR #83 raised the lock TTL to
+        ~5540 s, the default heartbeat interval (ttl/3 ~= 1847 s) caused
+        crashed workers to hold stale locks for up to ~92 minutes.  The fix
+        passes an explicit HEARTBEAT_INTERVAL so refresh cadence is decoupled
+        from TTL size.
+        """
+        mock_redis = self._build_mock_redis()
+        mock_heartbeat_cls = MagicMock()
+        mock_heartbeat_instance = MagicMock()
+        mock_heartbeat_cls.return_value = mock_heartbeat_instance
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocker.patch("orcest.worker.loop.Heartbeat", mock_heartbeat_cls)
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        mock_heartbeat_cls.assert_called_once()
+        _, kwargs = mock_heartbeat_cls.call_args
+        assert "interval" in kwargs, "Heartbeat must receive an explicit interval kwarg"
+        assert kwargs["interval"] == HEARTBEAT_INTERVAL
+
+    def test_worker_base_exception_releases_lock_and_stops_heartbeat(
+        self, mocker, worker_config, sample_task
+    ):
+        """When _execute_task raises a BaseException (e.g. KeyboardInterrupt),
+        heartbeat.stop() and lock.release() are called before the exception
+        propagates out of run_worker."""
+        mock_redis = self._build_mock_redis()
+
+        # Capture the mocked heartbeat and lock so we can assert on them.
+        mock_heartbeat = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocker.patch("orcest.worker.loop.Heartbeat", return_value=mock_heartbeat)
+        mocker.patch("orcest.worker.loop.RedisLock", return_value=mock_lock)
+        mocker.patch(
+            "orcest.worker.loop._execute_task",
+            side_effect=KeyboardInterrupt(),
+        )
+
+        self._configure_one_iteration(
+            mock_redis, sample_task, mocks["signal_handlers"]
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            run_worker(worker_config)
+
+        # Both cleanup methods must be invoked before the exception propagates.
+        mock_heartbeat.stop.assert_called_once()
+        mock_lock.release.assert_called_once()

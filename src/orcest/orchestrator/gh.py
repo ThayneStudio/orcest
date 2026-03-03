@@ -79,7 +79,7 @@ def _run_gh(args: list[str], token: str) -> str:
         if len(args) > 4:
             brief += " ..."
         raise GhCliError(
-            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
+            f"gh command timed out after {exc.timeout}s: gh {brief}",
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise GhCliError(
@@ -91,56 +91,16 @@ def _run_gh(args: list[str], token: str) -> str:
     return result.stdout.strip()
 
 
-def _run_gh_bytes(args: list[str], token: str) -> bytes:
-    """Execute a gh CLI command and return raw stdout bytes.
-
-    Same as _run_gh but does not decode output. Useful for endpoints
-    that return binary data (e.g., log zip files).
-
-    Raises:
-        GhNotInstalledError: If the gh CLI binary is not on PATH.
-        GhCliError: On non-zero exit, with stderr included in the message.
-    """
-    env = os.environ.copy()
-    env["GITHUB_TOKEN"] = token
-    env["GH_TOKEN"] = token
-
-    try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True,
-            env=env,
-            check=True,
-            timeout=_GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        raise GhNotInstalledError(
-            "gh CLI not found on PATH. Install it from https://cli.github.com/"
-        ) from None
-    except subprocess.TimeoutExpired as exc:
-        # Truncate args to avoid dumping entire GraphQL queries into logs
-        brief = " ".join(args[:4])
-        if len(args) > 4:
-            brief += " ..."
-        raise GhCliError(
-            f"gh command timed out after {_GH_TIMEOUT_SECONDS}s: gh {brief}",
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-        raise GhCliError(
-            f"gh command failed (exit {exc.returncode}): {stderr_text.strip()}",
-            stderr=stderr_text,
-            returncode=exc.returncode,
-        ) from exc
-
-    return result.stdout
-
-
-def list_open_prs(repo: str, token: str) -> list[dict]:
+def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
     headRefOid, isDraft, author, createdAt, labels, reviewDecision.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        token: GitHub token.
+        limit: Maximum number of PRs to fetch. Defaults to 100.
     """
     _validate_repo(repo)
     output = _run_gh(
@@ -154,7 +114,7 @@ def list_open_prs(repo: str, token: str) -> list[dict]:
             "--json",
             "number,title,headRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision",
             "--limit",
-            "100",
+            str(limit),
         ],
         token,
     )
@@ -188,9 +148,23 @@ def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
 
     Returns list of dicts with: name, status, conclusion, detailsUrl.
     """
-    pr = get_pr(repo, pr_number, token)
-    checks = pr.get("statusCheckRollup") or []
-    return checks
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--json",
+            "statusCheckRollup",
+        ],
+        token,
+    )
+    if not output:
+        return []
+    data = json.loads(output)
+    return data.get("statusCheckRollup") or []
 
 
 def get_pr_diff(repo: str, number: int, token: str) -> str:
@@ -203,22 +177,6 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
             str(number),
             "--repo",
             repo,
-        ],
-        token,
-    )
-
-
-def get_check_run_logs(repo: str, run_id: int, token: str) -> bytes:
-    """Get logs for a specific check run.
-
-    Uses gh api to fetch the logs. The GitHub API returns a zip file,
-    so this returns raw bytes that the caller must unzip.
-    """
-    _validate_repo(repo)
-    return _run_gh_bytes(
-        [
-            "api",
-            f"repos/{repo}/actions/runs/{run_id}/logs",
         ],
         token,
     )
@@ -304,7 +262,7 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
 
 
 def post_comment(repo: str, number: int, body: str, token: str) -> None:
-    """Post a comment on a PR/issue.
+    """Post a comment on a PR or issue.
 
     Uses --body-file with a temp file to avoid argument length limits
     and to prevent any interpretation of special characters in the body.
@@ -330,25 +288,40 @@ def post_comment(repo: str, number: int, body: str, token: str) -> None:
 _VALID_MERGE_METHODS = {"squash", "merge", "rebase"}
 
 
-def merge_pr(repo: str, number: int, token: str, method: str = "squash") -> None:
-    """Merge a PR. Raises GhCliError on failure."""
+def merge_pr(
+    repo: str,
+    number: int,
+    token: str,
+    method: str = "squash",
+    delete_branch: bool = True,
+) -> None:
+    """Merge a PR. Raises GhCliError on failure.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        number: PR number to merge.
+        token: GitHub token.
+        method: Merge method — one of 'squash', 'merge', or 'rebase'.
+        delete_branch: Whether to delete the head branch after merging.
+            Defaults to True. Set to False if branch protection rules
+            prevent deletion or if you prefer to keep branches post-merge.
+    """
     if method not in _VALID_MERGE_METHODS:
         raise ValueError(
             f"Invalid merge method: {method!r}. Must be one of {sorted(_VALID_MERGE_METHODS)}."
         )
     _validate_repo(repo)
-    _run_gh(
-        [
-            "pr",
-            "merge",
-            str(number),
-            "--repo",
-            repo,
-            f"--{method}",
-            "--delete-branch",
-        ],
-        token,
-    )
+    args = [
+        "pr",
+        "merge",
+        str(number),
+        "--repo",
+        repo,
+        f"--{method}",
+    ]
+    if delete_branch:
+        args.append("--delete-branch")
+    _run_gh(args, token)
 
 
 def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[dict]:
@@ -364,11 +337,11 @@ def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[di
     owner, name = repo.split("/", 1)
 
     query = """
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
-        pageInfo { hasNextPage }
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           path
@@ -390,8 +363,14 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }
 """
 
-    output = _run_gh(
-        [
+    all_thread_nodes: list[dict] = []
+    cursor: str | None = None
+    MAX_PAGES = 50  # safety cap; 50 × 100 = 5 000 threads
+    page_count = 0
+
+    while page_count < MAX_PAGES:
+        page_count += 1
+        args = [
             "api",
             "graphql",
             "-f",
@@ -402,47 +381,72 @@ query($owner: String!, $repo: String!, $number: Int!) {
             f"number={number}",
             "-f",
             f"query={query}",
-        ],
-        token,
-    )
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"after={cursor}"])
 
-    if not output:
-        raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
+        output = _run_gh(args, token)
 
-    data = json.loads(output)
+        if not output:
+            raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
 
-    # GraphQL can return HTTP 200 with errors in the body. Raise so
-    # callers don't mistake a failed query for "no threads" (which
-    # could trigger an incorrect auto-merge).
-    if "errors" in data:
-        msgs = [e.get("message", str(e)) for e in data["errors"]]
-        raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
+        data = json.loads(output)
 
-    repo_data = (data.get("data") or {}).get("repository")
-    if not repo_data:
-        raise GhCliError(
-            f"GraphQL returned null repository for {repo!r} — "
-            "check that the repo exists and the token has access"
-        )
-    pr_node = repo_data.get("pullRequest")
-    if not pr_node:
-        raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
-    review_threads = pr_node.get("reviewThreads") or {}
-    threads = review_threads.get("nodes") or []
+        # GraphQL can return HTTP 200 with errors in the body. Raise so
+        # callers don't mistake a failed query for "no threads" (which
+        # could trigger an incorrect auto-merge).
+        if "errors" in data:
+            msgs = [e.get("message", str(e)) for e in data["errors"]]
+            raise GhCliError(f"GraphQL errors fetching review threads: {'; '.join(msgs)}")
 
-    # If there are more threads than our page size (100), we risk missing
-    # unresolved ones. Raise rather than silently returning an incomplete
-    # list, which could trigger an incorrect auto-merge.
-    page_info = review_threads.get("pageInfo") or {}
-    if page_info.get("hasNextPage"):
-        raise GhCliError(
-            f"PR #{number} in {repo} has more than 100 review threads; "
-            "pagination not implemented — cannot guarantee all unresolved "
-            "threads have been fetched"
-        )
+        repo_data = (data.get("data") or {}).get("repository")
+        if not repo_data:
+            raise GhCliError(
+                f"GraphQL returned null repository for {repo!r} — "
+                "check that the repo exists and the token has access"
+            )
+        pr_node = repo_data.get("pullRequest")
+        if not pr_node:
+            raise GhCliError(f"GraphQL returned null pullRequest for PR #{number} in {repo}")
+        review_threads = pr_node.get("reviewThreads") or {}
+        all_thread_nodes.extend(review_threads.get("nodes") or [])
+
+        page_info = review_threads.get("pageInfo") or {}
+        if page_info.get("hasNextPage"):
+            if cursor is None:
+                logger.warning(
+                    "PR #%d in %s has more than 100 review threads; fetching additional pages",
+                    number,
+                    repo,
+                )
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                # Safety guard: hasNextPage is True but no cursor returned.
+                logger.warning(
+                    "PR #%d in %s: hasNextPage is True but endCursor is missing; "
+                    "stopping pagination with %d threads fetched so far",
+                    number,
+                    repo,
+                    len(all_thread_nodes),
+                )
+                break
+        else:
+            break
+    else:
+        # Loop exhausted MAX_PAGES without a natural break.
+        page_info = review_threads.get("pageInfo") or {}  # type: ignore[possibly-undefined]
+        if page_info.get("hasNextPage"):
+            logger.warning(
+                "PR #%d in %s: reached MAX_PAGES (%d) pagination limit; "
+                "some review threads may have been truncated (%d fetched so far)",
+                number,
+                repo,
+                MAX_PAGES,
+                len(all_thread_nodes),
+            )
 
     results = []
-    for thread in threads:
+    for thread in all_thread_nodes:
         if thread.get("isResolved"):
             continue
         comments_data = thread.get("comments") or {}
@@ -472,6 +476,58 @@ query($owner: String!, $repo: String!, $number: Int!) {
         )
 
     return results
+
+
+def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
+    """Get inline review comments for a PR.
+
+    Uses the /pulls/{number}/comments REST endpoint to fetch line-specific
+    review comments left by reviewers. Unlike get_unresolved_review_threads,
+    this returns all inline comments (not just unresolved ones) and uses the
+    REST API rather than GraphQL.
+
+    Fetches all pages of results using --paginate.
+
+    Returns list of dicts with keys: path, line, author, body.
+    """
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "api",
+            "--paginate",
+            f"repos/{repo}/pulls/{number}/comments",
+            "-F",
+            "per_page=100",  # fetch 100 per page for efficiency
+        ],
+        token,
+    )
+    if not output:
+        return []
+    # --paginate concatenates one JSON array per page: [page1][page2]...
+    # Parse all pages and flatten into a single list.
+    comments: list[dict] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    text = output.strip()
+    while idx < len(text):
+        page, end_idx = decoder.raw_decode(text, idx)
+        comments.extend(page)
+        idx = end_idx
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+    results = []
+    for comment in comments:
+        line = comment.get("line")
+        results.append(
+            {
+                "path": comment.get("path", ""),
+                "line": line if line is not None else comment.get("original_line"),
+                "author": (comment.get("user") or {}).get("login", ""),
+                "body": comment.get("body", ""),
+            }
+        )
+    return results
+
 
 
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
@@ -518,6 +574,7 @@ def get_issue(repo: str, number: int, token: str) -> dict:
     if not output:
         raise GhCliError(f"gh issue view returned empty output for issue #{number}")
     return json.loads(output)
+
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:

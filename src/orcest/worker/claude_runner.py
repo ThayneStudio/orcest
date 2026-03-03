@@ -8,6 +8,7 @@ Timeouts and usage exhaustion are NOT retried.
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -19,14 +20,31 @@ from pathlib import Path
 from orcest.worker.runner import RunnerResult
 
 # Patterns that indicate Claude usage/rate limit exhaustion.
-# Checked against both stderr and stdout (case-insensitive).
+# Checked against stderr only (case-insensitive).
 _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
     ("usage", "limit"),
-    ("rate", "limit"),
     ("quota", "exceeded"),
     ("token limit", ""),
     ("billing", "limit"),
 ]
+
+# Anchored regex for rate-limit errors.  Two intentional constraints:
+#
+# 1. Word-order: the indicator (exceeded/reached/hit/error) must appear *after*
+#    "rate limit", so inverted-order phrases like "You've hit the rate limit"
+#    won't match.  False positives are the bigger risk; this is deliberate.
+#
+# 2. End-of-line anchor (\s*$): the indicator must be near the end of the line,
+#    which rejects casual mentions like "rate limit exceeded in user-authored code"
+#    while matching clean API error lines like "rate limit exceeded".
+#    Trade-off: messages with trailing context on the same line (e.g.
+#    "rate limit exceeded, retry after 60s") won't match.  The primary false-
+#    positive guard is that this regex is only ever checked against stderr
+#    (see _is_usage_exhausted), not user-visible stdout.
+_RATE_LIMIT_RE = re.compile(
+    r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Environment variables that are safe to forward to the Claude subprocess.
 # We use an allowlist rather than os.environ.copy() to avoid leaking secrets
@@ -97,26 +115,51 @@ def _is_usage_exhausted(stderr: str) -> bool:
     excluded because stream-json output contains ``"usage": {...}`` in
     every API response message, causing false positives when the word
     "limit" also appears anywhere in Claude's text output or the prompt.
+    Returns True if any pattern matches.
     """
+    if _RATE_LIMIT_RE.search(stderr):
+        return True
     text = stderr.lower()
     for primary, secondary in _USAGE_EXHAUSTION_PATTERNS:
+        # When secondary is empty, only the primary keyword is required.
         if primary in text and (not secondary or secondary in text):
             return True
     return False
 
 
-def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
     """Kill a subprocess and all its children via process group signal.
 
     Because we launch with start_new_session=True, the subprocess is
-    the leader of its own process group.  Sending SIGKILL to the group
+    the leader of its own process group.  Sending signals to the group
     ensures child processes (e.g. Node.js subprocesses spawned by Claude
     CLI) are also terminated.
+
+    Sends SIGTERM first to allow Claude to exit cleanly, waits up to
+    ``sigterm_timeout`` seconds, then sends SIGKILL if still alive.
     """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError):
         # Process already exited or we lost permission -- nothing to do.
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    try:
+        proc.wait(timeout=sigterm_timeout)
+        # Leader exited cleanly; fall through to SIGKILL the group for any remaining children.
+    except subprocess.TimeoutExpired:
+        # Leader ignored SIGTERM; SIGKILL below will force-terminate the whole group.
+        pass
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Process already exited between SIGTERM and SIGKILL -- nothing to do.
         pass
 
 
@@ -172,6 +215,7 @@ def run_claude(
     retry_backoff: int = 10,
     logger: logging.Logger | None = None,
     on_output: Callable[[str], None] | None = None,
+    abort_event: threading.Event | None = None,
 ) -> ClaudeResult:
     """Execute Claude CLI and return parsed result.
 
@@ -195,12 +239,20 @@ def run_claude(
         retry_backoff: Seconds between retries.
         logger: Optional logger for status messages.
         on_output: Optional callback invoked with each stdout line.
+        abort_event: Optional event that, when set, interrupts retry backoff
+            and aborts the running subprocess so the worker can respond to a
+            lost lock without waiting the full delay.
 
     Returns:
         ClaudeResult with success flag, summary, and timing.
     """
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
+
+    # Use a dedicated event for interruptible backoff sleeps.  If no
+    # external abort event is provided, create a local one that is
+    # never set so event.wait(timeout=N) behaves like time.sleep(N).
+    _abort = abort_event if abort_event is not None else threading.Event()
 
     env = _build_env(token)
 
@@ -274,7 +326,9 @@ def run_claude(
                     logger.warning(
                         f"Failed to create stderr drain thread; retrying in {retry_backoff}s...",
                     )
-                time.sleep(retry_backoff)
+                _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         # Read stdout line-by-line, streaming to on_output
@@ -299,9 +353,10 @@ def run_claude(
         watchdog_cancelled = threading.Event()
         watchdog_killed = threading.Event()
         watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
+        assert proc is not None
 
         def _watchdog(
-            _proc: subprocess.Popen[str] = proc,
+            _proc: subprocess.Popen[str] = proc,  # type: ignore[assignment]
             _remaining: float = watchdog_remaining,
             _cancelled: threading.Event = watchdog_cancelled,
             _killed: threading.Event = watchdog_killed,
@@ -335,7 +390,9 @@ def run_claude(
                     logger.warning(
                         f"Failed to create watchdog thread; retrying in {retry_backoff}s...",
                     )
-                time.sleep(retry_backoff)
+                _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         try:
@@ -354,7 +411,31 @@ def run_claude(
                                 "disabling streaming for remaining attempts",
                                 exc_info=True,
                             )
+                        # Disable streaming for all remaining retry attempts to avoid log spam
                         on_output = None
+                if abort_event is not None and abort_event.is_set():
+                    watchdog_cancelled.set()
+                    watchdog_thread.join(timeout=5)
+                    _kill_process_tree(proc)
+                    stderr_thread.join(timeout=5)
+                    _close_pipes(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    duration = int(time.monotonic() - start_time)
+                    if logger:
+                        logger.warning("Claude subprocess killed: lock lost")
+                    return ClaudeResult(
+                        success=False,
+                        summary="Aborted: lock lost",
+                        duration_seconds=duration,
+                        raw_output="".join(stdout_lines),
+                    )
                 if time.monotonic() - attempt_start >= timeout:
                     timed_out = True
                     break
@@ -395,7 +476,9 @@ def run_claude(
             if attempt < max_retries:
                 if logger:
                     logger.info(f"Retrying in {retry_backoff}s...")
-                time.sleep(retry_backoff)
+                _abort.wait(timeout=retry_backoff)
+                if _abort.is_set():
+                    break
             continue
 
         # Cancel the watchdog -- stdout reading finished (normally
@@ -492,7 +575,9 @@ def run_claude(
         if attempt < max_retries:
             if logger:
                 logger.info(f"Retrying in {retry_backoff}s...")
-            time.sleep(retry_backoff)
+            _abort.wait(timeout=retry_backoff)
+            if _abort.is_set():
+                break
 
     # All retries exhausted -- include stderr from the most recent
     # attempt that successfully started a drain thread.
@@ -526,6 +611,7 @@ class ClaudeRunner:
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
+        abort_event: threading.Event | None = None,
     ) -> RunnerResult:
 
         result = run_claude(
@@ -537,6 +623,7 @@ class ClaudeRunner:
             retry_backoff=self.retry_backoff,
             logger=logger,
             on_output=on_output,
+            abort_event=abort_event,
         )
         return RunnerResult(
             success=result.success,
@@ -567,6 +654,7 @@ def _extract_summary(stream_json_output: str) -> str:
 
     lines = stream_json_output.strip().splitlines()
     last_text = ""
+    last_result = ""
 
     for line in lines:
         line = line.strip()
@@ -581,7 +669,7 @@ def _extract_summary(stream_json_output: str) -> str:
         # Guard with ``"role" not in obj`` so that an assistant message
         # that happens to contain a "result" key isn't misinterpreted.
         if "result" in obj and isinstance(obj["result"], str) and "role" not in obj:
-            return obj["result"][:500]
+            last_result = obj["result"]
 
         # stream-json assistant message with content array
         # stream-json wraps messages: {"type":"assistant","message":{"role":...,"content":[...]}}
@@ -596,4 +684,6 @@ def _extract_summary(stream_json_output: str) -> str:
         # stream-json system message (final line, has cost_usd)
         # -- not useful for summary, skip
 
+    if last_result:
+        return last_result[:500]
     return last_text[:500] if last_text else "No summary available"

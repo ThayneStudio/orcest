@@ -38,8 +38,17 @@ def setup_logging(
     fmt = f"[{component}:{identifier}] %(message)s"
     handler.setFormatter(logging.Formatter(fmt))
 
+    numeric_level = getattr(logging, level.upper(), None)
+    if numeric_level is None or not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {level!r}")
+
     logger = logging.getLogger(f"orcest.{component}.{identifier}")
-    logger.setLevel(getattr(logging, level.upper()))
+    logger.setLevel(numeric_level)
+    # setup_logging is the sole entry point for logger configuration, so no
+    # external handlers are expected to exist. If external handler injection
+    # is ever needed (e.g. telemetry, test hooks), replace this with selective
+    # removal of only RichHandler instances added by setup_logging.
+    logger.handlers.clear()
     logger.addHandler(handler)
 
     # Prevent propagation to root logger (avoids duplicate output)

@@ -23,6 +23,12 @@ _PER_CHECK_LOG_LIMIT = 5000
 # Total log budget across all checks in a single prompt
 _TOTAL_LOG_BUDGET = 15000
 
+# Tasks stream cap: 1000 entries (half the xadd_capped default of 2000).
+# The tasks stream holds pending work items; at typical throughput the queue
+# depth stays well below 100, so 1000 gives ample headroom while keeping
+# Redis memory usage predictable.
+TASKS_STREAM_MAXLEN = 1000
+
 
 def _extract_run_id(details_url: str) -> int | None:
     """Extract the workflow run ID from a GitHub Actions detailsUrl.
@@ -48,30 +54,33 @@ def _publish_and_notify(
     """Publish a task to Redis and update GitHub visibility.
 
     Shared by publish_fix_task and publish_followup_task to avoid
-    duplicating the publish -> comment -> log sequence.
+    duplicating the increment -> publish -> comment -> log sequence.
 
-    The task is published to Redis first. If commenting fails
-    afterwards, the error is logged but the task is not lost.
+    The attempt counter is incremented before publishing to Redis so that a
+    crash between the two operations still counts the attempt, preventing
+    unbounded retries.  If commenting fails afterwards, the error is logged
+    but the task is not lost.
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
-    redis.xadd(tasks_stream, task.to_dict())
-
-    # Track attempt count for re-enqueue throttling.
-    # Wrapped in try/except because the task is already in Redis -- a
-    # failed increment is harmless (next cycle may re-enqueue, but the
-    # max-attempts check in discover_actionable_prs prevents runaway loops).
+    # Increment attempt count BEFORE publishing to Redis to eliminate the
+    # check-then-act race: if the orchestrator crashes between xadd and
+    # increment, the attempt would never be counted, allowing unbounded
+    # retries.  An increment without a subsequent xadd is safe -- the
+    # max-attempts guard in discover_actionable_prs prevents runaway loops.
     try:
         increment_attempts(redis, pr_state.number, pr_state.head_sha)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for PR #{pr_state.number} "
-            f"(task {task.id} already published to Redis)",
+            f"before publishing task {task.id} to Redis",
             exc_info=True,
         )
+
+    # Publish to backend-specific stream
+    tasks_stream = f"tasks:{default_runner}"
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
 
     # Post comment on PR for visibility
     try:
@@ -147,8 +156,23 @@ def publish_fix_task(
         if classification == CIFailureType.CODE:
             task_type = TaskType.FIX_CI
 
-    # Use review threads from pr_state (already populated by discover_actionable_prs)
-    review_threads = pr_state.review_threads if not pr_state.ci_failures else []
+    # Use review threads from pr_state (populated by discover_actionable_prs for
+    # CHANGES_REQUESTED). For CI failures, fetch inline review comments from the
+    # REST API since discover_actionable_prs does not populate review_threads there.
+    _log = logger or logging.getLogger(__name__)
+    if pr_state.ci_failures:
+        try:
+            raw_inline = gh.get_pr_review_comments(repo, pr_state.number, token)
+            review_threads = _group_inline_comments(raw_inline)
+        except Exception as exc:
+            _log.warning(
+                "Failed to fetch inline review comments for PR #%s; proceeding without them: %s",
+                pr_state.number,
+                exc,
+            )
+            review_threads = []
+    else:
+        review_threads = pr_state.review_threads
 
     # Render prompt
     prompt = _render_fix_prompt(
@@ -349,19 +373,20 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Publish to issue-specific stream (lower priority than PR tasks)
-    tasks_stream = f"tasks:issue:{default_runner}"
-    redis.xadd(tasks_stream, task.to_dict())
-
-    # Track attempt count
+    # Increment attempt count BEFORE publishing to Redis (same rationale as
+    # _publish_and_notify: prevents unbounded retries on orchestrator crash).
     try:
         increment_issue_attempts(redis, issue_state.number)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for issue #{issue_state.number} "
-            f"(task {task.id} already published to Redis)",
+            f"before publishing task {task.id} to Redis",
             exc_info=True,
         )
+
+    # Publish to issue-specific stream (lower priority than PR tasks)
+    tasks_stream = f"tasks:issue:{default_runner}"
+    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=TASKS_STREAM_MAXLEN)
 
     # Post comment on issue for visibility
     try:
@@ -387,6 +412,25 @@ def _slugify(text: str, max_len: int = 40) -> str:
     """Convert text to a branch-name-safe slug."""
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:max_len].rstrip("-")
+
+
+def _group_inline_comments(comments: list[dict]) -> list[dict]:
+    """Group flat inline review comments by (path, line) into thread-like dicts.
+
+    Input dicts have keys: path, line, author, body (as returned by
+    gh.get_pr_review_comments). Output dicts match the format expected by
+    _render_review_threads: {path, line, comments: [{author, body}]}.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for c in comments:
+        key = (c.get("path", ""), c.get("line"))
+        if key not in groups:
+            groups[key] = []
+        groups[key].append({"author": c.get("author", ""), "body": c.get("body", "")})
+    return [
+        {"path": path, "line": line, "comments": thread_comments}
+        for (path, line), thread_comments in groups.items()
+    ]
 
 
 def _render_issue_prompt(
@@ -541,7 +585,7 @@ def _render_rebase_prompt(
         "   ```",
         "5. Verify the branch is clean and the rebase succeeded.",
         "",
-        "Do NOT create new commits — only rebase existing ones.",
+        "Do NOT create new commits \u2014 only rebase existing ones.",
         "Do NOT squash commits during the rebase.",
         "Push to the existing branch. Do not create new PRs.",
     ])

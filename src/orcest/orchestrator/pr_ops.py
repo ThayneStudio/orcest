@@ -9,6 +9,7 @@ main loop acts on these recommendations.
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
@@ -72,12 +73,18 @@ def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
     the counter is reset to 0.
     """
     key = _make_attempts_key(pr_number)
-    data = redis.client.hgetall(key)
+    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
     if not data:
         return 0
     stored_sha = data.get("head_sha", "")
     if stored_sha != head_sha:
-        # New commits pushed — reset counter
+        # New commits pushed — reset counter.
+        # TOCTOU note: the hgetall → delete sequence is not atomic. A second
+        # concurrent caller could observe the same stale SHA and also call
+        # delete, resulting in a double-delete (benign). This is intentional:
+        # the system is single-orchestrator by design, so the race cannot
+        # occur in practice. A Lua script would provide atomicity if
+        # multi-instance support is ever added.
         redis.client.delete(key)
         return 0
     try:
@@ -100,6 +107,12 @@ def increment_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int
 
     # Check for SHA mismatch *before* incrementing so the counter
     # resets correctly even if get_attempt_count was never called.
+    # TOCTOU note: the hget → delete → pipeline sequence is not atomic. Two
+    # concurrent callers could both observe a stale SHA, both call delete, and
+    # then both hincrby — producing an incorrect retry count. This is
+    # intentional: the system is single-orchestrator by design, so the race
+    # cannot occur in practice. A Lua script would provide atomicity if
+    # multi-instance support is ever added.
     stored_sha = redis.client.hget(key, "head_sha")
     if stored_sha is not None and stored_sha != head_sha:
         redis.client.delete(key)
@@ -127,8 +140,8 @@ def discover_actionable_prs(
     """Discover PRs that need action.
 
     Filter cascade (ordered by cost, cheapest first):
-    1. Skip PRs with terminal orcest labels (blocked/needs-human)
-    2. Skip draft PRs
+    1. Skip draft PRs (single boolean field, cheapest check)
+    2. Skip PRs with terminal orcest labels (blocked/needs-human)
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs that have been attempted but haven't changed (attempt count > 0)
     5. Fetch CI status; skip if checks are still pending
@@ -150,6 +163,22 @@ def discover_actionable_prs(
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
+        # Skip draft PRs -- cheapest check, single boolean field
+        if pr_data.get("isDraft"):
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_DRAFT,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                )
+            )
+            continue
+
         # Skip if terminal orcest label present (blocked/needs-human)
         if any(label in terminal_labels for label in pr_labels):
             results.append(
@@ -166,24 +195,8 @@ def discover_actionable_prs(
             )
             continue
 
-        # Skip draft PRs
-        if pr_data.get("isDraft"):
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_DRAFT,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                )
-            )
-            continue
-
         # Skip if locked in Redis
-        lock_key = make_pr_lock_key(number)
+        lock_key = make_pr_lock_key(repo, number)
         if redis.client.exists(lock_key):
             results.append(
                 PRState(

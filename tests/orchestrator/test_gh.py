@@ -6,6 +6,7 @@ The mock target is the *module-level* import inside ``gh.py``, i.e.
 """
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -14,7 +15,6 @@ from orcest.orchestrator.gh import (
     GhCliError,
     GhNotInstalledError,
     add_label,
-    get_check_run_logs,
     get_ci_status,
     get_failed_run_logs,
     get_pr,
@@ -124,7 +124,7 @@ def test_get_ci_status_returns_failed_checks(mocker):
         "title": "broken",
         "statusCheckRollup": checks,
     }
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data), stderr=""
@@ -135,6 +135,11 @@ def test_get_ci_status_returns_failed_checks(mocker):
     failed = [c for c in result if c["conclusion"] == "FAILURE"]
     assert len(failed) == 1
     assert failed[0]["name"] == "tests"
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +532,34 @@ def test_get_pr_malformed_json_raises(mocker):
 # ---------------------------------------------------------------------------
 
 
+def test_list_open_prs_custom_limit(mocker):
+    """list_open_prs passes the custom limit value to the gh CLI."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+    )
+    list_open_prs(REPO, TOKEN, limit=250)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--limit" in args_passed
+    limit_idx = args_passed.index("--limit")
+    assert args_passed[limit_idx + 1] == "250"
+
+
+def test_list_open_prs_default_limit(mocker):
+    """list_open_prs defaults to limit 100 when not specified."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+    )
+    list_open_prs(REPO, TOKEN)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--limit" in args_passed
+    limit_idx = args_passed.index("--limit")
+    assert args_passed[limit_idx + 1] == "100"
+
+
 def test_list_open_prs_malformed_json(mocker):
     """list_open_prs with invalid JSON stdout -> JSONDecodeError."""
     mocker.patch(
@@ -548,23 +581,31 @@ def test_get_ci_status_missing_rollup(mocker):
     """statusCheckRollup absent/None -> returns []."""
     # Case 1: key absent entirely
     pr_data_no_key = {"number": 10, "title": "no checks"}
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data_no_key), stderr=""
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
     # Case 2: key present but None
     pr_data_none = {"number": 10, "title": "null checks", "statusCheckRollup": None}
-    mocker.patch(
+    mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout=json.dumps(pr_data_none), stderr=""
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
+    args_passed = mock_run.call_args[0][0]
+    assert "--json" in args_passed
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "statusCheckRollup"
 
 
 # ---------------------------------------------------------------------------
@@ -602,57 +643,6 @@ def test_get_pr_diff_failure_raises(mocker):
     )
     with pytest.raises(GhCliError):
         get_pr_diff(REPO, 99, TOKEN)
-
-
-# ---------------------------------------------------------------------------
-# get_check_run_logs (_run_gh_bytes path)
-# ---------------------------------------------------------------------------
-
-
-def test_get_check_run_logs_success(mocker):
-    """get_check_run_logs returns raw bytes from _run_gh_bytes."""
-    zip_bytes = b"PK\x03\x04fake-zip-content"
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        return_value=subprocess.CompletedProcess(
-            args=["gh"], returncode=0, stdout=zip_bytes, stderr=b""
-        ),
-    )
-    result = get_check_run_logs(REPO, 12345, TOKEN)
-    assert result == zip_bytes
-    assert isinstance(result, bytes)
-
-
-def test_get_check_run_logs_failure_raises(mocker):
-    """CalledProcessError in _run_gh_bytes -> GhCliError."""
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["gh", "api"],
-            stderr=b"403 Forbidden",
-        ),
-    )
-    with pytest.raises(GhCliError, match="403 Forbidden"):
-        get_check_run_logs(REPO, 12345, TOKEN)
-
-
-def test_get_check_run_logs_malformed_utf8_stderr(mocker):
-    """_run_gh_bytes uses errors='replace' when decoding stderr bytes."""
-    # Build stderr with invalid UTF-8 byte sequences
-    bad_stderr = b"Error: \xff\xfe bad bytes"
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["gh", "api"],
-            stderr=bad_stderr,
-        ),
-    )
-    with pytest.raises(GhCliError) as exc_info:
-        get_check_run_logs(REPO, 12345, TOKEN)
-    # The replacement character should appear instead of raising UnicodeDecodeError
-    assert "\ufffd" in exc_info.value.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +737,19 @@ def test_merge_pr_merge_method(mocker):
     assert "--squash" not in args_passed
     assert "--rebase" not in args_passed
     assert "--delete-branch" in args_passed
+
+
+def test_merge_pr_no_delete_branch(mocker):
+    """merge_pr with delete_branch=False omits --delete-branch flag."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="",
+    )
+    merge_pr(REPO, 10, TOKEN, delete_branch=False)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--delete-branch" not in args_passed
+    assert "--squash" in args_passed
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +871,6 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
             }
         ),
     )
-    import logging
 
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
@@ -881,8 +883,79 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
     assert any("more than 10 comments" in msg for msg in caplog.messages)
 
 
-def test_get_unresolved_threads_pagination_raises(mocker):
-    """Raises GhCliError when reviewThreads has more pages than we fetch."""
+def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
+    """Fetches all pages and returns threads from every page when hasNextPage is True."""
+    page1 = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor_abc"},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_page1",
+                                    "path": "a.py",
+                                    "line": 1,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [{"body": "Fix", "author": {"login": "alice"}}],
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    page2 = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_page2",
+                                    "path": "b.py",
+                                    "line": 2,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [{"body": "Also fix", "author": {"login": "bob"}}],
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[page1, page2],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        result = get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    # Threads from both pages are returned
+    assert len(result) == 2
+    assert result[0]["id"] == "PRRT_page1"
+    assert result[1]["id"] == "PRRT_page2"
+    # Warning logged about additional pages
+    assert any("more than 100 review threads" in msg for msg in caplog.messages)
+    # Second call includes the cursor
+    second_args = mock_run.call_args_list[1][0][0]
+    assert "after=cursor_abc" in " ".join(second_args)
+
+
+def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
+    """Stops pagination and logs a warning when hasNextPage=True but endCursor is absent."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
@@ -899,7 +972,10 @@ def test_get_unresolved_threads_pagination_raises(mocker):
                                         "line": 1,
                                         "isResolved": False,
                                         "comments": {
-                                            "nodes": [{"body": "Fix", "author": {"login": "alice"}}]
+                                            "pageInfo": {"hasNextPage": False},
+                                            "nodes": [
+                                                {"body": "Fix", "author": {"login": "alice"}}
+                                            ],
                                         },
                                     },
                                 ],
@@ -910,8 +986,15 @@ def test_get_unresolved_threads_pagination_raises(mocker):
             }
         ),
     )
-    with pytest.raises(GhCliError, match="more than 100 review threads"):
-        get_unresolved_review_threads(REPO, 5, TOKEN)
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        result = get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    # The fetched thread is still returned
+    assert len(result) == 1
+    assert result[0]["id"] == "PRRT_1"
+    # Both the "more than 100" and "endCursor missing" warnings are logged
+    assert any("more than 100 review threads" in msg for msg in caplog.messages)
+    assert any("endCursor is missing" in msg for msg in caplog.messages)
 
 
 # ---------------------------------------------------------------------------
@@ -930,16 +1013,3 @@ def test_run_gh_timeout_raises_gh_cli_error(mocker):
     )
     with pytest.raises(GhCliError, match="timed out"):
         list_open_prs(REPO, TOKEN)
-
-
-def test_run_gh_bytes_timeout_raises_gh_cli_error(mocker):
-    """subprocess.TimeoutExpired in _run_gh_bytes -> GhCliError."""
-    mocker.patch(
-        "orcest.orchestrator.gh.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(
-            cmd=["gh", "api"],
-            timeout=120,
-        ),
-    )
-    with pytest.raises(GhCliError, match="timed out"):
-        get_check_run_logs(REPO, 12345, TOKEN)

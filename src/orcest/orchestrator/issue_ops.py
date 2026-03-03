@@ -8,6 +8,7 @@ with recommended actions.
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
@@ -49,7 +50,7 @@ def _make_attempts_key(issue_number: int) -> str:
 def get_attempt_count(redis: RedisClient, issue_number: int) -> int:
     """Get the current attempt count for an issue."""
     key = _make_attempts_key(issue_number)
-    data = redis.client.hgetall(key)
+    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
     if not data:
         return 0
     try:
@@ -124,7 +125,7 @@ def discover_actionable_issues(
             continue
 
         # Skip if locked in Redis
-        lock_key = make_issue_lock_key(number)
+        lock_key = make_issue_lock_key(repo, number)
         if redis.client.exists(lock_key):
             results.append(
                 IssueState(

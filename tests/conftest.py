@@ -47,14 +47,8 @@ def fake_redis_server():
 @pytest.fixture
 def fake_redis_client(fake_redis_server):
     """RedisClient backed by fakeredis with Lua support."""
-    config = RedisConfig(host="localhost", port=6379, db=0)
-    client = RedisClient(config)
-    # Disconnect the real connection pool before swapping in fakeredis
-    client._pool.disconnect()
-    client._client.close()
     fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
-    client._client = fake
-    client._pool = fake.connection_pool
+    client = RedisClient.from_client(fake)
     yield client
     client.close()
 
@@ -65,13 +59,8 @@ def make_fake_redis_client(fake_redis_server):
     clients: list[RedisClient] = []
 
     def factory():
-        config = RedisConfig(host="localhost", port=6379, db=0)
-        rc = RedisClient(config)
-        rc._pool.disconnect()
-        rc._client.close()
         fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
-        rc._client = fake
-        rc._pool = fake.connection_pool
+        rc = RedisClient.from_client(fake)
         clients.append(rc)
         return rc
 
@@ -157,12 +146,12 @@ def gh_mock(mocker):
         "get_pr",
         "get_ci_status",
         "get_pr_diff",
-        "get_check_run_logs",
         "get_failed_run_logs",
         "add_label",
         "remove_label",
         "post_comment",
         "get_unresolved_review_threads",
+        "get_pr_review_comments",
         "resolve_review_thread",
         "merge_pr",
     ]:

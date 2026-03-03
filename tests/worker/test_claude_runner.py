@@ -3,8 +3,8 @@
 Mocks ``subprocess.Popen`` so that no real ``claude`` process is spawned.
 The mock target is ``orcest.worker.claude_runner.subprocess.Popen``.
 
-Also mocks ``time.sleep`` and ``time.monotonic`` to avoid real delays
-and to control timing for duration calculations.
+Also mocks ``time.monotonic`` to avoid real delays and to control
+timing for duration calculations.
 """
 
 import json
@@ -111,7 +111,6 @@ def test_run_claude_success(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -156,7 +155,6 @@ def test_run_claude_failure_retries(mock_popen, mocker, tmp_path):
 
     mock_cls.side_effect = popen_side_effect
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt1_start, watchdog_remaining1, duration1,
@@ -164,7 +162,7 @@ def test_run_claude_failure_retries(mock_popen, mocker, tmp_path):
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0),
     )
 
-    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2)
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
 
     assert result.success is True
     assert mock_cls.call_count == 2
@@ -188,7 +186,6 @@ def test_run_claude_timeout_no_retry(mock_popen, mocker, tmp_path):
 
     # start_time, attempt_start, watchdog_remaining, check_line1,
     # check_line2, check_line3(>timeout), duration
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 120.0, 200.0, 200.0),
@@ -215,7 +212,6 @@ def test_run_claude_usage_exhausted_no_retry(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter(["Error: usage limit reached for this billing period\n"])
     mock_proc.returncode = 1
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, duration
@@ -246,7 +242,6 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
     monkeypatch.setenv("SECRET_KEY", "super_secret_value")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -278,7 +273,6 @@ def test_run_claude_command_args(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -342,7 +336,6 @@ def test_on_output_called_per_line(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, 3x timeout_check, duration
@@ -369,7 +362,6 @@ def test_on_output_none_still_works(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -393,7 +385,6 @@ def test_timeout_during_streaming_calls_on_output(mock_popen, mocker, tmp_path):
 
     kill_mock = mocker.patch("orcest.worker.claude_runner._kill_process_tree")
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     # start_time=0, attempt_start=0, watchdog_remaining_calc=0(->60s left),
     # check_line1=10(<60 ok), check_line2=70(>=60 timeout; line2 is still
     # appended and on_output called BEFORE the timeout check fires), duration=70
@@ -430,7 +421,6 @@ def test_on_output_exception_disables_callback(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, 3x timeout_check, duration
@@ -469,7 +459,6 @@ def test_stderr_captured_via_thread(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter(["rate limit exceeded\n"])
     mock_proc.returncode = 1
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, duration
@@ -495,7 +484,6 @@ def test_run_claude_popen_oserror(mocker, tmp_path):
         side_effect=OSError("No such file or directory: 'claude'"),
     )
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, duration
@@ -538,7 +526,6 @@ def test_run_claude_all_retries_exhausted(mock_popen, mocker, tmp_path):
 
     mock_cls.side_effect = popen_side_effect
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt1_start, watchdog_remaining1, duration1,
@@ -547,7 +534,7 @@ def test_run_claude_all_retries_exhausted(mock_popen, mocker, tmp_path):
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0),
     )
 
-    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2)
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
 
     assert result.success is False
     assert "Failed after 2 attempts" in result.summary
@@ -577,7 +564,6 @@ def test_run_claude_wait_timeout_after_stdout(mock_popen, mocker, tmp_path):
     ]
 
     kill_mock = mocker.patch("orcest.worker.claude_runner._kill_process_tree")
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line),
@@ -613,7 +599,6 @@ def test_run_claude_returncode_none_no_retry(mock_popen, mocker, tmp_path):
     ]
 
     mocker.patch("orcest.worker.claude_runner._kill_process_tree")
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -643,7 +628,6 @@ def test_run_claude_with_logger(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
@@ -690,6 +674,28 @@ def test_extract_summary_result_key():
     output = json.dumps(obj) + "\n"
     result = _extract_summary(output)
     assert result == "Task completed successfully"
+
+
+# ---------------------------------------------------------------------------
+# _extract_summary: multi-result stream -> last result wins (regression #111)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_extract_summary_last_result_in_multi_result_stream():
+    """Multi-result stream -> last top-level 'result' value is returned.
+
+    Regression test for issue #111: _extract_summary must scan all lines and
+    return the *last* result, not early-return on the first one.
+    """
+    lines = [
+        json.dumps({"result": "intermediate result"}) + "\n",
+        _stream_json_assistant("assistant message in between") + "\n",
+        json.dumps({"result": "final summary"}) + "\n",
+    ]
+    output = "".join(lines)
+    result = _extract_summary(output)
+    assert result == "final summary"
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +795,7 @@ def test_is_usage_exhausted_all_patterns():
     """Test all 5 pattern pairs from _USAGE_EXHAUSTION_PATTERNS."""
     # ("usage", "limit")
     assert _is_usage_exhausted("usage limit reached") is True
-    # ("rate", "limit")
+    # _RATE_LIMIT_RE (anchored regex)
     assert _is_usage_exhausted("rate limit exceeded") is True
     # ("quota", "exceeded")
     assert _is_usage_exhausted("quota exceeded for account") is True
@@ -802,7 +808,7 @@ def test_is_usage_exhausted_all_patterns():
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: stdout NOT checked (false positive prevention)
+# _is_usage_exhausted: pattern in stdout is NOT detected (only stderr checked)
 # ---------------------------------------------------------------------------
 
 
@@ -816,6 +822,14 @@ def test_is_usage_exhausted_stdout_not_checked():
     """
     # Empty stderr -> not detected regardless of stdout content
     assert _is_usage_exhausted("") is False
+
+
+@pytest.mark.unit
+def test_is_usage_exhausted_rate_limit_mid_sentence():
+    """'exceeded' mid-sentence (not EOL) must not trigger the anchored regex."""
+    assert _is_usage_exhausted("") is False
+    # "exceeded" here is not at end-of-line — the \s*$ anchor rejects it.
+    assert _is_usage_exhausted("rate limit exceeded in user-authored code") is False
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +847,6 @@ def test_claude_runner_class_run(mock_popen, mocker, tmp_path):
     mock_proc.stderr = iter([])
     mock_proc.returncode = 0
 
-    mocker.patch("orcest.worker.claude_runner.time.sleep")
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
         # start_time, attempt_start, watchdog_remaining, timeout_check(1 line), duration
