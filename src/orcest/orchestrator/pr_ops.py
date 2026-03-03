@@ -282,8 +282,9 @@ def discover_actionable_prs(
             continue
 
         # No CI checks at all — distinct from green (all checks passed).
-        # This can happen when CI is not configured, or (commonly) when the
-        # PR has merge conflicts and GitHub never triggered CI on it.
+        # This can happen when CI is not configured, or when mergeability
+        # is UNKNOWN and GitHub did not trigger CI on the branch.
+        # Note: PRs in repos with no CI configured will never be merged by orcest.
         if not checks:
             logger.debug("PR #%d has no CI checks, skipping", number)
             results.append(
