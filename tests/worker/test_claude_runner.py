@@ -826,10 +826,25 @@ def test_is_usage_exhausted_stdout_not_checked():
 
 @pytest.mark.unit
 def test_is_usage_exhausted_rate_limit_mid_sentence():
-    """'exceeded' mid-sentence (not EOL) must not trigger the anchored regex."""
-    assert _is_usage_exhausted("") is False
-    # "exceeded" here is not at end-of-line — the \s*$ anchor rejects it.
-    assert _is_usage_exhausted("rate limit exceeded in user-authored code") is False
+    """'rate limit exceeded' followed by non-alpha trailing text still matches."""
+    # Space after "exceeded" is a non-alpha character -> matches the lookahead.
+    assert _is_usage_exhausted("rate limit exceeded in user-authored code") is True
+
+
+@pytest.mark.unit
+def test_is_usage_exhausted_rate_limit_trailing_text():
+    """Real API error messages with trailing text on the same line are detected."""
+    # Trailing punctuation + extra words
+    assert _is_usage_exhausted("Rate limit exceeded. Retry after 60 seconds.") is True
+    # Trailing words without punctuation
+    assert _is_usage_exhausted("Rate limit exceeded for your plan") is True
+
+
+@pytest.mark.unit
+def test_is_usage_exhausted_rate_limit_no_false_positive_mid_word():
+    """Indicator word immediately followed by an alpha char (mid-word) does not match."""
+    # 'exceededly' has an alpha char right after 'exceeded' -> no match
+    assert _is_usage_exhausted("rate limit exceededly unusual") is False
 
 
 # ---------------------------------------------------------------------------
