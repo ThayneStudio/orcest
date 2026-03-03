@@ -792,7 +792,7 @@ def test_extract_summary_non_text_content_blocks():
 
 @pytest.mark.unit
 def test_is_usage_exhausted_all_patterns():
-    """Test all 5 pattern pairs from _USAGE_EXHAUSTION_PATTERNS."""
+    """Test all 4 pattern pairs from _USAGE_EXHAUSTION_PATTERNS plus _RATE_LIMIT_RE."""
     # ("usage", "limit")
     assert _is_usage_exhausted("usage limit reached") is True
     # _RATE_LIMIT_RE (anchored regex)
