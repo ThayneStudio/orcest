@@ -13,26 +13,32 @@ from orcest.cli import _status_once, _validate_ssh_input, main
 
 @pytest.fixture
 def runner():
-    """CliRunner with stderr and stdout unconditionally separated (Click 8.2+).
+    """CliRunner with stderr and stdout separated (mix_stderr=False semantics).
 
-    ``CliRunner(mix_stderr=False)`` cannot be used here because Click 8.2
-    removed the ``mix_stderr`` parameter entirely — passing it raises::
+    Root cause of the original CI failure: the ``_status_once`` Rich Console
+    was constructed without an explicit ``file=`` argument.  Rich's default
+    ``Console()`` detects that it is not attached to a real terminal and falls
+    back to writing to the real ``sys.stderr`` file descriptor, which bypasses
+    Click's stream capture entirely.  This meant ``result.stderr`` contained
+    spurious Rich output that had nothing to do with ``click.echo(..., err=True)``.
+
+    Fix applied in ``cli.py``: ``Console(file=sys.stdout)`` so that Rich table
+    output is captured by Click on ``result.stdout``.
+
+    Why ``CliRunner(mix_stderr=False)`` is not used: Click 8.3 removed the
+    ``mix_stderr`` constructor parameter entirely.  Passing it raises::
 
         TypeError: CliRunner.__init__() got an unexpected keyword argument 'mix_stderr'
 
-    This is NOT equivalent to the old ``mix_stderr=True`` (merged) default.
-    Click 8.2+ always separates streams regardless of constructor arguments:
+    In Click 8.3+, streams are **always** separated — ``result.stdout`` and
+    ``result.stderr`` are independent regardless of constructor arguments.
+    This gives the same guarantees as the old ``mix_stderr=False`` flag:
 
     * ``result.stdout`` — only what was written to ``sys.stdout``
     * ``result.stderr`` — only what was written to ``sys.stderr``
 
-    All error-message assertions below use ``result.stderr`` and verify that
+    All error-message assertions below use ``result.stderr`` to verify that
     ``click.echo(..., err=True)`` routes output to stderr, not stdout.
-
-    Root cause of the original CI failure: the ``_status_once`` Rich Console
-    defaulted to the real ``sys.stderr`` fd, bypassing Click's stream capture.
-    Fixed in ``cli.py`` by constructing ``Console(file=sys.stdout)`` so Rich
-    table output never leaks to stderr.
 
     ``test_runner_separates_stderr_from_stdout`` asserts these invariants
     empirically and will fail immediately if Click ever reverts behaviour.
