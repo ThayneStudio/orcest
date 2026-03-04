@@ -1,11 +1,17 @@
 """CLI entry point for orcest."""
 
+from __future__ import annotations
+
 import re
 import sys
+from typing import TYPE_CHECKING
 
 import click
 from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from orcest.shared.redis_client import RedisClient
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
@@ -20,13 +26,13 @@ def _validate_ssh_input(value: str, label: str) -> None:
 
 
 @click.group()
-def main():
+def main() -> None:
     """Orcest: Autonomous CI/CD orchestration system."""
 
 
 @main.command()
 @click.option("--config", default="config/orchestrator.yaml", help="Path to orchestrator config.")
-def orchestrate(config):
+def orchestrate(config: str) -> None:
     """Start the orchestrator loop."""
     from orcest.orchestrator.loop import run_orchestrator
     from orcest.shared.config import load_orchestrator_config
@@ -39,7 +45,7 @@ def orchestrate(config):
 @click.option("--id", "worker_id", required=True, help="Unique worker identifier.")
 @click.option("--config", default="config/worker.yaml", help="Path to worker config.")
 @click.option("--runner", default=None, help="Runner type override (claude, noop, etc.)")
-def work(worker_id, config, runner):
+def work(worker_id: str, config: str, runner: str | None) -> None:
     """Start a worker loop."""
     from orcest.shared.config import load_worker_config
     from orcest.worker.loop import run_worker
@@ -57,7 +63,7 @@ def work(worker_id, config, runner):
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
 @click.option("--once", is_flag=True, help="Print status once and exit (no TUI).")
 @click.option("--interval", default=3.0, type=float, help="TUI refresh interval in seconds.")
-def status(redis_host, config, once, interval):
+def status(redis_host: str | None, config: str, once: bool, interval: float) -> None:
     """Show system status: workers, queue depth, active tasks.
 
     Connects to Redis directly via REDIS_HOST (e.g. 10.20.0.19 or 10.20.0.19:6380),
@@ -105,7 +111,7 @@ def status(redis_host, config, once, interval):
         redis.close()
 
 
-def _status_once(redis):
+def _status_once(redis: RedisClient) -> None:
     """Print system status once and exit (original behavior)."""
     import redis as redis_lib
 
@@ -130,7 +136,7 @@ def _status_once(redis):
     groups = []
     for stream_key in task_streams:
         try:
-            for g in client.xinfo_groups(stream_key):
+            for g in client.xinfo_groups(stream_key):  # type: ignore[union-attr]
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
@@ -179,7 +185,7 @@ def _status_once(redis):
 
 @main.command()
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for repo/token).")
-def init(config):
+def init(config: str) -> None:
     """Initialize the target repo: create orcest labels."""
     import os
     import subprocess
@@ -240,7 +246,7 @@ def init(config):
 @click.option("--user", default="root", help="SSH user for the target host.")
 @click.option("--worker-config", default="config/worker.yaml", help="Worker config to deploy.")
 @click.option("--env-file", default="provision/.env", help="Env file with secrets.")
-def provision(host, user, worker_config, env_file):
+def provision(host: str, user: str, worker_config: str, env_file: str) -> None:
     """Provision a worker VM via SSH.
 
     Copies setup script, config, and systemd service to the target host,
@@ -396,7 +402,7 @@ def provision(host, user, worker_config, env_file):
     default="provision/.env.orchestrator",
     help="Env file with GITHUB_TOKEN.",
 )
-def provision_orchestrator(host, user, orch_config, env_file):
+def provision_orchestrator(host: str, user: str, orch_config: str, env_file: str) -> None:
     """Provision an orchestrator VM via SSH.
 
     Installs Docker, uploads the compose stack, config, and env to the target
