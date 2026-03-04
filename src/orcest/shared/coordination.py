@@ -4,6 +4,7 @@ Uses Lua scripts for atomic release and refresh to prevent race conditions
 where a lock could be released by a non-owner.
 """
 
+import types
 import uuid
 
 from orcest.shared.redis_client import RedisClient
@@ -81,7 +82,10 @@ class RedisLock:
         return self
 
     def __exit__(
-        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
     ) -> None:
         self.release()
 
