@@ -7,7 +7,7 @@ on:
 
 jobs:
   integration:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     services:
       redis:
         image: redis:7-alpine
