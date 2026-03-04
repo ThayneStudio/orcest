@@ -495,6 +495,8 @@ def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
     output = _run_gh(
         [
             "api",
+            "--method",
+            "GET",
             "--paginate",
             f"repos/{repo}/pulls/{number}/comments",
             "-F",
