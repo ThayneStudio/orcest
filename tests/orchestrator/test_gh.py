@@ -8,6 +8,7 @@ The mock target is the *module-level* import inside ``gh.py``, i.e.
 import json
 import logging
 import subprocess
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -30,6 +31,14 @@ from orcest.orchestrator.gh import (
 
 REPO = "acme/widgets"
 TOKEN = "test-token-abc123"
+
+
+def assert_uses_status_check_rollup_json(mock_run: MagicMock) -> None:
+    """Assert that the gh CLI was called with --json statusCheckRollup."""
+    args, kwargs = mock_run.call_args
+    cmd = args[0]
+    assert "--json" in cmd
+    assert "statusCheckRollup" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +146,7 @@ def test_get_ci_status_returns_failed_checks(mocker):
     assert len(failed) == 1
     assert failed[0]["name"] == "tests"
 
-    args_passed = mock_run.call_args[0][0]
-    assert "--json" in args_passed
-    json_idx = args_passed.index("--json")
-    assert args_passed[json_idx + 1] == "statusCheckRollup"
+    assert_uses_status_check_rollup_json(mock_run)
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +595,7 @@ def test_get_ci_status_missing_rollup(mocker):
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
-    args_passed = mock_run.call_args[0][0]
-    assert "--json" in args_passed
-    json_idx = args_passed.index("--json")
-    assert args_passed[json_idx + 1] == "statusCheckRollup"
+    assert_uses_status_check_rollup_json(mock_run)
 
     # Case 2: key present but None
     pr_data_none = {"number": 10, "title": "null checks", "statusCheckRollup": None}
@@ -603,10 +606,7 @@ def test_get_ci_status_missing_rollup(mocker):
         ),
     )
     assert get_ci_status(REPO, 10, TOKEN) == []
-    args_passed = mock_run.call_args[0][0]
-    assert "--json" in args_passed
-    json_idx = args_passed.index("--json")
-    assert args_passed[json_idx + 1] == "statusCheckRollup"
+    assert_uses_status_check_rollup_json(mock_run)
 
 
 # ---------------------------------------------------------------------------
