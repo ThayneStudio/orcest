@@ -809,12 +809,12 @@ def test_is_usage_exhausted_all_patterns():
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: "exceeded" mid-sentence (not EOL) must not trigger the anchored regex
+# _is_usage_exhausted: empty stderr (documents stderr-only interface)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_rate_limit_not_at_eol():
+def test_is_usage_exhausted_empty_stderr():
     """Empty stderr does not trigger usage exhaustion.
 
     Note: _is_usage_exhausted only accepts a stderr string; stdout is never
