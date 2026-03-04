@@ -776,7 +776,7 @@ class TestRunWorker:
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
 
-    def test_lock_ttl_proportional_to_heartbeat_interval(self, mocker, worker_config, sample_task):
+    def test_lock_ttl_proportional_to_heartbeat_interval(self):
         """LOCK_TTL must equal 3 × HEARTBEAT_INTERVAL to bound the crash-orphaned-lock window.
 
         Regression test for issue #206: before this fix the lock TTL was
