@@ -37,7 +37,8 @@ def assert_uses_status_check_rollup_json(mock_run: MagicMock) -> None:
     """Assert that the gh CLI was called with --json statusCheckRollup."""
     cmd = mock_run.call_args[0][0]
     assert "--json" in cmd
-    assert "statusCheckRollup" in cmd
+    json_idx = cmd.index("--json")
+    assert cmd[json_idx + 1] == "statusCheckRollup"
 
 
 # ---------------------------------------------------------------------------
