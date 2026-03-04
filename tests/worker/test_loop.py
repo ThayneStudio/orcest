@@ -15,6 +15,7 @@ from orcest.worker.loop import (
     _STREAM_MAXLEN,
     CONSUMER_GROUP,
     HEARTBEAT_INTERVAL,
+    LOCK_TTL,
     RESULTS_STREAM,
     _execute_task,
     _make_abort_event,
@@ -599,13 +600,7 @@ class TestRunWorker:
         lock_key = set_call[0][0]
         assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
-        runner = worker_config.runner
-        expected_ttl = (
-            runner.timeout * runner.max_retries
-            + runner.retry_backoff * (runner.max_retries - 1)
-            + 120
-        )
-        assert set_call[1]["ex"] == expected_ttl
+        assert set_call[1]["ex"] == LOCK_TTL
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
@@ -780,6 +775,19 @@ class TestRunWorker:
         # The pending entry must be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
+
+    def test_lock_ttl_proportional_to_heartbeat_interval(self, mocker, worker_config, sample_task):
+        """LOCK_TTL must equal 3 × HEARTBEAT_INTERVAL to bound the crash-orphaned-lock window.
+
+        Regression test for issue #206: before this fix the lock TTL was
+        derived from runner timeouts (~5540 s ≈ 92 min), meaning a crashed
+        worker held its Redis lock for up to 92 min.  Setting LOCK_TTL =
+        3 × HEARTBEAT_INTERVAL (180 s) bounds that window to ~3 min.
+        """
+        assert LOCK_TTL == 3 * HEARTBEAT_INTERVAL, (
+            f"LOCK_TTL ({LOCK_TTL}s) must be 3 × HEARTBEAT_INTERVAL ({HEARTBEAT_INTERVAL}s) "
+            "to bound the crash-orphaned-lock window (issue #206)"
+        )
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task
