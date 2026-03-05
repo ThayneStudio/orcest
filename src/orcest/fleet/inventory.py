@@ -95,10 +95,7 @@ def load_inventory(path: str | Path) -> FleetInventory:
 
     projects: list[ProjectEntry] = []
     for proj_data in data.get("projects") or []:
-        workers = [
-            WorkerEntry(vm_id=w["vm_id"])
-            for w in (proj_data.get("workers") or [])
-        ]
+        workers = [WorkerEntry(vm_id=w["vm_id"]) for w in (proj_data.get("workers") or [])]
         projects.append(
             ProjectEntry(
                 name=proj_data["name"],

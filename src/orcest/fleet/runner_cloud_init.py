@@ -59,9 +59,7 @@ def render_runner_userdata(
         ),
     }
 
-    return "#cloud-config\n" + yaml.dump(
-        cloud_config, default_flow_style=False, sort_keys=False
-    )
+    return "#cloud-config\n" + yaml.dump(cloud_config, default_flow_style=False, sort_keys=False)
 
 
 def _runcmd(

@@ -205,10 +205,7 @@ def _runcmd(repo: str, github_token: str) -> list[str]:
         f"su - orcest -c 'echo {github_token} | gh auth login --with-token'",
         # Create Python virtualenv and install orcest
         "sudo -u orcest python3 -m venv /opt/orcest/venv",
-        (
-            f"sudo -u orcest /opt/orcest/venv/bin/pip install"
-            f" 'git+https://github.com/{repo}.git'"
-        ),
+        (f"sudo -u orcest /opt/orcest/venv/bin/pip install 'git+https://github.com/{repo}.git'"),
         # Enable and start the worker service
         "systemctl daemon-reload",
         "systemctl enable --now orcest-worker",

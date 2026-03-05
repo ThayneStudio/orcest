@@ -58,8 +58,10 @@ def fleet():
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token", envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True, help="Claude OAuth token.",
+    "--claude-token",
+    envvar="CLAUDE_CODE_OAUTH_TOKEN",
+    required=True,
+    help="Claude OAuth token.",
 )
 @click.option("--orch-config", default=None, help="Orchestrator config file to deploy.")
 def onboard(repo, name, inventory, github_token, claude_token, orch_config):
@@ -158,9 +160,7 @@ def onboard(repo, name, inventory, github_token, claude_token, orch_config):
         else:
             console.print("  [yellow]Could not detect IP (VM may still be booting).[/yellow]")
     else:
-        console.print(
-            "\n  [yellow]Proxmox not configured — skipping VM creation.[/yellow]"
-        )
+        console.print("\n  [yellow]Proxmox not configured — skipping VM creation.[/yellow]")
         console.print(f"  Use the cloud-init file at {userdata_path} to provision manually.")
 
     console.print(f"\n[bold]Project '{project_name}' onboarded.[/bold]")
@@ -171,8 +171,10 @@ def onboard(repo, name, inventory, github_token, claude_token, orch_config):
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token", envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True, help="Claude OAuth token.",
+    "--claude-token",
+    envvar="CLAUDE_CODE_OAUTH_TOKEN",
+    required=True,
+    help="Claude OAuth token.",
 )
 def add_worker(project_name, inventory, github_token, claude_token):
     """Add a worker VM to an existing project."""
@@ -285,9 +287,7 @@ def status(inventory):
                     except Exception:
                         vm_status = "unknown"
                         ip = ""
-                    vm_table.add_row(
-                        str(worker.vm_id), project.name, vm_status, ip
-                    )
+                    vm_table.add_row(str(worker.vm_id), project.name, vm_status, ip)
 
             console.print(vm_table)
         except ImportError:
@@ -339,8 +339,10 @@ def destroy(project_name, inventory):
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token", envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True, help="Claude OAuth token.",
+    "--claude-token",
+    envvar="CLAUDE_CODE_OAUTH_TOKEN",
+    required=True,
+    help="Claude OAuth token.",
 )
 def update(inventory, github_token, claude_token):
     """Rolling-replace all worker VMs with fresh cloud-init instances.

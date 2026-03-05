@@ -67,10 +67,14 @@ def test_onboard_creates_project(runner, inv_path):
     result = runner.invoke(
         fleet,
         [
-            "onboard", "ThayneStudio/my-project",
-            "--inventory", inv_path,
-            "--github-token", "ghp_fake",
-            "--claude-token", "sk-fake",
+            "onboard",
+            "ThayneStudio/my-project",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
         ],
     )
     assert result.exit_code == 0
@@ -91,11 +95,16 @@ def test_onboard_custom_name(runner, inv_path):
     result = runner.invoke(
         fleet,
         [
-            "onboard", "ThayneStudio/my-project",
-            "--name", "custom-name",
-            "--inventory", inv_path,
-            "--github-token", "ghp_fake",
-            "--claude-token", "sk-fake",
+            "onboard",
+            "ThayneStudio/my-project",
+            "--name",
+            "custom-name",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
         ],
     )
     assert result.exit_code == 0
@@ -106,18 +115,21 @@ def test_onboard_custom_name(runner, inv_path):
 
 def test_onboard_duplicate_fails(runner, inv_path):
     """fleet onboard fails if project already exists."""
-    inv = FleetInventory(
-        projects=[ProjectEntry(name="alpha", repo="Org/alpha")]
-    )
+    inv = FleetInventory(projects=[ProjectEntry(name="alpha", repo="Org/alpha")])
     _save(inv, inv_path)
     result = runner.invoke(
         fleet,
         [
-            "onboard", "Org/alpha",
-            "--name", "alpha",
-            "--inventory", inv_path,
-            "--github-token", "ghp_fake",
-            "--claude-token", "sk-fake",
+            "onboard",
+            "Org/alpha",
+            "--name",
+            "alpha",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
         ],
     )
     assert result.exit_code != 0
@@ -140,10 +152,14 @@ def test_add_worker_appends_to_project(runner, inv_path):
     result = runner.invoke(
         fleet,
         [
-            "add-worker", "alpha",
-            "--inventory", inv_path,
-            "--github-token", "ghp_fake",
-            "--claude-token", "sk-fake",
+            "add-worker",
+            "alpha",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
         ],
     )
     assert result.exit_code == 0
@@ -160,10 +176,14 @@ def test_add_worker_missing_project(runner, inv_path):
     result = runner.invoke(
         fleet,
         [
-            "add-worker", "nonexistent",
-            "--inventory", inv_path,
-            "--github-token", "ghp_fake",
-            "--claude-token", "sk-fake",
+            "add-worker",
+            "nonexistent",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
         ],
     )
     assert result.exit_code != 0

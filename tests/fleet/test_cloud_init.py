@@ -39,9 +39,7 @@ def test_worker_yaml_in_write_files():
     output = _render(redis_host="10.0.0.1", redis_port=6380)
     data = yaml.safe_load(output)
 
-    worker_file = next(
-        f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml"
-    )
+    worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
     worker_cfg = yaml.safe_load(worker_file["content"])
     assert worker_cfg["redis"]["host"] == "10.0.0.1"
     assert worker_cfg["redis"]["port"] == 6380
@@ -65,8 +63,7 @@ def test_systemd_unit_in_write_files():
     data = yaml.safe_load(output)
 
     unit_file = next(
-        f for f in data["write_files"]
-        if f["path"] == "/etc/systemd/system/orcest-worker.service"
+        f for f in data["write_files"] if f["path"] == "/etc/systemd/system/orcest-worker.service"
     )
     assert "ExecStart=/opt/orcest/venv/bin/orcest work" in unit_file["content"]
     assert "ReadWritePaths=" in unit_file["content"]
@@ -78,9 +75,7 @@ def test_claude_json_onboarding_bypass():
     output = _render()
     data = yaml.safe_load(output)
 
-    claude_file = next(
-        f for f in data["write_files"] if f["path"] == "/home/orcest/.claude.json"
-    )
+    claude_file = next(f for f in data["write_files"] if f["path"] == "/home/orcest/.claude.json")
     assert "hasCompletedOnboarding" in claude_file["content"]
 
 
