@@ -24,12 +24,14 @@ def _make_pr_data(
     head_sha: str = "",
     is_draft: bool = False,
     mergeable: str = "MERGEABLE",
+    base_branch: str = "main",
 ) -> dict:
     """Build a PR dict matching the shape returned by gh.list_open_prs."""
     return {
         "number": number,
         "title": title,
         "headRefName": branch,
+        "baseRefName": base_branch,
         "headRefOid": head_sha,
         "isDraft": is_draft,
         "labels": labels or [],
@@ -855,6 +857,23 @@ def test_conflicting_pr_enqueues_rebase(gh_mock, fake_redis_client, label_config
     assert pr.review_threads == []
     # CI should not be fetched — merge conflict detected before that step
     gh_mock.get_ci_status.assert_not_called()
+
+
+def test_base_branch_propagated_to_pr_state(gh_mock, fake_redis_client, label_config):
+    """base_branch is extracted from baseRefName and set on PRState."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=500, labels=[], mergeable="CONFLICTING", base_branch="develop"),
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].base_branch == "develop"
 
 
 def test_unknown_mergeable_falls_through_to_ci(gh_mock, fake_redis_client, label_config):

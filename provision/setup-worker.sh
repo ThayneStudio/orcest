@@ -19,7 +19,12 @@ sudo apt-get install -y -qq \
     python3-pip \
     python3-venv \
     git \
-    curl
+    curl \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    golang-go \
+    unzip
 
 # Install Node.js (required for Claude CLI)
 if ! command -v node &>/dev/null; then
@@ -34,6 +39,17 @@ if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
 
+# Install Docker Engine
+if ! command -v docker &>/dev/null; then
+    echo "Installing Docker Engine..."
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+        | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io
+fi
+
 # Install gh CLI
 if ! command -v gh &>/dev/null; then
     echo "Installing gh CLI..."
@@ -45,10 +61,27 @@ if ! command -v gh &>/dev/null; then
     sudo apt-get install -y -qq gh
 fi
 
+# Install Supabase CLI
+if ! command -v supabase &>/dev/null; then
+    echo "Installing Supabase CLI..."
+    sudo npm install -g supabase
+fi
+
+# Install Playwright browsers
+if ! npx playwright --version &>/dev/null 2>&1; then
+    echo "Installing Playwright browsers..."
+    npx playwright install --with-deps chromium
+fi
+
 # Create orcest user (if not exists)
 if ! id -u orcest &>/dev/null; then
     echo "Creating orcest user..."
     sudo useradd --system --create-home --shell /bin/bash orcest
+fi
+
+# Add orcest to docker group (if docker is installed)
+if command -v docker &>/dev/null; then
+    sudo usermod -aG docker orcest 2>/dev/null || true
 fi
 
 # Create workspace directory
@@ -74,7 +107,7 @@ fi
 # Verify dependencies
 echo ""
 echo "Verifying installation..."
-for cmd in python3 node claude gh git; do
+for cmd in python3 node claude gh git docker go; do
     if command -v "$cmd" &>/dev/null; then
         echo "  $cmd: ok"
     else

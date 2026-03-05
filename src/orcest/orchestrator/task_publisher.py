@@ -292,6 +292,7 @@ def publish_rebase_task(
         branch=pr_state.branch,
         repo=repo,
         merge_error=merge_error,
+        base_branch=pr_state.base_branch,
     )
 
     task = Task.create(
@@ -447,7 +448,7 @@ def _render_issue_prompt(
     sections: list[str] = [
         f"# Implement Issue #{issue_number}: {issue_title}",
         "",
-        "You are on the default branch (main/master).",
+        "You are on the default branch.",
         "",
         "## Issue Description",
         "",
@@ -549,6 +550,7 @@ def _render_rebase_prompt(
     branch: str,
     repo: str,
     merge_error: str = "",
+    base_branch: str = "main",
 ) -> str:
     """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
     sections: list[str] = [
@@ -569,13 +571,13 @@ def _render_rebase_prompt(
         [
             "## Instructions",
             "",
-            "1. Fetch the latest base branch (`master` or `main`):",
+            f"1. Fetch the latest base branch (`{base_branch}`):",
             "   ```",
-            "   git fetch origin master",
+            f"   git fetch origin {base_branch}",
             "   ```",
-            "2. Rebase your branch onto the base branch:",
+            f"2. Rebase your branch onto `{base_branch}`:",
             "   ```",
-            "   git rebase origin/master",
+            f"   git rebase origin/{base_branch}",
             "   ```",
             "3. If there are merge conflicts:",
             "   - Read the conflicting files to understand both sides",

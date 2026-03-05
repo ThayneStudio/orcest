@@ -61,6 +61,7 @@ class PRState:
     ci_failures: list[dict]  # Failed check runs
     review_threads: list[dict]  # Actionable review comments
     labels: list[str]
+    base_branch: str = "main"  # Target branch (from baseRefName)
 
 
 def _make_attempts_key(pr_number: int) -> str:
@@ -163,6 +164,7 @@ def discover_actionable_prs(
         number: int = pr_data["number"]
         title: str = pr_data["title"]
         branch: str = pr_data["headRefName"]
+        base_branch: str = pr_data.get("baseRefName", "main")
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
@@ -178,6 +180,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -194,6 +197,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -211,6 +215,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -229,6 +234,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -243,6 +249,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -265,6 +272,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -296,6 +304,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -338,6 +347,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
             continue
@@ -357,6 +367,7 @@ def discover_actionable_prs(
                     ci_failures=ci_failures,
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
         elif review_decision == "CHANGES_REQUESTED":
@@ -382,6 +393,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=threads,
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
         elif review_decision == "APPROVED":
@@ -408,6 +420,7 @@ def discover_actionable_prs(
                         ci_failures=[],
                         review_threads=[],
                         labels=pr_labels,
+                        base_branch=base_branch,
                     )
                 )
                 continue
@@ -429,6 +442,7 @@ def discover_actionable_prs(
                         ci_failures=[],
                         review_threads=threads,
                         labels=pr_labels,
+                        base_branch=base_branch,
                     )
                 )
             else:
@@ -443,6 +457,7 @@ def discover_actionable_prs(
                         ci_failures=[],
                         review_threads=[],
                         labels=pr_labels,
+                        base_branch=base_branch,
                     )
                 )
         else:
@@ -457,6 +472,7 @@ def discover_actionable_prs(
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
+                    base_branch=base_branch,
                 )
             )
 

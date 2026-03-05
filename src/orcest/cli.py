@@ -383,6 +383,12 @@ def provision(host, user, worker_config, env_file):
     console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")
 
 
+# Register fleet subcommands
+from orcest.fleet.cli import fleet  # noqa: E402
+
+main.add_command(fleet)
+
+
 @main.command("provision-orchestrator")
 @click.argument("host")
 @click.option("--user", default="root", help="SSH user for the target host.")
