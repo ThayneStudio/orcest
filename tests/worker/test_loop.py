@@ -922,7 +922,6 @@ class TestDeadLetterTask:
             "tasks:claude",
             "entry-42",
             sample_task,
-            local_worker_config,
             logging.getLogger("test"),
         )
 
@@ -948,7 +947,6 @@ class TestDeadLetterTask:
             "tasks:claude",
             "entry-99",
             sample_task,
-            local_worker_config,
             logging.getLogger("test"),
         )
 

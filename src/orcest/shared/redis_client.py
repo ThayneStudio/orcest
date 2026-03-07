@@ -210,10 +210,16 @@ class RedisClient:
                 stream, group, min=entry_id, max=entry_id, count=1
             )
         except Exception:
+            logger.warning(
+                "xpending_count failed for stream %s entry %s; treating as 0 deliveries",
+                stream,
+                entry_id,
+                exc_info=True,
+            )
             return 0
         if not entries:
             return 0
-        count = entries[0].get("times_delivered", 0)
+        count = entries[0].get("times_delivered", 0)  # type: ignore[index]
         return int(count) if count else 0
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
