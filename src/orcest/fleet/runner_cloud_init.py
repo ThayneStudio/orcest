@@ -107,7 +107,7 @@ def _runcmd(
             "su - runner -c '"
             "cd /opt/actions-runner && "
             "RUNNER_VER=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest"
-            " | grep '\"tag_name\"' | sed 's/.*\"v\\([^\"]*\\)\".*/\\1/') && "
+            ' | grep \'"tag_name"\' | sed \'s/.*"v\\([^"]*\\)".*/\\1/\') && '
             "curl -o actions-runner-linux-x64.tar.gz -L "
             "https://github.com/actions/runner/releases/download/v${RUNNER_VER}/"
             "actions-runner-linux-x64-${RUNNER_VER}.tar.gz && "

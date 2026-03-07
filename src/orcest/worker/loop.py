@@ -256,7 +256,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # re-enqueue if needed (belt-and-suspenders with the orchestrator's
         # clear in _handle_result).
         try:
-            resource_type = task.resource_type or "pr"
+            resource_type = task.resource_type
             clear_pending_task(redis, task.repo, resource_type, task.resource_id)
         except Exception:
             logger.warning(
