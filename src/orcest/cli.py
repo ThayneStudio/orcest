@@ -7,6 +7,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from orcest.fleet.cli import fleet
+
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
@@ -382,9 +384,6 @@ def provision(host, user, worker_config, env_file):
     console.print("\n  To authenticate Claude Code, run:")
     console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")
 
-
-# Register fleet subcommands
-from orcest.fleet.cli import fleet  # noqa: E402
 
 main.add_command(fleet)
 

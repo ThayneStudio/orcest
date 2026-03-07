@@ -8,6 +8,8 @@ creating, destroying, and querying worker VMs. Replaces the shell-based
 from __future__ import annotations
 
 import logging
+import re
+import subprocess
 import time
 
 from orcest.fleet.inventory import ProxmoxConfig
@@ -49,7 +51,7 @@ class ProxmoxClient:
                 user=self.config.token_id.split("!")[0],
                 token_name=self.config.token_id.split("!")[-1],
                 token_value=self.config.token_secret,
-                verify_ssl=False,
+                verify_ssl=self.config.verify_ssl,
             )
         return self._api
 
@@ -102,7 +104,7 @@ class ProxmoxClient:
         disk_size: str = DEFAULT_DISK_SIZE,
         bridge: str = DEFAULT_BRIDGE,
         cicustom: str = "",
-        ci_user: str = "thayne",
+        ci_user: str = "ubuntu",
         ssh_public_key: str = "",
     ) -> None:
         """Create a VM from a cloud image with cloud-init.
@@ -185,39 +187,44 @@ class ProxmoxClient:
 
         if not has_image:
             logger.info("Downloading cloud image to Proxmox node...")
-            self.node.storage("local").post(
+            upid: str = self.node.storage("local").post(
                 "download-url",
                 content="iso",
                 filename=CLOUD_IMG_NAME,
                 url=CLOUD_IMG_URL,
             )
             # Wait for download to complete
-            self._wait_for_task_completion()
+            self._wait_for_task_completion(upid)
 
-        # Import the disk — uses qm importdisk equivalent via API
-        # The Proxmox API doesn't have a direct importdisk endpoint, so we use
-        # the node's exec or the disk import approach. For now, we create the
-        # disk via the config API after the image is available.
-        #
-        # Alternative: use the storage API to clone the image into VM disk.
-        # The cleanest approach with proxmoxer is to use qm commands via
-        # the node's exec endpoint, or to pre-create a template VM.
-        self.node.qemu(vm_id).config.put(
-            scsi0=f"local:iso/{CLOUD_IMG_NAME},import-from=local:iso/{CLOUD_IMG_NAME}"
+        # Import the disk via qm importdisk (requires SSH access to the Proxmox host).
+        # The Proxmox REST API does not expose a direct importdisk endpoint.
+        img_path = f"/var/lib/vz/template/iso/{CLOUD_IMG_NAME}"
+        result = subprocess.run(
+            ["ssh", f"root@{self.config.host}", f"qm importdisk {vm_id} {img_path} {storage}"],
+            check=True,
+            capture_output=True,
+            text=True,
         )
+        # qm importdisk prints: Successfully imported disk as 'storage:vm-NNN-disk-N'
+        m = re.search(r"'([^']+)'", result.stdout)
+        disk_volid = m.group(1) if m else f"{storage}:vm-{vm_id}-disk-0"
+        self.node.qemu(vm_id).config.put(scsi0=f"{disk_volid},discard=on")
 
         # Resize disk
         self.node.qemu(vm_id).resize.put(disk="scsi0", size=disk_size)
 
-    def _wait_for_task_completion(self, timeout: int = 300) -> None:
-        """Wait for the most recent node task to complete."""
+    def _wait_for_task_completion(self, upid: str, timeout: int = 300) -> None:
+        """Wait for a specific node task (identified by UPID) to complete."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            tasks = self.node.tasks.get(limit=1)
-            if tasks and tasks[0].get("status") == "OK":
+            result = self.node.tasks(upid).status.get()
+            status = result.get("status", "")
+            if status == "OK":
                 return
+            if status == "ERROR":
+                raise RuntimeError(f"Proxmox task {upid} failed")
             time.sleep(2)
-        logger.warning("Task did not complete within %ds", timeout)
+        logger.warning("Task %s did not complete within %ds", upid, timeout)
 
     def destroy_vm(self, vm_id: int) -> None:
         """Stop and destroy a VM."""
@@ -254,5 +261,5 @@ class ProxmoxClient:
 
     def delete_snippet(self, volid: str) -> None:
         """Delete a snippet from Proxmox storage."""
-        storage, _, path = volid.partition(":")
+        storage, _, _ = volid.partition(":")
         self.node.storage(storage).content(volid).delete()

@@ -7,39 +7,11 @@ orchestrator stacks and disposable worker VMs from a laptop.
 from __future__ import annotations
 
 import os
-import re
-import subprocess
 import sys
 
 import click
 from rich.console import Console
 from rich.table import Table
-
-_SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-
-
-def _validate_ssh_input(value: str, label: str) -> None:
-    if not _SSH_INPUT_RE.match(value):
-        raise click.BadParameter(
-            f"Invalid {value!r}: only alphanumerics, dots, hyphens, and underscores are allowed.",
-            param_hint=repr(label),
-        )
-
-
-def _ssh(target: str, cmd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["ssh", target, cmd],
-        capture_output=True,
-        text=True,
-    )
-
-
-def _scp(target: str, src: str, dest: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["scp", src, f"{target}:{dest}"],
-        capture_output=True,
-        text=True,
-    )
 
 
 def _repo_to_project_name(repo: str) -> str:
@@ -125,9 +97,10 @@ def onboard(repo, name, inventory, github_token, claude_token, orch_config):
         repo=repo,
     )
 
-    # Write user-data to temp file for Proxmox upload
+    # Write user-data to temp file for Proxmox upload (0600: contains secrets)
     userdata_path = f"/tmp/orcest-worker-{vm_id}-userdata.yaml"
-    with open(userdata_path, "w") as f:
+    fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(userdata)
 
     console.print(f"  Cloud-init user-data written to {userdata_path}")
@@ -226,7 +199,8 @@ def add_worker(project_name, inventory, github_token, claude_token):
             console.print(f"  VM IP: [green]{ip}[/green]")
     else:
         userdata_path = f"/tmp/orcest-worker-{vm_id}-userdata.yaml"
-        with open(userdata_path, "w") as f:
+        fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(userdata)
         console.print(f"  Cloud-init user-data written to {userdata_path}")
 
@@ -472,7 +446,8 @@ def add_runner(org_url, runner_token, runner_name, labels, inventory, vm_id):
             console.print(f"  VM IP: [green]{ip}[/green]")
     else:
         userdata_path = f"/tmp/orcest-runner-{vm_id}-userdata.yaml"
-        with open(userdata_path, "w") as f:
+        fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(userdata)
         console.print(f"  Cloud-init user-data written to {userdata_path}")
 

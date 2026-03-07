@@ -115,8 +115,14 @@ def render_worker_userdata(
                 "permissions": "0644",
                 "content": claude_json,
             },
+            {
+                "path": "/opt/orcest/.gh-token",
+                "owner": "orcest:orcest",
+                "permissions": "0600",
+                "content": f"{github_token}\n",
+            },
         ],
-        "runcmd": _runcmd(repo=repo, github_token=github_token),
+        "runcmd": _runcmd(repo=repo),
     }
 
     # Render as YAML with the #cloud-config header
@@ -155,7 +161,7 @@ WantedBy=multi-user.target
 """
 
 
-def _runcmd(repo: str, github_token: str) -> list[str]:
+def _runcmd(repo: str) -> list[str]:
     """Return the list of runcmd entries for cloud-init."""
     return [
         # Create workspace directories
@@ -201,8 +207,8 @@ def _runcmd(repo: str, github_token: str) -> list[str]:
         "npm install -g supabase",
         # Install Playwright browsers
         "npx playwright install --with-deps chromium",
-        # Authenticate gh CLI for the orcest user
-        f"su - orcest -c 'echo {github_token} | gh auth login --with-token'",
+        # Authenticate gh CLI for the orcest user using the pre-written token file
+        "su - orcest -c 'gh auth login --with-token < /opt/orcest/.gh-token'",
         # Create Python virtualenv and install orcest
         "sudo -u orcest python3 -m venv /opt/orcest/venv",
         (f"sudo -u orcest /opt/orcest/venv/bin/pip install 'git+https://github.com/{repo}.git'"),

@@ -7,6 +7,8 @@ with GitHub. Runners are cattle: destroy and recreate to update.
 
 from __future__ import annotations
 
+import shlex
+
 import yaml
 
 
@@ -69,7 +71,8 @@ def _runcmd(
     runner_labels: str,
 ) -> list[str]:
     """Return runcmd entries for runner provisioning."""
-    name_flag = f"--name {runner_name}" if runner_name else "--name $(hostname)"
+    # Omit --name when not specified; config.sh defaults to the machine hostname.
+    name_flag = f"--name {shlex.quote(runner_name)}" if runner_name else ""
 
     return [
         # Create runner user home
@@ -97,24 +100,28 @@ def _runcmd(
         "npx playwright install --with-deps chromium",
         # Install Supabase CLI
         "npm install -g supabase",
-        # Download and configure GitHub Actions runner
+        # Download and configure GitHub Actions runner (version determined at boot time)
         "mkdir -p /opt/actions-runner",
         "chown runner:runner /opt/actions-runner",
         (
             "su - runner -c '"
             "cd /opt/actions-runner && "
+            "RUNNER_VER=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest"
+            " | grep '\"tag_name\"' | sed 's/.*\"v\\([^\"]*\\)\".*/\\1/') && "
             "curl -o actions-runner-linux-x64.tar.gz -L "
-            "https://github.com/actions/runner/releases/latest/download/"
-            "actions-runner-linux-x64-2.321.0-linux-x64.tar.gz && "
+            "https://github.com/actions/runner/releases/download/v${RUNNER_VER}/"
+            "actions-runner-linux-x64-${RUNNER_VER}.tar.gz && "
             "tar xzf actions-runner-linux-x64.tar.gz && "
             "rm actions-runner-linux-x64.tar.gz"
             "'"
         ),
-        # Configure the runner (non-interactive)
+        # Configure the runner (non-interactive).
+        # shlex.quote ensures values containing spaces or metacharacters are
+        # safely quoted within the outer single-quoted shell argument.
         (
             f"su - runner -c 'cd /opt/actions-runner && "
-            f"./config.sh --url {org_url} --token {runner_token} "
-            f"{name_flag} --labels {runner_labels} "
+            f"./config.sh --url {shlex.quote(org_url)} --token {shlex.quote(runner_token)} "
+            f"{name_flag} --labels {shlex.quote(runner_labels)} "
             f"--unattended --replace'"
         ),
         # Install as systemd service

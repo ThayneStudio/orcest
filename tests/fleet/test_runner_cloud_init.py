@@ -62,8 +62,9 @@ def test_runcmd_uses_custom_name():
     assert "--name my-runner" in runcmd
 
 
-def test_runcmd_uses_hostname_when_no_name():
+def test_runcmd_omits_name_flag_when_no_name():
+    # When no runner_name is provided, --name is omitted and config.sh defaults to hostname
     output = _render()
     data = yaml.safe_load(output)
     runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
-    assert "--name $(hostname)" in runcmd
+    assert "--name " not in runcmd

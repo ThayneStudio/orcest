@@ -39,6 +39,7 @@ class ProxmoxConfig:
     storage: str = "local-lvm"
     token_id: str = ""  # e.g. "root@pam!orcest"
     token_secret: str = ""
+    verify_ssl: bool = False
 
 
 @dataclass
@@ -91,6 +92,7 @@ def load_inventory(path: str | Path) -> FleetInventory:
         storage=proxmox_data.get("storage", "local-lvm"),
         token_id=proxmox_data.get("token_id", ""),
         token_secret=proxmox_data.get("token_secret", ""),
+        verify_ssl=proxmox_data.get("verify_ssl", False),
     )
 
     projects: list[ProjectEntry] = []
@@ -127,6 +129,7 @@ def save_inventory(inventory: FleetInventory, path: str | Path) -> None:
             "storage": inventory.proxmox.storage,
             "token_id": inventory.proxmox.token_id,
             "token_secret": inventory.proxmox.token_secret,
+            "verify_ssl": inventory.proxmox.verify_ssl,
         },
         "projects": [],
     }
