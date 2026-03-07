@@ -27,8 +27,10 @@ from orcest.worker.runner import Runner, RunnerResult, create_runner
 from orcest.worker.workspace import Workspace
 
 RESULTS_STREAM = "results"
+DEAD_LETTER_STREAM = "orcest:dead-letter"
 CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
+MAX_DELIVERY_COUNT = 3  # Dead-letter after this many deliveries
 _STREAM_MAXLEN = 2000
 
 
@@ -154,6 +156,14 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             f"Received task {task.id}: {task.type.value} "
             f"for {task.resource_type} #{task.resource_id}"
         )
+
+        # Dead-letter guard: if this entry has been delivered too many times
+        # (result-publish failures leaving it unACKed), route it to the
+        # dead-letter stream instead of running Claude again.
+        delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
+        if delivery_count > MAX_DELIVERY_COUNT:
+            _dead_letter_task(redis, current_stream, entry_id, task, config, logger)
+            continue
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
@@ -336,6 +346,48 @@ def _drain_pending_tasks(
                 )
     if drained:
         logger.info(f"Drained {drained} pending task(s) from previous lifecycle")
+
+
+def _dead_letter_task(
+    redis: RedisClient,
+    tasks_stream: str,
+    entry_id: str,
+    task: Task,
+    config: WorkerConfig,
+    logger: logging.Logger,
+) -> None:
+    """Route a task that has exceeded MAX_DELIVERY_COUNT to the dead-letter stream.
+
+    Publishes the task payload to DEAD_LETTER_STREAM with metadata explaining
+    why it was dead-lettered, then ACKs the original entry so the main stream
+    does not stall.  ACK happens even if the dead-letter publish fails so the
+    worker can make progress.
+    """
+    dl_fields = {
+        **task.to_dict(),
+        "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
+        "tasks_stream": tasks_stream,
+        "original_entry_id": entry_id,
+    }
+    try:
+        redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
+        logger.error(
+            f"Task {task.id} ({task.type.value} for {task.resource_type} "
+            f"#{task.resource_id}) exceeded max delivery count "
+            f"({MAX_DELIVERY_COUNT}); routed to {DEAD_LETTER_STREAM!r}"
+        )
+    except Exception:
+        logger.error(
+            f"Failed to publish dead-letter entry for task {task.id}; ACKing anyway",
+            exc_info=True,
+        )
+    try:
+        redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+    except Exception:
+        logger.error(
+            f"Failed to ACK dead-lettered task {task.id} (entry {entry_id})",
+            exc_info=True,
+        )
 
 
 def _execute_task(

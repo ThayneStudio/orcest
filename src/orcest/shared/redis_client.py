@@ -193,6 +193,29 @@ class RedisClient:
                 return pending + lag
         return 0
 
+    def xpending_count(self, stream: str, group: str, entry_id: str) -> int:
+        """Return how many times a specific pending entry has been delivered.
+
+        Queries XPENDING with the exact entry ID range to retrieve the
+        delivery count for that entry.  Returns 0 if the entry is not in
+        the pending list (already ACKed) or if an error occurs.
+
+        Args:
+            stream: Stream name.
+            group: Consumer group name.
+            entry_id: The stream entry ID to look up.
+        """
+        try:
+            entries = self._client.xpending_range(
+                stream, group, min=entry_id, max=entry_id, count=1
+            )
+        except Exception:
+            return 0
+        if not entries:
+            return 0
+        count = entries[0].get("times_delivered", 0)
+        return int(count) if count else 0
+
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
 
