@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
+MAX_PAGES = 50  # safety cap; 50 × 100 = 5 000 threads
+
 
 class GhCliError(Exception):
     """Raised when a gh CLI operation fails."""
@@ -366,7 +368,6 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 
     all_thread_nodes: list[dict] = []
     cursor: str | None = None
-    MAX_PAGES = 50  # safety cap; 50 × 100 = 5 000 threads
     page_count = 0
 
     while page_count < MAX_PAGES:
