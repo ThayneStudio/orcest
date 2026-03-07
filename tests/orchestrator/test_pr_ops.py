@@ -8,11 +8,14 @@ fake_redis_client (fakeredis-backed RedisClient).
 from orcest.orchestrator.pr_ops import (
     PRAction,
     clear_attempts,
+    clear_total_attempts,
     discover_actionable_prs,
     get_attempt_count,
+    get_total_attempt_count,
     increment_attempts,
+    increment_total_attempts,
 )
-from orcest.shared.coordination import make_pr_lock_key
+from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 
 
 def _make_pr_data(
@@ -960,3 +963,128 @@ def test_skip_no_checks_pr(gh_mock, fake_redis_client, label_config):
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_NO_CHECKS
     assert results[0].number == 410
+
+
+# ---------------------------------------------------------------------------
+# Pending task dedup tests
+# ---------------------------------------------------------------------------
+
+
+def test_skip_queued_when_pending_task_exists(gh_mock, fake_redis_client, label_config):
+    """A PR with a pending task marker is classified as SKIP_QUEUED."""
+    pr_number = 600
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    # Set a pending task marker
+    pending_key = make_pending_task_key("test-org/test-repo", "pr", pr_number)
+    fake_redis_client.client.set(pending_key, "task-xyz")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_QUEUED
+    # CI should not be fetched
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_no_skip_queued_without_pending_marker(gh_mock, fake_redis_client, label_config):
+    """A PR without a pending marker proceeds to CI check as normal."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=601, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_GREEN
+    gh_mock.get_ci_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Total attempt counter (circuit breaker) tests
+# ---------------------------------------------------------------------------
+
+
+def test_total_attempts_circuit_breaker(gh_mock, fake_redis_client, label_config):
+    """A PR exceeding max_total_attempts is classified as SKIP_MAX_TOTAL_ATTEMPTS."""
+    pr_number = 700
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    # Set total attempts to the limit
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_total_attempts_survives_sha_change(fake_redis_client):
+    """Total attempt counter is NOT reset when the per-SHA counter resets."""
+    pr_number = 710
+    # Increment both counters
+    increment_attempts(fake_redis_client, pr_number, "sha1")
+    increment_total_attempts(fake_redis_client, pr_number)
+
+    # SHA changes — per-SHA counter resets, total does not
+    assert get_attempt_count(fake_redis_client, pr_number, "sha2") == 0
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 1
+
+
+def test_clear_total_attempts(fake_redis_client):
+    """clear_total_attempts removes the total attempts key."""
+    pr_number = 720
+    increment_total_attempts(fake_redis_client, pr_number)
+    increment_total_attempts(fake_redis_client, pr_number)
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 2
+
+    clear_total_attempts(fake_redis_client, pr_number)
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
+
+
+def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_config):
+    """A PR with total attempts below the limit proceeds normally."""
+    pr_number = 730
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
+    ]
+    # Set total attempts below limit
+    for _ in range(5):
+        increment_total_attempts(fake_redis_client, pr_number)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX

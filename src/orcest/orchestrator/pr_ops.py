@@ -13,7 +13,7 @@ from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
-from orcest.shared.coordination import make_pr_lock_key
+from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,9 @@ class PRAction(str, Enum):
     SKIP_GREEN = "skip_green"  # CI passing, nothing to do
     SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
     SKIP_PENDING = "skip_pending"  # CI checks still running
-    SKIP_MAX_ATTEMPTS = "skip_max_attempts"  # Exhausted retry budget
+    SKIP_QUEUED = "skip_queued"  # Task already pending in queue
+    SKIP_MAX_ATTEMPTS = "skip_max_attempts"  # Exhausted per-SHA retry budget
+    SKIP_MAX_TOTAL_ATTEMPTS = "skip_max_total_attempts"  # Exhausted cross-SHA retry budget
     SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
 
 
@@ -133,12 +135,47 @@ def clear_attempts(redis: RedisClient, pr_number: int) -> None:
     redis.client.delete(_make_attempts_key(pr_number))
 
 
+def _make_total_attempts_key(pr_number: int) -> str:
+    """Redis key for tracking total attempts across all SHAs."""
+    return f"pr:{pr_number}:total_attempts"
+
+
+def get_total_attempt_count(redis: RedisClient, pr_number: int) -> int:
+    """Get the total attempt count for a PR (across all SHAs)."""
+    val = redis.client.get(_make_total_attempts_key(pr_number))
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
+
+
+def increment_total_attempts(redis: RedisClient, pr_number: int) -> int:
+    """Increment the total attempt count for a PR. Returns the new count.
+
+    Uses INCR + EXPIRE so the counter auto-cleans after 30 days.
+    """
+    key = _make_total_attempts_key(pr_number)
+    pipe = redis.client.pipeline(transaction=True)
+    pipe.incr(key)
+    pipe.expire(key, 30 * 24 * 3600)  # 30-day TTL
+    results = pipe.execute()
+    return results[0]
+
+
+def clear_total_attempts(redis: RedisClient, pr_number: int) -> None:
+    """Clear the total attempt counter for a PR (on successful completion)."""
+    redis.client.delete(_make_total_attempts_key(pr_number))
+
+
 def discover_actionable_prs(
     repo: str,
     token: str,
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
+    max_total_attempts: int = 10,
 ) -> list[PRState]:
     """Discover PRs that need action.
 
@@ -146,10 +183,12 @@ def discover_actionable_prs(
     1. Skip draft PRs (single boolean field, cheapest check)
     2. Skip PRs with terminal orcest labels (blocked/needs-human)
     3. Skip PRs with active Redis locks (worker in progress)
-    4. Skip PRs that have been attempted but haven't changed (attempt count > 0)
-    5. Route PRs with merge conflicts (mergeable == CONFLICTING) to ENQUEUE_REBASE
-    6. Fetch CI status; skip if checks are still pending or absent
-    7. Route by CI + review state: failures -> fix, changes requested -> fix,
+    4. Skip PRs with a pending task already queued
+    5. Skip PRs that exceeded total cross-SHA attempt limit
+    6. Skip PRs that have been attempted but haven't changed (attempt count > 0)
+    7. Route PRs with merge conflicts (mergeable == CONFLICTING) to ENQUEUE_REBASE
+    8. Fetch CI status; skip if checks are still pending or absent
+    9. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
     """
     prs = gh.list_open_prs(repo, token)
@@ -212,6 +251,42 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.SKIP_LOCKED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        # Skip if a task for this PR is already pending in the queue
+        pending_key = make_pending_task_key(repo, "pr", number)
+        if redis.client.exists(pending_key):
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_QUEUED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        # Skip if total cross-SHA attempt limit exceeded (circuit breaker)
+        total_attempts = get_total_attempt_count(redis, number)
+        if total_attempts >= max_total_attempts:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,

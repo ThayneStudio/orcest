@@ -13,7 +13,12 @@ import threading
 import time
 
 from orcest.shared.config import WorkerConfig
-from orcest.shared.coordination import RedisLock, make_issue_lock_key, make_pr_lock_key
+from orcest.shared.coordination import (
+    RedisLock,
+    clear_pending_task,
+    make_issue_lock_key,
+    make_pr_lock_key,
+)
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, Task, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -244,6 +249,18 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         except Exception:
             logger.error(
                 f"Failed to ACK task {task.id} (will be redelivered)",
+                exc_info=True,
+            )
+
+        # Clear pending-task marker promptly so the orchestrator can
+        # re-enqueue if needed (belt-and-suspenders with the orchestrator's
+        # clear in _handle_result).
+        try:
+            resource_type = task.resource_type or "pr"
+            clear_pending_task(redis, task.repo, resource_type, task.resource_id)
+        except Exception:
+            logger.warning(
+                f"Failed to clear pending task marker for {task.resource_type} #{task.resource_id}",
                 exc_info=True,
             )
 
