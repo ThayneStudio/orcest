@@ -13,6 +13,7 @@ from orcest.orchestrator.gh import GhCliError
 from orcest.orchestrator.issue_ops import IssueAction, IssueState
 from orcest.orchestrator.pr_ops import PRAction, PRState
 from orcest.orchestrator.task_publisher import (
+    _render_rebase_prompt,
     publish_fix_task,
     publish_followup_task,
     publish_issue_task,
@@ -1127,3 +1128,32 @@ def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
     error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
     assert any("Failed to increment attempt counter" in m for m in error_msgs)
     assert any("skipping publish" in m for m in error_msgs)
+
+
+# --- Rebase prompt tests ---
+
+
+def test_rebase_prompt_uses_base_branch():
+    """_render_rebase_prompt uses the base_branch parameter instead of hardcoding master."""
+    prompt = _render_rebase_prompt(
+        pr_number=1,
+        pr_title="Test PR",
+        branch="fix/thing",
+        repo="test-org/test-repo",
+        base_branch="develop",
+    )
+    assert "git fetch origin develop" in prompt
+    assert "git rebase origin/develop" in prompt
+    assert "master" not in prompt
+
+
+def test_rebase_prompt_defaults_to_main():
+    """_render_rebase_prompt defaults to main when base_branch is not specified."""
+    prompt = _render_rebase_prompt(
+        pr_number=1,
+        pr_title="Test PR",
+        branch="fix/thing",
+        repo="test-org/test-repo",
+    )
+    assert "git fetch origin main" in prompt
+    assert "git rebase origin/main" in prompt

@@ -12,7 +12,8 @@ from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import IssueState
 from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
-from orcest.orchestrator.pr_ops import PRState, increment_attempts
+from orcest.orchestrator.pr_ops import PRState, increment_attempts, increment_total_attempts
+from orcest.shared.coordination import set_pending_task
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -64,6 +65,12 @@ def _publish_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
+    # Claim the pending-task slot atomically (SET NX EX). If another task
+    # is already pending for this PR, skip publish to avoid duplicates.
+    if not set_pending_task(redis, task.repo, "pr", pr_state.number, task.id):
+        _log.info(f"Pending task already exists for PR #{pr_state.number}, skipping publish")
+        return
+
     # Increment attempt count BEFORE publishing to Redis to eliminate the
     # check-then-act race: if the orchestrator crashes between xadd and
     # increment, the attempt would never be counted, allowing unbounded
@@ -71,6 +78,7 @@ def _publish_and_notify(
     # max-attempts guard in discover_actionable_prs prevents runaway loops.
     try:
         increment_attempts(redis, pr_state.number, pr_state.head_sha)
+        increment_total_attempts(redis, pr_state.number)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for PR #{pr_state.number} "
@@ -292,6 +300,7 @@ def publish_rebase_task(
         branch=pr_state.branch,
         repo=repo,
         merge_error=merge_error,
+        base_branch=pr_state.base_branch,
     )
 
     task = Task.create(
@@ -375,6 +384,11 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
+    # Claim the pending-task slot atomically (SET NX EX).
+    if not set_pending_task(redis, task.repo, "issue", issue_state.number, task.id):
+        _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
+        return
+
     # Increment attempt count BEFORE publishing to Redis (same rationale as
     # _publish_and_notify: prevents unbounded retries on orchestrator crash).
     try:
@@ -447,7 +461,7 @@ def _render_issue_prompt(
     sections: list[str] = [
         f"# Implement Issue #{issue_number}: {issue_title}",
         "",
-        "You are on the default branch (main/master).",
+        "You are on the default branch.",
         "",
         "## Issue Description",
         "",
@@ -549,6 +563,7 @@ def _render_rebase_prompt(
     branch: str,
     repo: str,
     merge_error: str = "",
+    base_branch: str = "main",
 ) -> str:
     """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
     sections: list[str] = [
@@ -569,13 +584,13 @@ def _render_rebase_prompt(
         [
             "## Instructions",
             "",
-            "1. Fetch the latest base branch (`master` or `main`):",
+            f"1. Fetch the latest base branch (`{base_branch}`):",
             "   ```",
-            "   git fetch origin master",
+            f"   git fetch origin {base_branch}",
             "   ```",
-            "2. Rebase your branch onto the base branch:",
+            f"2. Rebase your branch onto `{base_branch}`:",
             "   ```",
-            "   git rebase origin/master",
+            f"   git rebase origin/{base_branch}",
             "   ```",
             "3. If there are merge conflicts:",
             "   - Read the conflicting files to understand both sides",

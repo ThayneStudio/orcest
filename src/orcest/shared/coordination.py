@@ -98,3 +98,35 @@ def make_pr_lock_key(repo: str, pr_number: int) -> str:
 def make_issue_lock_key(repo: str, issue_number: int) -> str:
     """Generate the Redis key for an issue lock."""
     return f"lock:issue:{repo}:{issue_number}"
+
+
+def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> str:
+    """Generate the Redis key for a pending task marker."""
+    return f"pending:{resource_type}:{repo}:{resource_id}"
+
+
+def set_pending_task(
+    redis_client: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+    task_id: str,
+    ttl: int = 7200,
+) -> bool:
+    """Mark a task as pending for a resource. Returns True if set (no existing pending task).
+
+    Uses SET NX EX for atomic check-and-set with a TTL safety net.
+    """
+    key = make_pending_task_key(repo, resource_type, resource_id)
+    return redis_client.client.set(key, task_id, nx=True, ex=ttl) is not None
+
+
+def clear_pending_task(
+    redis_client: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+) -> None:
+    """Clear the pending task marker for a resource."""
+    key = make_pending_task_key(repo, resource_type, resource_id)
+    redis_client.client.delete(key)
