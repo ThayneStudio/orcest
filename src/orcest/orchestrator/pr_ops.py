@@ -142,7 +142,7 @@ def _make_total_attempts_key(pr_number: int) -> str:
 
 def get_total_attempt_count(redis: RedisClient, pr_number: int) -> int:
     """Get the total attempt count for a PR (across all SHAs)."""
-    val = redis.client.get(_make_total_attempts_key(pr_number))
+    val: str | None = cast(str | None, redis.client.get(_make_total_attempts_key(pr_number)))
     if val is None:
         return 0
     try:
