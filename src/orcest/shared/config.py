@@ -54,7 +54,8 @@ class OrchestratorConfig:
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
     default_runner: str = "claude"
-    max_attempts: int = 3  # Max task attempts per PR before needs-human
+    max_attempts: int = 3  # Max task attempts per SHA before needs-human
+    max_total_attempts: int = 10  # Max total attempts across all SHAs (circuit breaker)
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
 
 
@@ -200,6 +201,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
+    # Max total attempts across all SHAs (circuit breaker)
+    max_total_attempts = _safe_int(raw.get("max_total_attempts", 10), "max_total_attempts")
+
     # Whether to delete the head branch after merging
     delete_branch_on_merge = _safe_bool(
         raw.get("delete_branch_on_merge", True), "delete_branch_on_merge"
@@ -212,6 +216,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         labels=labels_config,
         default_runner=default_runner,
         max_attempts=max_attempts,
+        max_total_attempts=max_total_attempts,
         delete_branch_on_merge=delete_branch_on_merge,
     )
 
