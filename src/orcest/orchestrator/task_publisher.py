@@ -24,11 +24,35 @@ _PER_CHECK_LOG_LIMIT = 5000
 # Total log budget across all checks in a single prompt
 _TOTAL_LOG_BUDGET = 15000
 
-# Tasks stream cap: 1000 entries.
-# The tasks stream holds pending work items; at typical throughput the queue
-# depth stays well below 100, so 1000 gives ample headroom while keeping
-# Redis memory usage predictable.
-_TASKS_STREAM_MAXLEN = 1000
+# Tasks stream cap: 10 000 entries.
+#
+# SEMANTIC NOTE: tasks:* streams are work queues consumed via XREADGROUP,
+# unlike output/log streams which are append-only observation channels.
+# This distinction matters for trimming:
+#
+#   - Output/log streams: trimming old entries is safe because consumers only
+#     need recent data for display; losing old log lines is acceptable.
+#   - Task streams: trimming *undelivered* entries causes silent task loss —
+#     the entry is removed from Redis before any worker reads it, so the work
+#     is silently dropped.
+#
+# With approximate MAXLEN, Redis may trim the oldest entries as soon as the
+# stream exceeds ~maxlen entries.  If the backlog of undelivered tasks grows
+# beyond that threshold (i.e. workers are seriously behind), the oldest tasks
+# can be lost before a worker ever reads them.
+#
+# SAFETY NET: the orchestrator's GitHub re-poll loop is the mitigation.
+# On the next poll cycle the orchestrator will re-discover actionable
+# PRs/issues and re-enqueue any tasks that were trimmed, so work is not
+# permanently lost — only delayed by one poll interval.
+#
+# MAXLEN RATIONALE: 10 000 was chosen to make silent loss practically
+# impossible under realistic conditions.  At typical throughput the queue
+# depth stays well below 100.  A backlog of 10 000 undelivered tasks would
+# require workers to be catastrophically behind; at that point the system is
+# already degraded for other reasons.  10 000 entries add only ~5-10 MB of
+# Redis memory (stream entries are compact), which is negligible.
+_TASKS_STREAM_MAXLEN = 10_000
 
 
 def _extract_run_id(details_url: str) -> int | None:
