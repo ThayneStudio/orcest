@@ -13,7 +13,12 @@ import time
 from orcest.orchestrator import gh
 from orcest.orchestrator.issue_ops import IssueAction, discover_actionable_issues
 from orcest.orchestrator.issue_ops import clear_attempts as clear_issue_attempts
-from orcest.orchestrator.pr_ops import PRAction, clear_attempts, discover_actionable_prs
+from orcest.orchestrator.pr_ops import (
+    PRAction,
+    clear_attempts,
+    clear_total_attempts,
+    discover_actionable_prs,
+)
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
     publish_followup_task,
@@ -21,6 +26,7 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
 )
 from orcest.shared.config import OrchestratorConfig
+from orcest.shared.coordination import clear_pending_task
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -92,6 +98,7 @@ def _poll_cycle(
         redis=redis,
         label_config=config.labels,
         max_attempts=config.max_attempts,
+        max_total_attempts=config.max_total_attempts,
     )
 
     # Step 3: Act on PRs
@@ -317,10 +324,58 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+        elif pr_state.action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS:
+            logger.warning(
+                "PR #%d: total attempt limit reached (%d), adding needs-human label",
+                pr_state.number,
+                config.max_total_attempts,
+            )
+            labeled = False
+            try:
+                gh.add_label(
+                    config.github.repo,
+                    pr_state.number,
+                    config.labels.needs_human,
+                    config.github.token,
+                )
+                labeled = True
+            except Exception as e:
+                logger.error(
+                    "Failed to label PR #%d as needs-human: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
+            try:
+                label_note = (
+                    f"Labeling as `{config.labels.needs_human}` for manual review."
+                    if labeled
+                    else f"Failed to add `{config.labels.needs_human}` "
+                    f"label — please triage manually."
+                )
+                gh.post_comment(
+                    config.github.repo,
+                    pr_state.number,
+                    f"**orcest** has exhausted its total retry budget "
+                    f"({config.max_total_attempts} attempts across all commits) "
+                    f"for this PR. {label_note}\n\n"
+                    f"Remove the `{config.labels.needs_human}` label to allow "
+                    f"orcest to try again.",
+                    config.github.token,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to comment on PR #%d about max total attempts: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
         elif pr_state.action == PRAction.SKIP_DRAFT:
             logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:
             logger.debug(f"PR #{pr_state.number}: CI pending, skipping")
+        elif pr_state.action == PRAction.SKIP_QUEUED:
+            logger.debug(f"PR #{pr_state.number}: task already queued, skipping")
         elif pr_state.action == PRAction.SKIP_ACTIVE:
             logger.debug(f"PR #{pr_state.number}: task in flight, skipping")
         elif pr_state.action == PRAction.SKIP_LABELED:
@@ -343,6 +398,7 @@ def _poll_cycle(
             PRAction.ENQUEUE_REBASE,
             PRAction.SKIP_LOCKED,
             PRAction.SKIP_ACTIVE,
+            PRAction.SKIP_QUEUED,
         )
         for pr_state in pr_states
     )
@@ -426,6 +482,8 @@ def _poll_cycle(
                     f"Failed to comment on issue #{issue_state.number} about max attempts: {e}",
                     exc_info=True,
                 )
+        elif issue_state.action == IssueAction.SKIP_QUEUED:
+            logger.debug(f"Issue #{issue_state.number}: task already queued, skipping")
         elif issue_state.action == IssueAction.SKIP_LOCKED:
             logger.debug(f"Issue #{issue_state.number}: locked, skipping")
         elif issue_state.action == IssueAction.SKIP_ACTIVE:
@@ -555,10 +613,22 @@ def _handle_result(
     resource_id = result.resource_id
     is_issue = result.resource_type == "issue"
     resource_label = "issue" if is_issue else "PR"
+    resource_type = result.resource_type or ("issue" if is_issue else "pr")
 
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
+
+    # Clear the pending-task marker so the orchestrator can enqueue again
+    # if needed. This applies to ALL result statuses — the task is no longer
+    # pending regardless of whether it succeeded or failed.
+    try:
+        clear_pending_task(redis, repo, resource_type, resource_id)
+    except Exception as e:
+        logger.error(
+            f"Failed to clear pending task marker for {resource_label} #{resource_id}: {e}",
+            exc_info=True,
+        )
 
     # Clear attempt counter on success so future failures start fresh.
     if result.status == ResultStatus.COMPLETED:
@@ -567,6 +637,7 @@ def _handle_result(
                 clear_issue_attempts(redis, resource_id)
             else:
                 clear_attempts(redis, resource_id)
+                clear_total_attempts(redis, resource_id)
         except Exception as e:
             logger.error(
                 f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",

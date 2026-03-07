@@ -12,7 +12,7 @@ from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
-from orcest.shared.coordination import make_issue_lock_key
+from orcest.shared.coordination import make_issue_lock_key, make_pending_task_key
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ class IssueAction(str, Enum):
     ENQUEUE_IMPLEMENT = "enqueue_implement"
     SKIP_LOCKED = "skip_locked"
     SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
+    SKIP_QUEUED = "skip_queued"  # Task already pending in queue
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
 
@@ -133,6 +134,20 @@ def discover_actionable_issues(
                     title=title,
                     body=body,
                     action=IssueAction.SKIP_LOCKED,
+                    labels=issue_labels,
+                )
+            )
+            continue
+
+        # Skip if a task for this issue is already pending in the queue
+        pending_key = make_pending_task_key(repo, "issue", number)
+        if redis.client.exists(pending_key):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_QUEUED,
                     labels=issue_labels,
                 )
             )

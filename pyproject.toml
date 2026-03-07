@@ -22,6 +22,10 @@ orcest = "orcest.cli:main"
 where = ["src"]
 
 [project.optional-dependencies]
+fleet = [
+    "proxmoxer>=2.0",
+    "requests>=2.31",
+]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.14",
