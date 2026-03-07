@@ -74,7 +74,9 @@ def _safe_int(value: Any, field_name: str) -> int:
     None, or truly unconvertible values.
     """
     if value is None:
-        raise ValueError(f"Config field '{field_name}' is null/missing but an integer is required.")
+        raise ValueError(
+            f"Config field '{field_name}' is explicitly set to null but an integer is required."
+        )
     try:
         return int(value)
     except (ValueError, TypeError) as exc:
