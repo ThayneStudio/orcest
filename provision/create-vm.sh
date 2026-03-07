@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # --- Dependencies ---
-for cmd in qm wget; do
+for cmd in qm wget gpg; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: '${cmd}' not found. This script must be run on a Proxmox host."
         exit 1
@@ -115,11 +115,22 @@ else
     echo "Using cached image: ${IMG_CACHE}/${CLOUD_IMG}"
 fi
 
-# --- Verify cloud image checksum ---
+# --- Import Ubuntu cloud image signing key (if not already present) ---
+UBUNTU_SIGNING_KEY="843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+if ! gpg --list-keys "$UBUNTU_SIGNING_KEY" &>/dev/null; then
+    echo "Importing Ubuntu cloud image signing key ${UBUNTU_SIGNING_KEY}..."
+    gpg --keyserver keyserver.ubuntu.com --recv-keys "$UBUNTU_SIGNING_KEY"
+fi
+
+# --- Verify cloud image checksum (with GPG signature check) ---
 echo "Verifying image checksum..."
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS" \
     -O "${IMG_CACHE}/SHA256SUMS"
+wget -q --max-redirect=0 \
+    "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
+    -O "${IMG_CACHE}/SHA256SUMS.gpg"
+gpg --keyid-format long --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS"
 (cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
 
 # --- Create VM ---
