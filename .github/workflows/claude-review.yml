@@ -19,7 +19,15 @@ jobs:
 
     steps:
       - name: Install Bun dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libatomic1 unzip
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libatomic1 unzip curl
+          mkdir -p "$HOME/.bun/bin"
+          curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.3.6/bun-linux-x64.zip \
+            -o /tmp/bun.zip
+          unzip -o -q /tmp/bun.zip -d /tmp/bun-install
+          mv /tmp/bun-install/bun-linux-x64/bun "$HOME/.bun/bin/bun"
+          chmod +x "$HOME/.bun/bin/bun"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
       - name: Checkout repository
         uses: actions/checkout@v4
