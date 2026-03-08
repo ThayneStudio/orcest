@@ -133,7 +133,7 @@ def test_enqueue_ci_failure(gh_mock, fake_redis_client, label_config):
 
 
 def test_skip_green_pr(gh_mock, fake_redis_client, label_config):
-    """A PR with all-green CI and no actionable review state is SKIP_GREEN."""
+    """A PR with all-green CI, no review, and no unresolved threads is SKIP_GREEN."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=7, labels=[], review_decision=""),
     ]
@@ -141,6 +141,7 @@ def test_skip_green_pr(gh_mock, fake_redis_client, label_config):
         {"name": "ruff", "conclusion": "success"},
         {"name": "pytest", "conclusion": "success"},
     ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -281,14 +282,15 @@ def test_followup_when_approved_with_threads(gh_mock, fake_redis_client, label_c
     assert pr.review_threads == threads
 
 
-def test_skip_green_no_review(gh_mock, fake_redis_client, label_config):
-    """Empty reviewDecision + CI green -> SKIP_GREEN, threads NOT fetched."""
+def test_skip_green_no_review_no_threads(gh_mock, fake_redis_client, label_config):
+    """Empty reviewDecision + CI green + no unresolved threads -> SKIP_GREEN."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=90, labels=[], review_decision=""),
     ]
     gh_mock.get_ci_status.return_value = [
         {"name": "lint", "conclusion": "success"},
     ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -299,7 +301,38 @@ def test_skip_green_no_review(gh_mock, fake_redis_client, label_config):
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_GREEN
-    gh_mock.get_unresolved_review_threads.assert_not_called()
+    gh_mock.get_unresolved_review_threads.assert_called_once()
+
+
+def test_enqueue_fix_for_unresolved_review_threads(gh_mock, fake_redis_client, label_config):
+    """Empty reviewDecision + CI green + unresolved threads -> ENQUEUE_FIX."""
+    threads = [
+        {
+            "id": "thread-1",
+            "path": "src/foo.py",
+            "line": 10,
+            "comments": [{"author": "reviewer", "body": "Fix this"}],
+        },
+    ]
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=91, labels=[], review_decision=""),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = threads
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert results[0].review_threads == threads
+    assert results[0].ci_failures == []
 
 
 def test_ci_failure_skips_review_check(gh_mock, fake_redis_client, label_config):
@@ -786,7 +819,7 @@ def test_discover_multiple_prs(gh_mock, fake_redis_client, label_config):
     gh_mock.list_open_prs.return_value = [
         # PR 310: CI failure -> ENQUEUE_FIX
         _make_pr_data(number=310, labels=[]),
-        # PR 311: CI green, no review -> SKIP_GREEN
+        # PR 311: CI green, no review, no threads -> SKIP_GREEN
         _make_pr_data(number=311, labels=[], review_decision=""),
     ]
 
@@ -796,6 +829,7 @@ def test_discover_multiple_prs(gh_mock, fake_redis_client, label_config):
         return [{"name": "tests", "conclusion": "success"}]
 
     gh_mock.get_ci_status.side_effect = ci_status_side_effect
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -819,6 +853,7 @@ def test_discover_review_required_skips_green(gh_mock, fake_redis_client, label_
     gh_mock.get_ci_status.return_value = [
         {"name": "tests", "conclusion": "success"},
     ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -830,8 +865,6 @@ def test_discover_review_required_skips_green(gh_mock, fake_redis_client, label_
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_GREEN
     assert results[0].number == 320
-    # Review threads should not be fetched for REVIEW_REQUIRED
-    gh_mock.get_unresolved_review_threads.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +920,7 @@ def test_unknown_mergeable_falls_through_to_ci(gh_mock, fake_redis_client, label
     gh_mock.get_ci_status.return_value = [
         {"name": "tests", "conclusion": "success"},
     ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1001,6 +1035,7 @@ def test_no_skip_queued_without_pending_marker(gh_mock, fake_redis_client, label
     gh_mock.get_ci_status.return_value = [
         {"name": "tests", "conclusion": "success"},
     ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",

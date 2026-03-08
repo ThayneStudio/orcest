@@ -536,19 +536,51 @@ def discover_actionable_prs(
                     )
                 )
         else:
-            # CI green, no actionable review state
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_GREEN,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            # CI green, no formal review decision — check for unresolved
+            # review threads (e.g. from automated code review comments that
+            # use COMMENTED state rather than CHANGES_REQUESTED).
+            try:
+                threads = gh.get_unresolved_review_threads(repo, number, token)
+            except Exception:
+                logger.warning(
+                    "Failed to fetch review threads for PR #%d, skipping",
+                    number,
+                    exc_info=True,
                 )
-            )
+                threads = []
+
+            if threads:
+                logger.info(
+                    "PR #%d is CI green with %d unresolved review thread(s), enqueuing fix",
+                    number,
+                    len(threads),
+                )
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.ENQUEUE_FIX,
+                        ci_failures=[],
+                        review_threads=threads,
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_GREEN,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
 
     return results
