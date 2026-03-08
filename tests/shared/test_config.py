@@ -175,3 +175,11 @@ def test_delete_branch_on_merge_null_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="explicitly set to null"):
         load_orchestrator_config(cfg_file)
+
+
+def test_redis_port_null_raises(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nredis:\n  port: null\n")
+
+    with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)
