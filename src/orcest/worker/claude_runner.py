@@ -419,8 +419,8 @@ def run_claude(
                 # or network wait), the abort won't be detected until the
                 # next stdout line arrives or the watchdog fires its hard
                 # kill.  The watchdog provides a hard upper bound of
-                # watchdog_remaining seconds at the point of lock loss (at
-                # most `timeout` seconds from execution start), but there is
+                # watchdog_remaining seconds at the point of lock loss (i.e.
+                # at most timeout seconds from execution start), but there is
                 # no prompt/graceful signal to Claude on lock loss -- just an
                 # eventual SIGKILL.
                 #
