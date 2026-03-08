@@ -45,6 +45,10 @@ _TOTAL_LOG_BUDGET = 15000
 # On the next poll cycle the orchestrator will re-discover actionable
 # PRs/issues and re-enqueue any tasks that were trimmed, so work is not
 # permanently lost — only delayed by one poll interval.
+# CAVEAT: each trimmed (and therefore un-executed) task still consumes an
+# attempt counter slot.  If trimming happens on every cycle until
+# max_attempts is exhausted, the item will be permanently silenced.
+# At 10 000 MAXLEN this is extraordinarily unlikely, but not impossible.
 #
 # MAXLEN RATIONALE: 10 000 was chosen to make silent loss practically
 # impossible under realistic conditions.  At typical throughput the queue
