@@ -14,7 +14,7 @@
 #   ORCEST_VM_SOCKETS=2      ORCEST_VM_DISK=10G
 #
 # Prerequisites:
-#   - Run on the Proxmox host (needs qm and wget)
+#   - Run on the Proxmox host (needs qm, wget, and gpg)
 #   - SSH public key at ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
 
 set -euo pipefail
@@ -131,7 +131,7 @@ wget -q --max-redirect=0 \
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
     -O "${IMG_CACHE}/SHA256SUMS.gpg"
-gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" 2>/dev/null \
+gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
     | grep -q "VALIDSIG ${UBUNTU_SIGNING_KEY}" \
     || { echo "Error: SHA256SUMS not signed by expected Ubuntu key ${UBUNTU_SIGNING_KEY}"; exit 1; }
 (cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
