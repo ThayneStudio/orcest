@@ -119,7 +119,8 @@ fi
 UBUNTU_SIGNING_KEY="843938DF228D22F7B3742BC0D94AA3F0EFE21092"
 if ! gpg --list-keys "$UBUNTU_SIGNING_KEY" &>/dev/null; then
     echo "Importing Ubuntu cloud image signing key ${UBUNTU_SIGNING_KEY}..."
-    gpg --keyserver keyserver.ubuntu.com --keyserver-options timeout=30 --recv-keys "$UBUNTU_SIGNING_KEY"
+    gpg --keyserver keyserver.ubuntu.com --keyserver-options timeout=30 --recv-keys "$UBUNTU_SIGNING_KEY" \
+        || { echo "Error: Failed to import Ubuntu signing key ${UBUNTU_SIGNING_KEY} from keyserver"; exit 1; }
 fi
 
 # --- Verify cloud image checksum (with GPG signature check) ---
