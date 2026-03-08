@@ -361,6 +361,13 @@ def _dead_letter_task(
     why it was dead-lettered, then ACKs the original entry so the main stream
     does not stall.  ACK happens even if the dead-letter publish fails so the
     worker can make progress.
+
+    At-least-once delivery caveat: if ``xadd_capped`` succeeds but the
+    subsequent ``xack`` fails, the entry remains in the PEL.  The next time
+    it is reclaimed its delivery count will still exceed MAX_DELIVERY_COUNT,
+    causing ``_dead_letter_task`` to fire again and produce a duplicate entry
+    in DEAD_LETTER_STREAM.  Consumers of that stream must therefore
+    de-duplicate on ``original_entry_id``.
     """
     dl_fields = {
         **task.to_dict(),
