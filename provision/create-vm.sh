@@ -130,8 +130,10 @@ wget -q --max-redirect=0 \
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
     -O "${IMG_CACHE}/SHA256SUMS.gpg"
-gpg --keyid-format long --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" 2>&1 \
-    | grep -q "${UBUNTU_SIGNING_KEY}" || { echo "Error: SHA256SUMS not signed by expected Ubuntu key ${UBUNTU_SIGNING_KEY}"; exit 1; }
+gpg_output=$(gpg --keyid-format long --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" 2>&1) \
+    || { echo "Error: GPG verification failed:"; echo "$gpg_output"; exit 1; }
+echo "$gpg_output" | grep -q "${UBUNTU_SIGNING_KEY}" \
+    || { echo "Error: SHA256SUMS not signed by expected Ubuntu key ${UBUNTU_SIGNING_KEY}"; echo "$gpg_output"; exit 1; }
 (cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
 
 # --- Create VM ---
