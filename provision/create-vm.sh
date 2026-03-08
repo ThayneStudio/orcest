@@ -119,7 +119,7 @@ fi
 UBUNTU_SIGNING_KEY="843938DF228D22F7B3742BC0D94AA3F0EFE21092"
 if ! gpg --list-keys "$UBUNTU_SIGNING_KEY" &>/dev/null; then
     echo "Importing Ubuntu cloud image signing key ${UBUNTU_SIGNING_KEY}..."
-    gpg --keyserver keyserver.ubuntu.com --recv-keys "$UBUNTU_SIGNING_KEY"
+    gpg --keyserver keyserver.ubuntu.com --keyserver-options timeout=30 --recv-keys "$UBUNTU_SIGNING_KEY"
 fi
 
 # --- Verify cloud image checksum (with GPG signature check) ---
@@ -130,7 +130,8 @@ wget -q --max-redirect=0 \
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
     -O "${IMG_CACHE}/SHA256SUMS.gpg"
-gpg --keyid-format long --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS"
+gpg --keyid-format long --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" 2>&1 \
+    | grep -q "${UBUNTU_SIGNING_KEY}" || { echo "Error: SHA256SUMS not signed by expected Ubuntu key ${UBUNTU_SIGNING_KEY}"; exit 1; }
 (cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
 
 # --- Create VM ---
