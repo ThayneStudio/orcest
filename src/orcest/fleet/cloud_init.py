@@ -203,8 +203,8 @@ def _runcmd(repo: str) -> list[str]:
         ),
         "apt-get update -qq",
         "apt-get install -y -qq gh",
-        # Install Supabase CLI
-        "npm install -g supabase",
+        # Install Supabase CLI (npm global install no longer supported)
+        "curl -fsSL https://raw.githubusercontent.com/supabase/cli/main/install.sh | bash",
         # Install Playwright browsers
         "npx playwright install --with-deps chromium",
         # Authenticate gh CLI for the orcest user using the pre-written token file
