@@ -12,7 +12,7 @@ import subprocess
 import pytest
 
 from orcest.orchestrator.gh import (
-    MAX_PAGES,
+    _MAX_PAGES,
     GhCliError,
     GhNotInstalledError,
     add_label,
@@ -1031,15 +1031,15 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
     )
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        side_effect=[page] * MAX_PAGES,
+        side_effect=[page] * _MAX_PAGES,
     )
 
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
 
     assert any("reached MAX_PAGES" in msg for msg in caplog.messages)
-    # All MAX_PAGES fetched threads are included in the result despite the truncation warning
-    assert len(result) == MAX_PAGES
+    # All _MAX_PAGES fetched threads are included in the result despite the truncation warning
+    assert len(result) == _MAX_PAGES
 
 
 # ---------------------------------------------------------------------------
