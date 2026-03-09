@@ -879,14 +879,14 @@ class TestRunWorker:
     def test_worker_processes_task_below_max_delivery_count(
         self, mocker, worker_config, sample_task
     ):
-        """When delivery count is at or below MAX_DELIVERY_COUNT the task is
+        """When delivery count is below MAX_DELIVERY_COUNT the task is
         processed normally."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
 
-        # Delivery count is exactly at the threshold — should still execute
-        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT
+        # Delivery count is one below the threshold — should still execute
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT - 1
 
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 

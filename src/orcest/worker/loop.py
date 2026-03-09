@@ -161,7 +161,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # (result-publish failures leaving it unACKed), route it to the
         # dead-letter stream instead of running Claude again.
         delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
-        if delivery_count > MAX_DELIVERY_COUNT:
+        if delivery_count >= MAX_DELIVERY_COUNT:
             _dead_letter_task(redis, current_stream, entry_id, task, logger)
             continue
 
@@ -369,13 +369,13 @@ def _dead_letter_task(
     in DEAD_LETTER_STREAM.  Consumers of that stream must therefore
     de-duplicate on ``original_entry_id``.
     """
-    dl_fields = {
-        **task.to_dict(),
-        "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
-        "tasks_stream": tasks_stream,
-        "original_entry_id": entry_id,
-    }
     try:
+        dl_fields = {
+            **task.to_dict(),
+            "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
+            "tasks_stream": tasks_stream,
+            "original_entry_id": entry_id,
+        }
         redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
         logger.error(
             f"Task {task.id} ({task.type.value} for {task.resource_type} "

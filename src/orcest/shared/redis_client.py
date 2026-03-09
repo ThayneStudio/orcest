@@ -220,7 +220,7 @@ class RedisClient:
         if not entries:
             return 0
         count = entries[0].get("times_delivered", 0)  # type: ignore[index]
-        return int(count) if count else 0
+        return int(count)
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
