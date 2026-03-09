@@ -98,8 +98,8 @@ def _runcmd(
         "usermod -aG docker runner",
         # Install Playwright browsers
         "npx playwright install --with-deps chromium",
-        # Install Supabase CLI
-        "npm install -g supabase",
+        # Install Supabase CLI (npm global install no longer supported)
+        "curl -fsSL https://raw.githubusercontent.com/supabase/cli/main/install.sh | bash",
         # Download and configure GitHub Actions runner (version determined at boot time)
         "mkdir -p /opt/actions-runner",
         "chown runner:runner /opt/actions-runner",
