@@ -204,7 +204,12 @@ def _runcmd(repo: str) -> list[str]:
         "apt-get update -qq",
         "apt-get install -y -qq gh",
         # Install Supabase CLI (npm global install no longer supported)
-        "curl -fsSL https://raw.githubusercontent.com/supabase/cli/main/install.sh | bash",
+        "ARCH=$(dpkg --print-architecture)"
+        " && SUPA_VER=$(curl -fsSL https://api.github.com/repos/supabase/cli/releases/latest"
+        " | grep -oP '\"tag_name\":\\s*\"v\\K[^\"]+') "
+        '&& curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPA_VER}'
+        '/supabase_${SUPA_VER}_linux_${ARCH}.deb" -o /tmp/supabase.deb'
+        " && dpkg -i /tmp/supabase.deb && rm -f /tmp/supabase.deb",
         # Install Playwright browsers
         "npx playwright install --with-deps chromium",
         # Authenticate gh CLI for the orcest user using the pre-written token file
