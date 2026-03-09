@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import signal
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -16,7 +17,6 @@ from orcest.worker.loop import (
     CONSUMER_GROUP,
     HEARTBEAT_INTERVAL,
     RESULTS_STREAM,
-    _any_event,
     _execute_task,
     _make_abort_event,
     run_worker,
@@ -116,48 +116,6 @@ class TestMakeAbortEvent:
         assert not abort.is_set()
         shutdown_event.set()
         assert abort.wait(timeout=1), "abort event must wake when shutdown_event fires"
-
-
-# ---------------------------------------------------------------------------
-# Tests for _any_event
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestAnyEvent:
-    """Tests for the _any_event helper."""
-
-    def test_fires_when_first_source_set(self):
-        """Combined event fires when the first source event is set."""
-        e1, e2 = threading.Event(), threading.Event()
-        combined = _any_event(e1, e2)
-        assert not combined.is_set()
-        e1.set()
-        assert combined.wait(timeout=1.0)
-
-    def test_fires_when_second_source_set(self):
-        """Combined event fires when the second source event is set."""
-        e1, e2 = threading.Event(), threading.Event()
-        combined = _any_event(e1, e2)
-        assert not combined.is_set()
-        e2.set()
-        assert combined.wait(timeout=1.0)
-
-    def test_already_set_source_fires_immediately(self):
-        """Combined event is set immediately if a source is already set."""
-        e1 = threading.Event()
-        e1.set()
-        combined = _any_event(e1, threading.Event())
-        assert combined.wait(timeout=1.0)
-
-    def test_not_set_when_no_source_fires(self):
-        """Combined event stays unset when no source fires."""
-        e1, e2 = threading.Event(), threading.Event()
-        combined = _any_event(e1, e2)
-        assert not combined.wait(timeout=0.05)
-        # Cleanup: set both so daemon watch threads terminate
-        e1.set()
-        e2.set()
 
 
 # ---------------------------------------------------------------------------
@@ -598,11 +556,9 @@ class TestRunWorker:
             if normal_call_count == 1:
                 return [("entry-1", task_fields)]
             # On subsequent calls, trigger SIGTERM handler to exit loop
-            import signal as sig
-
-            handler = signal_handlers.get(sig.SIGTERM)
+            handler = signal_handlers.get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -765,11 +721,9 @@ class TestRunWorker:
             normal_call_count += 1
             if normal_call_count == 1:
                 return [("entry-bad", {"garbage": "data"})]
-            import signal as sig
-
-            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -799,11 +753,9 @@ class TestRunWorker:
                     return [("pending-1", task_fields)]
                 return []
             # No new tasks — trigger shutdown immediately
-            import signal as sig
-
-            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -835,14 +787,10 @@ class TestRunWorker:
         def fake_execute_task(*args, abort_event=None, **kwargs):
             captured_abort_event[0] = abort_event
             # Simulate SIGTERM arriving while the task is running
-            import signal as sig
-
-            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             task = args[0]
-            from orcest.shared.models import TaskResult
-
             return TaskResult(
                 task_id=task.id,
                 worker_id=worker_config.worker_id,
