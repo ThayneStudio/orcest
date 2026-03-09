@@ -332,6 +332,26 @@ def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
 
 
 # ---------------------------------------------------------------------------
+# Tests for stream_queue_depth
+# ---------------------------------------------------------------------------
+
+
+def test_stream_queue_depth_warns_on_non_list(fake_redis_client, mocker, caplog):
+    """stream_queue_depth returns 0 and logs a warning when xinfo_groups returns a non-list."""
+    import logging
+
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        return_value="unexpected",
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
+        result = fake_redis_client.stream_queue_depth("mystream", "mygroup")
+    assert result == 0
+    assert any("unexpected type" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Tests for xack edge cases
 # ---------------------------------------------------------------------------
 
