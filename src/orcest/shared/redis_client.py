@@ -184,6 +184,11 @@ class RedisClient:
         except redis.ResponseError:
             return 0
         if not isinstance(groups, list):
+            logger.warning(
+                "xinfo_groups returned unexpected type %s for stream %r",
+                type(groups),
+                stream,
+            )
             return 0
         for g in groups:
             if g.get("name") == group:
