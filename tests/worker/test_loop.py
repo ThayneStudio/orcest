@@ -151,7 +151,7 @@ class TestExecuteTask:
 
         # Workspace lifecycle
         mock_workspace.setup.assert_called_once_with(
-            sample_task.repo, sample_task.branch, sample_task.token
+            sample_task.repo, sample_task.branch, sample_task.token, sample_task.base_branch
         )
         mock_workspace.cleanup.assert_called_once()
 

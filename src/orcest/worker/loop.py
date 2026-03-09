@@ -368,7 +368,7 @@ def _execute_task(
 
         # Setup workspace
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
-        work_dir = workspace.setup(task.repo, task.branch, task.token)
+        work_dir = workspace.setup(task.repo, task.branch, task.token, task.base_branch)
 
         output_errors = 0
 
