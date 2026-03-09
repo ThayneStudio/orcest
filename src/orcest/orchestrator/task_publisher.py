@@ -204,6 +204,7 @@ def publish_fix_task(
         resource_id=pr_state.number,
         prompt=prompt,
         branch=pr_state.branch,
+        base_branch=pr_state.base_branch,
     )
 
     _publish_and_notify(
@@ -264,6 +265,7 @@ def publish_followup_task(
         resource_id=pr_state.number,
         prompt=prompt,
         branch=pr_state.branch,
+        base_branch=pr_state.base_branch,
     )
 
     _publish_and_notify(
@@ -311,6 +313,7 @@ def publish_rebase_task(
         resource_id=pr_state.number,
         prompt=prompt,
         branch=pr_state.branch,
+        base_branch=pr_state.base_branch,
     )
 
     _publish_and_notify(

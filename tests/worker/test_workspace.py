@@ -160,6 +160,80 @@ def test_token_sanitized_in_error(mocker, tmp_path):
 
 
 @pytest.mark.unit
+def test_rebase_onto_base_branch(mocker, tmp_path):
+    """When base_branch is set, setup() fetches and rebases onto it."""
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, BRANCH, TOKEN, base_branch="main")
+
+    # Find the fetch and rebase calls (after clone, set-url, and 3 configs)
+    all_calls = [call[0][0] for call in mock_run.call_args_list]
+
+    fetch_calls = [args for args in all_calls if "fetch" in args]
+    assert len(fetch_calls) == 1
+    assert "origin" in fetch_calls[0]
+    assert "main" in fetch_calls[0]
+
+    rebase_calls = [args for args in all_calls if "rebase" in args]
+    assert len(rebase_calls) == 1
+    assert "origin/main" in rebase_calls[0]
+
+
+@pytest.mark.unit
+def test_no_rebase_without_base_branch(mocker, tmp_path):
+    """When base_branch is None, no fetch/rebase is performed."""
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, BRANCH, TOKEN)
+
+    all_calls = [call[0][0] for call in mock_run.call_args_list]
+    assert not any("fetch" in args for args in all_calls)
+    assert not any("rebase" in args for args in all_calls)
+
+
+@pytest.mark.unit
+def test_rebase_conflict_raises_workspace_error(mocker, tmp_path):
+    """Rebase conflict aborts the rebase and raises WorkspaceError."""
+    def side_effect(cmd, **kwargs):
+        if "rebase" in cmd and "--abort" not in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr="CONFLICT"
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    mocker.patch("orcest.worker.workspace.subprocess.run", side_effect=side_effect)
+    ws = Workspace(str(tmp_path))
+    with pytest.raises(WorkspaceError, match="rebase onto origin/main failed"):
+        ws.setup(REPO, BRANCH, TOKEN, base_branch="main")
+
+
+@pytest.mark.unit
+def test_no_rebase_without_branch(mocker, tmp_path):
+    """When branch is None (default branch checkout), no rebase is performed."""
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN, base_branch="main")
+
+    all_calls = [call[0][0] for call in mock_run.call_args_list]
+    assert not any("fetch" in args for args in all_calls)
+    assert not any("rebase" in args for args in all_calls)
+
+
+# ---------------------------------------------------------------------------
+# cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
 def test_cleanup_removes_directory(tmp_path):
     """cleanup() removes the workspace temp directory."""
     # Simulate what setup() does: create a temp dir under base_dir

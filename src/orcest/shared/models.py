@@ -37,6 +37,7 @@ class Task:
     resource_id: int  # PR/issue number
     prompt: str  # Full rendered prompt
     branch: str | None  # Existing branch (for PR fixes)
+    base_branch: str | None  # Base branch to rebase onto (e.g. "main", "master")
     created_at: datetime
 
     def to_dict(self) -> dict[str, str]:
@@ -50,6 +51,7 @@ class Task:
             "resource_id": str(self.resource_id),
             "prompt": self.prompt,
             "branch": self.branch or "",
+            "base_branch": self.base_branch or "",
             "created_at": self.created_at.isoformat(),
         }
 
@@ -65,6 +67,7 @@ class Task:
             resource_id=int(data["resource_id"]),
             prompt=data["prompt"],
             branch=data["branch"] or None,
+            base_branch=data.get("base_branch") or None,
             created_at=datetime.fromisoformat(data["created_at"]),
         )
 
@@ -78,6 +81,7 @@ class Task:
         resource_id: int,
         prompt: str,
         branch: str | None = None,
+        base_branch: str | None = None,
     ) -> "Task":
         """Factory with auto-generated ID and timestamp."""
         return cls(
@@ -89,6 +93,7 @@ class Task:
             resource_id=resource_id,
             prompt=prompt,
             branch=branch,
+            base_branch=base_branch,
             created_at=datetime.now(timezone.utc),
         )
 
