@@ -207,9 +207,7 @@ class Workspace:
                 capture_output=True,
                 timeout=30,
             )
-            raise WorkspaceError(
-                f"rebase onto origin/{base_branch} failed with conflicts"
-            )
+            raise WorkspaceError(f"rebase onto origin/{base_branch} failed with conflicts")
 
     def cleanup(self) -> None:
         """Remove the workspace directory.

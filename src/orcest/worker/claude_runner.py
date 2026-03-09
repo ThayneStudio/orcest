@@ -413,6 +413,21 @@ def run_claude(
                             )
                         # Disable streaming for all remaining retry attempts to avoid log spam
                         on_output = None
+                # NOTE (known limitation): abort latency is unbounded when
+                # Claude produces no stdout.  This check only fires between
+                # lines, so if the subprocess is silent (e.g. long tool-call
+                # or network wait), the abort won't be detected until the
+                # next stdout line arrives or the watchdog fires its hard
+                # kill.  The watchdog provides a hard upper bound of at most
+                # timeout seconds from execution start (i.e. at most
+                # timeout - elapsed seconds remaining after lock loss is detected), but there is
+                # no prompt/graceful signal to Claude on lock loss -- just an
+                # eventual SIGKILL.
+                #
+                # If prompt abort on lock loss becomes a requirement, consider
+                # switching to a non-blocking read loop (e.g. select-based) that
+                # can interleave abort checks without blocking on stdout.  See
+                # GitHub issue #144 for context.
                 if abort_event is not None and abort_event.is_set():
                     watchdog_cancelled.set()
                     watchdog_thread.join(timeout=5)

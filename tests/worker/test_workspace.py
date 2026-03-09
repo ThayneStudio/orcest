@@ -200,11 +200,10 @@ def test_no_rebase_without_base_branch(mocker, tmp_path):
 @pytest.mark.unit
 def test_rebase_conflict_raises_workspace_error(mocker, tmp_path):
     """Rebase conflict aborts the rebase and raises WorkspaceError."""
+
     def side_effect(cmd, **kwargs):
         if "rebase" in cmd and "--abort" not in cmd:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=1, stdout="", stderr="CONFLICT"
-            )
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="CONFLICT")
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     mocker.patch("orcest.worker.workspace.subprocess.run", side_effect=side_effect)
