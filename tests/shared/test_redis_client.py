@@ -1,6 +1,9 @@
 """Tests for orcest.shared.redis_client using fakeredis."""
 
+import logging
+
 import pytest
+import redis as _redis
 
 # Tests use the fake_redis_client fixture from conftest.py
 
@@ -194,10 +197,6 @@ def test_xread_after_rejects_zero_count(fake_redis_client):
 
 def test_xread_after_returns_empty_on_connection_error(fake_redis_client, mocker, caplog):
     """xread_after returns [] and logs a warning on ConnectionError."""
-    import logging
-
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "xread",
@@ -211,10 +210,6 @@ def test_xread_after_returns_empty_on_connection_error(fake_redis_client, mocker
 
 def test_xread_after_returns_empty_on_timeout_error(fake_redis_client, mocker, caplog):
     """xread_after returns [] and logs a warning on TimeoutError."""
-    import logging
-
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "xread",
@@ -228,10 +223,6 @@ def test_xread_after_returns_empty_on_timeout_error(fake_redis_client, mocker, c
 
 def test_xread_after_returns_empty_on_response_error(fake_redis_client, mocker, caplog):
     """xread_after returns [] and logs a warning on ResponseError (e.g. WRONGTYPE)."""
-    import logging
-
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "xread",
@@ -245,10 +236,6 @@ def test_xread_after_returns_empty_on_response_error(fake_redis_client, mocker, 
 
 def test_xread_after_returns_empty_on_auth_error(fake_redis_client, mocker, caplog):
     """xread_after returns [] and logs a warning on AuthenticationError."""
-    import logging
-
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "xread",
@@ -267,8 +254,6 @@ def test_xread_after_returns_empty_on_auth_error(fake_redis_client, mocker, capl
 
 def test_health_check_connection_error(fake_redis_client, mocker):
     """health_check returns False when ping() raises ConnectionError."""
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "ping",
@@ -279,8 +264,6 @@ def test_health_check_connection_error(fake_redis_client, mocker):
 
 def test_health_check_timeout_error(fake_redis_client, mocker):
     """health_check returns False when ping() raises TimeoutError."""
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "ping",
@@ -291,8 +274,6 @@ def test_health_check_timeout_error(fake_redis_client, mocker):
 
 def test_health_check_auth_error(fake_redis_client, mocker):
     """health_check returns False when ping() raises AuthenticationError."""
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "ping",
@@ -303,8 +284,6 @@ def test_health_check_auth_error(fake_redis_client, mocker):
 
 def test_health_check_response_error(fake_redis_client, mocker):
     """health_check returns False when ping() raises ResponseError (e.g. NOPERM)."""
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "ping",
@@ -320,8 +299,6 @@ def test_health_check_response_error(fake_redis_client, mocker):
 
 def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
     """Non-BUSYGROUP ResponseError from xgroup_create is re-raised."""
-    import redis as _redis
-
     mocker.patch.object(
         fake_redis_client._client,
         "xgroup_create",
@@ -338,8 +315,6 @@ def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
 
 def test_stream_queue_depth_warns_on_non_list(fake_redis_client, mocker, caplog):
     """stream_queue_depth returns 0 and logs a warning when xinfo_groups returns a non-list."""
-    import logging
-
     mocker.patch.object(
         fake_redis_client._client,
         "xinfo_groups",

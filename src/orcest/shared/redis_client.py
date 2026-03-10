@@ -186,7 +186,7 @@ class RedisClient:
         if not isinstance(groups, list):
             logger.warning(
                 "xinfo_groups returned unexpected type %s for stream %r",
-                type(groups),
+                type(groups).__name__,
                 stream,
             )
             return 0
