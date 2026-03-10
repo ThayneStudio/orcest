@@ -1287,10 +1287,11 @@ def test_skip_green_when_claude_review_not_success(gh_mock, fake_redis_client, l
 def test_get_claude_review_run_id_success():
     """Extracts run ID from a successful claude-review check."""
     checks = [
-        {"name": "lint", "conclusion": "success"},
+        {"name": "lint", "conclusion": "success", "status": "COMPLETED"},
         {
             "name": "claude-review",
             "conclusion": "SUCCESS",
+            "status": "COMPLETED",
             "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
         },
     ]
@@ -1312,6 +1313,7 @@ def test_get_claude_review_run_id_not_success():
         {
             "name": "claude-review",
             "conclusion": "failure",
+            "status": "COMPLETED",
             "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
         },
     ]
@@ -1321,7 +1323,39 @@ def test_get_claude_review_run_id_not_success():
 def test_get_claude_review_run_id_no_details_url():
     """Returns None when claude-review has no detailsUrl."""
     checks = [
-        {"name": "claude-review", "conclusion": "SUCCESS"},
+        {"name": "claude-review", "conclusion": "SUCCESS", "status": "COMPLETED"},
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_in_progress_returns_none():
+    """Returns None when a claude-review run is in progress (new run pending after re-trigger)."""
+    checks = [
+        {
+            "name": "claude-review",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
+        },
+        {
+            "name": "claude-review",
+            "conclusion": None,
+            "status": "IN_PROGRESS",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/11111",
+        },
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_queued_returns_none():
+    """Returns None when a claude-review run is queued (new run pending after re-trigger)."""
+    checks = [
+        {
+            "name": "claude-review",
+            "conclusion": None,
+            "status": "QUEUED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/11111",
+        },
     ]
     assert _get_claude_review_run_id(checks) is None
 

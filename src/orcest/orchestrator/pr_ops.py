@@ -196,13 +196,22 @@ def clear_review_retrigger(redis: RedisClient, pr_number: int) -> None:
 def _get_claude_review_run_id(checks: list[dict]) -> int | None:
     """Extract the GitHub Actions run ID for a successful claude-review check.
 
-    Returns None if no claude-review check exists or it didn't succeed.
+    Returns None if no claude-review check exists, it didn't succeed, or any
+    claude-review run is currently in progress (to avoid acting on a stale
+    completed result while a new run is pending after a re-trigger).
     """
-    for check in checks:
-        if (
-            check.get("name") == "claude-review"
-            and (check.get("conclusion") or "").upper() == "SUCCESS"
-        ):
+    claude_review_checks = [c for c in checks if c.get("name") == "claude-review"]
+    if not claude_review_checks:
+        return None
+
+    # If any run is still in progress, a re-triggered run may be pending —
+    # don't act on a stale completed result.
+    for check in claude_review_checks:
+        if (check.get("status") or "").upper() != "COMPLETED":
+            return None
+
+    for check in claude_review_checks:
+        if (check.get("conclusion") or "").upper() == "SUCCESS":
             details_url = check.get("detailsUrl", "")
             # URL format: https://github.com/.../actions/runs/{run_id}/job/{job_id}
             match = re.search(r"/actions/runs/(\d+)", details_url)
