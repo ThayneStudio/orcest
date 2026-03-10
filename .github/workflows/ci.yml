@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [master]
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -54,7 +55,11 @@ jobs:
 
   integration:
     runs-on: [self-hosted, linux]
-    if: github.event_name == 'workflow_dispatch'
+    # Run on push to master to catch regressions automatically, and on workflow_dispatch
+    # for on-demand runs. Skipped on PR branches to avoid Redis overhead on every push.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
     services:
       redis:
         image: redis:7
