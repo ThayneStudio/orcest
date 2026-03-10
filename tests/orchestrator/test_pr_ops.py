@@ -1263,6 +1263,7 @@ def test_skip_green_when_claude_review_not_success(gh_mock, fake_redis_client, l
         {
             "name": "claude-review",
             "conclusion": "neutral",
+            "status": "COMPLETED",
             "detailsUrl": "https://github.com/org/repo/actions/runs/88888/job/999",
         },
     ]
