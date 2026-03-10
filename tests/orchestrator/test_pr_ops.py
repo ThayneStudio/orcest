@@ -7,13 +7,17 @@ fake_redis_client (fakeredis-backed RedisClient).
 
 from orcest.orchestrator.pr_ops import (
     PRAction,
+    _get_claude_review_run_id,
     clear_attempts,
+    clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
     get_attempt_count,
+    get_review_retrigger_sha,
     get_total_attempt_count,
     increment_attempts,
     increment_total_attempts,
+    set_review_retrigger_sha,
 )
 from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 
@@ -1123,3 +1127,263 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
 
     assert len(results) == 1
     assert results[0].action == PRAction.ENQUEUE_FIX
+
+
+# ---------------------------------------------------------------------------
+# Review re-trigger tests
+# ---------------------------------------------------------------------------
+
+
+def _make_claude_review_check(
+    run_id: int = 12345,
+    conclusion: str = "SUCCESS",
+) -> dict:
+    """Build a claude-review check dict matching statusCheckRollup shape."""
+    return {
+        "name": "claude-review",
+        "conclusion": conclusion,
+        "detailsUrl": f"https://github.com/org/repo/actions/runs/{run_id}/job/999",
+        "status": "COMPLETED",
+    }
+
+
+def test_retrigger_review_when_claude_review_passed_no_formal_review(
+    gh_mock, fake_redis_client, label_config
+):
+    """claude-review SUCCESS + empty reviewDecision + no retrigger yet → RETRIGGER_REVIEW."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=800, labels=[], review_decision="", head_sha="abc123"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        _make_claude_review_check(run_id=55555),
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_REVIEW
+    assert pr.review_run_id == 55555
+    assert pr.number == 800
+
+
+def test_retrigger_review_escalates_after_retrigger_exhausted(
+    gh_mock, fake_redis_client, label_config
+):
+    """claude-review SUCCESS + already re-triggered for this SHA → SKIP_MAX_ATTEMPTS."""
+    pr_number = 801
+    head_sha = "def456"
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], review_decision="", head_sha=head_sha),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        _make_claude_review_check(run_id=66666),
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    # Mark that we already re-triggered for this SHA
+    set_review_retrigger_sha(fake_redis_client, pr_number, head_sha)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_MAX_ATTEMPTS
+    assert results[0].number == pr_number
+
+
+def test_retrigger_review_allowed_after_new_sha(gh_mock, fake_redis_client, label_config):
+    """Re-trigger allowed when SHA changes (old retrigger was for a different SHA)."""
+    pr_number = 802
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], review_decision="", head_sha="new_sha"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        _make_claude_review_check(run_id=77777),
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    # Old retrigger was for a different SHA
+    set_review_retrigger_sha(fake_redis_client, pr_number, "old_sha")
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.RETRIGGER_REVIEW
+    assert results[0].review_run_id == 77777
+
+
+def test_skip_green_when_no_claude_review_check(gh_mock, fake_redis_client, label_config):
+    """No claude-review check in CI → normal SKIP_GREEN (no retrigger)."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=803, labels=[], review_decision=""),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        {"name": "tests", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_GREEN
+
+
+def test_skip_green_when_claude_review_not_success(gh_mock, fake_redis_client, label_config):
+    """claude-review exists but conclusion is neutral → normal SKIP_GREEN."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=804, labels=[], review_decision=""),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "lint", "conclusion": "success"},
+        {
+            "name": "claude-review",
+            "conclusion": "neutral",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/88888/job/999",
+        },
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_GREEN
+
+
+# ---------------------------------------------------------------------------
+# _get_claude_review_run_id unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_claude_review_run_id_success():
+    """Extracts run ID from a successful claude-review check."""
+    checks = [
+        {"name": "lint", "conclusion": "success", "status": "COMPLETED"},
+        {
+            "name": "claude-review",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
+        },
+    ]
+    assert _get_claude_review_run_id(checks) == 12345
+
+
+def test_get_claude_review_run_id_no_match():
+    """Returns None when no claude-review check exists."""
+    checks = [
+        {"name": "lint", "conclusion": "success"},
+        {"name": "tests", "conclusion": "success"},
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_not_success():
+    """Returns None when claude-review exists but conclusion is not SUCCESS."""
+    checks = [
+        {
+            "name": "claude-review",
+            "conclusion": "failure",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
+        },
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_no_details_url():
+    """Returns None when claude-review has no detailsUrl."""
+    checks = [
+        {"name": "claude-review", "conclusion": "SUCCESS", "status": "COMPLETED"},
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_in_progress_returns_none():
+    """Returns None when a claude-review run is in progress (new run pending after re-trigger)."""
+    checks = [
+        {
+            "name": "claude-review",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/67890",
+        },
+        {
+            "name": "claude-review",
+            "conclusion": None,
+            "status": "IN_PROGRESS",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/11111",
+        },
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+def test_get_claude_review_run_id_queued_returns_none():
+    """Returns None when a claude-review run is queued (new run pending after re-trigger)."""
+    checks = [
+        {
+            "name": "claude-review",
+            "conclusion": None,
+            "status": "QUEUED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/11111",
+        },
+    ]
+    assert _get_claude_review_run_id(checks) is None
+
+
+# ---------------------------------------------------------------------------
+# Review retrigger Redis tracking tests
+# ---------------------------------------------------------------------------
+
+
+def test_review_retrigger_sha_roundtrip(fake_redis_client):
+    """set/get/clear review retrigger SHA works correctly."""
+    pr_number = 900
+    assert get_review_retrigger_sha(fake_redis_client, pr_number) is None
+
+    set_review_retrigger_sha(fake_redis_client, pr_number, "abc123")
+    assert get_review_retrigger_sha(fake_redis_client, pr_number) == "abc123"
+
+    clear_review_retrigger(fake_redis_client, pr_number)
+    assert get_review_retrigger_sha(fake_redis_client, pr_number) is None
+
+
+def test_review_retrigger_sha_has_ttl(fake_redis_client):
+    """set_review_retrigger_sha sets a 7-day TTL."""
+    pr_number = 901
+    set_review_retrigger_sha(fake_redis_client, pr_number, "sha1")
+
+    key = f"pr:{pr_number}:review_retrigger"
+    ttl = fake_redis_client.client.ttl(key)
+    expected_ttl = 7 * 24 * 3600
+    assert 0 < ttl <= expected_ttl

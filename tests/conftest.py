@@ -154,6 +154,7 @@ def gh_mock(mocker):
         "get_pr_review_comments",
         "resolve_review_thread",
         "merge_pr",
+        "rerun_workflow",
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
