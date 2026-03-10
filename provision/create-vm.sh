@@ -133,7 +133,7 @@ gpg --list-keys "${UBUNTU_SIGNING_KEY}" &>/dev/null \
     || gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${UBUNTU_SIGNING_KEY}"
 # Verify GPG signature. Ubuntu may sign with a subkey; VALIDSIG includes the
 # primary key fingerprint as the last field, so anchor the grep to end-of-line.
-if ! gpg --batch --keyid-format long --status-fd 1 \
+if ! gpg --batch --status-fd 1 \
         --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
         | grep -q "^\[GNUPG:\] VALIDSIG .* ${UBUNTU_SIGNING_KEY}$"; then
     echo "Error: GPG signature verification failed or signed by unexpected key" >&2
