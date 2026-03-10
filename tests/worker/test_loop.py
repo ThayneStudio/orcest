@@ -6,7 +6,7 @@ import logging
 import signal
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1037,8 +1037,6 @@ class TestCheckGhCredentials:
 
     def _run(self, tmp_path: Path, logger: logging.Logger) -> None:
         """Call _check_gh_credentials with Path.home() pointing to tmp_path."""
-        from unittest.mock import patch
-
         with patch("pathlib.Path.home", return_value=tmp_path):
             _check_gh_credentials(logger)
 

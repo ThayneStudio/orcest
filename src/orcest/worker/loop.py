@@ -14,6 +14,8 @@ import threading
 import time
 from pathlib import Path
 
+import yaml
+
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
@@ -56,13 +58,7 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
         return
 
     try:
-        import yaml
-    except ImportError:
-        logger.warning("PyYAML is not installed; skipping gh credential check")
-        return
-
-    try:
-        data = yaml.safe_load(hosts_file.read_text())
+        data = yaml.safe_load(hosts_file.read_text(encoding="utf-8"))
     except Exception as exc:
         logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}")
         return
