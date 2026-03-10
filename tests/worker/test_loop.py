@@ -17,6 +17,7 @@ from orcest.worker.loop import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
     HEARTBEAT_INTERVAL,
+    LOCK_TTL,
     MAX_DELIVERY_COUNT,
     RESULTS_STREAM,
     _check_gh_credentials,
@@ -605,13 +606,7 @@ class TestRunWorker:
         lock_key = set_call[0][0]
         assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
-        runner = worker_config.runner
-        expected_ttl = (
-            runner.timeout * runner.max_retries
-            + runner.retry_backoff * (runner.max_retries - 1)
-            + 120
-        )
-        assert set_call[1]["ex"] == expected_ttl
+        assert set_call[1]["ex"] == LOCK_TTL
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
@@ -827,6 +822,17 @@ class TestRunWorker:
         run_worker(worker_config)
 
         assert captured_abort_event[0] is not None, "abort_event was not passed to _execute_task"
+
+    def test_lock_ttl_equals_3x_heartbeat_interval(self):
+        """LOCK_TTL must equal 3 × HEARTBEAT_INTERVAL so that a crashed worker's
+        orphaned lock expires within ~180 s instead of ~92 minutes.
+
+        Regression test for issue #206.
+        """
+        assert LOCK_TTL == 180, (
+            f"LOCK_TTL ({LOCK_TTL}s) must equal 180 s (3 × HEARTBEAT_INTERVAL) "
+            f"to bound the crash orphaned-lock window"
+        )
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task
