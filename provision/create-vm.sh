@@ -125,6 +125,9 @@ wget -q --max-redirect=0 \
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
     -O "${IMG_CACHE}/SHA256SUMS.gpg"
+# Import Ubuntu Cloud Image Builder key if not already present.
+gpg --list-keys "${UBUNTU_SIGNING_KEY}" &>/dev/null \
+    || gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${UBUNTU_SIGNING_KEY}"
 # Verify GPG signature. Ubuntu may sign with a subkey, so the primary key
 # fingerprint can appear anywhere on the VALIDSIG line.
 if ! gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
