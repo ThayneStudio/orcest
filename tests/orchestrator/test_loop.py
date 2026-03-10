@@ -275,7 +275,7 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 
 
 def test_consume_results_completed(fake_redis_client, orchestrator_config, gh_mock):
-    """A COMPLETED result clears attempts and posts a comment."""
+    """A COMPLETED result clears attempts but does not post a comment."""
     # Set up consumer group and add a result to the stream
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
@@ -285,10 +285,8 @@ def test_consume_results_completed(fake_redis_client, orchestrator_config, gh_mo
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # Should post a comment about completion
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "completed" in comment_body
+    # Success is silent — no comment posted
+    gh_mock.post_comment.assert_not_called()
 
     # No label operations
     gh_mock.remove_label.assert_not_called()
@@ -437,10 +435,8 @@ def test_consume_results_xack_failure_continues(
     # Should not raise -- xack failure is caught and logged
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # The result was still processed: comment was posted
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "completed" in comment_body
+    # The result was still processed (completed = no comment posted)
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_consume_results_blocked_status_posts_comment(
@@ -755,7 +751,7 @@ def test_handle_result_post_comment_failure(
     """When post_comment raises in _handle_result, it should be logged (no crash)."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    result = _make_task_result(status=ResultStatus.COMPLETED, pr_number=91)
+    result = _make_task_result(status=ResultStatus.FAILED, pr_number=91)
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     gh_mock.post_comment.side_effect = RuntimeError("GitHub API down")
@@ -764,9 +760,5 @@ def test_handle_result_post_comment_failure(
     # Should not raise -- post_comment failure is caught and logged
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # post_comment was attempted
+    # post_comment was attempted (failures still get comments)
     gh_mock.post_comment.assert_called_once()
-
-    # COMPLETED has no label operations
-    gh_mock.remove_label.assert_not_called()
-    gh_mock.add_label.assert_not_called()

@@ -111,12 +111,12 @@ def test_publish_does_not_add_label(gh_mock, fake_redis_client):
     gh_mock.add_label.assert_not_called()
 
 
-def test_publish_posts_comment(gh_mock, fake_redis_client):
-    """publish_fix_task calls gh.post_comment on the PR."""
+def test_publish_does_not_post_comment(gh_mock, fake_redis_client):
+    """publish_fix_task does not post a comment (queued comments are noise)."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=20)
 
-    task = publish_fix_task(
+    publish_fix_task(
         pr_state=pr_state,
         repo="test-org/test-repo",
         token="fake-token",
@@ -124,12 +124,7 @@ def test_publish_posts_comment(gh_mock, fake_redis_client):
         default_runner="claude",
     )
 
-    gh_mock.post_comment.assert_called_once()
-    call_args = gh_mock.post_comment.call_args
-    assert call_args[0][0] == "test-org/test-repo"
-    assert call_args[0][1] == 20
-    # Comment body should mention the task ID
-    assert task.id in call_args[0][2]
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_prompt_truncates_long_diff(gh_mock, fake_redis_client):
@@ -774,33 +769,29 @@ def test_publish_fix_task_log_budget_exhaustion(
     assert "D" * 100 not in task.prompt
 
 
-def test_publish_and_notify_comment_fail(
+def test_publish_does_not_comment_even_if_gh_would_fail(
     gh_mock,
     fake_redis_client,
-    caplog,
 ):
-    """post_comment raises. Task should still be published to Redis."""
+    """publish_fix_task never calls post_comment, so gh errors don't matter."""
     _setup_gh_defaults(gh_mock)
     gh_mock.post_comment.side_effect = RuntimeError("comment fail")
     pr_state = _make_pr_state(number=603)
 
-    with caplog.at_level(logging.ERROR):
-        task = publish_fix_task(
-            pr_state=pr_state,
-            repo="test-org/test-repo",
-            token="fake-token",
-            redis=fake_redis_client,
-            default_runner="claude",
-        )
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
 
-    # Task is still published to Redis despite comment failure
+    # Task is still published to Redis
     assert isinstance(task, Task)
     entries = fake_redis_client.client.xrange("tasks:claude")
     assert any(f["id"] == task.id for _, f in entries)
-
-    # The error log should mention comment failure
-    error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("Failed to post comment" in m for m in error_msgs)
+    # No comment was attempted
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_publish_and_notify_xadd_failure(

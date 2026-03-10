@@ -120,21 +120,6 @@ def _publish_and_notify(
     tasks_stream = f"tasks:{default_runner}"
     redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
 
-    # Post comment on PR for visibility
-    try:
-        gh.post_comment(
-            repo,
-            pr_state.number,
-            f"**orcest** queued task `{task.id}` ({task_type.value}) for this PR.",
-            token,
-        )
-    except Exception:
-        _log.error(
-            f"Failed to post comment on PR #{pr_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
-
     _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
 
 
@@ -436,21 +421,6 @@ def _publish_issue_and_notify(
     # Publish to issue-specific stream (lower priority than PR tasks)
     tasks_stream = f"tasks:issue:{default_runner}"
     redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
-
-    # Post comment on issue for visibility
-    try:
-        gh.post_issue_comment(
-            repo,
-            issue_state.number,
-            f"**orcest** queued task `{task.id}` ({task_type.value}) for this issue.",
-            token,
-        )
-    except Exception:
-        _log.error(
-            f"Failed to post comment on issue #{issue_state.number} "
-            f"(task {task.id} already published to Redis)",
-            exc_info=True,
-        )
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
 

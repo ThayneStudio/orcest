@@ -678,69 +678,63 @@ def _handle_result(
                 exc_info=True,
             )
 
-    # Format result comment
-    safe_summary = result.summary[:500] if result.summary else ""
+    # Only post comments for non-success statuses (failures, blocked, etc.)
+    # Success is silent to avoid comment noise on PRs/issues.
+    if result.status != ResultStatus.COMPLETED:
+        safe_summary = result.summary[:500] if result.summary else ""
 
-    if result.status == ResultStatus.COMPLETED:
-        body = (
-            f"**orcest** task `{result.task_id}` completed "
-            f"({result.duration_seconds}s, "
-            f"worker: {result.worker_id}).\n\n"
-            f"Summary: {safe_summary}"
-        )
-    elif result.status == ResultStatus.FAILED:
-        label_note = (
-            f"Labeling as `{labels.needs_human}` for manual review."
-            if labeled
-            else f"Failed to add `{labels.needs_human}` label — please triage manually."
-        )
-        body = (
-            f"**orcest** task `{result.task_id}` failed "
-            f"({result.duration_seconds}s, "
-            f"worker: {result.worker_id}).\n\n"
-            f"Summary: {safe_summary}\n\n"
-            f"{label_note}"
-        )
-    elif result.status == ResultStatus.BLOCKED:
-        label_note = (
-            f"Labeling as `{labels.blocked}` — waiting for external input."
-            if labeled
-            else f"Failed to add `{labels.blocked}` label — please triage manually."
-        )
-        body = (
-            f"**orcest** task `{result.task_id}` is blocked "
-            f"({result.duration_seconds}s, "
-            f"worker: {result.worker_id}).\n\n"
-            f"Summary: {safe_summary}\n\n"
-            f"{label_note}"
-        )
-    elif result.status == ResultStatus.USAGE_EXHAUSTED:
-        branch_note = (
-            f"Work saved on branch `{result.branch}`. " if result.branch else "Work saved. "
-        )
-        body = (
-            f"**orcest** task `{result.task_id}` paused "
-            f"(usage limit reached, "
-            f"worker: {result.worker_id}).\n\n"
-            f"{branch_note}"
-            f"Will resume when capacity is available."
-        )
-    else:
-        body = (
-            f"**orcest** task `{result.task_id}`: "
-            f"{result.status.value} "
-            f"({result.duration_seconds}s, "
-            f"worker: {result.worker_id}).\n\n"
-            f"Summary: {safe_summary}"
-        )
+        if result.status == ResultStatus.FAILED:
+            label_note = (
+                f"Labeling as `{labels.needs_human}` for manual review."
+                if labeled
+                else f"Failed to add `{labels.needs_human}` label — please triage manually."
+            )
+            body = (
+                f"**orcest** task `{result.task_id}` failed "
+                f"({result.duration_seconds}s, "
+                f"worker: {result.worker_id}).\n\n"
+                f"Summary: {safe_summary}\n\n"
+                f"{label_note}"
+            )
+        elif result.status == ResultStatus.BLOCKED:
+            label_note = (
+                f"Labeling as `{labels.blocked}` — waiting for external input."
+                if labeled
+                else f"Failed to add `{labels.blocked}` label — please triage manually."
+            )
+            body = (
+                f"**orcest** task `{result.task_id}` is blocked "
+                f"({result.duration_seconds}s, "
+                f"worker: {result.worker_id}).\n\n"
+                f"Summary: {safe_summary}\n\n"
+                f"{label_note}"
+            )
+        elif result.status == ResultStatus.USAGE_EXHAUSTED:
+            branch_note = (
+                f"Work saved on branch `{result.branch}`. " if result.branch else "Work saved. "
+            )
+            body = (
+                f"**orcest** task `{result.task_id}` paused "
+                f"(usage limit reached, "
+                f"worker: {result.worker_id}).\n\n"
+                f"{branch_note}"
+                f"Will resume when capacity is available."
+            )
+        else:
+            body = (
+                f"**orcest** task `{result.task_id}`: "
+                f"{result.status.value} "
+                f"({result.duration_seconds}s, "
+                f"worker: {result.worker_id}).\n\n"
+                f"Summary: {safe_summary}"
+            )
 
-    # Post comment on the resource
-    try:
-        _post_comment(repo, resource_id, body, token)
-    except Exception as e:
-        logger.error(
-            f"Failed to post comment on {resource_label} #{resource_id}: {e}",
-            exc_info=True,
-        )
+        try:
+            _post_comment(repo, resource_id, body, token)
+        except Exception as e:
+            logger.error(
+                f"Failed to post comment on {resource_label} #{resource_id}: {e}",
+                exc_info=True,
+            )
 
-    logger.info("Result comment: %s...", body[:100])
+        logger.info("Result comment: %s...", body[:100])
