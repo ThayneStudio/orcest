@@ -808,7 +808,7 @@ def test_is_usage_exhausted_all_patterns():
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: empty stderr is not detected
+# _is_usage_exhausted: anchored-regex boundary and edge cases
 # ---------------------------------------------------------------------------
 
 
