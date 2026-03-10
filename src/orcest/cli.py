@@ -133,7 +133,7 @@ def _status_once(redis: RedisClient) -> None:
     groups = []
     for stream_key in task_streams:
         try:
-            for g in client.xinfo_groups(stream_key):  # type: ignore[union-attr]
+            for g in client.xinfo_groups(str(stream_key)):  # type: ignore[union-attr]  # stubs type xinfo_groups as Awaitable[Any]|Any
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
