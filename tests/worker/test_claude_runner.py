@@ -817,6 +817,9 @@ def test_is_usage_exhausted_empty_stderr():
     """Empty stderr -> not detected; _is_usage_exhausted only inspects stderr.
 
     The function accepts only a stderr string — stdout is never passed in.
+    Claude's stream-json stdout contains ``"usage": {...}`` in every API
+    response message; if "limit" also appeared there the pattern would fire
+    incorrectly, so stdout is excluded by design.
     """
     # Empty stderr -> not detected
     assert _is_usage_exhausted("") is False
