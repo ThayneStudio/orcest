@@ -126,9 +126,9 @@ wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
     -O "${IMG_CACHE}/SHA256SUMS.gpg"
 # Verify GPG signature. Ubuntu may sign with a subkey, so the primary key
-# fingerprint can appear anywhere on the VALIDSIG line — match it broadly.
+# fingerprint can appear anywhere on the VALIDSIG line.
 if ! gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
-        | grep -q "${UBUNTU_SIGNING_KEY}"; then
+        | grep -q "VALIDSIG.*${UBUNTU_SIGNING_KEY}"; then
     echo "Error: GPG signature verification failed for SHA256SUMS" >&2
     exit 1
 fi
