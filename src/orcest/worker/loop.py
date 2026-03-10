@@ -33,7 +33,8 @@ from orcest.worker.workspace import Workspace
 RESULTS_STREAM = "results"
 DEAD_LETTER_STREAM = "orcest:dead-letter"
 CONSUMER_GROUP = "workers"
-HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
+HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
+LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
 _STREAM_MAXLEN = 2000
 
@@ -226,15 +227,10 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             lock_key = make_issue_lock_key(task.repo, task.resource_id)
         else:
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
-        ttl = (
-            config.runner.timeout * config.runner.max_retries
-            + config.runner.retry_backoff * (config.runner.max_retries - 1)
-            + 120  # 2-minute safety buffer
-        )
         lock = RedisLock(
             redis,
             lock_key,
-            ttl=ttl,
+            ttl=LOCK_TTL,
             owner=config.worker_id,
         )
 
@@ -251,8 +247,8 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         logger.info(f"Acquired lock {lock_key}")
 
         # Start heartbeat; signal lock_lost if the lock cannot be refreshed.
-        # Use an explicit interval independent of lock.ttl so the orphaned-lock
-        # window stays bounded even when the TTL grows large (see issue #121).
+        # LOCK_TTL = 3 * HEARTBEAT_INTERVAL so the lock survives up to 2 missed
+        # refreshes; a crashed worker's lock expires within LOCK_TTL (≈ 180 s).
         lock_lost = threading.Event()
         heartbeat = Heartbeat(
             lock,
