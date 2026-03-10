@@ -876,6 +876,29 @@ class TestRunWorker:
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "entry-1")
 
+    def test_worker_dead_letters_task_at_max_delivery_count(
+        self, mocker, worker_config, sample_task
+    ):
+        """When delivery count equals MAX_DELIVERY_COUNT the task is dead-lettered."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Simulate delivery count exactly at the threshold
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT
+
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called
+        mocks["runner"].run.assert_not_called()
+
+        # Dead-letter stream must have received the task
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 1, "expected exactly one dead-letter entry"
+
     def test_worker_processes_task_below_max_delivery_count(
         self, mocker, worker_config, sample_task
     ):

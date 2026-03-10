@@ -30,7 +30,7 @@ RESULTS_STREAM = "results"
 DEAD_LETTER_STREAM = "orcest:dead-letter"
 CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
-MAX_DELIVERY_COUNT = 3  # Dead-letter after this many deliveries
+MAX_DELIVERY_COUNT = 3  # Dead-letter on or after this many deliveries (task runs at most MAX_DELIVERY_COUNT-1 times)
 _STREAM_MAXLEN = 2000
 
 
