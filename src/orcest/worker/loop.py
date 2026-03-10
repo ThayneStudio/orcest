@@ -48,8 +48,10 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
             return combined
 
     def _watch(ev: threading.Event) -> None:
-        ev.wait()
-        combined.set()
+        while not combined.is_set():
+            if ev.wait(timeout=0.05):
+                combined.set()
+                return
 
     for ev in events:
         threading.Thread(target=_watch, args=(ev,), daemon=True).start()

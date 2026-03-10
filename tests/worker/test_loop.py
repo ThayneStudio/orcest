@@ -790,6 +790,14 @@ class TestRunWorker:
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
+            # Assert here, while the task is still "running" — the finally block
+            # hasn't fired yet, so only the SIGTERM → shutdown_event path can have
+            # set abort_event.  This catches regressions where SIGTERM no longer
+            # propagates to the abort_event.
+            assert abort_event is not None
+            assert abort_event.wait(timeout=1.0), (
+                "abort_event not set after SIGTERM; SIGTERM would not interrupt retry-backoff sleeps"
+            )
             task = args[0]
             return TaskResult(
                 task_id=task.id,
@@ -808,10 +816,6 @@ class TestRunWorker:
         run_worker(worker_config)
 
         assert captured_abort_event[0] is not None, "abort_event was not passed to _execute_task"
-        # The watcher thread should have set the combined event after SIGTERM
-        assert captured_abort_event[0].wait(timeout=1.0), (
-            "abort_event not set after SIGTERM; SIGTERM would not interrupt retry-backoff sleeps"
-        )
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task
