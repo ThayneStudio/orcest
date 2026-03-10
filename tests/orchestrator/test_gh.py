@@ -12,6 +12,7 @@ import subprocess
 import pytest
 
 from orcest.orchestrator.gh import (
+    _MAX_PAGES,
     GhCliError,
     GhNotInstalledError,
     add_label,
@@ -1001,7 +1002,7 @@ def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
 def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
     """Logs a warning when MAX_PAGES is exhausted and hasNextPage is still True."""
     # Build a page response with hasNextPage=True and a valid cursor so the
-    # loop keeps iterating until it hits the MAX_PAGES (50) safety cap.
+    # loop keeps iterating until it hits the MAX_PAGES safety cap.
     # The while...else branch fires when page_count reaches MAX_PAGES.
     page = json.dumps(
         {
@@ -1030,15 +1031,15 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
     )
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
-        side_effect=[page] * 50,  # must equal MAX_PAGES defined in get_unresolved_review_threads
+        side_effect=[page] * _MAX_PAGES,
     )
 
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
 
     assert any("reached MAX_PAGES" in msg for msg in caplog.messages)
-    # All 50 fetched threads are included in the result despite the truncation warning
-    assert len(result) == 50
+    # All _MAX_PAGES fetched threads are included in the result despite the truncation warning
+    assert len(result) == _MAX_PAGES
 
 
 # ---------------------------------------------------------------------------
