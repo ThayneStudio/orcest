@@ -138,7 +138,9 @@ def _status_once(redis: RedisClient) -> None:
     groups = []
     for stream_key in task_streams:
         try:
-            for g in client.xinfo_groups(stream_key.decode() if isinstance(stream_key, bytes) else stream_key):  # type: ignore[union-attr]  # client may be None per redis stubs
+            # scan_iter yields bytes|str; decode to ensure str for xinfo_groups
+            key_str = stream_key.decode() if isinstance(stream_key, bytes) else stream_key
+            for g in client.xinfo_groups(key_str):  # type: ignore[union-attr]  # redis stubs type client as a union
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
