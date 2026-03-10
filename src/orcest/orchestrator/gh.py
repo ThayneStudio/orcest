@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
-_MAX_PAGES = 50  # safety cap; each page fetches up to 100 threads
+_MAX_PAGES = 50  # safety cap; each page fetches up to 100 threads (50 × 100 = 5 000 total)
 
 
 class GhCliError(Exception):

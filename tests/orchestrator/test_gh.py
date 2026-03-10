@@ -1000,10 +1000,10 @@ def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
 
 
 def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
-    """Logs a warning when MAX_PAGES is exhausted and hasNextPage is still True."""
+    """Logs a warning when _MAX_PAGES is exhausted and hasNextPage is still True."""
     # Build a page response with hasNextPage=True and a valid cursor so the
-    # loop keeps iterating until it hits the MAX_PAGES safety cap.
-    # The while...else branch fires when page_count reaches MAX_PAGES.
+    # loop keeps iterating until it hits the _MAX_PAGES safety cap.
+    # The while...else branch fires when page_count reaches _MAX_PAGES.
     page = json.dumps(
         {
             "data": {
