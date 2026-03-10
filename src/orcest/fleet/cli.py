@@ -20,7 +20,7 @@ def _repo_to_project_name(repo: str) -> str:
 
 
 @click.group()
-def fleet():
+def fleet() -> None:
     """Manage the orcest fleet: orchestrators, workers, and VMs."""
 
 
@@ -36,7 +36,14 @@ def fleet():
     help="Claude OAuth token.",
 )
 @click.option("--orch-config", default=None, help="Orchestrator config file to deploy.")
-def onboard(repo, name, inventory, github_token, claude_token, orch_config):
+def onboard(
+    repo: str,
+    name: str | None,
+    inventory: str,
+    github_token: str,
+    claude_token: str,
+    orch_config: str | None,
+) -> None:
     """Onboard a new repo: deploy orchestrator stack + create first worker VM.
 
     REPO is in "owner/repo" format (e.g. ThayneStudio/my-project).
@@ -149,7 +156,7 @@ def onboard(repo, name, inventory, github_token, claude_token, orch_config):
     required=True,
     help="Claude OAuth token.",
 )
-def add_worker(project_name, inventory, github_token, claude_token):
+def add_worker(project_name: str, inventory: str, github_token: str, claude_token: str) -> None:
     """Add a worker VM to an existing project."""
     from orcest.fleet.cloud_init import render_worker_userdata
     from orcest.fleet.inventory import WorkerEntry, load_inventory, save_inventory
@@ -209,7 +216,7 @@ def add_worker(project_name, inventory, github_token, claude_token):
 
 @fleet.command()
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-def status(inventory):
+def status(inventory: str) -> None:
     """Show fleet status: projects, workers, and VM states."""
     from orcest.fleet.inventory import load_inventory
 
@@ -272,7 +279,7 @@ def status(inventory):
 @click.argument("project_name")
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.confirmation_option(prompt="Are you sure you want to destroy this project?")
-def destroy(project_name, inventory):
+def destroy(project_name: str, inventory: str) -> None:
     """Destroy a project: remove orchestrator stack and all worker VMs."""
     from orcest.fleet.inventory import load_inventory, save_inventory
 
@@ -318,7 +325,7 @@ def destroy(project_name, inventory):
     required=True,
     help="Claude OAuth token.",
 )
-def update(inventory, github_token, claude_token):
+def update(inventory: str, github_token: str, claude_token: str) -> None:
     """Rolling-replace all worker VMs with fresh cloud-init instances.
 
     For each project, creates new worker VMs, waits for them to come up,
@@ -404,7 +411,14 @@ def update(inventory, github_token, claude_token):
 @click.option("--labels", default="self-hosted,linux", help="Runner labels.")
 @click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.option("--vm-id", default=None, type=int, help="VM ID (default: auto).")
-def add_runner(org_url, runner_token, runner_name, labels, inventory, vm_id):
+def add_runner(
+    org_url: str,
+    runner_token: str,
+    runner_name: str,
+    labels: str,
+    inventory: str,
+    vm_id: int | None,
+) -> None:
     """Create a self-hosted GitHub Actions runner VM via Proxmox."""
     from orcest.fleet.inventory import load_inventory
     from orcest.fleet.runner_cloud_init import render_runner_userdata
