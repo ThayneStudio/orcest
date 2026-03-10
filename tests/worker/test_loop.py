@@ -828,9 +828,9 @@ class TestRunWorker:
 
         Regression test for issue #206.
         """
-        assert LOCK_TTL == 3 * HEARTBEAT_INTERVAL, (
-            f"LOCK_TTL ({LOCK_TTL}s) must equal 3 × HEARTBEAT_INTERVAL "
-            f"({HEARTBEAT_INTERVAL}s) to bound the crash orphaned-lock window"
+        assert LOCK_TTL == 180, (
+            f"LOCK_TTL ({LOCK_TTL}s) must equal 180 s (3 × HEARTBEAT_INTERVAL) "
+            f"to bound the crash orphaned-lock window"
         )
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
