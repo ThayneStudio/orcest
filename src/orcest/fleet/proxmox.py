@@ -11,6 +11,7 @@ import logging
 import re
 import subprocess
 import time
+from typing import Any
 
 from orcest.fleet.inventory import ProxmoxConfig
 
@@ -36,7 +37,7 @@ class ProxmoxClient:
         self._api = None
 
     @property
-    def api(self):
+    def api(self) -> Any:
         """Lazy-connect to the Proxmox API."""
         if self._api is None:
             try:
@@ -56,7 +57,7 @@ class ProxmoxClient:
         return self._api
 
     @property
-    def node(self):
+    def node(self) -> Any:
         """Proxmox node API endpoint."""
         return self.api.nodes(self.config.node)
 
