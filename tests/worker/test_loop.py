@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import signal
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -555,11 +556,9 @@ class TestRunWorker:
             if normal_call_count == 1:
                 return [("entry-1", task_fields)]
             # On subsequent calls, trigger SIGTERM handler to exit loop
-            import signal as sig
-
-            handler = signal_handlers.get(sig.SIGTERM)
+            handler = signal_handlers.get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -722,11 +721,9 @@ class TestRunWorker:
             normal_call_count += 1
             if normal_call_count == 1:
                 return [("entry-bad", {"garbage": "data"})]
-            import signal as sig
-
-            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -756,11 +753,9 @@ class TestRunWorker:
                     return [("pending-1", task_fields)]
                 return []
             # No new tasks — trigger shutdown immediately
-            import signal as sig
-
-            handler = mocks["signal_handlers"].get(sig.SIGTERM)
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
-                handler(sig.SIGTERM, None)
+                handler(signal.SIGTERM, None)
             return []
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
@@ -780,6 +775,48 @@ class TestRunWorker:
         # The pending entry must be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
+
+    def test_abort_event_fires_on_sigterm(self, mocker, worker_config, sample_task):
+        """The abort_event passed to _execute_task is set when SIGTERM fires,
+        so that retry-backoff sleeps are interrupted promptly on shutdown."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        captured_abort_event: list[threading.Event | None] = [None]
+
+        def fake_execute_task(*args, abort_event=None, **kwargs):
+            captured_abort_event[0] = abort_event
+            # Simulate SIGTERM arriving while the task is running
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
+            if handler:
+                handler(signal.SIGTERM, None)
+            # Assert here, while the task is still "running" — the finally block
+            # hasn't fired yet, so only the SIGTERM → shutdown_event path can have
+            # set abort_event.  This catches regressions where SIGTERM no longer
+            # propagates to the abort_event.
+            assert abort_event is not None
+            assert abort_event.wait(timeout=1.0), (
+                "abort_event not set after SIGTERM; "
+                "SIGTERM would not interrupt retry-backoff sleeps"
+            )
+            task = args[0]
+            return TaskResult(
+                task_id=task.id,
+                worker_id=worker_config.worker_id,
+                status=ResultStatus.COMPLETED,
+                resource_type=task.resource_type,
+                resource_id=task.resource_id,
+                branch=task.branch,
+                summary="ok",
+                duration_seconds=0,
+            )
+
+        mocker.patch("orcest.worker.loop._execute_task", side_effect=fake_execute_task)
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        assert captured_abort_event[0] is not None, "abort_event was not passed to _execute_task"
 
     def test_heartbeat_uses_explicit_interval_not_lock_ttl(
         self, mocker, worker_config, sample_task

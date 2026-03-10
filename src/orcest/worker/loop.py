@@ -48,8 +48,10 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
             return combined
 
     def _watch(ev: threading.Event) -> None:
-        ev.wait()
-        combined.set()
+        while not combined.is_set():
+            if ev.wait(timeout=0.05):
+                combined.set()
+                return
 
     for ev in events:
         threading.Thread(target=_watch, args=(ev,), daemon=True).start()
@@ -228,6 +230,11 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
             else:
                 logger.info(f"Released lock {lock_key}")
+        finally:
+            # Terminate abort_event watch threads so they don't accumulate
+            # across tasks.  Setting lock_lost is idempotent when it was
+            # already set by the heartbeat callback.
+            lock_lost.set()
 
         # Publish result, then ACK only if publish succeeded.
         # If publish fails, the result is lost — there is no XPENDING
