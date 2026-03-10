@@ -51,6 +51,12 @@ if ! command -v docker &>/dev/null; then
 fi
 
 # Install gh CLI
+# IMPORTANT: gh must be authenticated with a non-expiring token.
+# Use a fine-grained PAT (github_pat_…) or classic PAT (ghp_…), NOT an
+# OAuth app token (gho_…).  The worker's systemd unit sets ProtectHome=read-only,
+# so gh cannot write a refreshed token back to ~/.config/gh/hosts.yml.
+# Set GH_TOKEN (or GITHUB_TOKEN) in /opt/orcest/.env rather than running
+# `gh auth login`, which stores an OAuth token that is subject to refresh.
 if ! command -v gh &>/dev/null; then
     echo "Installing gh CLI..."
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

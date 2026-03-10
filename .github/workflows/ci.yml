@@ -87,10 +87,9 @@ jobs:
     runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - run: docker buildx build --cache-from type=gha --cache-to type=gha,mode=max -t orcest:ci .
+      - run: docker build -t orcest:ci .

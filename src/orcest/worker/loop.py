@@ -7,10 +7,14 @@ for the orchestrator.
 """
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
+from pathlib import Path
+
+import yaml
 
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
@@ -32,6 +36,55 @@ CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; independent of lock TTL to bound orphaned-lock window
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
 _STREAM_MAXLEN = 2000
+
+
+def _check_gh_credentials(logger: logging.Logger) -> None:
+    """Warn if gh is configured with an OAuth token that may attempt refresh writes.
+
+    Under ``ProtectHome=read-only`` (PR #92), gh cannot write an updated token
+    back to ``~/.config/gh/hosts.yml``.  OAuth app tokens (prefix ``gho_`` or
+    ``ghu_``) are subject to expiry and refresh; fine-grained PATs
+    (``github_pat_``) and classic PATs (``ghp_``) are not.
+
+    If the ``GH_TOKEN`` / ``GITHUB_TOKEN`` environment variable is set, gh uses
+    that value directly and never writes to ``hosts.yml``, so no check is needed.
+    """
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        # Token supplied via env var — gh won't refresh / write hosts.yml.
+        return
+
+    hosts_file = Path.home() / ".config" / "gh" / "hosts.yml"
+    if not hosts_file.exists():
+        return
+
+    try:
+        data = yaml.safe_load(hosts_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}")
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    # OAuth token prefixes that gh may attempt to refresh by writing hosts.yml.
+    _OAUTH_PREFIXES = ("gho_", "ghu_")
+
+    for host, host_cfg in data.items():
+        if not isinstance(host_cfg, dict):
+            continue
+        token = host_cfg.get("oauth_token")
+        if not isinstance(token, str):
+            continue
+        if token.startswith(_OAUTH_PREFIXES):
+            logger.warning(
+                f"gh credential for {host!r} appears to be an OAuth app token "
+                f"(prefix '{token[:4]}').  Under ProtectHome=read-only, gh cannot "
+                "refresh this token by writing to ~/.config/gh/hosts.yml, which "
+                "will cause intermittent authentication failures.  "
+                "Replace it with a fine-grained PAT (github_pat_…) or classic PAT "
+                "(ghp_…) that does not require refresh, or set the GH_TOKEN "
+                "environment variable in /opt/orcest/.env."
+            )
 
 
 def _make_abort_event(*events: threading.Event) -> threading.Event:
@@ -70,6 +123,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             after the current iteration completes.
     """
     logger = setup_logging("worker", config.worker_id)
+    _check_gh_credentials(logger)
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
     pr_tasks_stream = f"tasks:{config.backend}"
