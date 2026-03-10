@@ -287,27 +287,32 @@ def _poll_cycle(
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.RETRIGGER_REVIEW:
-            assert pr_state.review_run_id is not None
-            run_id = pr_state.review_run_id
-            logger.info(
-                "PR #%d: claude-review passed but no formal review, re-triggering run %d",
-                pr_state.number,
-                run_id,
-            )
-            try:
-                gh.rerun_workflow(
-                    config.github.repo,
-                    run_id,
-                    config.github.token,
-                )
-                set_review_retrigger_sha(redis, pr_state.number, pr_state.head_sha)
-            except Exception as e:
+            if pr_state.review_run_id is None:
                 logger.error(
-                    "Failed to re-trigger review for PR #%d: %s",
+                    "PR #%d: RETRIGGER_REVIEW action but review_run_id is None, skipping",
                     pr_state.number,
-                    e,
-                    exc_info=True,
                 )
+            else:
+                run_id = pr_state.review_run_id
+                logger.info(
+                    "PR #%d: claude-review passed but no formal review, re-triggering run %d",
+                    pr_state.number,
+                    run_id,
+                )
+                try:
+                    gh.rerun_workflow(
+                        config.github.repo,
+                        run_id,
+                        config.github.token,
+                    )
+                    set_review_retrigger_sha(redis, pr_state.number, pr_state.head_sha)
+                except Exception as e:
+                    logger.error(
+                        "Failed to re-trigger review for PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:

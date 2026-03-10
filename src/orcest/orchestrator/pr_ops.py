@@ -617,7 +617,7 @@ def discover_actionable_prs(
                 review_run_id = _get_claude_review_run_id(checks)
                 retrigger_sha = get_review_retrigger_sha(redis, number)
 
-                if review_run_id and retrigger_sha != head_sha:
+                if review_run_id is not None and retrigger_sha != head_sha:
                     # claude-review passed but no formal review — re-trigger
                     logger.info(
                         "PR #%d: claude-review passed but no formal review, will re-trigger run %d",
@@ -638,7 +638,7 @@ def discover_actionable_prs(
                             review_run_id=review_run_id,
                         )
                     )
-                elif review_run_id and retrigger_sha == head_sha:
+                elif review_run_id is not None and retrigger_sha == head_sha:
                     # Already re-triggered for this SHA, still no review — escalate
                     logger.warning(
                         "PR #%d: claude-review re-trigger exhausted (SHA %s), escalating",
