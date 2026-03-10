@@ -1204,9 +1204,7 @@ def test_retrigger_review_escalates_after_retrigger_exhausted(
     assert results[0].number == pr_number
 
 
-def test_retrigger_review_allowed_after_new_sha(
-    gh_mock, fake_redis_client, label_config
-):
+def test_retrigger_review_allowed_after_new_sha(gh_mock, fake_redis_client, label_config):
     """Re-trigger allowed when SHA changes (old retrigger was for a different SHA)."""
     pr_number = 802
     gh_mock.list_open_prs.return_value = [
@@ -1233,9 +1231,7 @@ def test_retrigger_review_allowed_after_new_sha(
     assert results[0].review_run_id == 77777
 
 
-def test_skip_green_when_no_claude_review_check(
-    gh_mock, fake_redis_client, label_config
-):
+def test_skip_green_when_no_claude_review_check(gh_mock, fake_redis_client, label_config):
     """No claude-review check in CI → normal SKIP_GREEN (no retrigger)."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=803, labels=[], review_decision=""),
@@ -1257,17 +1253,18 @@ def test_skip_green_when_no_claude_review_check(
     assert results[0].action == PRAction.SKIP_GREEN
 
 
-def test_skip_green_when_claude_review_not_success(
-    gh_mock, fake_redis_client, label_config
-):
+def test_skip_green_when_claude_review_not_success(gh_mock, fake_redis_client, label_config):
     """claude-review exists but conclusion is neutral → normal SKIP_GREEN."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=804, labels=[], review_decision=""),
     ]
     gh_mock.get_ci_status.return_value = [
         {"name": "lint", "conclusion": "success"},
-        {"name": "claude-review", "conclusion": "neutral",
-         "detailsUrl": "https://github.com/org/repo/actions/runs/88888/job/999"},
+        {
+            "name": "claude-review",
+            "conclusion": "neutral",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/88888/job/999",
+        },
     ]
     gh_mock.get_unresolved_review_threads.return_value = []
 

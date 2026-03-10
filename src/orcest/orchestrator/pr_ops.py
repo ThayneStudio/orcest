@@ -620,8 +620,7 @@ def discover_actionable_prs(
                 if review_run_id and retrigger_sha != head_sha:
                     # claude-review passed but no formal review — re-trigger
                     logger.info(
-                        "PR #%d: claude-review passed but no formal review, "
-                        "will re-trigger run %d",
+                        "PR #%d: claude-review passed but no formal review, will re-trigger run %d",
                         number,
                         review_run_id,
                     )
