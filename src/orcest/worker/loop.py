@@ -164,7 +164,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # dead-letter stream instead of running Claude again.
         delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
         if delivery_count >= MAX_DELIVERY_COUNT:
-            _dead_letter_task(redis, current_stream, entry_id, task, logger)
+            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
             continue
 
         # Try to acquire lock (use resource-type-aware key)
@@ -360,6 +360,7 @@ def _dead_letter_task(
     tasks_stream: str,
     entry_id: str,
     task: Task,
+    delivery_count: int,
     logger: logging.Logger,
 ) -> None:
     """Route a task that has exceeded MAX_DELIVERY_COUNT to the dead-letter stream.
@@ -382,6 +383,7 @@ def _dead_letter_task(
             "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
             "tasks_stream": tasks_stream,
             "original_entry_id": entry_id,
+            "delivery_count": str(delivery_count),
         }
         redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
         logger.error(

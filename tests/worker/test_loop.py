@@ -985,6 +985,7 @@ class TestDeadLetterTask:
             "tasks:claude",
             "entry-42",
             sample_task,
+            5,
             logging.getLogger("test"),
         )
 
@@ -995,6 +996,7 @@ class TestDeadLetterTask:
         assert "dead_letter_reason" in fields
         assert fields["original_entry_id"] == "entry-42"
         assert fields["tasks_stream"] == "tasks:claude"
+        assert fields["delivery_count"] == "5"
 
         mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-42")
 
@@ -1010,6 +1012,7 @@ class TestDeadLetterTask:
             "tasks:claude",
             "entry-99",
             sample_task,
+            3,
             logging.getLogger("test"),
         )
 
