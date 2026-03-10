@@ -7,6 +7,7 @@ stream operations with simplified return types.
 from __future__ import annotations
 
 import logging
+import types
 
 import redis
 
@@ -55,7 +56,10 @@ class RedisClient:
         return self
 
     def __exit__(
-        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
     ) -> None:
         self.close()
 
