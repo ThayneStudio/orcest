@@ -7,6 +7,7 @@ main loop acts on these recommendations.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import cast
@@ -49,6 +50,7 @@ class PRAction(str, Enum):
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"  # Exhausted per-SHA retry budget
     SKIP_MAX_TOTAL_ATTEMPTS = "skip_max_total_attempts"  # Exhausted cross-SHA retry budget
     SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
+    RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
 
 
 @dataclass
@@ -64,6 +66,7 @@ class PRState:
     review_threads: list[dict]  # Actionable review comments
     labels: list[str]
     base_branch: str = "main"  # Target branch (from baseRefName)
+    review_run_id: int | None = None  # GitHub Actions run ID for re-triggering review
 
 
 def _make_attempts_key(pr_number: int) -> str:
@@ -167,6 +170,45 @@ def increment_total_attempts(redis: RedisClient, pr_number: int) -> int:
 def clear_total_attempts(redis: RedisClient, pr_number: int) -> None:
     """Clear the total attempt counter for a PR (on successful completion)."""
     redis.client.delete(_make_total_attempts_key(pr_number))
+
+
+def _make_review_retrigger_key(pr_number: int) -> str:
+    """Redis key for tracking review re-trigger attempts per PR."""
+    return f"pr:{pr_number}:review_retrigger"
+
+
+def get_review_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
+    """Get the SHA that was already re-triggered for review, or None."""
+    val: str | None = cast(str | None, redis.client.get(_make_review_retrigger_key(pr_number)))
+    return val
+
+
+def set_review_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str) -> None:
+    """Record that we re-triggered review for this SHA. Expires in 7 days."""
+    redis.client.set(_make_review_retrigger_key(pr_number), head_sha, ex=7 * 24 * 3600)
+
+
+def clear_review_retrigger(redis: RedisClient, pr_number: int) -> None:
+    """Clear the review re-trigger marker for a PR."""
+    redis.client.delete(_make_review_retrigger_key(pr_number))
+
+
+def _get_claude_review_run_id(checks: list[dict]) -> int | None:
+    """Extract the GitHub Actions run ID for a successful claude-review check.
+
+    Returns None if no claude-review check exists or it didn't succeed.
+    """
+    for check in checks:
+        if (
+            check.get("name") == "claude-review"
+            and (check.get("conclusion") or "").upper() == "SUCCESS"
+        ):
+            details_url = check.get("detailsUrl", "")
+            # URL format: https://github.com/.../actions/runs/{run_id}/job/{job_id}
+            match = re.search(r"/actions/runs/(\d+)", details_url)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 def discover_actionable_prs(
@@ -569,18 +611,68 @@ def discover_actionable_prs(
                     )
                 )
             else:
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_GREEN,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
+                # CI green, no review threads, no formal review decision.
+                # Check if claude-review passed but didn't submit a formal
+                # review — if so, re-trigger once per SHA.
+                review_run_id = _get_claude_review_run_id(checks)
+                retrigger_sha = get_review_retrigger_sha(redis, number)
+
+                if review_run_id and retrigger_sha != head_sha:
+                    # claude-review passed but no formal review — re-trigger
+                    logger.info(
+                        "PR #%d: claude-review passed but no formal review, "
+                        "will re-trigger run %d",
+                        number,
+                        review_run_id,
                     )
-                )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.RETRIGGER_REVIEW,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                            review_run_id=review_run_id,
+                        )
+                    )
+                elif review_run_id and retrigger_sha == head_sha:
+                    # Already re-triggered for this SHA, still no review — escalate
+                    logger.warning(
+                        "PR #%d: claude-review re-trigger exhausted (SHA %s), escalating",
+                        number,
+                        head_sha[:8],
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_MAX_ATTEMPTS,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                else:
+                    # No claude-review check found — normal SKIP_GREEN
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_GREEN,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
 
     return results

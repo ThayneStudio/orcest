@@ -762,3 +762,83 @@ def test_handle_result_post_comment_failure(
 
     # post_comment was attempted (failures still get comments)
     gh_mock.post_comment.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# RETRIGGER_REVIEW tests
+# ---------------------------------------------------------------------------
+
+
+def test_poll_cycle_retrigger_review(mocker, fake_redis_client, orchestrator_config, gh_mock):
+    """_poll_cycle calls gh.rerun_workflow and records retrigger SHA for RETRIGGER_REVIEW."""
+    pr_state = PRState(
+        number=500,
+        title="PR #500",
+        branch="fix/500",
+        head_sha="sha999",
+        action=PRAction.RETRIGGER_REVIEW,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+        review_run_id=12345,
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.rerun_workflow.assert_called_once_with(
+        orchestrator_config.github.repo,
+        12345,
+        orchestrator_config.github.token,
+    )
+
+    # Verify the retrigger SHA was recorded in Redis
+    from orcest.orchestrator.pr_ops import get_review_retrigger_sha
+
+    assert get_review_retrigger_sha(fake_redis_client, 500) == "sha999"
+
+
+def test_poll_cycle_retrigger_review_failure_logged(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """If rerun_workflow raises, the error is logged but the loop doesn't crash."""
+    pr_state = PRState(
+        number=501,
+        title="PR #501",
+        branch="fix/501",
+        head_sha="sha000",
+        action=PRAction.RETRIGGER_REVIEW,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+        review_run_id=99999,
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
+
+    logger = logging.getLogger("test")
+    # Should not raise
+    _poll_cycle(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.rerun_workflow.assert_called_once()
+
+    # Retrigger SHA should NOT be recorded on failure
+    from orcest.orchestrator.pr_ops import get_review_retrigger_sha
+
+    assert get_review_retrigger_sha(fake_redis_client, 501) is None
