@@ -19,6 +19,7 @@ from orcest.worker.loop import (
     HEARTBEAT_INTERVAL,
     MAX_DELIVERY_COUNT,
     RESULTS_STREAM,
+    _check_gh_credentials,
     _dead_letter_task,
     _execute_task,
     _make_abort_event,
@@ -1018,3 +1019,93 @@ class TestDeadLetterTask:
 
         # xack must still be called despite the publish failure
         mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-99")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _check_gh_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestCheckGhCredentials:
+    """Unit tests for the startup OAuth-token detector."""
+
+    def _make_hosts_yml(self, tmp_path: Path, token: str) -> Path:
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text(f"github.com:\n  oauth_token: {token}\n  user: testuser\n")
+        return hosts_file
+
+    def _run(self, tmp_path: Path, logger: logging.Logger) -> None:
+        """Call _check_gh_credentials with Path.home() pointing to tmp_path."""
+        from unittest.mock import patch
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            _check_gh_credentials(logger)
+
+    def test_no_warning_for_classic_pat(self, tmp_path, caplog, monkeypatch):
+        """Classic PAT (ghp_) must not trigger a warning."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        self._make_hosts_yml(tmp_path, "ghp_abc123")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not caplog.records, f"Unexpected warning: {caplog.text}"
+
+    def test_no_warning_for_fine_grained_pat(self, tmp_path, caplog, monkeypatch):
+        """Fine-grained PAT (github_pat_) must not trigger a warning."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        self._make_hosts_yml(tmp_path, "github_pat_abc123")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not caplog.records
+
+    def test_warning_for_oauth_token_gho(self, tmp_path, caplog, monkeypatch):
+        """OAuth app token (gho_) must trigger a warning."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        self._make_hosts_yml(tmp_path, "gho_abc123")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert any("OAuth" in r.message for r in caplog.records)
+
+    def test_warning_for_oauth_token_ghu(self, tmp_path, caplog, monkeypatch):
+        """User-to-server OAuth token (ghu_) must trigger a warning."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        self._make_hosts_yml(tmp_path, "ghu_xyz789")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert any("OAuth" in r.message for r in caplog.records)
+
+    def test_no_warning_when_gh_token_env_set(self, tmp_path, caplog, monkeypatch):
+        """When GH_TOKEN env var is set, skip the file check entirely."""
+        monkeypatch.setenv("GH_TOKEN", "ghp_env_token")
+        # Even if hosts.yml has an OAuth token, no warning should fire.
+        self._make_hosts_yml(tmp_path, "gho_should_be_ignored")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not caplog.records
+
+    def test_no_warning_when_github_token_env_set(self, tmp_path, caplog, monkeypatch):
+        """When GITHUB_TOKEN env var is set, skip the file check entirely."""
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_env_token")
+        self._make_hosts_yml(tmp_path, "gho_should_be_ignored")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not caplog.records
+
+    def test_no_warning_when_hosts_file_missing(self, tmp_path, caplog, monkeypatch):
+        """If hosts.yml does not exist, no warning should be emitted."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not caplog.records
