@@ -24,7 +24,7 @@ set -euo pipefail
 # --- Dependencies ---
 for cmd in qm wget gpg; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: '${cmd}' not found. This script must be run on a Proxmox host."
+        echo "Error: '${cmd}' not found. Install missing dependencies (qm and wget require a Proxmox host; gpg requires: apt-get install -y gpg)."
         exit 1
     fi
 done
