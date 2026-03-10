@@ -7,6 +7,7 @@ for the orchestrator.
 """
 
 import logging
+import os
 import signal
 import sys
 import threading
@@ -46,8 +47,6 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
     If the ``GH_TOKEN`` / ``GITHUB_TOKEN`` environment variable is set, gh uses
     that value directly and never writes to ``hosts.yml``, so no check is needed.
     """
-    import os
-
     if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
         # Token supplied via env var — gh won't refresh / write hosts.yml.
         return
@@ -58,7 +57,11 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
 
     try:
         import yaml
+    except ImportError:
+        logger.warning("PyYAML is not installed; skipping gh credential check")
+        return
 
+    try:
         data = yaml.safe_load(hosts_file.read_text())
     except Exception as exc:
         logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}")
