@@ -117,7 +117,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
     for key in lock_keys:
-        owner: str = cast(str, client.get(key)) or "(expired)"
+        owner: str = cast(str | None, client.get(key)) or "(expired)"
         ttl: int = cast(int, client.ttl(key))
         pr_num = key.removeprefix("lock:pr:")
         locks.append(LockInfo(pr=pr_num, owner=owner, ttl=ttl))
