@@ -14,13 +14,15 @@
 #   ORCEST_VM_SOCKETS=2      ORCEST_VM_DISK=10G
 #
 # Prerequisites:
-#   - Run on the Proxmox host (needs qm and wget)
+#   - Run on the Proxmox host (needs qm, wget, and gpg)
 #   - SSH public key at ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
+#   - Ubuntu cloud image signing key imported in GPG keyring:
+#       gpg --recv-keys 843938DF228D22F7B3742BC0D94AA3F0EFE21092
 
 set -euo pipefail
 
 # --- Dependencies ---
-for cmd in qm wget; do
+for cmd in qm wget gpg; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: '${cmd}' not found. This script must be run on a Proxmox host."
         exit 1
