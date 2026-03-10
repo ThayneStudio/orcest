@@ -15,8 +15,11 @@ from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
     _STREAM_MAXLEN,
     CONSUMER_GROUP,
+    DEAD_LETTER_STREAM,
     HEARTBEAT_INTERVAL,
+    MAX_DELIVERY_COUNT,
     RESULTS_STREAM,
+    _dead_letter_task,
     _execute_task,
     _make_abort_event,
     run_worker,
@@ -480,6 +483,9 @@ class TestRunWorker:
         mock_redis.xadd.return_value = "1-0"
         mock_redis.xadd_capped.return_value = "1-0"
 
+        # Default delivery count below threshold so existing tests proceed normally
+        mock_redis.xpending_count.return_value = 1
+
         # For RedisLock -- it accesses redis.client.register_script
         mock_script = MagicMock(return_value=1)
         mock_redis.client.register_script.return_value = mock_script
@@ -873,3 +879,136 @@ class TestRunWorker:
         # Both cleanup methods must be invoked before the exception propagates.
         mock_heartbeat.stop.assert_called_once()
         mock_lock.release.assert_called_once()
+
+    def test_worker_dead_letters_task_exceeding_max_delivery_count(
+        self, mocker, worker_config, sample_task
+    ):
+        """When a task's delivery count exceeds MAX_DELIVERY_COUNT, the worker
+        routes it to DEAD_LETTER_STREAM, ACKs the original entry, and does NOT
+        invoke the runner."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Simulate delivery count above the threshold
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT + 1
+
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called
+        mocks["runner"].run.assert_not_called()
+
+        # Dead-letter stream must have received the task
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 1, "expected exactly one dead-letter entry"
+        dl_fields = dl_calls[0][0][1]
+        assert dl_fields["id"] == sample_task.id
+        assert "dead_letter_reason" in dl_fields
+        assert "original_entry_id" in dl_fields
+
+        # The original entry must be ACKed so the main stream doesn't stall
+        expected_stream = f"tasks:{worker_config.backend}"
+        mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "entry-1")
+
+    def test_worker_dead_letters_task_at_max_delivery_count(
+        self, mocker, worker_config, sample_task
+    ):
+        """When delivery count equals MAX_DELIVERY_COUNT the task is dead-lettered."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Simulate delivery count exactly at the threshold
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT
+
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called
+        mocks["runner"].run.assert_not_called()
+
+        # Dead-letter stream must have received the task
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 1, "expected exactly one dead-letter entry"
+
+    def test_worker_processes_task_below_max_delivery_count(
+        self, mocker, worker_config, sample_task
+    ):
+        """When delivery count is below MAX_DELIVERY_COUNT the task is
+        processed normally."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+
+        # Delivery count is one below the threshold — should still execute
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT - 1
+
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner must have been called
+        mocks["runner"].run.assert_called_once()
+
+        # No dead-letter entry should have been published
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for _dead_letter_task helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDeadLetterTask:
+    """Tests for the _dead_letter_task helper."""
+
+    def test_publishes_to_dead_letter_stream_and_acks(self, local_worker_config, sample_task):
+        """_dead_letter_task writes to DEAD_LETTER_STREAM and ACKs the entry."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xack.return_value = 1
+
+        _dead_letter_task(
+            mock_redis,
+            "tasks:claude",
+            "entry-42",
+            sample_task,
+            logging.getLogger("test"),
+        )
+
+        mock_redis.xadd_capped.assert_called_once()
+        stream, fields, *_ = mock_redis.xadd_capped.call_args[0]
+        assert stream == DEAD_LETTER_STREAM
+        assert fields["id"] == sample_task.id
+        assert "dead_letter_reason" in fields
+        assert fields["original_entry_id"] == "entry-42"
+        assert fields["tasks_stream"] == "tasks:claude"
+
+        mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-42")
+
+    def test_acks_even_when_dead_letter_publish_fails(self, local_worker_config, sample_task):
+        """_dead_letter_task ACKs the original entry even if publishing to the
+        dead-letter stream raises an exception."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
+        mock_redis.xack.return_value = 1
+
+        _dead_letter_task(
+            mock_redis,
+            "tasks:claude",
+            "entry-99",
+            sample_task,
+            logging.getLogger("test"),
+        )
+
+        # xack must still be called despite the publish failure
+        mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-99")
