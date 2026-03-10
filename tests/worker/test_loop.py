@@ -822,7 +822,7 @@ class TestRunWorker:
 
         assert captured_abort_event[0] is not None, "abort_event was not passed to _execute_task"
 
-    def test_lock_ttl_is_proportional_to_heartbeat_interval(self):
+    def test_lock_ttl_equals_3x_heartbeat_interval(self):
         """LOCK_TTL must equal 3 × HEARTBEAT_INTERVAL so that a crashed worker's
         orphaned lock expires within ~180 s instead of ~92 minutes.
 
