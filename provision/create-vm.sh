@@ -14,15 +14,18 @@
 #   ORCEST_VM_SOCKETS=2      ORCEST_VM_DISK=10G
 #
 # Prerequisites:
-#   - Run on the Proxmox host (needs qm and wget)
+#   - Run on the Proxmox host (needs qm, wget, and gpg)
 #   - SSH public key at ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
+#   - (optional) Pre-import Ubuntu cloud image signing key for offline use:
+#       gpg --recv-keys 843938DF228D22F7B3742BC0D94AA3F0EFE21092
+#     (if absent, the script auto-imports from keyserver.ubuntu.com)
 
 set -euo pipefail
 
 # --- Dependencies ---
-for cmd in qm wget; do
+for cmd in qm wget gpg; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: '${cmd}' not found. This script must be run on a Proxmox host."
+        echo "Error: '${cmd}' not found. Install missing dependencies (qm and wget require a Proxmox host; gpg requires: apt-get install -y gpg)."
         exit 1
     fi
 done
@@ -128,11 +131,12 @@ wget -q --max-redirect=0 \
 # Import Ubuntu Cloud Image Builder key if not already present.
 gpg --list-keys "${UBUNTU_SIGNING_KEY}" &>/dev/null \
     || gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${UBUNTU_SIGNING_KEY}"
-# Verify GPG signature. Ubuntu may sign with a subkey, so the primary key
-# fingerprint can appear anywhere on the VALIDSIG line.
-if ! gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
-        | grep -q "VALIDSIG.*${UBUNTU_SIGNING_KEY}"; then
-    echo "Error: GPG signature verification failed for SHA256SUMS" >&2
+# Verify GPG signature. Ubuntu may sign with a subkey; VALIDSIG includes the
+# primary key fingerprint as the last field, so anchor the grep to end-of-line.
+if ! gpg --batch --status-fd 1 \
+        --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
+        | grep -q "^\[GNUPG:\] VALIDSIG .* ${UBUNTU_SIGNING_KEY}$"; then
+    echo "Error: GPG signature verification failed or signed by unexpected key" >&2
     exit 1
 fi
 echo "  GPG signature verified."
