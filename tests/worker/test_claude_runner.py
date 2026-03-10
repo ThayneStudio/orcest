@@ -685,8 +685,8 @@ def test_extract_summary_result_key():
 def test_extract_summary_last_result_in_multi_result_stream_regression_111():
     """Multi-result stream -> last top-level 'result' value is returned.
 
-    Regression test for issue #111 (originally fixed in PR #59): _extract_summary must scan all lines and
-    return the *last* result, not early-return on the first one.
+    Regression test for issue #111 (originally fixed in PR #59): _extract_summary must scan
+    all lines and return the *last* result, not early-return on the first one.
     """
     lines = [
         json.dumps({"result": "intermediate result"}) + "\n",
@@ -808,18 +808,15 @@ def test_is_usage_exhausted_all_patterns():
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: "exceeded" mid-sentence (not EOL) must not trigger the anchored regex
+# _is_usage_exhausted: empty stderr is not detected
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_rate_limit_not_at_eol():
+def test_is_usage_exhausted_empty_stderr():
     """Empty stderr -> not detected; _is_usage_exhausted only inspects stderr.
 
     The function accepts only a stderr string — stdout is never passed in.
-    The anchored regex (_RATE_LIMIT_RE) requires the indicator word to be
-    followed by a non-alphabetic character or end-of-string, so spurious
-    mid-word or absent matches do not fire.
     """
     # Empty stderr -> not detected
     assert _is_usage_exhausted("") is False
