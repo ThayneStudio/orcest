@@ -16,8 +16,10 @@ from orcest.orchestrator.issue_ops import clear_attempts as clear_issue_attempts
 from orcest.orchestrator.pr_ops import (
     PRAction,
     clear_attempts,
+    clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
+    set_review_retrigger_sha,
 )
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
@@ -202,6 +204,11 @@ def _poll_cycle(
                             exc_info=True,
                         )
             else:
+                # Clean up review retrigger marker on successful merge
+                try:
+                    clear_review_retrigger(redis, pr_state.number)
+                except Exception:
+                    pass  # Best-effort cleanup; key has TTL anyway
                 try:
                     gh.post_comment(
                         config.github.repo,
@@ -279,6 +286,33 @@ def _poll_cycle(
                 )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
+        elif pr_state.action == PRAction.RETRIGGER_REVIEW:
+            if pr_state.review_run_id is None:
+                logger.error(
+                    "PR #%d: RETRIGGER_REVIEW action but review_run_id is None, skipping",
+                    pr_state.number,
+                )
+            else:
+                run_id = pr_state.review_run_id
+                logger.info(
+                    "PR #%d: claude-review passed but no formal review, re-triggering run %d",
+                    pr_state.number,
+                    run_id,
+                )
+                try:
+                    gh.rerun_workflow(
+                        config.github.repo,
+                        run_id,
+                        config.github.token,
+                    )
+                    set_review_retrigger_sha(redis, pr_state.number, pr_state.head_sha)
+                except Exception as e:
+                    logger.error(
+                        "Failed to re-trigger review for PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:

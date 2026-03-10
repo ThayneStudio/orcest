@@ -185,6 +185,25 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
     )
 
 
+def rerun_workflow(repo: str, run_id: int, token: str) -> None:
+    """Re-run a GitHub Actions workflow run.
+
+    Used to re-trigger claude-review when it completed without submitting
+    a formal review.
+    """
+    _validate_repo(repo)
+    _run_gh(
+        [
+            "run",
+            "rerun",
+            str(run_id),
+            "--repo",
+            repo,
+        ],
+        token,
+    )
+
+
 def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
     """Get failed step logs for a GitHub Actions workflow run.
 
