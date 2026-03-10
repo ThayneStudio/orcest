@@ -3,12 +3,16 @@
 import re
 import sys
 
+from typing import TYPE_CHECKING
+
 import click
 from rich.console import Console
 from rich.table import Table
 
 from orcest.fleet.cli import fleet
-from orcest.shared.redis_client import RedisClient
+
+if TYPE_CHECKING:
+    from orcest.shared.redis_client import RedisClient
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
@@ -133,7 +137,7 @@ def _status_once(redis: RedisClient) -> None:
     groups = []
     for stream_key in task_streams:
         try:
-            for g in client.xinfo_groups(str(stream_key)):  # type: ignore[union-attr]  # stubs type xinfo_groups as Awaitable[Any]|Any
+            for g in client.xinfo_groups(str(stream_key)):  # type: ignore[union-attr]  # scan_iter returns bytes|str but stubs expect str
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
