@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
+_MAX_PAGES = 50  # safety cap; each page fetches up to 100 threads
+
 
 class GhCliError(Exception):
     """Raised when a gh CLI operation fails."""
@@ -366,10 +368,9 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 
     all_thread_nodes: list[dict] = []
     cursor: str | None = None
-    MAX_PAGES = 50  # safety cap; 50 × 100 = 5 000 threads
     page_count = 0
 
-    while page_count < MAX_PAGES:
+    while page_count < _MAX_PAGES:
         page_count += 1
         args = [
             "api",
@@ -434,7 +435,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
         else:
             break
     else:
-        # Loop exhausted MAX_PAGES without a natural break.
+        # Loop exhausted _MAX_PAGES without a natural break.
         page_info = review_threads.get("pageInfo") or {}  # type: ignore[possibly-undefined]
         if page_info.get("hasNextPage"):
             logger.warning(
@@ -442,7 +443,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
                 "some review threads may have been truncated (%d fetched so far)",
                 number,
                 repo,
-                MAX_PAGES,
+                _MAX_PAGES,
                 len(all_thread_nodes),
             )
 
