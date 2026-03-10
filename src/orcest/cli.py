@@ -1,5 +1,7 @@
 """CLI entry point for orcest."""
 
+from __future__ import annotations
+
 import re
 import sys
 from typing import TYPE_CHECKING
@@ -136,7 +138,7 @@ def _status_once(redis: RedisClient) -> None:
     groups = []
     for stream_key in task_streams:
         try:
-            for g in client.xinfo_groups(str(stream_key)):  # type: ignore[union-attr]  # scan_iter returns bytes|str but stubs expect str
+            for g in client.xinfo_groups(str(stream_key)):  # type: ignore[union-attr]  # client may be None per redis stubs; str() handles scan_iter returning bytes|str
                 groups.append({"stream": stream_key, **g})
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
