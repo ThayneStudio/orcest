@@ -115,11 +115,27 @@ else
     echo "Using cached image: ${IMG_CACHE}/${CLOUD_IMG}"
 fi
 
-# --- Verify cloud image checksum ---
+# --- Verify cloud image checksum and GPG signature ---
 echo "Verifying image checksum..."
+# Ubuntu Cloud Image Builder (signing key fingerprint)
+UBUNTU_SIGNING_KEY="843938DF228D22F7B3742BC0D94AA3F0EFE21092"
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS" \
     -O "${IMG_CACHE}/SHA256SUMS"
+wget -q --max-redirect=0 \
+    "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" \
+    -O "${IMG_CACHE}/SHA256SUMS.gpg"
+# Import Ubuntu Cloud Image Builder key if not already present.
+gpg --list-keys "${UBUNTU_SIGNING_KEY}" &>/dev/null \
+    || gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${UBUNTU_SIGNING_KEY}"
+# Verify GPG signature. Ubuntu may sign with a subkey, so the primary key
+# fingerprint can appear anywhere on the VALIDSIG line.
+if ! gpg --status-fd 1 --verify "${IMG_CACHE}/SHA256SUMS.gpg" "${IMG_CACHE}/SHA256SUMS" \
+        | grep -q "VALIDSIG.*${UBUNTU_SIGNING_KEY}"; then
+    echo "Error: GPG signature verification failed for SHA256SUMS" >&2
+    exit 1
+fi
+echo "  GPG signature verified."
 (cd "$IMG_CACHE" && sha256sum -c --ignore-missing SHA256SUMS)
 
 # --- Create VM ---
