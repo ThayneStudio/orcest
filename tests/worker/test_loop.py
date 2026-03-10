@@ -818,6 +818,9 @@ class TestRunWorker:
             )
 
         mocker.patch("orcest.worker.loop._execute_task", side_effect=fake_execute_task)
+        # _configure_one_iteration sets up xreadgroup to return the task on the first call.
+        # SIGTERM is fired inside fake_execute_task, so the second-call shutdown path
+        # configured by _configure_one_iteration is never reached.
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
