@@ -796,7 +796,8 @@ class TestRunWorker:
             # propagates to the abort_event.
             assert abort_event is not None
             assert abort_event.wait(timeout=1.0), (
-                "abort_event not set after SIGTERM; SIGTERM would not interrupt retry-backoff sleeps"
+                "abort_event not set after SIGTERM; "
+                "SIGTERM would not interrupt retry-backoff sleeps"
             )
             task = args[0]
             return TaskResult(
