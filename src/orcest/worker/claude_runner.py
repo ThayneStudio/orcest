@@ -418,9 +418,9 @@ def run_claude(
                 # lines, so if the subprocess is silent (e.g. long tool-call
                 # or network wait), the abort won't be detected until the
                 # next stdout line arrives or the watchdog fires its hard
-                # kill.  The watchdog provides a hard upper bound of at most
-                # timeout seconds from execution start (i.e. at most
-                # timeout - elapsed seconds remaining after lock loss is detected), but there is
+                # kill.  The watchdog fires a hard SIGKILL at most
+                # timeout - elapsed seconds after lock loss is detected
+                # (i.e. before the total execution timeout), but there is
                 # no prompt/graceful signal to Claude on lock loss -- just an
                 # eventual SIGKILL.
                 #
