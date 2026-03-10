@@ -364,3 +364,59 @@ def test_xack_nonexistent_entry_returns_zero(fake_redis_client):
 
     result = fake_redis_client.xack(stream, group, "9999999999999-0")
     assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for xpending_count
+# ---------------------------------------------------------------------------
+
+
+def test_xpending_count_returns_one_after_first_delivery(fake_redis_client):
+    """xpending_count returns 1 after a message is delivered once."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"k": "v"})
+
+    entries = fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
+    assert len(entries) == 1
+    entry_id = entries[0][0]
+
+    count = fake_redis_client.xpending_count(stream, group, entry_id)
+    assert count == 1
+
+
+def test_xpending_count_returns_zero_for_acked_entry(fake_redis_client):
+    """xpending_count returns 0 after the entry has been ACKed."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"k": "v"})
+
+    entries = fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
+    entry_id = entries[0][0]
+    fake_redis_client.xack(stream, group, entry_id)
+
+    count = fake_redis_client.xpending_count(stream, group, entry_id)
+    assert count == 0
+
+
+def test_xpending_count_returns_zero_for_nonexistent_entry(fake_redis_client):
+    """xpending_count returns 0 for an entry ID that was never delivered."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    count = fake_redis_client.xpending_count(stream, group, "9999999999999-0")
+    assert count == 0
+
+
+def test_xpending_count_returns_zero_on_error(fake_redis_client, mocker):
+    """xpending_count returns 0 when xpending_range raises an exception."""
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xpending_range",
+        side_effect=Exception("Redis error"),
+    )
+    count = fake_redis_client.xpending_count("test-stream", "test-group", "1-0")
+    assert count == 0
