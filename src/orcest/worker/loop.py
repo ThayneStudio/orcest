@@ -72,7 +72,7 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
     for host, host_cfg in data.items():
         if not isinstance(host_cfg, dict):
             continue
-        token = host_cfg.get("oauth_token", "")
+        token = host_cfg.get("oauth_token") or ""
         if token.startswith(_OAUTH_PREFIXES):
             logger.warning(
                 f"gh credential for {host!r} appears to be an OAuth app token "
