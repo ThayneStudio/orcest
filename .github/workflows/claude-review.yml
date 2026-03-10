@@ -60,6 +60,6 @@ jobs:
 
             Do NOT use `gh pr comment`. Use only inline comments for specific feedback and `gh pr review` for the final verdict.
 
-          claude_args: '--allowedTools "Read,Write,Glob,Grep,Bash,mcp__github_inline_comment__create_inline_comment"'
+          claude_args: '--allowedTools "Read,Write,Glob,Grep,Bash(gh *),mcp__github_inline_comment__create_inline_comment"'
         env:
           GH_TOKEN: ${{ github.token }}
