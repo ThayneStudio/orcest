@@ -685,8 +685,8 @@ def test_extract_summary_result_key():
 def test_extract_summary_last_result_in_multi_result_stream_regression_111():
     """Multi-result stream -> last top-level 'result' value is returned.
 
-    Regression test for issue #111: _extract_summary must scan all lines and
-    return the *last* result, not early-return on the first one.
+    Regression test for issue #111 (originally fixed in PR #59): _extract_summary must scan
+    all lines and return the *last* result, not early-return on the first one.
     """
     lines = [
         json.dumps({"result": "intermediate result"}) + "\n",
@@ -808,19 +808,20 @@ def test_is_usage_exhausted_all_patterns():
 
 
 # ---------------------------------------------------------------------------
-# _is_usage_exhausted: pattern in stdout is NOT detected (only stderr checked)
+# _is_usage_exhausted: anchored-regex boundary and edge cases
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_is_usage_exhausted_stdout_not_checked():
-    """Only stderr is checked — stdout is excluded to prevent false positives.
+def test_is_usage_exhausted_empty_stderr():
+    """Empty stderr -> not detected; _is_usage_exhausted only inspects stderr.
 
+    The function accepts only a stderr string — stdout is never passed in.
     Claude's stream-json stdout contains ``"usage": {...}`` in every API
-    response message.  If "limit" also appears anywhere in Claude's text
-    or prompt, the ("usage", "limit") pattern would match incorrectly.
+    response message; if "limit" also appeared there the pattern would fire
+    incorrectly, so stdout is excluded by design.
     """
-    # Empty stderr -> not detected regardless of stdout content
+    # Empty stderr -> not detected
     assert _is_usage_exhausted("") is False
 
 
