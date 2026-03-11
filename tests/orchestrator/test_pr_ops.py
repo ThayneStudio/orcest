@@ -9,14 +9,17 @@ from orcest.orchestrator.pr_ops import (
     PRAction,
     _get_claude_review_run_id,
     clear_attempts,
+    clear_exhausted_notified,
     clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
     get_attempt_count,
+    get_exhausted_notified,
     get_review_retrigger_sha,
     get_total_attempt_count,
     increment_attempts,
     increment_total_attempts,
+    set_exhausted_notified,
     set_review_retrigger_sha,
 )
 from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
@@ -1127,6 +1130,81 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
 
     assert len(results) == 1
     assert results[0].action == PRAction.ENQUEUE_FIX
+
+
+def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client, label_config):
+    """When exhausted_notified flag is NOT set and total_attempts >= limit, PR is skipped.
+
+    This is the first-time exhaustion case: the orchestrator hasn't yet posted the
+    notification, so we return SKIP_MAX_TOTAL_ATTEMPTS (loop.py will add the label
+    and set the flag).
+    """
+    pr_number = 740
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+    # No exhausted_notified flag set
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    # Counter was NOT reset
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
+
+
+def test_total_attempts_reset_when_label_removed(gh_mock, fake_redis_client, label_config):
+    """When exhausted_notified flag IS set and total_attempts >= limit, counter is reset.
+
+    This is the label-removal recovery path: the human removed the needs-human label,
+    so we reset the counter and let the PR proceed normally.
+    """
+    pr_number = 750
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
+    ]
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+    # Simulate: orchestrator previously set the flag when it added the needs-human label
+    set_exhausted_notified(fake_redis_client, pr_number)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    # PR should proceed normally (not skipped) after reset
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    # Counter and flag were both cleared
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
+    assert not get_exhausted_notified(fake_redis_client, pr_number)
+
+
+def test_exhausted_notified_helpers(fake_redis_client):
+    """set/get/clear_exhausted_notified operate correctly."""
+    pr_number = 760
+    assert not get_exhausted_notified(fake_redis_client, pr_number)
+
+    set_exhausted_notified(fake_redis_client, pr_number)
+    assert get_exhausted_notified(fake_redis_client, pr_number)
+
+    clear_exhausted_notified(fake_redis_client, pr_number)
+    assert not get_exhausted_notified(fake_redis_client, pr_number)
 
 
 # ---------------------------------------------------------------------------
