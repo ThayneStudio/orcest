@@ -11,17 +11,12 @@ from rich.console import Console
 from rich.table import Table
 
 from orcest.fleet.cli import fleet
-from orcest.shared.models import DEAD_LETTER_STREAM
+from orcest.shared.models import DEAD_LETTER_METADATA_FIELDS, DEAD_LETTER_STREAM
 
 if TYPE_CHECKING:
     from orcest.shared.redis_client import RedisClient
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-
-# Fields added by the dead-letter handler that are not part of the original task.
-_DEAD_LETTER_METADATA_FIELDS = frozenset(
-    {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
-)
 
 
 def _validate_ssh_input(value: str, label: str) -> None:
@@ -258,8 +253,6 @@ def dead_letters(redis_host: str | None, config: str, replay: bool, count: int) 
 
 def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> None:
     """Implementation of orcest dead-letters, separated for testability."""
-    from rich.table import Table as RichTable
-
     console = Console(file=sys.stdout)
 
     entries = redis.xread_after(DEAD_LETTER_STREAM, last_id="0-0", count=count)
@@ -269,7 +262,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         return
 
     noun = "entry" if len(entries) == 1 else "entries"
-    table = RichTable(title=f"Dead-Lettered Tasks ({len(entries)} {noun})")
+    table = Table(title=f"Dead-Lettered Tasks ({len(entries)} {noun})")
     table.add_column("Entry ID", style="dim")
     table.add_column("Task ID", style="cyan")
     table.add_column("Type", style="magenta")
@@ -313,7 +306,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
             continue
 
         # Strip dead-letter metadata; keep only original task fields.
-        task_fields = {k: v for k, v in fields.items() if k not in _DEAD_LETTER_METADATA_FIELDS}
+        task_fields = {k: v for k, v in fields.items() if k not in DEAD_LETTER_METADATA_FIELDS}
         try:
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).
