@@ -295,6 +295,7 @@ def test_poll_cycle_deployment_skipped_when_disabled(
 
     _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    # Merge happened but deployment was not invoked (enabled=False)
+    # Merge happened; run_deployment is called unconditionally but is a no-op when disabled
     gh_mock.merge_pr.assert_called_once()
-    mock_deploy.assert_not_called()
+    mock_deploy.assert_called_once()
+    gh_mock.create_issue.assert_not_called()

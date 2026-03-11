@@ -224,30 +224,30 @@ def _poll_cycle(
                         comment_err,
                         exc_info=True,
                     )
-                # Run deployment if configured
-                if config.deployment.enabled and config.deployment.command:
+                # Run deployment if configured (run_deployment is a no-op when disabled)
+                try:
+                    run_deployment(config.deployment, pr_state.number, logger)
+                    logger.info("PR #%d: deployment succeeded", pr_state.number)
+                except DeploymentError as deploy_err:
+                    err_msg = str(deploy_err)
+                    logger.error("PR #%d: deployment failed: %s", pr_state.number, err_msg)
                     try:
-                        run_deployment(config.deployment, pr_state.number, logger)
-                        logger.info("PR #%d: deployment succeeded", pr_state.number)
-                    except DeploymentError as deploy_err:
-                        err_msg = str(deploy_err)
-                        logger.error("PR #%d: deployment failed: %s", pr_state.number, err_msg)
-                        try:
-                            gh.create_issue(
-                                config.github.repo,
-                                f"Deployment failed after merge of PR #{pr_state.number}",
-                                f"**orcest** deployment failed after merging "
-                                f"PR #{pr_state.number} ({pr_state.title}).\n\n"
-                                f"Error: {err_msg[:500]}",
-                                config.github.token,
-                            )
-                        except Exception as issue_err:
-                            logger.error(
-                                "PR #%d: failed to create deployment failure issue: %s",
-                                pr_state.number,
-                                issue_err,
-                                exc_info=True,
-                            )
+                        gh.create_issue(
+                            config.github.repo,
+                            f"Deployment failed after merge of PR #{pr_state.number}",
+                            f"**orcest** deployment failed after merging "
+                            f"PR #{pr_state.number} ({pr_state.title}).\n\n"
+                            f"Error: {err_msg[:500]}",
+                            config.github.token,
+                            labels=["orcest:needs-human"],
+                        )
+                    except Exception as issue_err:
+                        logger.error(
+                            "PR #%d: failed to create deployment failure issue: %s",
+                            pr_state.number,
+                            issue_err,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
