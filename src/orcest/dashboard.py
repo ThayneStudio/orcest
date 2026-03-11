@@ -491,11 +491,11 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             for stream, depth in snapshot.queue_depths.items():
                 queues.add_row(stream, str(depth))
             queues.add_row("results", str(snapshot.results_depth))
+            if not snapshot.queue_depths:
+                queues.add_row("(no task streams)", "0")
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
             queues.add_row("orcest:dead-letter", dl_text)
-            if not snapshot.queue_depths:
-                queues.add_row("(no task streams)", "0")
 
             # Active locks
             locks_table = self.query_one("#locks-table", DataTable)

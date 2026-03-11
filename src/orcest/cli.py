@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
+_DEAD_LETTER_STREAM = "orcest:dead-letter"
+# Fields added by the dead-letter handler that are not part of the original task.
+_DEAD_LETTER_METADATA_FIELDS = frozenset(
+    {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
+)
+
 
 def _validate_ssh_input(value: str, label: str) -> None:
     """Raise click.BadParameter if value contains shell metacharacters."""
@@ -128,7 +134,7 @@ def _status_once(redis: RedisClient) -> None:
         results_len = "(not a stream)"
 
     try:
-        dead_letter_len = client.xlen("orcest:dead-letter") or 0
+        dead_letter_len = client.xlen(_DEAD_LETTER_STREAM) or 0
     except redis_lib.ResponseError:
         dead_letter_len = "(not a stream)"
 
@@ -166,7 +172,7 @@ def _status_once(redis: RedisClient) -> None:
     if not task_streams:
         table.add_row("tasks:*", "0")
     table.add_row("results", str(results_len))
-    table.add_row("orcest:dead-letter", str(dead_letter_len))
+    table.add_row(_DEAD_LETTER_STREAM, str(dead_letter_len))
     console.print(table)
 
     if locks:
@@ -191,13 +197,6 @@ def _status_once(redis: RedisClient) -> None:
         console.print(group_table)
 
     console.print()
-
-
-_DEAD_LETTER_STREAM = "orcest:dead-letter"
-# Fields added by the dead-letter handler that are not part of the original task.
-_DEAD_LETTER_METADATA_FIELDS = frozenset(
-    {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
-)
 
 
 @main.command("dead-letters")
@@ -309,6 +308,8 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         # Strip dead-letter metadata; keep only original task fields.
         task_fields = {k: v for k, v in fields.items() if k not in _DEAD_LETTER_METADATA_FIELDS}
         try:
+            # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
+            # and will be replayed again on the next --replay run (at-least-once delivery).
             redis.xadd(tasks_stream, task_fields)
             client.xdel(_DEAD_LETTER_STREAM, entry_id)
             replayed += 1
