@@ -109,13 +109,18 @@ def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> st
     return f"pending:{resource_type}:{repo}:{resource_id}"
 
 
+# Pending-task marker TTL: RunnerConfig defaults: timeout(1800s) × max_retries(3) + 5-min buffer.
+# Much tighter than the previous 7200 s (2 h), bounding the crash-orphaned-marker window.
+_PENDING_TASK_TTL = 1800 * 3 + 300
+
+
 def set_pending_task(
     redis_client: RedisClient,
     repo: str,
     resource_type: str,
     resource_id: int,
     task_id: str,
-    ttl: int = 7200,
+    ttl: int = _PENDING_TASK_TTL,
 ) -> bool:
     """Mark a task as pending for a resource. Returns True if set (no existing pending task).
 
