@@ -20,6 +20,7 @@ from typing import Any, cast
 import redis as redis_lib
 from rich.markup import escape as rich_escape
 
+from orcest.shared.models import DEAD_LETTER_STREAM
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         results_depth = 0
 
     try:
-        dead_letter_count: int = cast(int, client.xlen("orcest:dead-letter")) or 0
+        dead_letter_count: int = cast(int, client.xlen(DEAD_LETTER_STREAM)) or 0
     except redis_lib.ResponseError:
         dead_letter_count = 0
 
@@ -495,7 +496,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 queues.add_row("(no task streams)", "0")
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
-            queues.add_row("orcest:dead-letter", dl_text)
+            queues.add_row(DEAD_LETTER_STREAM, dl_text)
 
             # Active locks
             locks_table = self.query_one("#locks-table", DataTable)

@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+# Redis stream / key name constants
+DEAD_LETTER_STREAM = "orcest:dead-letter"
+
 
 class TaskType(str, Enum):
     FIX_PR = "fix_pr"

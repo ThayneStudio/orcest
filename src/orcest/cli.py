@@ -11,13 +11,13 @@ from rich.console import Console
 from rich.table import Table
 
 from orcest.fleet.cli import fleet
+from orcest.shared.models import DEAD_LETTER_STREAM
 
 if TYPE_CHECKING:
     from orcest.shared.redis_client import RedisClient
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
-_DEAD_LETTER_STREAM = "orcest:dead-letter"
 # Fields added by the dead-letter handler that are not part of the original task.
 _DEAD_LETTER_METADATA_FIELDS = frozenset(
     {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
@@ -134,7 +134,7 @@ def _status_once(redis: RedisClient) -> None:
         results_len = "(not a stream)"
 
     try:
-        dead_letter_len = client.xlen(_DEAD_LETTER_STREAM) or 0
+        dead_letter_len = client.xlen(DEAD_LETTER_STREAM) or 0
     except redis_lib.ResponseError:
         dead_letter_len = "(not a stream)"
 
@@ -172,7 +172,7 @@ def _status_once(redis: RedisClient) -> None:
     if not task_streams:
         table.add_row("tasks:*", "0")
     table.add_row("results", str(results_len))
-    table.add_row(_DEAD_LETTER_STREAM, str(dead_letter_len))
+    table.add_row(DEAD_LETTER_STREAM, str(dead_letter_len))
     console.print(table)
 
     if locks:
@@ -211,7 +211,7 @@ def _status_once(redis: RedisClient) -> None:
     "--count",
     default=100,
     type=int,
-    help="Maximum number of entries to list.",
+    help="Maximum number of entries to list (also caps replay scope when --replay is used).",
 )
 def dead_letters(redis_host: str | None, config: str, replay: bool, count: int) -> None:
     """List and optionally replay dead-lettered tasks.
@@ -262,10 +262,10 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
     console = Console(file=sys.stdout)
 
-    entries = redis.xread_after(_DEAD_LETTER_STREAM, last_id="0-0", count=count)
+    entries = redis.xread_after(DEAD_LETTER_STREAM, last_id="0-0", count=count)
 
     if not entries:
-        console.print(f"[green]No dead-lettered tasks in {_DEAD_LETTER_STREAM!r}.[/green]")
+        console.print(f"[green]No dead-lettered tasks in {DEAD_LETTER_STREAM!r}.[/green]")
         return
 
     noun = "entry" if len(entries) == 1 else "entries"
@@ -291,6 +291,11 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
     console.print(table)
 
+    if len(entries) == count:
+        console.print(
+            f"[yellow]{count} entries shown; stream may have more — re-run to process remaining.[/yellow]"
+        )
+
     if not replay:
         return
 
@@ -311,7 +316,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).
             redis.xadd(tasks_stream, task_fields)
-            client.xdel(_DEAD_LETTER_STREAM, entry_id)
+            client.xdel(DEAD_LETTER_STREAM, entry_id)
             replayed += 1
         except Exception as exc:
             console.print(f"[red]Failed to replay entry {entry_id}: {exc}[/red]")
