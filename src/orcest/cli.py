@@ -286,7 +286,11 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
     if len(entries) == count:
         console.print(
             f"[yellow]{count} entries shown; stream may have more "
-            "— re-run to process remaining.[/yellow]"
+            + (
+                "— re-run with --replay to process remaining.[/yellow]"
+                if replay
+                else "— increase --count to see more.[/yellow]"
+            )
         )
 
     if not replay:
