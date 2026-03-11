@@ -600,6 +600,8 @@ def _poll_cycle(
             logger.debug(f"PR #{pr_state.number}: terminal label, skipping")
         elif pr_state.action == PRAction.SKIP_NO_CHECKS:
             logger.debug(f"PR #{pr_state.number}: no CI checks, skipping")
+        elif pr_state.action == PRAction.SKIP_USAGE_COOLDOWN:
+            logger.debug("PR #%d: usage-exhausted cooldown active, skipping", pr_state.number)
         else:
             logger.warning(
                 "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action

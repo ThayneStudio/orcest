@@ -466,6 +466,11 @@ def discover_actionable_prs(
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).
+        # Note: the cooldown is keyed to PR number, not head SHA, so new commits
+        # pushed during the cooldown window are still blocked for up to 30 minutes.
+        # This is intentional — USAGE_EXHAUSTED is account-level, so new commits
+        # don't help. If new commits should bypass the cooldown (e.g. urgent
+        # hotfixes), a SHA comparison would be needed here.
         if has_usage_exhausted_cooldown(redis, number):
             results.append(
                 PRState(
