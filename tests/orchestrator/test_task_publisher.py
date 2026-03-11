@@ -317,6 +317,43 @@ def test_prompt_truncates_long_ci_logs(
     assert "truncated" in task.prompt
 
 
+def test_prompt_early_error_path_captures_marker_before_tail(
+    gh_mock,
+    fake_redis_client,
+):
+    """Error markers before the tail window are included via the early-error path.
+
+    With the error at position 0 and a total log of 25,008 chars, the plain
+    tail slice (last 20,000 chars) starts at position 5,008 and would miss
+    the "FAILURES" marker entirely.  The early-error branch must capture it.
+    """
+    _setup_gh_defaults(gh_mock)
+    # "FAILURES" at position 0, followed by filler, then more filler to push
+    # the total length well past the 20,000 per-check limit.
+    long_log = "FAILURES" + "x" * 5000 + "y" * 20000  # 25,008 chars total
+    gh_mock.get_failed_run_logs.return_value = long_log
+
+    ci_failures = _make_ci_failures_with_urls(run_ids=[88889], names=["tests"])
+    pr_state = _make_pr_state(number=55, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # The early error marker must appear even though it sits before the tail window
+    assert "FAILURES" in task.prompt
+    # The mid-log separator signals that the early-error branch was taken
+    assert "middle of log omitted" in task.prompt
+    # The tail portion should also be present
+    assert "y" * 1000 in task.prompt
+    # The full log should not appear verbatim (it was truncated)
+    assert long_log not in task.prompt
+
+
 # --- Review thread prompt tests ---
 
 
