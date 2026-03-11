@@ -95,6 +95,22 @@ def test_attempt_counts(fake_redis_client):
     assert snap.attempt_counts == {"PR #42": 3}
 
 
+def test_dead_letter_count_zero_when_empty(fake_redis_client):
+    """Dead-letter count is 0 when the stream does not exist."""
+    snap = fetch_snapshot(fake_redis_client)
+    assert snap.dead_letter_count == 0
+
+
+def test_dead_letter_count_in_snapshot(fake_redis_client):
+    """Reports dead-letter stream length in snapshot."""
+    fake_redis_client.xadd("orcest:dead-letter", {"id": "t1", "type": "fix_ci"})
+    fake_redis_client.xadd("orcest:dead-letter", {"id": "t2", "type": "fix_ci"})
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    assert snap.dead_letter_count == 2
+
+
 def test_disconnected_redis(fake_redis_client, mocker):
     """Returns redis_ok=False when Redis is unreachable."""
     mocker.patch.object(fake_redis_client, "health_check", return_value=False)

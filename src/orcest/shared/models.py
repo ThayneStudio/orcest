@@ -9,6 +9,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+# Redis stream / key name constants
+DEAD_LETTER_STREAM = "orcest:dead-letter"
+
+# Fields added by the dead-letter handler that are not part of the original task.
+# Shared here so both the writer (worker/loop.py) and the reader (cli.py dead-letters
+# command) reference the same canonical set — a rename stays consistent automatically.
+DEAD_LETTER_METADATA_FIELDS = frozenset(
+    {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
+)
+
 
 class TaskType(str, Enum):
     FIX_PR = "fix_pr"

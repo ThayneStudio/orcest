@@ -232,6 +232,11 @@ class RedisClient:
         count = entries[0].get("times_delivered", 0)  # type: ignore[index]
         return int(count)
 
+    def xdel(self, stream: str, *entry_ids: str) -> int:
+        """Delete entries from a stream by ID. Returns number deleted."""
+        result: int = self._client.xdel(stream, *entry_ids)  # type: ignore[assignment]
+        return result
+
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
 
