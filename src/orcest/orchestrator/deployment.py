@@ -40,17 +40,17 @@ def run_deployment(
     if not config.enabled or not config.command:
         return False
 
+    if config.health_check_url and not config.health_check_url.startswith(("http://", "https://")):
+        raise DeploymentError(
+            f"health_check_url must use http:// or https://, got: {config.health_check_url!r}"
+        )
+
     logger.info("PR #%d: running deployment: %s", pr_number, config.command)
     _run_command(config.command, "deployment", pr_number, logger)
     logger.info("PR #%d: deployment command succeeded", pr_number)
 
     if not config.health_check_url:
         return True
-
-    if not config.health_check_url.startswith(("http://", "https://")):
-        raise DeploymentError(
-            f"health_check_url must use http:// or https://, got: {config.health_check_url!r}"
-        )
 
     logger.info(
         "PR #%d: health check %s (timeout: %ds)",
