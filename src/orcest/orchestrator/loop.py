@@ -863,6 +863,17 @@ def _handle_result(
                 f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
                 exc_info=True,
             )
+
+        # Remove orcest:ready label from completed issues so they are not
+        # re-discovered on the next poll cycle.
+        if is_issue:
+            try:
+                gh.remove_issue_label(repo, resource_id, labels.ready, token)
+            except Exception as e:
+                logger.error(
+                    f"Failed to remove ready label from issue #{resource_id}: {e}",
+                    exc_info=True,
+                )
     elif result.status == ResultStatus.USAGE_EXHAUSTED and not is_issue:
         # Clear the per-SHA attempt counter so the PR can be re-enqueued once
         # the cooldown expires. The total-attempts counter is intentionally
@@ -885,17 +896,6 @@ def _handle_result(
             except Exception as e:
                 logger.error(
                     f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
-                    exc_info=True,
-                )
-
-        # Remove orcest:ready label from completed issues so they are not
-        # re-discovered on the next poll cycle.
-        if is_issue:
-            try:
-                gh.remove_issue_label(repo, resource_id, labels.ready, token)
-            except Exception as e:
-                logger.error(
-                    f"Failed to remove ready label from issue #{resource_id}: {e}",
                     exc_info=True,
                 )
 

@@ -1210,18 +1210,16 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
     assert get_total_attempt_count(fake_redis_client, pr_number) == 10
 
 
-def test_total_attempts_reset_when_label_removed(gh_mock, fake_redis_client, label_config):
-    """When exhausted_notified flag IS set and total_attempts >= limit, counter is reset.
+def test_total_attempts_still_skipped_when_exhausted_notified(gh_mock, fake_redis_client, label_config):
+    """When exhausted_notified flag IS set and total_attempts >= limit, PR is still skipped.
 
-    This is the label-removal recovery path: the human removed the needs-human label,
-    so we reset the counter and let the PR proceed normally.
+    The label-removal recovery path was removed (see commit 7e98a82). The
+    exhausted_notified flag no longer triggers a counter reset — SKIP_MAX_TOTAL_ATTEMPTS
+    is returned unconditionally when the circuit breaker is tripped.
     """
     pr_number = 750
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
-    ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
     ]
     for _ in range(10):
         increment_total_attempts(fake_redis_client, pr_number)
@@ -1237,11 +1235,10 @@ def test_total_attempts_reset_when_label_removed(gh_mock, fake_redis_client, lab
     )
 
     assert len(results) == 1
-    # PR should proceed normally (not skipped) after reset
-    assert results[0].action == PRAction.ENQUEUE_FIX
-    # Counter and flag were both cleared
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    # Counter and flag are NOT cleared — no label-removal recovery path
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
+    assert get_exhausted_notified(fake_redis_client, pr_number)
 
 
 def test_exhausted_notified_helpers(fake_redis_client):
