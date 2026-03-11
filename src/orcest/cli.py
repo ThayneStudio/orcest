@@ -127,6 +127,11 @@ def _status_once(redis: RedisClient) -> None:
         # WRONGTYPE: results key exists but is not a stream
         results_len = "(not a stream)"
 
+    try:
+        dead_letter_len = client.xlen("orcest:dead-letter") or 0
+    except redis_lib.ResponseError:
+        dead_letter_len = "(not a stream)"
+
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
     locks = []
     for key in lock_keys:
@@ -161,6 +166,7 @@ def _status_once(redis: RedisClient) -> None:
     if not task_streams:
         table.add_row("tasks:*", "0")
     table.add_row("results", str(results_len))
+    table.add_row("orcest:dead-letter", str(dead_letter_len))
     console.print(table)
 
     if locks:
@@ -185,6 +191,135 @@ def _status_once(redis: RedisClient) -> None:
         console.print(group_table)
 
     console.print()
+
+
+_DEAD_LETTER_STREAM = "orcest:dead-letter"
+# Fields added by the dead-letter handler that are not part of the original task.
+_DEAD_LETTER_METADATA_FIELDS = frozenset(
+    {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
+)
+
+
+@main.command("dead-letters")
+@click.argument("redis_host", required=False, default=None)
+@click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
+@click.option(
+    "--replay",
+    is_flag=True,
+    help="Re-enqueue dead-lettered tasks to their original task streams.",
+)
+@click.option(
+    "--count",
+    default=100,
+    type=int,
+    help="Maximum number of entries to list.",
+)
+def dead_letters(redis_host: str | None, config: str, replay: bool, count: int) -> None:
+    """List and optionally replay dead-lettered tasks.
+
+    Reads entries from the orcest:dead-letter stream and displays them in a
+    table. Use --replay to re-enqueue them back to their original task streams
+    and remove them from the dead-letter stream.
+
+    Connects to Redis directly via REDIS_HOST (e.g. 10.20.0.19 or
+    10.20.0.19:6380), or falls back to --config file.
+    """
+    from orcest.shared.config import RedisConfig
+    from orcest.shared.redis_client import RedisClient
+
+    if redis_host:
+        if ":" in redis_host:
+            host, port_str = redis_host.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                click.echo(f"Error: Invalid port number: {port_str}", err=True)
+                raise SystemExit(1)
+        else:
+            host, port = redis_host, 6379
+        redis_cfg = RedisConfig(host=host, port=port, db=0)
+    else:
+        from orcest.shared.config import load_orchestrator_config
+
+        cfg = load_orchestrator_config(config)
+        redis_cfg = cfg.redis
+
+    redis = RedisClient(redis_cfg)
+
+    if not redis.health_check():
+        redis.close()
+        click.echo("Error: Cannot connect to Redis.", err=True)
+        raise SystemExit(1)
+
+    try:
+        _dead_letters_command(redis, replay=replay, count=count)
+    finally:
+        redis.close()
+
+
+def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> None:
+    """Implementation of orcest dead-letters, separated for testability."""
+    from rich.table import Table as RichTable
+
+    console = Console(file=sys.stdout)
+
+    entries = redis.xread_after(_DEAD_LETTER_STREAM, last_id="0-0", count=count)
+
+    if not entries:
+        console.print(f"[green]No dead-lettered tasks in {_DEAD_LETTER_STREAM!r}.[/green]")
+        return
+
+    noun = "entry" if len(entries) == 1 else "entries"
+    table = RichTable(title=f"Dead-Lettered Tasks ({len(entries)} {noun})")
+    table.add_column("Entry ID", style="dim")
+    table.add_column("Task ID", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Resource", style="yellow")
+    table.add_column("Repo", style="green")
+    table.add_column("Deliveries", style="red")
+    table.add_column("Original Stream", style="blue")
+
+    for entry_id, fields in entries:
+        table.add_row(
+            entry_id,
+            fields.get("id", "?"),
+            fields.get("type", "?"),
+            f"{fields.get('resource_type', '?')} #{fields.get('resource_id', '?')}",
+            fields.get("repo", "?"),
+            fields.get("delivery_count", "?"),
+            fields.get("tasks_stream", "?"),
+        )
+
+    console.print(table)
+
+    if not replay:
+        return
+
+    replayed = 0
+    errors = 0
+    client = redis.client
+
+    for entry_id, fields in entries:
+        tasks_stream = fields.get("tasks_stream")
+        if not tasks_stream:
+            console.print(f"[yellow]Entry {entry_id}: missing tasks_stream, skipping[/yellow]")
+            errors += 1
+            continue
+
+        # Strip dead-letter metadata; keep only original task fields.
+        task_fields = {k: v for k, v in fields.items() if k not in _DEAD_LETTER_METADATA_FIELDS}
+        try:
+            redis.xadd(tasks_stream, task_fields)
+            client.xdel(_DEAD_LETTER_STREAM, entry_id)
+            replayed += 1
+        except Exception as exc:
+            console.print(f"[red]Failed to replay entry {entry_id}: {exc}[/red]")
+            errors += 1
+
+    if replayed:
+        console.print(f"\n[green]Replayed {replayed} task(s) to their original streams.[/green]")
+    if errors:
+        console.print(f"\n[red]{errors} error(s) during replay.[/red]")
 
 
 @main.command()

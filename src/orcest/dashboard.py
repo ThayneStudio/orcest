@@ -63,6 +63,7 @@ class SystemSnapshot:
     fetched_at: datetime
     queue_depths: dict[str, int] = field(default_factory=dict)
     results_depth: int = 0
+    dead_letter_count: int = 0
     locks: list[LockInfo] = field(default_factory=list)
     consumer_groups: list[ConsumerGroupInfo] = field(default_factory=list)
     recent_results: list[RecentResult] = field(default_factory=list)
@@ -112,6 +113,11 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         results_depth: int = cast(int, client.xlen("results")) or 0
     except redis_lib.ResponseError:
         results_depth = 0
+
+    try:
+        dead_letter_count: int = cast(int, client.xlen("orcest:dead-letter")) or 0
+    except redis_lib.ResponseError:
+        dead_letter_count = 0
 
     # Active locks
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
@@ -178,6 +184,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         fetched_at=datetime.now(timezone.utc),
         queue_depths=queue_depths,
         results_depth=results_depth,
+        dead_letter_count=dead_letter_count,
         locks=locks,
         consumer_groups=consumer_groups,
         recent_results=recent_results,
@@ -484,6 +491,9 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             for stream, depth in snapshot.queue_depths.items():
                 queues.add_row(stream, str(depth))
             queues.add_row("results", str(snapshot.results_depth))
+            dl_count = snapshot.dead_letter_count
+            dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
+            queues.add_row("orcest:dead-letter", dl_text)
             if not snapshot.queue_depths:
                 queues.add_row("(no task streams)", "0")
 
