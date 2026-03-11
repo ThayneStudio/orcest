@@ -1210,7 +1210,7 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
     assert get_total_attempt_count(fake_redis_client, pr_number) == 10
 
 
-def test_total_attempts_still_skipped_when_exhausted_notified(gh_mock, fake_redis_client, label_config):
+def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
     """When exhausted_notified flag IS set and total_attempts >= limit, PR is still skipped.
 
     The label-removal recovery path was removed (see commit 7e98a82). The
