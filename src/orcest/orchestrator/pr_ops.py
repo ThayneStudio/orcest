@@ -8,7 +8,8 @@ main loop acts on these recommendations.
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import cast
 
@@ -51,6 +52,7 @@ class PRAction(str, Enum):
     SKIP_MAX_TOTAL_ATTEMPTS = "skip_max_total_attempts"  # Exhausted cross-SHA retry budget
     SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
+    RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
 
 
 @dataclass
@@ -67,6 +69,7 @@ class PRState:
     labels: list[str]
     base_branch: str = "main"  # Target branch (from baseRefName)
     review_run_id: int | None = None  # GitHub Actions run ID for re-triggering review
+    stale_run_ids: list[int] = field(default_factory=list)  # Run IDs of stale pending checks
 
 
 def _make_attempts_key(pr_number: int) -> str:
@@ -216,6 +219,56 @@ def clear_review_retrigger(redis: RedisClient, pr_number: int) -> None:
     redis.client.delete(_make_review_retrigger_key(pr_number))
 
 
+def _parse_iso_timestamp(ts: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp string into a timezone-aware datetime.
+
+    Returns None if the input is absent or cannot be parsed.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _check_stale_pending(
+    ci_pending: list[dict], timeout_seconds: int
+) -> tuple[bool, list[int]]:
+    """Determine whether all pending checks have exceeded the staleness timeout.
+
+    Returns ``(all_stale, run_ids)`` where:
+    - ``all_stale`` is True only when every pending check has been in a
+      pending state for longer than ``timeout_seconds``.
+    - ``run_ids`` lists the GitHub Actions workflow run IDs extracted from
+      ``detailsUrl`` for re-triggering (may be empty if checks lack that URL,
+      e.g. StatusContext checks).
+
+    A check without a parseable ``startedAt``/``createdAt`` timestamp is
+    treated as non-stale (conservative: avoids spurious re-triggers).
+    """
+    now = datetime.now(timezone.utc)
+
+    for check in ci_pending:
+        ts_str = check.get("startedAt") or check.get("createdAt")
+        started_at = _parse_iso_timestamp(ts_str)
+        if started_at is None:
+            return False, []
+        if (now - started_at).total_seconds() < timeout_seconds:
+            return False, []
+
+    # All pending checks have exceeded the timeout — collect their run IDs
+    run_ids: list[int] = []
+    for check in ci_pending:
+        details_url = check.get("detailsUrl") or ""
+        match = re.search(r"/actions/runs/(\d+)", details_url)
+        if match:
+            run_id = int(match.group(1))
+            if run_id not in run_ids:
+                run_ids.append(run_id)
+    return True, run_ids
+
+
 def _get_claude_review_run_id(checks: list[dict]) -> int | None:
     """Extract the GitHub Actions run ID for a successful claude-review check.
 
@@ -250,6 +303,7 @@ def discover_actionable_prs(
     label_config: LabelConfig,
     max_attempts: int = 3,
     max_total_attempts: int = 10,
+    stale_pending_timeout_seconds: int = 7200,
 ) -> list[PRState]:
     """Discover PRs that need action.
 
@@ -496,24 +550,54 @@ def discover_actionable_prs(
             # Only skip as pending if no checks have failed yet.
             # If there are already failures, enqueue a fix immediately
             # rather than waiting for other checks to finish.
-            logger.debug(
-                "PR #%d has %d check(s) still pending, skipping",
-                number,
-                len(ci_pending),
+            all_stale, stale_run_ids = _check_stale_pending(
+                ci_pending, stale_pending_timeout_seconds
             )
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_PENDING,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            if all_stale:
+                # All pending checks have exceeded the staleness timeout.
+                # Re-trigger what we can; if no run IDs are extractable
+                # (e.g. StatusContext checks), the loop will add needs-human.
+                logger.warning(
+                    "PR #%d has %d stale pending check(s) (>%ds), "
+                    "escalating for re-trigger (run_ids=%s)",
+                    number,
+                    len(ci_pending),
+                    stale_pending_timeout_seconds,
+                    stale_run_ids,
                 )
-            )
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.RETRIGGER_STALE_CHECKS,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                        stale_run_ids=stale_run_ids,
+                    )
+                )
+            else:
+                logger.debug(
+                    "PR #%d has %d check(s) still pending, skipping",
+                    number,
+                    len(ci_pending),
+                )
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_PENDING,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
             continue
 
         # Check review state

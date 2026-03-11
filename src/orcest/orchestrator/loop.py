@@ -103,6 +103,7 @@ def _poll_cycle(
         label_config=config.labels,
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
+        stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
     )
 
     # Step 3: Act on PRs
@@ -344,6 +345,91 @@ def _poll_cycle(
                 except Exception as e:
                     logger.error(
                         "Failed to re-trigger review for PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
+        elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
+            run_ids = pr_state.stale_run_ids
+            if not run_ids:
+                # Stale pending checks found but no re-triggerable run IDs
+                # (e.g. StatusContext checks). Escalate to needs-human.
+                logger.warning(
+                    "PR #%d: stale pending checks with no re-triggerable run IDs; "
+                    "adding needs-human label",
+                    pr_state.number,
+                )
+                try:
+                    gh.add_label(
+                        config.github.repo,
+                        pr_state.number,
+                        config.labels.needs_human,
+                        config.github.token,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to add needs-human label to PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
+                try:
+                    gh.post_comment(
+                        config.github.repo,
+                        pr_state.number,
+                        f"**orcest** detected stale CI checks that have been pending for "
+                        f"more than {config.stale_pending_timeout_seconds // 3600}h but "
+                        f"could not re-trigger them automatically. "
+                        f"Please investigate the stuck checks manually.",
+                        config.github.token,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to comment on PR #%d about stale checks: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "PR #%d: %d pending check(s) stuck (>%ds), re-triggering run(s) %s",
+                    pr_state.number,
+                    len(pr_state.stale_run_ids),
+                    config.stale_pending_timeout_seconds,
+                    run_ids,
+                )
+                for run_id in run_ids:
+                    try:
+                        gh.rerun_workflow(
+                            config.github.repo,
+                            run_id,
+                            config.github.token,
+                        )
+                        logger.info(
+                            "PR #%d: re-triggered stale workflow run %d",
+                            pr_state.number,
+                            run_id,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to re-trigger stale run %d for PR #%d: %s",
+                            run_id,
+                            pr_state.number,
+                            e,
+                            exc_info=True,
+                        )
+                try:
+                    gh.post_comment(
+                        config.github.repo,
+                        pr_state.number,
+                        f"**orcest** detected CI checks stuck in pending state for more than "
+                        f"{config.stale_pending_timeout_seconds // 3600}h. "
+                        f"Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
+                        config.github.token,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to post stale-check comment on PR #%d: %s",
                         pr_state.number,
                         e,
                         exc_info=True,
