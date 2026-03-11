@@ -239,6 +239,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     stale_pending_timeout_seconds = _safe_int(
         raw.get("stale_pending_timeout_seconds", 7200), "stale_pending_timeout_seconds"
     )
+    if stale_pending_timeout_seconds <= 0:
+        raise ValueError(
+            f"Config field 'stale_pending_timeout_seconds' must be a positive integer, "
+            f"got {stale_pending_timeout_seconds!r}."
+        )
 
     config = OrchestratorConfig(
         redis=redis_config,

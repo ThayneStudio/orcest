@@ -413,7 +413,7 @@ def _poll_cycle(
                     len(run_ids),
                     run_ids,
                 )
-                any_rerun_succeeded = False
+                any_cancel_succeeded = False
                 for run_id in run_ids:
                     try:
                         gh.cancel_workflow(
@@ -421,57 +421,60 @@ def _poll_cycle(
                             run_id,
                             config.github.token,
                         )
+                        any_cancel_succeeded = True
                         logger.info(
-                            "PR #%d: cancelled stale workflow run %d before rerun",
+                            "PR #%d: cancelled stale workflow run %d",
                             pr_state.number,
                             run_id,
                         )
                     except Exception as e:
                         logger.warning(
-                            "Failed to cancel stale run %d for PR #%d (may already be "
-                            "completed): %s",
+                            "Failed to cancel stale run %d for PR #%d: %s",
                             run_id,
                             pr_state.number,
                             e,
                         )
+                    # Best-effort immediate rerun; gh run rerun requires the
+                    # run to be in a completed state, so this will usually fail
+                    # while the cancel is still propagating.  If it does fail,
+                    # the cancelled run will appear as a CI failure on the next
+                    # poll cycle and be handled by the normal fix flow.
                     try:
                         gh.rerun_workflow(
                             config.github.repo,
                             run_id,
                             config.github.token,
                         )
-                        any_rerun_succeeded = True
                         logger.info(
                             "PR #%d: re-triggered stale workflow run %d",
                             pr_state.number,
                             run_id,
                         )
                     except Exception as e:
-                        logger.warning(
-                            "Failed to re-trigger stale run %d for PR #%d "
-                            "(cancel may still be in progress): %s",
+                        logger.debug(
+                            "Could not immediately re-trigger run %d for PR #%d "
+                            "(cancel may still be propagating): %s",
                             run_id,
                             pr_state.number,
                             e,
                         )
-                # Always set cooldown after attempting, regardless of rerun
-                # success — prevents a busy retry loop when reruns fail due
-                # to the cancel→rerun async race.
+                # Always set cooldown after attempting — prevents a busy retry
+                # loop if the run can't be cancelled or immediately rerun.
                 set_stale_retrigger_sha(
                     redis,
                     pr_state.number,
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
                 )
-                if any_rerun_succeeded:
+                if any_cancel_succeeded:
                     try:
                         gh.post_comment(
                             config.github.repo,
                             pr_state.number,
                             f"**orcest** detected CI checks stuck in pending state for"
                             f" more than {config.stale_pending_timeout_seconds // 3600}h."
-                            f" Cancelling and re-triggering {len(run_ids)} workflow"
-                            f" run(s) to self-heal.",
+                            f" Cancelled {len(run_ids)} workflow run(s) to self-heal."
+                            f" CI will restart once the cancellation propagates.",
                             config.github.token,
                         )
                     except Exception as e:
