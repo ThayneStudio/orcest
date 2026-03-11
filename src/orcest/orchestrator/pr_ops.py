@@ -274,7 +274,6 @@ def get_transient_attempt_count(redis: RedisClient, pr_number: int, head_sha: st
         return 0
     stored_sha = data.get("head_sha", "")
     if stored_sha != head_sha:
-        redis.client.delete(key)
         return 0
     try:
         return int(data.get("count", 0))
@@ -289,6 +288,11 @@ def increment_transient_attempts(redis: RedisClient, pr_number: int, head_sha: s
     Sets a 7-day TTL on the key so closed/merged PR counters don't leak.
     """
     key = _make_transient_attempts_key(pr_number)
+    # The hget + conditional delete are intentionally outside the pipeline/transaction:
+    # the orchestrator is a single instance, so there is no concurrent writer that
+    # could race between this delete and the pipeline execute below.  Moving the
+    # delete inside the pipeline would require a Lua script to make the
+    # read-then-conditional-delete atomic; that complexity isn't warranted here.
     stored_sha = redis.client.hget(key, "head_sha")
     if stored_sha is not None and stored_sha != head_sha:
         redis.client.delete(key)
