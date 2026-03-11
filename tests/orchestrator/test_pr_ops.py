@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     set_exhausted_notified,
     set_review_retrigger_sha,
+    set_usage_exhausted_cooldown,
 )
 from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 
@@ -1059,6 +1060,51 @@ def test_no_skip_queued_without_pending_marker(gh_mock, fake_redis_client, label
     gh_mock.get_ci_status.assert_called_once()
 
 
+def test_skip_usage_cooldown_when_active(gh_mock, fake_redis_client, label_config):
+    """A PR with an active USAGE_EXHAUSTED cooldown is classified as SKIP_USAGE_COOLDOWN."""
+    pr_number = 602
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    # Set a cooldown marker (short TTL is fine for tests)
+    set_usage_exhausted_cooldown(fake_redis_client, pr_number, ttl_seconds=300)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_USAGE_COOLDOWN
+    # CI should not be fetched during cooldown
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_no_skip_usage_cooldown_when_not_set(gh_mock, fake_redis_client, label_config):
+    """A PR with no active cooldown proceeds normally (equivalent to an expired cooldown)."""
+    pr_number = 603
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure"},
+    ]
+
+    # No cooldown set — PR should proceed to CI evaluation
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    gh_mock.get_ci_status.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Total attempt counter (circuit breaker) tests
 # ---------------------------------------------------------------------------
@@ -1164,18 +1210,16 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
     assert get_total_attempt_count(fake_redis_client, pr_number) == 10
 
 
-def test_total_attempts_reset_when_label_removed(gh_mock, fake_redis_client, label_config):
-    """When exhausted_notified flag IS set and total_attempts >= limit, counter is reset.
+def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
+    """When exhausted_notified flag IS set and total_attempts >= limit, PR is still skipped.
 
-    This is the label-removal recovery path: the human removed the needs-human label,
-    so we reset the counter and let the PR proceed normally.
+    The label-removal recovery path was removed in PR #330. The
+    exhausted_notified flag no longer triggers a counter reset — SKIP_MAX_TOTAL_ATTEMPTS
+    is returned unconditionally when the circuit breaker is tripped.
     """
     pr_number = 750
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
-    ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
     ]
     for _ in range(10):
         increment_total_attempts(fake_redis_client, pr_number)
@@ -1191,11 +1235,10 @@ def test_total_attempts_reset_when_label_removed(gh_mock, fake_redis_client, lab
     )
 
     assert len(results) == 1
-    # PR should proceed normally (not skipped) after reset
-    assert results[0].action == PRAction.ENQUEUE_FIX
-    # Counter and flag were both cleared
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    # Counter and flag are NOT cleared — no label-removal recovery path
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
+    assert get_exhausted_notified(fake_redis_client, pr_number)
 
 
 def test_exhausted_notified_helpers(fake_redis_client):

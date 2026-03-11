@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
+    set_usage_exhausted_cooldown,
 )
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
@@ -599,6 +600,8 @@ def _poll_cycle(
             logger.debug(f"PR #{pr_state.number}: terminal label, skipping")
         elif pr_state.action == PRAction.SKIP_NO_CHECKS:
             logger.debug(f"PR #{pr_state.number}: no CI checks, skipping")
+        elif pr_state.action == PRAction.SKIP_USAGE_COOLDOWN:
+            logger.debug("PR #%d: usage-exhausted cooldown active, skipping", pr_state.number)
         else:
             logger.warning(
                 "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action
@@ -873,10 +876,34 @@ def _handle_result(
                     f"Failed to remove ready label from issue #{resource_id}: {e}",
                     exc_info=True,
                 )
+    elif result.status == ResultStatus.USAGE_EXHAUSTED and not is_issue:
+        # Clear the per-SHA attempt counter so the PR can be re-enqueued once
+        # the cooldown expires. The total-attempts counter is intentionally
+        # preserved as a circuit-breaker across rate-limit cycles.
+        attempts_cleared = False
+        try:
+            clear_attempts(redis, resource_id)
+            attempts_cleared = True
+        except Exception as e:
+            logger.error(
+                f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
+                f"after USAGE_EXHAUSTED: {e}",
+                exc_info=True,
+            )
+        # Only set the cooldown when the attempt counter was actually cleared;
+        # otherwise the PR will re-stall after the cooldown expires.
+        if attempts_cleared:
+            try:
+                set_usage_exhausted_cooldown(redis, resource_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
+                    exc_info=True,
+                )
 
     # Manage labels based on result status.
     # Only terminal statuses (FAILED, BLOCKED) add labels.
-    # USAGE_EXHAUSTED does nothing — task stays parked via attempt counter.
+    # USAGE_EXHAUSTED adds no labels — the PR will resume via the cooldown mechanism.
     labeled = False
     if result.status == ResultStatus.FAILED:
         try:

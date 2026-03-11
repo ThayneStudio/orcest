@@ -17,8 +17,11 @@ from orcest.orchestrator.loop import (
 from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
+    get_attempt_count,
     get_exhausted_notified,
     get_total_attempt_count,
+    has_usage_exhausted_cooldown,
+    increment_attempts,
     increment_total_attempts,
 )
 from orcest.shared.models import ResultStatus, TaskResult
@@ -399,12 +402,19 @@ def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock)
 
 
 def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config, gh_mock):
-    """A USAGE_EXHAUSTED result posts a comment but changes no labels."""
+    """A USAGE_EXHAUSTED result posts a comment, clears per-SHA attempts, and sets cooldown."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 60
+    head_sha = "deadbeef"
+
+    # Simulate a prior attempt so the counter is non-zero
+    increment_attempts(fake_redis_client, pr_number, head_sha)
+    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 1
 
     result = _make_task_result(
         status=ResultStatus.USAGE_EXHAUSTED,
-        pr_number=60,
+        pr_number=pr_number,
         branch="fix/widget",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
@@ -421,6 +431,12 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     # No label operations for USAGE_EXHAUSTED
     gh_mock.remove_label.assert_not_called()
     gh_mock.add_label.assert_not_called()
+
+    # Per-SHA attempt counter must be cleared so PR can be re-enqueued after cooldown
+    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 0
+
+    # Cooldown marker must be set
+    assert has_usage_exhausted_cooldown(fake_redis_client, pr_number)
 
 
 def test_consume_results_usage_exhausted_no_branch(
