@@ -413,7 +413,7 @@ def _poll_cycle(
                     len(run_ids),
                     run_ids,
                 )
-                any_succeeded = False
+                any_rerun_succeeded = False
                 for run_id in run_ids:
                     try:
                         gh.cancel_workflow(
@@ -421,7 +421,6 @@ def _poll_cycle(
                             run_id,
                             config.github.token,
                         )
-                        any_succeeded = True
                         logger.info(
                             "PR #%d: cancelled stale workflow run %d before rerun",
                             pr_state.number,
@@ -441,6 +440,7 @@ def _poll_cycle(
                             run_id,
                             config.github.token,
                         )
+                        any_rerun_succeeded = True
                         logger.info(
                             "PR #%d: re-triggered stale workflow run %d",
                             pr_state.number,
@@ -463,7 +463,7 @@ def _poll_cycle(
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
                 )
-                if any_succeeded:
+                if any_rerun_succeeded:
                     try:
                         gh.post_comment(
                             config.github.repo,
