@@ -91,7 +91,7 @@ def _run_command(command: str, label: str, pr_number: int, logger: logging.Logge
         raise DeploymentError(f"{label} command timed out after {_DEPLOY_TIMEOUT_SECONDS}s")
 
     if result.returncode != 0:
-        stderr_excerpt = result.stderr.strip()[:300]
+        stderr_excerpt = (result.stderr.strip() or result.stdout.strip())[:300]
         raise DeploymentError(
             f"{label} command failed (exit {result.returncode}): {stderr_excerpt}"
         )
@@ -105,17 +105,19 @@ def _wait_for_healthy(url: str, timeout_seconds: int, logger: logging.Logger) ->
     deadline = time.monotonic() + timeout_seconds
     poll_interval = 2  # seconds between attempts
 
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            with urlopen(url, timeout=5) as resp:  # noqa: S310
+            with urlopen(url, timeout=min(5, remaining)) as resp:  # noqa: S310
                 if 200 <= resp.status < 300:
                     return True
         except (URLError, OSError):
             pass
 
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(poll_interval, remaining))
+        if remaining > 0:
+            time.sleep(min(poll_interval, remaining))
 
     return False
