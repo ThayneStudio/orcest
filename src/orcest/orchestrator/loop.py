@@ -231,9 +231,7 @@ def _poll_cycle(
                         logger.info("PR #%d: deployment succeeded", pr_state.number)
                     except DeploymentError as deploy_err:
                         err_msg = str(deploy_err)
-                        logger.error(
-                            "PR #%d: deployment failed: %s", pr_state.number, err_msg
-                        )
+                        logger.error("PR #%d: deployment failed: %s", pr_state.number, err_msg)
                         try:
                             gh.create_issue(
                                 config.github.repo,

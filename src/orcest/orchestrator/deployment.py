@@ -86,9 +86,7 @@ def _run_command(command: str, label: str, pr_number: int, logger: logging.Logge
             timeout=_DEPLOY_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        raise DeploymentError(
-            f"{label} command timed out after {_DEPLOY_TIMEOUT_SECONDS}s"
-        )
+        raise DeploymentError(f"{label} command timed out after {_DEPLOY_TIMEOUT_SECONDS}s")
 
     if result.returncode != 0:
         stderr_excerpt = result.stderr.strip()[:300]

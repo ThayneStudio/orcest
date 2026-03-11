@@ -221,9 +221,7 @@ def test_poll_cycle_runs_deployment_after_merge(
 
     _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    mock_deploy.assert_called_once_with(
-        orchestrator_config.deployment, 200, mocker.ANY
-    )
+    mock_deploy.assert_called_once_with(orchestrator_config.deployment, 200, mocker.ANY)
 
 
 def test_poll_cycle_deployment_failure_creates_issue(
