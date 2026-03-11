@@ -226,8 +226,7 @@ def _poll_cycle(
                     )
                 # Run deployment if configured (run_deployment is a no-op when disabled)
                 try:
-                    run_deployment(config.deployment, pr_state.number, logger)
-                    if config.deployment.enabled and config.deployment.command:
+                    if run_deployment(config.deployment, pr_state.number, logger):
                         logger.info("PR #%d: deployment succeeded", pr_state.number)
                 except DeploymentError as deploy_err:
                     err_msg = str(deploy_err)

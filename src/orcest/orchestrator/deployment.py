@@ -24,24 +24,28 @@ def run_deployment(
     config: DeploymentConfig,
     pr_number: int,
     logger: logging.Logger,
-) -> None:
+) -> bool:
     """Run the deployment command, health check, and rollback if needed.
 
-    Does nothing when deployment is disabled or no command is configured.
+    Does nothing when deployment is disabled or no command is configured,
+    returning False in that case.
+
+    Returns:
+        True if deployment actually ran, False if it was a no-op.
 
     Raises:
         DeploymentError: If the deploy command fails or health check does not
             pass within the configured timeout (rollback is attempted first).
     """
     if not config.enabled or not config.command:
-        return
+        return False
 
     logger.info("PR #%d: running deployment: %s", pr_number, config.command)
     _run_command(config.command, "deployment", pr_number, logger)
     logger.info("PR #%d: deployment command succeeded", pr_number)
 
     if not config.health_check_url:
-        return
+        return True
 
     logger.info(
         "PR #%d: health check %s (timeout: %ds)",
@@ -52,7 +56,7 @@ def run_deployment(
     healthy = _wait_for_healthy(config.health_check_url, config.health_check_timeout, logger)
     if healthy:
         logger.info("PR #%d: health check passed", pr_number)
-        return
+        return True
 
     logger.error(
         "PR #%d: health check failed after %ds — %s",
@@ -116,8 +120,6 @@ def _wait_for_healthy(url: str, timeout_seconds: int, logger: logging.Logger) ->
         except (URLError, OSError):
             pass
 
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(poll_interval, remaining))
+        time.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
     return False
