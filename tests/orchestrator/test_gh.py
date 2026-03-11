@@ -17,6 +17,7 @@ from orcest.orchestrator.gh import (
     GhCliError,
     GhNotInstalledError,
     add_label,
+    create_issue,
     get_ci_status,
     get_failed_run_logs,
     get_pr,
@@ -1143,3 +1144,48 @@ def test_run_gh_timeout_raises_gh_cli_error(mocker):
     )
     with pytest.raises(GhCliError, match="timed out"):
         list_open_prs(REPO, TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# create_issue
+# ---------------------------------------------------------------------------
+
+
+def test_create_issue_returns_issue_number(mocker):
+    """create_issue parses the issue number from the URL returned by gh."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="https://github.com/acme/widgets/issues/42\n",
+    )
+    result = create_issue(REPO, "Test title", "Test body", TOKEN)
+    assert result == 42
+
+
+def test_create_issue_url_with_trailing_slash(mocker):
+    """create_issue handles a URL with a trailing slash."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="https://github.com/acme/widgets/issues/99/\n",
+    )
+    result = create_issue(REPO, "Test title", "Test body", TOKEN)
+    assert result == 99
+
+
+def test_create_issue_empty_output_raises(mocker):
+    """create_issue raises GhCliError when gh output is empty."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="",
+    )
+    with pytest.raises(GhCliError, match="Could not parse issue number"):
+        create_issue(REPO, "Test title", "Test body", TOKEN)
+
+
+def test_create_issue_non_numeric_end_raises(mocker):
+    """create_issue raises GhCliError when gh output has no numeric issue number."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="Error: could not create issue",
+    )
+    with pytest.raises(GhCliError, match="Could not parse issue number"):
+        create_issue(REPO, "Test title", "Test body", TOKEN)
