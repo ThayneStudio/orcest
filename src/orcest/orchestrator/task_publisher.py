@@ -244,8 +244,9 @@ def publish_fix_task(
     # If every CI failure is transient, re-trigger the runs directly instead of
     # asking Claude to "fix" something that isn't a code problem.  A separate
     # transient counter (per SHA) tracks how many times we've done this so we
-    # don't spin forever: after _MAX_TRANSIENT_RETRIES we fall back to the
-    # normal fix-task path and let Claude investigate.
+    # don't spin forever: after _MAX_TRANSIENT_RETRIES (or immediately if no
+    # runs could be re-triggered) we fall back to the normal fix-task path and
+    # let Claude investigate.
     _log = logger or logging.getLogger(__name__)
     if failure_summaries and all(
         s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries

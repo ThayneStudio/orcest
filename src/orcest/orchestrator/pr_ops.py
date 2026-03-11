@@ -296,6 +296,9 @@ def increment_transient_attempts(redis: RedisClient, pr_number: int, head_sha: s
     stored_sha = redis.client.hget(key, "head_sha")
     if stored_sha is not None and stored_sha != head_sha:
         redis.client.delete(key)
+    # pipeline(transaction=True) maps to a Redis MULTI/EXEC block: all three
+    # commands execute atomically — either all succeed or none do.  There is no
+    # risk of the counter being incremented while head_sha is left stale.
     pipe = redis.client.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
     pipe.hset(key, "head_sha", head_sha)
