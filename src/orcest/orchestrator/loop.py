@@ -353,7 +353,14 @@ def _poll_cycle(
                     )
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
-            if not run_ids:
+            # Cooldown guard: skip if we already acted on this SHA
+            if get_stale_retrigger_sha(redis, pr_state.number) == pr_state.head_sha:
+                logger.debug(
+                    "PR #%d: stale checks already handled for SHA %s, skipping",
+                    pr_state.number,
+                    pr_state.head_sha,
+                )
+            elif not run_ids:
                 # Stale pending checks found but no re-triggerable run IDs
                 # (e.g. StatusContext checks). Escalate to needs-human.
                 logger.warning(
@@ -385,6 +392,12 @@ def _poll_cycle(
                         f"Please investigate the stuck checks manually.",
                         config.github.token,
                     )
+                    set_stale_retrigger_sha(
+                        redis,
+                        pr_state.number,
+                        pr_state.head_sha,
+                        ex=config.stale_pending_timeout_seconds,
+                    )
                 except Exception as e:
                     logger.error(
                         "Failed to comment on PR #%d about stale checks: %s",
@@ -393,66 +406,77 @@ def _poll_cycle(
                         exc_info=True,
                     )
             else:
-                # Cooldown guard: skip if we already re-triggered for this SHA
-                if get_stale_retrigger_sha(redis, pr_state.number) == pr_state.head_sha:
-                    logger.debug(
-                        "PR #%d: stale checks already re-triggered for SHA %s, skipping",
+                logger.warning(
+                    "PR #%d: stale pending check(s) (>%ds); re-triggering %d run(s) %s",
+                    pr_state.number,
+                    config.stale_pending_timeout_seconds,
+                    len(run_ids),
+                    run_ids,
+                )
+                any_succeeded = False
+                for run_id in run_ids:
+                    try:
+                        gh.cancel_workflow(
+                            config.github.repo,
+                            run_id,
+                            config.github.token,
+                        )
+                        logger.info(
+                            "PR #%d: cancelled stale workflow run %d before rerun",
+                            pr_state.number,
+                            run_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to cancel stale run %d for PR #%d (may already be "
+                            "completed): %s",
+                            run_id,
+                            pr_state.number,
+                            e,
+                        )
+                    try:
+                        gh.rerun_workflow(
+                            config.github.repo,
+                            run_id,
+                            config.github.token,
+                        )
+                        any_succeeded = True
+                        logger.info(
+                            "PR #%d: re-triggered stale workflow run %d",
+                            pr_state.number,
+                            run_id,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to re-trigger stale run %d for PR #%d: %s",
+                            run_id,
+                            pr_state.number,
+                            e,
+                            exc_info=True,
+                        )
+                if any_succeeded:
+                    set_stale_retrigger_sha(
+                        redis,
                         pr_state.number,
                         pr_state.head_sha,
+                        ex=config.stale_pending_timeout_seconds,
                     )
-                else:
-                    logger.warning(
-                        "PR #%d: stale pending check(s) (>%ds); re-triggering %d run(s) %s",
-                        pr_state.number,
-                        config.stale_pending_timeout_seconds,
-                        len(run_ids),
-                        run_ids,
-                    )
-                    any_succeeded = False
-                    for run_id in run_ids:
-                        try:
-                            gh.rerun_workflow(
-                                config.github.repo,
-                                run_id,
-                                config.github.token,
-                            )
-                            any_succeeded = True
-                            logger.info(
-                                "PR #%d: re-triggered stale workflow run %d",
-                                pr_state.number,
-                                run_id,
-                            )
-                        except Exception as e:
-                            logger.error(
-                                "Failed to re-trigger stale run %d for PR #%d: %s",
-                                run_id,
-                                pr_state.number,
-                                e,
-                                exc_info=True,
-                            )
-                    if any_succeeded:
-                        set_stale_retrigger_sha(
-                            redis,
+                    try:
+                        gh.post_comment(
+                            config.github.repo,
                             pr_state.number,
-                            pr_state.head_sha,
-                            ex=config.stale_pending_timeout_seconds,
+                            f"**orcest** detected CI checks stuck in pending state for"
+                            f" more than {config.stale_pending_timeout_seconds // 3600}h."
+                            f" Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
+                            config.github.token,
                         )
-                        try:
-                            gh.post_comment(
-                                config.github.repo,
-                                pr_state.number,
-                                f"**orcest** detected CI checks stuck in pending state for"
-                                f" more than {config.stale_pending_timeout_seconds // 3600}h."
-                                f" Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
-                                config.github.token,
-                            )
-                        except Exception as e:
-                            logger.error(
-                                "Failed to post stale-check comment on PR #%d: %s",
-                                pr_state.number,
-                                e,
-                                exc_info=True,
-                            )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to post stale-check comment on PR #%d: %s",
+                            pr_state.number,
+                            e,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:

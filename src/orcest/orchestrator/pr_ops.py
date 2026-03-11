@@ -230,9 +230,7 @@ def get_stale_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
     return val
 
 
-def set_stale_retrigger_sha(
-    redis: RedisClient, pr_number: int, head_sha: str, ex: int
-) -> None:
+def set_stale_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str, ex: int) -> None:
     """Record that we re-triggered stale checks for this SHA. Expires after ``ex`` seconds."""
     redis.client.set(_make_stale_retrigger_key(pr_number), head_sha, ex=ex)
 
