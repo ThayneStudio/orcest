@@ -232,9 +232,7 @@ def _parse_iso_timestamp(ts: str | None) -> datetime | None:
         return None
 
 
-def _check_stale_pending(
-    ci_pending: list[dict], timeout_seconds: int
-) -> tuple[bool, list[int]]:
+def _check_stale_pending(ci_pending: list[dict], timeout_seconds: int) -> tuple[bool, list[int]]:
     """Determine whether all pending checks have exceeded the staleness timeout.
 
     Returns ``(all_stale, run_ids)`` where:
