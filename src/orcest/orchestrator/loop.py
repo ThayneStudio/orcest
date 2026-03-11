@@ -374,7 +374,6 @@ def _poll_cycle(
                     config.github.token,
                 )
                 labeled = True
-                set_exhausted_notified(redis, pr_state.number)
             except Exception as e:
                 logger.error(
                     "Failed to label PR #%d as needs-human: %s",
@@ -382,6 +381,16 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+            if labeled:
+                try:
+                    set_exhausted_notified(redis, pr_state.number)
+                except Exception as e:
+                    logger.error(
+                        "Failed to set exhausted_notified flag for PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
             try:
                 label_note = (
                     f"Labeling as `{config.labels.needs_human}` for manual review."
