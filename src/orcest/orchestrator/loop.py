@@ -392,12 +392,6 @@ def _poll_cycle(
                         f"Please investigate the stuck checks manually.",
                         config.github.token,
                     )
-                    set_stale_retrigger_sha(
-                        redis,
-                        pr_state.number,
-                        pr_state.head_sha,
-                        ex=config.stale_pending_timeout_seconds,
-                    )
                 except Exception as e:
                     logger.error(
                         "Failed to comment on PR #%d about stale checks: %s",
@@ -405,6 +399,12 @@ def _poll_cycle(
                         e,
                         exc_info=True,
                     )
+                set_stale_retrigger_sha(
+                    redis,
+                    pr_state.number,
+                    pr_state.head_sha,
+                    ex=config.stale_pending_timeout_seconds,
+                )
             else:
                 logger.warning(
                     "PR #%d: stale pending check(s) (>%ds); re-triggering %d run(s) %s",
