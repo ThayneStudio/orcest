@@ -111,6 +111,9 @@ def _wait_for_healthy(url: str, timeout_seconds: int, logger: logging.Logger) ->
 
     Returns True if healthy, False if the timeout was reached.
     """
+    if timeout_seconds <= 0:
+        logger.error("health_check_timeout must be > 0, got %d", timeout_seconds)
+        return False
     deadline = time.monotonic() + timeout_seconds
     poll_interval = 2  # seconds between attempts
 
