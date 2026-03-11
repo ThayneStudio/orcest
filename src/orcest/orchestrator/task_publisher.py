@@ -196,6 +196,11 @@ def publish_fix_task(
     3. Render prompt
     4. Publish to Redis stream
     5. Post comment on PR
+
+    Returns:
+        The published Task, or None if all CI failures were classified as
+        transient and CI was re-triggered directly (no Claude task enqueued,
+        main attempt budget not consumed).
     """
     # Gather context
     diff = gh.get_pr_diff(repo, pr_state.number, token)
