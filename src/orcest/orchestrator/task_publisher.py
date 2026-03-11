@@ -267,6 +267,13 @@ def publish_fix_task(
                             run_id,
                             exc_info=True,
                         )
+            if not retriggered:
+                _log.warning(
+                    "PR #%d: transient path triggered but no runs were re-triggered (retry %d/%d)",
+                    pr_state.number,
+                    transient_count,
+                    _MAX_TRANSIENT_RETRIES,
+                )
             # No Claude task needed — return without consuming the main attempt budget.
             return None
         else:
