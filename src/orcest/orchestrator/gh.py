@@ -204,23 +204,24 @@ def cancel_workflow(repo: str, run_id: int, token: str) -> None:
     )
 
 
-def rerun_workflow(repo: str, run_id: int, token: str) -> None:
+def rerun_workflow(repo: str, run_id: int, token: str, failed_only: bool = False) -> None:
     """Re-run a GitHub Actions workflow run.
 
     Used to re-trigger claude-review when it completed without submitting
-    a formal review.
+    a formal review, and to re-trigger transient CI failures.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        run_id: The workflow run ID to re-run.
+        token: GitHub token.
+        failed_only: If True, only re-run failed jobs (``--failed`` flag).
+            Defaults to False (re-runs all jobs).
     """
     _validate_repo(repo)
-    _run_gh(
-        [
-            "run",
-            "rerun",
-            str(run_id),
-            "--repo",
-            repo,
-        ],
-        token,
-    )
+    args = ["run", "rerun", str(run_id), "--repo", repo]
+    if failed_only:
+        args.append("--failed")
+    _run_gh(args, token)
 
 
 def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
