@@ -291,10 +291,10 @@ def test_prompt_truncates_long_ci_logs(
     gh_mock,
     fake_redis_client,
 ):
-    """CI logs longer than 5000 chars are truncated to the last 5000."""
+    """CI logs longer than 20,000 chars are truncated to the last 20,000."""
     _setup_gh_defaults(gh_mock)
     # Create a log that's well over the per-check limit
-    long_log = "x" * 3000 + "REAL_ERROR_AT_END" + "y" * 3000
+    long_log = "x" * 12000 + "REAL_ERROR_AT_END" + "y" * 12000
     gh_mock.get_failed_run_logs.return_value = long_log
 
     ci_failures = _make_ci_failures_with_urls(run_ids=[88888], names=["tests"])
@@ -308,13 +308,51 @@ def test_prompt_truncates_long_ci_logs(
         default_runner="claude",
     )
 
-    # The full log (6017 chars) should NOT appear verbatim
+    # The full log (24,017 chars) should NOT appear verbatim
     assert long_log not in task.prompt
     # The end of the log (where errors are) should be present
     assert "REAL_ERROR_AT_END" in task.prompt
     assert "y" * 3000 in task.prompt
     # Truncation indicator should appear
     assert "truncated" in task.prompt
+
+
+def test_prompt_early_error_path_captures_marker_before_tail(
+    gh_mock,
+    fake_redis_client,
+):
+    """Error markers before the tail window are included via the early-error path.
+
+    With the error at position 0 and a total log of 25,009 chars, the plain
+    tail slice (last 20,000 chars) starts at position 5,009 and would miss
+    the "FAILURES" marker entirely.  The early-error branch must capture it.
+    """
+    _setup_gh_defaults(gh_mock)
+    # "FAILURES\n" at position 0 (word boundary after S), followed by filler,
+    # then more filler to push the total length well past the 20,000 per-check
+    # limit.  Matches the \bFAILURES\b pattern used in _LOG_ERROR_RE.
+    long_log = "FAILURES\n" + "x" * 5000 + "y" * 20000  # 25,009 chars total
+    gh_mock.get_failed_run_logs.return_value = long_log
+
+    ci_failures = _make_ci_failures_with_urls(run_ids=[88889], names=["tests"])
+    pr_state = _make_pr_state(number=55, ci_failures=ci_failures)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # The early error marker must appear even though it sits before the tail window
+    assert "FAILURES" in task.prompt
+    # The mid-log separator signals that the early-error branch was taken
+    assert "middle of log omitted" in task.prompt
+    # The tail portion should also be present
+    assert "y" * 1000 in task.prompt
+    # The full log should not appear verbatim (it was truncated)
+    assert long_log not in task.prompt
 
 
 # --- Review thread prompt tests ---
@@ -720,23 +758,23 @@ def test_publish_fix_task_log_budget_exhaustion(
     gh_mock,
     fake_redis_client,
 ):
-    """Multiple CI checks that collectively exhaust the 15k total budget.
+    """Multiple CI checks that collectively exhaust the 50k total budget.
     The last check should get truncated or empty log in the prompt.
 
-    Logs are intentionally larger than _PER_CHECK_LOG_LIMIT (5000) so that
+    Logs are intentionally larger than _PER_CHECK_LOG_LIMIT (20000) so that
     the truncation-indicator path is exercised and the budget accounting
     (which subtracts the *capped* length, not the indicator-inflated
     excerpt length) is validated.
     """
     _setup_gh_defaults(gh_mock)
-    # Each check has 6000 chars of logs (> 5000 per-check limit).
-    # Per-check cap is 5000, so each consumes 5000 of the 15000 budget.
-    # With 4 checks that is 20k capped total but only 15k budget, so the
-    # 4th check should have no log excerpt.
-    log_a = "A" * 6000
-    log_b = "B" * 6000
-    log_c = "C" * 6000
-    log_d = "D" * 6000
+    # Each check has 22000 chars of logs (> 20000 per-check limit).
+    # Per-check cap is 20000, so A and B each consume 20000 of the 50000 budget.
+    # C gets the remaining 10000 (min of 20000 and 10000).
+    # With budget exhausted, the 4th check should have no log excerpt.
+    log_a = "A" * 22000
+    log_b = "B" * 22000
+    log_c = "C" * 22000
+    log_d = "D" * 22000
 
     # Each check has its own unique run_id
     ci_failures = _make_ci_failures_with_urls(
@@ -759,7 +797,7 @@ def test_publish_fix_task_log_budget_exhaustion(
         default_runner="claude",
     )
 
-    # First three checks consume the full 15k budget (5k each, capped from 6k)
+    # First three checks consume the full 50k budget (A:20k, B:20k, C:10k, capped from 22k)
     assert "A" * 100 in task.prompt  # check-a log present
     assert "B" * 100 in task.prompt  # check-b log present
     assert "C" * 100 in task.prompt  # check-c log present
