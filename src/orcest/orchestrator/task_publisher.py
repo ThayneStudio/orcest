@@ -112,7 +112,10 @@ def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
 
 
 # Max number of transient-CI re-triggers before falling back to a Claude fix task.
-# Transient retries do not consume the main per-SHA attempt budget.
+# Transient retries do not consume the main per-SHA attempt budget when CI is
+# successfully re-triggered.  If re-triggering fails entirely (no runs could be
+# re-triggered), the code falls through to the Claude fix path and does consume
+# the main budget for that cycle.
 _MAX_TRANSIENT_RETRIES = 3
 
 
@@ -244,9 +247,10 @@ def publish_fix_task(
     # If every CI failure is transient, re-trigger the runs directly instead of
     # asking Claude to "fix" something that isn't a code problem.  A separate
     # transient counter (per SHA) tracks how many times we've done this so we
-    # don't spin forever: after _MAX_TRANSIENT_RETRIES (or immediately if no
-    # runs could be re-triggered) we fall back to the normal fix-task path and
-    # let Claude investigate.
+    # don't spin forever: after _MAX_TRANSIENT_RETRIES we fall back to the
+    # normal fix-task path.  If no runs could be re-triggered (all rerun calls
+    # raised), we fall through to Claude immediately — both a transient slot and
+    # a main-attempt slot are consumed for that cycle.
     _log = logger or logging.getLogger(__name__)
     if failure_summaries and all(
         s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
