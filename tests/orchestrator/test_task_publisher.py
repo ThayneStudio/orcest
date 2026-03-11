@@ -323,14 +323,15 @@ def test_prompt_early_error_path_captures_marker_before_tail(
 ):
     """Error markers before the tail window are included via the early-error path.
 
-    With the error at position 0 and a total log of 25,008 chars, the plain
-    tail slice (last 20,000 chars) starts at position 5,008 and would miss
+    With the error at position 0 and a total log of 25,009 chars, the plain
+    tail slice (last 20,000 chars) starts at position 5,009 and would miss
     the "FAILURES" marker entirely.  The early-error branch must capture it.
     """
     _setup_gh_defaults(gh_mock)
-    # "FAILURES" at position 0, followed by filler, then more filler to push
-    # the total length well past the 20,000 per-check limit.
-    long_log = "FAILURES" + "x" * 5000 + "y" * 20000  # 25,008 chars total
+    # "FAILURES\n" at position 0 (word boundary after S), followed by filler,
+    # then more filler to push the total length well past the 20,000 per-check
+    # limit.  Matches the \bFAILURES\b pattern used in _LOG_ERROR_RE.
+    long_log = "FAILURES\n" + "x" * 5000 + "y" * 20000  # 25,009 chars total
     gh_mock.get_failed_run_logs.return_value = long_log
 
     ci_failures = _make_ci_failures_with_urls(run_ids=[88889], names=["tests"])

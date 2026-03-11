@@ -67,7 +67,7 @@ _LOG_ERROR_RE = re.compile(
     r"|^FAIL[:\s]"
     r"|AssertionError"
     r"|Tests run:.*Failures:"
-    r"|FAILURES)",
+    r"|\bFAILURES\b)",
     re.MULTILINE,
 )
 
