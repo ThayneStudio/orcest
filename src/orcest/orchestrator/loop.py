@@ -20,8 +20,10 @@ from orcest.orchestrator.pr_ops import (
     clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
+    get_stale_retrigger_sha,
     set_exhausted_notified,
     set_review_retrigger_sha,
+    set_stale_retrigger_sha,
 )
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
@@ -103,6 +105,7 @@ def _poll_cycle(
         label_config=config.labels,
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
+        stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
     )
 
     # Step 3: Act on PRs
@@ -348,6 +351,141 @@ def _poll_cycle(
                         e,
                         exc_info=True,
                     )
+        elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
+            run_ids = pr_state.stale_run_ids
+            # Cooldown guard: skip if we already acted on this SHA
+            if get_stale_retrigger_sha(redis, pr_state.number) == pr_state.head_sha:
+                logger.debug(
+                    "PR #%d: stale checks already handled for SHA %s, skipping",
+                    pr_state.number,
+                    pr_state.head_sha,
+                )
+            elif not run_ids:
+                # Stale pending checks found but no re-triggerable run IDs
+                # (e.g. StatusContext checks). Escalate to needs-human.
+                logger.warning(
+                    "PR #%d: stale pending checks with no re-triggerable run IDs; "
+                    "adding needs-human label",
+                    pr_state.number,
+                )
+                try:
+                    gh.add_label(
+                        config.github.repo,
+                        pr_state.number,
+                        config.labels.needs_human,
+                        config.github.token,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to add needs-human label to PR #%d: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
+                try:
+                    gh.post_comment(
+                        config.github.repo,
+                        pr_state.number,
+                        f"**orcest** detected stale CI checks that have been pending for "
+                        f"more than {config.stale_pending_timeout_seconds // 60}m but "
+                        f"could not re-trigger them automatically. "
+                        f"Please investigate the stuck checks manually.",
+                        config.github.token,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to comment on PR #%d about stale checks: %s",
+                        pr_state.number,
+                        e,
+                        exc_info=True,
+                    )
+                set_stale_retrigger_sha(
+                    redis,
+                    pr_state.number,
+                    pr_state.head_sha,
+                    ex=config.stale_pending_timeout_seconds,
+                )
+            else:
+                logger.warning(
+                    "PR #%d: stale pending check(s) (>%ds); re-triggering %d run(s) %s",
+                    pr_state.number,
+                    config.stale_pending_timeout_seconds,
+                    len(run_ids),
+                    run_ids,
+                )
+                any_cancel_succeeded = False
+                cancelled_count = 0
+                for run_id in run_ids:
+                    try:
+                        gh.cancel_workflow(
+                            config.github.repo,
+                            run_id,
+                            config.github.token,
+                        )
+                        any_cancel_succeeded = True
+                        cancelled_count += 1
+                        logger.info(
+                            "PR #%d: cancelled stale workflow run %d",
+                            pr_state.number,
+                            run_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to cancel stale run %d for PR #%d: %s",
+                            run_id,
+                            pr_state.number,
+                            e,
+                        )
+                    # Best-effort immediate rerun; gh run rerun requires the
+                    # run to be in a completed state, so this will usually fail
+                    # while the cancel is still propagating.  If it does fail,
+                    # the cancelled run will appear as a CI failure on the next
+                    # poll cycle and be handled by the normal fix flow.
+                    try:
+                        gh.rerun_workflow(
+                            config.github.repo,
+                            run_id,
+                            config.github.token,
+                        )
+                        logger.info(
+                            "PR #%d: re-triggered stale workflow run %d",
+                            pr_state.number,
+                            run_id,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Could not immediately re-trigger run %d for PR #%d "
+                            "(cancel may still be propagating): %s",
+                            run_id,
+                            pr_state.number,
+                            e,
+                        )
+                # Always set cooldown after attempting — prevents a busy retry
+                # loop if the run can't be cancelled or immediately rerun.
+                set_stale_retrigger_sha(
+                    redis,
+                    pr_state.number,
+                    pr_state.head_sha,
+                    ex=config.stale_pending_timeout_seconds,
+                )
+                if any_cancel_succeeded:
+                    try:
+                        gh.post_comment(
+                            config.github.repo,
+                            pr_state.number,
+                            f"**orcest** detected CI checks stuck in pending state for"
+                            f" more than {config.stale_pending_timeout_seconds // 60}m."
+                            f" Cancelled {cancelled_count} of {len(run_ids)} run(s) to self-heal."
+                            f" CI will restart once the cancellation propagates.",
+                            config.github.token,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to post stale-check comment on PR #%d: %s",
+                            pr_state.number,
+                            e,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:

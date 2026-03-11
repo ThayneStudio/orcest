@@ -5,8 +5,11 @@ Each test uses the gh_mock fixture (all gh.* functions mocked) and
 fake_redis_client (fakeredis-backed RedisClient).
 """
 
+from datetime import datetime, timedelta, timezone
+
 from orcest.orchestrator.pr_ops import (
     PRAction,
+    _check_stale_pending,
     _get_claude_review_run_id,
     clear_attempts,
     clear_exhausted_notified,
@@ -1465,3 +1468,260 @@ def test_review_retrigger_sha_has_ttl(fake_redis_client):
     ttl = fake_redis_client.client.ttl(key)
     expected_ttl = 7 * 24 * 3600
     assert 0 < ttl <= expected_ttl
+
+
+# ---------------------------------------------------------------------------
+# _check_stale_pending unit tests
+# ---------------------------------------------------------------------------
+
+
+def _stale_ts(hours_ago: float = 3.0) -> str:
+    """Return an ISO 8601 timestamp that is `hours_ago` hours in the past."""
+    ts = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return ts.isoformat()
+
+
+def _fresh_ts(minutes_ago: float = 30.0) -> str:
+    """Return an ISO 8601 timestamp that is `minutes_ago` minutes in the past."""
+    ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return ts.isoformat()
+
+
+def test_check_stale_pending_all_stale_with_run_ids():
+    """All pending checks are stale and have detailsUrl — returns (True, [run_ids])."""
+    checks = [
+        {
+            "name": "build",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/11111/job/1",
+        },
+        {
+            "name": "test",
+            "startedAt": _stale_ts(4),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/22222/job/2",
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is True
+    assert sorted(run_ids) == [11111, 22222]
+
+
+def test_check_stale_pending_one_check_fresh():
+    """One fresh check prevents re-triggering — returns (False, [])."""
+    checks = [
+        {
+            "name": "build",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/11111/job/1",
+        },
+        {
+            "name": "deploy",
+            "startedAt": _fresh_ts(30),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/33333/job/3",
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is False
+    assert run_ids == []
+
+
+def test_check_stale_pending_no_timestamp_is_conservative():
+    """A check without a timestamp is treated as non-stale — returns (False, [])."""
+    checks = [
+        {
+            "name": "build",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/11111/job/1",
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is False
+    assert run_ids == []
+
+
+def test_check_stale_pending_stale_but_no_run_id():
+    """Stale checks with no extractable run ID return (True, [])."""
+    checks = [
+        {
+            "name": "ci/external",
+            "state": "PENDING",
+            "createdAt": _stale_ts(3),
+            # No detailsUrl — StatusContext check
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is True
+    assert run_ids == []
+
+
+def test_check_stale_pending_deduplicates_run_ids():
+    """Multiple jobs from the same workflow run produce a single run ID."""
+    checks = [
+        {
+            "name": "job-1",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/1",
+        },
+        {
+            "name": "job-2",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/2",
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is True
+    assert run_ids == [99999]
+
+
+def test_check_stale_pending_uses_created_at_for_status_context():
+    """StatusContext checks use createdAt as their age timestamp."""
+    checks = [
+        {
+            "name": "ci/external",
+            "state": "PENDING",
+            "createdAt": _stale_ts(3),
+            "targetUrl": "https://example.com/build/123",
+        },
+    ]
+    all_stale, run_ids = _check_stale_pending(checks, timeout_seconds=7200)
+    assert all_stale is True
+    assert run_ids == []  # No GitHub Actions run ID in targetUrl
+
+
+# ---------------------------------------------------------------------------
+# discover_actionable_prs — stale pending check tests
+# ---------------------------------------------------------------------------
+
+
+def test_retrigger_stale_checks_when_all_pending_stale(gh_mock, fake_redis_client, label_config):
+    """All pending checks exceed the timeout → RETRIGGER_STALE_CHECKS with run IDs."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1000, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/55555/job/1",
+        },
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_STALE_CHECKS
+    assert pr.number == 1000
+    assert pr.stale_run_ids == [55555]
+
+
+def test_skip_pending_when_checks_are_fresh(gh_mock, fake_redis_client, label_config):
+    """Pending checks within timeout window → SKIP_PENDING (not re-triggered)."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1001, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            "startedAt": _fresh_ts(30),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/66666/job/1",
+        },
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+
+
+def test_skip_pending_when_no_timestamp(gh_mock, fake_redis_client, label_config):
+    """Pending check with no timestamp → SKIP_PENDING (conservative, not re-triggered)."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1002, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            # No startedAt or createdAt
+        },
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+
+
+def test_retrigger_stale_checks_no_run_ids(gh_mock, fake_redis_client, label_config):
+    """Stale StatusContext checks (no GitHub Actions URL) → RETRIGGER_STALE_CHECKS, empty list."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1003, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "ci/jenkins",
+            "state": "PENDING",
+            "createdAt": _stale_ts(3),
+            # No GitHub Actions detailsUrl
+        },
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_STALE_CHECKS
+    assert pr.stale_run_ids == []
+
+
+def test_skip_pending_when_one_check_fresh_one_stale(gh_mock, fake_redis_client, label_config):
+    """Mix of fresh and stale pending checks → SKIP_PENDING (not all stale)."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1004, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            "startedAt": _stale_ts(3),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/77777/job/1",
+        },
+        {
+            "name": "deploy",
+            "startedAt": _fresh_ts(30),
+            "detailsUrl": "https://github.com/org/repo/actions/runs/88888/job/2",
+        },
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
