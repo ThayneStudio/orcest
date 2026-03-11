@@ -7,6 +7,7 @@ where a lock could be released by a non-owner.
 import types
 import uuid
 
+from orcest.shared.config import RunnerConfig
 from orcest.shared.redis_client import RedisClient
 
 # Lua script for atomic check-and-delete (release).
@@ -111,10 +112,10 @@ def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> st
 
 # Pending-task marker TTL: runner default timeout × default max_retries + 5-minute
 # buffer.  The orchestrator sets this marker but doesn't know the worker's runtime
-# runner config, so we derive it from RunnerConfig defaults (timeout=1800,
-# max_retries=3): 1800*3+300 = 5700 s (~95 min).  This is much tighter than the
-# previous 7200 s (2 h), bounding the crash-orphaned-marker window.
-_PENDING_TASK_TTL = 1800 * 3 + 300  # 5700 s
+# runner config, so we derive it from RunnerConfig defaults.  This is much tighter
+# than the previous 7200 s (2 h), bounding the crash-orphaned-marker window.
+_DEFAULT_RUNNER = RunnerConfig()
+_PENDING_TASK_TTL = _DEFAULT_RUNNER.timeout * _DEFAULT_RUNNER.max_retries + 300  # +5-min buffer
 
 
 def set_pending_task(
