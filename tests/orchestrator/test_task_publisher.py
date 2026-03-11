@@ -1393,8 +1393,8 @@ def test_all_transient_deduplicates_run_ids(gh_mock, fake_redis_client):
 
 
 def test_all_transient_graceful_on_rerun_failure(gh_mock, fake_redis_client):
-    """If rerun_workflow raises, publish_fix_task still returns None without
-    crashing (the transient retry is still counted)."""
+    """If all rerun_workflow calls raise, publish_fix_task falls back to a Claude
+    fix task immediately (the transient retry is still counted)."""
     from orcest.orchestrator.gh import GhCliError
     from orcest.orchestrator.pr_ops import get_transient_attempt_count
 
@@ -1413,12 +1413,12 @@ def test_all_transient_graceful_on_rerun_failure(gh_mock, fake_redis_client):
         default_runner="claude",
     )
 
-    # Still returns None (no Claude task)
-    assert result is None
+    # Falls back to Claude fix task since no runs were re-triggered
+    assert isinstance(result, Task)
     # Transient counter was still incremented
     assert get_transient_attempt_count(fake_redis_client, 906, "abc123") == 1
-    # No task in stream
-    assert len(fake_redis_client.client.xrange("tasks:claude")) == 0
+    # Task enqueued in stream
+    assert len(fake_redis_client.client.xrange("tasks:claude")) == 1
 
 
 def test_no_ci_failures_not_transient_path(gh_mock, fake_redis_client):

@@ -269,13 +269,16 @@ def publish_fix_task(
                         )
             if not retriggered:
                 _log.warning(
-                    "PR #%d: transient path triggered but no runs were re-triggered (retry %d/%d)",
+                    "PR #%d: transient path triggered but no runs were re-triggered (retry %d/%d); "
+                    "falling back to fix task",
                     pr_state.number,
                     transient_count,
                     _MAX_TRANSIENT_RETRIES,
                 )
-            # No Claude task needed — return without consuming the main attempt budget.
-            return None
+                # Fall through to enqueue a Claude fix task since we couldn't retrigger anything.
+            else:
+                # No Claude task needed — return without consuming the main attempt budget.
+                return None
         else:
             _log.warning(
                 "PR #%d: transient retry budget exhausted (%d/%d), falling back to fix task",
