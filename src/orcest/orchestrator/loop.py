@@ -205,9 +205,13 @@ def _poll_cycle(
                             exc_info=True,
                         )
             else:
-                # Clean up review retrigger marker on successful merge
+                # Clean up state on successful merge
                 try:
                     clear_review_retrigger(redis, pr_state.number)
+                except Exception:
+                    pass  # Best-effort cleanup; key has TTL anyway
+                try:
+                    clear_total_attempts(redis, pr_state.number)
                 except Exception:
                     pass  # Best-effort cleanup; key has TTL anyway
                 try:
@@ -675,14 +679,16 @@ def _handle_result(
             exc_info=True,
         )
 
-    # Clear attempt counter on success so future failures start fresh.
+    # Clear per-SHA attempt counter on success so future failures on a new
+    # SHA start fresh. Do NOT clear total_attempts here — that cross-SHA
+    # circuit breaker should only be reset when the PR is truly resolved
+    # (merged), not on intermediate task successes.
     if result.status == ResultStatus.COMPLETED:
         try:
             if is_issue:
                 clear_issue_attempts(redis, resource_id)
             else:
                 clear_attempts(redis, resource_id)
-                clear_total_attempts(redis, resource_id)
         except Exception as e:
             logger.error(
                 f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
