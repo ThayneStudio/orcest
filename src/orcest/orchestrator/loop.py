@@ -387,7 +387,7 @@ def _poll_cycle(
                         config.github.repo,
                         pr_state.number,
                         f"**orcest** detected stale CI checks that have been pending for "
-                        f"more than {config.stale_pending_timeout_seconds // 3600}h but "
+                        f"more than {config.stale_pending_timeout_seconds // 60}m but "
                         f"could not re-trigger them automatically. "
                         f"Please investigate the stuck checks manually.",
                         config.github.token,
@@ -414,6 +414,7 @@ def _poll_cycle(
                     run_ids,
                 )
                 any_cancel_succeeded = False
+                cancelled_count = 0
                 for run_id in run_ids:
                     try:
                         gh.cancel_workflow(
@@ -422,6 +423,7 @@ def _poll_cycle(
                             config.github.token,
                         )
                         any_cancel_succeeded = True
+                        cancelled_count += 1
                         logger.info(
                             "PR #%d: cancelled stale workflow run %d",
                             pr_state.number,
@@ -472,8 +474,8 @@ def _poll_cycle(
                             config.github.repo,
                             pr_state.number,
                             f"**orcest** detected CI checks stuck in pending state for"
-                            f" more than {config.stale_pending_timeout_seconds // 3600}h."
-                            f" Cancelled {len(run_ids)} workflow run(s) to self-heal."
+                            f" more than {config.stale_pending_timeout_seconds // 60}m."
+                            f" Cancelled {cancelled_count} of {len(run_ids)} run(s) to self-heal."
                             f" CI will restart once the cancellation propagates.",
                             config.github.token,
                         )
