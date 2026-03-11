@@ -80,7 +80,9 @@ def _run_command(command: str, label: str, pr_number: int, logger: logging.Logge
     try:
         result = subprocess.run(
             command,
-            shell=True,  # Intentional: command is operator-controlled YAML; do not source from untrusted input
+            # shell=True is intentional: command is operator-controlled YAML;
+            # do not source this value from untrusted input (e.g. PR labels).
+            shell=True,  # noqa: S603 S605
             capture_output=True,
             text=True,
             timeout=_DEPLOY_TIMEOUT_SECONDS,
