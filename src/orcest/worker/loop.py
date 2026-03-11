@@ -24,14 +24,13 @@ from orcest.shared.coordination import (
     make_pr_lock_key,
 )
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import ResultStatus, Task, TaskResult
+from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import Runner, RunnerResult, create_runner
 from orcest.worker.workspace import Workspace
 
 RESULTS_STREAM = "results"
-DEAD_LETTER_STREAM = "orcest:dead-letter"
 CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
