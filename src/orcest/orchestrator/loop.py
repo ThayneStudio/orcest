@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
+    set_usage_exhausted_cooldown,
 )
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
@@ -862,6 +863,27 @@ def _handle_result(
                 f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
                 exc_info=True,
             )
+    elif result.status == ResultStatus.USAGE_EXHAUSTED and not is_issue:
+        # Clear the per-SHA attempt counter so the PR can be re-enqueued once
+        # the cooldown expires. The total-attempts counter is intentionally
+        # preserved as a circuit-breaker across rate-limit cycles.
+        try:
+            clear_attempts(redis, resource_id)
+        except Exception as e:
+            logger.error(
+                f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
+                f"after USAGE_EXHAUSTED: {e}",
+                exc_info=True,
+            )
+        # Set a cooldown so the PR is not immediately re-enqueued on the next
+        # poll cycle, giving the API time to recover.
+        try:
+            set_usage_exhausted_cooldown(redis, resource_id)
+        except Exception as e:
+            logger.error(
+                f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
+                exc_info=True,
+            )
 
         # Remove orcest:ready label from completed issues so they are not
         # re-discovered on the next poll cycle.
@@ -876,7 +898,7 @@ def _handle_result(
 
     # Manage labels based on result status.
     # Only terminal statuses (FAILED, BLOCKED) add labels.
-    # USAGE_EXHAUSTED does nothing — task stays parked via attempt counter.
+    # USAGE_EXHAUSTED adds no labels — the PR will resume via the cooldown mechanism.
     labeled = False
     if result.status == ResultStatus.FAILED:
         try:

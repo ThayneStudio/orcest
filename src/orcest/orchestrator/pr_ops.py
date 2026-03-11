@@ -53,6 +53,7 @@ class PRAction(str, Enum):
     SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
+    SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
 
 
 @dataclass
@@ -235,6 +236,27 @@ def set_stale_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str, e
     redis.client.set(_make_stale_retrigger_key(pr_number), head_sha, ex=ex)
 
 
+def _make_usage_cooldown_key(pr_number: int) -> str:
+    """Redis key for the USAGE_EXHAUSTED cooldown marker."""
+    return f"pr:{pr_number}:usage_cooldown"
+
+
+def set_usage_exhausted_cooldown(
+    redis: RedisClient, pr_number: int, ttl_seconds: int = 1800
+) -> None:
+    """Set a cooldown marker so the PR is not immediately re-enqueued after USAGE_EXHAUSTED.
+
+    The key expires after ``ttl_seconds`` (default 30 minutes), at which point
+    the next poll cycle will pick the PR up again.
+    """
+    redis.client.set(_make_usage_cooldown_key(pr_number), "1", ex=ttl_seconds)
+
+
+def has_usage_exhausted_cooldown(redis: RedisClient, pr_number: int) -> bool:
+    """Return True if a USAGE_EXHAUSTED cooldown is still active for this PR."""
+    return bool(redis.client.exists(_make_usage_cooldown_key(pr_number)))
+
+
 def _parse_iso_timestamp(ts: str | None) -> datetime | None:
     """Parse an ISO 8601 timestamp string into a timezone-aware datetime.
 
@@ -414,6 +436,24 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.SKIP_QUEUED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
+        # API capacity to recover before re-enqueuing).
+        if has_usage_exhausted_cooldown(redis, number):
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_USAGE_COOLDOWN,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,

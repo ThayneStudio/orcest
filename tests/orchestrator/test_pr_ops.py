@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     set_exhausted_notified,
     set_review_retrigger_sha,
+    set_usage_exhausted_cooldown,
 )
 from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 
@@ -1056,6 +1057,51 @@ def test_no_skip_queued_without_pending_marker(gh_mock, fake_redis_client, label
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_GREEN
+    gh_mock.get_ci_status.assert_called_once()
+
+
+def test_skip_usage_cooldown_when_active(gh_mock, fake_redis_client, label_config):
+    """A PR with an active USAGE_EXHAUSTED cooldown is classified as SKIP_USAGE_COOLDOWN."""
+    pr_number = 602
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    # Set a cooldown marker (short TTL is fine for tests)
+    set_usage_exhausted_cooldown(fake_redis_client, pr_number, ttl_seconds=300)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_USAGE_COOLDOWN
+    # CI should not be fetched during cooldown
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_no_skip_usage_cooldown_when_expired(gh_mock, fake_redis_client, label_config):
+    """A PR with no active cooldown proceeds normally after the cooldown expires."""
+    pr_number = 603
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure"},
+    ]
+
+    # No cooldown set — PR should proceed to CI evaluation
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
     gh_mock.get_ci_status.assert_called_once()
 
 
