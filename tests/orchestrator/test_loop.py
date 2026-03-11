@@ -14,7 +14,7 @@ from orcest.orchestrator.loop import (
     _consume_results,
     _poll_cycle,
 )
-from orcest.orchestrator.pr_ops import PRAction, PRState
+from orcest.orchestrator.pr_ops import PRAction, PRState, get_exhausted_notified
 from orcest.shared.models import ResultStatus, TaskResult
 
 
@@ -284,8 +284,6 @@ def test_poll_cycle_skip_max_total_attempts_labels_and_sets_flag(
     assert "Remove the" in comment_body
 
     # Should set the exhausted_notified flag so label-removal recovery works
-    from orcest.orchestrator.pr_ops import get_exhausted_notified
-
     assert get_exhausted_notified(fake_redis_client, 51)
 
 
