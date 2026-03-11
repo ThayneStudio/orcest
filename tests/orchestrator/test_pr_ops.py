@@ -1082,8 +1082,8 @@ def test_skip_usage_cooldown_when_active(gh_mock, fake_redis_client, label_confi
     gh_mock.get_ci_status.assert_not_called()
 
 
-def test_no_skip_usage_cooldown_when_expired(gh_mock, fake_redis_client, label_config):
-    """A PR with no active cooldown proceeds normally after the cooldown expires."""
+def test_no_skip_usage_cooldown_when_not_set(gh_mock, fake_redis_client, label_config):
+    """A PR with no active cooldown proceeds normally (equivalent to an expired cooldown)."""
     pr_number = 603
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),

@@ -867,23 +867,26 @@ def _handle_result(
         # Clear the per-SHA attempt counter so the PR can be re-enqueued once
         # the cooldown expires. The total-attempts counter is intentionally
         # preserved as a circuit-breaker across rate-limit cycles.
+        _attempts_cleared = False
         try:
             clear_attempts(redis, resource_id)
+            _attempts_cleared = True
         except Exception as e:
             logger.error(
                 f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
                 f"after USAGE_EXHAUSTED: {e}",
                 exc_info=True,
             )
-        # Set a cooldown so the PR is not immediately re-enqueued on the next
-        # poll cycle, giving the API time to recover.
-        try:
-            set_usage_exhausted_cooldown(redis, resource_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
-                exc_info=True,
-            )
+        # Only set the cooldown when the attempt counter was actually cleared;
+        # otherwise the PR will re-stall after the cooldown expires.
+        if _attempts_cleared:
+            try:
+                set_usage_exhausted_cooldown(redis, resource_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
+                    exc_info=True,
+                )
 
         # Remove orcest:ready label from completed issues so they are not
         # re-discovered on the next poll cycle.
