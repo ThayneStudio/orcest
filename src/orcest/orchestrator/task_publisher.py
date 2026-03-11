@@ -20,9 +20,9 @@ from orcest.shared.redis_client import RedisClient
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)")
 
 # Per-check log excerpt limit (errors are at the end of logs)
-_PER_CHECK_LOG_LIMIT = 5000
+_PER_CHECK_LOG_LIMIT = 20000
 # Total log budget across all checks in a single prompt
-_TOTAL_LOG_BUDGET = 15000
+_TOTAL_LOG_BUDGET = 50000
 
 # Tasks stream cap: 10 000 entries.
 #
@@ -57,6 +57,49 @@ _TOTAL_LOG_BUDGET = 15000
 # already degraded for other reasons.  10 000 entries add only ~5-10 MB of
 # Redis memory (stream entries are compact), which is negligible.
 _TASKS_STREAM_MAXLEN = 10_000
+
+# Regex matching lines that signal the start of an important log section
+# (stack traces, test failures, assertion errors, etc.)
+_LOG_ERROR_RE = re.compile(
+    r"(Traceback \(most recent call last\)"
+    r"|^ERROR[:\s]"
+    r"|^FAILED[:\s]"
+    r"|^FAIL[:\s]"
+    r"|AssertionError"
+    r"|Tests run:.*Failures:"
+    r"|FAILURES)",
+    re.MULTILINE,
+)
+
+
+def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
+    """Extract the most relevant sections from a CI log.
+
+    If an important error/failure marker appears *before* the tail window,
+    up to half the budget is reserved for context around that early error so
+    the cause (not just the symptom) is visible.  Otherwise falls back to a
+    plain tail excerpt, which works well for most CI logs where errors appear
+    at the end.
+    """
+    if len(log_text) <= max_len:
+        return log_text
+
+    tail_start = len(log_text) - max_len
+    first_error = _LOG_ERROR_RE.search(log_text)
+
+    if first_error and first_error.start() < tail_start:
+        # Important section exists before the tail — capture context around it
+        ctx_start = max(0, first_error.start() - 200)
+        ctx_end = min(len(log_text), first_error.start() + 2000)
+        early_section = log_text[ctx_start:ctx_end]
+
+        separator = "\n... (middle of log omitted) ...\n"
+        early_budget = min(len(early_section), max_len // 2)
+        tail_budget = max_len - early_budget - len(separator)
+        return early_section[:early_budget] + separator + log_text[-tail_budget:]
+
+    # Default: return the tail (errors are usually at the end of CI logs)
+    return log_text[-max_len:]
 
 
 def _extract_run_id(details_url: str) -> int | None:
@@ -627,8 +670,8 @@ def _render_fix_prompt(
     Uses simple string formatting (no Jinja2 dependency).
     Diff is truncated to 10,000 characters to keep prompt size manageable.
     CI log excerpts are included when available, with each log capped at
-    the last ~5000 characters (errors are at the end) and total log
-    content capped at ~15000 characters.
+    ~20,000 characters (prioritising error sections and tail) and total log
+    content capped at ~50,000 characters.
     """
     sections: list[str] = [
         f"# Fix PR #{pr_number}: {pr_title}",
@@ -652,9 +695,12 @@ def _render_fix_prompt(
                 log_text = ci_logs.get(failure["name"], "")
                 if log_text and log_budget > 0:
                     max_len = min(_PER_CHECK_LOG_LIMIT, log_budget)
-                    excerpt = log_text[-max_len:]
+                    excerpt = _extract_relevant_log_sections(log_text, max_len)
                     if len(log_text) > max_len:
-                        excerpt = f"... (truncated, showing last {max_len} chars)\n" + excerpt
+                        excerpt = (
+                            f"... (truncated, showing {max_len} of {len(log_text)} chars)\n"
+                            + excerpt
+                        )
                     sections.append("")
                     sections.append(f"  **Log output for {failure['name']}:**")
                     sections.append("")
@@ -694,7 +740,7 @@ def _render_fix_prompt(
     if truncated:
         sections.append(
             f"*Note: diff truncated from {len(diff)} to 10,000 characters. "
-            f"Review the full files in the repository for complete context.*"
+            f"Run `git diff HEAD` in the workspace to view the complete diff.*"
         )
     sections.extend(
         [
