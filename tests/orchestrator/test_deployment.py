@@ -47,10 +47,9 @@ def test_run_deployment_no_command_is_noop():
 # ---------------------------------------------------------------------------
 
 
-def test_run_deployment_success(mocker):
-    """run_deployment succeeds when the deploy command exits 0."""
+def test_run_deployment_success():
+    """run_deployment succeeds when the deploy command exits 0 and no health check is configured."""
     config = _config(command="true")
-    mocker.patch("orcest.orchestrator.deployment._wait_for_healthy")  # not reached
     run_deployment(config, pr_number=3, logger=logger)
 
 
@@ -75,6 +74,13 @@ def test_run_deployment_command_timeout(mocker):
 # ---------------------------------------------------------------------------
 # run_deployment — health check
 # ---------------------------------------------------------------------------
+
+
+def test_run_deployment_invalid_health_check_url_scheme():
+    """run_deployment raises DeploymentError when health_check_url is not http/https."""
+    config = _config(command="true", health_check_url="file:///etc/shadow")
+    with pytest.raises(DeploymentError, match="health_check_url must use http"):
+        run_deployment(config, pr_number=6, logger=logger)
 
 
 def test_run_deployment_skips_health_check_when_no_url():
@@ -172,7 +178,12 @@ def test_wait_for_healthy_returns_true_on_200(mocker):
 
 
 def test_wait_for_healthy_returns_false_on_timeout(mocker):
-    """_wait_for_healthy returns False when no healthy response within timeout."""
+    """_wait_for_healthy returns False when connection errors prevent success before timeout.
+
+    Mocks time.monotonic to simulate: one failed poll attempt inside the deadline,
+    then the deadline expiring on the next check, to verify the loop actually
+    exercises error handling and not just the zero-timeout early-exit path.
+    """
     from urllib.error import URLError
 
     mocker.patch(
@@ -180,8 +191,18 @@ def test_wait_for_healthy_returns_false_on_timeout(mocker):
         side_effect=URLError("connection refused"),
     )
     mocker.patch("orcest.orchestrator.deployment.time.sleep")
+    # Calls in order:
+    #   1. deadline = time.monotonic() + 2  →  0.0 + 2 = 2.0
+    #   2. remaining = 2.0 - time.monotonic()  →  2.0 - 0.5 = 1.5  (inside deadline, poll)
+    #   3. urlopen raises URLError
+    #   4. time.sleep arg: deadline - time.monotonic()  →  2.0 - 1.0 = 1.0
+    #   5. remaining = 2.0 - time.monotonic()  →  2.0 - 3.0 = -1.0  (past deadline → break)
+    mocker.patch(
+        "orcest.orchestrator.deployment.time.monotonic",
+        side_effect=[0.0, 0.5, 1.0, 3.0],
+    )
 
-    result = _wait_for_healthy("http://localhost/health", timeout_seconds=0, logger=logger)
+    result = _wait_for_healthy("http://localhost/health", timeout_seconds=2, logger=logger)
     assert result is False
 
 

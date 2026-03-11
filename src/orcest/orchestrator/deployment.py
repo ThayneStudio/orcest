@@ -47,6 +47,11 @@ def run_deployment(
     if not config.health_check_url:
         return True
 
+    if not config.health_check_url.startswith(("http://", "https://")):
+        raise DeploymentError(
+            f"health_check_url must use http:// or https://, got: {config.health_check_url!r}"
+        )
+
     logger.info(
         "PR #%d: health check %s (timeout: %ds)",
         pr_number,
