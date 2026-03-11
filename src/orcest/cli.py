@@ -300,9 +300,10 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
     if not replay:
         return
 
+    import redis as redis_lib
+
     replayed = 0
     errors = 0
-    client = redis.client
 
     for entry_id, fields in entries:
         tasks_stream = fields.get("tasks_stream")
@@ -317,9 +318,9 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).
             redis.xadd(tasks_stream, task_fields)
-            client.xdel(DEAD_LETTER_STREAM, entry_id)
+            redis.xdel(DEAD_LETTER_STREAM, entry_id)
             replayed += 1
-        except Exception as exc:
+        except redis_lib.RedisError as exc:
             console.print(f"[red]Failed to replay entry {entry_id}: {exc}[/red]")
             errors += 1
 
