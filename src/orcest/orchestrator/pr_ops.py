@@ -53,6 +53,7 @@ class PRAction(str, Enum):
     SKIP_NO_CHECKS = "skip_no_checks"  # No CI checks configured or triggered
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
+    SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
 
 
 @dataclass
@@ -233,6 +234,27 @@ def get_stale_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
 def set_stale_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str, ex: int) -> None:
     """Record that we re-triggered stale checks for this SHA. Expires after ``ex`` seconds."""
     redis.client.set(_make_stale_retrigger_key(pr_number), head_sha, ex=ex)
+
+
+def _make_usage_cooldown_key(pr_number: int) -> str:
+    """Redis key for the USAGE_EXHAUSTED cooldown marker."""
+    return f"pr:{pr_number}:usage_cooldown"
+
+
+def set_usage_exhausted_cooldown(
+    redis: RedisClient, pr_number: int, ttl_seconds: int = 1800
+) -> None:
+    """Set a cooldown marker so the PR is not immediately re-enqueued after USAGE_EXHAUSTED.
+
+    The key expires after ``ttl_seconds`` (default 30 minutes), at which point
+    the next poll cycle will pick the PR up again.
+    """
+    redis.client.set(_make_usage_cooldown_key(pr_number), "1", ex=ttl_seconds)
+
+
+def has_usage_exhausted_cooldown(redis: RedisClient, pr_number: int) -> bool:
+    """Return True if a USAGE_EXHAUSTED cooldown is still active for this PR."""
+    return bool(redis.client.exists(_make_usage_cooldown_key(pr_number)))
 
 
 def _parse_iso_timestamp(ts: str | None) -> datetime | None:
@@ -423,36 +445,53 @@ def discover_actionable_prs(
             continue
 
         # Skip if total cross-SHA attempt limit exceeded (circuit breaker).
-        # Exception: if we already posted the exhausted-budget notification and the
-        # needs-human label is now absent, the human deliberately removed it to
-        # approve a retry — reset the counter and let the PR proceed normally.
+        # Check this before the usage cooldown so the circuit-breaker state is
+        # visible immediately rather than being masked for 30 minutes.
+        #
+        # Note: the human-override path (resetting counters when the needs-human
+        # label was removed) was removed in PR #330. It was fragile — the label
+        # could be removed by accident or by another automation — and provided no
+        # reliable signal of deliberate human intent. PRs that hit this limit now
+        # require direct Redis intervention: `del pr:<n>:total_attempts`.
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, number):
-                # Human removed the needs-human label → retry approved; reset counters.
-                logger.info(
-                    "PR #%d: needs-human label removed after exhaustion — resetting "
-                    "total attempts counter for human-approved retry",
-                    number,
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
                 )
-                clear_total_attempts(redis, number)
-                clear_exhausted_notified(redis, number)
-                # Fall through to normal processing below.
-            else:
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
+            )
+            continue
+
+        # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
+        # API capacity to recover before re-enqueuing).
+        # Note: the cooldown is keyed to PR number, not head SHA, so new commits
+        # pushed during the cooldown window are still blocked for up to 30 minutes.
+        # This is intentional — USAGE_EXHAUSTED is account-level, so new commits
+        # don't help. If new commits should bypass the cooldown (e.g. urgent
+        # hotfixes), a SHA comparison would be needed here.
+        if has_usage_exhausted_cooldown(redis, number):
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_USAGE_COOLDOWN,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
                 )
-                continue
+            )
+            continue
 
         # Skip if previously attempted on this SHA (awaiting new commits)
         # or max attempts reached.
