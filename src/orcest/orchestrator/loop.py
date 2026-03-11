@@ -232,7 +232,7 @@ def _poll_cycle(
                     err_msg = str(deploy_err)
                     logger.error("PR #%d: deployment failed: %s", pr_state.number, err_msg)
                     try:
-                        gh.create_issue(
+                        issue_number = gh.create_issue(
                             config.github.repo,
                             f"Deployment failed after merge of PR #{pr_state.number}",
                             f"**orcest** deployment failed after merging "
@@ -240,6 +240,11 @@ def _poll_cycle(
                             f"Error: {err_msg[:500]}",
                             config.github.token,
                             labels=["orcest:needs-human"],
+                        )
+                        logger.info(
+                            "PR #%d: created deployment failure issue #%d",
+                            pr_state.number,
+                            issue_number,
                         )
                     except Exception as issue_err:
                         logger.error(

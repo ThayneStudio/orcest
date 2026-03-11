@@ -33,13 +33,15 @@ logger = logging.getLogger("test")
 def test_run_deployment_disabled_is_noop():
     """run_deployment does nothing when deployment is disabled."""
     config = _config(enabled=False, command="false")  # 'false' exits 1 — would raise
-    run_deployment(config, pr_number=1, logger=logger)  # must not raise
+    result = run_deployment(config, pr_number=1, logger=logger)
+    assert result is False
 
 
 def test_run_deployment_no_command_is_noop():
     """run_deployment does nothing when command is empty string."""
     config = _config(enabled=True, command="")
-    run_deployment(config, pr_number=2, logger=logger)
+    result = run_deployment(config, pr_number=2, logger=logger)
+    assert result is False
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +52,8 @@ def test_run_deployment_no_command_is_noop():
 def test_run_deployment_success():
     """run_deployment succeeds when the deploy command exits 0 and no health check is configured."""
     config = _config(command="true")
-    run_deployment(config, pr_number=3, logger=logger)
+    result = run_deployment(config, pr_number=3, logger=logger)
+    assert result is True
 
 
 def test_run_deployment_command_failure():
@@ -275,6 +278,7 @@ def test_poll_cycle_deployment_failure_creates_issue(
         "orcest.orchestrator.loop.run_deployment",
         side_effect=DeploymentError("deploy failed"),
     )
+    gh_mock.create_issue.return_value = 999
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"))
