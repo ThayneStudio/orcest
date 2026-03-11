@@ -718,13 +718,17 @@ def create_issue(
     for label in labels or []:
         args.extend(["--label", label])
     output = _run_gh(args, token)
-    # gh issue create returns the issue URL; extract the issue number from it
-    # e.g. https://github.com/owner/repo/issues/42
-    url = output.strip()
-    try:
-        return int(url.rstrip("/").rsplit("/", 1)[-1])
-    except (ValueError, IndexError):
-        raise GhCliError(f"Could not parse issue number from gh output: {url!r}")
+    # gh issue create returns the issue URL; extract the issue number from it.
+    # Use the first line that looks like an issue URL — gh may emit trailing
+    # warnings or deprecation notices after the URL.
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if "/issues/" in line:
+            try:
+                return int(line.rstrip("/").rsplit("/", 1)[-1])
+            except (ValueError, IndexError):
+                continue
+    raise GhCliError(f"Could not parse issue number from gh output: {output.strip()!r}")
 
 
 def resolve_review_thread(thread_id: str, token: str) -> None:

@@ -234,6 +234,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         ),
         rollback_command=str(deployment_raw.get("rollback_command", "")),
     )
+    if deployment_config.health_check_url and deployment_config.health_check_timeout <= 0:
+        raise ValueError(
+            f"Config field 'deployment.health_check_timeout' must be a positive integer "
+            f"when health_check_url is set, got {deployment_config.health_check_timeout}"
+        )
 
     # Seconds a pending check can be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds = _safe_int(
