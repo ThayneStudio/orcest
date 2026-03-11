@@ -20,8 +20,10 @@ from orcest.orchestrator.pr_ops import (
     get_exhausted_notified,
     get_review_retrigger_sha,
     get_total_attempt_count,
+    get_transient_attempt_count,
     increment_attempts,
     increment_total_attempts,
+    increment_transient_attempts,
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_usage_exhausted_cooldown,
@@ -1768,3 +1770,62 @@ def test_skip_pending_when_one_check_fresh_one_stale(gh_mock, fake_redis_client,
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_PENDING
+
+
+# --- Transient attempt counter tests ---
+
+
+def test_transient_attempt_count_starts_at_zero(fake_redis_client):
+    """get_transient_attempt_count returns 0 for an unknown PR."""
+    assert get_transient_attempt_count(fake_redis_client, 1000, "abc") == 0
+
+
+def test_increment_transient_attempts_increments(fake_redis_client):
+    """increment_transient_attempts increments and returns the new count."""
+    pr_number = 1001
+    sha = "sha-aaa"
+    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 1
+    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 2
+    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 3
+    assert get_transient_attempt_count(fake_redis_client, pr_number, sha) == 3
+
+
+def test_transient_attempts_reset_on_new_sha(fake_redis_client):
+    """Transient counter resets to 1 when head SHA changes (new commits)."""
+    pr_number = 1002
+    sha_v1 = "sha-111"
+    sha_v2 = "sha-222"
+
+    increment_transient_attempts(fake_redis_client, pr_number, sha_v1)
+    increment_transient_attempts(fake_redis_client, pr_number, sha_v1)
+    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v1) == 2
+
+    # New SHA: counter resets
+    new_count = increment_transient_attempts(fake_redis_client, pr_number, sha_v2)
+    assert new_count == 1
+    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v2) == 1
+    # Old SHA now returns 0 (key was reset)
+    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v1) == 0
+
+
+def test_transient_attempts_has_ttl(fake_redis_client):
+    """increment_transient_attempts sets a 7-day TTL on the key."""
+    pr_number = 1003
+    increment_transient_attempts(fake_redis_client, pr_number, "sha-ttl")
+
+    key = f"pr:{pr_number}:transient_attempts"
+    ttl = fake_redis_client.client.ttl(key)
+    expected_ttl = 7 * 24 * 3600
+    assert 0 < ttl <= expected_ttl
+
+
+def test_transient_attempts_independent_of_main_attempts(fake_redis_client):
+    """Transient counter does not affect the main per-SHA attempt counter."""
+    pr_number = 1004
+    sha = "sha-ind"
+
+    increment_transient_attempts(fake_redis_client, pr_number, sha)
+    increment_transient_attempts(fake_redis_client, pr_number, sha)
+
+    # Main attempt counter should still be 0
+    assert get_attempt_count(fake_redis_client, pr_number, sha) == 0
