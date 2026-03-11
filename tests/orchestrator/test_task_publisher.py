@@ -308,7 +308,7 @@ def test_prompt_truncates_long_ci_logs(
         default_runner="claude",
     )
 
-    # The full log (6017 chars) should NOT appear verbatim
+    # The full log (24,017 chars) should NOT appear verbatim
     assert long_log not in task.prompt
     # The end of the log (where errors are) should be present
     assert "REAL_ERROR_AT_END" in task.prompt

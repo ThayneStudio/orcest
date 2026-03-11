@@ -90,7 +90,7 @@ def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
     if first_error and first_error.start() < tail_start:
         # Important section exists before the tail — capture context around it
         ctx_start = max(0, first_error.start() - 200)
-        ctx_end = min(len(log_text), first_error.start() + 2000)
+        ctx_end = min(len(log_text), first_error.start() + max_len // 4)
         early_section = log_text[ctx_start:ctx_end]
 
         separator = "\n... (middle of log omitted) ...\n"
