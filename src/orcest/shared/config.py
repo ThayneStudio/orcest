@@ -48,11 +48,21 @@ class RunnerConfig:
 
 
 @dataclass
+class DeploymentConfig:
+    enabled: bool = False
+    command: str = ""  # Shell command to run on the orchestrator host after merge
+    health_check_url: str = ""  # Optional HTTP endpoint to poll for readiness
+    health_check_timeout: int = 30  # Seconds to wait for health check to pass
+    rollback_command: str = ""  # Optional command to run if health check fails
+
+
+@dataclass
 class OrchestratorConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     github: GithubConfig = field(default_factory=GithubConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
+    deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
     max_total_attempts: int = 10  # Max total attempts across all SHAs (circuit breaker)
@@ -211,11 +221,24 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         raw.get("delete_branch_on_merge", True), "delete_branch_on_merge"
     )
 
+    # Deployment (CD) config
+    deployment_raw = _safe_dict(raw, "deployment")
+    deployment_config = DeploymentConfig(
+        enabled=_safe_bool(deployment_raw.get("enabled", False), "deployment.enabled"),
+        command=str(deployment_raw.get("command", "")),
+        health_check_url=str(deployment_raw.get("health_check_url", "")),
+        health_check_timeout=_safe_int(
+            deployment_raw.get("health_check_timeout", 30), "deployment.health_check_timeout"
+        ),
+        rollback_command=str(deployment_raw.get("rollback_command", "")),
+    )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
         polling=polling_config,
         labels=labels_config,
+        deployment=deployment_config,
         default_runner=default_runner,
         max_attempts=max_attempts,
         max_total_attempts=max_total_attempts,

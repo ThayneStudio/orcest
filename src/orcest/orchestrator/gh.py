@@ -665,6 +665,48 @@ def post_issue_comment(repo: str, number: int, body: str, token: str) -> None:
         )
 
 
+def create_issue(
+    repo: str,
+    title: str,
+    body: str,
+    token: str,
+    labels: list[str] | None = None,
+) -> int:
+    """Create a new GitHub issue and return its number.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        title: Issue title.
+        body: Issue body (Markdown).
+        token: GitHub token.
+        labels: Optional list of label names to apply.
+
+    Returns:
+        The newly created issue number.
+    """
+    _validate_repo(repo)
+    args = [
+        "issue",
+        "create",
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--body",
+        body,
+    ]
+    for label in labels or []:
+        args.extend(["--label", label])
+    output = _run_gh(args, token)
+    # gh issue create returns the issue URL; extract the issue number from it
+    # e.g. https://github.com/owner/repo/issues/42
+    url = output.strip()
+    try:
+        return int(url.rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        raise GhCliError(f"Could not parse issue number from gh output: {url!r}")
+
+
 def resolve_review_thread(thread_id: str, token: str) -> None:
     """Resolve a review thread on a PR.
 
