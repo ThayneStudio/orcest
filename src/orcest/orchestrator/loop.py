@@ -19,6 +19,7 @@ from orcest.orchestrator.pr_ops import (
     clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
+    set_exhausted_notified,
     set_review_retrigger_sha,
 )
 from orcest.orchestrator.task_publisher import (
@@ -373,6 +374,7 @@ def _poll_cycle(
                     config.github.token,
                 )
                 labeled = True
+                set_exhausted_notified(redis, pr_state.number)
             except Exception as e:
                 logger.error(
                     "Failed to label PR #%d as needs-human: %s",
