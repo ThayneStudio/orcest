@@ -421,6 +421,7 @@ def _poll_cycle(
                             run_id,
                             config.github.token,
                         )
+                        any_succeeded = True
                         logger.info(
                             "PR #%d: cancelled stale workflow run %d before rerun",
                             pr_state.number,
@@ -440,34 +441,37 @@ def _poll_cycle(
                             run_id,
                             config.github.token,
                         )
-                        any_succeeded = True
                         logger.info(
                             "PR #%d: re-triggered stale workflow run %d",
                             pr_state.number,
                             run_id,
                         )
                     except Exception as e:
-                        logger.error(
-                            "Failed to re-trigger stale run %d for PR #%d: %s",
+                        logger.warning(
+                            "Failed to re-trigger stale run %d for PR #%d "
+                            "(cancel may still be in progress): %s",
                             run_id,
                             pr_state.number,
                             e,
-                            exc_info=True,
                         )
+                # Always set cooldown after attempting, regardless of rerun
+                # success — prevents a busy retry loop when reruns fail due
+                # to the cancel→rerun async race.
+                set_stale_retrigger_sha(
+                    redis,
+                    pr_state.number,
+                    pr_state.head_sha,
+                    ex=config.stale_pending_timeout_seconds,
+                )
                 if any_succeeded:
-                    set_stale_retrigger_sha(
-                        redis,
-                        pr_state.number,
-                        pr_state.head_sha,
-                        ex=config.stale_pending_timeout_seconds,
-                    )
                     try:
                         gh.post_comment(
                             config.github.repo,
                             pr_state.number,
                             f"**orcest** detected CI checks stuck in pending state for"
                             f" more than {config.stale_pending_timeout_seconds // 3600}h."
-                            f" Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
+                            f" Cancelling and re-triggering {len(run_ids)} workflow"
+                            f" run(s) to self-heal.",
                             config.github.token,
                         )
                     except Exception as e:
