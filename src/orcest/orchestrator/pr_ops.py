@@ -257,6 +257,49 @@ def has_usage_exhausted_cooldown(redis: RedisClient, pr_number: int) -> bool:
     return bool(redis.client.exists(_make_usage_cooldown_key(pr_number)))
 
 
+def _make_transient_attempts_key(pr_number: int) -> str:
+    """Redis key for tracking transient CI retry count per PR."""
+    return f"pr:{pr_number}:transient_attempts"
+
+
+def get_transient_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+    """Get the transient CI retry count for a PR.
+
+    Resets to 0 when the head SHA changes (new commits pushed), so the
+    transient budget is per-SHA just like the main attempt counter.
+    """
+    key = _make_transient_attempts_key(pr_number)
+    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
+    if not data:
+        return 0
+    stored_sha = data.get("head_sha", "")
+    if stored_sha != head_sha:
+        redis.client.delete(key)
+        return 0
+    try:
+        return int(data.get("count", 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def increment_transient_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+    """Increment and return the transient CI retry count for a PR.
+
+    Resets to 1 if the stored head SHA differs from head_sha (new commits).
+    Sets a 7-day TTL on the key so closed/merged PR counters don't leak.
+    """
+    key = _make_transient_attempts_key(pr_number)
+    stored_sha = redis.client.hget(key, "head_sha")
+    if stored_sha is not None and stored_sha != head_sha:
+        redis.client.delete(key)
+    pipe = redis.client.pipeline(transaction=True)
+    pipe.hincrby(key, "count", 1)
+    pipe.hset(key, "head_sha", head_sha)
+    pipe.expire(key, 7 * 24 * 3600)  # 7-day TTL
+    results = pipe.execute()
+    return results[0]  # new count
+
+
 def _parse_iso_timestamp(ts: str | None) -> datetime | None:
     """Parse an ISO 8601 timestamp string into a timezone-aware datetime.
 

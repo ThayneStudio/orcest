@@ -12,7 +12,12 @@ from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import IssueState
 from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
-from orcest.orchestrator.pr_ops import PRState, increment_attempts, increment_total_attempts
+from orcest.orchestrator.pr_ops import (
+    PRState,
+    increment_attempts,
+    increment_total_attempts,
+    increment_transient_attempts,
+)
 from orcest.shared.coordination import set_pending_task
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
@@ -106,6 +111,11 @@ def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
     return log_text[-max_len:]
 
 
+# Max number of transient-CI re-triggers before falling back to a Claude fix task.
+# Transient retries do not consume the main per-SHA attempt budget.
+_MAX_TRANSIENT_RETRIES = 3
+
+
 def _extract_run_id(details_url: str) -> int | None:
     """Extract the workflow run ID from a GitHub Actions detailsUrl.
 
@@ -177,7 +187,7 @@ def publish_fix_task(
     redis: RedisClient,
     default_runner: str,
     logger: logging.Logger | None = None,
-) -> Task:
+) -> Task | None:
     """Create and publish a fix task for a PR.
 
     Steps:
@@ -226,10 +236,53 @@ def publish_fix_task(
         if classification == CIFailureType.CODE:
             task_type = TaskType.FIX_CI
 
+    # If every CI failure is transient, re-trigger the runs directly instead of
+    # asking Claude to "fix" something that isn't a code problem.  A separate
+    # transient counter (per SHA) tracks how many times we've done this so we
+    # don't spin forever: after _MAX_TRANSIENT_RETRIES we fall back to the
+    # normal fix-task path and let Claude investigate.
+    _log = logger or logging.getLogger(__name__)
+    if failure_summaries and all(
+        s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
+    ):
+        transient_count = increment_transient_attempts(
+            redis, pr_state.number, pr_state.head_sha
+        )
+        if transient_count <= _MAX_TRANSIENT_RETRIES:
+            _log.info(
+                "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",
+                pr_state.number,
+                transient_count,
+                _MAX_TRANSIENT_RETRIES,
+            )
+            retriggered: set[int] = set()
+            for check in pr_state.ci_failures:
+                run_id = _extract_run_id(check.get("detailsUrl", ""))
+                if run_id is not None and run_id not in retriggered:
+                    try:
+                        gh.rerun_workflow(repo, run_id, token, failed_only=True)
+                        retriggered.add(run_id)
+                    except Exception:
+                        _log.warning(
+                            "PR #%d: failed to re-trigger run %d",
+                            pr_state.number,
+                            run_id,
+                            exc_info=True,
+                        )
+            # No Claude task needed — return without consuming the main attempt budget.
+            return None
+        else:
+            _log.warning(
+                "PR #%d: transient retry budget exhausted (%d/%d), falling back to fix task",
+                pr_state.number,
+                transient_count,
+                _MAX_TRANSIENT_RETRIES,
+            )
+            # Fall through to enqueue a Claude fix task below.
+
     # Use review threads from pr_state (populated by discover_actionable_prs for
     # CHANGES_REQUESTED). For CI failures, fetch inline review comments from the
     # REST API since discover_actionable_prs does not populate review_threads there.
-    _log = logger or logging.getLogger(__name__)
     if pr_state.ci_failures:
         try:
             raw_inline = gh.get_pr_review_comments(repo, pr_state.number, token)

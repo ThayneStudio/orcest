@@ -1186,3 +1186,257 @@ def test_rebase_prompt_defaults_to_main():
     )
     assert "git fetch origin main" in prompt
     assert "git rebase origin/main" in prompt
+
+
+# --- Transient CI failure handling tests ---
+
+
+def _make_transient_ci_failures(run_ids: list[int]) -> list[dict]:
+    """Build ci_failures where each check has a transient-matching name and a GitHub Actions URL."""
+    return [
+        {
+            "name": f"timeout-check-{i}",
+            "conclusion": "TIMED_OUT",
+            "detailsUrl": f"https://github.com/org/repo/actions/runs/{run_id}/job/{9000 + i}",
+        }
+        for i, run_id in enumerate(run_ids)
+    ]
+
+
+def test_all_transient_failures_retrigger_ci_not_enqueue(gh_mock, fake_redis_client):
+    """When all CI failures are transient, publish_fix_task re-triggers CI
+    and returns None instead of enqueueing a Claude task."""
+    _setup_gh_defaults(gh_mock)
+    # Name contains 'timeout' → TRANSIENT classification
+    gh_mock.get_failed_run_logs.return_value = "connection reset by peer"
+
+    ci_failures = _make_transient_ci_failures([42001])
+    pr_state = _make_pr_state(number=900, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Should return None (no Claude task)
+    assert result is None
+    # Should have called rerun_workflow for the run
+    gh_mock.rerun_workflow.assert_called_once_with(
+        "test-org/test-repo", 42001, "fake-token", failed_only=True
+    )
+    # Nothing should be in the tasks stream
+    entries = fake_redis_client.client.xrange("tasks:claude")
+    assert len(entries) == 0
+
+
+def test_all_transient_failures_does_not_increment_main_attempts(
+    gh_mock, fake_redis_client
+):
+    """All-transient path does not increment the main per-SHA attempt counter."""
+    from orcest.orchestrator.pr_ops import get_attempt_count
+
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "timeout"
+
+    ci_failures = _make_transient_ci_failures([42002])
+    pr_state = _make_pr_state(number=901, ci_failures=ci_failures)
+
+    publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Main attempt counter must still be 0
+    assert get_attempt_count(fake_redis_client, 901, "abc123") == 0
+
+
+def test_transient_retries_counted_separately(gh_mock, fake_redis_client):
+    """Each call to publish_fix_task for all-transient failures increments
+    the transient counter, not the main attempt counter."""
+    from orcest.orchestrator.pr_ops import get_transient_attempt_count
+
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "ETIMEDOUT"
+
+    ci_failures = _make_transient_ci_failures([42003])
+    pr_state = _make_pr_state(number=902, ci_failures=ci_failures)
+
+    for expected_count in (1, 2, 3):
+        publish_fix_task(
+            pr_state=pr_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+        assert get_transient_attempt_count(fake_redis_client, 902, "abc123") == expected_count
+
+
+def test_transient_budget_exhausted_falls_back_to_fix_task(gh_mock, fake_redis_client):
+    """After _MAX_TRANSIENT_RETRIES transient re-triggers, publish_fix_task
+    falls back to enqueuing a Claude fix task (returning a Task, not None)."""
+    from orcest.orchestrator.task_publisher import _MAX_TRANSIENT_RETRIES
+
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "ETIMEDOUT"
+
+    ci_failures = _make_transient_ci_failures([42004])
+    pr_state = _make_pr_state(number=903, ci_failures=ci_failures)
+
+    # Exhaust the transient budget
+    for _ in range(_MAX_TRANSIENT_RETRIES):
+        publish_fix_task(
+            pr_state=pr_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    # Reset tasks stream so we can check the fallback enqueue
+    fake_redis_client.client.delete("tasks:claude")
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Now should return a Task (fallback to Claude)
+    assert isinstance(result, Task)
+    # And the task should be in the stream
+    entries = fake_redis_client.client.xrange("tasks:claude")
+    assert len(entries) == 1
+
+
+def test_mixed_failures_enqueue_fix_task(gh_mock, fake_redis_client):
+    """When failures include both TRANSIENT and CODE, publish_fix_task
+    enqueues a Claude fix task (not a transient re-trigger)."""
+    _setup_gh_defaults(gh_mock)
+
+    def mock_get_logs(repo, run_id, token):
+        # run 10001 → transient log, run 10002 → code error log
+        return {
+            10001: "connection reset by peer",
+            10002: "FAILED test_foo.py::test_bar (AssertionError)",
+        }.get(run_id, "")
+
+    gh_mock.get_failed_run_logs.side_effect = mock_get_logs
+
+    ci_failures = [
+        {
+            "name": "flaky-network",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/10001/job/1",
+        },
+        {
+            "name": "tests",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/10002/job/2",
+        },
+    ]
+    pr_state = _make_pr_state(number=904, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Mixed failures → Claude task, not a transient re-trigger
+    assert isinstance(result, Task)
+    # rerun_workflow should NOT be called for mixed failures
+    gh_mock.rerun_workflow.assert_not_called()
+    # Task should be in the stream
+    entries = fake_redis_client.client.xrange("tasks:claude")
+    assert len(entries) == 1
+
+
+def test_all_transient_deduplicates_run_ids(gh_mock, fake_redis_client):
+    """Two transient checks with the same run_id only trigger one rerun call."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "timeout"
+
+    # Two checks sharing run_id 77777
+    ci_failures = [
+        {
+            "name": "timeout-job-a",
+            "conclusion": "TIMED_OUT",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/77777/job/1",
+        },
+        {
+            "name": "timeout-job-b",
+            "conclusion": "TIMED_OUT",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/77777/job/2",
+        },
+    ]
+    pr_state = _make_pr_state(number=905, ci_failures=ci_failures)
+
+    publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # rerun_workflow called exactly once despite two checks
+    gh_mock.rerun_workflow.assert_called_once()
+
+
+def test_all_transient_graceful_on_rerun_failure(gh_mock, fake_redis_client):
+    """If rerun_workflow raises, publish_fix_task still returns None without
+    crashing (the transient retry is still counted)."""
+    from orcest.orchestrator.gh import GhCliError
+    from orcest.orchestrator.pr_ops import get_transient_attempt_count
+
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "timeout"
+    gh_mock.rerun_workflow.side_effect = GhCliError("gh run rerun failed")
+
+    ci_failures = _make_transient_ci_failures([99001])
+    pr_state = _make_pr_state(number=906, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Still returns None (no Claude task)
+    assert result is None
+    # Transient counter was still incremented
+    assert get_transient_attempt_count(fake_redis_client, 906, "abc123") == 1
+    # No task in stream
+    assert len(fake_redis_client.client.xrange("tasks:claude")) == 0
+
+
+def test_no_ci_failures_not_transient_path(gh_mock, fake_redis_client):
+    """With no CI failures (review-only fix), the transient path is not triggered."""
+    _setup_gh_defaults(gh_mock)
+    threads = _make_sample_threads()
+    pr_state = _make_pr_state(number=907, ci_failures=[], review_threads=threads)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # Review-only fix: Claude task created normally
+    assert isinstance(result, Task)
+    gh_mock.rerun_workflow.assert_not_called()
