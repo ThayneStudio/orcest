@@ -444,6 +444,26 @@ def discover_actionable_prs(
             )
             continue
 
+        # Skip if total cross-SHA attempt limit exceeded (circuit breaker).
+        # Check this before the usage cooldown so the circuit-breaker state is
+        # visible immediately rather than being masked for 30 minutes.
+        total_attempts = get_total_attempt_count(redis, number)
+        if total_attempts >= max_total_attempts:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).
         if has_usage_exhausted_cooldown(redis, number):
@@ -461,38 +481,6 @@ def discover_actionable_prs(
                 )
             )
             continue
-
-        # Skip if total cross-SHA attempt limit exceeded (circuit breaker).
-        # Exception: if we already posted the exhausted-budget notification and the
-        # needs-human label is now absent, the human deliberately removed it to
-        # approve a retry — reset the counter and let the PR proceed normally.
-        total_attempts = get_total_attempt_count(redis, number)
-        if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, number):
-                # Human removed the needs-human label → retry approved; reset counters.
-                logger.info(
-                    "PR #%d: needs-human label removed after exhaustion — resetting "
-                    "total attempts counter for human-approved retry",
-                    number,
-                )
-                clear_total_attempts(redis, number)
-                clear_exhausted_notified(redis, number)
-                # Fall through to normal processing below.
-            else:
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
-                )
-                continue
 
         # Skip if previously attempted on this SHA (awaiting new commits)
         # or max attempts reached.
