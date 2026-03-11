@@ -265,7 +265,7 @@ def _poll_cycle(
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
-                publish_fix_task(
+                result = publish_fix_task(
                     pr_state=pr_state,
                     repo=config.github.repo,
                     token=config.github.token,
@@ -273,7 +273,8 @@ def _poll_cycle(
                     default_runner=config.default_runner,
                     logger=logger,
                 )
-                enqueued += 1
+                if result is not None:
+                    enqueued += 1
             except Exception as e:
                 logger.error(
                     "Failed to publish fix task for PR #%d: %s",
