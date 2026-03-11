@@ -219,6 +219,24 @@ def clear_review_retrigger(redis: RedisClient, pr_number: int) -> None:
     redis.client.delete(_make_review_retrigger_key(pr_number))
 
 
+def _make_stale_retrigger_key(pr_number: int) -> str:
+    """Redis key for tracking stale-check re-trigger per PR."""
+    return f"pr:{pr_number}:stale_retrigger"
+
+
+def get_stale_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
+    """Get the SHA for which stale checks were already re-triggered, or None."""
+    val: str | None = cast(str | None, redis.client.get(_make_stale_retrigger_key(pr_number)))
+    return val
+
+
+def set_stale_retrigger_sha(
+    redis: RedisClient, pr_number: int, head_sha: str, ex: int
+) -> None:
+    """Record that we re-triggered stale checks for this SHA. Expires after ``ex`` seconds."""
+    redis.client.set(_make_stale_retrigger_key(pr_number), head_sha, ex=ex)
+
+
 def _parse_iso_timestamp(ts: str | None) -> datetime | None:
     """Parse an ISO 8601 timestamp string into a timezone-aware datetime.
 
@@ -245,6 +263,9 @@ def _check_stale_pending(ci_pending: list[dict], timeout_seconds: int) -> tuple[
     A check without a parseable ``startedAt``/``createdAt`` timestamp is
     treated as non-stale (conservative: avoids spurious re-triggers).
     """
+    if not ci_pending:
+        return False, []
+
     now = datetime.now(timezone.utc)
 
     for check in ci_pending:
