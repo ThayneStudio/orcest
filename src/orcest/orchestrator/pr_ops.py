@@ -447,6 +447,12 @@ def discover_actionable_prs(
         # Skip if total cross-SHA attempt limit exceeded (circuit breaker).
         # Check this before the usage cooldown so the circuit-breaker state is
         # visible immediately rather than being masked for 30 minutes.
+        #
+        # Note: the human-override path (resetting counters when the needs-human
+        # label was removed) was removed in PR #330. It was fragile — the label
+        # could be removed by accident or by another automation — and provided no
+        # reliable signal of deliberate human intent. PRs that hit this limit now
+        # require direct Redis intervention: `del pr:<n>:total_attempts`.
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
             results.append(
