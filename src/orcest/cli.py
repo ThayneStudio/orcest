@@ -7,6 +7,7 @@ import sys
 from typing import TYPE_CHECKING
 
 import click
+import redis as redis_lib
 from rich.console import Console
 from rich.table import Table
 
@@ -116,8 +117,6 @@ def status(redis_host: str | None, config: str, once: bool, interval: float) -> 
 
 def _status_once(redis: RedisClient) -> None:
     """Print system status once and exit (original behavior)."""
-    import redis as redis_lib
-
     console = Console(file=sys.stdout)
     client = redis.client
 
@@ -292,8 +291,6 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
     if not replay:
         return
-
-    import redis as redis_lib
 
     replayed = 0
     errors = 0
