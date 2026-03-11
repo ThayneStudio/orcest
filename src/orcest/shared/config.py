@@ -67,6 +67,8 @@ class OrchestratorConfig:
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
     max_total_attempts: int = 10  # Max total attempts across all SHAs (circuit breaker)
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
+    # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
+    stale_pending_timeout_seconds: int = 7200
 
 
 @dataclass
@@ -233,6 +235,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         rollback_command=str(deployment_raw.get("rollback_command", "")),
     )
 
+    # Seconds a pending check can be stuck before being re-triggered (default 2 hours)
+    stale_pending_timeout_seconds = _safe_int(
+        raw.get("stale_pending_timeout_seconds", 7200), "stale_pending_timeout_seconds"
+    )
+    if stale_pending_timeout_seconds <= 0:
+        raise ValueError(
+            f"Config field 'stale_pending_timeout_seconds' must be a positive integer, "
+            f"got {stale_pending_timeout_seconds!r}."
+        )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -243,6 +255,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         max_attempts=max_attempts,
         max_total_attempts=max_total_attempts,
         delete_branch_on_merge=delete_branch_on_merge,
+        stale_pending_timeout_seconds=stale_pending_timeout_seconds,
     )
 
     # Validate required fields

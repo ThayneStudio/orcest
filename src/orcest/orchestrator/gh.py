@@ -185,6 +185,25 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
     )
 
 
+def cancel_workflow(repo: str, run_id: int, token: str) -> None:
+    """Cancel a GitHub Actions workflow run.
+
+    Used before re-triggering a stale in-progress run, since ``gh run rerun``
+    requires the run to be in a completed state.
+    """
+    _validate_repo(repo)
+    _run_gh(
+        [
+            "run",
+            "cancel",
+            str(run_id),
+            "--repo",
+            repo,
+        ],
+        token,
+    )
+
+
 def rerun_workflow(repo: str, run_id: int, token: str) -> None:
     """Re-run a GitHub Actions workflow run.
 
