@@ -441,9 +441,9 @@ def _poll_cycle(
                             gh.post_comment(
                                 config.github.repo,
                                 pr_state.number,
-                                f"**orcest** detected CI checks stuck in pending state for more than "
-                                f"{config.stale_pending_timeout_seconds // 3600}h. "
-                                f"Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
+                                f"**orcest** detected CI checks stuck in pending state for"
+                                f" more than {config.stale_pending_timeout_seconds // 3600}h."
+                                f" Re-triggering {len(run_ids)} workflow run(s) to self-heal.",
                                 config.github.token,
                             )
                         except Exception as e:
