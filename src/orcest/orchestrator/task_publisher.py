@@ -245,9 +245,7 @@ def publish_fix_task(
     if failure_summaries and all(
         s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
     ):
-        transient_count = increment_transient_attempts(
-            redis, pr_state.number, pr_state.head_sha
-        )
+        transient_count = increment_transient_attempts(redis, pr_state.number, pr_state.head_sha)
         if transient_count <= _MAX_TRANSIENT_RETRIES:
             _log.info(
                 "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",

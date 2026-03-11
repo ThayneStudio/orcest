@@ -1232,9 +1232,7 @@ def test_all_transient_failures_retrigger_ci_not_enqueue(gh_mock, fake_redis_cli
     assert len(entries) == 0
 
 
-def test_all_transient_failures_does_not_increment_main_attempts(
-    gh_mock, fake_redis_client
-):
+def test_all_transient_failures_does_not_increment_main_attempts(gh_mock, fake_redis_client):
     """All-transient path does not increment the main per-SHA attempt counter."""
     from orcest.orchestrator.pr_ops import get_attempt_count
 
