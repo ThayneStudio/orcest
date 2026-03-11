@@ -14,7 +14,13 @@ from orcest.orchestrator.loop import (
     _consume_results,
     _poll_cycle,
 )
-from orcest.orchestrator.pr_ops import PRAction, PRState, get_exhausted_notified
+from orcest.orchestrator.pr_ops import (
+    PRAction,
+    PRState,
+    get_exhausted_notified,
+    get_total_attempt_count,
+    increment_total_attempts,
+)
 from orcest.shared.models import ResultStatus, TaskResult
 
 
@@ -155,6 +161,9 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    # Pre-populate total_attempts so we can verify it is cleared on merge
+    increment_total_attempts(fake_redis_client, 40)
+    assert get_total_attempt_count(fake_redis_client, 40) == 1
 
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, logger)
@@ -169,6 +178,8 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     gh_mock.post_comment.assert_called_once()
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "merged" in comment_body
+    # Critical invariant: total_attempts must be cleared when PR is merged
+    assert get_total_attempt_count(fake_redis_client, 40) == 0
 
 
 def test_poll_cycle_merge_failure_labels_needs_human(
@@ -329,6 +340,32 @@ def test_consume_results_completed(fake_redis_client, orchestrator_config, gh_mo
     # No label operations
     gh_mock.remove_label.assert_not_called()
     gh_mock.add_label.assert_not_called()
+
+
+def test_consume_results_completed_does_not_clear_total_attempts(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A COMPLETED result must NOT clear total_attempts.
+
+    total_attempts is the cross-SHA circuit-breaker counter and should only be
+    reset when the PR is truly resolved (merged), not on intermediate successes.
+    Regression test for the bug fixed in #313.
+    """
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    # Pre-populate the cross-SHA counter to simulate prior attempts
+    increment_total_attempts(fake_redis_client, 42)
+    increment_total_attempts(fake_redis_client, 42)
+    assert get_total_attempt_count(fake_redis_client, 42) == 2
+
+    result = _make_task_result(status=ResultStatus.COMPLETED, pr_number=42)
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # total_attempts must still be non-zero after an intermediate task success
+    assert get_total_attempt_count(fake_redis_client, 42) == 2
 
 
 def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock):
