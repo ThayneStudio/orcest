@@ -95,8 +95,12 @@ def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
 
         separator = "\n... (middle of log omitted) ...\n"
         early_budget = min(len(early_section), max_len // 2)
-        tail_budget = max_len - early_budget - len(separator)
-        return early_section[:early_budget] + separator + log_text[-tail_budget:]
+        tail_budget = max(0, max_len - early_budget - len(separator))
+        return (
+            early_section[:early_budget] + separator + log_text[-tail_budget:]
+            if tail_budget > 0
+            else early_section[:early_budget]
+        )
 
     # Default: return the tail (errors are usually at the end of CI logs)
     return log_text[-max_len:]
@@ -698,7 +702,7 @@ def _render_fix_prompt(
                     excerpt = _extract_relevant_log_sections(log_text, max_len)
                     if len(log_text) > max_len:
                         excerpt = (
-                            f"... (truncated, showing {max_len} of {len(log_text)} chars)\n"
+                            f"... (truncated, showing {len(excerpt)} of {len(log_text)} chars)\n"
                             + excerpt
                         )
                     sections.append("")
