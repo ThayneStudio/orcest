@@ -193,8 +193,6 @@ class RedisClient:
         # narrow to list[dict[str, Any]].  In practice the command always returns
         # a list, but we keep this guard to handle unexpected responses from custom
         # Redis proxies or future library changes without raising an AttributeError.
-        # If mypy is run under stricter settings, suppress the redundant isinstance
-        # warning on the line below with: # type: ignore[misc]
         if not isinstance(groups, list):
             logger.warning(
                 "xinfo_groups returned unexpected type %s for stream %r",
