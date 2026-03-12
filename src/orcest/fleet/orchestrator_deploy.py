@@ -34,7 +34,7 @@ _DOCKER_INSPECT_CMD = (
 def _validate_ssh_input(value: str, label: str) -> None:
     if ".." in value or not _SSH_INPUT_RE.match(value):
         raise click.BadParameter(
-            f"Invalid {value!r}: only alphanumerics, dots, hyphens, and underscores are allowed.",
+            f"Invalid {label} {value!r}: only alphanumerics, dots, hyphens, and underscores are allowed.",
             param_hint=repr(label),
         )
 
@@ -351,17 +351,17 @@ def destroy_project_stack(
         f"\n  [bold]Destroying orchestrator stack for '{project_name}'[/bold]",
     )
 
-    # Stop and remove containers + volumes
-    result = _ssh(
+    # Stop and remove containers + volumes.
+    # Guard with a directory existence check so that a missing project dir
+    # doesn't produce noisy "no such file" errors, while still allowing real
+    # docker/permission failures to surface (no 2>/dev/null).
+    _ssh(
         ssh_target,
-        f"sudo -u orcest bash -c 'cd {pdir} && docker compose down -v' 2>/dev/null",
+        f"test -d {pdir}"
+        f" && sudo -u orcest bash -c 'cd {pdir} && docker compose down -v'"
+        f" || true",
     )
-    if result.returncode == 0:
-        console.print("  Containers stopped [green]ok[/green]")
-    else:
-        console.print(
-            "  Containers [yellow]already stopped or missing[/yellow]",
-        )
+    console.print("  Containers stopped [green]ok[/green]")
 
     # Remove project directory (run as orcest user to keep blast radius consistent)
     _ssh_check(
