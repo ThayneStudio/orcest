@@ -144,8 +144,7 @@ def test_next_redis_port():
 
     # Full range exhausted: returns 6400 (caller enforces the cap)
     all_ports = [
-        ProjectEntry(name=f"p{i}", repo=f"Org/p{i}", redis_port=6379 + i)
-        for i in range(21)
+        ProjectEntry(name=f"p{i}", repo=f"Org/p{i}", redis_port=6379 + i) for i in range(21)
     ]
     full = FleetInventory(projects=all_ports)
     assert full.next_redis_port() == 6400
