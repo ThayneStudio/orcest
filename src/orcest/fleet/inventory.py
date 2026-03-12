@@ -59,10 +59,17 @@ class FleetInventory:
         return None
 
     def next_redis_port(self) -> int:
-        """Return the next available Redis port (max existing + 1, or 6379)."""
-        if not self.projects:
-            return 6379
-        return max(p.redis_port for p in self.projects) + 1
+        """Return the lowest available Redis port in the range [6379, 6399].
+
+        Scans for gaps left by destroyed projects so ports are reused rather
+        than allocated monotonically.  Returns 6400 when the range is
+        exhausted (the caller in ``cli.py`` enforces the upper-bound check).
+        """
+        used = {p.redis_port for p in self.projects}
+        for port in range(6379, 6400):
+            if port not in used:
+                return port
+        return 6400
 
     def next_vm_id(self) -> int:
         """Return the next available VM ID (max existing + 1, or 200)."""

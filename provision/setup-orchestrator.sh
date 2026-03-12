@@ -60,10 +60,10 @@ sudo chown -R orcest:orcest "$ORCEST_DIR"
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# Open Redis port if ufw is active (workers connect to 6379)
+# Open Redis port range if ufw is active (workers connect on per-project ports)
 if command -v ufw &>/dev/null && sudo ufw status | grep -q "Status: active"; then
-    echo "Opening Redis port 6379..."
-    sudo ufw allow 6379/tcp
+    echo "Opening Redis port range 6379-6399..."
+    sudo ufw allow 6379:6399/tcp
 fi
 
 # Verify
