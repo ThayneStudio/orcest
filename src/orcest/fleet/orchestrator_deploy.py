@@ -285,10 +285,13 @@ def deploy_project_stack(
         console,
     )
 
-    # Validate tokens do not contain newlines (would produce a malformed .env).
-    if "\n" in github_token or "\n" in claude_token:
+    # Validate tokens do not contain characters that corrupt the .env file:
+    # - newlines produce a malformed .env
+    # - '#' is a comment delimiter in docker compose .env parsing and would
+    #   silently truncate the token value
+    if any(c in token for token in (github_token, claude_token) for c in ("\n", "#")):
         raise click.BadParameter(
-            "Token must not contain newlines.",
+            "Token must not contain newlines or '#'.",
             param_hint="'github_token' / 'claude_token'",
         )
 
@@ -353,14 +356,21 @@ def destroy_project_stack(
     )
 
     # Stop and remove containers + volumes.
-    # Guard with a directory existence check so that a missing project dir
-    # doesn't produce noisy "no such file" errors, while still allowing real
-    # docker/permission failures to surface (no 2>/dev/null).
-    _ssh(
+    # A missing project dir is not an error (idempotent destroy); real docker
+    # failures are surfaced so the caller knows containers may still be running.
+    result = _ssh(
         ssh_target,
-        f"test -d {pdir} && sudo -u orcest bash -c 'cd {pdir} && docker compose down -v' || true",
+        f"if [ -d {pdir} ]; then sudo -u orcest bash -c 'cd {pdir} && docker compose down -v'; fi",
     )
-    console.print("  Containers stopped [green]ok[/green]")
+    if result.returncode != 0:
+        console.print(
+            "  [yellow]Warning: docker compose down failed"
+            " — containers may still be running.[/yellow]"
+        )
+        if result.stderr.strip():
+            console.print(f"    {result.stderr.strip()}")
+    else:
+        console.print("  Containers stopped [green]ok[/green]")
 
     # Remove project directory (run as orcest user to keep blast radius consistent)
     _ssh_check(
