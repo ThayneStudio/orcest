@@ -896,7 +896,8 @@ def discover_actionable_prs(
                         )
                     )
                 else:
-                    # No claude-review check found — normal SKIP_GREEN
+                    # No actionable claude-review run (absent, not SUCCESS, or missing run URL)
+                    # — normal SKIP_GREEN
                     results.append(
                         PRState(
                             number=number,
