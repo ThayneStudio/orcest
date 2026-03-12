@@ -28,9 +28,26 @@ jobs:
           fi
 
       - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        # We use a manual git checkout instead of actions/checkout@v4 because
+        # self-hosted runners may have a pre-existing GITHUB_WORKSPACE directory
+        # that causes actions/checkout to fail with permission or dirty-state
+        # errors.  The manual approach is resilient: it re-initialises the repo
+        # in place and fetches only the PR tip (--depth 1) to minimise data
+        # transferred.
+        #
+        # Note: only the PR head ref is fetched here; origin/<base-branch> is
+        # NOT available locally.  The claude-code-action review step relies on
+        # `gh pr diff` (API-based) rather than local git operations, so the
+        # missing base ref is not a problem in practice.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" init -q 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote remove origin 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote add origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head"
+          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
 
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1

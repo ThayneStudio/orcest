@@ -110,11 +110,22 @@ def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> st
     return f"pending:{resource_type}:{repo}:{resource_id}"
 
 
-# Pending-task marker TTL: RunnerConfig defaults (timeout × max_retries) + 5-min buffer.
-# Much tighter than the previous 7200 s (2 h), bounding the crash-orphaned-marker window.
-_rc = RunnerConfig()
-_PENDING_TASK_TTL = _rc.timeout * _rc.max_retries + 300
-del _rc
+def compute_pending_task_ttl(runner_config: RunnerConfig) -> int:
+    """Compute the pending-task marker TTL from a live RunnerConfig.
+
+    TTL = timeout × max_retries + 5-minute buffer.  This bounds the
+    crash-orphaned-marker window to the actual worst-case runner duration.
+    Callers with a loaded config should use this instead of the module-level
+    fallback constant so that non-default timeout/max_retries values are
+    reflected in the TTL.
+    """
+    return runner_config.timeout * runner_config.max_retries + 300
+
+
+# Fallback TTL computed from RunnerConfig *defaults*.  Used as the default
+# argument for set_pending_task; callers that have a live RunnerConfig should
+# pass compute_pending_task_ttl(runner_config) instead.
+_PENDING_TASK_TTL = compute_pending_task_ttl(RunnerConfig())
 
 
 def set_pending_task(

@@ -2,8 +2,10 @@
 
 import pytest
 
+from orcest.shared.config import RunnerConfig
 from orcest.shared.coordination import (
     RedisLock,
+    compute_pending_task_ttl,
     make_issue_lock_key,
     make_pr_lock_key,
 )
@@ -114,3 +116,17 @@ def test_context_manager_releases_on_exception(fake_redis_client):
     assert lock.is_held is False
     # Key should be gone — a new lock can acquire immediately
     assert RedisLock(fake_redis_client, "test-lock").acquire() is True
+
+
+def test_compute_pending_task_ttl_uses_runner_values():
+    """compute_pending_task_ttl returns timeout × max_retries + 300."""
+    rc = RunnerConfig(timeout=1800, max_retries=3)
+    assert compute_pending_task_ttl(rc) == 1800 * 3 + 300
+
+
+def test_compute_pending_task_ttl_reflects_non_default_values():
+    """Non-default timeout/max_retries produce a larger TTL than the default constant."""
+    rc = RunnerConfig(timeout=3600, max_retries=5)
+    ttl = compute_pending_task_ttl(rc)
+    assert ttl == 3600 * 5 + 300
+    assert ttl > compute_pending_task_ttl(RunnerConfig())
