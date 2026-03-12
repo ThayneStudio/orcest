@@ -18,22 +18,17 @@ from rich.console import Console
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
-_DOCKER_BUILD_CMD = (
-    "sudo -u orcest docker build"
-    " -t orcest-orchestrator:latest /opt/orcest/"
-)
+_DOCKER_BUILD_CMD = "sudo -u orcest docker build -t orcest-orchestrator:latest /opt/orcest/"
 
 _DOCKER_INSPECT_CMD = (
-    "sudo -u orcest docker image inspect"
-    " orcest-orchestrator:latest >/dev/null 2>&1"
+    "sudo -u orcest docker image inspect orcest-orchestrator:latest >/dev/null 2>&1"
 )
 
 
 def _validate_ssh_input(value: str, label: str) -> None:
     if not _SSH_INPUT_RE.match(value):
         raise click.BadParameter(
-            f"Invalid {value!r}: only alphanumerics, dots,"
-            " hyphens, and underscores are allowed.",
+            f"Invalid {value!r}: only alphanumerics, dots, hyphens, and underscores are allowed.",
             param_hint=repr(label),
         )
 
@@ -47,7 +42,10 @@ def _ssh(target: str, cmd: str) -> subprocess.CompletedProcess[str]:
 
 
 def _ssh_check(
-    target: str, cmd: str, description: str, console: Console,
+    target: str,
+    cmd: str,
+    description: str,
+    console: Console,
 ) -> None:
     """Run an SSH command, print status, and exit on failure."""
     console.print(f"  {description}...", end=" ")
@@ -142,13 +140,17 @@ def render_orchestrator_config(repo: str) -> str:
 
 
 def _ensure_image(
-    ssh_target: str, console: Console, *, force: bool,
+    ssh_target: str,
+    console: Console,
+    *,
+    force: bool,
 ) -> None:
     """Build the orchestrator image if missing (or forced)."""
     if force:
         console.print("  Rebuilding orcest-orchestrator image...")
         result = subprocess.run(
-            ["ssh", ssh_target, _DOCKER_BUILD_CMD], text=True,
+            ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+            text=True,
         )
         if result.returncode != 0:
             console.print("  Image build [red]failed[/red]")
@@ -162,7 +164,8 @@ def _ensure_image(
             "  Building orcest-orchestrator image (first time)...",
         )
         build_result = subprocess.run(
-            ["ssh", ssh_target, _DOCKER_BUILD_CMD], text=True,
+            ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+            text=True,
         )
         if build_result.returncode != 0:
             console.print("  Image build [red]failed[/red]")
@@ -190,8 +193,7 @@ def deploy_project_stack(
     pdir = f"/opt/orcest/projects/{project_name}"
 
     console.print(
-        f"\n  [bold]Deploying orchestrator stack"
-        f" for '{project_name}'[/bold]",
+        f"\n  [bold]Deploying orchestrator stack for '{project_name}'[/bold]",
     )
 
     _ensure_image(ssh_target, console, force=rebuild_image)
@@ -228,8 +230,7 @@ def deploy_project_stack(
     env_content = f"GITHUB_TOKEN={github_token}"
     _ssh_check(
         ssh_target,
-        f"sudo -u orcest bash -c 'umask 077 && "
-        f"cat > {pdir}/.env << ENVEOF\n{env_content}\nENVEOF'",
+        f"sudo -u orcest bash -c 'umask 077 && cat > {pdir}/.env << ENVEOF\n{env_content}\nENVEOF'",
         "Writing .env",
         console,
     )
@@ -240,8 +241,7 @@ def deploy_project_stack(
     # Start the stack
     _ssh_check(
         ssh_target,
-        f"sudo -u orcest bash -c"
-        f" 'cd {pdir} && docker compose up -d'",
+        f"sudo -u orcest bash -c 'cd {pdir} && docker compose up -d'",
         "Starting containers",
         console,
     )
@@ -250,8 +250,7 @@ def deploy_project_stack(
     console.print("  Verifying Redis...", end=" ")
     result = _ssh(
         ssh_target,
-        f"sudo -u orcest bash -c"
-        f" 'cd {pdir} && docker compose exec -T redis redis-cli ping'",
+        f"sudo -u orcest bash -c 'cd {pdir} && docker compose exec -T redis redis-cli ping'",
     )
     if result.stdout.strip() == "PONG":
         console.print("[green]PONG[/green]")
@@ -277,15 +276,13 @@ def destroy_project_stack(
     pdir = f"/opt/orcest/projects/{project_name}"
 
     console.print(
-        f"\n  [bold]Destroying orchestrator stack"
-        f" for '{project_name}'[/bold]",
+        f"\n  [bold]Destroying orchestrator stack for '{project_name}'[/bold]",
     )
 
     # Stop and remove containers + volumes
     result = _ssh(
         ssh_target,
-        f"sudo -u orcest bash -c"
-        f" 'cd {pdir} && docker compose down -v' 2>/dev/null",
+        f"sudo -u orcest bash -c 'cd {pdir} && docker compose down -v' 2>/dev/null",
     )
     if result.returncode == 0:
         console.print("  Containers stopped [green]ok[/green]")
@@ -317,7 +314,8 @@ def rebuild_image(host: str, user: str, console: Console) -> None:
         "\n  [bold]Rebuilding orcest-orchestrator image[/bold]",
     )
     result = subprocess.run(
-        ["ssh", ssh_target, _DOCKER_BUILD_CMD], text=True,
+        ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+        text=True,
     )
     if result.returncode != 0:
         console.print("  Image build [red]failed[/red]")

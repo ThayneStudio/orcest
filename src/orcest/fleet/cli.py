@@ -36,7 +36,8 @@ def fleet() -> None:
     help="Claude OAuth token.",
 )
 @click.option(
-    "--rebuild-image", is_flag=True,
+    "--rebuild-image",
+    is_flag=True,
     help="Force rebuild of the orchestrator Docker image.",
 )
 def onboard(
@@ -399,10 +400,7 @@ def update(inventory: str, github_token: str, claude_token: str, rebuild_image: 
             console.print(f"  Restarting orchestrator stack for '{project.name}'...", end=" ")
             import subprocess
 
-            cmd = (
-                f"sudo -u orcest bash -c"
-                f" 'cd {project_dir} && docker compose up -d'"
-            )
+            cmd = f"sudo -u orcest bash -c 'cd {project_dir} && docker compose up -d'"
             result = subprocess.run(
                 ["ssh", ssh_target, cmd],
                 capture_output=True,
