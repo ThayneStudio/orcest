@@ -18,7 +18,10 @@ from rich.console import Console
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
-_SSH_OPTS = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+# StrictHostKeyChecking=yes requires known_hosts to be pre-populated (e.g. via
+# ssh-keyscan during provisioning) but prevents MITM on initial connection when
+# writing secrets to the remote host.
+_SSH_OPTS = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
 
 _DOCKER_BUILD_CMD = "sudo -u orcest docker build -t orcest-orchestrator:latest /opt/orcest/"
 
@@ -180,10 +183,14 @@ def _ensure_image(
         console.print("  Rebuilding orcest-orchestrator image...")
         result = subprocess.run(
             ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
+            capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             console.print("  Image build [red]failed[/red]")
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                console.print(f"    {output}")
             sys.exit(1)
         console.print("  Image build [green]ok[/green]")
         return
@@ -195,10 +202,14 @@ def _ensure_image(
         )
         build_result = subprocess.run(
             ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
+            capture_output=True,
             text=True,
         )
         if build_result.returncode != 0:
             console.print("  Image build [red]failed[/red]")
+            output = (build_result.stdout + build_result.stderr).strip()
+            if output:
+                console.print(f"    {output}")
             sys.exit(1)
         console.print("  Image build [green]ok[/green]")
 
@@ -371,9 +382,13 @@ def rebuild_image(host: str, user: str, console: Console) -> None:
     )
     result = subprocess.run(
         ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
+        capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         console.print("  Image build [red]failed[/red]")
+        output = (result.stdout + result.stderr).strip()
+        if output:
+            console.print(f"    {output}")
         sys.exit(1)
     console.print("  Image rebuild [green]ok[/green]")
