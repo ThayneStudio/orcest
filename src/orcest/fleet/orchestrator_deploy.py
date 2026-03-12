@@ -59,6 +59,34 @@ def _ssh_check(
     console.print("[green]ok[/green]")
 
 
+def _ssh_stdin_check(
+    target: str,
+    cmd: str,
+    stdin_data: str,
+    description: str,
+    console: Console,
+) -> None:
+    """Run an SSH command with stdin input, print status, and exit on failure.
+
+    Use this when secret values must be delivered via stdin rather than
+    embedded in the shell command string.
+    """
+    console.print(f"  {description}...", end=" ")
+    result = subprocess.run(
+        ["ssh", target, cmd],
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print("[red]failed[/red]")
+        stderr = result.stderr.strip()
+        if stderr:
+            console.print(f"    {stderr}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+
 def _ufw_cmd(action: str, port: int) -> str:
     """Build a ufw command that only runs if ufw is active."""
     return (
@@ -226,12 +254,13 @@ def deploy_project_stack(
         console,
     )
 
-    # Write .env (contains secrets, restrict permissions)
-    # Use printf to avoid heredoc variable/command expansion issues.
-    env_cmd = f'printf "%s\\n" "GITHUB_TOKEN={github_token}" > {pdir}/.env'
-    _ssh_check(
+    # Write .env (contains secrets, restrict permissions).
+    # Pass token via stdin so it never enters the shell command string,
+    # avoiding any risk of injection if the token contains shell metacharacters.
+    _ssh_stdin_check(
         ssh_target,
-        f"sudo -u orcest bash -c 'umask 077 && {env_cmd}'",
+        f"sudo -u orcest bash -c 'umask 077 && cat > {pdir}/.env'",
+        f"GITHUB_TOKEN={github_token}\n",
         "Writing .env",
         console,
     )
@@ -302,6 +331,26 @@ def destroy_project_stack(
 
     # Close firewall port if ufw is active
     _ssh(ssh_target, _ufw_cmd("delete allow", redis_port))
+
+
+def restart_project_stack(
+    ssh_target: str,
+    project_name: str,
+    console: Console,
+) -> None:
+    """Restart a per-project orchestrator stack (docker compose up -d)."""
+    _validate_ssh_input(project_name, "project_name")
+    pdir = f"/opt/orcest/projects/{project_name}"
+    console.print(f"  Restarting orchestrator stack for '{project_name}'...", end=" ")
+    result = subprocess.run(
+        ["ssh", ssh_target, f"sudo -u orcest bash -c 'cd {pdir} && docker compose up -d'"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        console.print("[green]ok[/green]")
+    else:
+        console.print("[yellow]failed (stack may not exist yet)[/yellow]")
 
 
 def rebuild_image(host: str, user: str, console: Console) -> None:

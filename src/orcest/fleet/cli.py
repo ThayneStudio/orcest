@@ -392,24 +392,12 @@ def update(inventory: str, github_token: str, claude_token: str, rebuild_image: 
     # Rebuild orchestrator image and restart stacks if requested
     if rebuild_image and inv.orchestrator_host:
         from orcest.fleet.orchestrator_deploy import rebuild_image as _rebuild_image
+        from orcest.fleet.orchestrator_deploy import restart_project_stack
 
         _rebuild_image(inv.orchestrator_host, inv.orchestrator_user, console)
         ssh_target = f"{inv.orchestrator_user}@{inv.orchestrator_host}"
-        import subprocess
-
         for project in inv.projects:
-            project_dir = f"/opt/orcest/projects/{project.name}"
-            console.print(f"  Restarting orchestrator stack for '{project.name}'...", end=" ")
-            cmd = f"sudo -u orcest bash -c 'cd {project_dir} && docker compose up -d'"
-            result = subprocess.run(
-                ["ssh", ssh_target, cmd],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                console.print("[green]ok[/green]")
-            else:
-                console.print("[yellow]failed (stack may not exist yet)[/yellow]")
+            restart_project_stack(ssh_target, project.name, console)
 
     from orcest.fleet.proxmox import ProxmoxClient
 
