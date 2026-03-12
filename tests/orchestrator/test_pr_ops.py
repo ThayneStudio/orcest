@@ -1293,6 +1293,118 @@ def test_exhausted_notified_helpers(fake_redis_client):
     assert not get_exhausted_notified(fake_redis_client, pr_number)
 
 
+def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
+    gh_mock, fake_redis_client, label_config
+):
+    """SKIP_LABELED with needs-human present and exhausted_notified set refreshes the flag TTL.
+
+    This prevents the TTL cliff: without the refresh, the 30-day flag TTL can
+    expire while the needs-human label is still present (because SKIP_LABELED
+    fires before the circuit breaker, never triggering a refresh). When the
+    human eventually removes the label, the recovery branch would silently miss
+    and the circuit breaker would re-fire instead.
+    """
+    pr_number = 761
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[{"name": label_config.needs_human}]),
+    ]
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+    set_exhausted_notified(fake_redis_client, pr_number)
+
+    # Manually shorten the TTL to simulate approaching expiry.
+    key = f"pr:{pr_number}:exhausted_notified"
+    fake_redis_client.client.expire(key, 60)  # 60 seconds remaining
+    ttl_before = fake_redis_client.client.ttl(key)
+    assert ttl_before == 60
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_LABELED
+    # Flag must still be set and TTL must have been reset to the full 30-day window.
+    assert get_exhausted_notified(fake_redis_client, pr_number)
+    ttl_after = fake_redis_client.client.ttl(key)
+    assert ttl_after > 24 * 3600  # reset to ~30-day window, not just any increase
+
+
+def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
+    gh_mock, fake_redis_client, label_config
+):
+    """SKIP_LABELED with blocked label does NOT refresh exhausted_notified.
+
+    The TTL refresh is specific to the needs-human label, which is the recovery
+    signal. A blocked PR is in a different state; we should not touch the flag.
+    """
+    pr_number = 762
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[{"name": label_config.blocked}]),
+    ]
+    set_exhausted_notified(fake_redis_client, pr_number)
+
+    key = f"pr:{pr_number}:exhausted_notified"
+    fake_redis_client.client.expire(key, 60)
+    ttl_before = fake_redis_client.client.ttl(key)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_LABELED
+    # TTL must NOT have been refreshed.
+    ttl_after = fake_redis_client.client.ttl(key)
+    assert ttl_after <= ttl_before
+
+
+def test_recovery_also_clears_per_sha_attempts(gh_mock, fake_redis_client, label_config):
+    """Recovery path clears per-SHA attempt counter as well as total_attempts.
+
+    If the per-SHA counter were left intact, SKIP_ACTIVE would fire immediately
+    after recovery even though the operator removed the needs-human label expecting
+    a retry, silently stalling the PR until new commits are pushed.
+    """
+    pr_number = 763
+    head_sha = "abc123"
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha=head_sha),
+    ]
+    gh_mock.get_ci_status.return_value = []
+
+    # Seed both counters to their limits.
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+    for _ in range(3):
+        increment_attempts(fake_redis_client, pr_number, head_sha)
+    set_exhausted_notified(fake_redis_client, pr_number)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    # Recovery fired and per-SHA counter was cleared, so the PR re-entered
+    # normal processing (SKIP_NO_CHECKS with empty CI) instead of SKIP_ACTIVE.
+    assert results[0].action == PRAction.SKIP_NO_CHECKS
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
+    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 0
+
+
 # ---------------------------------------------------------------------------
 # Review re-trigger tests
 # ---------------------------------------------------------------------------
