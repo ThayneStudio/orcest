@@ -498,15 +498,15 @@ def discover_actionable_prs(
         # Check this before the usage cooldown so the circuit-breaker state is
         # visible immediately rather than being masked for 30 minutes.
         #
-        # Recovery path: if the exhausted_notified flag is set and the
-        # needs-human label is no longer present, the human has approved a
-        # retry — reset the counters and fall through to normal processing.
-        # The label check is made explicit here (rather than relying solely on
-        # the SKIP_LABELED guard above) so the invariant remains correct even
-        # if the filter ordering is ever changed.
+        # Recovery path: if the exhausted_notified flag is set, the human has
+        # approved a retry by removing the needs-human label — reset the counters
+        # and fall through to normal processing.
+        # Note: the needs-human label guard is *not* checked here because
+        # needs_human is in terminal_labels — any PR still carrying it is
+        # caught by SKIP_LABELED above and never reaches this block.
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, number) and label_config.needs_human not in pr_labels:
+            if get_exhausted_notified(redis, number):
                 # Human removed the needs-human label → retry approved; reset counters.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)

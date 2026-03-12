@@ -1251,7 +1251,13 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
 def test_total_attempts_no_recovery_needs_human_label_present(
     gh_mock, fake_redis_client, label_config
 ):
-    """exhausted_notified=True but needs-human label still present → no recovery, PR is skipped."""
+    """exhausted_notified=True but needs-human label still present → PR is skipped.
+
+    SKIP_LABELED fires first (needs_human is in terminal_labels), so the PR
+    never reaches the circuit-breaker block.  This test documents that invariant:
+    counters are not cleared, and the result is SKIP_LABELED, not
+    SKIP_MAX_TOTAL_ATTEMPTS.
+    """
     pr_number = 751
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[{"name": label_config.needs_human}]),
