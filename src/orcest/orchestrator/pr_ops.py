@@ -509,11 +509,13 @@ def discover_actionable_prs(
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
             if get_exhausted_notified(redis, number):
-                # needs-human label removed → treated as retry approval; reset counters.
+                # exhausted_notified is set and needs-human label is absent (inferred
+                # via SKIP_LABELED invariant above); treat as retry signal and reset.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)
                 logger.info(
-                    "PR #%d: needs-human label removed, resetting attempt counters for retry",
+                    "PR #%d: exhausted_notified set and needs-human label absent"
+                    " (inferred via SKIP_LABELED invariant); resetting attempt counters for retry",
                     number,
                 )
                 # Fall through to normal processing (Redis counters now reset).
