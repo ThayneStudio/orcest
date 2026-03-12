@@ -17,6 +17,7 @@ import click
 from rich.console import Console
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 # StrictHostKeyChecking=yes requires known_hosts to be pre-populated (e.g. via
 # ssh-keyscan during provisioning) but prevents MITM on initial connection when
@@ -230,6 +231,12 @@ def deploy_project_stack(
     _validate_ssh_input(host, "host")
     _validate_ssh_input(user, "user")
     _validate_ssh_input(project_name, "project_name")
+    if not _REPO_RE.match(repo):
+        raise click.BadParameter(
+            f"Invalid repo {repo!r}: expected 'owner/repo' format with alphanumerics, dots,"
+            " hyphens, or underscores.",
+            param_hint="'repo'",
+        )
 
     ssh_target = f"{user}@{host}"
     pdir = f"/opt/orcest/projects/{project_name}"
@@ -248,12 +255,12 @@ def deploy_project_stack(
         console,
     )
 
-    # Write docker-compose.yml
+    # Write docker-compose.yml via stdin to avoid heredoc delimiter injection
     compose = render_project_compose(redis_port)
-    _ssh_check(
+    _ssh_stdin_check(
         ssh_target,
-        f"sudo -u orcest tee {pdir}/docker-compose.yml"
-        f" > /dev/null << 'COMPOSEEOF'\n{compose}COMPOSEEOF",
+        f"sudo -u orcest bash -c 'cat > {pdir}/docker-compose.yml'",
+        compose,
         "Writing docker-compose.yml",
         console,
     )

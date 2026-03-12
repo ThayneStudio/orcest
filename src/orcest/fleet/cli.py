@@ -104,7 +104,8 @@ def onboard(
     console.print(f"  Worker VM ID: {vm_id}")
     console.print(f"  Worker ID: {worker_id}")
 
-    # Add project to inventory
+    # Add project to inventory (not persisted yet — saved only after deploy succeeds
+    # to avoid a partial-deploy state that blocks retry via the duplicate check)
     project = ProjectEntry(
         name=project_name,
         repo=repo,
@@ -112,8 +113,6 @@ def onboard(
         workers=[WorkerEntry(vm_id=vm_id)],
     )
     inv.projects.append(project)
-    save_inventory(inv, inv_path)
-    console.print("  Inventory updated.")
 
     # Deploy orchestrator stack (Redis + orchestrator container)
     deploy_project_stack(
@@ -127,6 +126,11 @@ def onboard(
         console=console,
         rebuild_image=rebuild_image,
     )
+
+    # Persist inventory only after a successful deploy so that a mid-deploy failure
+    # does not block a retry ('orcest fleet destroy <name>' is the recovery path).
+    save_inventory(inv, inv_path)
+    console.print("  Inventory updated.")
 
     # Generate cloud-init user-data for the first worker VM
     userdata = render_worker_userdata(
