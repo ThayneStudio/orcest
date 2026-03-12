@@ -18,7 +18,7 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     increment_transient_attempts,
 )
-from orcest.shared.coordination import set_pending_task
+from orcest.shared.coordination import _PENDING_TASK_TTL, set_pending_task
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -138,6 +138,7 @@ def _publish_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
@@ -155,7 +156,7 @@ def _publish_and_notify(
 
     # Claim the pending-task slot atomically (SET NX EX). If another task
     # is already pending for this PR, skip publish to avoid duplicates.
-    if not set_pending_task(redis, task.repo, "pr", pr_state.number, task.id):
+    if not set_pending_task(redis, task.repo, "pr", pr_state.number, task.id, ttl=pending_task_ttl):
         _log.info(f"Pending task already exists for PR #{pr_state.number}, skipping publish")
         return
 
@@ -189,6 +190,7 @@ def publish_fix_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
@@ -345,6 +347,7 @@ def publish_fix_task(
         token=token,
         redis=redis,
         default_runner=default_runner,
+        pending_task_ttl=pending_task_ttl,
         logger=logger,
     )
 
@@ -357,6 +360,7 @@ def publish_followup_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a triage-followups task for a PR.
@@ -406,6 +410,7 @@ def publish_followup_task(
         token=token,
         redis=redis,
         default_runner=default_runner,
+        pending_task_ttl=pending_task_ttl,
         logger=logger,
     )
 
@@ -419,6 +424,7 @@ def publish_rebase_task(
     redis: RedisClient,
     default_runner: str,
     merge_error: str = "",
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a rebase task for a PR with merge conflicts.
@@ -454,6 +460,7 @@ def publish_rebase_task(
         token=token,
         redis=redis,
         default_runner=default_runner,
+        pending_task_ttl=pending_task_ttl,
         logger=logger,
     )
 
@@ -466,6 +473,7 @@ def publish_issue_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish an implementation task for a GitHub issue.
@@ -499,6 +507,7 @@ def publish_issue_task(
         token=token,
         redis=redis,
         default_runner=default_runner,
+        pending_task_ttl=pending_task_ttl,
         logger=logger,
     )
 
@@ -512,6 +521,7 @@ def _publish_issue_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
+    pending_task_ttl: int = _PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility on the issue."""
@@ -519,7 +529,9 @@ def _publish_issue_and_notify(
     _log = logger or logging.getLogger(__name__)
 
     # Claim the pending-task slot atomically (SET NX EX).
-    if not set_pending_task(redis, task.repo, "issue", issue_state.number, task.id):
+    if not set_pending_task(
+        redis, task.repo, "issue", issue_state.number, task.id, ttl=pending_task_ttl
+    ):
         _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
         return
 

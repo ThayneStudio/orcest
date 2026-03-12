@@ -175,3 +175,31 @@ def test_delete_branch_on_merge_null_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="explicitly set to null"):
         load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_runner_defaults(tmp_path: Path):
+    """OrchestratorConfig.runner uses RunnerConfig defaults when not specified."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.runner.timeout == 1800
+    assert config.runner.max_retries == 3
+
+
+def test_load_orchestrator_config_runner_from_yaml(tmp_path: Path):
+    """OrchestratorConfig.runner reflects values from the YAML runner section."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "runner:\n"
+        "  timeout: 3600\n"
+        "  max_retries: 5\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.runner.timeout == 3600
+    assert config.runner.max_retries == 5

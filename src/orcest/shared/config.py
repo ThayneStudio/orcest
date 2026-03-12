@@ -63,6 +63,11 @@ class OrchestratorConfig:
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
+    # Runner settings used to compute the pending-task marker TTL.  These
+    # should match the timeout/max_retries deployed on worker nodes so that
+    # crash-orphaned markers expire no earlier than the actual worst-case
+    # runner duration.
+    runner: RunnerConfig = field(default_factory=RunnerConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
     max_total_attempts: int = 10  # Max total attempts across all SHAs (circuit breaker)
@@ -207,6 +212,17 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         ready=str(labels_raw.get("ready", "orcest:ready")),
     )
 
+    # Runner config — timeout and max_retries drive the pending-task marker TTL.
+    # These should match the values deployed on worker nodes.
+    runner_raw = _safe_dict(raw, "runner")
+    runner_config = RunnerConfig(
+        type=str(runner_raw.get("type", "claude")),
+        timeout=_safe_int(runner_raw.get("timeout", 1800), "runner.timeout"),
+        max_retries=_safe_int(runner_raw.get("max_retries", 3), "runner.max_retries"),
+        retry_backoff=_safe_int(runner_raw.get("retry_backoff", 10), "runner.retry_backoff"),
+        extra={str(k): str(v) for k, v in _safe_dict(runner_raw, "extra").items()},
+    )
+
     # Default runner backend
     default_runner = str(
         os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude"))
@@ -256,6 +272,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         polling=polling_config,
         labels=labels_config,
         deployment=deployment_config,
+        runner=runner_config,
         default_runner=default_runner,
         max_attempts=max_attempts,
         max_total_attempts=max_total_attempts,
