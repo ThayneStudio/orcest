@@ -526,7 +526,10 @@ def discover_actionable_prs(
                     " resetting total attempt counter for retry",
                     number,
                 )
-                # Fall through to normal processing (Redis counters now reset).
+                # Fall through to normal processing (total_attempts counter now reset).
+                # Note: per-SHA attempt counts (pr:{n}:attempts:{sha}) are NOT cleared here.
+                # If the current SHA is also at its per-SHA limit, SKIP_ACTIVE will fire
+                # and no task will be enqueued until new commits are pushed.
             else:
                 results.append(
                     PRState(
