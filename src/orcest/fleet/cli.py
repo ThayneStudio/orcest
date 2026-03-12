@@ -91,6 +91,12 @@ def onboard(
 
     # Allocate resources
     redis_port = inv.next_redis_port()
+    if redis_port > 6399:
+        console.print(
+            f"[red]Redis port {redis_port} exceeds the allowed range (6379–6399).[/red]\n"
+            "  Remove unused projects or expand the firewall rule before adding more."
+        )
+        sys.exit(1)
     vm_id = inv.next_vm_id()
     worker_id = f"worker-{vm_id}"
 
