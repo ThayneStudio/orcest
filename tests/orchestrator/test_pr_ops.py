@@ -1331,7 +1331,7 @@ def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
     # Flag must still be set and TTL must have been reset to the full 30-day window.
     assert get_exhausted_notified(fake_redis_client, pr_number)
     ttl_after = fake_redis_client.client.ttl(key)
-    assert ttl_after > ttl_before  # TTL was refreshed
+    assert ttl_after > 24 * 3600  # reset to ~30-day window, not just any increase
 
 
 def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(

@@ -522,8 +522,9 @@ def discover_actionable_prs(
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
                 # The three deletes are intentionally non-atomic. A crash between them
                 # leaves a partial reset: total_attempts and/or exhausted_notified may be
-                # stale orphans, but processing continues normally on the next poll because
-                # total_attempts is 0 after the first delete.
+                # stale orphans. The circuit breaker will not re-trigger because
+                # total_attempts is 0 after the first delete, but if clear_attempts
+                # has not yet run, SKIP_ACTIVE may still fire until new commits arrive.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)
                 clear_attempts(redis, number)
