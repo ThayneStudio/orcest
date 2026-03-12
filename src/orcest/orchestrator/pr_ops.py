@@ -498,27 +498,34 @@ def discover_actionable_prs(
         # Check this before the usage cooldown so the circuit-breaker state is
         # visible immediately rather than being masked for 30 minutes.
         #
-        # Note: the human-override path (resetting counters when the needs-human
-        # label was removed) was removed in PR #330. It was fragile — the label
-        # could be removed by accident or by another automation — and provided no
-        # reliable signal of deliberate human intent. PRs that hit this limit now
-        # require direct Redis intervention: `del pr:<n>:total_attempts`.
+        # Recovery path: if the exhausted_notified flag is set and the
+        # needs-human label is no longer present, the human has approved a
+        # retry — reset the counters and fall through to normal processing.
+        # The label check is made explicit here (rather than relying solely on
+        # the SKIP_LABELED guard above) so the invariant remains correct even
+        # if the filter ordering is ever changed.
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            if get_exhausted_notified(redis, number) and label_config.needs_human not in pr_labels:
+                # Human removed the needs-human label → retry approved; reset counters.
+                clear_total_attempts(redis, number)
+                clear_exhausted_notified(redis, number)
+                # Fall through to normal processing (total_attempts now reset).
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
                 )
-            )
-            continue
+                continue
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).

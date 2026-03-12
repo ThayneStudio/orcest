@@ -1213,19 +1213,23 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
 
 
 def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
-    """When exhausted_notified flag IS set and total_attempts >= limit, PR is still skipped.
+    """When exhausted_notified IS set and needs-human label is absent, counters reset.
 
-    The label-removal recovery path was removed in PR #330. The
-    exhausted_notified flag no longer triggers a counter reset — SKIP_MAX_TOTAL_ATTEMPTS
-    is returned unconditionally when the circuit breaker is tripped.
+    This is the human-approval recovery path: the orchestrator previously added
+    needs-human and set the flag; the human then removed the label. On the next
+    poll the circuit breaker is bypassed, counters are reset, and the PR
+    re-enters normal processing.
     """
     pr_number = 750
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
     ]
+    # PR has no CI checks configured after recovery.
+    gh_mock.get_ci_status.return_value = []
     for _ in range(10):
         increment_total_attempts(fake_redis_client, pr_number)
-    # Simulate: orchestrator previously set the flag when it added the needs-human label
+    # Simulate: orchestrator previously set the flag when it added the needs-human label;
+    # human then removed the label (so pr_labels contains no needs_human entry).
     set_exhausted_notified(fake_redis_client, pr_number)
 
     results = discover_actionable_prs(
@@ -1237,10 +1241,11 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
-    # Counter and flag are NOT cleared — no label-removal recovery path
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
-    assert get_exhausted_notified(fake_redis_client, pr_number)
+    # Recovery fired — PR re-entered normal processing (SKIP_NO_CHECKS with empty CI).
+    assert results[0].action == PRAction.SKIP_NO_CHECKS
+    # Counter and flag are cleared by the recovery path.
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
+    assert not get_exhausted_notified(fake_redis_client, pr_number)
 
 
 def test_exhausted_notified_helpers(fake_redis_client):
