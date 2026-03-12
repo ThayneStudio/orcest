@@ -94,10 +94,17 @@ def _ssh_stdin_check(
 
 
 def _ufw_cmd(action: str, port: int) -> str:
-    """Build a ufw command that only runs if ufw is active."""
+    """Build a ufw command that only runs if ufw is active.
+
+    Returns 0 if ufw is not installed/active (nothing to do) or if the rule
+    change succeeds; returns non-zero only if ufw IS active but the rule
+    change fails.  This allows callers to use ``_ssh_check`` without false
+    positives on hosts that don't use ufw.
+    """
     return (
-        "sudo ufw status 2>/dev/null | grep -q 'Status: active'"
-        f" && sudo ufw {action} {port}/tcp >/dev/null 2>&1"
+        f"if command -v ufw >/dev/null 2>&1"
+        f" && sudo ufw status 2>/dev/null | grep -q 'Status: active';"
+        f" then sudo ufw {action} {port}/tcp; fi"
     )
 
 
@@ -135,7 +142,7 @@ def render_project_compose(redis_port: int) -> str:
               - .env
             restart: unless-stopped
             healthcheck:
-              test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
+              test: ["CMD", "python3", "-c", "import redis; redis.Redis('redis').ping()"]
               interval: 30s
               timeout: 5s
               retries: 3
@@ -277,6 +284,13 @@ def deploy_project_stack(
         console,
     )
 
+    # Validate tokens do not contain newlines (would produce a malformed .env).
+    if "\n" in github_token or "\n" in claude_token:
+        raise click.BadParameter(
+            "Token must not contain newlines.",
+            param_hint="'github_token' / 'claude_token'",
+        )
+
     # Write .env (contains secrets, restrict permissions).
     # Pass token via stdin so it never enters the shell command string,
     # avoiding any risk of injection if the token contains shell metacharacters.
@@ -289,7 +303,12 @@ def deploy_project_stack(
     )
 
     # Open firewall port if ufw is active
-    _ssh(ssh_target, _ufw_cmd("allow", redis_port))
+    _ssh_check(
+        ssh_target,
+        _ufw_cmd("allow", redis_port),
+        f"Opening firewall port {redis_port}",
+        console,
+    )
 
     # Start the stack
     _ssh_check(
@@ -353,7 +372,12 @@ def destroy_project_stack(
     )
 
     # Close firewall port if ufw is active
-    _ssh(ssh_target, _ufw_cmd("delete allow", redis_port))
+    result = _ssh(ssh_target, _ufw_cmd("delete allow", redis_port))
+    if result.returncode != 0:
+        console.print(
+            f"  [yellow]Warning: failed to remove ufw rule for port {redis_port}"
+            " — the port may remain open.[/yellow]"
+        )
 
 
 def restart_project_stack(
