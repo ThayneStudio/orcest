@@ -443,6 +443,12 @@ def discover_actionable_prs(
 
         # Skip if terminal orcest label present (blocked/needs-human)
         if any(label in terminal_labels for label in pr_labels):
+            # TTL cliff prevention: refresh exhausted_notified on every SKIP_LABELED cycle
+            # while the needs-human label is present and the flag is set. Without this,
+            # the 30-day TTL can expire before the operator removes the label, causing the
+            # recovery branch to silently miss and the circuit breaker to re-fire instead.
+            if label_config.needs_human in pr_labels and get_exhausted_notified(redis, number):
+                set_exhausted_notified(redis, number)
             results.append(
                 PRState(
                     number=number,
@@ -506,35 +512,29 @@ def discover_actionable_prs(
         # Note: the label is *not* re-checked here because needs_human is in
         # terminal_labels — any PR still carrying it is caught by SKIP_LABELED
         # above and never reaches this block.
-        # TTL cliff: exhausted_notified has a 30-day TTL. Because SKIP_LABELED
-        # fires before the circuit breaker while the label is present, the flag
-        # is never refreshed during that window. If the flag expires before the
-        # label is removed, this recovery branch will not fire — the loop will
-        # return SKIP_MAX_TOTAL_ATTEMPTS instead, re-add the label, and reset
-        # the flag. Operators debugging a missed recovery should verify the flag
-        # is still live: redis.exists(f"pr:{number}:exhausted_notified")
+        # TTL cliff prevention: exhausted_notified has a 30-day TTL. The SKIP_LABELED
+        # block above refreshes the flag on every poll while the needs-human label is
+        # present, so the flag stays live as long as the label is there.
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
             if get_exhausted_notified(redis, number):
                 # exhausted_notified is set and needs-human label is absent (inferred
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
-                # The two deletes are intentionally non-atomic. A crash between them
-                # leaves exhausted_notified as a stale orphan: total_attempts is 0 so
-                # processing continues normally, but when the PR eventually re-exhausts
-                # its budget the recovery branch fires one extra cycle without a label
-                # removal — self-correcting but potentially surprising in logs.
+                # The three deletes are intentionally non-atomic. A crash between them
+                # leaves a partial reset: total_attempts and/or exhausted_notified may be
+                # stale orphans, but processing continues normally on the next poll because
+                # total_attempts is 0 after the first delete.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)
+                clear_attempts(redis, number)
                 logger.info(
                     "PR #%d: exhausted_notified set and needs-human label absent"
                     " (inferred via SKIP_LABELED invariant);"
-                    " resetting total attempt counter and exhausted_notified flag for retry",
+                    " resetting total attempt counter, exhausted_notified flag,"
+                    " and per-SHA attempt counter for retry",
                     number,
                 )
-                # Fall through to normal processing (Redis counters now reset).
-                # Note: per-SHA attempt counts (pr:{n}:attempts:{sha}) are NOT cleared here.
-                # If the current SHA is also at its per-SHA limit, SKIP_ACTIVE will fire
-                # and no task will be enqueued until new commits are pushed.
+                # Fall through to normal processing (all Redis counters now reset).
             else:
                 results.append(
                     PRState(
