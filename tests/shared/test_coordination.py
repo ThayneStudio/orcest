@@ -114,5 +114,3 @@ def test_context_manager_releases_on_exception(fake_redis_client):
     assert lock.is_held is False
     # Key should be gone — a new lock can acquire immediately
     assert RedisLock(fake_redis_client, "test-lock").acquire() is True
-
-

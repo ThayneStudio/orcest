@@ -4,7 +4,6 @@ Uses Lua scripts for atomic release and refresh to prevent race conditions
 where a lock could be released by a non-owner.
 """
 
-import dataclasses
 import types
 import uuid
 
@@ -113,11 +112,7 @@ def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> st
 
 # Pending-task marker TTL: RunnerConfig defaults (timeout × max_retries) + 5-min buffer.
 # Much tighter than the previous 7200 s (2 h), bounding the crash-orphaned-marker window.
-_PENDING_TASK_TTL = int(
-    next(f.default for f in dataclasses.fields(RunnerConfig) if f.name == "timeout")
-    * next(f.default for f in dataclasses.fields(RunnerConfig) if f.name == "max_retries")
-    + 300
-)
+_PENDING_TASK_TTL = RunnerConfig().timeout * RunnerConfig().max_retries + 300
 
 
 def set_pending_task(
