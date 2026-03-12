@@ -192,11 +192,7 @@ def test_load_orchestrator_config_runner_from_yaml(tmp_path: Path):
     """OrchestratorConfig.runner reflects values from the YAML runner section."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n"
-        "  repo: acme/widgets\n"
-        "runner:\n"
-        "  timeout: 3600\n"
-        "  max_retries: 5\n"
+        "github:\n  repo: acme/widgets\nrunner:\n  timeout: 3600\n  max_retries: 5\n"
     )
 
     config = load_orchestrator_config(cfg_file)
