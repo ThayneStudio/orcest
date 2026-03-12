@@ -34,7 +34,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote remove origin 2>/dev/null || true
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin \
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head"
           git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
 
