@@ -77,6 +77,11 @@ _LOG_ERROR_RE = re.compile(
     re.MULTILINE,
 )
 
+# Default pending-task marker TTL, computed once at import time from
+# RunnerConfig defaults.  Functions that have a live RunnerConfig available
+# should receive the TTL explicitly; this constant is used only as a fallback.
+_DEFAULT_PENDING_TASK_TTL: int = compute_pending_task_ttl(RunnerConfig())
+
 
 def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
     """Extract the most relevant sections from a CI log.
@@ -139,7 +144,7 @@ def _publish_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
@@ -191,7 +196,7 @@ def publish_fix_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
@@ -361,7 +366,7 @@ def publish_followup_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a triage-followups task for a PR.
@@ -425,7 +430,7 @@ def publish_rebase_task(
     redis: RedisClient,
     default_runner: str,
     merge_error: str = "",
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a rebase task for a PR with merge conflicts.
@@ -474,7 +479,7 @@ def publish_issue_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish an implementation task for a GitHub issue.
@@ -522,7 +527,7 @@ def _publish_issue_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
+    pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility on the issue."""
