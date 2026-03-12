@@ -188,6 +188,13 @@ class RedisClient:
             groups: list[dict[str, Any]] = self._client.xinfo_groups(stream)  # type: ignore[assignment]
         except redis.ResponseError:
             return 0
+        # Runtime safety net: redis-py's stubs type xinfo_groups as ResponseT (a
+        # broad union), so the # type: ignore[assignment] above is required to
+        # narrow to list[dict[str, Any]].  In practice the command always returns
+        # a list, but we keep this guard to handle unexpected responses from custom
+        # Redis proxies or future library changes without raising an AttributeError.
+        # If mypy is run under stricter settings, suppress the redundant isinstance
+        # warning on the line below with: # type: ignore[misc]
         if not isinstance(groups, list):
             logger.warning(
                 "xinfo_groups returned unexpected type %s for stream %r",
