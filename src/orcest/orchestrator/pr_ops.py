@@ -522,7 +522,7 @@ def discover_actionable_prs(
                 clear_exhausted_notified(redis, number)
                 logger.info(
                     "PR #%d: exhausted_notified set and needs-human label absent"
-                    " (inferred via SKIP_LABELED invariant); resetting attempt counters for retry",
+                    " (inferred via SKIP_LABELED invariant); resetting total attempt counter for retry",
                     number,
                 )
                 # Fall through to normal processing (Redis counters now reset).
