@@ -395,11 +395,11 @@ def update(inventory: str, github_token: str, claude_token: str, rebuild_image: 
 
         _rebuild_image(inv.orchestrator_host, inv.orchestrator_user, console)
         ssh_target = f"{inv.orchestrator_user}@{inv.orchestrator_host}"
+        import subprocess
+
         for project in inv.projects:
             project_dir = f"/opt/orcest/projects/{project.name}"
             console.print(f"  Restarting orchestrator stack for '{project.name}'...", end=" ")
-            import subprocess
-
             cmd = f"sudo -u orcest bash -c 'cd {project_dir} && docker compose up -d'"
             result = subprocess.run(
                 ["ssh", ssh_target, cmd],

@@ -16,7 +16,7 @@ import textwrap
 import click
 from rich.console import Console
 
-_SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 _DOCKER_BUILD_CMD = "sudo -u orcest docker build -t orcest-orchestrator:latest /opt/orcest/"
 
@@ -26,7 +26,7 @@ _DOCKER_INSPECT_CMD = (
 
 
 def _validate_ssh_input(value: str, label: str) -> None:
-    if not _SSH_INPUT_RE.match(value):
+    if ".." in value or not _SSH_INPUT_RE.match(value):
         raise click.BadParameter(
             f"Invalid {value!r}: only alphanumerics, dots, hyphens, and underscores are allowed.",
             param_hint=repr(label),
@@ -227,10 +227,11 @@ def deploy_project_stack(
     )
 
     # Write .env (contains secrets, restrict permissions)
-    env_content = f"GITHUB_TOKEN={github_token}"
+    # Use printf to avoid heredoc variable/command expansion issues.
+    env_cmd = f'printf "%s\\n" "GITHUB_TOKEN={github_token}" > {pdir}/.env'
     _ssh_check(
         ssh_target,
-        f"sudo -u orcest bash -c 'umask 077 && cat > {pdir}/.env << ENVEOF\n{env_content}\nENVEOF'",
+        f"sudo -u orcest bash -c 'umask 077 && {env_cmd}'",
         "Writing .env",
         console,
     )
