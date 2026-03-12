@@ -18,7 +18,8 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     increment_transient_attempts,
 )
-from orcest.shared.coordination import _PENDING_TASK_TTL, set_pending_task
+from orcest.shared.config import RunnerConfig
+from orcest.shared.coordination import compute_pending_task_ttl, set_pending_task
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -138,7 +139,7 @@ def _publish_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
@@ -190,7 +191,7 @@ def publish_fix_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
@@ -360,7 +361,7 @@ def publish_followup_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a triage-followups task for a PR.
@@ -424,7 +425,7 @@ def publish_rebase_task(
     redis: RedisClient,
     default_runner: str,
     merge_error: str = "",
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish a rebase task for a PR with merge conflicts.
@@ -473,7 +474,7 @@ def publish_issue_task(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> Task:
     """Create and publish an implementation task for a GitHub issue.
@@ -521,7 +522,7 @@ def _publish_issue_and_notify(
     token: str,
     redis: RedisClient,
     default_runner: str,
-    pending_task_ttl: int = _PENDING_TASK_TTL,
+    pending_task_ttl: int = compute_pending_task_ttl(RunnerConfig()),
     logger: logging.Logger | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility on the issue."""

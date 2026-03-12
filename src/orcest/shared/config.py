@@ -215,11 +215,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Runner config — timeout and max_retries drive the pending-task marker TTL.
     # These should match the values deployed on worker nodes.
     runner_raw = _safe_dict(raw, "runner")
+    _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
-        type=str(runner_raw.get("type", "claude")),
-        timeout=_safe_int(runner_raw.get("timeout", 1800), "runner.timeout"),
-        max_retries=_safe_int(runner_raw.get("max_retries", 3), "runner.max_retries"),
-        retry_backoff=_safe_int(runner_raw.get("retry_backoff", 10), "runner.retry_backoff"),
+        type=str(runner_raw.get("type", _runner_defaults.type)),
+        timeout=_safe_int(runner_raw.get("timeout", _runner_defaults.timeout), "runner.timeout"),
+        max_retries=_safe_int(
+            runner_raw.get("max_retries", _runner_defaults.max_retries), "runner.max_retries"
+        ),
+        retry_backoff=_safe_int(
+            runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
+        ),
         extra={str(k): str(v) for k, v in _safe_dict(runner_raw, "extra").items()},
     )
 
@@ -313,11 +318,16 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     # Runner (construct first so backend can default from runner.type)
     runner_raw = _safe_dict(raw, "runner")
     runner_extra_raw = _safe_dict(runner_raw, "extra")
+    _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
-        type=str(runner_raw.get("type", "claude")),
-        timeout=_safe_int(runner_raw.get("timeout", 1800), "runner.timeout"),
-        max_retries=_safe_int(runner_raw.get("max_retries", 3), "runner.max_retries"),
-        retry_backoff=_safe_int(runner_raw.get("retry_backoff", 10), "runner.retry_backoff"),
+        type=str(runner_raw.get("type", _runner_defaults.type)),
+        timeout=_safe_int(runner_raw.get("timeout", _runner_defaults.timeout), "runner.timeout"),
+        max_retries=_safe_int(
+            runner_raw.get("max_retries", _runner_defaults.max_retries), "runner.max_retries"
+        ),
+        retry_backoff=_safe_int(
+            runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
+        ),
         extra={str(k): str(v) for k, v in runner_extra_raw.items()},
     )
 
