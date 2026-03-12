@@ -123,6 +123,7 @@ def onboard(
         redis_port=redis_port,
         repo=repo,
         github_token=github_token,
+        claude_token=claude_token,
         console=console,
         rebuild_image=rebuild_image,
     )

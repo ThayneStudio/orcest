@@ -18,6 +18,8 @@ from rich.console import Console
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
+_SSH_OPTS = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+
 _DOCKER_BUILD_CMD = "sudo -u orcest docker build -t orcest-orchestrator:latest /opt/orcest/"
 
 _DOCKER_INSPECT_CMD = (
@@ -35,7 +37,7 @@ def _validate_ssh_input(value: str, label: str) -> None:
 
 def _ssh(target: str, cmd: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["ssh", target, cmd],
+        ["ssh", *_SSH_OPTS, target, cmd],
         capture_output=True,
         text=True,
     )
@@ -73,7 +75,7 @@ def _ssh_stdin_check(
     """
     console.print(f"  {description}...", end=" ")
     result = subprocess.run(
-        ["ssh", target, cmd],
+        ["ssh", *_SSH_OPTS, target, cmd],
         input=stdin_data,
         capture_output=True,
         text=True,
@@ -177,7 +179,7 @@ def _ensure_image(
     if force:
         console.print("  Rebuilding orcest-orchestrator image...")
         result = subprocess.run(
-            ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+            ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
             text=True,
         )
         if result.returncode != 0:
@@ -192,7 +194,7 @@ def _ensure_image(
             "  Building orcest-orchestrator image (first time)...",
         )
         build_result = subprocess.run(
-            ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+            ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
             text=True,
         )
         if build_result.returncode != 0:
@@ -208,6 +210,7 @@ def deploy_project_stack(
     redis_port: int,
     repo: str,
     github_token: str,
+    claude_token: str,
     console: Console,
     *,
     rebuild_image: bool = False,
@@ -262,7 +265,7 @@ def deploy_project_stack(
     _ssh_stdin_check(
         ssh_target,
         f"sudo -u orcest bash -c 'umask 077 && cat > {pdir}/.env'",
-        f"GITHUB_TOKEN={github_token}\n",
+        f"GITHUB_TOKEN={github_token}\nCLAUDE_TOKEN={claude_token}\n",
         "Writing .env",
         console,
     )
@@ -344,8 +347,9 @@ def restart_project_stack(
     _validate_ssh_input(project_name, "project_name")
     pdir = f"/opt/orcest/projects/{project_name}"
     console.print(f"  Restarting orchestrator stack for '{project_name}'...", end=" ")
+    compose_up = f"sudo -u orcest bash -c 'cd {pdir} && docker compose up -d'"
     result = subprocess.run(
-        ["ssh", ssh_target, f"sudo -u orcest bash -c 'cd {pdir} && docker compose up -d'"],
+        ["ssh", *_SSH_OPTS, ssh_target, compose_up],
         capture_output=True,
         text=True,
     )
@@ -366,7 +370,7 @@ def rebuild_image(host: str, user: str, console: Console) -> None:
         "\n  [bold]Rebuilding orcest-orchestrator image[/bold]",
     )
     result = subprocess.run(
-        ["ssh", ssh_target, _DOCKER_BUILD_CMD],
+        ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
         text=True,
     )
     if result.returncode != 0:
