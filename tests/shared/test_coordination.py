@@ -126,9 +126,7 @@ def test_compute_pending_task_ttl_uses_runner_values():
 
 def test_compute_pending_task_ttl_reflects_non_default_values():
     """Non-default timeout/max_retries produce a larger TTL than the default constant."""
-    from orcest.shared.coordination import _PENDING_TASK_TTL
-
     rc = RunnerConfig(timeout=3600, max_retries=5)
     ttl = compute_pending_task_ttl(rc)
     assert ttl == 3600 * 5 + 300
-    assert ttl > _PENDING_TASK_TTL
+    assert ttl > compute_pending_task_ttl(RunnerConfig())

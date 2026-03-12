@@ -28,9 +28,15 @@ jobs:
           fi
 
       - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" init -q 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote remove origin 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote add origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head"
+          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
 
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
