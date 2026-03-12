@@ -244,12 +244,14 @@ def deploy_project_stack(
         console,
     )
 
-    # Write orchestrator config
+    # Write orchestrator config.
+    # Pass via stdin to avoid heredoc injection if repo contains a line
+    # matching the delimiter.
     config = render_orchestrator_config(repo)
-    _ssh_check(
+    _ssh_stdin_check(
         ssh_target,
-        f"sudo -u orcest tee {pdir}/config/orchestrator.yaml"
-        f" > /dev/null << 'CONFIGEOF'\n{config}CONFIGEOF",
+        f"sudo -u orcest bash -c 'cat > {pdir}/config/orchestrator.yaml'",
+        config,
         "Writing orchestrator config",
         console,
     )
@@ -321,10 +323,10 @@ def destroy_project_stack(
             "  Containers [yellow]already stopped or missing[/yellow]",
         )
 
-    # Remove project directory
+    # Remove project directory (run as orcest user to keep blast radius consistent)
     _ssh_check(
         ssh_target,
-        f"sudo rm -rf {pdir}",
+        f"sudo -u orcest rm -rf {pdir}",
         "Removing project directory",
         console,
     )
