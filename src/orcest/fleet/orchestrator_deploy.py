@@ -358,9 +358,7 @@ def destroy_project_stack(
     # docker/permission failures to surface (no 2>/dev/null).
     _ssh(
         ssh_target,
-        f"test -d {pdir}"
-        f" && sudo -u orcest bash -c 'cd {pdir} && docker compose down -v'"
-        f" || true",
+        f"test -d {pdir} && sudo -u orcest bash -c 'cd {pdir} && docker compose down -v' || true",
     )
     console.print("  Containers stopped [green]ok[/green]")
 
