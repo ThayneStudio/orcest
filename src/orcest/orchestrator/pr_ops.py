@@ -506,6 +506,13 @@ def discover_actionable_prs(
         # Note: the label is *not* re-checked here because needs_human is in
         # terminal_labels — any PR still carrying it is caught by SKIP_LABELED
         # above and never reaches this block.
+        # TTL cliff: exhausted_notified has a 30-day TTL. Because SKIP_LABELED
+        # fires before the circuit breaker while the label is present, the flag
+        # is never refreshed during that window. If the flag expires before the
+        # label is removed, this recovery branch will not fire — the loop will
+        # return SKIP_MAX_TOTAL_ATTEMPTS instead, re-add the label, and reset
+        # the flag. Operators debugging a missed recovery should verify the flag
+        # is still live: redis.exists(f"pr:{number}:exhausted_notified")
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
             if get_exhausted_notified(redis, number):
