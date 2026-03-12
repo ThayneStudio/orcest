@@ -1248,6 +1248,31 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
     assert not get_exhausted_notified(fake_redis_client, pr_number)
 
 
+def test_total_attempts_no_recovery_when_needs_human_label_still_present(gh_mock, fake_redis_client, label_config):
+    """exhausted_notified=True but needs-human label still present → no recovery, PR is skipped."""
+    pr_number = 751
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[{"name": label_config.needs_human}]),
+    ]
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, pr_number)
+    set_exhausted_notified(fake_redis_client, pr_number)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_LABELED
+    # Counters must NOT be cleared — no human approval yet.
+    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
+    assert get_exhausted_notified(fake_redis_client, pr_number)
+
+
 def test_exhausted_notified_helpers(fake_redis_client):
     """set/get/clear_exhausted_notified operate correctly."""
     pr_number = 760
