@@ -518,6 +518,11 @@ def discover_actionable_prs(
             if get_exhausted_notified(redis, number):
                 # exhausted_notified is set and needs-human label is absent (inferred
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
+                # The two deletes are intentionally non-atomic. A crash between them
+                # leaves exhausted_notified as a stale orphan: total_attempts is 0 so
+                # processing continues normally, but when the PR eventually re-exhausts
+                # its budget the recovery branch fires one extra cycle without a label
+                # removal — self-correcting but potentially surprising in logs.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)
                 logger.info(
