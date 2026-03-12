@@ -404,7 +404,8 @@ def test_dead_letters_command_replay_missing_tasks_stream(fake_redis_client):
 
     output = buf.getvalue()
     assert "skipping" in output
-    assert "error" in output.lower()
+    assert "skipped (no tasks_stream field)" in output
+    assert "error" not in output.lower()
 
 
 def test_dead_letters_cli_redis_connection_failure(mocker, runner):
