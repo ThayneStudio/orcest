@@ -112,7 +112,8 @@ def make_pending_task_key(repo: str, resource_type: str, resource_id: int) -> st
 
 # Pending-task marker TTL: RunnerConfig defaults (timeout × max_retries) + 5-min buffer.
 # Much tighter than the previous 7200 s (2 h), bounding the crash-orphaned-marker window.
-_PENDING_TASK_TTL = RunnerConfig().timeout * RunnerConfig().max_retries + 300
+_rc = RunnerConfig()
+_PENDING_TASK_TTL = _rc.timeout * _rc.max_retries + 300
 
 
 def set_pending_task(
