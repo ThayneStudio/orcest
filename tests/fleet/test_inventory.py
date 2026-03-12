@@ -120,17 +120,34 @@ def test_get_project():
 
 
 def test_next_redis_port():
-    """next_redis_port returns max existing + 1, or 6379 if empty."""
+    """next_redis_port returns the lowest available port in [6379, 6399], reusing gaps."""
     empty = FleetInventory()
     assert empty.next_redis_port() == 6379
 
+    # Gap at 6380 should be reused rather than returning max+1 (6382)
     inv = FleetInventory(
         projects=[
             ProjectEntry(name="a", repo="Org/a", redis_port=6379),
             ProjectEntry(name="b", repo="Org/b", redis_port=6381),
         ]
     )
-    assert inv.next_redis_port() == 6382
+    assert inv.next_redis_port() == 6380
+
+    # Contiguous block: returns first port after the block
+    inv2 = FleetInventory(
+        projects=[
+            ProjectEntry(name="a", repo="Org/a", redis_port=6379),
+            ProjectEntry(name="b", repo="Org/b", redis_port=6380),
+        ]
+    )
+    assert inv2.next_redis_port() == 6381
+
+    # Full range exhausted: returns 6400 (caller enforces the cap)
+    all_ports = [
+        ProjectEntry(name=f"p{i}", repo=f"Org/p{i}", redis_port=6379 + i) for i in range(21)
+    ]
+    full = FleetInventory(projects=all_ports)
+    assert full.next_redis_port() == 6400
 
 
 def test_next_vm_id():

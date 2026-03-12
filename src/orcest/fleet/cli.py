@@ -35,18 +35,23 @@ def fleet() -> None:
     required=True,
     help="Claude OAuth token.",
 )
-@click.option("--orch-config", default=None, help="Orchestrator config file to deploy.")
+@click.option(
+    "--rebuild-image",
+    is_flag=True,
+    help="Force rebuild of the orchestrator Docker image.",
+)
 def onboard(
     repo: str,
     name: str | None,
     inventory: str,
     github_token: str,
     claude_token: str,
-    orch_config: str | None,
+    rebuild_image: bool,
 ) -> None:
     """Onboard a new repo: deploy orchestrator stack + create first worker VM.
 
     REPO is in "owner/repo" format (e.g. ThayneStudio/my-project).
+    Requires the orchestrator host to be provisioned first (provision-orchestrator).
     """
     from orcest.fleet.cloud_init import render_worker_userdata
     from orcest.fleet.inventory import (
@@ -56,6 +61,7 @@ def onboard(
         load_inventory,
         save_inventory,
     )
+    from orcest.fleet.orchestrator_deploy import deploy_project_stack
 
     console = Console()
     project_name = name or _repo_to_project_name(repo)
@@ -69,6 +75,15 @@ def onboard(
     else:
         inv = FleetInventory()
 
+    # Require orchestrator_host to be set
+    if not inv.orchestrator_host:
+        console.print(
+            "[red]orchestrator_host not set in fleet inventory.[/red]\n"
+            "  Run 'orcest provision-orchestrator' first,"
+            " then set orchestrator_host in the inventory."
+        )
+        sys.exit(1)
+
     # Check for duplicate
     if inv.get_project(project_name):
         console.print(f"[red]Project '{project_name}' already exists in fleet inventory.[/red]")
@@ -76,6 +91,12 @@ def onboard(
 
     # Allocate resources
     redis_port = inv.next_redis_port()
+    if redis_port > 6399:
+        console.print(
+            f"[red]Redis port {redis_port} exceeds the allowed range (6379–6399).[/red]\n"
+            "  Remove unused projects or expand the firewall rule before adding more."
+        )
+        sys.exit(1)
     vm_id = inv.next_vm_id()
     worker_id = f"worker-{vm_id}"
 
@@ -83,7 +104,8 @@ def onboard(
     console.print(f"  Worker VM ID: {vm_id}")
     console.print(f"  Worker ID: {worker_id}")
 
-    # Add project to inventory
+    # Add project to inventory (not persisted yet — saved only after deploy succeeds
+    # to avoid a partial-deploy state that blocks retry via the duplicate check)
     project = ProjectEntry(
         name=project_name,
         repo=repo,
@@ -91,12 +113,28 @@ def onboard(
         workers=[WorkerEntry(vm_id=vm_id)],
     )
     inv.projects.append(project)
+
+    # Deploy orchestrator stack (Redis + orchestrator container)
+    deploy_project_stack(
+        host=inv.orchestrator_host,
+        user=inv.orchestrator_user,
+        project_name=project_name,
+        redis_port=redis_port,
+        repo=repo,
+        github_token=github_token,
+        claude_token=claude_token,
+        console=console,
+        rebuild_image=rebuild_image,
+    )
+
+    # Persist inventory only after a successful deploy so that a mid-deploy failure
+    # does not block a retry ('orcest fleet destroy <name>' is the recovery path).
     save_inventory(inv, inv_path)
     console.print("  Inventory updated.")
 
-    # Generate cloud-init user-data
+    # Generate cloud-init user-data for the first worker VM
     userdata = render_worker_userdata(
-        redis_host=inv.orchestrator_host or "localhost",
+        redis_host=inv.orchestrator_host,
         redis_port=redis_port,
         worker_id=worker_id,
         github_token=github_token,
@@ -110,7 +148,7 @@ def onboard(
     with os.fdopen(fd, "w") as f:
         f.write(userdata)
 
-    console.print(f"  Cloud-init user-data written to {userdata_path}")
+    console.print(f"\n  Cloud-init user-data written to {userdata_path}")
 
     # If Proxmox is configured, create the VM
     if inv.proxmox.host and inv.proxmox.token_id:
@@ -282,6 +320,7 @@ def status(inventory: str) -> None:
 def destroy(project_name: str, inventory: str) -> None:
     """Destroy a project: remove orchestrator stack and all worker VMs."""
     from orcest.fleet.inventory import load_inventory, save_inventory
+    from orcest.fleet.orchestrator_deploy import destroy_project_stack
 
     console = Console()
     inv = load_inventory(inventory)
@@ -292,6 +331,16 @@ def destroy(project_name: str, inventory: str) -> None:
         sys.exit(1)
 
     console.print(f"\n[bold]Destroying project '{project_name}'[/bold]")
+
+    # Tear down orchestrator stack on the orchestrator host
+    if inv.orchestrator_host:
+        destroy_project_stack(
+            host=inv.orchestrator_host,
+            user=inv.orchestrator_user,
+            project_name=project_name,
+            redis_port=project.redis_port,
+            console=console,
+        )
 
     # Destroy worker VMs via Proxmox if configured
     if inv.proxmox.host and inv.proxmox.token_id:
@@ -325,11 +374,17 @@ def destroy(project_name: str, inventory: str) -> None:
     required=True,
     help="Claude OAuth token.",
 )
-def update(inventory: str, github_token: str, claude_token: str) -> None:
+@click.option(
+    "--rebuild-image",
+    is_flag=True,
+    help="Rebuild the orchestrator Docker image and restart all orchestrator stacks.",
+)
+def update(inventory: str, github_token: str, claude_token: str, rebuild_image: bool) -> None:
     """Rolling-replace all worker VMs with fresh cloud-init instances.
 
     For each project, creates new worker VMs, waits for them to come up,
-    then destroys the old ones.
+    then destroys the old ones. With --rebuild-image, also rebuilds the
+    shared orchestrator Docker image and restarts all orchestrator stacks.
     """
     from orcest.fleet.cloud_init import render_worker_userdata
     from orcest.fleet.inventory import WorkerEntry, load_inventory, save_inventory
@@ -344,6 +399,23 @@ def update(inventory: str, github_token: str, claude_token: str) -> None:
     if not (inv.proxmox.host and inv.proxmox.token_id):
         console.print("[red]Proxmox not configured — cannot perform rolling replace.[/red]")
         sys.exit(1)
+
+    # Rebuild orchestrator image and restart stacks if requested
+    if rebuild_image:
+        if not inv.orchestrator_host:
+            console.print(
+                "[yellow]--rebuild-image: orchestrator_host not set,"
+                " skipping image rebuild.[/yellow]"
+            )
+        else:
+            from orcest.fleet.orchestrator_deploy import rebuild_image as _rebuild_image
+            from orcest.fleet.orchestrator_deploy import restart_project_stack
+
+            _rebuild_image(inv.orchestrator_host, inv.orchestrator_user, console)
+            for project in inv.projects:
+                restart_project_stack(
+                    inv.orchestrator_host, inv.orchestrator_user, project.name, console
+                )
 
     from orcest.fleet.proxmox import ProxmoxClient
 
