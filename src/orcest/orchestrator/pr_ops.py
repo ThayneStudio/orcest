@@ -514,7 +514,7 @@ def discover_actionable_prs(
                     "PR #%d: needs-human label removed, resetting attempt counters for retry",
                     number,
                 )
-                # Fall through to normal processing (total_attempts now reset).
+                # Fall through to normal processing (Redis counters now reset).
             else:
                 results.append(
                     PRState(
