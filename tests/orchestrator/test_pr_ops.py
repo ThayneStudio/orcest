@@ -1248,7 +1248,9 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
     assert not get_exhausted_notified(fake_redis_client, pr_number)
 
 
-def test_total_attempts_no_recovery_when_needs_human_label_still_present(gh_mock, fake_redis_client, label_config):
+def test_total_attempts_no_recovery_needs_human_label_present(
+    gh_mock, fake_redis_client, label_config
+):
     """exhausted_notified=True but needs-human label still present → no recovery, PR is skipped."""
     pr_number = 751
     gh_mock.list_open_prs.return_value = [

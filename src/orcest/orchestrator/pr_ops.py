@@ -510,6 +510,10 @@ def discover_actionable_prs(
                 # Human removed the needs-human label → retry approved; reset counters.
                 clear_total_attempts(redis, number)
                 clear_exhausted_notified(redis, number)
+                logger.info(
+                    "PR #%d: needs-human label removed, resetting attempt counters for retry",
+                    number,
+                )
                 # Fall through to normal processing (total_attempts now reset).
             else:
                 results.append(
