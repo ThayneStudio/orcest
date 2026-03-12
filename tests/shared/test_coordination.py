@@ -2,9 +2,7 @@
 
 import pytest
 
-from orcest.shared.config import RunnerConfig
 from orcest.shared.coordination import (
-    _PENDING_TASK_TTL,
     RedisLock,
     make_issue_lock_key,
     make_pr_lock_key,
@@ -116,9 +114,3 @@ def test_context_manager_releases_on_exception(fake_redis_client):
     assert lock.is_held is False
     # Key should be gone — a new lock can acquire immediately
     assert RedisLock(fake_redis_client, "test-lock").acquire() is True
-
-
-def test_pending_task_ttl_covers_runner_defaults():
-    """_PENDING_TASK_TTL must stay >= RunnerConfig defaults to avoid orphaned-marker drift."""
-    runner = RunnerConfig()
-    assert _PENDING_TASK_TTL >= runner.timeout * runner.max_retries
