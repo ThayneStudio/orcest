@@ -297,13 +297,14 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         return
 
     replayed = 0
+    skipped = 0
     errors = 0
 
     for entry_id, fields in entries:
         tasks_stream = fields.get("tasks_stream")
         if not tasks_stream:
             console.print(f"[yellow]Entry {entry_id}: missing tasks_stream, skipping[/yellow]")
-            errors += 1
+            skipped += 1
             continue
 
         # Strip dead-letter metadata; keep only original task fields.
@@ -320,6 +321,8 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
     if replayed:
         console.print(f"\n[green]Replayed {replayed} task(s) to their original streams.[/green]")
+    if skipped:
+        console.print(f"\n[yellow]{skipped} skipped (no tasks_stream field).[/yellow]")
     if errors:
         console.print(f"\n[red]{errors} error(s) during replay.[/red]")
 
