@@ -498,27 +498,58 @@ def discover_actionable_prs(
         # Check this before the usage cooldown so the circuit-breaker state is
         # visible immediately rather than being masked for 30 minutes.
         #
-        # Note: the human-override path (resetting counters when the needs-human
-        # label was removed) was removed in PR #330. It was fragile — the label
-        # could be removed by accident or by another automation — and provided no
-        # reliable signal of deliberate human intent. PRs that hit this limit now
-        # require direct Redis intervention: `del pr:<n>:total_attempts`.
+        # Recovery path: if the exhausted_notified flag is set and the
+        # needs-human label is gone, reset the counters and fall through to
+        # normal processing. Any actor (human or automation) that removes the
+        # label is treated as approval — the code cannot distinguish between
+        # deliberate human intent and automated label removal.
+        # Note: the label is *not* re-checked here because needs_human is in
+        # terminal_labels — any PR still carrying it is caught by SKIP_LABELED
+        # above and never reaches this block.
+        # TTL cliff: exhausted_notified has a 30-day TTL. Because SKIP_LABELED
+        # fires before the circuit breaker while the label is present, the flag
+        # is never refreshed during that window. If the flag expires before the
+        # label is removed, this recovery branch will not fire — the loop will
+        # return SKIP_MAX_TOTAL_ATTEMPTS instead, re-add the label, and reset
+        # the flag. Operators debugging a missed recovery should verify the flag
+        # is still live: redis.exists(f"pr:{number}:exhausted_notified")
         total_attempts = get_total_attempt_count(redis, number)
         if total_attempts >= max_total_attempts:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            if get_exhausted_notified(redis, number):
+                # exhausted_notified is set and needs-human label is absent (inferred
+                # via SKIP_LABELED invariant above); treat as retry signal and reset.
+                # The two deletes are intentionally non-atomic. A crash between them
+                # leaves exhausted_notified as a stale orphan: total_attempts is 0 so
+                # processing continues normally, but when the PR eventually re-exhausts
+                # its budget the recovery branch fires one extra cycle without a label
+                # removal — self-correcting but potentially surprising in logs.
+                clear_total_attempts(redis, number)
+                clear_exhausted_notified(redis, number)
+                logger.info(
+                    "PR #%d: exhausted_notified set and needs-human label absent"
+                    " (inferred via SKIP_LABELED invariant);"
+                    " resetting total attempt counter and exhausted_notified flag for retry",
+                    number,
                 )
-            )
-            continue
+                # Fall through to normal processing (Redis counters now reset).
+                # Note: per-SHA attempt counts (pr:{n}:attempts:{sha}) are NOT cleared here.
+                # If the current SHA is also at its per-SHA limit, SKIP_ACTIVE will fire
+                # and no task will be enqueued until new commits are pushed.
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+                continue
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).
