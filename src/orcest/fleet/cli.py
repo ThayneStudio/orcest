@@ -412,9 +412,10 @@ def update(inventory: str, github_token: str, claude_token: str, rebuild_image: 
             from orcest.fleet.orchestrator_deploy import restart_project_stack
 
             _rebuild_image(inv.orchestrator_host, inv.orchestrator_user, console)
-            ssh_target = f"{inv.orchestrator_user}@{inv.orchestrator_host}"
             for project in inv.projects:
-                restart_project_stack(ssh_target, project.name, console)
+                restart_project_stack(
+                    inv.orchestrator_host, inv.orchestrator_user, project.name, console
+                )
 
     from orcest.fleet.proxmox import ProxmoxClient
 

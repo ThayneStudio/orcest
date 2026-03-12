@@ -251,7 +251,7 @@ def deploy_project_stack(
     # - newlines produce a malformed .env
     # - '#' is a comment delimiter in docker compose .env parsing and would
     #   silently truncate the token value
-    if any(c in token for token in (github_token, claude_token) for c in ("\n", "#")):
+    if any(c in t for t in (github_token, claude_token) for c in ("\n", "#")):
         raise click.BadParameter(
             "Token must not contain newlines or '#'.",
             param_hint="'github_token' / 'claude_token'",
@@ -395,12 +395,16 @@ def destroy_project_stack(
 
 
 def restart_project_stack(
-    ssh_target: str,
+    host: str,
+    user: str,
     project_name: str,
     console: Console,
 ) -> None:
     """Restart a per-project orchestrator stack (docker compose up -d)."""
+    _validate_ssh_input(host, "host")
+    _validate_ssh_input(user, "user")
     _validate_ssh_input(project_name, "project_name")
+    ssh_target = f"{user}@{host}"
     pdir = f"/opt/orcest/projects/{project_name}"
     console.print(f"  Restarting orchestrator stack for '{project_name}'...", end=" ")
     compose_up = f"sudo -u orcest bash -c 'cd {pdir} && docker compose up -d'"
