@@ -61,9 +61,10 @@ def test_status_shows_projects(runner, inv_path):
     assert "200" in result.output
 
 
-def test_onboard_creates_project(runner, inv_path):
+def test_onboard_creates_project(runner, inv_path, mocker):
     """fleet onboard creates a new project entry in the inventory."""
-    _save(FleetInventory(), inv_path)
+    _save(FleetInventory(orchestrator_host="10.20.0.23"), inv_path)
+    mocker.patch("orcest.fleet.orchestrator_deploy.deploy_project_stack")
     result = runner.invoke(
         fleet,
         [
@@ -89,9 +90,10 @@ def test_onboard_creates_project(runner, inv_path):
     assert data["projects"][0]["redis_port"] == 6379
 
 
-def test_onboard_custom_name(runner, inv_path):
+def test_onboard_custom_name(runner, inv_path, mocker):
     """fleet onboard --name overrides the derived project name."""
-    _save(FleetInventory(), inv_path)
+    _save(FleetInventory(orchestrator_host="10.20.0.23"), inv_path)
+    mocker.patch("orcest.fleet.orchestrator_deploy.deploy_project_stack")
     result = runner.invoke(
         fleet,
         [
@@ -113,9 +115,32 @@ def test_onboard_custom_name(runner, inv_path):
     assert data["projects"][0]["name"] == "custom-name"
 
 
+def test_onboard_requires_orchestrator_host(runner, inv_path):
+    """fleet onboard fails if orchestrator_host is not set."""
+    _save(FleetInventory(), inv_path)
+    result = runner.invoke(
+        fleet,
+        [
+            "onboard",
+            "Org/repo",
+            "--inventory",
+            inv_path,
+            "--github-token",
+            "ghp_fake",
+            "--claude-token",
+            "sk-fake",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "orchestrator_host not set" in result.output
+
+
 def test_onboard_duplicate_fails(runner, inv_path):
     """fleet onboard fails if project already exists."""
-    inv = FleetInventory(projects=[ProjectEntry(name="alpha", repo="Org/alpha")])
+    inv = FleetInventory(
+        orchestrator_host="10.20.0.23",
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
     _save(inv, inv_path)
     result = runner.invoke(
         fleet,
