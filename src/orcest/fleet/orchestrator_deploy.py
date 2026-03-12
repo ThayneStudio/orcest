@@ -246,6 +246,17 @@ def deploy_project_stack(
             param_hint="'repo'",
         )
 
+    # Validate tokens before issuing any SSH commands — avoids leaving a
+    # half-deployed project directory that blocks retry via the duplicate check.
+    # - newlines produce a malformed .env
+    # - '#' is a comment delimiter in docker compose .env parsing and would
+    #   silently truncate the token value
+    if any(c in token for token in (github_token, claude_token) for c in ("\n", "#")):
+        raise click.BadParameter(
+            "Token must not contain newlines or '#'.",
+            param_hint="'github_token' / 'claude_token'",
+        )
+
     ssh_target = f"{user}@{host}"
     pdir = f"/opt/orcest/projects/{project_name}"
 
@@ -284,16 +295,6 @@ def deploy_project_stack(
         "Writing orchestrator config",
         console,
     )
-
-    # Validate tokens do not contain characters that corrupt the .env file:
-    # - newlines produce a malformed .env
-    # - '#' is a comment delimiter in docker compose .env parsing and would
-    #   silently truncate the token value
-    if any(c in token for token in (github_token, claude_token) for c in ("\n", "#")):
-        raise click.BadParameter(
-            "Token must not contain newlines or '#'.",
-            param_hint="'github_token' / 'claude_token'",
-        )
 
     # Write .env (contains secrets, restrict permissions).
     # Pass token via stdin so it never enters the shell command string,
@@ -369,8 +370,12 @@ def destroy_project_stack(
         )
         if result.stderr.strip():
             console.print(f"    {result.stderr.strip()}")
-    else:
-        console.print("  Containers stopped [green]ok[/green]")
+        console.print(
+            "  [yellow]Skipping directory removal to avoid orphaning containers.[/yellow]\n"
+            "  Stop the containers manually, then re-run 'fleet destroy'."
+        )
+        return
+    console.print("  Containers stopped [green]ok[/green]")
 
     # Remove project directory (run as orcest user to keep blast radius consistent)
     _ssh_check(
@@ -407,7 +412,9 @@ def restart_project_stack(
     if result.returncode == 0:
         console.print("[green]ok[/green]")
     else:
-        console.print("[yellow]failed (stack may not exist yet)[/yellow]")
+        console.print("[yellow]failed[/yellow]")
+        if result.stderr.strip():
+            console.print(f"    {result.stderr.strip()}")
 
 
 def rebuild_image(host: str, user: str, console: Console) -> None:
