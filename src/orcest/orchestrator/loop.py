@@ -33,7 +33,7 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
 )
 from orcest.shared.config import OrchestratorConfig
-from orcest.shared.coordination import clear_pending_task
+from orcest.shared.coordination import clear_pending_task, compute_pending_task_ttl
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -94,6 +94,7 @@ def _poll_cycle(
     logger: logging.Logger,
 ) -> None:
     """Single orchestrator poll cycle."""
+    pending_task_ttl = compute_pending_task_ttl(config.runner)
 
     # Step 1: Consume results from workers
     _consume_results(config, redis, logger)
@@ -161,6 +162,7 @@ def _poll_cycle(
                             redis=redis,
                             default_runner=config.default_runner,
                             merge_error=err_msg[:200],
+                            pending_task_ttl=pending_task_ttl,
                             logger=logger,
                         )
                         enqueued += 1
@@ -271,6 +273,7 @@ def _poll_cycle(
                     token=config.github.token,
                     redis=redis,
                     default_runner=config.default_runner,
+                    pending_task_ttl=pending_task_ttl,
                     logger=logger,
                 )
                 if result is not None:
@@ -291,6 +294,7 @@ def _poll_cycle(
                     token=config.github.token,
                     redis=redis,
                     default_runner=config.default_runner,
+                    pending_task_ttl=pending_task_ttl,
                     logger=logger,
                 )
                 enqueued += 1
@@ -314,6 +318,7 @@ def _poll_cycle(
                     token=config.github.token,
                     redis=redis,
                     default_runner=config.default_runner,
+                    pending_task_ttl=pending_task_ttl,
                     logger=logger,
                 )
                 enqueued += 1
@@ -657,6 +662,7 @@ def _poll_cycle(
                     token=config.github.token,
                     redis=redis,
                     default_runner=config.default_runner,
+                    pending_task_ttl=pending_task_ttl,
                     logger=logger,
                 )
                 enqueued += 1
