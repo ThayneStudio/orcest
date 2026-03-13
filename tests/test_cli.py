@@ -221,27 +221,30 @@ def test_status_once_wrongtype_both_does_not_raise(fake_redis_client):
     _status_once(fake_redis_client)
 
 
-def test_status_once_wrongtype_tasks_key_shows_not_a_stream(fake_redis_client):
-    """A WRONGTYPE tasks:* key is reported as '(not a stream)' in output."""
+def test_status_once_wrongtype_tasks_key_excluded_from_output(fake_redis_client):
+    """A WRONGTYPE tasks:* key is silently excluded from queue depths output."""
     fake_redis_client.client.set("tasks:bad-key", "oops")
-    # _status_once uses Rich console which writes to stdout
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
         _status_once(fake_redis_client)
 
     output = buf.getvalue()
-    assert "(not a stream)" in output
+    # fetch_snapshot skips WRONGTYPE keys silently; bad key should not appear
+    assert "tasks:bad-key" not in output
+    assert "Orcest System Status" in output
 
 
-def test_status_once_wrongtype_results_key_shows_not_a_stream(fake_redis_client):
-    """A WRONGTYPE results key is reported as '(not a stream)' in the results row."""
+def test_status_once_wrongtype_results_key_shows_zero(fake_redis_client):
+    """A WRONGTYPE results key falls back to 0 in the queue depths table."""
     fake_redis_client.client.set("results", "some-value")
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
         _status_once(fake_redis_client)
 
     output = buf.getvalue()
-    assert "(not a stream)" in output
+    # fetch_snapshot catches the ResponseError and returns results_depth=0
+    assert "results" in output
+    assert "Orcest System Status" in output
 
 
 # ---------------------------------------------------------------------------

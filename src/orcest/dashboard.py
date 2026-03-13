@@ -63,7 +63,7 @@ class DeadLetterEntry:
     repo: str
     resource_type: str
     resource_id: str
-    timestamp: str
+    timestamp_ms: int
     reason: str
 
 
@@ -141,9 +141,8 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     for entry_id, fields in dl_raw:
         try:
             ms = int(entry_id.split("-")[0])
-            ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         except (ValueError, IndexError):
-            ts = entry_id
+            ms = 0
         dead_letter_entries.append(
             DeadLetterEntry(
                 entry_id=entry_id,
@@ -151,7 +150,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
                 repo=fields.get("repo", "?"),
                 resource_type=fields.get("resource_type", "?"),
                 resource_id=fields.get("resource_id", "?"),
-                timestamp=ts,
+                timestamp_ms=ms,
                 reason=fields.get("dead_letter_reason", "?"),
             )
         )
@@ -355,6 +354,11 @@ def _format_duration(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+def _truncate(s: str, n: int = 60) -> str:
+    """Truncate string to n characters, appending '...' if needed."""
+    return s[:n] + "..." if len(s) > n else s
+
+
 def _status_style(status: str) -> str:
     """Return a Rich markup color for a result status."""
     s = status.lower()
@@ -463,7 +467,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 yield DataTable(id="groups-table")
                 yield Static("Recent Results", classes="section-title")
                 yield DataTable(id="results-table")
-                yield Static("Dead Letters (last 5)", classes="section-title")
+                yield Static("Dead Letters", classes="section-title")
                 yield DataTable(id="dead-letters-table")
             with VerticalScroll(id="worker-container"):
                 yield Static("", id="worker-header")
@@ -596,9 +600,16 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             dl_table.clear()
             if snapshot.dead_letter_entries:
                 for entry in snapshot.dead_letter_entries:
-                    reason = (entry.reason[:60] + "...") if len(entry.reason) > 60 else entry.reason
+                    ts = (
+                        datetime.fromtimestamp(
+                            entry.timestamp_ms / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M UTC")
+                        if entry.timestamp_ms
+                        else entry.entry_id
+                    )
+                    reason = _truncate(entry.reason)
                     dl_table.add_row(
-                        entry.timestamp,
+                        ts,
                         entry.task_type,
                         entry.repo,
                         f"{entry.resource_type} #{entry.resource_id}",

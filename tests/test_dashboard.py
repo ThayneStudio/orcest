@@ -142,7 +142,7 @@ def test_dead_letter_entries_populated(fake_redis_client):
     assert entry.resource_type == "pr"
     assert entry.resource_id == "42"
     assert entry.reason == "max deliveries exceeded"
-    assert entry.timestamp  # non-empty string
+    assert entry.timestamp_ms > 0
 
 
 def test_dead_letter_entries_capped_at_five(fake_redis_client):
