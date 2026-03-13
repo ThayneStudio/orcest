@@ -64,7 +64,7 @@ class DeadLetterEntry:
     resource_type: str
     resource_id: str
     timestamp_ms: int | None
-    reason: str
+    reason: str | None
 
 
 @dataclass
@@ -151,7 +151,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
                 resource_type=fields.get("resource_type", "?"),
                 resource_id=fields.get("resource_id", "?"),
                 timestamp_ms=ms,
-                reason=fields.get("dead_letter_reason", "?"),
+                reason=fields.get("dead_letter_reason"),
             )
         )
 
@@ -607,13 +607,15 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                         if entry.timestamp_ms is not None
                         else entry.entry_id
                     )
-                    reason = truncate(entry.reason)
+                    reason_str = truncate(entry.reason) if entry.reason is not None else "?"
                     dl_table.add_row(
                         ts,
                         entry.task_type,
                         entry.repo,
                         f"{entry.resource_type} #{entry.resource_id}",
-                        Text(reason, style="red") if reason != "?" else Text(reason),
+                        Text(reason_str, style="red")
+                        if entry.reason is not None
+                        else Text(reason_str),
                     )
             else:
                 dl_table.add_row("--", "--", "--", "--", "No dead-lettered tasks")

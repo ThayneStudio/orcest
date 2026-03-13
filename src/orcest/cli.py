@@ -161,7 +161,7 @@ def _status_once(redis: RedisClient) -> None:
                 entry.task_type,
                 entry.repo,
                 f"{entry.resource_type} #{entry.resource_id}",
-                truncate(entry.reason),
+                truncate(entry.reason) if entry.reason is not None else "?",
             )
         console.print(dl_detail_table)
 
