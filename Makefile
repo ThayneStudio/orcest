@@ -2,11 +2,11 @@
 
 # Unit tests only (no Redis needed)
 test-unit:
-	pytest -m unit
+	pytest -m unit --cov=src/orcest --cov-report=term-missing
 
 # All tests — starts Redis, runs everything, stops Redis
 test: redis-up
-	pytest -v; ret=$$?; $(MAKE) redis-down; exit $$ret
+	pytest -v --cov=src/orcest --cov-report=term-missing; ret=$$?; $(MAKE) redis-down; exit $$ret
 
 # Start Redis in Docker for integration/stress tests
 redis-up:
