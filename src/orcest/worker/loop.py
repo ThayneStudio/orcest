@@ -36,6 +36,8 @@ HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
 _STREAM_MAXLEN = 2000
+_RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
+_RESULT_PUBLISH_BACKOFF = (1, 2, 4)  # Seconds to sleep before each retry (attempt 2, 3, ...)
 
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
@@ -295,20 +297,10 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # already set by the heartbeat callback.
             lock_lost.set()
 
-        # Publish result, then ACK only if publish succeeded.
-        # If publish fails, the result is lost — there is no XPENDING
-        # reconciliation for RESULTS_STREAM. The task entry stays unACKed so
-        # _drain_pending_tasks will publish a FAILED result on the next restart.
-        try:
-            redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
-            logger.info(f"Published result for task {task.id}: {result.status.value}")
-        except Exception:
-            logger.error(
-                f"Failed to publish result for task {task.id}; result lost — "
-                "task remains pending for _drain_pending_tasks on next restart",
-                exc_info=True,
-            )
+        # Publish result with retry + dead-letter fallback; ACK only on success.
+        if not _publish_result_with_retry(redis, result, task, logger):
             continue
+        logger.info(f"Published result for task {task.id}: {result.status.value}")
 
         try:
             redis.xack(current_stream, CONSUMER_GROUP, entry_id)
@@ -452,6 +444,63 @@ def _dead_letter_task(
             f"Failed to ACK dead-lettered task {task.id} (entry {entry_id})",
             exc_info=True,
         )
+
+
+def _publish_result_with_retry(
+    redis: RedisClient,
+    result: TaskResult,
+    task: Task,
+    logger: logging.Logger,
+) -> bool:
+    """Publish a task result to RESULTS_STREAM with exponential backoff retry.
+
+    Attempts up to _RESULT_PUBLISH_RETRIES times, sleeping _RESULT_PUBLISH_BACKOFF
+    seconds between consecutive attempts.  If all attempts fail, writes the result
+    and full task context to DEAD_LETTER_STREAM for manual recovery.
+
+    Returns True if the result was successfully published to RESULTS_STREAM,
+    False otherwise (dead-letter write may or may not have succeeded).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_RESULT_PUBLISH_RETRIES):
+        if attempt > 0:
+            time.sleep(_RESULT_PUBLISH_BACKOFF[attempt - 1])
+        try:
+            redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
+            return True
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                f"Result publish attempt {attempt + 1}/{_RESULT_PUBLISH_RETRIES} "
+                f"failed for task {result.task_id}: {exc}"
+            )
+
+    # All retries exhausted — send to dead-letter stream for manual recovery.
+    logger.error(
+        f"All {_RESULT_PUBLISH_RETRIES} result publish attempts failed for task "
+        f"{result.task_id}; writing to {DEAD_LETTER_STREAM!r}",
+        exc_info=last_exc,
+    )
+    try:
+        dl_fields = {
+            **result.to_dict(),
+            **task.to_dict(),
+            "dead_letter_reason": (
+                f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
+            ),
+        }
+        redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
+        logger.error(
+            f"Result for task {result.task_id} written to dead-letter stream "
+            f"{DEAD_LETTER_STREAM!r} for manual recovery"
+        )
+    except Exception:
+        logger.error(
+            f"Failed to write result for task {result.task_id} to dead-letter stream; "
+            "result is permanently lost",
+            exc_info=True,
+        )
+    return False
 
 
 def _execute_task(

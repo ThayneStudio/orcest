@@ -13,6 +13,8 @@ import pytest
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.worker.loop import (
+    _RESULT_PUBLISH_BACKOFF,
+    _RESULT_PUBLISH_RETRIES,
     _STREAM_MAXLEN,
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
@@ -24,6 +26,7 @@ from orcest.worker.loop import (
     _dead_letter_task,
     _execute_task,
     _make_abort_event,
+    _publish_result_with_retry,
     run_worker,
 )
 from orcest.worker.runner import RunnerResult
@@ -686,15 +689,16 @@ class TestRunWorker:
         mock_redis.xreadgroup.assert_not_called()
 
     def test_worker_result_publish_failure_does_not_ack(self, mocker, worker_config, sample_task):
-        """When redis.xadd_capped for the results stream raises, xack must NOT be called.
+        """When all result-stream publish retries raise, xack must NOT be called.
         The message stays in XPENDING so it can be re-delivered and the result
-        is not silently lost."""
+        is not silently lost (a dead-letter entry is written instead)."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+        mocker.patch("orcest.worker.loop.time.sleep")  # avoid real sleeps during retries
 
-        # Make the results-stream publish fail
+        # Make the results-stream publish fail (all retries)
         def _xadd_capped_side_effect(stream, data, **kwargs):
             if stream == RESULTS_STREAM:
                 raise ConnectionError("Redis unavailable")
@@ -1025,6 +1029,141 @@ class TestDeadLetterTask:
 
         # xack must still be called despite the publish failure
         mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-99")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _publish_result_with_retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPublishResultWithRetry:
+    """Tests for the _publish_result_with_retry helper."""
+
+    def _make_result(self, task: "Task") -> "TaskResult":
+        return TaskResult(
+            task_id=task.id,
+            worker_id="test-worker",
+            status=ResultStatus.COMPLETED,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            branch=task.branch,
+            summary="done",
+            duration_seconds=1,
+        )
+
+    def test_succeeds_on_first_attempt(self, sample_task):
+        """Returns True and calls xadd_capped once when the first attempt succeeds."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+        result = self._make_result(sample_task)
+
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test")
+        )
+
+        assert ok is True
+        mock_redis.xadd_capped.assert_called_once_with(
+            RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN
+        )
+
+    def test_retries_and_succeeds_on_second_attempt(self, sample_task, monkeypatch):
+        """Returns True when the first attempt fails and the second succeeds."""
+        call_count = [0]
+
+        def xadd_capped(stream, data, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1 and stream == RESULTS_STREAM:
+                raise ConnectionError("blip")
+            return "1-0"
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = xadd_capped
+        slept: list[float] = []
+        monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
+        result = self._make_result(sample_task)
+
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test")
+        )
+
+        assert ok is True
+        assert call_count[0] == 2
+        # Should have slept once before the second attempt
+        assert slept == [_RESULT_PUBLISH_BACKOFF[0]]
+
+    def test_retries_and_succeeds_on_third_attempt(self, sample_task, monkeypatch):
+        """Returns True when the first two attempts fail and the third succeeds."""
+        call_count = [0]
+
+        def xadd_capped(stream, data, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3 and stream == RESULTS_STREAM:
+                raise ConnectionError("blip")
+            return "1-0"
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = xadd_capped
+        slept: list[float] = []
+        monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
+        result = self._make_result(sample_task)
+
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test")
+        )
+
+        assert ok is True
+        assert call_count[0] == 3
+        assert slept == [_RESULT_PUBLISH_BACKOFF[0], _RESULT_PUBLISH_BACKOFF[1]]
+
+    def test_all_retries_fail_writes_dead_letter(self, sample_task, monkeypatch):
+        """Returns False and writes to DEAD_LETTER_STREAM when all retries fail."""
+        mock_redis = MagicMock()
+
+        def xadd_capped(stream, data, **kwargs):
+            if stream == RESULTS_STREAM:
+                raise ConnectionError("Redis down")
+            return "1-0"
+
+        mock_redis.xadd_capped.side_effect = xadd_capped
+        monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
+        result = self._make_result(sample_task)
+
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test")
+        )
+
+        assert ok is False
+        # Should have attempted RESULTS_STREAM exactly _RESULT_PUBLISH_RETRIES times
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == _RESULT_PUBLISH_RETRIES
+        # Dead-letter stream must have been written exactly once
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 1
+        dl_fields = dl_calls[0][0][1]
+        assert dl_fields["task_id"] == sample_task.id
+        assert "dead_letter_reason" in dl_fields
+
+    def test_all_retries_fail_dead_letter_also_fails_returns_false(
+        self, sample_task, monkeypatch, caplog
+    ):
+        """Returns False even when the dead-letter write itself raises."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = ConnectionError("Redis down")
+        monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
+        result = self._make_result(sample_task)
+
+        with caplog.at_level(logging.ERROR):
+            ok = _publish_result_with_retry(
+                mock_redis, result, sample_task, logging.getLogger("test")
+            )
+
+        assert ok is False
+        assert any("permanently lost" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
