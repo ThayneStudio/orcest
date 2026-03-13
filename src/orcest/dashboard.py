@@ -601,9 +601,9 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if snapshot.dead_letter_entries:
                 for entry in snapshot.dead_letter_entries:
                     ts = (
-                        datetime.fromtimestamp(
-                            entry.timestamp_ms / 1000, tz=timezone.utc
-                        ).strftime("%Y-%m-%d %H:%M UTC")
+                        datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M UTC"
+                        )
                         if entry.timestamp_ms
                         else entry.entry_id
                     )
