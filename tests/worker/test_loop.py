@@ -1058,9 +1058,7 @@ class TestPublishResultWithRetry:
         mock_redis.xadd_capped.return_value = "1-0"
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test")
-        )
+        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
 
         assert ok is True
         mock_redis.xadd_capped.assert_called_once_with(
@@ -1083,9 +1081,7 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test")
-        )
+        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
 
         assert ok is True
         assert call_count[0] == 2
@@ -1108,9 +1104,7 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test")
-        )
+        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
 
         assert ok is True
         assert call_count[0] == 3
@@ -1129,9 +1123,7 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test")
-        )
+        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
 
         assert ok is False
         # Should have attempted RESULTS_STREAM exactly _RESULT_PUBLISH_RETRIES times
