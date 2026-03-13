@@ -352,7 +352,7 @@ def test_consume_results_completed_does_not_clear_total_attempts(
 
     total_attempts is the cross-SHA circuit-breaker counter and should only be
     reset when the PR is truly resolved (merged), not on intermediate successes.
-    Regression test for the bug fixed in #313.
+    Regression test for the bug fixed in PR #331 (issue #335).
     """
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
