@@ -66,6 +66,8 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    pending_task_ttl = compute_pending_task_ttl(config.runner)
+
     logger.info(
         "Orchestrator started. Repo: %s, poll interval: %ds",
         config.github.repo,
@@ -74,7 +76,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(config, redis, logger)
+            _poll_cycle(config, redis, logger, pending_task_ttl)
         except Exception as e:
             logger.error("Poll cycle failed: %s", e, exc_info=True)
             # Continue after error -- don't crash the loop
@@ -92,10 +94,9 @@ def _poll_cycle(
     config: OrchestratorConfig,
     redis: RedisClient,
     logger: logging.Logger,
+    pending_task_ttl: int,
 ) -> None:
     """Single orchestrator poll cycle."""
-    pending_task_ttl = compute_pending_task_ttl(config.runner)
-
     # Step 1: Consume results from workers
     _consume_results(config, redis, logger)
 
