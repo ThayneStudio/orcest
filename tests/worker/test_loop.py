@@ -325,14 +325,15 @@ class TestExecuteTask:
         # Workspace cleanup should still run via the finally block
         mock_workspace.cleanup.assert_called_once()
 
-    def test_worker_on_output_redis_error_logs_once(
+    def test_worker_on_output_redis_error_rate_limited_logging(
         self, local_worker_config, sample_task, mock_workspace, caplog
     ):
-        """When redis.xadd_capped raises inside on_output, the first error
-        is logged as a warning but subsequent errors are suppressed."""
+        """When redis.xadd_capped raises inside on_output, errors are logged
+        at powers of ten (1, 10, 100, …) so operators see ongoing degradation
+        without flooding the log."""
         mock_runner = MagicMock()
 
-        # Configure the runner to invoke on_output multiple times
+        # Configure the runner to invoke on_output multiple times (3 errors)
         def run_with_output(**kwargs):
             on_output = kwargs.get("on_output")
             if on_output:
@@ -365,12 +366,57 @@ class TestExecuteTask:
 
         assert result.status == ResultStatus.COMPLETED
 
-        # Count how many "Failed to publish output line" warnings were logged.
-        # The first error should be logged; subsequent ones should be suppressed.
+        # 3 errors: only error #1 is a power of ten, so exactly one warning.
         output_warnings = [
             r for r in caplog.records if "Failed to publish output line" in r.message
         ]
         assert len(output_warnings) == 1
+        assert "error #1" in output_warnings[0].message
+
+    def test_worker_on_output_redis_error_logs_at_powers_of_ten(
+        self, local_worker_config, sample_task, mock_workspace, caplog
+    ):
+        """Errors are logged again at #10, #100, etc. to surface ongoing degradation."""
+        mock_runner = MagicMock()
+
+        # Configure the runner to invoke on_output 10 times
+        def run_with_output(**kwargs):
+            on_output = kwargs.get("on_output")
+            if on_output:
+                for i in range(10):
+                    on_output(f"line {i}\n")
+            return _success_runner_result()
+
+        mock_runner.run.side_effect = run_with_output
+
+        mock_redis = MagicMock()
+
+        def xadd_capped_side_effect(stream, data, **kwargs):
+            if "line" in data:
+                raise ConnectionError("Redis down")
+            return "1-0"
+
+        mock_redis.xadd_capped.side_effect = xadd_capped_side_effect
+
+        with caplog.at_level(logging.WARNING):
+            result = _execute_task(
+                sample_task,
+                local_worker_config,
+                mock_runner,
+                mock_workspace,
+                mock_redis,
+                logging.getLogger("test"),
+            )
+
+        assert result.status == ResultStatus.COMPLETED
+
+        # 10 errors: #1 and #10 are powers of ten, so two warnings.
+        output_warnings = [
+            r for r in caplog.records if "Failed to publish output line" in r.message
+        ]
+        assert len(output_warnings) == 2
+        assert "error #1" in output_warnings[0].message
+        assert "error #10" in output_warnings[1].message
 
     def test_abort_event_passed_to_runner(self, local_worker_config, sample_task, mock_workspace):
         """_execute_task passes abort_event to runner.run()."""
