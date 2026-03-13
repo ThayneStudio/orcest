@@ -38,6 +38,9 @@ MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at mos
 _STREAM_MAXLEN = 2000
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
+assert len(_RESULT_PUBLISH_BACKOFF) == _RESULT_PUBLISH_RETRIES - 1, (
+    "_RESULT_PUBLISH_BACKOFF must have exactly _RESULT_PUBLISH_RETRIES - 1 entries"
+)
 
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
@@ -487,8 +490,8 @@ def _publish_result_with_retry(
     )
     try:
         dl_fields = {
-            **result.to_dict(),
             **task.to_dict(),
+            **result.to_dict(),
             "dead_letter_reason": (
                 f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
             ),
