@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,20 @@ class GhCliError(Exception):
         super().__init__(message)
         self.stderr = stderr
         self.returncode = returncode
+
+
+class GhRateLimitError(GhCliError):
+    """Raised when the gh CLI is rate-limited by GitHub (HTTP 429)."""
+
+    def __init__(
+        self,
+        message: str,
+        stderr: str = "",
+        returncode: int | None = None,
+        retry_after: int | None = None,
+    ):
+        super().__init__(message, stderr=stderr, returncode=returncode)
+        self.retry_after = retry_after
 
 
 class GhNotInstalledError(GhCliError):
@@ -47,6 +62,29 @@ def _validate_repo(repo: str) -> None:
 
 _GH_TIMEOUT_SECONDS = 120
 
+# Exponential backoff delays (seconds) between rate-limit retries.
+# The number of entries equals the number of retries attempted before giving up.
+_RATE_LIMIT_BACKOFF_SECONDS: tuple[int, ...] = (30, 60, 120)
+
+_RATE_LIMIT_RE = re.compile(r"rate.?limit", re.IGNORECASE)
+_RATE_LIMIT_429_RE = re.compile(r"\b429\b")
+_RETRY_AFTER_RE = re.compile(r"retry.?after[:\s]+(\d+)", re.IGNORECASE)
+
+# Maximum seconds to honour a server-supplied retry-after header; guards
+# against misbehaving or adversarial responses with extreme values.
+_MAX_RETRY_AFTER_SECONDS = 300
+
+
+def _is_rate_limited(stderr: str) -> bool:
+    """Return True if stderr indicates a GitHub rate-limit response."""
+    return bool(_RATE_LIMIT_RE.search(stderr)) or bool(_RATE_LIMIT_429_RE.search(stderr))
+
+
+def _extract_retry_after(stderr: str) -> int | None:
+    """Extract retry-after duration in seconds from gh CLI stderr, if present."""
+    m = _RETRY_AFTER_RE.search(stderr)
+    return int(m.group(1)) if m else None
+
 
 def _run_gh(args: list[str], token: str) -> str:
     """Execute a gh CLI command and return stdout.
@@ -54,43 +92,75 @@ def _run_gh(args: list[str], token: str) -> str:
     Sets both GITHUB_TOKEN and GH_TOKEN for compatibility across
     gh CLI versions.
 
+    Retries up to len(_RATE_LIMIT_BACKOFF_SECONDS) times with exponential
+    backoff when GitHub rate-limits the request.
+
     Raises:
         GhNotInstalledError: If the gh CLI binary is not on PATH.
-        GhCliError: On non-zero exit, with stderr included in the message.
+        GhRateLimitError: When rate-limited and all retries are exhausted.
+        GhCliError: On non-zero exit for any other error.
     """
     env = os.environ.copy()
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token  # gh CLI also checks GH_TOKEN
 
-    try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=True,
-            timeout=_GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        raise GhNotInstalledError(
-            "gh CLI not found on PATH. Install it from https://cli.github.com/"
-        ) from None
-    except subprocess.TimeoutExpired as exc:
-        # Truncate args to avoid dumping entire GraphQL queries into logs
-        brief = " ".join(args[:4])
-        if len(args) > 4:
-            brief += " ..."
-        raise GhCliError(
-            f"gh command timed out after {exc.timeout}s: gh {brief}",
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise GhCliError(
-            f"gh command failed (exit {exc.returncode}): {exc.stderr.strip()}",
-            stderr=exc.stderr,
-            returncode=exc.returncode,
-        ) from exc
+    for attempt in range(len(_RATE_LIMIT_BACKOFF_SECONDS) + 1):
+        try:
+            result = subprocess.run(
+                ["gh", *args],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+                timeout=_GH_TIMEOUT_SECONDS,
+            )
+            return result.stdout.strip()
+        except FileNotFoundError:
+            raise GhNotInstalledError(
+                "gh CLI not found on PATH. Install it from https://cli.github.com/"
+            ) from None
+        except subprocess.TimeoutExpired as exc:
+            # Truncate args to avoid dumping entire GraphQL queries into logs
+            brief = " ".join(args[:4])
+            if len(args) > 4:
+                brief += " ..."
+            raise GhCliError(
+                f"gh command timed out after {exc.timeout}s: gh {brief}",
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            if _is_rate_limited(exc.stderr):
+                retry_after = _extract_retry_after(exc.stderr)
+                if attempt < len(_RATE_LIMIT_BACKOFF_SECONDS):
+                    if retry_after is not None:
+                        wait = min(retry_after, _MAX_RETRY_AFTER_SECONDS)
+                    else:
+                        wait = _RATE_LIMIT_BACKOFF_SECONDS[attempt]
+                    logger.warning(
+                        "GitHub rate limit hit; retrying in %ds (attempt %d/%d)",
+                        wait,
+                        attempt + 1,
+                        len(_RATE_LIMIT_BACKOFF_SECONDS),
+                    )
+                    time.sleep(wait)
+                    continue
+                raise GhRateLimitError(
+                    f"gh command rate-limited (exit {exc.returncode}): {exc.stderr.strip()}",
+                    stderr=exc.stderr,
+                    returncode=exc.returncode,
+                    retry_after=(
+                        min(retry_after, _MAX_RETRY_AFTER_SECONDS)
+                        if retry_after is not None
+                        else None
+                    ),
+                ) from exc
+            raise GhCliError(
+                f"gh command failed (exit {exc.returncode}): {exc.stderr.strip()}",
+                stderr=exc.stderr,
+                returncode=exc.returncode,
+            ) from exc
 
-    return result.stdout.strip()
+    # Unreachable: the loop always returns or raises before this point.
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
