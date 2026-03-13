@@ -306,6 +306,26 @@ def test_lock_checked_before_pending(issue_gh_mock, fake_redis_client, label_con
     assert results[0].action == IssueAction.SKIP_LOCKED
 
 
+def test_pending_checked_before_attempts(issue_gh_mock, fake_redis_client, label_config):
+    """Pending-task check happens before attempt check (SKIP_QUEUED, not SKIP_ACTIVE)."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=13, labels=[]),
+    ]
+    pending_key = make_pending_task_key(REPO, "issue", 13)
+    fake_redis_client.client.set(pending_key, "task-pending")
+    increment_attempts(fake_redis_client, 13)  # count = 1 — would cause SKIP_ACTIVE
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert results[0].action == IssueAction.SKIP_QUEUED
+
+
 # ---------------------------------------------------------------------------
 # IssueState fields
 # ---------------------------------------------------------------------------
@@ -318,7 +338,7 @@ def test_issue_state_fields_populated(issue_gh_mock, fake_redis_client, label_co
             number=50,
             title="Add dark mode",
             body="Users want dark mode",
-            labels=[{"name": "orcest:ready"}, {"name": "enhancement"}],
+            labels=[{"name": label_config.ready}, {"name": "enhancement"}],
         ),
     ]
 
@@ -334,7 +354,7 @@ def test_issue_state_fields_populated(issue_gh_mock, fake_redis_client, label_co
     assert state.number == 50
     assert state.title == "Add dark mode"
     assert state.body == "Users want dark mode"
-    assert "orcest:ready" in state.labels
+    assert label_config.ready in state.labels
     assert "enhancement" in state.labels
     assert state.action == IssueAction.ENQUEUE_IMPLEMENT
 
