@@ -49,7 +49,7 @@ def _make_issue_data(
 def test_happy_path_enqueue_implement(issue_gh_mock, fake_redis_client, label_config):
     """An issue with orcest:ready and no blockers is ENQUEUE_IMPLEMENT."""
     issue_gh_mock.return_value = [
-        _make_issue_data(number=1, labels=[{"name": "orcest:ready"}]),
+        _make_issue_data(number=1, labels=[{"name": label_config.ready}]),
     ]
 
     results = discover_actionable_issues(
@@ -271,7 +271,7 @@ def test_terminal_label_checked_before_lock(issue_gh_mock, fake_redis_client, la
     issue_gh_mock.return_value = [
         _make_issue_data(
             number=11,
-            labels=[{"name": "orcest:blocked"}],
+            labels=[{"name": label_config.blocked}],
         ),
     ]
     # Also set a lock — the label check should short-circuit first
