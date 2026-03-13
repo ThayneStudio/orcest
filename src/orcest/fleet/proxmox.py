@@ -67,7 +67,9 @@ class ProxmoxClient:
             self.node.qemu(vm_id).status.current.get()
             return True
         except Exception:
-            logger.debug("VM %d: existence check failed, treating as not found", vm_id, exc_info=True)
+            logger.debug(
+                "VM %d: existence check failed, treating as not found", vm_id, exc_info=True
+            )
             return False
 
     def get_vm_status(self, vm_id: int) -> str:
@@ -92,7 +94,7 @@ class ProxmoxClient:
                             return ip
             except Exception:
                 logger.debug(
-                    "VM %d: guest agent not ready yet, retrying", vm_id, exc_info=True
+                    "VM %d: exception during guest agent query, retrying", vm_id, exc_info=True
                 )
             time.sleep(5)
         return None
@@ -187,7 +189,9 @@ class ProxmoxClient:
             volumes = self.node.storage("local").content.get()
             has_image = any(v.get("volid", "").endswith(CLOUD_IMG_NAME) for v in volumes)
         except Exception:
-            logger.debug("Failed to check cloud image presence, assuming not downloaded", exc_info=True)
+            logger.debug(
+                "Failed to check cloud image presence, assuming not downloaded", exc_info=True
+            )
             has_image = False
 
         if not has_image:
