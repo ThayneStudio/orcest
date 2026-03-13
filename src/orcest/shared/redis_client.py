@@ -27,6 +27,8 @@ class RedisClient:
             db=config.db,
             password=config.password,
             decode_responses=True,
+            socket_timeout=config.socket_timeout,
+            socket_connect_timeout=config.socket_connect_timeout,
         )
         self._client: redis.Redis = redis.Redis(connection_pool=self._pool)
 
