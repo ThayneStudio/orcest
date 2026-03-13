@@ -339,9 +339,7 @@ def test_issue_state_fields_populated(issue_gh_mock, fake_redis_client, label_co
     assert state.action == IssueAction.ENQUEUE_IMPLEMENT
 
 
-def test_issue_body_none_defaults_to_empty_string(
-    issue_gh_mock, fake_redis_client, label_config
-):
+def test_issue_body_none_defaults_to_empty_string(issue_gh_mock, fake_redis_client, label_config):
     """Issues with null body are handled gracefully (body defaults to '')."""
     issue_gh_mock.return_value = [
         {
