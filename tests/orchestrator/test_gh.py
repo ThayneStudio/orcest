@@ -14,8 +14,11 @@ import pytest
 
 from orcest.orchestrator.gh import (
     _MAX_PAGES,
+    _MAX_RETRY_AFTER_SECONDS,
+    _RATE_LIMIT_BACKOFF_SECONDS,
     GhCliError,
     GhNotInstalledError,
+    GhRateLimitError,
     add_label,
     create_issue,
     get_ci_status,
@@ -1189,3 +1192,174 @@ def test_create_issue_non_numeric_end_raises(mocker):
     )
     with pytest.raises(GhCliError, match="Could not parse issue number"):
         create_issue(REPO, "Test title", "Test body", TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# _run_gh — rate-limit detection and exponential backoff
+# ---------------------------------------------------------------------------
+
+
+def _make_rate_limit_error(stderr: str, returncode: int = 1) -> subprocess.CalledProcessError:
+    exc = subprocess.CalledProcessError(returncode, ["gh"], stderr=stderr)
+    return exc
+
+
+def test_run_gh_rate_limit_text_raises_gh_rate_limit_error(mocker):
+    """stderr containing 'rate limit' causes GhRateLimitError after all retries."""
+    mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("error: rate limit exceeded"),
+    )
+    with pytest.raises(GhRateLimitError):
+        list_open_prs(REPO, TOKEN)
+
+
+def test_run_gh_rate_limit_429_raises_gh_rate_limit_error(mocker):
+    """stderr containing '429' causes GhRateLimitError after all retries."""
+    mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("HTTP 429: Too Many Requests"),
+    )
+    with pytest.raises(GhRateLimitError):
+        list_open_prs(REPO, TOKEN)
+
+
+def test_run_gh_rate_limit_is_subclass_of_gh_cli_error(mocker):
+    """GhRateLimitError is a subclass of GhCliError so callers catching GhCliError still work."""
+    assert issubclass(GhRateLimitError, GhCliError)
+
+
+def test_run_gh_rate_limit_retries_configured_number_of_times(mocker):
+    """_run_gh retries exactly len(_RATE_LIMIT_BACKOFF_SECONDS) times before giving up."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded"),
+    )
+    with pytest.raises(GhRateLimitError):
+        list_open_prs(REPO, TOKEN)
+
+    # Total calls = initial attempt + one per backoff entry
+    assert mock_run.call_count == len(_RATE_LIMIT_BACKOFF_SECONDS) + 1
+    assert mock_sleep.call_count == len(_RATE_LIMIT_BACKOFF_SECONDS)
+
+
+def test_run_gh_rate_limit_uses_backoff_delays(mocker):
+    """time.sleep is called with the configured backoff delays in order."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded"),
+    )
+    with pytest.raises(GhRateLimitError):
+        list_open_prs(REPO, TOKEN)
+
+    sleep_args = [call.args[0] for call in mock_sleep.call_args_list]
+    assert sleep_args == list(_RATE_LIMIT_BACKOFF_SECONDS)
+
+
+def test_run_gh_rate_limit_uses_retry_after_when_present(mocker):
+    """When 'retry after N' is in stderr, that duration is used instead of the default backoff."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded, retry after 45 seconds"),
+    )
+    with pytest.raises(GhRateLimitError):
+        list_open_prs(REPO, TOKEN)
+
+    # Every sleep call should use the retry-after value (45), not the defaults
+    sleep_args = [call.args[0] for call in mock_sleep.call_args_list]
+    assert all(v == 45 for v in sleep_args)
+
+
+def test_run_gh_rate_limit_error_carries_retry_after(mocker):
+    """GhRateLimitError.retry_after is set from the retry-after duration in stderr."""
+    mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit, retry after: 90"),
+    )
+    with pytest.raises(GhRateLimitError) as exc_info:
+        list_open_prs(REPO, TOKEN)
+
+    assert exc_info.value.retry_after == 90
+
+
+def test_run_gh_rate_limit_error_retry_after_none_when_absent(mocker):
+    """GhRateLimitError.retry_after is None when no retry-after value appears in stderr."""
+    mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("API rate limit exceeded"),
+    )
+    with pytest.raises(GhRateLimitError) as exc_info:
+        list_open_prs(REPO, TOKEN)
+
+    assert exc_info.value.retry_after is None
+
+
+def test_run_gh_rate_limit_succeeds_after_retry(mocker):
+    """If a rate-limit is followed by a successful response, the result is returned normally."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    payload = [{"number": 1, "title": "PR"}]
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=[
+            _make_rate_limit_error("rate limit exceeded"),
+            subprocess.CompletedProcess(
+                args=["gh"], returncode=0, stdout=json.dumps(payload), stderr=""
+            ),
+        ],
+    )
+    result = list_open_prs(REPO, TOKEN)
+    assert result == payload
+    assert mock_run.call_count == 2
+    assert mock_sleep.call_count == 1
+
+
+def test_run_gh_non_rate_limit_error_does_not_retry(mocker):
+    """Non-rate-limit errors raise GhCliError immediately without retrying."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(1, ["gh"], stderr="authentication failed"),
+    )
+    with pytest.raises(GhCliError) as exc_info:
+        list_open_prs(REPO, TOKEN)
+
+    assert not isinstance(exc_info.value, GhRateLimitError)
+    assert mock_run.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_run_gh_rate_limit_logs_warning(mocker, caplog):
+    """A warning is logged each time a rate-limit is detected."""
+    mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded"),
+    )
+    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
+        with pytest.raises(GhRateLimitError):
+            list_open_prs(REPO, TOKEN)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_messages) == len(_RATE_LIMIT_BACKOFF_SECONDS)
+
+
+def test_run_gh_rate_limit_caps_retry_after_at_max(mocker):
+    """When server-supplied retry-after exceeds _MAX_RETRY_AFTER_SECONDS, sleep uses the cap."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded, retry after 999 seconds"),
+    )
+    with pytest.raises(GhRateLimitError) as exc_info:
+        list_open_prs(REPO, TOKEN)
+
+    sleep_args = [call.args[0] for call in mock_sleep.call_args_list]
+    assert all(v == _MAX_RETRY_AFTER_SECONDS for v in sleep_args)
+    assert exc_info.value.retry_after == _MAX_RETRY_AFTER_SECONDS
