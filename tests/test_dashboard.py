@@ -6,6 +6,7 @@ import pytest
 import redis as redis_lib
 
 from orcest.dashboard import (
+    DeadLetterEntry,
     _format_duration,
     _format_ttl,
     _status_style,
@@ -109,6 +110,68 @@ def test_dead_letter_count_in_snapshot(fake_redis_client):
     snap = fetch_snapshot(fake_redis_client)
 
     assert snap.dead_letter_count == 2
+
+
+def test_dead_letter_entries_empty_when_no_stream(fake_redis_client):
+    """Dead-letter entries list is empty when the stream does not exist."""
+    snap = fetch_snapshot(fake_redis_client)
+    assert snap.dead_letter_entries == []
+
+
+def test_dead_letter_entries_populated(fake_redis_client):
+    """Fetches last N dead-letter entries with task details."""
+    fake_redis_client.xadd(
+        "orcest:dead-letter",
+        {
+            "id": "task-abc",
+            "type": "fix_ci",
+            "repo": "org/repo",
+            "resource_type": "pr",
+            "resource_id": "42",
+            "dead_letter_reason": "max deliveries exceeded",
+        },
+    )
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    assert len(snap.dead_letter_entries) == 1
+    entry = snap.dead_letter_entries[0]
+    assert isinstance(entry, DeadLetterEntry)
+    assert entry.task_type == "fix_ci"
+    assert entry.repo == "org/repo"
+    assert entry.resource_type == "pr"
+    assert entry.resource_id == "42"
+    assert entry.reason == "max deliveries exceeded"
+    assert entry.timestamp_ms > 0
+
+
+def test_dead_letter_entries_capped_at_five(fake_redis_client):
+    """At most 5 dead-letter entries are returned in the snapshot."""
+    for i in range(8):
+        fake_redis_client.xadd(
+            "orcest:dead-letter",
+            {"id": f"task-{i}", "type": "fix_ci", "repo": "org/repo"},
+        )
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    assert snap.dead_letter_count == 8
+    assert len(snap.dead_letter_entries) == 5
+
+
+def test_dead_letter_entries_most_recent_first(fake_redis_client):
+    """Dead-letter entries are returned most recent first."""
+    for i in range(3):
+        fake_redis_client.xadd(
+            "orcest:dead-letter",
+            {"id": f"task-{i}", "type": "fix_ci", "repo": f"org/repo-{i}"},
+        )
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    # Most recent entry has the highest repo index
+    assert snap.dead_letter_entries[0].repo == "org/repo-2"
+    assert snap.dead_letter_entries[2].repo == "org/repo-0"
 
 
 def test_disconnected_redis(fake_redis_client, mocker):
