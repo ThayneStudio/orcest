@@ -38,6 +38,11 @@ class TestRenderProjectCompose:
         data = yaml.safe_load(content)
         assert "healthcheck" in data["services"]["redis"]
 
+    def test_orchestrator_no_healthcheck(self):
+        content = render_project_compose(redis_port=6379)
+        data = yaml.safe_load(content)
+        assert "healthcheck" not in data["services"]["orchestrator"]
+
     def test_env_file_reference(self):
         content = render_project_compose(redis_port=6379)
         data = yaml.safe_load(content)

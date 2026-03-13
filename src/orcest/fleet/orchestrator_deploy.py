@@ -142,11 +142,6 @@ def render_project_compose(redis_port: int) -> str:
             env_file:
               - .env
             restart: unless-stopped
-            healthcheck:
-              test: ["CMD", "python3", "-c", "import redis; redis.Redis('redis').ping()"]
-              interval: 30s
-              timeout: 5s
-              retries: 3
             logging:
               driver: json-file
               options:
