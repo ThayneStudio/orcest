@@ -217,11 +217,19 @@ def _poll_cycle(
                 try:
                     clear_review_retrigger(redis, pr_state.number)
                 except Exception:
-                    pass  # Best-effort cleanup; key has TTL anyway
+                    logger.debug(
+                        "cleanup failed: clear_review_retrigger for PR #%d",
+                        pr_state.number,
+                        exc_info=True,
+                    )  # Best-effort cleanup; key has TTL anyway
                 try:
                     clear_total_attempts(redis, pr_state.number)
                 except Exception:
-                    pass  # Best-effort cleanup; key has TTL anyway
+                    logger.debug(
+                        "cleanup failed: clear_total_attempts for PR #%d",
+                        pr_state.number,
+                        exc_info=True,
+                    )  # Best-effort cleanup; key has TTL anyway
                 try:
                     gh.post_comment(
                         config.github.repo,
