@@ -494,12 +494,15 @@ def _execute_task(
                 redis.xadd_capped(output_stream, {"line": line}, maxlen=_STREAM_MAXLEN)
             except Exception:
                 # Non-critical: don't kill the task over a streaming failure.
-                # Log the first occurrence so operators know Redis output
-                # streaming is degraded.
+                # Log at error #1, #10, #100, … (powers of ten) so operators
+                # see ongoing degradation without flooding the log.
                 output_errors += 1
-                if output_errors == 1:
+                n = output_errors
+                while n % 10 == 0:
+                    n //= 10
+                if n == 1:
                     logger.warning(
-                        "Failed to publish output line to Redis (further errors suppressed)",
+                        f"Failed to publish output line to Redis (error #{output_errors})",
                         exc_info=True,
                     )
 
