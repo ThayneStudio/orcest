@@ -109,7 +109,7 @@ def test_skip_blocked_label(issue_gh_mock, fake_redis_client, label_config):
     issue_gh_mock.return_value = [
         _make_issue_data(
             number=5,
-            labels=[{"name": "orcest:ready"}, {"name": "orcest:blocked"}],
+            labels=[{"name": label_config.ready}, {"name": label_config.blocked}],
         ),
     ]
 
@@ -130,7 +130,7 @@ def test_skip_needs_human_label(issue_gh_mock, fake_redis_client, label_config):
     issue_gh_mock.return_value = [
         _make_issue_data(
             number=6,
-            labels=[{"name": "orcest:ready"}, {"name": "orcest:needs-human"}],
+            labels=[{"name": label_config.ready}, {"name": label_config.needs_human}],
         ),
     ]
 
