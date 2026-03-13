@@ -37,7 +37,7 @@ LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires withi
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
 _STREAM_MAXLEN = 2000
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
-_RESULT_PUBLISH_BACKOFF = (1, 2, 4)  # Seconds to sleep before each retry (attempt 2, 3, ...)
+_RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
@@ -298,7 +298,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             lock_lost.set()
 
         # Publish result with retry + dead-letter fallback; ACK only on success.
-        if not _publish_result_with_retry(redis, result, task, logger):
+        if not _publish_result_with_retry(redis, result, task, logger, current_stream, entry_id):
             continue
         logger.info(f"Published result for task {task.id}: {result.status.value}")
 
@@ -451,12 +451,16 @@ def _publish_result_with_retry(
     result: TaskResult,
     task: Task,
     logger: logging.Logger,
+    tasks_stream: str,
+    entry_id: str,
 ) -> bool:
     """Publish a task result to RESULTS_STREAM with exponential backoff retry.
 
     Attempts up to _RESULT_PUBLISH_RETRIES times, sleeping _RESULT_PUBLISH_BACKOFF
     seconds between consecutive attempts.  If all attempts fail, writes the result
-    and full task context to DEAD_LETTER_STREAM for manual recovery.
+    and full task context to DEAD_LETTER_STREAM for manual recovery.  The dead-letter
+    entry includes ``tasks_stream`` and ``original_entry_id`` so that
+    ``orcest dead-letters --replay`` can re-enqueue it.
 
     Returns True if the result was successfully published to RESULTS_STREAM,
     False otherwise (dead-letter write may or may not have succeeded).
@@ -488,6 +492,8 @@ def _publish_result_with_retry(
             "dead_letter_reason": (
                 f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
             ),
+            "tasks_stream": tasks_stream,
+            "original_entry_id": entry_id,
         }
         redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
         logger.error(

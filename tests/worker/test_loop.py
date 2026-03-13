@@ -1058,7 +1058,9 @@ class TestPublishResultWithRetry:
         mock_redis.xadd_capped.return_value = "1-0"
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+        )
 
         assert ok is True
         mock_redis.xadd_capped.assert_called_once_with(
@@ -1081,7 +1083,9 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+        )
 
         assert ok is True
         assert call_count[0] == 2
@@ -1104,7 +1108,9 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+        )
 
         assert ok is True
         assert call_count[0] == 3
@@ -1123,7 +1129,14 @@ class TestPublishResultWithRetry:
         monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
         result = self._make_result(sample_task)
 
-        ok = _publish_result_with_retry(mock_redis, result, sample_task, logging.getLogger("test"))
+        ok = _publish_result_with_retry(
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "entry-42",
+        )
 
         assert ok is False
         # Should have attempted RESULTS_STREAM exactly _RESULT_PUBLISH_RETRIES times
@@ -1139,6 +1152,8 @@ class TestPublishResultWithRetry:
         dl_fields = dl_calls[0][0][1]
         assert dl_fields["task_id"] == sample_task.id
         assert "dead_letter_reason" in dl_fields
+        assert dl_fields["tasks_stream"] == "tasks:claude"
+        assert dl_fields["original_entry_id"] == "entry-42"
 
     def test_all_retries_fail_dead_letter_also_fails_returns_false(
         self, sample_task, monkeypatch, caplog
@@ -1151,7 +1166,12 @@ class TestPublishResultWithRetry:
 
         with caplog.at_level(logging.ERROR):
             ok = _publish_result_with_retry(
-                mock_redis, result, sample_task, logging.getLogger("test")
+                mock_redis,
+                result,
+                sample_task,
+                logging.getLogger("test"),
+                "tasks:claude",
+                "1-1",
             )
 
         assert ok is False
