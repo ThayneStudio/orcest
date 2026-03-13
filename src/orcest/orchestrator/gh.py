@@ -72,7 +72,7 @@ _RETRY_AFTER_RE = re.compile(r"retry.?after[:\s]+(\d+)", re.IGNORECASE)
 
 def _is_rate_limited(stderr: str) -> bool:
     """Return True if stderr indicates a GitHub rate-limit response."""
-    return bool(_RATE_LIMIT_RE.search(stderr)) or "429" in stderr
+    return bool(_RATE_LIMIT_RE.search(stderr)) or bool(re.search(r"\b429\b", stderr))
 
 
 def _extract_retry_after(stderr: str) -> int | None:
@@ -126,10 +126,11 @@ def _run_gh(args: list[str], token: str) -> str:
             if _is_rate_limited(exc.stderr):
                 retry_after = _extract_retry_after(exc.stderr)
                 if attempt < len(_RATE_LIMIT_BACKOFF_SECONDS):
-                    wait = (
+                    wait = min(
                         retry_after
                         if retry_after is not None
-                        else _RATE_LIMIT_BACKOFF_SECONDS[attempt]
+                        else _RATE_LIMIT_BACKOFF_SECONDS[attempt],
+                        max(_RATE_LIMIT_BACKOFF_SECONDS),
                     )
                     logger.warning(
                         "GitHub rate limit hit; retrying in %ds (attempt %d/%d)",
