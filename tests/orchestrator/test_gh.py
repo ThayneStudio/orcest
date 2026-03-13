@@ -14,6 +14,7 @@ import pytest
 
 from orcest.orchestrator.gh import (
     _MAX_PAGES,
+    _MAX_RETRY_AFTER_SECONDS,
     _RATE_LIMIT_BACKOFF_SECONDS,
     GhCliError,
     GhNotInstalledError,
@@ -1347,3 +1348,18 @@ def test_run_gh_rate_limit_logs_warning(mocker, caplog):
 
     warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warning_messages) == len(_RATE_LIMIT_BACKOFF_SECONDS)
+
+
+def test_run_gh_rate_limit_caps_retry_after_at_max(mocker):
+    """When server-supplied retry-after exceeds _MAX_RETRY_AFTER_SECONDS, sleep uses the cap."""
+    mock_sleep = mocker.patch("orcest.orchestrator.gh.time.sleep")
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=_make_rate_limit_error("rate limit exceeded, retry after 999 seconds"),
+    )
+    with pytest.raises(GhRateLimitError) as exc_info:
+        list_open_prs(REPO, TOKEN)
+
+    sleep_args = [call.args[0] for call in mock_sleep.call_args_list]
+    assert all(v == _MAX_RETRY_AFTER_SECONDS for v in sleep_args)
+    assert exc_info.value.retry_after == _MAX_RETRY_AFTER_SECONDS
