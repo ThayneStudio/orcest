@@ -443,6 +443,7 @@ def _poll_cycle(
                             run_id,
                             pr_state.number,
                             e,
+                            exc_info=True,
                         )
                     # Best-effort immediate rerun; gh run rerun requires the
                     # run to be in a completed state, so this will usually fail

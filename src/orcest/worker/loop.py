@@ -60,7 +60,7 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
     try:
         data = yaml.safe_load(hosts_file.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}")
+        logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}", exc_info=True)
         return
 
     if not isinstance(data, dict):
