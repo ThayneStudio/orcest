@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import click
@@ -11,6 +12,7 @@ import redis as redis_lib
 from rich.console import Console
 from rich.table import Table
 
+from orcest.dashboard import fetch_snapshot, truncate
 from orcest.fleet.cli import fleet
 from orcest.shared.models import DEAD_LETTER_METADATA_FIELDS, DEAD_LETTER_STREAM
 
@@ -117,10 +119,6 @@ def status(redis_host: str | None, config: str, once: bool, interval: float) -> 
 
 def _status_once(redis: RedisClient) -> None:
     """Print system status once and exit (original behavior)."""
-    from datetime import datetime, timezone
-
-    from orcest.dashboard import _truncate, fetch_snapshot
-
     console = Console(file=sys.stdout)
     snapshot = fetch_snapshot(redis)
 
@@ -155,7 +153,7 @@ def _status_once(redis: RedisClient) -> None:
                 datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
                     "%Y-%m-%d %H:%M UTC"
                 )
-                if entry.timestamp_ms
+                if entry.timestamp_ms is not None
                 else entry.entry_id
             )
             dl_detail_table.add_row(
@@ -163,7 +161,7 @@ def _status_once(redis: RedisClient) -> None:
                 entry.task_type,
                 entry.repo,
                 f"{entry.resource_type} #{entry.resource_id}",
-                _truncate(entry.reason),
+                truncate(entry.reason),
             )
         console.print(dl_detail_table)
 

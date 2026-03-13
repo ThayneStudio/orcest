@@ -63,7 +63,7 @@ class DeadLetterEntry:
     repo: str
     resource_type: str
     resource_id: str
-    timestamp_ms: int
+    timestamp_ms: int | None
     reason: str
 
 
@@ -142,7 +142,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         try:
             ms = int(entry_id.split("-")[0])
         except (ValueError, IndexError):
-            ms = 0
+            ms = None
         dead_letter_entries.append(
             DeadLetterEntry(
                 entry_id=entry_id,
@@ -354,9 +354,9 @@ def _format_duration(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
-def _truncate(s: str, n: int = 60) -> str:
-    """Truncate string to n characters, appending '...' if needed."""
-    return s[:n] + "..." if len(s) > n else s
+def truncate(s: str, n: int = 60) -> str:
+    """Truncate string to at most n characters (including '...' suffix)."""
+    return s[: n - 3] + "..." if len(s) > n else s
 
 
 def _status_style(status: str) -> str:
@@ -604,10 +604,10 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                         datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
                             "%Y-%m-%d %H:%M UTC"
                         )
-                        if entry.timestamp_ms
+                        if entry.timestamp_ms is not None
                         else entry.entry_id
                     )
-                    reason = _truncate(entry.reason)
+                    reason = truncate(entry.reason)
                     dl_table.add_row(
                         ts,
                         entry.task_type,
