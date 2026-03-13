@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from orcest.shared.config import load_orchestrator_config, load_worker_config
+from orcest.shared.config import RunnerConfig, load_orchestrator_config, load_worker_config
 
 # ---------------------------------------------------------------------------
 # Env vars that config.py reads -- we must ensure they are unset in every
@@ -184,8 +184,9 @@ def test_load_orchestrator_config_runner_defaults(tmp_path: Path):
 
     config = load_orchestrator_config(cfg_file)
 
-    assert config.runner.timeout == 1800
-    assert config.runner.max_retries == 3
+    defaults = RunnerConfig()
+    assert config.runner.timeout == defaults.timeout
+    assert config.runner.max_retries == defaults.max_retries
 
 
 def test_load_orchestrator_config_runner_from_yaml(tmp_path: Path):
