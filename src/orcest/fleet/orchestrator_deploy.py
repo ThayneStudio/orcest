@@ -94,6 +94,22 @@ def _ssh_stdin_check(
     console.print("[green]ok[/green]")
 
 
+def _run_build(ssh_target: str, console: Console) -> None:
+    """Run the Docker image build on the remote host, exiting on failure."""
+    result = subprocess.run(
+        ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print("  Image build [red]failed[/red]")
+        output = (result.stdout + result.stderr).strip()
+        if output:
+            console.print(f"    {output}")
+        sys.exit(1)
+    console.print("  Image build [green]ok[/green]")
+
+
 def _ufw_cmd(action: str, port: int) -> str:
     """Build a ufw command that only runs if ufw is active.
 
@@ -185,18 +201,7 @@ def _ensure_image(
     """Build the orchestrator image if missing (or forced)."""
     if force:
         console.print("  Rebuilding orcest-orchestrator image...")
-        result = subprocess.run(
-            ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print("  Image build [red]failed[/red]")
-            output = (result.stdout + result.stderr).strip()
-            if output:
-                console.print(f"    {output}")
-            sys.exit(1)
-        console.print("  Image build [green]ok[/green]")
+        _run_build(ssh_target, console)
         return
 
     result = _ssh(ssh_target, _DOCKER_INSPECT_CMD)
@@ -204,18 +209,7 @@ def _ensure_image(
         console.print(
             "  Building orcest-orchestrator image (first time)...",
         )
-        build_result = subprocess.run(
-            ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
-            capture_output=True,
-            text=True,
-        )
-        if build_result.returncode != 0:
-            console.print("  Image build [red]failed[/red]")
-            output = (build_result.stdout + build_result.stderr).strip()
-            if output:
-                console.print(f"    {output}")
-            sys.exit(1)
-        console.print("  Image build [green]ok[/green]")
+        _run_build(ssh_target, console)
 
 
 def deploy_project_stack(
@@ -426,15 +420,4 @@ def rebuild_image(host: str, user: str, console: Console) -> None:
     console.print(
         "\n  [bold]Rebuilding orcest-orchestrator image[/bold]",
     )
-    result = subprocess.run(
-        ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        console.print("  Image build [red]failed[/red]")
-        output = (result.stdout + result.stderr).strip()
-        if output:
-            console.print(f"    {output}")
-        sys.exit(1)
-    console.print("  Image rebuild [green]ok[/green]")
+    _run_build(ssh_target, console)
