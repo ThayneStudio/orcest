@@ -2,7 +2,7 @@
 
 # Unit tests only (no Redis needed)
 test-unit:
-	pytest -m unit
+	pytest -m unit --cov=src/orcest --cov-report=term-missing
 
 # All tests — starts Redis, runs everything, stops Redis
 test: redis-up
