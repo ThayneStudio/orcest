@@ -201,7 +201,7 @@ def _ensure_image(
     """Build the orchestrator image if missing (or forced)."""
     if force:
         console.print("  Rebuilding orcest-orchestrator image...")
-        _run_build(ssh_target, console)
+        _run_build(ssh_target, console, action="rebuild")
         return
 
     result = _ssh(ssh_target, _DOCKER_INSPECT_CMD)
