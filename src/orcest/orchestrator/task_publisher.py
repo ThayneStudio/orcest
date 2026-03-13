@@ -318,6 +318,7 @@ def publish_fix_task(
                 "Failed to fetch inline review comments for PR #%s; proceeding without them: %s",
                 pr_state.number,
                 exc,
+                exc_info=True,
             )
             review_threads = []
     else:
