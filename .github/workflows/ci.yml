@@ -77,7 +77,7 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x
+      - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x --cov=src/orcest --cov-report=term-missing
 
   integration:
     runs-on: [self-hosted, linux]
