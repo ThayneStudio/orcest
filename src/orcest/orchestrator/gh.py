@@ -147,7 +147,11 @@ def _run_gh(args: list[str], token: str) -> str:
                     f"gh command rate-limited (exit {exc.returncode}): {exc.stderr.strip()}",
                     stderr=exc.stderr,
                     returncode=exc.returncode,
-                    retry_after=min(retry_after, _MAX_RETRY_AFTER_SECONDS) if retry_after is not None else None,
+                    retry_after=(
+                        min(retry_after, _MAX_RETRY_AFTER_SECONDS)
+                        if retry_after is not None
+                        else None
+                    ),
                 ) from exc
             raise GhCliError(
                 f"gh command failed (exit {exc.returncode}): {exc.stderr.strip()}",
