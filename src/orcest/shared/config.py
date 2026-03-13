@@ -18,6 +18,8 @@ class RedisConfig:
     port: int = 6379
     db: int = 0
     password: str | None = None
+    socket_timeout: int = 30
+    socket_connect_timeout: int = 10
 
 
 @dataclass
@@ -165,11 +167,18 @@ def _build_redis_config(raw: dict[str, Any]) -> RedisConfig:
     # Password comes from env var only -- never stored in YAML
     password = os.environ.get("ORCEST_REDIS_PASSWORD")
 
+    socket_timeout_raw = redis_raw.get("socket_timeout", 30)
+    socket_connect_timeout_raw = redis_raw.get("socket_connect_timeout", 10)
+
     return RedisConfig(
         host=str(host),
         port=_safe_int(port_raw, "redis.port"),
         db=_safe_int(db_raw, "redis.db"),
         password=password,
+        socket_timeout=_safe_int(socket_timeout_raw, "redis.socket_timeout"),
+        socket_connect_timeout=_safe_int(
+            socket_connect_timeout_raw, "redis.socket_connect_timeout"
+        ),
     )
 
 

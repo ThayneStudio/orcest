@@ -200,3 +200,54 @@ def test_load_orchestrator_config_runner_from_yaml(tmp_path: Path):
 
     assert config.runner.timeout == 3600
     assert config.runner.max_retries == 5
+
+
+# -- Redis socket timeout defaults ------------------------------------------
+
+
+def test_redis_socket_timeout_defaults_orchestrator(tmp_path: Path):
+    """RedisConfig gets default socket timeouts when not set in YAML."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.redis.socket_timeout == 30
+    assert config.redis.socket_connect_timeout == 10
+
+
+def test_redis_socket_timeout_from_yaml_orchestrator(tmp_path: Path):
+    """RedisConfig reads custom socket timeouts from the YAML redis section."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "redis:\n  socket_timeout: 5\n  socket_connect_timeout: 3\ngithub:\n  repo: acme/widgets\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.redis.socket_timeout == 5
+    assert config.redis.socket_connect_timeout == 3
+
+
+def test_redis_socket_timeout_defaults_worker(tmp_path: Path):
+    """WorkerConfig gets default socket timeouts when not set in YAML."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("worker_id: worker-0\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.redis.socket_timeout == 30
+    assert config.redis.socket_connect_timeout == 10
+
+
+def test_redis_socket_timeout_from_yaml_worker(tmp_path: Path):
+    """WorkerConfig reads custom socket timeouts from the YAML redis section."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text(
+        "redis:\n  socket_timeout: 15\n  socket_connect_timeout: 7\nworker_id: worker-0\n"
+    )
+
+    config = load_worker_config(cfg_file)
+
+    assert config.redis.socket_timeout == 15
+    assert config.redis.socket_connect_timeout == 7

@@ -2,6 +2,8 @@
 redis:
   host: redis
   port: 6379
+  # socket_timeout: 30          # Seconds before a Redis operation times out
+  # socket_connect_timeout: 10  # Seconds before a Redis connection attempt times out
 
 github:
   # GitHub personal access token (or set GITHUB_TOKEN env var)
