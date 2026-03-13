@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sys
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 import redis as redis_lib
@@ -172,7 +172,7 @@ def _status_once(redis: RedisClient) -> None:
 
     # Show details of recent dead-lettered tasks if any exist
     try:
-        dl_entries_raw = client.xrevrange(DEAD_LETTER_STREAM, count=5)
+        dl_entries_raw: list[Any] = cast(list[Any], client.xrevrange(DEAD_LETTER_STREAM, count=5))
     except redis_lib.ResponseError:
         dl_entries_raw = []
     if dl_entries_raw:
