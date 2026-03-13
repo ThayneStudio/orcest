@@ -57,6 +57,17 @@ class RecentResult:
 
 
 @dataclass
+class DeadLetterEntry:
+    entry_id: str
+    task_type: str
+    repo: str
+    resource_type: str
+    resource_id: str
+    timestamp: str
+    reason: str
+
+
+@dataclass
 class SystemSnapshot:
     """Complete point-in-time view of orcest system state."""
 
@@ -69,6 +80,7 @@ class SystemSnapshot:
     consumer_groups: list[ConsumerGroupInfo] = field(default_factory=list)
     recent_results: list[RecentResult] = field(default_factory=list)
     attempt_counts: dict[str, int] = field(default_factory=dict)
+    dead_letter_entries: list[DeadLetterEntry] = field(default_factory=list)
 
 
 def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
@@ -119,6 +131,30 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         dead_letter_count: int = cast(int, client.xlen(DEAD_LETTER_STREAM)) or 0
     except redis_lib.ResponseError:
         dead_letter_count = 0
+
+    # Dead-letter entries (most recent first, up to 5)
+    dead_letter_entries: list[DeadLetterEntry] = []
+    try:
+        dl_raw: list[Any] = cast(list[Any], client.xrevrange(DEAD_LETTER_STREAM, count=5))
+    except redis_lib.ResponseError:
+        dl_raw = []
+    for entry_id, fields in dl_raw:
+        try:
+            ms = int(entry_id.split("-")[0])
+            ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except (ValueError, IndexError):
+            ts = entry_id
+        dead_letter_entries.append(
+            DeadLetterEntry(
+                entry_id=entry_id,
+                task_type=fields.get("type", "?"),
+                repo=fields.get("repo", "?"),
+                resource_type=fields.get("resource_type", "?"),
+                resource_id=fields.get("resource_id", "?"),
+                timestamp=ts,
+                reason=fields.get("dead_letter_reason", "?"),
+            )
+        )
 
     # Active locks
     lock_keys = list(client.scan_iter(match="lock:pr:*"))
@@ -190,6 +226,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         consumer_groups=consumer_groups,
         recent_results=recent_results,
         attempt_counts=attempt_counts,
+        dead_letter_entries=dead_letter_entries,
     )
 
 
@@ -426,6 +463,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 yield DataTable(id="groups-table")
                 yield Static("Recent Results", classes="section-title")
                 yield DataTable(id="results-table")
+                yield Static("Dead Letters (last 5)", classes="section-title")
+                yield DataTable(id="dead-letters-table")
             with VerticalScroll(id="worker-container"):
                 yield Static("", id="worker-header")
                 yield RichLog(id="worker-log", wrap=True, markup=True)
@@ -450,6 +489,9 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                 "Duration",
                 "Summary",
             )
+
+            dead_letters_tbl = self.query_one("#dead-letters-table", DataTable)
+            dead_letters_tbl.add_columns("Time", "Type", "Repo", "Resource", "Reason")
 
             self._update_display()
             self.set_interval(refresh_interval, self._update_display)
@@ -548,6 +590,22 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                     "--",
                     "No results yet",
                 )
+
+            # Dead-letter entries
+            dl_table = self.query_one("#dead-letters-table", DataTable)
+            dl_table.clear()
+            if snapshot.dead_letter_entries:
+                for entry in snapshot.dead_letter_entries:
+                    reason = (entry.reason[:60] + "...") if len(entry.reason) > 60 else entry.reason
+                    dl_table.add_row(
+                        entry.timestamp,
+                        entry.task_type,
+                        entry.repo,
+                        f"{entry.resource_type} #{entry.resource_id}",
+                        Text(reason, style="red") if reason != "?" else Text(reason),
+                    )
+            else:
+                dl_table.add_row("--", "--", "--", "--", "No dead-lettered tasks")
 
         def _update_worker_output(self) -> None:
             """Read new output entries from the current worker's stream."""

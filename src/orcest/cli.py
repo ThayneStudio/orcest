@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import click
@@ -168,6 +169,38 @@ def _status_once(redis: RedisClient) -> None:
     table.add_row("results", str(results_len))
     table.add_row(DEAD_LETTER_STREAM, str(dead_letter_len))
     console.print(table)
+
+    # Show details of recent dead-lettered tasks if any exist
+    try:
+        dl_entries_raw = client.xrevrange(DEAD_LETTER_STREAM, count=5)
+    except redis_lib.ResponseError:
+        dl_entries_raw = []
+    if dl_entries_raw:
+        dl_detail_table = Table(title=f"Recent Dead-Lettered Tasks (last {len(dl_entries_raw)})")
+        dl_detail_table.add_column("Time", style="dim")
+        dl_detail_table.add_column("Type", style="magenta")
+        dl_detail_table.add_column("Repo", style="green")
+        dl_detail_table.add_column("Resource", style="yellow")
+        dl_detail_table.add_column("Reason", style="red")
+        for entry_id, fields in dl_entries_raw:
+            try:
+                ms = int(entry_id.split("-")[0])
+                ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+            except (ValueError, IndexError):
+                ts = entry_id
+            reason = fields.get("dead_letter_reason", "?")
+            if len(reason) > 60:
+                reason = reason[:60] + "..."
+            dl_detail_table.add_row(
+                ts,
+                fields.get("type", "?"),
+                fields.get("repo", "?"),
+                f"{fields.get('resource_type', '?')} #{fields.get('resource_id', '?')}",
+                reason,
+            )
+        console.print(dl_detail_table)
 
     if locks:
         lock_table = Table(title="Active Locks")
