@@ -94,7 +94,7 @@ def _ssh_stdin_check(
     console.print("[green]ok[/green]")
 
 
-def _run_build(ssh_target: str, console: Console) -> None:
+def _run_build(ssh_target: str, console: Console, action: str = "build") -> None:
     """Run the Docker image build on the remote host, exiting on failure."""
     result = subprocess.run(
         ["ssh", *_SSH_OPTS, ssh_target, _DOCKER_BUILD_CMD],
@@ -102,12 +102,12 @@ def _run_build(ssh_target: str, console: Console) -> None:
         text=True,
     )
     if result.returncode != 0:
-        console.print("  Image build [red]failed[/red]")
+        console.print(f"  Image {action} [red]failed[/red]")
         output = (result.stdout + result.stderr).strip()
         if output:
             console.print(f"    {output}")
         sys.exit(1)
-    console.print("  Image build [green]ok[/green]")
+    console.print(f"  Image {action} [green]ok[/green]")
 
 
 def _ufw_cmd(action: str, port: int) -> str:
@@ -420,4 +420,4 @@ def rebuild_image(host: str, user: str, console: Console) -> None:
     console.print(
         "\n  [bold]Rebuilding orcest-orchestrator image[/bold]",
     )
-    _run_build(ssh_target, console)
+    _run_build(ssh_target, console, action="rebuild")
