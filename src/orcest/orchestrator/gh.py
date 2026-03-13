@@ -67,12 +67,17 @@ _GH_TIMEOUT_SECONDS = 120
 _RATE_LIMIT_BACKOFF_SECONDS: tuple[int, ...] = (30, 60, 120)
 
 _RATE_LIMIT_RE = re.compile(r"rate.?limit", re.IGNORECASE)
+_RATE_LIMIT_429_RE = re.compile(r"\b429\b")
 _RETRY_AFTER_RE = re.compile(r"retry.?after[:\s]+(\d+)", re.IGNORECASE)
+
+# Maximum seconds to honour a server-supplied retry-after header; guards
+# against misbehaving or adversarial responses with extreme values.
+_MAX_RETRY_AFTER_SECONDS = 300
 
 
 def _is_rate_limited(stderr: str) -> bool:
     """Return True if stderr indicates a GitHub rate-limit response."""
-    return bool(_RATE_LIMIT_RE.search(stderr)) or bool(re.search(r"\b429\b", stderr))
+    return bool(_RATE_LIMIT_RE.search(stderr)) or bool(_RATE_LIMIT_429_RE.search(stderr))
 
 
 def _extract_retry_after(stderr: str) -> int | None:
@@ -126,12 +131,10 @@ def _run_gh(args: list[str], token: str) -> str:
             if _is_rate_limited(exc.stderr):
                 retry_after = _extract_retry_after(exc.stderr)
                 if attempt < len(_RATE_LIMIT_BACKOFF_SECONDS):
-                    wait = min(
-                        retry_after
-                        if retry_after is not None
-                        else _RATE_LIMIT_BACKOFF_SECONDS[attempt],
-                        max(_RATE_LIMIT_BACKOFF_SECONDS),
-                    )
+                    if retry_after is not None:
+                        wait = min(retry_after, _MAX_RETRY_AFTER_SECONDS)
+                    else:
+                        wait = _RATE_LIMIT_BACKOFF_SECONDS[attempt]
                     logger.warning(
                         "GitHub rate limit hit; retrying in %ds (attempt %d/%d)",
                         wait,
