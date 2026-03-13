@@ -220,11 +220,7 @@ def test_redis_socket_timeout_from_yaml_orchestrator(tmp_path: Path):
     """RedisConfig reads custom socket timeouts from the YAML redis section."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "redis:\n"
-        "  socket_timeout: 5\n"
-        "  socket_connect_timeout: 3\n"
-        "github:\n"
-        "  repo: acme/widgets\n"
+        "redis:\n  socket_timeout: 5\n  socket_connect_timeout: 3\ngithub:\n  repo: acme/widgets\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -248,10 +244,7 @@ def test_redis_socket_timeout_from_yaml_worker(tmp_path: Path):
     """WorkerConfig reads custom socket timeouts from the YAML redis section."""
     cfg_file = tmp_path / "worker.yaml"
     cfg_file.write_text(
-        "redis:\n"
-        "  socket_timeout: 15\n"
-        "  socket_connect_timeout: 7\n"
-        "worker_id: worker-0\n"
+        "redis:\n  socket_timeout: 15\n  socket_connect_timeout: 7\nworker_id: worker-0\n"
     )
 
     config = load_worker_config(cfg_file)
