@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import click
@@ -11,6 +12,7 @@ import redis as redis_lib
 from rich.console import Console
 from rich.table import Table
 
+from orcest.dashboard import fetch_snapshot, truncate
 from orcest.fleet.cli import fleet
 from orcest.shared.models import DEAD_LETTER_METADATA_FIELDS, DEAD_LETTER_STREAM
 
@@ -118,76 +120,70 @@ def status(redis_host: str | None, config: str, once: bool, interval: float) -> 
 def _status_once(redis: RedisClient) -> None:
     """Print system status once and exit (original behavior)."""
     console = Console(file=sys.stdout)
-    client = redis.client
+    snapshot = fetch_snapshot(redis)
 
-    task_streams = list(client.scan_iter(match="tasks:*"))
-    try:
-        results_len = client.xlen("results") or 0
-    except redis_lib.ResponseError:
-        # WRONGTYPE: results key exists but is not a stream
-        results_len = "(not a stream)"
-
-    try:
-        dead_letter_len = client.xlen(DEAD_LETTER_STREAM) or 0
-    except redis_lib.ResponseError:
-        dead_letter_len = "(not a stream)"
-
-    lock_keys = list(client.scan_iter(match="lock:pr:*"))
-    locks = []
-    for key in lock_keys:
-        owner = client.get(key) or "(expired)"
-        ttl = client.ttl(key)
-        pr_num = key.split(":")[-1]
-        locks.append({"pr": pr_num, "owner": owner, "ttl": ttl})
-
-    groups = []
-    for stream_key in task_streams:
-        try:
-            # scan_iter yields bytes|str; decode to ensure str for xinfo_groups
-            key_str = stream_key.decode() if isinstance(stream_key, bytes) else stream_key
-            for g in client.xinfo_groups(key_str):  # type: ignore[union-attr]  # redis stubs type client as a union
-                groups.append({"stream": stream_key, **g})
-        except redis_lib.ResponseError:
-            pass  # Stream has no consumer groups
-        except redis_lib.RedisError as e:
-            console.print(f"  [yellow]Could not read groups for {stream_key}: {e}[/yellow]")
+    if not snapshot.redis_ok:
+        console.print("[red]Error: Cannot connect to Redis.[/red]")
+        return
 
     console.print("\n[bold]Orcest System Status[/bold]\n")
 
     table = Table(title="Queue Depths")
     table.add_column("Stream", style="cyan")
     table.add_column("Pending", style="yellow")
-    for stream_key in sorted(task_streams):
-        try:
-            table.add_row(stream_key, str(client.xlen(stream_key) or 0))
-        except redis_lib.ResponseError:
-            # WRONGTYPE: key exists but is not a stream
-            table.add_row(stream_key, "(not a stream)")
-    if not task_streams:
+    for stream_key, depth in sorted(snapshot.queue_depths.items()):
+        table.add_row(str(stream_key), str(depth))
+    if not snapshot.queue_depths:
         table.add_row("tasks:*", "0")
-    table.add_row("results", str(results_len))
-    table.add_row(DEAD_LETTER_STREAM, str(dead_letter_len))
+    table.add_row("results", str(snapshot.results_depth))
+    table.add_row(DEAD_LETTER_STREAM, str(snapshot.dead_letter_count))
     console.print(table)
 
-    if locks:
+    if snapshot.dead_letter_entries:
+        dl_detail_table = Table(
+            title=f"Recent Dead-Lettered Tasks (last {len(snapshot.dead_letter_entries)})"
+        )
+        dl_detail_table.add_column("Time", style="dim")
+        dl_detail_table.add_column("Type", style="magenta")
+        dl_detail_table.add_column("Repo", style="green")
+        dl_detail_table.add_column("Resource", style="yellow")
+        dl_detail_table.add_column("Reason", style="red")
+        for entry in snapshot.dead_letter_entries:
+            ts = (
+                datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+                if entry.timestamp_ms is not None
+                else entry.entry_id
+            )
+            dl_detail_table.add_row(
+                ts,
+                entry.task_type,
+                entry.repo,
+                f"{entry.resource_type} #{entry.resource_id}",
+                truncate(entry.reason) if entry.reason is not None else "?",
+            )
+        console.print(dl_detail_table)
+
+    if snapshot.locks:
         lock_table = Table(title="Active Locks")
         lock_table.add_column("PR", style="cyan")
         lock_table.add_column("Owner", style="green")
         lock_table.add_column("TTL (s)", style="yellow")
-        for lock in locks:
-            lock_table.add_row(lock["pr"], lock["owner"], str(lock["ttl"]))
+        for lock in snapshot.locks:
+            lock_table.add_row(lock.pr, lock.owner, str(lock.ttl))
         console.print(lock_table)
     else:
         console.print("[dim]No active locks.[/dim]")
 
-    if groups:
+    if snapshot.consumer_groups:
         group_table = Table(title="Consumer Groups")
         group_table.add_column("Stream", style="magenta")
         group_table.add_column("Group", style="cyan")
         group_table.add_column("Consumers", style="green")
         group_table.add_column("Pending", style="yellow")
-        for g in groups:
-            group_table.add_row(g["stream"], g["name"], str(g["consumers"]), str(g["pending"]))
+        for g in snapshot.consumer_groups:
+            group_table.add_row(str(g.stream), g.name, str(g.consumers), str(g.pending))
         console.print(group_table)
 
     console.print()
