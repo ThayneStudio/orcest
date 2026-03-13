@@ -520,14 +520,21 @@ def discover_actionable_prs(
             if get_exhausted_notified(redis, number):
                 # exhausted_notified is set and needs-human label is absent (inferred
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
-                # The three deletes are intentionally non-atomic. A crash between them
-                # leaves a partial reset: total_attempts and/or exhausted_notified may be
-                # stale orphans. The circuit breaker will not re-trigger because
-                # total_attempts is 0 after the first delete, but if clear_attempts
-                # has not yet run, SKIP_ACTIVE may still fire until new commits arrive.
+                # The three deletes are intentionally non-atomic. A crash between steps
+                # leaves a partial reset, but the ordering is chosen to minimise the
+                # window where SKIP_ACTIVE can fire spuriously:
+                #   - After step 1 (total=0, sha=max, exhausted=1): next poll skips the
+                #     circuit-breaker block (total < max) but SKIP_ACTIVE fires. Window
+                #     is narrower than before because exhausted_notified is still present
+                #     and harmless (only read inside the total >= max guard).
+                #   - After step 2 (total=0, sha=0, exhausted=1): next poll skips the
+                #     circuit-breaker block entirely and the stale exhausted_notified flag
+                #     is a harmless orphan — normal processing proceeds.
+                # clear_exhausted_notified is last so its removal is the final
+                # confirmation that the full reset succeeded.
                 clear_total_attempts(redis, number)
-                clear_exhausted_notified(redis, number)
                 clear_attempts(redis, number)
+                clear_exhausted_notified(redis, number)
                 logger.info(
                     "PR #%d: exhausted_notified set and needs-human label absent"
                     " (inferred via SKIP_LABELED invariant);"
