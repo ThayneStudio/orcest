@@ -1,8 +1,7 @@
 """Fleet configuration schema and I/O.
 
-Replaces ``inventory.py`` with a richer schema that supports multiple orgs
-(each with independent tokens), Proxmox auto-detection fields, and an
-orchestrator VM managed via OpenTofu.
+Supports multiple orgs (each with independent tokens), Proxmox
+auto-detection fields, and an orchestrator VM managed via OpenTofu.
 
 Config lives at ``/etc/orcest/config.yaml`` on the Proxmox host.
 """
