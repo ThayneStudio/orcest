@@ -1,14 +1,92 @@
-"""Cloud-init user-data generation for worker VMs.
+"""Cloud-init user-data generation for orchestrator and worker VMs.
 
-Generates a cloud-init YAML document that fully provisions a worker VM
-at boot time — no SSH provisioning step needed. The VM boots, installs
-all dependencies, configures the orcest worker service, and starts
-pulling tasks from the orchestrator.
+Generates cloud-init YAML documents that fully provision VMs at boot time —
+no SSH provisioning step needed. The VM boots, installs all dependencies,
+and configures the appropriate services.
 """
 
 from __future__ import annotations
 
 import yaml
+
+
+def render_orchestrator_userdata(
+    *,
+    ssh_public_key: str = "",
+) -> str:
+    """Render cloud-init user-data for the orchestrator VM.
+
+    Installs Docker Engine + Compose, creates the orcest user,
+    and sets up the /opt/orcest directory structure. Does NOT start
+    any compose stacks — that happens per-project via fleet onboard.
+
+    Args:
+        ssh_public_key: Optional SSH public key for the ``thayne`` user.
+    """
+    orcest_user: dict = {
+        "name": "orcest",
+        "system": True,
+        "shell": "/bin/bash",
+        "home": "/home/orcest",
+        "groups": ["docker"],
+    }
+
+    # Inject SSH key via cloud-init's native ssh_authorized_keys directive
+    # (avoids shell injection risk from runcmd echo)
+    if ssh_public_key:
+        orcest_user["ssh_authorized_keys"] = [ssh_public_key]
+
+    cloud_config: dict = {
+        "users": [
+            "default",
+            orcest_user,
+        ],
+        "package_update": True,
+        "packages": [
+            "curl",
+            "ca-certificates",
+            "gnupg",
+            "lsb-release",
+            "git",
+        ],
+        "runcmd": _orchestrator_runcmd(),
+    }
+
+    # If an SSH public key is provided, inject it for the default (thayne) user too
+    if ssh_public_key:
+        cloud_config["ssh_authorized_keys"] = [ssh_public_key]
+
+    return "#cloud-config\n" + yaml.dump(cloud_config, default_flow_style=False, sort_keys=False)
+
+
+def _orchestrator_runcmd() -> list[str]:
+    """Return the list of runcmd entries for orchestrator cloud-init."""
+    return [
+        # Create directory structure
+        "mkdir -p /opt/orcest/projects",
+        "chown -R orcest:orcest /opt/orcest",
+        # Install Docker Engine
+        (
+            "curl -fsSL https://download.docker.com/linux/ubuntu/gpg"
+            " | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg"
+        ),
+        (
+            'echo "deb [arch=$(dpkg --print-architecture)'
+            " signed-by=/usr/share/keyrings/docker-archive-keyring.gpg]"
+            " https://download.docker.com/linux/ubuntu"
+            ' $(lsb_release -cs) stable"'
+            " | tee /etc/apt/sources.list.d/docker.list > /dev/null"
+        ),
+        "apt-get update -qq",
+        "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+        "usermod -aG docker orcest",
+        # Open firewall port range 6379-6399 for Redis if ufw is active
+        (
+            "if command -v ufw >/dev/null 2>&1"
+            " && sudo ufw status 2>/dev/null | grep -q 'Status: active';"
+            " then sudo ufw allow 6379:6399/tcp; fi"
+        ),
+    ]
 
 
 def render_worker_userdata(

@@ -21,11 +21,10 @@ orcest = "orcest.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"orcest.fleet" = ["terraform/*.tf"]
+
 [project.optional-dependencies]
-fleet = [
-    "proxmoxer>=2.0",
-    "requests>=2.31",
-]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

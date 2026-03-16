@@ -75,7 +75,6 @@ def test_onboard_creates_project(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
-    mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.deploy_stack")
     result = runner.invoke(
         fleet,
@@ -111,7 +110,6 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
-    mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.deploy_stack")
     result = runner.invoke(
         fleet,
@@ -298,87 +296,3 @@ def test_add_org_registers_credentials(runner, cfg_path, mocker):
         data = yaml.safe_load(f)
     assert "MyOrg" in data["orgs"]
     assert data["orgs"]["MyOrg"]["github_token"] == "ghp_test123"
-
-
-def test_create_orchestrator(runner, cfg_path, mocker):
-    """fleet create-orchestrator creates VM and deploys Docker stack."""
-    cfg = FleetConfig(
-        proxmox=ProxmoxConfig(
-            api_token_id="root@pam!orcest",
-            api_token_secret="secret",
-        ),
-        orchestrator=OrchestratorConfig(ssh_key="ssh-ed25519 AAAA..."),
-    )
-    _save(cfg, cfg_path)
-    mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
-    mocker.patch("orcest.fleet.provisioner.write_tfvars")
-    mocker.patch("orcest.fleet.provisioner.apply")
-    mocker.patch("orcest.fleet.provisioner.get_output", return_value="10.20.0.99")
-    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
-    mocker.patch("orcest.fleet.orchestrator.upload_source")
-    mocker.patch("orcest.fleet.orchestrator.build_image")
-
-    result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])
-    assert result.exit_code == 0, result.output
-    assert "10.20.0.99" in result.output
-
-    # Verify config was updated with orchestrator host
-    with open(cfg_path) as f:
-        data = yaml.safe_load(f)
-    assert data["orchestrator"]["host"] == "10.20.0.99"
-
-
-def test_create_orchestrator_ssh_timeout(runner, cfg_path, mocker):
-    """fleet create-orchestrator saves config and exits if SSH times out."""
-    cfg = FleetConfig(
-        proxmox=ProxmoxConfig(
-            api_token_id="root@pam!orcest",
-            api_token_secret="secret",
-        ),
-    )
-    _save(cfg, cfg_path)
-    mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
-    mocker.patch("orcest.fleet.provisioner.write_tfvars")
-    mocker.patch("orcest.fleet.provisioner.apply")
-    mocker.patch("orcest.fleet.provisioner.get_output", return_value="10.20.0.99")
-    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
-
-    result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])
-    assert result.exit_code != 0
-
-    # Config should still be saved with the IP
-    with open(cfg_path) as f:
-        data = yaml.safe_load(f)
-    assert data["orchestrator"]["host"] == "10.20.0.99"
-
-
-def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
-    """fleet update uploads source, rebuilds image, restarts stacks, and applies terraform."""
-    cfg = FleetConfig(
-        orchestrator=OrchestratorConfig(host="10.20.0.23"),
-        projects=[
-            ProjectEntry(name="alpha", repo="Org/alpha"),
-            ProjectEntry(name="beta", repo="Org/beta"),
-        ],
-    )
-    _save(cfg, cfg_path)
-    mocker.patch("orcest.fleet.orchestrator.upload_source")
-    mocker.patch("orcest.fleet.orchestrator.build_image")
-    mock_restart = mocker.patch("orcest.fleet.orchestrator.restart_stack")
-    mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
-    mocker.patch("orcest.fleet.provisioner.write_tfvars")
-    mocker.patch("orcest.fleet.provisioner.apply")
-
-    result = runner.invoke(fleet, ["update", "--config", cfg_path])
-    assert result.exit_code == 0, result.output
-
-    # Should restart both project stacks
-    assert mock_restart.call_count == 2
-
-
-def test_update_requires_orchestrator_host(runner, cfg_path):
-    """fleet update fails if orchestrator host is not set."""
-    _save(FleetConfig(), cfg_path)
-    result = runner.invoke(fleet, ["update", "--config", cfg_path])
-    assert result.exit_code != 0
-    assert "Orchestrator host not set" in result.output

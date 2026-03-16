@@ -1,17 +1,47 @@
 """Fleet management CLI commands.
 
 Provides ``orcest fleet`` subcommands for managing the fleet of
-orchestrator stacks and disposable worker VMs from a laptop.
+orchestrator stacks and disposable worker VMs via Terraform and
+Docker Compose, driven by a single config file.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
+import time
 
 import click
 from rich.console import Console
 from rich.table import Table
+
+from orcest.fleet.config import DEFAULT_CONFIG_PATH
+
+_REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
+
+
+def _validate_project_name(name: str) -> None:
+    """Validate project name, exit on failure."""
+    from orcest.fleet.config import require_valid_project_name
+
+    try:
+        require_valid_project_name(name)
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+def _validate_repo(repo: str) -> None:
+    """Validate repo format (owner/repo)."""
+    if not _REPO_RE.match(repo):
+        click.echo(
+            f"Error: Invalid repo format {repo!r}: expected 'owner/repo' with "
+            "alphanumeric/dot/hyphen/underscore characters.",
+            err=True,
+        )
+        sys.exit(1)
 
 
 def _repo_to_project_name(repo: str) -> str:
@@ -19,461 +49,610 @@ def _repo_to_project_name(repo: str) -> str:
     return repo.rsplit("/", 1)[-1]
 
 
+def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) -> bool:
+    """Poll until SSH connects or timeout expires. Returns True on success."""
+    ssh_target = f"{user}@{host}"
+    deadline = time.monotonic() + timeout
+    console.print(f"  Waiting for SSH on {host}...", end=" ")
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                ssh_target,
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print("[green]ok[/green]")
+            return True
+        time.sleep(5)
+    console.print("[yellow]timed out[/yellow]")
+    return False
+
+
 @click.group()
 def fleet() -> None:
     """Manage the orcest fleet: orchestrators, workers, and VMs."""
 
 
+@fleet.command("add-org")
+@click.argument("org_name")
+@click.option("--github-token", required=True, help="GitHub token for this org.")
+@click.option("--claude-token", required=True, help="Claude OAuth token for this org.")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def add_org(org_name: str, github_token: str, claude_token: str, config: str) -> None:
+    """Register a GitHub organization with its credentials.
+
+    ORG_NAME is the GitHub org or user (e.g. 'ThayneStudio').
+    """
+    from orcest.fleet.config import OrgEntry, load_config, save_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    if org_name in cfg.orgs:
+        console.print(f"[yellow]Org '{org_name}' already exists, updating credentials.[/yellow]")
+
+    # Validate the GitHub token
+    console.print("  Validating GitHub token...", end=" ")
+    result = subprocess.run(
+        ["gh", "auth", "status"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GITHUB_TOKEN": github_token, "GH_TOKEN": github_token},
+    )
+    if result.returncode != 0:
+        console.print("[red]failed[/red]")
+        stderr = result.stderr.strip()
+        if stderr:
+            console.print(f"    {stderr}")
+        console.print("[yellow]Warning: token validation failed, saving anyway.[/yellow]")
+    else:
+        console.print("[green]ok[/green]")
+
+    cfg.orgs[org_name] = OrgEntry(
+        github_token=github_token,
+        claude_oauth_token=claude_token,
+    )
+    save_config(cfg, config)
+    console.print(f"\n[bold]Org '{org_name}' registered.[/bold]")
+
+
+@fleet.command("create-orchestrator")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def create_orchestrator(config: str) -> None:
+    """Create the orchestrator VM via Terraform and deploy the Docker stack."""
+    from orcest.fleet.config import load_config, save_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    console.print("\n[bold]Creating orchestrator VM[/bold]\n")
+
+    # Step 1: Generate and write tfvars
+    console.print("  Generating Terraform variables...", end=" ")
+    try:
+        from orcest.fleet.provisioner import generate_tfvars, write_tfvars
+
+        tfvars = generate_tfvars(cfg)
+        write_tfvars(tfvars)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 2: Apply Terraform
+    console.print("  Applying Terraform (this may take a few minutes)...")
+    try:
+        from orcest.fleet.provisioner import apply
+
+        apply()
+        console.print("  Terraform apply [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Terraform apply [red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 3: Get orchestrator IP from Terraform output
+    console.print("  Reading orchestrator IP...", end=" ")
+    try:
+        from orcest.fleet.provisioner import get_output
+
+        orch_ip = get_output("orchestrator_ip")
+        console.print(f"[green]{orch_ip}[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 4: Wait for SSH
+    if not _wait_for_ssh(orch_ip, cfg.orchestrator.user, console):
+        console.print("[yellow]SSH not available yet. VM may still be booting.[/yellow]")
+        console.print("  Saving config with the IP and exiting. Re-run after VM is ready.")
+        cfg.orchestrator.host = orch_ip
+        save_config(cfg, config)
+        sys.exit(1)
+
+    # Step 5: Upload source and build Docker image
+    ssh_target = f"{cfg.orchestrator.user}@{orch_ip}"
+    try:
+        from orcest.fleet.orchestrator import build_image, upload_source
+
+        console.print("  Uploading orcest source...")
+        upload_source(ssh_target)
+        console.print("  Upload [green]ok[/green]")
+
+        console.print("  Building Docker image (this may take a minute)...")
+        build_image(ssh_target)
+        console.print("  Docker build [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  [red]failed[/red]: {exc}")
+        console.print("  Saving config with partial state.")
+        cfg.orchestrator.host = orch_ip
+        save_config(cfg, config)
+        sys.exit(1)
+
+    # Step 6: Update config with orchestrator host
+    cfg.orchestrator.host = orch_ip
+    save_config(cfg, config)
+
+    console.print(f"\n[bold]Orchestrator created at {orch_ip}.[/bold]")
+    console.print("\n  Next steps:")
+    console.print(
+        "  1. Register an org:  orcest fleet add-org <org> --github-token ... --claude-token ..."
+    )
+    console.print("  2. Onboard a repo:   orcest fleet onboard <owner/repo>")
+
+
 @fleet.command()
 @click.argument("repo")
 @click.option("--name", default=None, help="Project name (default: derived from repo).")
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-@click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token",
-    envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True,
-    help="Claude OAuth token.",
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
 )
-@click.option(
-    "--rebuild-image",
-    is_flag=True,
-    help="Force rebuild of the orchestrator Docker image.",
-)
-def onboard(
-    repo: str,
-    name: str | None,
-    inventory: str,
-    github_token: str,
-    claude_token: str,
-    rebuild_image: bool,
-) -> None:
-    """Onboard a new repo: deploy orchestrator stack + create first worker VM.
+def onboard(repo: str, name: str | None, config: str) -> None:
+    """Onboard a new repo: deploy orchestrator stack + create worker VM(s).
 
     REPO is in "owner/repo" format (e.g. ThayneStudio/my-project).
-    Requires the orchestrator host to be provisioned first (provision-orchestrator).
+    Requires the orchestrator VM to be created first (fleet create-orchestrator).
     """
-    from orcest.fleet.cloud_init import render_worker_userdata
-    from orcest.fleet.inventory import (
-        FleetInventory,
-        ProjectEntry,
-        WorkerEntry,
-        load_inventory,
-        save_inventory,
-    )
-    from orcest.fleet.orchestrator_deploy import deploy_project_stack
+    from orcest.fleet.config import ProjectEntry, load_config, save_config
 
     console = Console()
+    cfg = load_config(config)
     project_name = name or _repo_to_project_name(repo)
+
+    # Validate inputs
+    _validate_repo(repo)
+    _validate_project_name(project_name)
 
     console.print(f"\n[bold]Onboarding {repo} as '{project_name}'[/bold]\n")
 
-    # Load or create inventory
-    inv_path = inventory
-    if os.path.exists(inv_path):
-        inv = load_inventory(inv_path)
-    else:
-        inv = FleetInventory()
-
-    # Require orchestrator_host to be set
-    if not inv.orchestrator_host:
+    # Validate orchestrator is set up
+    if not cfg.orchestrator.host:
         console.print(
-            "[red]orchestrator_host not set in fleet inventory.[/red]\n"
-            "  Run 'orcest provision-orchestrator' first,"
-            " then set orchestrator_host in the inventory."
+            "[red]Orchestrator host not set in fleet config.[/red]\n"
+            "  Run 'orcest fleet create-orchestrator' first."
+        )
+        sys.exit(1)
+
+    # Resolve org credentials
+    org_name = repo.split("/")[0] if "/" in repo else ""
+    org = cfg.orgs.get(org_name)
+    if not org:
+        console.print(
+            f"[red]Org '{org_name}' not found in fleet config.[/red]\n"
+            f"  Run 'orcest fleet add-org {org_name} --github-token ... --claude-token ...' first."
         )
         sys.exit(1)
 
     # Check for duplicate
-    if inv.get_project(project_name):
-        console.print(f"[red]Project '{project_name}' already exists in fleet inventory.[/red]")
+    if cfg.get_project(project_name):
+        console.print(f"[red]Project '{project_name}' already exists in fleet config.[/red]")
         sys.exit(1)
 
-    # Allocate resources
-    redis_port = inv.next_redis_port()
+    # Allocate redis_port
+    redis_port = cfg.next_redis_port()
     if redis_port > 6399:
         console.print(
-            f"[red]Redis port {redis_port} exceeds the allowed range (6379–6399).[/red]\n"
-            "  Remove unused projects or expand the firewall rule before adding more."
+            f"[red]Redis port {redis_port} exceeds the allowed range (6379-6399).[/red]\n"
+            "  Remove unused projects or expand the range before adding more."
         )
         sys.exit(1)
-    vm_id = inv.next_vm_id()
-    worker_id = f"worker-{vm_id}"
 
-    console.print(f"  Redis port: {redis_port}")
-    console.print(f"  Worker VM ID: {vm_id}")
-    console.print(f"  Worker ID: {worker_id}")
-
-    # Add project to inventory (not persisted yet — saved only after deploy succeeds
-    # to avoid a partial-deploy state that blocks retry via the duplicate check)
+    # Add project to config
     project = ProjectEntry(
         name=project_name,
         repo=repo,
         redis_port=redis_port,
-        workers=[WorkerEntry(vm_id=vm_id)],
+        workers=1,
     )
-    inv.projects.append(project)
+    cfg.projects.append(project)
 
-    # Deploy orchestrator stack (Redis + orchestrator container)
-    deploy_project_stack(
-        host=inv.orchestrator_host,
-        user=inv.orchestrator_user,
-        project_name=project_name,
-        redis_port=redis_port,
-        repo=repo,
-        github_token=github_token,
-        claude_token=claude_token,
-        console=console,
-        rebuild_image=rebuild_image,
-    )
+    console.print(f"  Project: {project_name}")
+    console.print(f"  Repo: {repo}")
+    console.print(f"  Redis port: {redis_port}")
+    console.print("  Workers: 1")
 
-    # Persist inventory only after a successful deploy so that a mid-deploy failure
-    # does not block a retry ('orcest fleet destroy <name>' is the recovery path).
-    save_inventory(inv, inv_path)
-    console.print("  Inventory updated.")
+    # Step 1: Generate tfvars and apply Terraform (creates worker VM)
+    console.print("\n  Provisioning worker VM(s) via Terraform...")
+    try:
+        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
 
-    # Generate cloud-init user-data for the first worker VM
-    userdata = render_worker_userdata(
-        redis_host=inv.orchestrator_host,
-        redis_port=redis_port,
-        worker_id=worker_id,
-        github_token=github_token,
-        claude_oauth_token=claude_token,
-        repo=repo,
-    )
+        tfvars = generate_tfvars(cfg)
+        write_tfvars(tfvars)
+        apply()
+        console.print("  Terraform apply [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Terraform apply [red]failed[/red]: {exc}")
+        # Remove the project we just added since provisioning failed
+        cfg.projects = [p for p in cfg.projects if p.name != project_name]
+        sys.exit(1)
 
-    # Write user-data to temp file for Proxmox upload (0600: contains secrets)
-    userdata_path = f"/tmp/orcest-worker-{vm_id}-userdata.yaml"
-    fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(userdata)
+    # Save config now — worker VM exists in Terraform state, must be tracked
+    save_config(cfg, config)
 
-    console.print(f"\n  Cloud-init user-data written to {userdata_path}")
-
-    # If Proxmox is configured, create the VM
-    if inv.proxmox.host and inv.proxmox.token_id:
-        from orcest.fleet.proxmox import ProxmoxClient
-
-        console.print("\n  Creating worker VM via Proxmox API...")
-        px = ProxmoxClient(inv.proxmox)
-
-        # Upload snippet
-        snippet_name = f"worker-{vm_id}.yaml"
-        snippet_path = px.upload_snippet(snippet_name, userdata)
-        console.print(f"  Uploaded cloud-init snippet: {snippet_path}")
-
-        # Create VM
-        px.create_vm(
-            vm_id=vm_id,
-            name=f"orcest-{project_name}-worker-{vm_id}",
-            cicustom=f"user={snippet_path}",
+    # Step 2: Write project files to orchestrator
+    ssh_target = cfg.ssh_target()
+    console.print("\n  Deploying orchestrator stack...")
+    try:
+        from orcest.fleet.orchestrator import (
+            generate_env_file,
+            generate_orchestrator_config,
+            write_project_files,
         )
-        console.print(f"  VM {vm_id} created and starting.")
 
-        # Wait for IP
-        console.print("  Waiting for VM IP...")
-        ip = px.get_vm_ip(vm_id)
-        if ip:
-            console.print(f"  VM IP: [green]{ip}[/green]")
-        else:
-            console.print("  [yellow]Could not detect IP (VM may still be booting).[/yellow]")
-    else:
-        console.print("\n  [yellow]Proxmox not configured — skipping VM creation.[/yellow]")
-        console.print(f"  Use the cloud-init file at {userdata_path} to provision manually.")
+        env_content = generate_env_file(
+            github_token=org.github_token,
+            redis_port=redis_port,
+            project_name=project_name,
+        )
+        config_yaml = generate_orchestrator_config(repo=repo, redis_port=redis_port)
+        write_project_files(ssh_target, project_name, env_content, config_yaml)
+        console.print("  Project files written [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Writing project files [red]failed[/red]: {exc}")
+        console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
+        sys.exit(1)
+
+    # Step 3: Ensure Docker image exists, then deploy stack
+    try:
+        from orcest.fleet.orchestrator import deploy_stack, image_exists
+
+        if not image_exists(ssh_target):
+            from orcest.fleet.orchestrator import build_image
+
+            console.print("  Docker image not found, building...")
+            build_image(ssh_target)
+            console.print("  Docker build [green]ok[/green]")
+
+        deploy_stack(ssh_target, project_name)
+        console.print("  Stack deployed [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Deploy stack [red]failed[/red]: {exc}")
+        console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
+        sys.exit(1)
 
     console.print(f"\n[bold]Project '{project_name}' onboarded.[/bold]")
 
 
 @fleet.command("add-worker")
 @click.argument("project_name")
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-@click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token",
-    envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True,
-    help="Claude OAuth token.",
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
 )
-def add_worker(project_name: str, inventory: str, github_token: str, claude_token: str) -> None:
-    """Add a worker VM to an existing project."""
-    from orcest.fleet.cloud_init import render_worker_userdata
-    from orcest.fleet.inventory import WorkerEntry, load_inventory, save_inventory
+def add_worker(project_name: str, config: str) -> None:
+    """Add a worker VM to an existing project.
+
+    Increments the worker count for PROJECT_NAME and applies Terraform
+    to create the new VM.
+    """
+    from orcest.fleet.config import load_config, save_config
 
     console = Console()
-    inv = load_inventory(inventory)
+    cfg = load_config(config)
 
-    project = inv.get_project(project_name)
+    project = cfg.get_project(project_name)
     if not project:
-        console.print(f"[red]Project '{project_name}' not found in fleet inventory.[/red]")
+        console.print(f"[red]Project '{project_name}' not found in fleet config.[/red]")
         sys.exit(1)
 
-    vm_id = inv.next_vm_id()
-    worker_id = f"worker-{vm_id}"
+    old_count = project.workers
+    project.workers += 1
 
     console.print(f"\n[bold]Adding worker to '{project_name}'[/bold]")
-    console.print(f"  VM ID: {vm_id}")
-    console.print(f"  Worker ID: {worker_id}")
+    console.print(f"  Workers: {old_count} -> {project.workers}")
 
-    project.workers.append(WorkerEntry(vm_id=vm_id))
-    save_inventory(inv, inventory)
+    # Generate tfvars and apply Terraform
+    console.print("  Applying Terraform...")
+    try:
+        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
 
-    userdata = render_worker_userdata(
-        redis_host=inv.orchestrator_host or "localhost",
-        redis_port=project.redis_port,
-        worker_id=worker_id,
-        github_token=github_token,
-        claude_oauth_token=claude_token,
-        repo=project.repo,
+        tfvars = generate_tfvars(cfg)
+        write_tfvars(tfvars)
+        apply()
+        console.print("  Terraform apply [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Terraform apply [red]failed[/red]: {exc}")
+        project.workers = old_count  # rollback
+        sys.exit(1)
+
+    save_config(cfg, config)
+    console.print(
+        f"\n[bold]Worker added to '{project_name}' (now {project.workers} workers).[/bold]"
     )
-
-    if inv.proxmox.host and inv.proxmox.token_id:
-        from orcest.fleet.proxmox import ProxmoxClient
-
-        px = ProxmoxClient(inv.proxmox)
-        snippet_name = f"worker-{vm_id}.yaml"
-        snippet_path = px.upload_snippet(snippet_name, userdata)
-        px.create_vm(
-            vm_id=vm_id,
-            name=f"orcest-{project_name}-worker-{vm_id}",
-            cicustom=f"user={snippet_path}",
-        )
-        console.print(f"  VM {vm_id} created and starting.")
-
-        ip = px.get_vm_ip(vm_id)
-        if ip:
-            console.print(f"  VM IP: [green]{ip}[/green]")
-    else:
-        userdata_path = f"/tmp/orcest-worker-{vm_id}-userdata.yaml"
-        fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(userdata)
-        console.print(f"  Cloud-init user-data written to {userdata_path}")
-
-    console.print(f"\n[bold]Worker {vm_id} added to '{project_name}'.[/bold]")
-
-
-@fleet.command()
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-def status(inventory: str) -> None:
-    """Show fleet status: projects, workers, and VM states."""
-    from orcest.fleet.inventory import load_inventory
-
-    console = Console()
-    inv = load_inventory(inventory)
-
-    if not inv.projects:
-        console.print("[dim]No projects in fleet inventory.[/dim]")
-        return
-
-    table = Table(title="Fleet Status")
-    table.add_column("Project", style="cyan")
-    table.add_column("Repo", style="white")
-    table.add_column("Redis Port", style="yellow")
-    table.add_column("Workers", style="green")
-    table.add_column("VM IDs", style="magenta")
-
-    for project in inv.projects:
-        vm_ids = ", ".join(str(w.vm_id) for w in project.workers) or "none"
-        table.add_row(
-            project.name,
-            project.repo,
-            str(project.redis_port),
-            str(len(project.workers)),
-            vm_ids,
-        )
-
-    console.print(table)
-
-    # If Proxmox is configured, show VM statuses
-    if inv.proxmox.host and inv.proxmox.token_id:
-        try:
-            from orcest.fleet.proxmox import ProxmoxClient
-
-            px = ProxmoxClient(inv.proxmox)
-            vm_table = Table(title="VM Status")
-            vm_table.add_column("VM ID", style="cyan")
-            vm_table.add_column("Project", style="white")
-            vm_table.add_column("Status", style="yellow")
-            vm_table.add_column("IP", style="green")
-
-            for project in inv.projects:
-                for worker in project.workers:
-                    try:
-                        vm_status = px.get_vm_status(worker.vm_id)
-                        ip = ""
-                        if vm_status == "running":
-                            ip = px.get_vm_ip(worker.vm_id, timeout=5) or ""
-                    except Exception:
-                        vm_status = "unknown"
-                        ip = ""
-                    vm_table.add_row(str(worker.vm_id), project.name, vm_status, ip)
-
-            console.print(vm_table)
-        except ImportError:
-            console.print("[yellow]proxmoxer not installed — skipping VM status.[/yellow]")
 
 
 @fleet.command()
 @click.argument("project_name")
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-@click.confirmation_option(prompt="Are you sure you want to destroy this project?")
-def destroy(project_name: str, inventory: str) -> None:
-    """Destroy a project: remove orchestrator stack and all worker VMs."""
-    from orcest.fleet.inventory import load_inventory, save_inventory
-    from orcest.fleet.orchestrator_deploy import destroy_project_stack
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def destroy(project_name: str, config: str, yes: bool) -> None:
+    """Destroy a project: remove orchestrator stack and all worker VMs.
+
+    Tears down the Docker Compose stack on the orchestrator, removes the
+    project from config, and applies Terraform to destroy worker VMs.
+    """
+    from orcest.fleet.config import load_config, save_config
 
     console = Console()
-    inv = load_inventory(inventory)
+    cfg = load_config(config)
 
-    project = inv.get_project(project_name)
+    project = cfg.get_project(project_name)
     if not project:
         console.print(f"[red]Project '{project_name}' not found.[/red]")
         sys.exit(1)
 
-    console.print(f"\n[bold]Destroying project '{project_name}'[/bold]")
-
-    # Tear down orchestrator stack on the orchestrator host
-    if inv.orchestrator_host:
-        destroy_project_stack(
-            host=inv.orchestrator_host,
-            user=inv.orchestrator_user,
-            project_name=project_name,
-            redis_port=project.redis_port,
-            console=console,
+    if not yes:
+        click.confirm(
+            f"Destroy project '{project_name}' ({project.workers} worker(s), "
+            f"redis port {project.redis_port})?",
+            abort=True,
         )
 
-    # Destroy worker VMs via Proxmox if configured
-    if inv.proxmox.host and inv.proxmox.token_id:
+    console.print(f"\n[bold]Destroying project '{project_name}'[/bold]")
+
+    # Step 1: Teardown orchestrator stack
+    if cfg.orchestrator.host:
+        ssh_target = cfg.ssh_target()
+        console.print("  Tearing down orchestrator stack...", end=" ")
         try:
-            from orcest.fleet.proxmox import ProxmoxClient
+            from orcest.fleet.orchestrator import teardown_stack
 
-            px = ProxmoxClient(inv.proxmox)
-            for worker in project.workers:
-                try:
-                    console.print(f"  Destroying VM {worker.vm_id}...", end=" ")
-                    px.destroy_vm(worker.vm_id)
-                    console.print("[green]ok[/green]")
-                except Exception as e:
-                    console.print(f"[yellow]failed: {e}[/yellow]")
-        except ImportError:
-            console.print("[yellow]proxmoxer not installed — skipping VM destruction.[/yellow]")
+            teardown_stack(ssh_target, project_name)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]failed: {exc}[/yellow]")
 
-    # Remove from inventory
-    inv.projects = [p for p in inv.projects if p.name != project_name]
-    save_inventory(inv, inventory)
+    # Step 2: Remove project from config and apply Terraform
+    # (worker VMs no longer in tfvars, will be destroyed)
+    cfg.projects = [p for p in cfg.projects if p.name != project_name]
+    console.print("  Applying Terraform to remove workers...")
+    try:
+        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
 
+        tfvars = generate_tfvars(cfg)
+        write_tfvars(tfvars)
+        apply()
+        console.print("  Terraform apply [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Terraform apply [yellow]failed: {exc}[/yellow]")
+        console.print(
+            "  [yellow]Workers may still be running. Run 'tofu destroy' manually.[/yellow]"
+        )
+
+    # Save config only after Terraform has been applied (or attempted)
+    save_config(cfg, config)
     console.print(f"\n[bold]Project '{project_name}' destroyed.[/bold]")
 
 
 @fleet.command()
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
-@click.option("--github-token", envvar="GITHUB_TOKEN", required=True, help="GitHub token.")
 @click.option(
-    "--claude-token",
-    envvar="CLAUDE_CODE_OAUTH_TOKEN",
-    required=True,
-    help="Claude OAuth token.",
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
 )
-@click.option(
-    "--rebuild-image",
-    is_flag=True,
-    help="Rebuild the orchestrator Docker image and restart all orchestrator stacks.",
-)
-def update(inventory: str, github_token: str, claude_token: str, rebuild_image: bool) -> None:
-    """Rolling-replace all worker VMs with fresh cloud-init instances.
+def update(config: str) -> None:
+    """Update the fleet: rebuild Docker image, restart stacks, recreate workers.
 
-    For each project, creates new worker VMs, waits for them to come up,
-    then destroys the old ones. With --rebuild-image, also rebuilds the
-    shared orchestrator Docker image and restarts all orchestrator stacks.
+    Uploads fresh source to the orchestrator, rebuilds the Docker image,
+    restarts all project stacks, and applies Terraform to recreate workers
+    with fresh cloud-init.
     """
-    from orcest.fleet.cloud_init import render_worker_userdata
-    from orcest.fleet.inventory import WorkerEntry, load_inventory, save_inventory
+    from orcest.fleet.config import load_config, save_config
 
     console = Console()
-    inv = load_inventory(inventory)
+    cfg = load_config(config)
 
-    if not inv.projects:
-        console.print("[dim]No projects to update.[/dim]")
-        return
-
-    if not (inv.proxmox.host and inv.proxmox.token_id):
-        console.print("[red]Proxmox not configured — cannot perform rolling replace.[/red]")
+    if not cfg.orchestrator.host:
+        console.print("[red]Orchestrator host not set in fleet config.[/red]")
         sys.exit(1)
 
-    # Rebuild orchestrator image and restart stacks if requested
-    if rebuild_image:
-        if not inv.orchestrator_host:
-            console.print(
-                "[yellow]--rebuild-image: orchestrator_host not set,"
-                " skipping image rebuild.[/yellow]"
-            )
-        else:
-            from orcest.fleet.orchestrator_deploy import rebuild_image as _rebuild_image
-            from orcest.fleet.orchestrator_deploy import restart_project_stack
+    ssh_target = cfg.ssh_target()
 
-            _rebuild_image(inv.orchestrator_host, inv.orchestrator_user, console)
-            for project in inv.projects:
-                restart_project_stack(
-                    inv.orchestrator_host, inv.orchestrator_user, project.name, console
-                )
+    console.print("\n[bold]Updating fleet[/bold]\n")
 
-    from orcest.fleet.proxmox import ProxmoxClient
+    # Step 1: Upload source and rebuild Docker image
+    try:
+        from orcest.fleet.orchestrator import build_image, upload_source
 
-    px = ProxmoxClient(inv.proxmox)
+        console.print("  Uploading fresh source...")
+        upload_source(ssh_target)
+        console.print("  Upload [green]ok[/green]")
 
-    for project in inv.projects:
-        console.print(f"\n[bold]Updating '{project.name}'[/bold]")
-        old_workers = list(project.workers)
-        new_workers: list[WorkerEntry] = []
+        console.print("  Rebuilding Docker image...")
+        build_image(ssh_target)
+        console.print("  Docker build [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  [red]failed[/red]: {exc}")
+        sys.exit(1)
 
-        for old_worker in old_workers:
-            new_vm_id = inv.next_vm_id()
-            worker_id = f"worker-{new_vm_id}"
+    # Step 2: Restart all project stacks
+    for project in cfg.projects:
+        console.print(f"  Restarting stack for '{project.name}'...", end=" ")
+        try:
+            from orcest.fleet.orchestrator import restart_stack
 
-            console.print(f"  Creating replacement VM {new_vm_id} for VM {old_worker.vm_id}...")
+            restart_stack(ssh_target, project.name)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]failed: {exc}[/yellow]")
 
-            userdata = render_worker_userdata(
-                redis_host=inv.orchestrator_host or "localhost",
-                redis_port=project.redis_port,
-                worker_id=worker_id,
-                github_token=github_token,
-                claude_oauth_token=claude_token,
-                repo=project.repo,
-            )
+    # Step 3: Regenerate tfvars and apply Terraform (recreates workers with fresh cloud-init)
+    console.print("\n  Recreating workers with fresh cloud-init...")
+    try:
+        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
 
-            snippet_name = f"worker-{new_vm_id}.yaml"
-            snippet_path = px.upload_snippet(snippet_name, userdata)
-            px.create_vm(
-                vm_id=new_vm_id,
-                name=f"orcest-{project.name}-worker-{new_vm_id}",
-                cicustom=f"user={snippet_path}",
-            )
+        tfvars = generate_tfvars(cfg)
+        write_tfvars(tfvars)
+        apply()
+        console.print("  Terraform apply [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Terraform apply [yellow]failed: {exc}[/yellow]")
 
-            new_entry = WorkerEntry(vm_id=new_vm_id)
-            new_workers.append(new_entry)
-            # Track in inventory immediately so next_vm_id sees it
-            project.workers.append(new_entry)
-
-            ip = px.get_vm_ip(new_vm_id, timeout=60)
-            if ip:
-                console.print(f"  New VM {new_vm_id} up at {ip}")
-            else:
-                console.print(f"  [yellow]New VM {new_vm_id} booting (no IP yet)[/yellow]")
-
-        # Destroy old VMs
-        for old_worker in old_workers:
-            try:
-                console.print(f"  Destroying old VM {old_worker.vm_id}...", end=" ")
-                px.destroy_vm(old_worker.vm_id)
-                console.print("[green]ok[/green]")
-            except Exception as e:
-                console.print(f"[yellow]failed: {e}[/yellow]")
-
-        # Update inventory: keep only new workers
-        project.workers = new_workers
-
-    save_inventory(inv, inventory)
+    save_config(cfg, config)
     console.print("\n[bold]Fleet update complete.[/bold]")
+
+
+@fleet.command()
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def status(config: str) -> None:
+    """Show fleet status: orchestrator, projects, and workers."""
+    from orcest.fleet.config import load_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    # Orchestrator status
+    orch_table = Table(title="Orchestrator")
+    orch_table.add_column("Property", style="cyan")
+    orch_table.add_column("Value", style="white")
+
+    orch_table.add_row("Host", cfg.orchestrator.host or "[dim]not set[/dim]")
+    orch_table.add_row("User", cfg.orchestrator.user)
+    orch_table.add_row("VM ID", str(cfg.orchestrator.vm_id))
+
+    # Try SSH ping to check status
+    if cfg.orchestrator.host:
+        ssh_target = cfg.ssh_target()
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "BatchMode=yes",
+                ssh_target,
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        ssh_status = (
+            "[green]reachable[/green]" if result.returncode == 0 else "[red]unreachable[/red]"
+        )
+        orch_table.add_row("SSH Status", ssh_status)
+
+    console.print(orch_table)
+
+    # Orgs
+    if cfg.orgs:
+        org_table = Table(title="Registered Orgs")
+        org_table.add_column("Org", style="cyan")
+        org_table.add_column("GitHub Token", style="green")
+        org_table.add_column("Claude Token", style="yellow")
+
+        for org_name, org_entry in cfg.orgs.items():
+            gh = f"{org_entry.github_token[:8]}..." if org_entry.github_token else "[dim]none[/dim]"
+            cl = (
+                f"{org_entry.claude_oauth_token[:8]}..."
+                if org_entry.claude_oauth_token
+                else "[dim]none[/dim]"
+            )
+            org_table.add_row(org_name, gh, cl)
+
+        console.print(org_table)
+
+    # Projects
+    if not cfg.projects:
+        console.print("\n[dim]No projects in fleet config.[/dim]")
+        return
+
+    proj_table = Table(title="Projects")
+    proj_table.add_column("Project", style="cyan")
+    proj_table.add_column("Repo", style="white")
+    proj_table.add_column("Redis Port", style="yellow")
+    proj_table.add_column("Workers", style="green")
+    proj_table.add_column("Stack Status", style="magenta")
+
+    for project in cfg.projects:
+        stack_status = "[dim]unknown[/dim]"
+        if cfg.orchestrator.host:
+            ssh_target = cfg.ssh_target()
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "BatchMode=yes",
+                    ssh_target,
+                    f"cd /opt/orcest && docker compose"
+                    f" -p orcest-{project.name}"
+                    f" ps --format json 2>/dev/null",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                stack_status = "[green]running[/green]"
+            elif result.returncode == 0:
+                stack_status = "[yellow]stopped[/yellow]"
+            else:
+                stack_status = "[red]error[/red]"
+
+        proj_table.add_row(
+            project.name,
+            project.repo,
+            str(project.redis_port),
+            str(project.workers),
+            stack_status,
+        )
+
+    console.print(proj_table)
 
 
 @fleet.command("add-runner")
@@ -481,25 +660,22 @@ def update(inventory: str, github_token: str, claude_token: str, rebuild_image: 
 @click.option("--runner-token", required=True, help="Runner registration token.")
 @click.option("--runner-name", default="", help="Runner name (default: hostname).")
 @click.option("--labels", default="self-hosted,linux", help="Runner labels.")
-@click.option("--inventory", default="/opt/orcest/fleet.yaml", help="Fleet inventory path.")
 @click.option("--vm-id", default=None, type=int, help="VM ID (default: auto).")
 def add_runner(
     org_url: str,
     runner_token: str,
     runner_name: str,
     labels: str,
-    inventory: str,
     vm_id: int | None,
 ) -> None:
     """Create a self-hosted GitHub Actions runner VM via Proxmox."""
-    from orcest.fleet.inventory import load_inventory
     from orcest.fleet.runner_cloud_init import render_runner_userdata
 
     console = Console()
-    inv = load_inventory(inventory)
 
     if vm_id is None:
-        vm_id = inv.next_vm_id()
+        # Use a high VM ID range for runners to avoid collision with workers
+        vm_id = 300
 
     runner_vm_name = runner_name or f"orcest-runner-{vm_id}"
 
@@ -514,27 +690,15 @@ def add_runner(
         runner_labels=labels,
     )
 
-    if inv.proxmox.host and inv.proxmox.token_id:
-        from orcest.fleet.proxmox import ProxmoxClient
-
-        px = ProxmoxClient(inv.proxmox)
-        snippet_name = f"runner-{vm_id}.yaml"
-        snippet_path = px.upload_snippet(snippet_name, userdata)
-        px.create_vm(
-            vm_id=vm_id,
-            name=runner_vm_name,
-            cicustom=f"user={snippet_path}",
-        )
-        console.print(f"  VM {vm_id} created and starting.")
-
-        ip = px.get_vm_ip(vm_id)
-        if ip:
-            console.print(f"  VM IP: [green]{ip}[/green]")
-    else:
-        userdata_path = f"/tmp/orcest-runner-{vm_id}-userdata.yaml"
-        fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(userdata)
-        console.print(f"  Cloud-init user-data written to {userdata_path}")
+    _write_userdata_file(userdata, vm_id, "runner", console)
 
     console.print(f"\n[bold]Runner VM {vm_id} created.[/bold]")
+
+
+def _write_userdata_file(userdata: str, vm_id: int, prefix: str, console: Console) -> None:
+    """Write cloud-init user-data to a temp file when Proxmox is not available."""
+    userdata_path = f"/tmp/orcest-{prefix}-{vm_id}-userdata.yaml"
+    fd = os.open(userdata_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(userdata)
+    console.print(f"  Cloud-init user-data written to {userdata_path}")
