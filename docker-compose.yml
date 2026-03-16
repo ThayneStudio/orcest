@@ -19,12 +19,13 @@ services:
         max-file: "3"
 
   orchestrator:
+    image: ${ORCEST_IMAGE:-orcest:latest}
     build: .
     depends_on:
       redis:
         condition: service_healthy
     volumes:
-      - ./config:/home/orcest/app/config:ro
+      - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
     environment:
       - GITHUB_TOKEN
     restart: unless-stopped
