@@ -1,1 +1,1 @@
-"""Fleet management: inventory, Proxmox API, cloud-init, CLI."""
+"""Fleet management: config, Terraform provisioning, cloud-init, CLI."""
