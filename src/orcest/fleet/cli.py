@@ -85,7 +85,7 @@ def fleet() -> None:
 
 @fleet.command("add-org")
 @click.argument("org_name")
-@click.option("--github-token", required=True, help="GitHub token for this org.")
+@click.option("--github-token", required=True, help="GitHub PAT (classic: repo+workflow scopes; fine-grained: contents, issues, pull-requests, actions R/W).")
 @click.option("--claude-token", required=True, help="Claude OAuth token for this org.")
 @click.option(
     "--config",
@@ -97,6 +97,12 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
     """Register a GitHub organization with its credentials.
 
     ORG_NAME is the GitHub org or user (e.g. 'ThayneStudio').
+
+    \b
+    GitHub token requirements:
+      Classic PAT (ghp_): repo + workflow scopes
+      Fine-grained PAT:   contents, issues, pull-requests, actions (R/W)
+                          metadata (read)
     """
     from orcest.fleet.config import OrgEntry, load_config, save_config
 
