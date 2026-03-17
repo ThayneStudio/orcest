@@ -448,11 +448,30 @@ def init():
             else:
                 stderr = result.stderr.strip()
                 if "already exists" in stderr:
-                    console.print("[yellow]token 'orcest' already exists[/yellow]")
-                    console.print(
-                        "    [dim]Set api_token_id and api_token_secret manually in config.[/dim]"
+                    # Delete and recreate to get a fresh secret
+                    console.print("[yellow]exists, recreating...[/yellow]", end=" ")
+                    subprocess.run(
+                        ["pveum", "user", "token", "remove", "root@pam", "orcest"],
+                        capture_output=True,
+                        text=True,
                     )
-                    api_token_id = "root@pam!orcest"
+                    result = subprocess.run(
+                        [
+                            "pveum", "user", "token", "add",
+                            "root@pam", "orcest",
+                            "--privsep", "0",
+                            "--output-format", "json",
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.returncode == 0:
+                        token_data = json.loads(result.stdout)
+                        api_token_id = token_data.get("full-tokenid", "root@pam!orcest")
+                        api_token_secret = token_data.get("value", "")
+                        console.print(f"[green]{api_token_id}[/green]")
+                    else:
+                        console.print(f"[red]failed: {result.stderr.strip()}[/red]")
                 else:
                     console.print(f"[yellow]failed: {stderr}[/yellow]")
         except FileNotFoundError:
