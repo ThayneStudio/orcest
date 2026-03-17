@@ -538,6 +538,10 @@ def init():
         f"  {step}. Register an org:           orcest fleet add-org <org>"
         " --github-token ... --claude-token ..."
     )
+    console.print(
+        f"     GitHub token: classic PAT with [bold]repo + workflow[/bold] scopes,"
+        " or fine-grained with contents/issues/PRs/actions R/W"
+    )
     console.print(f"  {step + 1}. Create orchestrator VM:    orcest fleet create-orchestrator")
     console.print(f"  {step + 2}. Onboard a repo:            orcest fleet onboard <owner/repo>")
 
