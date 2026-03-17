@@ -43,6 +43,7 @@ def render_orchestrator_userdata(
         ],
         "package_update": True,
         "packages": [
+            "qemu-guest-agent",
             "curl",
             "ca-certificates",
             "gnupg",
@@ -158,6 +159,7 @@ def render_worker_userdata(
         ],
         "package_update": True,
         "packages": [
+            "qemu-guest-agent",
             "python3",
             "python3-pip",
             "python3-venv",
