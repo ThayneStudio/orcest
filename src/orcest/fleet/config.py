@@ -77,6 +77,7 @@ class ProjectEntry:
     name: str = ""
     repo: str = ""  # "org/repo" format
     workers: int = 1
+    worker_vm_ids: list[int] = field(default_factory=list)
     worker_memory: int = 16384  # MB
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
@@ -178,6 +179,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
                 name=proj["name"],
                 repo=proj["repo"],
                 workers=proj.get("workers", 1),
+                worker_vm_ids=proj.get("worker_vm_ids", []),
                 worker_memory=proj.get("worker_memory", 16384),
                 worker_cores=proj.get("worker_cores", 8),
                 worker_disk_size=proj.get("worker_disk_size", 30),
@@ -225,6 +227,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
                 "name": p.name,
                 "repo": p.repo,
                 "workers": p.workers,
+                "worker_vm_ids": p.worker_vm_ids,
                 "worker_memory": p.worker_memory,
                 "worker_cores": p.worker_cores,
                 "worker_disk_size": p.worker_disk_size,

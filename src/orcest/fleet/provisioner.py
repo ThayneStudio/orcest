@@ -77,16 +77,22 @@ def generate_tfvars(config: FleetConfig) -> dict[str, Any]:
     )
 
     # Build worker entries: one per (project, worker-index) pair.
-    # VM IDs start at orchestrator.vm_id + 1 and increment.
-    next_vm_id = config.orchestrator.vm_id + 1
     workers: dict[str, dict[str, Any]] = {}
 
     for project in config.projects:
         org = config.resolve_org(project)
 
+        if len(project.worker_vm_ids) < project.workers:
+            raise ValueError(
+                f"Project '{project.name}' has {project.workers} worker(s) "
+                f"but only {len(project.worker_vm_ids)} VM ID(s) assigned. "
+                f"Re-run the onboard or add-worker command to assign VM IDs."
+            )
+
         for i in range(project.workers):
+            vm_id = project.worker_vm_ids[i]
             key = f"{project.name}-{i}"
-            worker_id = f"worker-{next_vm_id}"
+            worker_id = f"worker-{vm_id}"
 
             worker_userdata = render_worker_userdata(
                 redis_host=config.orchestrator.host or "localhost",
@@ -99,14 +105,13 @@ def generate_tfvars(config: FleetConfig) -> dict[str, Any]:
             )
 
             workers[key] = {
-                "vm_id": next_vm_id,
+                "vm_id": vm_id,
                 "project_name": project.name,
                 "memory": project.worker_memory,
                 "cores": project.worker_cores,
                 "disk_size": project.worker_disk_size,
                 "cloud_init_content": worker_userdata,
             }
-            next_vm_id += 1
 
     if not config.proxmox.api_token_id or not config.proxmox.api_token_secret:
         raise ValueError(
