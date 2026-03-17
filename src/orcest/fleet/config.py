@@ -76,7 +76,6 @@ class ProjectEntry:
 
     name: str = ""
     repo: str = ""  # "org/repo" format
-    redis_port: int = 6379
     workers: int = 1
     worker_memory: int = 16384  # MB
     worker_cores: int = 8
@@ -99,14 +98,6 @@ class FleetConfig:
             if p.name == name:
                 return p
         return None
-
-    def next_redis_port(self) -> int:
-        """Return the next available Redis port, avoiding collisions with existing projects."""
-        used = {p.redis_port for p in self.projects}
-        port = 6379
-        while port in used:
-            port += 1
-        return port
 
     def resolve_org(self, project: ProjectEntry) -> OrgEntry:
         """Resolve the org entry for a project by extracting the owner from its repo field."""
@@ -186,7 +177,6 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
             ProjectEntry(
                 name=proj["name"],
                 repo=proj["repo"],
-                redis_port=proj.get("redis_port", 6379),
                 workers=proj.get("workers", 1),
                 worker_memory=proj.get("worker_memory", 16384),
                 worker_cores=proj.get("worker_cores", 8),
@@ -234,7 +224,6 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             {
                 "name": p.name,
                 "repo": p.repo,
-                "redis_port": p.redis_port,
                 "workers": p.workers,
                 "worker_memory": p.worker_memory,
                 "worker_cores": p.worker_cores,

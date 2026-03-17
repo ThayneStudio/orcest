@@ -8,7 +8,6 @@ with recommended actions.
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
@@ -43,15 +42,15 @@ class IssueState:
     labels: list[str]
 
 
-def _make_attempts_key(issue_number: int) -> str:
+def _make_attempts_key(repo: str, issue_number: int) -> str:
     """Redis key for tracking task attempt count per issue."""
-    return f"issue:{issue_number}:attempts"
+    return f"issue:{repo}:{issue_number}:attempts"
 
 
-def get_attempt_count(redis: RedisClient, issue_number: int) -> int:
+def get_attempt_count(redis: RedisClient, repo: str, issue_number: int) -> int:
     """Get the current attempt count for an issue."""
-    key = _make_attempts_key(issue_number)
-    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
+    key = _make_attempts_key(repo, issue_number)
+    data: dict[str, str] = redis.hgetall(key)
     if not data:
         return 0
     try:
@@ -60,13 +59,13 @@ def get_attempt_count(redis: RedisClient, issue_number: int) -> int:
         return 0
 
 
-def increment_attempts(redis: RedisClient, issue_number: int) -> int:
+def increment_attempts(redis: RedisClient, repo: str, issue_number: int) -> int:
     """Increment and return the attempt count for an issue.
 
     Sets a 7-day TTL so closed issue counters don't leak memory.
     """
-    key = _make_attempts_key(issue_number)
-    pipe = redis.client.pipeline(transaction=True)
+    key = _make_attempts_key(repo, issue_number)
+    pipe = redis.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
     pipe.hset(key, "head_sha", _ISSUE_SHA_SENTINEL)
     pipe.expire(key, 7 * 24 * 3600)
@@ -74,9 +73,9 @@ def increment_attempts(redis: RedisClient, issue_number: int) -> int:
     return results[0]
 
 
-def clear_attempts(redis: RedisClient, issue_number: int) -> None:
+def clear_attempts(redis: RedisClient, repo: str, issue_number: int) -> None:
     """Clear the attempt counter for an issue."""
-    redis.client.delete(_make_attempts_key(issue_number))
+    redis.delete(_make_attempts_key(repo, issue_number))
 
 
 def discover_actionable_issues(
@@ -127,7 +126,7 @@ def discover_actionable_issues(
 
         # Skip if locked in Redis
         lock_key = make_issue_lock_key(repo, number)
-        if redis.client.exists(lock_key):
+        if redis.exists(lock_key):
             results.append(
                 IssueState(
                     number=number,
@@ -141,7 +140,7 @@ def discover_actionable_issues(
 
         # Skip if a task for this issue is already pending in the queue
         pending_key = make_pending_task_key(repo, "issue", number)
-        if redis.client.exists(pending_key):
+        if redis.exists(pending_key):
             results.append(
                 IssueState(
                     number=number,
@@ -154,7 +153,7 @@ def discover_actionable_issues(
             continue
 
         # Skip if task already in flight or max attempts reached
-        attempt_count = get_attempt_count(redis, number)
+        attempt_count = get_attempt_count(redis, repo, number)
         if attempt_count >= max_attempts:
             logger.warning(
                 "Issue #%d has reached %d attempts (max %d), skipping",

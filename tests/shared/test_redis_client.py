@@ -78,13 +78,13 @@ def test_xack_removes_from_pending(fake_redis_client):
     entry_id = entries[0][0]
 
     # Pending count should be > 0 before ack.
-    pending_info = fake_redis_client.client.xpending(stream, group)
+    pending_info = fake_redis_client.client.xpending(fake_redis_client._prefixed(stream), group)
     assert pending_info["pending"] > 0
 
     fake_redis_client.xack(stream, group, entry_id)
 
     # Pending count should be 0 after ack.
-    pending_info = fake_redis_client.client.xpending(stream, group)
+    pending_info = fake_redis_client.client.xpending(fake_redis_client._prefixed(stream), group)
     assert pending_info["pending"] == 0
 
 
@@ -122,7 +122,7 @@ def test_xadd_capped_basic(fake_redis_client):
     assert len(entry_id) > 0
 
     # Entry should be in the stream
-    length = fake_redis_client.client.xlen(stream)
+    length = fake_redis_client.xlen(stream)
     assert length == 1
 
 
@@ -133,7 +133,7 @@ def test_xadd_capped_trims(fake_redis_client):
     for i in range(30):
         fake_redis_client.xadd_capped(stream, {"line": f"line-{i}"}, maxlen=maxlen)
 
-    length = fake_redis_client.client.xlen(stream)
+    length = fake_redis_client.xlen(stream)
     # With approximate trimming, length should be at or near maxlen.
     # Assert both an upper bound (trimming happened) and that the stream
     # is not empty (entries were added).

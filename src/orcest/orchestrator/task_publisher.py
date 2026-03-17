@@ -172,8 +172,8 @@ def _publish_and_notify(
     # retries.  An increment without a subsequent xadd is safe -- the
     # max-attempts guard in discover_actionable_prs prevents runaway loops.
     try:
-        increment_attempts(redis, pr_state.number, pr_state.head_sha)
-        increment_total_attempts(redis, pr_state.number)
+        increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
+        increment_total_attempts(redis, repo, pr_state.number)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for PR #{pr_state.number} "
@@ -263,7 +263,9 @@ def publish_fix_task(
     if failure_summaries and all(
         s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
     ):
-        transient_count = increment_transient_attempts(redis, pr_state.number, pr_state.head_sha)
+        transient_count = increment_transient_attempts(
+            redis, repo, pr_state.number, pr_state.head_sha
+        )
         if transient_count <= _MAX_TRANSIENT_RETRIES:
             _log.info(
                 "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",
@@ -545,7 +547,7 @@ def _publish_issue_and_notify(
     # Increment attempt count BEFORE publishing to Redis (same rationale as
     # _publish_and_notify: prevents unbounded retries on orchestrator crash).
     try:
-        increment_issue_attempts(redis, issue_state.number)
+        increment_issue_attempts(redis, repo, issue_state.number)
     except Exception:
         _log.error(
             f"Failed to increment attempt counter for issue #{issue_state.number} "

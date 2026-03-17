@@ -165,8 +165,9 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     # Pre-populate total_attempts so we can verify it is cleared on merge
-    increment_total_attempts(fake_redis_client, 40)
-    assert get_total_attempt_count(fake_redis_client, 40) == 1
+    repo = orchestrator_config.github.repo
+    increment_total_attempts(fake_redis_client, repo, 40)
+    assert get_total_attempt_count(fake_redis_client, repo, 40) == 1
 
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
@@ -182,7 +183,7 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "merged" in comment_body
     # Critical invariant: total_attempts must be cleared when PR is merged
-    assert get_total_attempt_count(fake_redis_client, 40) == 0
+    assert get_total_attempt_count(fake_redis_client, repo, 40) == 0
 
 
 def test_poll_cycle_merge_failure_labels_needs_human(
@@ -298,7 +299,7 @@ def test_poll_cycle_skip_max_total_attempts_labels_and_sets_flag(
     assert "Remove the" in comment_body
 
     # Should set the exhausted_notified flag so label-removal recovery works
-    assert get_exhausted_notified(fake_redis_client, 51)
+    assert get_exhausted_notified(fake_redis_client, orchestrator_config.github.repo, 51)
 
 
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):
@@ -357,9 +358,10 @@ def test_consume_results_completed_does_not_clear_total_attempts(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     # Pre-populate the cross-SHA counter to simulate prior attempts
-    increment_total_attempts(fake_redis_client, 42)
-    increment_total_attempts(fake_redis_client, 42)
-    assert get_total_attempt_count(fake_redis_client, 42) == 2
+    repo = orchestrator_config.github.repo
+    increment_total_attempts(fake_redis_client, repo, 42)
+    increment_total_attempts(fake_redis_client, repo, 42)
+    assert get_total_attempt_count(fake_redis_client, repo, 42) == 2
 
     result = _make_task_result(status=ResultStatus.COMPLETED, pr_number=42)
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
@@ -368,7 +370,7 @@ def test_consume_results_completed_does_not_clear_total_attempts(
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
     # total_attempts must still be non-zero after an intermediate task success
-    assert get_total_attempt_count(fake_redis_client, 42) == 2
+    assert get_total_attempt_count(fake_redis_client, repo, 42) == 2
 
 
 def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock):
@@ -409,8 +411,9 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     head_sha = "deadbeef"
 
     # Simulate a prior attempt so the counter is non-zero
-    increment_attempts(fake_redis_client, pr_number, head_sha)
-    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 1
+    repo = orchestrator_config.github.repo
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
 
     result = _make_task_result(
         status=ResultStatus.USAGE_EXHAUSTED,
@@ -433,10 +436,10 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     gh_mock.add_label.assert_not_called()
 
     # Per-SHA attempt counter must be cleared so PR can be re-enqueued after cooldown
-    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 0
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
 
     # Cooldown marker must be set
-    assert has_usage_exhausted_cooldown(fake_redis_client, pr_number)
+    assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
 
 
 def test_consume_results_usage_exhausted_no_branch(
@@ -894,7 +897,8 @@ def test_poll_cycle_retrigger_review(mocker, fake_redis_client, orchestrator_con
     # Verify the retrigger SHA was recorded in Redis
     from orcest.orchestrator.pr_ops import get_review_retrigger_sha
 
-    assert get_review_retrigger_sha(fake_redis_client, 500) == "sha999"
+    repo = orchestrator_config.github.repo
+    assert get_review_retrigger_sha(fake_redis_client, repo, 500) == "sha999"
 
 
 def test_poll_cycle_retrigger_review_failure_logged(
@@ -932,4 +936,4 @@ def test_poll_cycle_retrigger_review_failure_logged(
     # Retrigger SHA should NOT be recorded on failure
     from orcest.orchestrator.pr_ops import get_review_retrigger_sha
 
-    assert get_review_retrigger_sha(fake_redis_client, 501) is None
+    assert get_review_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 501) is None

@@ -83,6 +83,7 @@ def upload_source(ssh_target: str) -> None:
                 tarball_path,
                 "Dockerfile",
                 "docker-compose.yml",
+                "docker-compose.redis.yml",
                 "pyproject.toml",
                 "src/",
             ],
@@ -117,6 +118,29 @@ def upload_source(ssh_target: str) -> None:
     finally:
         # Clean up local tarball
         os.unlink(tarball_path)
+
+
+def ensure_redis_stack(ssh_target: str) -> None:
+    """Ensure the shared Redis stack is running.
+
+    Starts (or updates) the shared Redis service from docker-compose.redis.yml.
+    This creates the ``orcest`` Docker network that per-project stacks join.
+    Idempotent — safe to call if Redis is already running.
+    """
+    logger.info("Ensuring shared Redis stack on %s", ssh_target)
+    result = _ssh(
+        ssh_target,
+        "cd /opt/orcest && docker compose"
+        " -f docker-compose.redis.yml"
+        " -p orcest-redis"
+        " up -d",
+    )
+    if result.returncode != 0:
+        logger.error("Redis stack failed: %s", result.stderr.strip())
+        raise RuntimeError(
+            f"Failed to start shared Redis stack: {result.stderr.strip()}"
+        )
+    logger.info("Shared Redis stack running on %s", ssh_target)
 
 
 def deploy_stack(ssh_target: str, project_name: str) -> None:
@@ -245,27 +269,27 @@ def write_project_files(
 
 def generate_env_file(
     github_token: str,
-    redis_port: int,
+    key_prefix: str,
     project_name: str,
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack."""
     return (
         f"GITHUB_TOKEN={github_token}\n"
         f"GH_TOKEN={github_token}\n"
-        f"REDIS_PORT={redis_port}\n"
+        f"ORCEST_REDIS_KEY_PREFIX={key_prefix}\n"
         f"ORCEST_IMAGE=orcest:latest\n"
         f"ORCEST_CONFIG_DIR=/opt/orcest/projects/{project_name}/config\n"
     )
 
 
-def generate_orchestrator_config(repo: str, redis_port: int = 6379) -> str:
+def generate_orchestrator_config(repo: str, key_prefix: str) -> str:
     """Generate orchestrator.yaml content for a project.
 
-    Uses redis host 'redis' (Docker Compose service name) and the allocated port.
-    The internal Redis port is always 6379 regardless of the externally mapped port.
+    Uses redis host 'redis' (Docker network service name), port 6379,
+    and the project's key prefix for namespace isolation.
     """
     config = {
-        "redis": {"host": "redis", "port": 6379},  # internal port is always 6379
+        "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
         "github": {"repo": repo},
     }
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

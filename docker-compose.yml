@@ -1,29 +1,7 @@
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-
   orchestrator:
     image: ${ORCEST_IMAGE:-orcest:latest}
     build: .
-    depends_on:
-      redis:
-        condition: service_healthy
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
     environment:
@@ -40,6 +18,10 @@ services:
         max-size: "50m"
         max-file: "3"
     mem_limit: 1g
+    networks:
+      - orcest
 
-volumes:
-  redis-data:
+networks:
+  orcest:
+    external: true
+    name: orcest

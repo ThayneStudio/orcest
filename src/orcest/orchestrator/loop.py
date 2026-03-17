@@ -215,7 +215,7 @@ def _poll_cycle(
             else:
                 # Clean up state on successful merge
                 try:
-                    clear_review_retrigger(redis, pr_state.number)
+                    clear_review_retrigger(redis, config.github.repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_review_retrigger for PR #%d",
@@ -223,7 +223,7 @@ def _poll_cycle(
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
-                    clear_total_attempts(redis, pr_state.number)
+                    clear_total_attempts(redis, config.github.repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_total_attempts for PR #%d",
@@ -359,7 +359,9 @@ def _poll_cycle(
                         run_id,
                         config.github.token,
                     )
-                    set_review_retrigger_sha(redis, pr_state.number, pr_state.head_sha)
+                    set_review_retrigger_sha(
+                        redis, config.github.repo, pr_state.number, pr_state.head_sha
+                    )
                 except Exception as e:
                     logger.error(
                         "Failed to re-trigger review for PR #%d: %s",
@@ -370,7 +372,8 @@ def _poll_cycle(
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
             # Cooldown guard: skip if we already acted on this SHA
-            if get_stale_retrigger_sha(redis, pr_state.number) == pr_state.head_sha:
+            stale_sha = get_stale_retrigger_sha(redis, config.github.repo, pr_state.number)
+            if stale_sha == pr_state.head_sha:
                 logger.debug(
                     "PR #%d: stale checks already handled for SHA %s, skipping",
                     pr_state.number,
@@ -417,6 +420,7 @@ def _poll_cycle(
                     )
                 set_stale_retrigger_sha(
                     redis,
+                    config.github.repo,
                     pr_state.number,
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
@@ -481,6 +485,7 @@ def _poll_cycle(
                 # loop if the run can't be cancelled or immediately rerun.
                 set_stale_retrigger_sha(
                     redis,
+                    config.github.repo,
                     pr_state.number,
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
@@ -572,7 +577,7 @@ def _poll_cycle(
                 )
             if labeled:
                 try:
-                    set_exhausted_notified(redis, pr_state.number)
+                    set_exhausted_notified(redis, config.github.repo, pr_state.number)
                 except Exception as e:
                     logger.error(
                         "Failed to set exhausted_notified flag for PR #%d: %s",
@@ -874,9 +879,9 @@ def _handle_result(
     if result.status == ResultStatus.COMPLETED:
         try:
             if is_issue:
-                clear_issue_attempts(redis, resource_id)
+                clear_issue_attempts(redis, repo, resource_id)
             else:
-                clear_attempts(redis, resource_id)
+                clear_attempts(redis, repo, resource_id)
         except Exception as e:
             logger.error(
                 f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
@@ -899,7 +904,7 @@ def _handle_result(
         # preserved as a circuit-breaker across rate-limit cycles.
         attempts_cleared = False
         try:
-            clear_attempts(redis, resource_id)
+            clear_attempts(redis, repo, resource_id)
             attempts_cleared = True
         except Exception as e:
             logger.error(
@@ -911,7 +916,7 @@ def _handle_result(
         # otherwise the PR will re-stall after the cooldown expires.
         if attempts_cleared:
             try:
-                set_usage_exhausted_cooldown(redis, resource_id)
+                set_usage_exhausted_cooldown(redis, repo, resource_id)
             except Exception as e:
                 logger.error(
                     f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",

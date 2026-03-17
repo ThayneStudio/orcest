@@ -30,6 +30,8 @@ from orcest.orchestrator.pr_ops import (
 )
 from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
 
+REPO = "test-org/test-repo"
+
 
 def _make_pr_data(
     number: int = 42,
@@ -84,8 +86,8 @@ def test_skip_locked_pr(gh_mock, fake_redis_client, label_config):
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=42, labels=[]),
     ]
-    # Set the lock that discover_actionable_prs checks via redis.client.exists
-    fake_redis_client.client.set(make_pr_lock_key("test-org/test-repo", 42), "worker-7")
+    # Set the lock that discover_actionable_prs checks via redis.exists
+    fake_redis_client.set_ex(make_pr_lock_key("test-org/test-repo", 42), "worker-7", 86400)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -382,7 +384,7 @@ def test_review_feedback_respects_max_attempts(gh_mock, fake_redis_client, label
 
     # Seed Redis with attempts at the max (3), matching the default head_sha=""
     for _ in range(3):
-        increment_attempts(fake_redis_client, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -606,7 +608,7 @@ def test_ci_failure_respects_max_attempts(gh_mock, fake_redis_client, label_conf
     ]
 
     for _ in range(3):
-        increment_attempts(fake_redis_client, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -629,7 +631,7 @@ def test_followup_respects_max_attempts(gh_mock, fake_redis_client, label_config
     ]
 
     for _ in range(3):
-        increment_attempts(fake_redis_client, pr_number, head_sha="")
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha="")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -684,47 +686,42 @@ def test_get_attempt_count_sha_mismatch_resets(fake_redis_client):
     """When head SHA changes (new commits pushed), the attempt counter resets to 0."""
     pr_number = 200
     # Seed attempts with old SHA
-    increment_attempts(fake_redis_client, pr_number, head_sha="abc123")
-    increment_attempts(fake_redis_client, pr_number, head_sha="abc123")
-    assert get_attempt_count(fake_redis_client, pr_number, "abc123") == 2
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="abc123")
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="abc123")
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, "abc123") == 2
 
     # Query with a different SHA — counter should reset
-    count = get_attempt_count(fake_redis_client, pr_number, "def456")
+    count = get_attempt_count(fake_redis_client, REPO, pr_number, "def456")
     assert count == 0
 
     # The key should have been deleted, so a fresh increment starts at 1
-    assert increment_attempts(fake_redis_client, pr_number, "def456") == 1
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "def456") == 1
 
 
 def test_get_attempt_count_missing_key_returns_zero(fake_redis_client):
     """When no attempts have been recorded for a PR, get_attempt_count returns 0."""
-    count = get_attempt_count(fake_redis_client, 999, "anysha")
+    count = get_attempt_count(fake_redis_client, REPO, 999, "anysha")
     assert count == 0
 
 
 def test_get_attempt_count_corrupt_count_returns_zero(fake_redis_client):
     """Non-integer 'count' value in the Redis hash returns 0 (ValueError caught)."""
     pr_number = 210
-    key = f"pr:{pr_number}:attempts"
-    fake_redis_client.client.hset(
-        key,
-        mapping={
-            "count": "not-a-number",
-            "head_sha": "abc123",
-        },
-    )
+    key = f"pr:{REPO}:{pr_number}:attempts"
+    fake_redis_client.hset(key, "count", "not-a-number")
+    fake_redis_client.hset(key, "head_sha", "abc123")
 
-    count = get_attempt_count(fake_redis_client, pr_number, "abc123")
+    count = get_attempt_count(fake_redis_client, REPO, pr_number, "abc123")
     assert count == 0
 
 
 def test_increment_attempts_sets_ttl(fake_redis_client):
     """increment_attempts sets a 7-day TTL on the attempts key."""
     pr_number = 220
-    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="sha1")
 
-    key = f"pr:{pr_number}:attempts"
-    ttl = fake_redis_client.client.ttl(key)
+    key = f"pr:{REPO}:{pr_number}:attempts"
+    ttl = fake_redis_client.ttl(key)
     expected_ttl = 7 * 24 * 3600
     # TTL should be set and close to 7 days (allow a small margin for execution time)
     assert ttl > 0
@@ -734,47 +731,47 @@ def test_increment_attempts_sets_ttl(fake_redis_client):
 def test_increment_attempts_stores_sha(fake_redis_client):
     """increment_attempts stores the head_sha in the hash."""
     pr_number = 230
-    increment_attempts(fake_redis_client, pr_number, head_sha="deadbeef")
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="deadbeef")
 
-    key = f"pr:{pr_number}:attempts"
-    stored_sha = fake_redis_client.client.hget(key, "head_sha")
+    key = f"pr:{REPO}:{pr_number}:attempts"
+    stored_sha = fake_redis_client.hget(key, "head_sha")
     assert stored_sha == "deadbeef"
 
 
 def test_increment_attempts_returns_new_count(fake_redis_client):
     """increment_attempts returns the new (incremented) count each time."""
     pr_number = 240
-    assert increment_attempts(fake_redis_client, pr_number, "sha1") == 1
-    assert increment_attempts(fake_redis_client, pr_number, "sha1") == 2
-    assert increment_attempts(fake_redis_client, pr_number, "sha1") == 3
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "sha1") == 1
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "sha1") == 2
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "sha1") == 3
 
 
 def test_increment_attempts_resets_on_sha_change(fake_redis_client):
     """increment_attempts resets the counter when the head SHA changes."""
     pr_number = 245
-    assert increment_attempts(fake_redis_client, pr_number, "old_sha") == 1
-    assert increment_attempts(fake_redis_client, pr_number, "old_sha") == 2
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "old_sha") == 1
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "old_sha") == 2
 
     # SHA changes — counter should reset to 1, not increment to 3
-    assert increment_attempts(fake_redis_client, pr_number, "new_sha") == 1
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "new_sha") == 1
 
     # Subsequent increments with the new SHA continue from 1
-    assert increment_attempts(fake_redis_client, pr_number, "new_sha") == 2
+    assert increment_attempts(fake_redis_client, REPO, pr_number, "new_sha") == 2
 
 
 def test_clear_attempts_deletes_key(fake_redis_client):
     """clear_attempts removes the attempts key from Redis entirely."""
     pr_number = 250
-    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
-    assert get_attempt_count(fake_redis_client, pr_number, "sha1") == 1
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="sha1")
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, "sha1") == 1
 
-    clear_attempts(fake_redis_client, pr_number)
+    clear_attempts(fake_redis_client, REPO, pr_number)
 
     # Key should be gone — get_attempt_count returns 0
-    assert get_attempt_count(fake_redis_client, pr_number, "sha1") == 0
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, "sha1") == 0
     # Verify key is actually deleted in Redis
-    key = f"pr:{pr_number}:attempts"
-    assert not fake_redis_client.client.exists(key)
+    key = f"pr:{REPO}:{pr_number}:attempts"
+    assert not fake_redis_client.exists(key)
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +808,7 @@ def test_discover_skip_active_via_attempt_counter(gh_mock, fake_redis_client, la
     ]
 
     # Seed attempt counter so it's > 0
-    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="sha1")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -974,7 +971,7 @@ def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, lab
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], mergeable="CONFLICTING", head_sha="sha1"),
     ]
-    increment_attempts(fake_redis_client, pr_number, head_sha="sha1")
+    increment_attempts(fake_redis_client, REPO, pr_number, head_sha="sha1")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1025,7 +1022,7 @@ def test_skip_queued_when_pending_task_exists(gh_mock, fake_redis_client, label_
     ]
     # Set a pending task marker
     pending_key = make_pending_task_key("test-org/test-repo", "pr", pr_number)
-    fake_redis_client.client.set(pending_key, "task-xyz")
+    fake_redis_client.set_ex(pending_key, "task-xyz", 86400)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1069,7 +1066,7 @@ def test_skip_usage_cooldown_when_active(gh_mock, fake_redis_client, label_confi
         _make_pr_data(number=pr_number, labels=[]),
     ]
     # Set a cooldown marker (short TTL is fine for tests)
-    set_usage_exhausted_cooldown(fake_redis_client, pr_number, ttl_seconds=300)
+    set_usage_exhausted_cooldown(fake_redis_client, REPO, pr_number, ttl_seconds=300)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1120,7 +1117,7 @@ def test_total_attempts_circuit_breaker(gh_mock, fake_redis_client, label_config
     ]
     # Set total attempts to the limit
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1139,23 +1136,23 @@ def test_total_attempts_survives_sha_change(fake_redis_client):
     """Total attempt counter is NOT reset when the per-SHA counter resets."""
     pr_number = 710
     # Increment both counters
-    increment_attempts(fake_redis_client, pr_number, "sha1")
-    increment_total_attempts(fake_redis_client, pr_number)
+    increment_attempts(fake_redis_client, REPO, pr_number, "sha1")
+    increment_total_attempts(fake_redis_client, REPO, pr_number)
 
     # SHA changes — per-SHA counter resets, total does not
-    assert get_attempt_count(fake_redis_client, pr_number, "sha2") == 0
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 1
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, "sha2") == 0
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 1
 
 
 def test_clear_total_attempts(fake_redis_client):
     """clear_total_attempts removes the total attempts key."""
     pr_number = 720
-    increment_total_attempts(fake_redis_client, pr_number)
-    increment_total_attempts(fake_redis_client, pr_number)
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 2
+    increment_total_attempts(fake_redis_client, REPO, pr_number)
+    increment_total_attempts(fake_redis_client, REPO, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 2
 
-    clear_total_attempts(fake_redis_client, pr_number)
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
+    clear_total_attempts(fake_redis_client, REPO, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
 
 
 def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_config):
@@ -1169,7 +1166,7 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
     ]
     # Set total attempts below limit
     for _ in range(5):
-        increment_total_attempts(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1195,7 +1192,7 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
         _make_pr_data(number=pr_number, labels=[]),
     ]
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
     # No exhausted_notified flag set
 
     results = discover_actionable_prs(
@@ -1209,7 +1206,7 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
     # Counter was NOT reset
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 10
 
 
 def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
@@ -1227,10 +1224,10 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
     # PR has no CI checks configured after recovery.
     gh_mock.get_ci_status.return_value = []
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
     # Simulate: orchestrator previously set the flag when it added the needs-human label;
     # human then removed the label (so pr_labels contains no needs_human entry).
-    set_exhausted_notified(fake_redis_client, pr_number)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1244,8 +1241,8 @@ def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_clie
     # Recovery fired — PR re-entered normal processing (SKIP_NO_CHECKS with empty CI).
     assert results[0].action == PRAction.SKIP_NO_CHECKS
     # Counter and flag are cleared by the recovery path.
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
+    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
 
 def test_total_attempts_no_recovery_when_needs_human_label_still_present(
@@ -1263,8 +1260,8 @@ def test_total_attempts_no_recovery_when_needs_human_label_still_present(
         _make_pr_data(number=pr_number, labels=[{"name": label_config.needs_human}]),
     ]
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
-    set_exhausted_notified(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1277,20 +1274,20 @@ def test_total_attempts_no_recovery_when_needs_human_label_still_present(
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_LABELED
     # Counters must NOT be cleared — no human approval yet.
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 10
-    assert get_exhausted_notified(fake_redis_client, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 10
+    assert get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
 
 def test_exhausted_notified_helpers(fake_redis_client):
     """set/get/clear_exhausted_notified operate correctly."""
     pr_number = 760
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
-    set_exhausted_notified(fake_redis_client, pr_number)
-    assert get_exhausted_notified(fake_redis_client, pr_number)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
+    assert get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
-    clear_exhausted_notified(fake_redis_client, pr_number)
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
+    clear_exhausted_notified(fake_redis_client, REPO, pr_number)
+    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
 
 def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
@@ -1309,13 +1306,13 @@ def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
         _make_pr_data(number=pr_number, labels=[{"name": label_config.needs_human}]),
     ]
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
-    set_exhausted_notified(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
     # Manually shorten the TTL to simulate approaching expiry.
-    key = f"pr:{pr_number}:exhausted_notified"
-    fake_redis_client.client.expire(key, 60)  # 60 seconds remaining
-    ttl_before = fake_redis_client.client.ttl(key)
+    key = f"pr:{REPO}:{pr_number}:exhausted_notified"
+    fake_redis_client.expire(key, 60)  # 60 seconds remaining
+    ttl_before = fake_redis_client.ttl(key)
     assert ttl_before == 60
 
     results = discover_actionable_prs(
@@ -1329,8 +1326,8 @@ def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_LABELED
     # Flag must still be set and TTL must have been reset to the full 30-day window.
-    assert get_exhausted_notified(fake_redis_client, pr_number)
-    ttl_after = fake_redis_client.client.ttl(key)
+    assert get_exhausted_notified(fake_redis_client, REPO, pr_number)
+    ttl_after = fake_redis_client.ttl(key)
     assert ttl_after > 24 * 3600  # reset to ~30-day window, not just any increase
 
 
@@ -1346,11 +1343,11 @@ def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[{"name": label_config.blocked}]),
     ]
-    set_exhausted_notified(fake_redis_client, pr_number)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
-    key = f"pr:{pr_number}:exhausted_notified"
-    fake_redis_client.client.expire(key, 60)
-    ttl_before = fake_redis_client.client.ttl(key)
+    key = f"pr:{REPO}:{pr_number}:exhausted_notified"
+    fake_redis_client.expire(key, 60)
+    ttl_before = fake_redis_client.ttl(key)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1362,7 +1359,7 @@ def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_LABELED
     # TTL must NOT have been refreshed.
-    ttl_after = fake_redis_client.client.ttl(key)
+    ttl_after = fake_redis_client.ttl(key)
     assert ttl_after <= ttl_before
 
 
@@ -1382,10 +1379,10 @@ def test_recovery_also_clears_per_sha_attempts(gh_mock, fake_redis_client, label
 
     # Seed both counters to their limits.
     for _ in range(10):
-        increment_total_attempts(fake_redis_client, pr_number)
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
     for _ in range(3):
-        increment_attempts(fake_redis_client, pr_number, head_sha)
-    set_exhausted_notified(fake_redis_client, pr_number)
+        increment_attempts(fake_redis_client, REPO, pr_number, head_sha)
+    set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1400,9 +1397,9 @@ def test_recovery_also_clears_per_sha_attempts(gh_mock, fake_redis_client, label
     # Recovery fired and per-SHA counter was cleared, so the PR re-entered
     # normal processing (SKIP_NO_CHECKS with empty CI) instead of SKIP_ACTIVE.
     assert results[0].action == PRAction.SKIP_NO_CHECKS
-    assert get_total_attempt_count(fake_redis_client, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, pr_number)
-    assert get_attempt_count(fake_redis_client, pr_number, head_sha) == 0
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
+    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, head_sha) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1463,7 @@ def test_retrigger_review_escalates_after_retrigger_exhausted(
     gh_mock.get_unresolved_review_threads.return_value = []
 
     # Mark that we already re-triggered for this SHA
-    set_review_retrigger_sha(fake_redis_client, pr_number, head_sha)
+    set_review_retrigger_sha(fake_redis_client, REPO, pr_number, head_sha)
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1493,7 +1490,7 @@ def test_retrigger_review_allowed_after_new_sha(gh_mock, fake_redis_client, labe
     gh_mock.get_unresolved_review_threads.return_value = []
 
     # Old retrigger was for a different SHA
-    set_review_retrigger_sha(fake_redis_client, pr_number, "old_sha")
+    set_review_retrigger_sha(fake_redis_client, REPO, pr_number, "old_sha")
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1645,22 +1642,22 @@ def test_get_claude_review_run_id_queued_returns_none():
 def test_review_retrigger_sha_roundtrip(fake_redis_client):
     """set/get/clear review retrigger SHA works correctly."""
     pr_number = 900
-    assert get_review_retrigger_sha(fake_redis_client, pr_number) is None
+    assert get_review_retrigger_sha(fake_redis_client, REPO, pr_number) is None
 
-    set_review_retrigger_sha(fake_redis_client, pr_number, "abc123")
-    assert get_review_retrigger_sha(fake_redis_client, pr_number) == "abc123"
+    set_review_retrigger_sha(fake_redis_client, REPO, pr_number, "abc123")
+    assert get_review_retrigger_sha(fake_redis_client, REPO, pr_number) == "abc123"
 
-    clear_review_retrigger(fake_redis_client, pr_number)
-    assert get_review_retrigger_sha(fake_redis_client, pr_number) is None
+    clear_review_retrigger(fake_redis_client, REPO, pr_number)
+    assert get_review_retrigger_sha(fake_redis_client, REPO, pr_number) is None
 
 
 def test_review_retrigger_sha_has_ttl(fake_redis_client):
     """set_review_retrigger_sha sets a 7-day TTL."""
     pr_number = 901
-    set_review_retrigger_sha(fake_redis_client, pr_number, "sha1")
+    set_review_retrigger_sha(fake_redis_client, REPO, pr_number, "sha1")
 
-    key = f"pr:{pr_number}:review_retrigger"
-    ttl = fake_redis_client.client.ttl(key)
+    key = f"pr:{REPO}:{pr_number}:review_retrigger"
+    ttl = fake_redis_client.ttl(key)
     expected_ttl = 7 * 24 * 3600
     assert 0 < ttl <= expected_ttl
 
@@ -1927,17 +1924,17 @@ def test_skip_pending_when_one_check_fresh_one_stale(gh_mock, fake_redis_client,
 
 def test_transient_attempt_count_starts_at_zero(fake_redis_client):
     """get_transient_attempt_count returns 0 for an unknown PR."""
-    assert get_transient_attempt_count(fake_redis_client, 1000, "abc") == 0
+    assert get_transient_attempt_count(fake_redis_client, REPO, 1000, "abc") == 0
 
 
 def test_increment_transient_attempts_increments(fake_redis_client):
     """increment_transient_attempts increments and returns the new count."""
     pr_number = 1001
     sha = "sha-aaa"
-    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 1
-    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 2
-    assert increment_transient_attempts(fake_redis_client, pr_number, sha) == 3
-    assert get_transient_attempt_count(fake_redis_client, pr_number, sha) == 3
+    assert increment_transient_attempts(fake_redis_client, REPO, pr_number, sha) == 1
+    assert increment_transient_attempts(fake_redis_client, REPO, pr_number, sha) == 2
+    assert increment_transient_attempts(fake_redis_client, REPO, pr_number, sha) == 3
+    assert get_transient_attempt_count(fake_redis_client, REPO, pr_number, sha) == 3
 
 
 def test_transient_attempts_reset_on_new_sha(fake_redis_client):
@@ -1946,25 +1943,25 @@ def test_transient_attempts_reset_on_new_sha(fake_redis_client):
     sha_v1 = "sha-111"
     sha_v2 = "sha-222"
 
-    increment_transient_attempts(fake_redis_client, pr_number, sha_v1)
-    increment_transient_attempts(fake_redis_client, pr_number, sha_v1)
-    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v1) == 2
+    increment_transient_attempts(fake_redis_client, REPO, pr_number, sha_v1)
+    increment_transient_attempts(fake_redis_client, REPO, pr_number, sha_v1)
+    assert get_transient_attempt_count(fake_redis_client, REPO, pr_number, sha_v1) == 2
 
     # New SHA: counter resets
-    new_count = increment_transient_attempts(fake_redis_client, pr_number, sha_v2)
+    new_count = increment_transient_attempts(fake_redis_client, REPO, pr_number, sha_v2)
     assert new_count == 1
-    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v2) == 1
+    assert get_transient_attempt_count(fake_redis_client, REPO, pr_number, sha_v2) == 1
     # Old SHA now returns 0 (key was reset)
-    assert get_transient_attempt_count(fake_redis_client, pr_number, sha_v1) == 0
+    assert get_transient_attempt_count(fake_redis_client, REPO, pr_number, sha_v1) == 0
 
 
 def test_transient_attempts_has_ttl(fake_redis_client):
     """increment_transient_attempts sets a 7-day TTL on the key."""
     pr_number = 1003
-    increment_transient_attempts(fake_redis_client, pr_number, "sha-ttl")
+    increment_transient_attempts(fake_redis_client, REPO, pr_number, "sha-ttl")
 
-    key = f"pr:{pr_number}:transient_attempts"
-    ttl = fake_redis_client.client.ttl(key)
+    key = f"pr:{REPO}:{pr_number}:transient_attempts"
+    ttl = fake_redis_client.ttl(key)
     expected_ttl = 7 * 24 * 3600
     assert 0 < ttl <= expected_ttl
 
@@ -1974,8 +1971,8 @@ def test_transient_attempts_independent_of_main_attempts(fake_redis_client):
     pr_number = 1004
     sha = "sha-ind"
 
-    increment_transient_attempts(fake_redis_client, pr_number, sha)
-    increment_transient_attempts(fake_redis_client, pr_number, sha)
+    increment_transient_attempts(fake_redis_client, REPO, pr_number, sha)
+    increment_transient_attempts(fake_redis_client, REPO, pr_number, sha)
 
     # Main attempt counter should still be 0
-    assert get_attempt_count(fake_redis_client, pr_number, sha) == 0
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, sha) == 0

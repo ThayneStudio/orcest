@@ -40,7 +40,7 @@ class RedisLock:
         owner: str | None = None,
     ):
         self.redis = redis_client
-        self.key = key
+        self.key = redis_client._prefixed(key)
         self.ttl = ttl
         self.owner = owner or str(uuid.uuid4())
         self._held = False
@@ -141,7 +141,7 @@ def set_pending_task(
     Uses SET NX EX for atomic check-and-set with a TTL safety net.
     """
     key = make_pending_task_key(repo, resource_type, resource_id)
-    return redis_client.client.set(key, task_id, nx=True, ex=ttl) is not None
+    return redis_client.set_nx_ex(key, task_id, ttl)
 
 
 def clear_pending_task(
@@ -152,4 +152,4 @@ def clear_pending_task(
 ) -> None:
     """Clear the pending task marker for a resource."""
     key = make_pending_task_key(repo, resource_type, resource_id)
-    redis_client.client.delete(key)
+    redis_client.delete(key)

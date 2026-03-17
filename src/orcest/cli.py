@@ -67,14 +67,18 @@ def work(worker_id: str, config: str, runner: str | None) -> None:
 @main.command()
 @click.argument("redis_host", required=False, default=None)
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
+@click.option("--prefix", default=None, help="Redis key prefix (project name).")
 @click.option("--once", is_flag=True, help="Print status once and exit (no TUI).")
 @click.option("--interval", default=3.0, type=float, help="TUI refresh interval in seconds.")
-def status(redis_host: str | None, config: str, once: bool, interval: float) -> None:
+def status(
+    redis_host: str | None, config: str, prefix: str | None, once: bool, interval: float,
+) -> None:
     """Show system status: workers, queue depth, active tasks.
 
     Connects to Redis directly via REDIS_HOST (e.g. 10.20.0.19 or 10.20.0.19:6380),
     or falls back to --config file. Launches a live TUI dashboard by default.
-    Use --once for single-shot output.
+    Use --once for single-shot output. Use --prefix to specify the project's
+    key prefix when connecting directly via REDIS_HOST.
     """
     from orcest.shared.config import RedisConfig
     from orcest.shared.redis_client import RedisClient
@@ -89,12 +93,17 @@ def status(redis_host: str | None, config: str, once: bool, interval: float) -> 
                 raise SystemExit(1)
         else:
             host, port = redis_host, 6379
-        redis_cfg = RedisConfig(host=host, port=port, db=0)
+        redis_cfg = RedisConfig(
+            host=host, port=port, db=0,
+            key_prefix=prefix or "orcest",
+        )
     else:
         from orcest.shared.config import load_orchestrator_config
 
         cfg = load_orchestrator_config(config)
         redis_cfg = cfg.redis
+        if prefix:
+            redis_cfg.key_prefix = prefix
 
     redis = RedisClient(redis_cfg)
 
@@ -192,6 +201,7 @@ def _status_once(redis: RedisClient) -> None:
 @main.command("dead-letters")
 @click.argument("redis_host", required=False, default=None)
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
+@click.option("--prefix", default=None, help="Redis key prefix (project name).")
 @click.option(
     "--replay",
     is_flag=True,
@@ -203,7 +213,9 @@ def _status_once(redis: RedisClient) -> None:
     type=int,
     help="Maximum number of entries to list (also caps replay scope when --replay is used).",
 )
-def dead_letters(redis_host: str | None, config: str, replay: bool, count: int) -> None:
+def dead_letters(
+    redis_host: str | None, config: str, prefix: str | None, replay: bool, count: int,
+) -> None:
     """List and optionally replay dead-lettered tasks.
 
     Reads entries from the orcest:dead-letter stream and displays them in a
@@ -226,12 +238,17 @@ def dead_letters(redis_host: str | None, config: str, replay: bool, count: int) 
                 raise SystemExit(1)
         else:
             host, port = redis_host, 6379
-        redis_cfg = RedisConfig(host=host, port=port, db=0)
+        redis_cfg = RedisConfig(
+            host=host, port=port, db=0,
+            key_prefix=prefix or "orcest",
+        )
     else:
         from orcest.shared.config import load_orchestrator_config
 
         cfg = load_orchestrator_config(config)
         redis_cfg = cfg.redis
+        if prefix:
+            redis_cfg.key_prefix = prefix
 
     redis = RedisClient(redis_cfg)
 

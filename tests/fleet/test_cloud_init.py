@@ -11,7 +11,7 @@ pytestmark = pytest.mark.unit
 def _render(**overrides):
     defaults = {
         "redis_host": "10.20.0.23",
-        "redis_port": 6379,
+        "key_prefix": "orcest",
         "worker_id": "worker-200",
         "github_token": "ghp_fake",
         "claude_oauth_token": "sk-ant-oat01-fake",
@@ -36,13 +36,14 @@ def test_output_is_valid_yaml():
 
 def test_worker_yaml_in_write_files():
     """The worker.yaml content is included in write_files."""
-    output = _render(redis_host="10.0.0.1", redis_port=6380)
+    output = _render(redis_host="10.0.0.1", key_prefix="myproject")
     data = yaml.safe_load(output)
 
     worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
     worker_cfg = yaml.safe_load(worker_file["content"])
     assert worker_cfg["redis"]["host"] == "10.0.0.1"
-    assert worker_cfg["redis"]["port"] == 6380
+    assert worker_cfg["redis"]["port"] == 6379
+    assert worker_cfg["redis"]["key_prefix"] == "myproject"
     assert worker_cfg["worker_id"] == "worker-200"
 
 

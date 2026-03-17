@@ -90,7 +90,7 @@ def generate_tfvars(config: FleetConfig) -> dict[str, Any]:
 
             worker_userdata = render_worker_userdata(
                 redis_host=config.orchestrator.host or "localhost",
-                redis_port=project.redis_port,
+                key_prefix=project.name,
                 worker_id=worker_id,
                 github_token=org.github_token,
                 claude_oauth_token=org.claude_oauth_token,
