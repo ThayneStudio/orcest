@@ -31,6 +31,20 @@ def _validate_ssh_input(value: str, label: str) -> None:
         )
 
 
+def _parse_redis_host(redis_host: str) -> tuple[str, int]:
+    """Parse a Redis host string into (host, port), defaulting port to 6379."""
+    if ":" in redis_host:
+        host, port_str = redis_host.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            click.echo(f"Error: Invalid port number: {port_str}", err=True)
+            raise SystemExit(1)
+    else:
+        host, port = redis_host, 6379
+    return host, port
+
+
 @click.group()
 def main() -> None:
     """Orcest: Autonomous CI/CD orchestration system."""
@@ -84,15 +98,7 @@ def status(
     from orcest.shared.redis_client import RedisClient
 
     if redis_host:
-        if ":" in redis_host:
-            host, port_str = redis_host.rsplit(":", 1)
-            try:
-                port = int(port_str)
-            except ValueError:
-                click.echo(f"Error: Invalid port number: {port_str}", err=True)
-                raise SystemExit(1)
-        else:
-            host, port = redis_host, 6379
+        host, port = _parse_redis_host(redis_host)
         redis_cfg = RedisConfig(
             host=host, port=port, db=0,
             key_prefix=prefix or "orcest",
@@ -229,15 +235,7 @@ def dead_letters(
     from orcest.shared.redis_client import RedisClient
 
     if redis_host:
-        if ":" in redis_host:
-            host, port_str = redis_host.rsplit(":", 1)
-            try:
-                port = int(port_str)
-            except ValueError:
-                click.echo(f"Error: Invalid port number: {port_str}", err=True)
-                raise SystemExit(1)
-        else:
-            host, port = redis_host, 6379
+        host, port = _parse_redis_host(redis_host)
         redis_cfg = RedisConfig(
             host=host, port=port, db=0,
             key_prefix=prefix or "orcest",

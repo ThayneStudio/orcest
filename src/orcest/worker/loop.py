@@ -65,7 +65,7 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
     try:
         data = yaml.safe_load(hosts_file.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning(f"Could not read gh credentials file {hosts_file}: {exc}", exc_info=True)
+        logger.warning("Could not read gh credentials file %s: %s", hosts_file, exc, exc_info=True)
         return
 
     if not isinstance(data, dict):
@@ -82,13 +82,15 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
             continue
         if token.startswith(_OAUTH_PREFIXES):
             logger.warning(
-                f"gh credential for {host!r} appears to be an OAuth app token "
-                f"(prefix '{token[:4]}').  Under ProtectHome=read-only, gh cannot "
+                "gh credential for %r appears to be an OAuth app token "
+                "(prefix %r).  Under ProtectHome=read-only, gh cannot "
                 "refresh this token by writing to ~/.config/gh/hosts.yml, which "
                 "will cause intermittent authentication failures.  "
                 "Replace it with a fine-grained PAT (github_pat_…) or classic PAT "
                 "(ghp_…) that does not require refresh, or set the GH_TOKEN "
-                "environment variable in /opt/orcest/.env."
+                "environment variable in /opt/orcest/.env.",
+                host,
+                token[:4],
             )
 
 

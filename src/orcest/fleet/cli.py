@@ -537,18 +537,18 @@ def update(config: str) -> None:
         console.print(f"[yellow]failed: {exc}[/yellow]")
 
     # Step 3: Restart all project stacks
+    from orcest.fleet.orchestrator import restart_stack
+
     for project in cfg.projects:
         console.print(f"  Restarting stack for '{project.name}'...", end=" ")
         try:
-            from orcest.fleet.orchestrator import restart_stack
-
             restart_stack(ssh_target, project.name)
             console.print("[green]ok[/green]")
         except Exception as exc:
             console.print(f"[yellow]failed: {exc}[/yellow]")
 
-    # Step 3: Regenerate tfvars and apply Terraform (recreates workers with fresh cloud-init)
-    console.print("\n  Recreating workers with fresh cloud-init...")
+    # Step 4: Regenerate tfvars and apply Terraform (ensures workers match current config)
+    console.print("\n  Applying Terraform to ensure workers match current config...")
     try:
         from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
 
@@ -639,6 +639,7 @@ def status(config: str) -> None:
     proj_table.add_column("Stack Status", style="magenta")
 
     for project in cfg.projects:
+        _validate_project_name(project.name)
         stack_status = "[dim]unknown[/dim]"
         if cfg.orchestrator.host:
             ssh_target = cfg.ssh_target()
