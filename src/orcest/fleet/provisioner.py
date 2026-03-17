@@ -149,8 +149,51 @@ def write_tfvars(tfvars: dict[str, Any], config_dir: Path = TERRAFORM_DIR) -> No
     logger.info("Wrote %s", path)
 
 
+def _ensure_ssh_agent() -> dict[str, str]:
+    """Ensure ssh-agent is running and has at least one key loaded.
+
+    Returns environment variables to pass to subprocesses so they can
+    reach the agent.  Starts a new agent and loads the default key if
+    one is not already available.
+    """
+    env = dict(os.environ)
+
+    # Check if an agent is already usable
+    check = subprocess.run(
+        ["ssh-add", "-l"], capture_output=True, text=True, env=env,
+    )
+    if check.returncode == 0:
+        return env  # agent running with keys
+
+    # Start a new agent
+    result = subprocess.run(
+        ["ssh-agent", "-s"], capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logger.warning("Could not start ssh-agent: %s", result.stderr)
+        return env
+
+    # Parse SSH_AUTH_SOCK and SSH_AGENT_PID from agent output
+    for line in result.stdout.splitlines():
+        for var in ("SSH_AUTH_SOCK", "SSH_AGENT_PID"):
+            if line.startswith(f"{var}="):
+                value = line.split("=", 1)[1].split(";", 1)[0]
+                env[var] = value
+                os.environ[var] = value
+
+    # Load default key
+    add = subprocess.run(
+        ["ssh-add"], capture_output=True, text=True, env=env,
+    )
+    if add.returncode != 0:
+        logger.warning("ssh-add failed: %s", add.stderr)
+
+    return env
+
+
 def _run_tofu(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run a ``tofu`` command, raising on failure."""
+    env = _ensure_ssh_agent()
     cmd = ["tofu", *args]
     logger.info("Running: %s (cwd=%s)", " ".join(cmd), cwd)
     result = subprocess.run(
@@ -158,6 +201,7 @@ def _run_tofu(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        env=env,
     )
     if result.returncode != 0:
         logger.error("tofu failed:\n%s", result.stderr)
