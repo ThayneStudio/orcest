@@ -273,6 +273,8 @@ def generate_env_file(
     project_name: str,
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack."""
+    if any(c in github_token for c in ("\n", "\r", "\0")):
+        raise ValueError("github_token must not contain newlines or null bytes")
     return (
         f"GITHUB_TOKEN={github_token}\n"
         f"GH_TOKEN={github_token}\n"

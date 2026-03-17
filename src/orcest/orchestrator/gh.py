@@ -67,7 +67,7 @@ _GH_TIMEOUT_SECONDS = 120
 _RATE_LIMIT_BACKOFF_SECONDS: tuple[int, ...] = (30, 60, 120)
 
 _RATE_LIMIT_RE = re.compile(r"rate.?limit", re.IGNORECASE)
-_RATE_LIMIT_429_RE = re.compile(r"\b429\b")
+_RATE_LIMIT_429_RE = re.compile(r"HTTP\s+429\b")
 _RETRY_AFTER_RE = re.compile(r"retry.?after[:\s]+(\d+)", re.IGNORECASE)
 
 # Maximum seconds to honour a server-supplied retry-after header; guards
@@ -317,7 +317,7 @@ def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
             ],
             token,
         )
-    except Exception:
+    except GhCliError:
         logger.warning(
             "Failed to fetch failed-step logs for run %d in %s",
             run_id,
