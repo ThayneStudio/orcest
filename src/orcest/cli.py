@@ -595,6 +595,59 @@ def init():
     console.print(f"  {step + 2}. Onboard a repo:            orcest fleet onboard <owner/repo>")
 
 
+@main.command("self-update")
+def self_update():
+    """Update the orcest CLI to the latest version from GitHub.
+
+    Reinstalls the package and refreshes Terraform templates.
+    """
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    from orcest.fleet.config import DEFAULT_CONFIG_DIR
+
+    console = Console()
+    console.print("\n[bold]Updating orcest[/bold]\n")
+
+    # Step 1: Reinstall from GitHub
+    console.print("  Installing latest version...", end=" ")
+    pip = Path(sys.executable).parent / "pip"
+    result = subprocess.run(
+        [
+            str(pip), "install", "--quiet", "--no-cache-dir",
+            "--force-reinstall", "git+https://github.com/ThayneStudio/orcest.git",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]")
+        console.print(f"    {result.stderr.strip()}")
+        raise SystemExit(1)
+    console.print("[green]ok[/green]")
+
+    # Step 2: Copy Terraform templates if config dir exists
+    terraform_dest = DEFAULT_CONFIG_DIR / "terraform"
+    if terraform_dest.is_dir():
+        console.print("  Updating Terraform templates...", end=" ")
+        # Re-import to get the freshly installed package path
+        import importlib
+
+        import orcest.fleet
+        importlib.reload(orcest.fleet)
+        terraform_src = Path(orcest.fleet.__file__).parent / "terraform"
+        if terraform_src.is_dir():
+            for hcl_file in terraform_src.iterdir():
+                if hcl_file.is_file():
+                    shutil.copy2(hcl_file, terraform_dest / hcl_file.name)
+            console.print("[green]ok[/green]")
+        else:
+            console.print("[yellow]source templates not found[/yellow]")
+
+    console.print("\n[bold]Update complete.[/bold]")
+
+
 @main.command("init-labels")
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for repo/token).")
 def init_labels(config: str) -> None:
