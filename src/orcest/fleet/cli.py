@@ -112,22 +112,25 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
     if org_name in cfg.orgs:
         console.print(f"[yellow]Org '{org_name}' already exists, updating credentials.[/yellow]")
 
-    # Validate the GitHub token
+    # Validate the GitHub token (best-effort; gh may not be installed on the Proxmox host)
     console.print("  Validating GitHub token...", end=" ")
-    result = subprocess.run(
-        ["gh", "auth", "status"],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "GITHUB_TOKEN": github_token, "GH_TOKEN": github_token},
-    )
-    if result.returncode != 0:
-        console.print("[red]failed[/red]")
-        stderr = result.stderr.strip()
-        if stderr:
-            console.print(f"    {stderr}")
-        console.print("[yellow]Warning: token validation failed, saving anyway.[/yellow]")
-    else:
-        console.print("[green]ok[/green]")
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GITHUB_TOKEN": github_token, "GH_TOKEN": github_token},
+        )
+        if result.returncode != 0:
+            console.print("[red]failed[/red]")
+            stderr = result.stderr.strip()
+            if stderr:
+                console.print(f"    {stderr}")
+            console.print("[yellow]Warning: token validation failed, saving anyway.[/yellow]")
+        else:
+            console.print("[green]ok[/green]")
+    except FileNotFoundError:
+        console.print("[yellow]skipped (gh CLI not installed)[/yellow]")
 
     cfg.orgs[org_name] = OrgEntry(
         github_token=github_token,
