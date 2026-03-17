@@ -595,8 +595,8 @@ def init():
     console.print(f"  {step + 2}. Onboard a repo:            orcest fleet onboard <owner/repo>")
 
 
-@main.command("self-update")
-def self_update():
+@main.command()
+def upgrade():
     """Update the orcest CLI to the latest version from GitHub.
 
     Reinstalls the package and refreshes Terraform templates.
