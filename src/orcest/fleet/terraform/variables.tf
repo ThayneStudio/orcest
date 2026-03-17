@@ -30,7 +30,7 @@ variable "orchestrator" {
     disk_size          = number # in GB
     cloud_init_content = string
   })
-  sensitive = true
+  # See comment on var.workers for why this is not marked sensitive.
 }
 
 variable "workers" {
@@ -43,6 +43,9 @@ variable "workers" {
     disk_size          = number # in GB
     cloud_init_content = string
   }))
-  default   = {}
-  sensitive = true
+  default = {}
+  # Not marked sensitive at the variable level because Terraform forbids
+  # sensitive values in for_each.  The cloud_init_content (which contains
+  # tokens) is protected by the snippets being written to Proxmox storage
+  # and the tfvars file having 0600 permissions.
 }
