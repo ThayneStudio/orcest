@@ -50,7 +50,6 @@ def test_status_shows_projects(runner, cfg_path):
             ProjectEntry(
                 name="alpha",
                 repo="Org/alpha",
-                redis_port=6379,
                 workers=1,
             ),
         ]
@@ -75,6 +74,7 @@ def test_onboard_creates_project(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.deploy_stack")
     result = runner.invoke(
@@ -95,7 +95,6 @@ def test_onboard_creates_project(runner, cfg_path, mocker):
     assert len(data["projects"]) == 1
     assert data["projects"][0]["name"] == "my-project"
     assert data["projects"][0]["repo"] == "ThayneStudio/my-project"
-    assert data["projects"][0]["redis_port"] == 6379
 
 
 def test_onboard_custom_name(runner, cfg_path, mocker):
@@ -111,6 +110,7 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.deploy_stack")
     result = runner.invoke(
@@ -198,7 +198,6 @@ def test_add_worker_increments_count(runner, cfg_path, mocker):
             ProjectEntry(
                 name="alpha",
                 repo="Org/alpha",
-                redis_port=6379,
                 workers=1,
             )
         ]
@@ -317,6 +316,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
 
     result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])
     assert result.exit_code == 0, result.output
@@ -364,6 +364,7 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
+    mock_ensure_redis = mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mock_restart = mocker.patch("orcest.fleet.orchestrator.restart_stack")
     mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
     mocker.patch("orcest.fleet.provisioner.write_tfvars")
@@ -372,7 +373,8 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
     result = runner.invoke(fleet, ["update", "--config", cfg_path])
     assert result.exit_code == 0, result.output
 
-    # Should restart both project stacks
+    # Should update shared Redis stack and restart both project stacks
+    mock_ensure_redis.assert_called_once()
     assert mock_restart.call_count == 2
 
 

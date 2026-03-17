@@ -55,7 +55,7 @@ class TestGenerateTfvars:
 
     def test_single_project_one_worker(self):
         cfg = _cfg(
-            projects=[ProjectEntry(name="alpha", repo="Org/alpha", redis_port=6379, workers=1)],
+            projects=[ProjectEntry(name="alpha", repo="Org/alpha", workers=1)],
         )
         tfvars = generate_tfvars(cfg)
 

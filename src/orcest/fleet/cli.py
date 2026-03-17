@@ -208,7 +208,21 @@ def create_orchestrator(config: str) -> None:
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 6: Update config with orchestrator host
+    # Step 6: Start shared Redis stack
+    try:
+        from orcest.fleet.orchestrator import ensure_redis_stack
+
+        console.print("  Starting shared Redis stack...")
+        ensure_redis_stack(ssh_target)
+        console.print("  Redis stack [green]ok[/green]")
+    except Exception as exc:
+        console.print(f"  Redis stack [red]failed[/red]: {exc}")
+        console.print("  Saving config with partial state.")
+        cfg.orchestrator.host = orch_ip
+        save_config(cfg, config)
+        sys.exit(1)
+
+    # Step 7: Update config with orchestrator host
     cfg.orchestrator.host = orch_ip
     save_config(cfg, config)
 
@@ -270,27 +284,17 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print(f"[red]Project '{project_name}' already exists in fleet config.[/red]")
         sys.exit(1)
 
-    # Allocate redis_port
-    redis_port = cfg.next_redis_port()
-    if redis_port > 6399:
-        console.print(
-            f"[red]Redis port {redis_port} exceeds the allowed range (6379-6399).[/red]\n"
-            "  Remove unused projects or expand the range before adding more."
-        )
-        sys.exit(1)
-
     # Add project to config
     project = ProjectEntry(
         name=project_name,
         repo=repo,
-        redis_port=redis_port,
         workers=1,
     )
     cfg.projects.append(project)
 
     console.print(f"  Project: {project_name}")
     console.print(f"  Repo: {repo}")
-    console.print(f"  Redis port: {redis_port}")
+    console.print(f"  Key prefix: {project_name}")
     console.print("  Workers: 1")
 
     # Step 1: Generate tfvars and apply Terraform (creates worker VM)
@@ -323,10 +327,12 @@ def onboard(repo: str, name: str | None, config: str) -> None:
 
         env_content = generate_env_file(
             github_token=org.github_token,
-            redis_port=redis_port,
+            key_prefix=project_name,
             project_name=project_name,
         )
-        config_yaml = generate_orchestrator_config(repo=repo, redis_port=redis_port)
+        config_yaml = generate_orchestrator_config(
+            repo=repo, key_prefix=project_name,
+        )
         write_project_files(ssh_target, project_name, env_content, config_yaml)
         console.print("  Project files written [green]ok[/green]")
     except Exception as exc:
@@ -334,9 +340,15 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
         sys.exit(1)
 
-    # Step 3: Ensure Docker image exists, then deploy stack
+    # Step 3: Ensure shared Redis stack is running, then deploy project stack
     try:
-        from orcest.fleet.orchestrator import deploy_stack, image_exists
+        from orcest.fleet.orchestrator import (
+            deploy_stack,
+            ensure_redis_stack,
+            image_exists,
+        )
+
+        ensure_redis_stack(ssh_target)
 
         if not image_exists(ssh_target):
             from orcest.fleet.orchestrator import build_image
@@ -432,8 +444,7 @@ def destroy(project_name: str, config: str, yes: bool) -> None:
 
     if not yes:
         click.confirm(
-            f"Destroy project '{project_name}' ({project.workers} worker(s), "
-            f"redis port {project.redis_port})?",
+            f"Destroy project '{project_name}' ({project.workers} worker(s))?",
             abort=True,
         )
 
@@ -515,7 +526,17 @@ def update(config: str) -> None:
         console.print(f"  [red]failed[/red]: {exc}")
         sys.exit(1)
 
-    # Step 2: Restart all project stacks
+    # Step 2: Update shared Redis stack
+    console.print("  Updating shared Redis stack...", end=" ")
+    try:
+        from orcest.fleet.orchestrator import ensure_redis_stack
+
+        ensure_redis_stack(ssh_target)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[yellow]failed: {exc}[/yellow]")
+
+    # Step 3: Restart all project stacks
     for project in cfg.projects:
         console.print(f"  Restarting stack for '{project.name}'...", end=" ")
         try:
@@ -614,7 +635,6 @@ def status(config: str) -> None:
     proj_table = Table(title="Projects")
     proj_table.add_column("Project", style="cyan")
     proj_table.add_column("Repo", style="white")
-    proj_table.add_column("Redis Port", style="yellow")
     proj_table.add_column("Workers", style="green")
     proj_table.add_column("Stack Status", style="magenta")
 
@@ -647,7 +667,6 @@ def status(config: str) -> None:
         proj_table.add_row(
             project.name,
             project.repo,
-            str(project.redis_port),
             str(project.workers),
             stack_status,
         )

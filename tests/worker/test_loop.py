@@ -542,6 +542,8 @@ class TestRunWorker:
         mock_redis.client.register_script.return_value = mock_script
         # lock.acquire calls redis.client.set(..., nx=True, ex=...)
         mock_redis.client.set.return_value = True
+        # RedisLock uses _prefixed() to namespace lock keys
+        mock_redis._prefixed = lambda key: f"test:{key}"
 
         return mock_redis
 
@@ -653,7 +655,7 @@ class TestRunWorker:
         mock_redis.client.set.assert_called_once()
         set_call = mock_redis.client.set.call_args
         lock_key = set_call[0][0]
-        assert lock_key == f"lock:pr:{sample_task.repo}:{sample_task.resource_id}"
+        assert lock_key == f"test:lock:pr:{sample_task.repo}:{sample_task.resource_id}"
         assert set_call[1]["nx"] is True
         assert set_call[1]["ex"] == LOCK_TTL
 

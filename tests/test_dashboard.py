@@ -52,7 +52,7 @@ def test_results_depth(fake_redis_client):
 
 def test_active_locks(fake_redis_client):
     """Shows active PR locks with owner and TTL."""
-    fake_redis_client.client.set("lock:pr:42", "worker-1", ex=1800)
+    fake_redis_client.set_ex("lock:pr:42", "worker-1", 1800)
 
     snap = fetch_snapshot(fake_redis_client)
 
@@ -89,7 +89,8 @@ def test_recent_results(fake_redis_client):
 
 def test_attempt_counts(fake_redis_client):
     """Reports PR attempt counters."""
-    fake_redis_client.client.hset("pr:42:attempts", mapping={"count": "3", "head_sha": "abc"})
+    fake_redis_client.hset("pr:test-org/test-repo:42:attempts", "count", "3")
+    fake_redis_client.hset("pr:test-org/test-repo:42:attempts", "head_sha", "abc")
 
     snap = fetch_snapshot(fake_redis_client)
 

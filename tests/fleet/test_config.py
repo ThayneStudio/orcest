@@ -91,28 +91,6 @@ class TestFleetConfigHelpers:
         cfg = FleetConfig()
         assert cfg.get_project("nope") is None
 
-    def test_next_redis_port_empty(self):
-        cfg = FleetConfig()
-        assert cfg.next_redis_port() == 6379
-
-    def test_next_redis_port_fills_gap(self):
-        cfg = FleetConfig(
-            projects=[
-                ProjectEntry(name="a", repo="O/a", redis_port=6379),
-                ProjectEntry(name="b", repo="O/b", redis_port=6381),
-            ]
-        )
-        assert cfg.next_redis_port() == 6380
-
-    def test_next_redis_port_increments(self):
-        cfg = FleetConfig(
-            projects=[
-                ProjectEntry(name="a", repo="O/a", redis_port=6379),
-                ProjectEntry(name="b", repo="O/b", redis_port=6380),
-            ]
-        )
-        assert cfg.next_redis_port() == 6381
-
     def test_resolve_org_found(self):
         cfg = FleetConfig(
             orgs={"MyOrg": OrgEntry(github_token="ghp_x")},
@@ -147,7 +125,7 @@ class TestConfigPersistence:
             orchestrator=OrchestratorConfig(vm_id=200, host="10.0.0.1", disk_size=40),
             orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_token="sk_def")},
             projects=[
-                ProjectEntry(name="proj", repo="Org/proj", redis_port=6380, workers=3),
+                ProjectEntry(name="proj", repo="Org/proj", workers=3),
             ],
         )
         save_config(original, path)
@@ -213,7 +191,7 @@ class TestConfigPersistence:
             yaml.dump(
                 {
                     "projects": [
-                        {"name": "old", "repo": "O/old", "redis_port": 6379, "workers": 1}
+                        {"name": "old", "repo": "O/old", "workers": 1}
                     ]
                 }
             )

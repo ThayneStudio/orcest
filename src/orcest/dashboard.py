@@ -15,7 +15,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any
 
 import redis as redis_lib
 from rich.markup import escape as rich_escape
@@ -111,31 +111,29 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     Separated from fetch_snapshot so the outer function can catch
     connection-level errors that occur after the health check.
     """
-    client = redis.client
-
     # Queue depths
-    task_streams = list(client.scan_iter(match="tasks:*"))
+    task_streams = redis.scan_iter(match="tasks:*")
     queue_depths: dict[str, int] = {}
     for stream_key in sorted(task_streams):
         try:
-            queue_depths[stream_key] = cast(int, client.xlen(stream_key)) or 0
+            queue_depths[stream_key] = redis.xlen(stream_key)
         except redis_lib.ResponseError:
             pass  # Key exists but is not a stream
 
     try:
-        results_depth: int = cast(int, client.xlen("results")) or 0
+        results_depth: int = redis.xlen("results")
     except redis_lib.ResponseError:
         results_depth = 0
 
     try:
-        dead_letter_count: int = cast(int, client.xlen(DEAD_LETTER_STREAM)) or 0
+        dead_letter_count: int = redis.xlen(DEAD_LETTER_STREAM)
     except redis_lib.ResponseError:
         dead_letter_count = 0
 
     # Dead-letter entries (most recent first, up to 5)
     dead_letter_entries: list[DeadLetterEntry] = []
     try:
-        dl_raw: list[Any] = cast(list[Any], client.xrevrange(DEAD_LETTER_STREAM, count=5))
+        dl_raw: list[Any] = redis.xrevrange(DEAD_LETTER_STREAM, count=5)
     except redis_lib.ResponseError:
         dl_raw = []
     for entry_id, fields in dl_raw:
@@ -156,11 +154,11 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         )
 
     # Active locks
-    lock_keys = list(client.scan_iter(match="lock:pr:*"))
+    lock_keys = redis.scan_iter(match="lock:pr:*")
     locks = []
     for key in lock_keys:
-        owner: str = cast(str | None, client.get(key)) or "(expired)"
-        ttl: int = cast(int, client.ttl(key))
+        owner: str = redis.get(key) or "(expired)"
+        ttl: int = redis.ttl(key)
         pr_num = key.removeprefix("lock:pr:")
         locks.append(LockInfo(pr=pr_num, owner=owner, ttl=ttl))
 
@@ -168,7 +166,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     consumer_groups = []
     for stream_key in sorted(task_streams):
         try:
-            for g in cast(list[Any], client.xinfo_groups(stream_key)):
+            for g in redis.xinfo_groups(stream_key):
                 consumer_groups.append(
                     ConsumerGroupInfo(
                         stream=stream_key,
@@ -183,7 +181,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Recent results (most recent first)
     recent_results = []
     try:
-        entries: list[Any] = cast(list[Any], client.xrevrange("results", count=max_results))
+        entries: list[Any] = redis.xrevrange("results", count=max_results)
     except redis_lib.ResponseError:
         entries = []
     for _entry_id, fields in entries:
@@ -204,12 +202,15 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
 
     # Attempt counters
     attempt_counts = {}
-    attempt_keys = list(client.scan_iter(match="pr:*:attempts"))
+    attempt_keys = redis.scan_iter(match="pr:*:*:attempts")
     for key in attempt_keys:
-        data: dict[str, str] = cast(dict[str, str], client.hgetall(key))
+        data: dict[str, str] = redis.hgetall(key)
         if data:
-            # Key format: "pr:<number>:attempts"
-            pr_num = key.removeprefix("pr:").removesuffix(":attempts")
+            # Key format: "pr:<repo>:<number>:attempts"
+            inner = key.removeprefix("pr:").removesuffix(":attempts")
+            # inner is "<repo>:<number>" — extract the PR number (last segment)
+            parts = inner.rsplit(":", 1)
+            pr_num = parts[-1] if parts else inner
             try:
                 attempt_counts[f"PR #{pr_num}"] = int(data.get("count", 0))
             except (ValueError, TypeError):
@@ -232,8 +233,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
 def discover_workers(redis: RedisClient) -> list[str]:
     """Return sorted list of worker IDs that have output streams."""
     try:
-        client = redis.client
-        streams = list(client.scan_iter(match="output:*"))
+        streams = redis.scan_iter(match="output:*")
         return sorted(s.removeprefix("output:") for s in streams)
     except (
         redis_lib.ConnectionError,

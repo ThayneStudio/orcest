@@ -156,7 +156,7 @@ def test_skip_locked_issue(issue_gh_mock, fake_redis_client, label_config):
         _make_issue_data(number=42, labels=[]),
     ]
     # Simulate a worker holding the lock
-    fake_redis_client.client.set(make_issue_lock_key(REPO, 42), "worker-1")
+    fake_redis_client.set_ex(make_issue_lock_key(REPO, 42), "worker-1", 86400)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -181,7 +181,7 @@ def test_skip_issue_with_pending_task(issue_gh_mock, fake_redis_client, label_co
         _make_issue_data(number=99, labels=[]),
     ]
     pending_key = make_pending_task_key(REPO, "issue", 99)
-    fake_redis_client.client.set(pending_key, "task-abc-123")
+    fake_redis_client.set_ex(pending_key, "task-abc-123", 86400)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -205,7 +205,7 @@ def test_skip_active_issue(issue_gh_mock, fake_redis_client, label_config):
     issue_gh_mock.return_value = [
         _make_issue_data(number=7, labels=[]),
     ]
-    increment_attempts(fake_redis_client, 7)  # count = 1
+    increment_attempts(fake_redis_client, REPO, 7)  # count = 1
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -226,7 +226,7 @@ def test_skip_max_attempts_reached(issue_gh_mock, fake_redis_client, label_confi
         _make_issue_data(number=8, labels=[]),
     ]
     for _ in range(3):
-        increment_attempts(fake_redis_client, 8)  # count = 3 (== max_attempts)
+        increment_attempts(fake_redis_client, REPO, 8)  # count = 3 (== max_attempts)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -247,7 +247,7 @@ def test_skip_max_attempts_exceeded(issue_gh_mock, fake_redis_client, label_conf
         _make_issue_data(number=9, labels=[]),
     ]
     for _ in range(5):
-        increment_attempts(fake_redis_client, 9)
+        increment_attempts(fake_redis_client, REPO, 9)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -275,7 +275,7 @@ def test_terminal_label_checked_before_lock(issue_gh_mock, fake_redis_client, la
         ),
     ]
     # Also set a lock — the label check should short-circuit first
-    fake_redis_client.client.set(make_issue_lock_key(REPO, 11), "worker-2")
+    fake_redis_client.set_ex(make_issue_lock_key(REPO, 11), "worker-2", 86400)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -292,9 +292,9 @@ def test_lock_checked_before_pending(issue_gh_mock, fake_redis_client, label_con
     issue_gh_mock.return_value = [
         _make_issue_data(number=12, labels=[]),
     ]
-    fake_redis_client.client.set(make_issue_lock_key(REPO, 12), "worker-3")
+    fake_redis_client.set_ex(make_issue_lock_key(REPO, 12), "worker-3", 86400)
     pending_key = make_pending_task_key(REPO, "issue", 12)
-    fake_redis_client.client.set(pending_key, "task-xyz")
+    fake_redis_client.set_ex(pending_key, "task-xyz", 86400)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -312,8 +312,8 @@ def test_pending_checked_before_attempts(issue_gh_mock, fake_redis_client, label
         _make_issue_data(number=13, labels=[]),
     ]
     pending_key = make_pending_task_key(REPO, "issue", 13)
-    fake_redis_client.client.set(pending_key, "task-pending")
-    increment_attempts(fake_redis_client, 13)  # count = 1 — would cause SKIP_ACTIVE
+    fake_redis_client.set_ex(pending_key, "task-pending", 86400)
+    increment_attempts(fake_redis_client, REPO, 13)  # count = 1 — would cause SKIP_ACTIVE
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -388,21 +388,21 @@ def test_issue_body_none_defaults_to_empty_string(issue_gh_mock, fake_redis_clie
 
 def test_get_attempt_count_zero_when_missing(fake_redis_client):
     """get_attempt_count returns 0 for an issue with no recorded attempts."""
-    assert get_attempt_count(fake_redis_client, 999) == 0
+    assert get_attempt_count(fake_redis_client, REPO, 999) == 0
 
 
 def test_increment_and_get_attempt_count(fake_redis_client):
     """increment_attempts increments the count; get_attempt_count reflects it."""
-    assert increment_attempts(fake_redis_client, 100) == 1
-    assert increment_attempts(fake_redis_client, 100) == 2
-    assert get_attempt_count(fake_redis_client, 100) == 2
+    assert increment_attempts(fake_redis_client, REPO, 100) == 1
+    assert increment_attempts(fake_redis_client, REPO, 100) == 2
+    assert get_attempt_count(fake_redis_client, REPO, 100) == 2
 
 
 def test_clear_attempts(fake_redis_client):
     """clear_attempts resets the counter to 0."""
-    increment_attempts(fake_redis_client, 200)
-    increment_attempts(fake_redis_client, 200)
-    assert get_attempt_count(fake_redis_client, 200) == 2
+    increment_attempts(fake_redis_client, REPO, 200)
+    increment_attempts(fake_redis_client, REPO, 200)
+    assert get_attempt_count(fake_redis_client, REPO, 200) == 2
 
-    clear_attempts(fake_redis_client, 200)
-    assert get_attempt_count(fake_redis_client, 200) == 0
+    clear_attempts(fake_redis_client, REPO, 200)
+    assert get_attempt_count(fake_redis_client, REPO, 200) == 0

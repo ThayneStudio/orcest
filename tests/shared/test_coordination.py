@@ -33,7 +33,7 @@ def test_release_by_owner_succeeds(fake_redis_client):
     lock.acquire()
 
     assert lock.release() is True
-    assert fake_redis_client.client.get("test-lock") is None
+    assert fake_redis_client.get("test-lock") is None
 
 
 def test_release_by_non_owner_fails(fake_redis_client):
@@ -44,7 +44,7 @@ def test_release_by_non_owner_fails(fake_redis_client):
     lock1.acquire()
     assert lock2.release() is False
     # Key should still exist, owned by lock1.
-    assert fake_redis_client.client.get("test-lock") == "owner-1"
+    assert fake_redis_client.get("test-lock") == "owner-1"
 
 
 def test_refresh_extends_ttl(fake_redis_client):
@@ -79,7 +79,7 @@ def test_acquire_sets_ttl(fake_redis_client):
     lock = RedisLock(fake_redis_client, "test-lock", ttl=300)
     lock.acquire()
 
-    ttl = fake_redis_client.client.ttl("test-lock")
+    ttl = fake_redis_client.ttl("test-lock")
     assert ttl > 0
 
 

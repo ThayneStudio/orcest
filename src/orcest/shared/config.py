@@ -20,6 +20,7 @@ class RedisConfig:
     password: str | None = None
     socket_timeout: int = 30
     socket_connect_timeout: int = 10
+    key_prefix: str = "orcest"
 
 
 @dataclass
@@ -169,6 +170,9 @@ def _build_redis_config(raw: dict[str, Any]) -> RedisConfig:
 
     socket_timeout_raw = redis_raw.get("socket_timeout", 30)
     socket_connect_timeout_raw = redis_raw.get("socket_connect_timeout", 10)
+    key_prefix = str(
+        os.environ.get("ORCEST_REDIS_KEY_PREFIX", redis_raw.get("key_prefix", "orcest"))
+    )
 
     return RedisConfig(
         host=str(host),
@@ -179,6 +183,7 @@ def _build_redis_config(raw: dict[str, Any]) -> RedisConfig:
         socket_connect_timeout=_safe_int(
             socket_connect_timeout_raw, "redis.socket_connect_timeout"
         ),
+        key_prefix=key_prefix,
     )
 
 

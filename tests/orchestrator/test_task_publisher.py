@@ -85,7 +85,8 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client):
 
     # Read all entries from the tasks stream
     default_runner = "claude"
-    entries = fake_redis_client.client.xrange(f"tasks:{default_runner}")
+    stream = fake_redis_client._prefixed(f"tasks:{default_runner}")
+    entries = fake_redis_client.client.xrange(stream)
     assert len(entries) >= 1
 
     # The last entry should match our task
@@ -580,7 +581,7 @@ def test_publish_fix_task_survives_comment_failure(
     assert isinstance(task, Task)
     assert task.resource_id == 300
     # Task should be in Redis despite comment failure
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert any(f["id"] == task.id for _, f in entries)
     # No labels are added by publish
     gh_mock.add_label.assert_not_called()
@@ -826,7 +827,7 @@ def test_publish_does_not_comment_even_if_gh_would_fail(
 
     # Task is still published to Redis
     assert isinstance(task, Task)
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert any(f["id"] == task.id for _, f in entries)
     # No comment was attempted
     gh_mock.post_comment.assert_not_called()
@@ -1110,7 +1111,7 @@ def test_publish_and_notify_skips_xadd_on_increment_failure(
         )
 
     # Task should NOT be published to Redis
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert not any(f["id"] == task.id for _, f in entries)
 
     # Error should be logged with skip rationale
@@ -1150,7 +1151,7 @@ def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
         )
 
     # Task should NOT be published to Redis
-    entries = fake_redis_client.client.xrange("tasks:issue:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:issue:claude"))
     assert not any(f["id"] == task.id for _, f in entries)
 
     # Error should be logged with skip rationale
@@ -1228,7 +1229,7 @@ def test_all_transient_failures_retrigger_ci_not_enqueue(gh_mock, fake_redis_cli
         "test-org/test-repo", 42001, "fake-token", failed_only=True
     )
     # Nothing should be in the tasks stream
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert len(entries) == 0
 
 
@@ -1251,7 +1252,7 @@ def test_all_transient_failures_does_not_increment_main_attempts(gh_mock, fake_r
     )
 
     # Main attempt counter must still be 0
-    assert get_attempt_count(fake_redis_client, 901, "abc123") == 0
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 901, "abc123") == 0
 
 
 def test_transient_retries_counted_separately(gh_mock, fake_redis_client):
@@ -1273,7 +1274,10 @@ def test_transient_retries_counted_separately(gh_mock, fake_redis_client):
             redis=fake_redis_client,
             default_runner="claude",
         )
-        assert get_transient_attempt_count(fake_redis_client, 902, "abc123") == expected_count
+        count = get_transient_attempt_count(
+            fake_redis_client, "test-org/test-repo", 902, "abc123"
+        )
+        assert count == expected_count
 
 
 def test_transient_budget_exhausted_falls_back_to_fix_task(gh_mock, fake_redis_client):
@@ -1298,7 +1302,7 @@ def test_transient_budget_exhausted_falls_back_to_fix_task(gh_mock, fake_redis_c
         )
 
     # Reset tasks stream so we can check the fallback enqueue
-    fake_redis_client.client.delete("tasks:claude")
+    fake_redis_client.delete("tasks:claude")
 
     result = publish_fix_task(
         pr_state=pr_state,
@@ -1311,7 +1315,7 @@ def test_transient_budget_exhausted_falls_back_to_fix_task(gh_mock, fake_redis_c
     # Now should return a Task (fallback to Claude)
     assert isinstance(result, Task)
     # And the task should be in the stream
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert len(entries) == 1
 
 
@@ -1356,7 +1360,7 @@ def test_mixed_failures_enqueue_fix_task(gh_mock, fake_redis_client):
     # rerun_workflow should NOT be called for mixed failures
     gh_mock.rerun_workflow.assert_not_called()
     # Task should be in the stream
-    entries = fake_redis_client.client.xrange("tasks:claude")
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert len(entries) == 1
 
 
@@ -1416,9 +1420,9 @@ def test_all_transient_graceful_on_rerun_failure(gh_mock, fake_redis_client):
     # Falls back to Claude fix task since no runs were re-triggered
     assert isinstance(result, Task)
     # Transient counter was still incremented
-    assert get_transient_attempt_count(fake_redis_client, 906, "abc123") == 1
+    assert get_transient_attempt_count(fake_redis_client, "test-org/test-repo", 906, "abc123") == 1
     # Task enqueued in stream
-    assert len(fake_redis_client.client.xrange("tasks:claude")) == 1
+    assert len(fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))) == 1
 
 
 def test_no_ci_failures_not_transient_path(gh_mock, fake_redis_client):

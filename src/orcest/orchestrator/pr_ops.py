@@ -11,7 +11,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import cast
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
@@ -73,19 +72,19 @@ class PRState:
     stale_run_ids: list[int] = field(default_factory=list)  # Run IDs of stale pending checks
 
 
-def _make_attempts_key(pr_number: int) -> str:
+def _make_attempts_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking task attempt count per PR."""
-    return f"pr:{pr_number}:attempts"
+    return f"pr:{repo}:{pr_number}:attempts"
 
 
-def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+def get_attempt_count(redis: RedisClient, repo: str, pr_number: int, head_sha: str) -> int:
     """Get the current attempt count for a PR.
 
     If the stored head SHA differs from the current one (new commits pushed),
     the counter is reset to 0.
     """
-    key = _make_attempts_key(pr_number)
-    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
+    key = _make_attempts_key(repo, pr_number)
+    data: dict[str, str] = redis.hgetall(key)
     if not data:
         return 0
     stored_sha = data.get("head_sha", "")
@@ -97,7 +96,7 @@ def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
         # the system is single-orchestrator by design, so the race cannot
         # occur in practice. A Lua script would provide atomicity if
         # multi-instance support is ever added.
-        redis.client.delete(key)
+        redis.delete(key)
         return 0
     try:
         return int(data.get("count", 0))
@@ -105,7 +104,7 @@ def get_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
         return 0
 
 
-def increment_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+def increment_attempts(redis: RedisClient, repo: str, pr_number: int, head_sha: str) -> int:
     """Increment and return the attempt count for a PR.
 
     If the stored head SHA differs from ``head_sha`` (new commits were
@@ -115,7 +114,7 @@ def increment_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int
     Sets a 7-day TTL on the key so closed/merged PR counters don't
     leak memory indefinitely.
     """
-    key = _make_attempts_key(pr_number)
+    key = _make_attempts_key(repo, pr_number)
 
     # Check for SHA mismatch *before* incrementing so the counter
     # resets correctly even if get_attempt_count was never called.
@@ -125,11 +124,11 @@ def increment_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int
     # intentional: the system is single-orchestrator by design, so the race
     # cannot occur in practice. A Lua script would provide atomicity if
     # multi-instance support is ever added.
-    stored_sha = redis.client.hget(key, "head_sha")
+    stored_sha = redis.hget(key, "head_sha")
     if stored_sha is not None and stored_sha != head_sha:
-        redis.client.delete(key)
+        redis.delete(key)
 
-    pipe = redis.client.pipeline(transaction=True)
+    pipe = redis.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
     pipe.hset(key, "head_sha", head_sha)
     pipe.expire(key, 7 * 24 * 3600)  # 7-day TTL
@@ -137,19 +136,19 @@ def increment_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int
     return results[0]  # new count
 
 
-def clear_attempts(redis: RedisClient, pr_number: int) -> None:
+def clear_attempts(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the attempt counter for a PR (e.g. on successful completion)."""
-    redis.client.delete(_make_attempts_key(pr_number))
+    redis.delete(_make_attempts_key(repo, pr_number))
 
 
-def _make_total_attempts_key(pr_number: int) -> str:
+def _make_total_attempts_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking total attempts across all SHAs."""
-    return f"pr:{pr_number}:total_attempts"
+    return f"pr:{repo}:{pr_number}:total_attempts"
 
 
-def get_total_attempt_count(redis: RedisClient, pr_number: int) -> int:
+def get_total_attempt_count(redis: RedisClient, repo: str, pr_number: int) -> int:
     """Get the total attempt count for a PR (across all SHAs)."""
-    val: str | None = cast(str | None, redis.client.get(_make_total_attempts_key(pr_number)))
+    val: str | None = redis.get(_make_total_attempts_key(repo, pr_number))
     if val is None:
         return 0
     try:
@@ -158,118 +157,122 @@ def get_total_attempt_count(redis: RedisClient, pr_number: int) -> int:
         return 0
 
 
-def increment_total_attempts(redis: RedisClient, pr_number: int) -> int:
+def increment_total_attempts(redis: RedisClient, repo: str, pr_number: int) -> int:
     """Increment the total attempt count for a PR. Returns the new count.
 
     Uses INCR + EXPIRE so the counter auto-cleans after 30 days.
     """
-    key = _make_total_attempts_key(pr_number)
-    pipe = redis.client.pipeline(transaction=True)
+    key = _make_total_attempts_key(repo, pr_number)
+    pipe = redis.pipeline(transaction=True)
     pipe.incr(key)
     pipe.expire(key, 30 * 24 * 3600)  # 30-day TTL
     results = pipe.execute()
     return results[0]
 
 
-def clear_total_attempts(redis: RedisClient, pr_number: int) -> None:
+def clear_total_attempts(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the total attempt counter for a PR (on successful completion)."""
-    redis.client.delete(_make_total_attempts_key(pr_number))
+    redis.delete(_make_total_attempts_key(repo, pr_number))
 
 
-def _make_exhausted_notified_key(pr_number: int) -> str:
+def _make_exhausted_notified_key(repo: str, pr_number: int) -> str:
     """Redis key tracking whether we've already notified humans of total-attempt exhaustion."""
-    return f"pr:{pr_number}:exhausted_notified"
+    return f"pr:{repo}:{pr_number}:exhausted_notified"
 
 
-def get_exhausted_notified(redis: RedisClient, pr_number: int) -> bool:
+def get_exhausted_notified(redis: RedisClient, repo: str, pr_number: int) -> bool:
     """Return True if we have already posted the exhausted-budget notification for this PR."""
-    return bool(redis.client.exists(_make_exhausted_notified_key(pr_number)))
+    return bool(redis.exists(_make_exhausted_notified_key(repo, pr_number)))
 
 
-def set_exhausted_notified(redis: RedisClient, pr_number: int) -> None:
+def set_exhausted_notified(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Record that the exhausted-budget notification was posted for this PR.
 
     Uses a 30-day TTL to match the total_attempts counter lifetime.
     """
-    redis.client.set(_make_exhausted_notified_key(pr_number), "1", ex=30 * 24 * 3600)
+    redis.set_ex(_make_exhausted_notified_key(repo, pr_number), "1", 30 * 24 * 3600)
 
 
-def clear_exhausted_notified(redis: RedisClient, pr_number: int) -> None:
+def clear_exhausted_notified(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the exhausted-budget notification flag (e.g. when human approves a retry)."""
-    redis.client.delete(_make_exhausted_notified_key(pr_number))
+    redis.delete(_make_exhausted_notified_key(repo, pr_number))
 
 
-def _make_review_retrigger_key(pr_number: int) -> str:
+def _make_review_retrigger_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking review re-trigger attempts per PR."""
-    return f"pr:{pr_number}:review_retrigger"
+    return f"pr:{repo}:{pr_number}:review_retrigger"
 
 
-def get_review_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
+def get_review_retrigger_sha(redis: RedisClient, repo: str, pr_number: int) -> str | None:
     """Get the SHA that was already re-triggered for review, or None."""
-    val: str | None = cast(str | None, redis.client.get(_make_review_retrigger_key(pr_number)))
+    val: str | None = redis.get(_make_review_retrigger_key(repo, pr_number))
     return val
 
 
-def set_review_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str) -> None:
+def set_review_retrigger_sha(redis: RedisClient, repo: str, pr_number: int, head_sha: str) -> None:
     """Record that we re-triggered review for this SHA. Expires in 7 days."""
-    redis.client.set(_make_review_retrigger_key(pr_number), head_sha, ex=7 * 24 * 3600)
+    redis.set_ex(_make_review_retrigger_key(repo, pr_number), head_sha, 7 * 24 * 3600)
 
 
-def clear_review_retrigger(redis: RedisClient, pr_number: int) -> None:
+def clear_review_retrigger(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the review re-trigger marker for a PR."""
-    redis.client.delete(_make_review_retrigger_key(pr_number))
+    redis.delete(_make_review_retrigger_key(repo, pr_number))
 
 
-def _make_stale_retrigger_key(pr_number: int) -> str:
+def _make_stale_retrigger_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking stale-check re-trigger per PR."""
-    return f"pr:{pr_number}:stale_retrigger"
+    return f"pr:{repo}:{pr_number}:stale_retrigger"
 
 
-def get_stale_retrigger_sha(redis: RedisClient, pr_number: int) -> str | None:
+def get_stale_retrigger_sha(redis: RedisClient, repo: str, pr_number: int) -> str | None:
     """Get the SHA for which stale checks were already re-triggered, or None."""
-    val: str | None = cast(str | None, redis.client.get(_make_stale_retrigger_key(pr_number)))
+    val: str | None = redis.get(_make_stale_retrigger_key(repo, pr_number))
     return val
 
 
-def set_stale_retrigger_sha(redis: RedisClient, pr_number: int, head_sha: str, ex: int) -> None:
+def set_stale_retrigger_sha(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str, ex: int
+) -> None:
     """Record that we re-triggered stale checks for this SHA. Expires after ``ex`` seconds."""
-    redis.client.set(_make_stale_retrigger_key(pr_number), head_sha, ex=ex)
+    redis.set_ex(_make_stale_retrigger_key(repo, pr_number), head_sha, ex)
 
 
-def _make_usage_cooldown_key(pr_number: int) -> str:
+def _make_usage_cooldown_key(repo: str, pr_number: int) -> str:
     """Redis key for the USAGE_EXHAUSTED cooldown marker."""
-    return f"pr:{pr_number}:usage_cooldown"
+    return f"pr:{repo}:{pr_number}:usage_cooldown"
 
 
 def set_usage_exhausted_cooldown(
-    redis: RedisClient, pr_number: int, ttl_seconds: int = 1800
+    redis: RedisClient, repo: str, pr_number: int, ttl_seconds: int = 1800
 ) -> None:
     """Set a cooldown marker so the PR is not immediately re-enqueued after USAGE_EXHAUSTED.
 
     The key expires after ``ttl_seconds`` (default 30 minutes), at which point
     the next poll cycle will pick the PR up again.
     """
-    redis.client.set(_make_usage_cooldown_key(pr_number), "1", ex=ttl_seconds)
+    redis.set_ex(_make_usage_cooldown_key(repo, pr_number), "1", ttl_seconds)
 
 
-def has_usage_exhausted_cooldown(redis: RedisClient, pr_number: int) -> bool:
+def has_usage_exhausted_cooldown(redis: RedisClient, repo: str, pr_number: int) -> bool:
     """Return True if a USAGE_EXHAUSTED cooldown is still active for this PR."""
-    return bool(redis.client.exists(_make_usage_cooldown_key(pr_number)))
+    return bool(redis.exists(_make_usage_cooldown_key(repo, pr_number)))
 
 
-def _make_transient_attempts_key(pr_number: int) -> str:
+def _make_transient_attempts_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking transient CI retry count per PR."""
-    return f"pr:{pr_number}:transient_attempts"
+    return f"pr:{repo}:{pr_number}:transient_attempts"
 
 
-def get_transient_attempt_count(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+def get_transient_attempt_count(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> int:
     """Get the transient CI retry count for a PR.
 
     Resets to 0 when the head SHA changes (new commits pushed), so the
     transient budget is per-SHA just like the main attempt counter.
     """
-    key = _make_transient_attempts_key(pr_number)
-    data: dict[str, str] = cast(dict[str, str], redis.client.hgetall(key))
+    key = _make_transient_attempts_key(repo, pr_number)
+    data: dict[str, str] = redis.hgetall(key)
     if not data:
         return 0
     stored_sha = data.get("head_sha", "")
@@ -281,25 +284,27 @@ def get_transient_attempt_count(redis: RedisClient, pr_number: int, head_sha: st
         return 0
 
 
-def increment_transient_attempts(redis: RedisClient, pr_number: int, head_sha: str) -> int:
+def increment_transient_attempts(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> int:
     """Increment and return the transient CI retry count for a PR.
 
     Resets to 1 if the stored head SHA differs from head_sha (new commits).
     Sets a 7-day TTL on the key so closed/merged PR counters don't leak.
     """
-    key = _make_transient_attempts_key(pr_number)
+    key = _make_transient_attempts_key(repo, pr_number)
     # The hget + conditional delete are intentionally outside the pipeline/transaction:
     # the orchestrator is a single instance, so there is no concurrent writer that
     # could race between this delete and the pipeline execute below.  Moving the
     # delete inside the pipeline would require a Lua script to make the
     # read-then-conditional-delete atomic; that complexity isn't warranted here.
-    stored_sha = redis.client.hget(key, "head_sha")
+    stored_sha = redis.hget(key, "head_sha")
     if stored_sha is not None and stored_sha != head_sha:
-        redis.client.delete(key)
+        redis.delete(key)
     # pipeline(transaction=True) maps to a Redis MULTI/EXEC block: all three
     # commands execute atomically — either all succeed or none do.  There is no
     # risk of the counter being incremented while head_sha is left stale.
-    pipe = redis.client.pipeline(transaction=True)
+    pipe = redis.pipeline(transaction=True)
     pipe.hincrby(key, "count", 1)
     pipe.hset(key, "head_sha", head_sha)
     pipe.expire(key, 7 * 24 * 3600)  # 7-day TTL
@@ -447,8 +452,9 @@ def discover_actionable_prs(
             # while the needs-human label is present and the flag is set. Without this,
             # the 30-day TTL can expire before the operator removes the label, causing the
             # recovery branch to silently miss and the circuit breaker to re-fire instead.
-            if label_config.needs_human in pr_labels and get_exhausted_notified(redis, number):
-                set_exhausted_notified(redis, number)
+            has_notified = get_exhausted_notified(redis, repo, number)
+            if label_config.needs_human in pr_labels and has_notified:
+                set_exhausted_notified(redis, repo, number)
             results.append(
                 PRState(
                     number=number,
@@ -466,7 +472,7 @@ def discover_actionable_prs(
 
         # Skip if locked in Redis
         lock_key = make_pr_lock_key(repo, number)
-        if redis.client.exists(lock_key):
+        if redis.exists(lock_key):
             results.append(
                 PRState(
                     number=number,
@@ -484,7 +490,7 @@ def discover_actionable_prs(
 
         # Skip if a task for this PR is already pending in the queue
         pending_key = make_pending_task_key(repo, "pr", number)
-        if redis.client.exists(pending_key):
+        if redis.exists(pending_key):
             results.append(
                 PRState(
                     number=number,
@@ -515,9 +521,9 @@ def discover_actionable_prs(
         # TTL cliff prevention: exhausted_notified has a 30-day TTL. The SKIP_LABELED
         # block above refreshes the flag on every poll while the needs-human label is
         # present, so the flag stays live as long as the label is there.
-        total_attempts = get_total_attempt_count(redis, number)
+        total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, number):
+            if get_exhausted_notified(redis, repo, number):
                 # exhausted_notified is set and needs-human label is absent (inferred
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
                 # The three deletes are intentionally non-atomic. A crash between steps
@@ -532,9 +538,9 @@ def discover_actionable_prs(
                 #     is a harmless orphan — normal processing proceeds.
                 # clear_exhausted_notified is last so its removal is the final
                 # confirmation that the full reset succeeded.
-                clear_total_attempts(redis, number)
-                clear_attempts(redis, number)
-                clear_exhausted_notified(redis, number)
+                clear_total_attempts(redis, repo, number)
+                clear_attempts(redis, repo, number)
+                clear_exhausted_notified(redis, repo, number)
                 logger.info(
                     "PR #%d: exhausted_notified set and needs-human label absent"
                     " (inferred via SKIP_LABELED invariant);"
@@ -566,7 +572,7 @@ def discover_actionable_prs(
         # This is intentional — USAGE_EXHAUSTED is account-level, so new commits
         # don't help. If new commits should bypass the cooldown (e.g. urgent
         # hotfixes), a SHA comparison would be needed here.
-        if has_usage_exhausted_cooldown(redis, number):
+        if has_usage_exhausted_cooldown(redis, repo, number):
             results.append(
                 PRState(
                     number=number,
@@ -584,7 +590,7 @@ def discover_actionable_prs(
 
         # Skip if previously attempted on this SHA (awaiting new commits)
         # or max attempts reached.
-        attempt_count = get_attempt_count(redis, number, head_sha)
+        attempt_count = get_attempt_count(redis, repo, number, head_sha)
         if attempt_count >= max_attempts:
             results.append(
                 PRState(
@@ -891,7 +897,7 @@ def discover_actionable_prs(
                 # Check if claude-review passed but didn't submit a formal
                 # review — if so, re-trigger once per SHA.
                 review_run_id = _get_claude_review_run_id(checks)
-                retrigger_sha = get_review_retrigger_sha(redis, number)
+                retrigger_sha = get_review_retrigger_sha(redis, repo, number)
 
                 if review_run_id is not None and retrigger_sha != head_sha:
                     # claude-review passed but no formal review — re-trigger

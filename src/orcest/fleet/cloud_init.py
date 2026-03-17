@@ -80,11 +80,11 @@ def _orchestrator_runcmd() -> list[str]:
         "apt-get update -qq",
         "apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin",
         "usermod -aG docker orcest",
-        # Open firewall port range 6379-6399 for Redis if ufw is active
+        # Open firewall port 6379 for Redis if ufw is active
         (
             "if command -v ufw >/dev/null 2>&1"
             " && sudo ufw status 2>/dev/null | grep -q 'Status: active';"
-            " then sudo ufw allow 6379:6399/tcp; fi"
+            " then sudo ufw allow 6379/tcp; fi"
         ),
     ]
 
@@ -92,7 +92,7 @@ def _orchestrator_runcmd() -> list[str]:
 def render_worker_userdata(
     *,
     redis_host: str,
-    redis_port: int = 6379,
+    key_prefix: str,
     worker_id: str,
     github_token: str,
     claude_oauth_token: str,
@@ -112,7 +112,7 @@ def render_worker_userdata(
 
     Args:
         redis_host: Orchestrator Redis host (IP or hostname).
-        redis_port: Orchestrator Redis port.
+        key_prefix: Redis key prefix for namespace isolation.
         worker_id: Unique worker identifier (used in heartbeats).
         github_token: GitHub token for gh CLI and orcest.
         claude_oauth_token: Claude Code OAuth token from ``claude setup-token``.
@@ -121,7 +121,7 @@ def render_worker_userdata(
     """
     worker_yaml = yaml.dump(
         {
-            "redis": {"host": redis_host, "port": redis_port},
+            "redis": {"host": redis_host, "port": 6379, "key_prefix": key_prefix},
             "worker_id": worker_id,
             "workspace_dir": "/opt/orcest/workspaces",
             "backend": "claude",
