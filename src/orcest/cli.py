@@ -460,17 +460,47 @@ def init():
         except (json.JSONDecodeError, KeyError) as exc:
             console.print(f"[yellow]failed to parse response: {exc}[/yellow]")
 
-    # Step 5: Read SSH public key
-    console.print("  Reading SSH public key...", end=" ")
+    # Step 5: Ensure SSH key exists (generate if needed) and authorize for local access
     home = Path(os.path.expanduser("~"))
-    for key_name in ("id_ed25519.pub", "id_rsa.pub"):
-        key_path = home / ".ssh" / key_name
-        if key_path.exists():
-            ssh_key = key_path.read_text().strip()
-            console.print(f"[green]{key_name}[/green]")
+    ssh_dir = home / ".ssh"
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+
+    console.print("  SSH key...", end=" ")
+    key_path = None
+    for key_name in ("id_ed25519", "id_rsa"):
+        if (ssh_dir / f"{key_name}.pub").exists():
+            key_path = ssh_dir / key_name
+            console.print(f"[green]found {key_name}[/green]")
             break
+
+    if key_path is None:
+        console.print("[yellow]not found, generating...[/yellow]", end=" ")
+        key_path = ssh_dir / "id_ed25519"
+        result = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]failed: {result.stderr.strip()}[/red]")
+        else:
+            console.print("[green]generated id_ed25519[/green]")
+
+    pub_path = Path(f"{key_path}.pub")
+    if pub_path.exists():
+        ssh_key = pub_path.read_text().strip()
+
+        # Authorize for local SSH (needed by Terraform bpg/proxmox provider)
+        authorized_keys = ssh_dir / "authorized_keys"
+        existing = authorized_keys.read_text() if authorized_keys.exists() else ""
+        if ssh_key not in existing:
+            console.print("  Authorizing key for local SSH...", end=" ")
+            with open(authorized_keys, "a") as f:
+                f.write(f"{ssh_key}\n")
+            authorized_keys.chmod(0o600)
+            console.print("[green]ok[/green]")
     else:
-        console.print("[yellow]not found (check ~/.ssh/)[/yellow]")
+        console.print("  [red]No public key found — SSH setup incomplete.[/red]")
 
     # Step 6: Write config
     console.print("  Writing config...", end=" ")
