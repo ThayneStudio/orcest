@@ -631,13 +631,23 @@ def upgrade():
     terraform_dest = DEFAULT_CONFIG_DIR / "terraform"
     if terraform_dest.is_dir():
         console.print("  Updating Terraform templates...", end=" ")
-        # Re-import to get the freshly installed package path
-        import importlib
+        # Use pip show to find the installed package location (importlib.reload
+        # may not pick up the new path after force-reinstall).
+        loc_result = subprocess.run(
+            [str(pip), "show", "orcest"],
+            capture_output=True,
+            text=True,
+        )
+        pkg_location = None
+        for line in loc_result.stdout.splitlines():
+            if line.startswith("Location:"):
+                pkg_location = Path(line.split(":", 1)[1].strip())
+                break
 
-        import orcest.fleet
-        importlib.reload(orcest.fleet)
-        terraform_src = Path(orcest.fleet.__file__).parent / "terraform"
-        if terraform_src.is_dir():
+        terraform_src = None
+        if pkg_location:
+            terraform_src = pkg_location / "orcest" / "fleet" / "terraform"
+        if terraform_src and terraform_src.is_dir():
             for hcl_file in terraform_src.iterdir():
                 if hcl_file.is_file():
                     shutil.copy2(hcl_file, terraform_dest / hcl_file.name)
