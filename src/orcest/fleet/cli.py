@@ -22,6 +22,23 @@ from orcest.fleet.config import DEFAULT_CONFIG_PATH
 _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
 
+def _next_free_vmid() -> int | None:
+    """Query Proxmox for the next available VM ID, or return None."""
+    import json
+
+    try:
+        result = subprocess.run(
+            ["pvesh", "get", "/cluster/nextid", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return int(json.loads(result.stdout))
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        pass
+    return None
+
+
 def _validate_project_name(name: str) -> None:
     """Validate project name, exit on failure."""
     from orcest.fleet.config import require_valid_project_name
@@ -141,20 +158,27 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
 
 
 @fleet.command("create-orchestrator")
+@click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the orchestrator.")
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def create_orchestrator(config: str) -> None:
+def create_orchestrator(vm_id: int | None, config: str) -> None:
     """Create the orchestrator VM via Terraform and deploy the Docker stack."""
     from orcest.fleet.config import load_config, save_config
 
     console = Console()
     cfg = load_config(config)
 
-    console.print("\n[bold]Creating orchestrator VM[/bold]\n")
+    # Prompt for VM ID
+    if vm_id is None:
+        default_id = _next_free_vmid() or cfg.orchestrator.vm_id
+        vm_id = click.prompt("  VM ID for orchestrator", default=default_id, type=int)
+    cfg.orchestrator.vm_id = vm_id
+
+    console.print(f"\n[bold]Creating orchestrator VM (ID {vm_id})[/bold]\n")
 
     # Step 1: Generate and write tfvars
     console.print("  Generating Terraform variables...", end=" ")
@@ -246,13 +270,14 @@ def create_orchestrator(config: str) -> None:
 @fleet.command()
 @click.argument("repo")
 @click.option("--name", default=None, help="Project name (default: derived from repo).")
+@click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the worker.")
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def onboard(repo: str, name: str | None, config: str) -> None:
+def onboard(repo: str, name: str | None, vm_id: int | None, config: str) -> None:
     """Onboard a new repo: deploy orchestrator stack + create worker VM(s).
 
     REPO is in "owner/repo" format (e.g. ThayneStudio/my-project).
@@ -293,11 +318,17 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print(f"[red]Project '{project_name}' already exists in fleet config.[/red]")
         sys.exit(1)
 
+    # Prompt for worker VM ID
+    if vm_id is None:
+        default_id = _next_free_vmid() or 200
+        vm_id = click.prompt("  VM ID for worker", default=default_id, type=int)
+
     # Add project to config
     project = ProjectEntry(
         name=project_name,
         repo=repo,
         workers=1,
+        worker_vm_ids=[vm_id],
     )
     cfg.projects.append(project)
 
@@ -378,13 +409,14 @@ def onboard(repo: str, name: str | None, config: str) -> None:
 
 @fleet.command("add-worker")
 @click.argument("project_name")
+@click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the new worker.")
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def add_worker(project_name: str, config: str) -> None:
+def add_worker(project_name: str, vm_id: int | None, config: str) -> None:
     """Add a worker VM to an existing project.
 
     Increments the worker count for PROJECT_NAME and applies Terraform
@@ -400,11 +432,17 @@ def add_worker(project_name: str, config: str) -> None:
         console.print(f"[red]Project '{project_name}' not found in fleet config.[/red]")
         sys.exit(1)
 
+    # Prompt for VM ID
+    if vm_id is None:
+        default_id = _next_free_vmid() or 200
+        vm_id = click.prompt("  VM ID for new worker", default=default_id, type=int)
+
     old_count = project.workers
     project.workers += 1
+    project.worker_vm_ids.append(vm_id)
 
     console.print(f"\n[bold]Adding worker to '{project_name}'[/bold]")
-    console.print(f"  Workers: {old_count} -> {project.workers}")
+    console.print(f"  Workers: {old_count} -> {project.workers} (VM ID {vm_id})")
 
     # Generate tfvars and apply Terraform
     console.print("  Applying Terraform...")
@@ -418,6 +456,7 @@ def add_worker(project_name: str, config: str) -> None:
     except Exception as exc:
         console.print(f"  Terraform apply [red]failed[/red]: {exc}")
         project.workers = old_count  # rollback
+        project.worker_vm_ids.pop()
         sys.exit(1)
 
     save_config(cfg, config)

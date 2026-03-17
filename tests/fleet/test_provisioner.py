@@ -55,19 +55,19 @@ class TestGenerateTfvars:
 
     def test_single_project_one_worker(self):
         cfg = _cfg(
-            projects=[ProjectEntry(name="alpha", repo="Org/alpha", workers=1)],
+            projects=[ProjectEntry(name="alpha", repo="Org/alpha", workers=1, worker_vm_ids=[200])],
         )
         tfvars = generate_tfvars(cfg)
 
         assert len(tfvars["workers"]) == 1
         w = tfvars["workers"]["alpha-0"]
-        assert w["vm_id"] == 200  # orchestrator.vm_id + 1
+        assert w["vm_id"] == 200
         assert w["project_name"] == "alpha"
         assert "cloud_init_content" in w
 
     def test_multiple_workers_per_project(self):
         cfg = _cfg(
-            projects=[ProjectEntry(name="alpha", repo="Org/alpha", workers=3)],
+            projects=[ProjectEntry(name="alpha", repo="Org/alpha", workers=3, worker_vm_ids=[200, 201, 202])],
         )
         tfvars = generate_tfvars(cfg)
 
@@ -78,8 +78,8 @@ class TestGenerateTfvars:
     def test_multiple_projects(self):
         cfg = _cfg(
             projects=[
-                ProjectEntry(name="alpha", repo="Org/alpha", workers=2),
-                ProjectEntry(name="beta", repo="Org/beta", workers=1),
+                ProjectEntry(name="alpha", repo="Org/alpha", workers=2, worker_vm_ids=[200, 201]),
+                ProjectEntry(name="beta", repo="Org/beta", workers=1, worker_vm_ids=[202]),
             ],
         )
         tfvars = generate_tfvars(cfg)
@@ -96,6 +96,7 @@ class TestGenerateTfvars:
                     name="heavy",
                     repo="Org/heavy",
                     workers=1,
+                    worker_vm_ids=[200],
                     worker_memory=32768,
                     worker_cores=16,
                     worker_disk_size=100,
@@ -111,7 +112,7 @@ class TestGenerateTfvars:
     def test_default_worker_specs(self):
         cfg = _cfg(
             projects=[
-                ProjectEntry(name="default", repo="Org/default", workers=1),
+                ProjectEntry(name="default", repo="Org/default", workers=1, worker_vm_ids=[200]),
             ],
         )
         tfvars = generate_tfvars(cfg)
