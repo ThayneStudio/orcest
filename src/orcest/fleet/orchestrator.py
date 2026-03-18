@@ -19,11 +19,20 @@ from orcest.fleet.config import require_valid_project_name as _validate_project_
 logger = logging.getLogger(__name__)
 
 
+_SSH_OPTS = [
+    "-o", "ConnectTimeout=5",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "BatchMode=yes",
+    "-o", "LogLevel=ERROR",
+]
+
+
 def _ssh(ssh_target: str, cmd: str) -> subprocess.CompletedProcess[str]:
     """Run a command on the orchestrator VM via SSH."""
     logger.debug("ssh %s: %s", ssh_target, cmd)
     return subprocess.run(
-        ["ssh", ssh_target, cmd],
+        ["ssh", *_SSH_OPTS, ssh_target, cmd],
         capture_output=True,
         text=True,
     )
@@ -33,7 +42,7 @@ def _scp(src: str, dest_target: str, dest_path: str) -> subprocess.CompletedProc
     """Copy a local file to the orchestrator VM via SCP."""
     logger.debug("scp %s -> %s:%s", src, dest_target, dest_path)
     return subprocess.run(
-        ["scp", src, f"{dest_target}:{dest_path}"],
+        ["scp", *_SSH_OPTS, src, f"{dest_target}:{dest_path}"],
         capture_output=True,
         text=True,
     )
