@@ -1023,6 +1023,108 @@ class TestRunWorker:
         ]
         assert len(dl_calls) == 0
 
+    def test_ephemeral_worker_exits_after_one_task(self, mocker, worker_config, sample_task):
+        """When ephemeral=True, the worker processes one task and exits without
+        needing a SIGTERM signal."""
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+
+        task_fields = sample_task.to_dict()
+        normal_call_count = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal normal_call_count
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            if normal_call_count == 1:
+                return [("entry-1", task_fields)]
+            # Should never reach here in ephemeral mode
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner was called exactly once
+        mocks["runner"].run.assert_called_once()
+        # Result was published
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        # pool:done key was set in Redis
+        mock_redis.set_ex.assert_called_once_with(
+            f"pool:done:{worker_config.worker_id}", "1", ttl=300
+        )
+        # Only one task read from the stream (no second xreadgroup for normal tasks)
+        assert normal_call_count == 1
+
+    def test_ephemeral_worker_sets_pool_done_key(self, mocker, worker_config, sample_task):
+        """Ephemeral worker sets pool:done:{worker_id} with TTL 300 on exit."""
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+
+        task_fields = sample_task.to_dict()
+
+        def xreadgroup_side_effect(**kwargs):
+            if kwargs.get("pending", False):
+                return []
+            return [("entry-1", task_fields)]
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        mock_redis.set_ex.assert_called_once_with(
+            f"pool:done:{worker_config.worker_id}", "1", ttl=300
+        )
+
+    def test_ephemeral_worker_survives_pool_done_key_failure(
+        self, mocker, worker_config, sample_task, caplog
+    ):
+        """When set_ex for pool:done fails, the worker still exits gracefully."""
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        mock_redis.set_ex.side_effect = ConnectionError("Redis unavailable")
+
+        task_fields = sample_task.to_dict()
+
+        def xreadgroup_side_effect(**kwargs):
+            if kwargs.get("pending", False):
+                return []
+            return [("entry-1", task_fields)]
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        with caplog.at_level(logging.WARNING):
+            run_worker(worker_config)
+
+        # Worker still exited (runner was called once, no hang)
+        mocks["runner"].run.assert_called_once()
+
+    def test_non_ephemeral_worker_continues_looping(self, mocker, worker_config, sample_task):
+        """Default (non-ephemeral) worker does NOT exit after one task and
+        does NOT set pool:done key."""
+        assert not worker_config.ephemeral  # sanity: default is False
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner was called (task processed)
+        mocks["runner"].run.assert_called_once()
+        # pool:done key must NOT have been set
+        mock_redis.set_ex.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dead_letter_task helper

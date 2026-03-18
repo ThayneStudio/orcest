@@ -172,6 +172,28 @@ def ensure_redis_stack(ssh_target: str) -> None:
     logger.info("Shared Redis stack running on %s", ssh_target)
 
 
+def ensure_pool_manager(ssh_target: str, fleet_config_path: str = "/etc/orcest/fleet.yaml") -> None:
+    """Ensure the pool manager stack is running.
+
+    Starts (or updates) the pool manager service from docker-compose.pool.yml.
+    Requires the Redis stack to be running first.
+    """
+    logger.info("Ensuring pool manager on %s", ssh_target)
+    result = _ssh(
+        ssh_target,
+        f"cd /opt/orcest && FLEET_CONFIG={fleet_config_path} docker compose"
+        " -f docker-compose.pool.yml"
+        " -p orcest-pool"
+        " up -d",
+    )
+    if result.returncode != 0:
+        logger.error("Pool manager failed: %s", result.stderr.strip())
+        raise RuntimeError(
+            f"Failed to start pool manager: {result.stderr.strip()}"
+        )
+    logger.info("Pool manager running on %s", ssh_target)
+
+
 def deploy_stack(ssh_target: str, project_name: str) -> None:
     """Start/update a per-project Docker Compose stack.
 

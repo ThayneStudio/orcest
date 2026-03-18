@@ -1,0 +1,262 @@
+"""Proxmox REST API client for VM lifecycle operations.
+
+Thin wrapper around the ``proxmoxer`` library, focused on the subset of
+Proxmox VE operations needed by the orcest pool manager: cloning templates,
+starting/stopping/destroying VMs, and querying guest-agent networking.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from proxmoxer import ProxmoxAPI
+
+logger = logging.getLogger(__name__)
+
+
+def parse_vm_ip(interfaces: list[dict]) -> str | None:
+    """Extract the first non-loopback IPv4 address from guest-agent interface data.
+
+    The *interfaces* list comes from the Proxmox
+    ``/agent/network-get-interfaces`` endpoint and looks like::
+
+        [
+            {"name": "lo", "ip-addresses": [{"ip-address": "127.0.0.1", ...}]},
+            {"name": "eth0", "ip-addresses": [
+                {"ip-address": "10.20.0.50", "ip-address-type": "ipv4", ...},
+                {"ip-address": "fe80::1", "ip-address-type": "ipv6", ...},
+            ]},
+        ]
+
+    Returns the first non-loopback IPv4 address found, or ``None``.
+    """
+    for iface in interfaces:
+        if iface.get("name") == "lo":
+            continue
+        for addr in iface.get("ip-addresses", []):
+            if addr.get("ip-address-type") == "ipv4":
+                ip = addr.get("ip-address")
+                if ip and ip != "127.0.0.1":
+                    return ip
+    return None
+
+
+class ProxmoxClient:
+    """Client for Proxmox VE REST API operations.
+
+    Uses ``proxmoxer`` with token-based authentication. All VM operations
+    target a single Proxmox node.
+
+    Args:
+        endpoint: Proxmox API URL (e.g. ``https://10.20.0.1:8006``).
+        token_id: API token ID (e.g. ``root@pam!orcest``).
+        token_secret: API token secret.
+        node: Proxmox node name (e.g. ``pve``).
+        verify_ssl: Whether to verify SSL certificates. ``False`` for self-signed certs.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        token_id: str,
+        token_secret: str,
+        node: str,
+        verify_ssl: bool = False,
+    ) -> None:
+        # Parse host and port from endpoint URL
+        # e.g. "https://10.20.0.1:8006" -> host="10.20.0.1", port=8006
+        from urllib.parse import urlparse
+
+        parsed = urlparse(endpoint)
+        host = parsed.hostname or endpoint
+        port = parsed.port or 8006
+
+        # Split token_id into user and token name
+        # e.g. "root@pam!orcest" -> user="root@pam", token_name="orcest"
+        if "!" in token_id:
+            user, token_name = token_id.split("!", 1)
+        else:
+            user = token_id
+            token_name = ""
+
+        self._api = ProxmoxAPI(
+            host,
+            port=port,
+            user=user,
+            token_name=token_name,
+            token_value=token_secret,
+            verify_ssl=verify_ssl,
+            backend="https",
+        )
+        self._node = node
+
+    def clone_vm(
+        self,
+        template_id: int,
+        new_id: int,
+        name: str,
+        storage: str,
+        linked: bool = True,
+    ) -> str:
+        """Clone a VM from a template.
+
+        Args:
+            template_id: VM ID of the template to clone from.
+            new_id: VM ID for the new clone.
+            name: Name for the new VM.
+            storage: Target storage for the clone.
+            linked: If True, create a linked clone (faster, less disk). Otherwise full clone.
+
+        Returns:
+            The Proxmox task UPID string.
+        """
+        logger.info(
+            "Cloning VM %d -> %d (name=%s, storage=%s, linked=%s)",
+            template_id, new_id, name, storage, linked,
+        )
+        upid = (
+            self._api.nodes(self._node)
+            .qemu(template_id)
+            .clone.post(
+                newid=new_id,
+                name=name,
+                target=storage,
+                full=0 if linked else 1,
+            )
+        )
+        self.wait_for_task(upid)
+        return upid
+
+    def start_vm(self, vm_id: int) -> None:
+        """Start a VM.
+
+        Args:
+            vm_id: The VM ID to start.
+        """
+        logger.info("Starting VM %d", vm_id)
+        self._api.nodes(self._node).qemu(vm_id).status.start.post()
+
+    def stop_vm(self, vm_id: int) -> None:
+        """Stop a VM.
+
+        Args:
+            vm_id: The VM ID to stop.
+        """
+        logger.info("Stopping VM %d", vm_id)
+        self._api.nodes(self._node).qemu(vm_id).status.stop.post()
+
+    def destroy_vm(self, vm_id: int, purge: bool = True) -> None:
+        """Destroy a VM and optionally purge its disks.
+
+        Args:
+            vm_id: The VM ID to destroy.
+            purge: If True, also remove disks and any related resources.
+        """
+        logger.info("Destroying VM %d (purge=%s)", vm_id, purge)
+        self._api.nodes(self._node).qemu(vm_id).delete(purge=1 if purge else 0)
+
+    def get_vm_status(self, vm_id: int) -> str:
+        """Get the current status of a VM.
+
+        Args:
+            vm_id: The VM ID to query.
+
+        Returns:
+            Status string (e.g. ``"running"``, ``"stopped"``).
+        """
+        result = self._api.nodes(self._node).qemu(vm_id).status.current.get()
+        return result["status"]
+
+    def get_vm_ip(self, vm_id: int, timeout: int = 120) -> str | None:
+        """Get the VM's IP address via the QEMU guest agent.
+
+        Polls the guest agent until a non-loopback IPv4 address is found
+        or the timeout expires. The guest agent typically takes a few seconds
+        to become available after VM boot.
+
+        Args:
+            vm_id: The VM ID to query.
+            timeout: Maximum seconds to wait for an IP address.
+
+        Returns:
+            The first non-loopback IPv4 address, or ``None`` on timeout.
+        """
+        logger.info("Waiting for VM %d IP address (timeout=%ds)", vm_id, timeout)
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            try:
+                result = (
+                    self._api.nodes(self._node)
+                    .qemu(vm_id)
+                    .agent("network-get-interfaces")
+                    .get()
+                )
+                interfaces = result.get("result", [])
+                ip = parse_vm_ip(interfaces)
+                if ip is not None:
+                    logger.info("VM %d has IP %s", vm_id, ip)
+                    return ip
+            except Exception:
+                # Guest agent not ready yet — keep polling
+                pass
+
+            time.sleep(2)
+
+        logger.warning("Timed out waiting for VM %d IP address", vm_id)
+        return None
+
+    def next_free_vmid(self) -> int:
+        """Get the next available VM ID from the cluster.
+
+        Returns:
+            The next free VM ID as an integer.
+        """
+        vmid = self._api.cluster.nextid.get()
+        return int(vmid)
+
+    def convert_to_template(self, vm_id: int) -> None:
+        """Convert a VM to a template.
+
+        Args:
+            vm_id: The VM ID to convert.
+        """
+        logger.info("Converting VM %d to template", vm_id)
+        upid = self._api.nodes(self._node).qemu(vm_id).template.post()
+        if upid:
+            self.wait_for_task(upid)
+
+    def wait_for_task(self, upid: str, timeout: int = 300) -> bool:
+        """Poll a Proxmox task until it completes.
+
+        Args:
+            upid: The Proxmox task UPID string.
+            timeout: Maximum seconds to wait for task completion.
+
+        Returns:
+            ``True`` if the task completed successfully.
+
+        Raises:
+            RuntimeError: If the task fails or times out.
+        """
+        logger.debug("Waiting for task %s (timeout=%ds)", upid, timeout)
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            task_status = (
+                self._api.nodes(self._node).tasks(upid).status.get()
+            )
+            status = task_status.get("status")
+            if status == "stopped":
+                exitstatus = task_status.get("exitstatus", "")
+                if exitstatus == "OK":
+                    logger.debug("Task %s completed successfully", upid)
+                    return True
+                raise RuntimeError(
+                    f"Proxmox task {upid} failed with exit status: {exitstatus}"
+                )
+
+            time.sleep(1)
+
+        raise RuntimeError(f"Proxmox task {upid} timed out after {timeout}s")

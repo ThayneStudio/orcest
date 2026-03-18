@@ -76,11 +76,19 @@ class ProjectEntry:
 
     name: str = ""
     repo: str = ""  # "org/repo" format
-    workers: int = 1
-    worker_vm_ids: list[int] = field(default_factory=list)
-    worker_memory: int = 16384  # MB
+
+
+@dataclass
+class PoolConfig:
+    """Ephemeral worker VM pool settings."""
+
+    size: int = 4  # Target warm pool size
+    template_vm_id: int = 0  # Template to clone from (0 = not configured)
+    storage: str = "ssd-pool"  # ZFS pool for linked clones
+    worker_memory: int = 16384  # MB per worker VM
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
+    max_task_duration: int = 3600  # seconds before force-kill
 
 
 @dataclass
@@ -91,6 +99,7 @@ class FleetConfig:
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     orgs: dict[str, OrgEntry] = field(default_factory=dict)
     projects: list[ProjectEntry] = field(default_factory=list)
+    pool: PoolConfig = field(default_factory=PoolConfig)
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -178,19 +187,26 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
             ProjectEntry(
                 name=proj["name"],
                 repo=proj["repo"],
-                workers=proj.get("workers", 1),
-                worker_vm_ids=proj.get("worker_vm_ids", []),
-                worker_memory=proj.get("worker_memory", 16384),
-                worker_cores=proj.get("worker_cores", 8),
-                worker_disk_size=proj.get("worker_disk_size", 30),
             )
         )
+
+    pl = data.get("pool") or {}
+    pool = PoolConfig(
+        size=pl.get("size", 4),
+        template_vm_id=pl.get("template_vm_id", 0),
+        storage=pl.get("storage", "ssd-pool"),
+        worker_memory=pl.get("worker_memory", 16384),
+        worker_cores=pl.get("worker_cores", 8),
+        worker_disk_size=pl.get("worker_disk_size", 30),
+        max_task_duration=pl.get("max_task_duration", 3600),
+    )
 
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
         orgs=orgs,
         projects=projects,
+        pool=pool,
     )
 
 
@@ -226,14 +242,18 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             {
                 "name": p.name,
                 "repo": p.repo,
-                "workers": p.workers,
-                "worker_vm_ids": p.worker_vm_ids,
-                "worker_memory": p.worker_memory,
-                "worker_cores": p.worker_cores,
-                "worker_disk_size": p.worker_disk_size,
             }
             for p in config.projects
         ],
+        "pool": {
+            "size": config.pool.size,
+            "template_vm_id": config.pool.template_vm_id,
+            "storage": config.pool.storage,
+            "worker_memory": config.pool.worker_memory,
+            "worker_cores": config.pool.worker_cores,
+            "worker_disk_size": config.pool.worker_disk_size,
+            "max_task_duration": config.pool.max_task_duration,
+        },
     }
 
     # Atomic write: write to temp file then rename, with restrictive permissions

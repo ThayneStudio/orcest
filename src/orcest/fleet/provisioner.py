@@ -59,57 +59,14 @@ def get_output(name: str, config_dir: Path = TERRAFORM_DIR) -> Any:
 def generate_tfvars(config: FleetConfig) -> dict[str, Any]:
     """Convert a :class:`FleetConfig` into a dict suitable for ``terraform.tfvars.json``.
 
-    This is the key translation layer between the orcest YAML config and the
-    Terraform variable schema.  It:
-
-    1. Renders cloud-init user-data for the orchestrator VM.
-    2. Renders cloud-init user-data for each worker VM (one per project x worker index).
-    3. Allocates VM IDs for workers (orchestrator VM ID + 1, incrementing).
-    4. Returns a dict whose keys match ``variables.tf``.
+    Terraform manages only the orchestrator VM. Worker VMs are managed by the
+    pool manager via the Proxmox API (ephemeral VMs cloned from a template).
     """
-    from orcest.fleet.cloud_init import render_orchestrator_userdata, render_worker_userdata
+    from orcest.fleet.cloud_init import render_orchestrator_userdata
 
-    # Render orchestrator user-data
     orchestrator_userdata = render_orchestrator_userdata(
         ssh_public_key=config.orchestrator.ssh_key,
     )
-
-    # Build worker entries: one per (project, worker-index) pair.
-    workers: dict[str, dict[str, Any]] = {}
-
-    for project in config.projects:
-        org = config.resolve_org(project)
-
-        if len(project.worker_vm_ids) < project.workers:
-            raise ValueError(
-                f"Project '{project.name}' has {project.workers} worker(s) "
-                f"but only {len(project.worker_vm_ids)} VM ID(s) assigned. "
-                f"Re-run the onboard or add-worker command to assign VM IDs."
-            )
-
-        for i in range(project.workers):
-            vm_id = project.worker_vm_ids[i]
-            key = f"{project.name}-{i}"
-            worker_id = f"worker-{vm_id}"
-
-            worker_userdata = render_worker_userdata(
-                redis_host=config.orchestrator.host or "localhost",
-                key_prefix=project.name,
-                worker_id=worker_id,
-                github_token=org.github_token,
-                claude_oauth_token=org.claude_oauth_token,
-                repo=project.repo,
-                ssh_public_key=config.orchestrator.ssh_key,
-            )
-
-            workers[key] = {
-                "vm_id": vm_id,
-                "project_name": project.name,
-                "memory": project.worker_memory,
-                "cores": project.worker_cores,
-                "disk_size": project.worker_disk_size,
-                "cloud_init_content": worker_userdata,
-            }
 
     if not config.proxmox.api_token_id or not config.proxmox.api_token_secret:
         raise ValueError(
@@ -129,7 +86,7 @@ def generate_tfvars(config: FleetConfig) -> dict[str, Any]:
             "disk_size": config.orchestrator.disk_size,
             "cloud_init_content": orchestrator_userdata,
         },
-        "workers": workers,
+        "workers": {},
     }
 
 

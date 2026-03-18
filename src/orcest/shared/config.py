@@ -86,6 +86,7 @@ class WorkerConfig:
     workspace_dir: str = "/tmp/orcest-workspaces"
     backend: str = "claude"
     runner: RunnerConfig = field(default_factory=RunnerConfig)
+    ephemeral: bool = False  # When True, process one task and exit
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -348,12 +349,17 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     # Backend — default from runner.type when not explicitly set
     backend = str(raw.get("backend", runner_config.type))
 
+    # Ephemeral mode — process one task and exit (default False)
+    ephemeral_raw = raw.get("ephemeral", False)
+    ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
+
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
         workspace_dir=workspace_dir,
         backend=backend,
         runner=runner_config,
+        ephemeral=ephemeral,
     )
 
     # Validate required fields
