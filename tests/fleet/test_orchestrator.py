@@ -10,6 +10,7 @@ from orcest.fleet.orchestrator import (
     generate_env_file,
     generate_orchestrator_config,
     image_exists,
+    upload_fleet_config,
 )
 
 pytestmark = pytest.mark.unit
@@ -170,3 +171,80 @@ class TestImageExists:
             "ubuntu",
         ]:
             assert image_exists("user@host", image=img) is True
+
+
+class TestUploadFleetConfig:
+    def _ok(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fail(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="oops")
+
+    def test_happy_path(self, mocker, tmp_path):
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("test: true\n")
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        scp = mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._ok)
+        upload_fleet_config("user@host", str(cfg_file))
+        # mkdir, mv+chmod
+        assert ssh.call_count == 2
+        assert scp.call_count == 1
+        # Verify the SSH commands are correct
+        ssh.assert_any_call("user@host", "sudo mkdir -p /etc/orcest")
+        ssh.assert_any_call(
+            "user@host",
+            "sudo mv /etc/orcest/.config.yaml.tmp /etc/orcest/config.yaml"
+            " && sudo chmod 600 /etc/orcest/config.yaml",
+        )
+        # Verify SCP uploads the local file to the temp path on the remote
+        scp.assert_called_once_with(
+            str(cfg_file), "user@host", "/etc/orcest/.config.yaml.tmp",
+        )
+
+    def test_missing_config_raises(self):
+        with pytest.raises(FileNotFoundError, match="Fleet config not found"):
+            upload_fleet_config("user@host", "/nonexistent/config.yaml")
+
+    def test_mkdir_failure_raises(self, mocker, tmp_path):
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("test: true\n")
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._fail)
+        with pytest.raises(RuntimeError, match="Failed to create /etc/orcest"):
+            upload_fleet_config("user@host", str(cfg_file))
+
+    def test_scp_failure_raises(self, mocker, tmp_path):
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("test: true\n")
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._fail)
+        with pytest.raises(RuntimeError, match="Failed to upload fleet config"):
+            upload_fleet_config("user@host", str(cfg_file))
+        # Only the mkdir call should have happened; mv+chmod must not run
+        assert ssh.call_count == 1
+
+    def test_mv_failure_cleans_up(self, mocker, tmp_path):
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("test: true\n")
+        call_count = 0
+
+        def ssh_side_effect(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:  # mkdir
+                return self._ok()
+            elif call_count == 2:  # mv+chmod
+                return self._fail()
+            else:  # cleanup rm
+                return self._ok()
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+        mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._ok)
+        with pytest.raises(RuntimeError, match="Failed to install fleet config"):
+            upload_fleet_config("user@host", str(cfg_file))
+        # mkdir + mv(fail) + rm cleanup
+        assert ssh.call_count == 3
+        # Verify the cleanup call removes the temp file
+        cleanup_call = ssh.call_args_list[2]
+        assert cleanup_call == mocker.call(
+            "user@host", "rm -f /etc/orcest/.config.yaml.tmp",
+        )

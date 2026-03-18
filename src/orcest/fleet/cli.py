@@ -371,16 +371,31 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 8: Update config with orchestrator host
+    # Step 8: Update config with orchestrator host (before uploading to remote)
     cfg.orchestrator.host = orch_ip
     save_config(cfg, config)
 
+    # Step 9: Start pool manager (if template and Proxmox creds are configured)
+    if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
+        try:
+            from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+
+            console.print("  Uploading fleet config and starting pool manager...")
+            upload_fleet_config(ssh_target, config)
+            ensure_pool_manager(ssh_target)
+            console.print("  Pool manager [green]ok[/green]")
+        except Exception as exc:
+            console.print(f"  Pool manager [yellow]failed: {exc}[/yellow]")
+            console.print("  (Pool manager can be started later with 'orcest fleet update')")
+
     console.print(f"\n[bold]Orchestrator created at {orch_ip}.[/bold]")
     console.print("\n  Next steps:")
+    console.print("  1. Create template:  orcest fleet create-template")
+    console.print("  2. Set pool size:    orcest fleet set-pool-size <N>")
     console.print(
-        "  1. Register an org:  orcest fleet add-org <org> --github-token ... --claude-token ..."
+        "  3. Register an org:  orcest fleet add-org <org> --github-token ... --claude-token ..."
     )
-    console.print("  2. Onboard a repo:   orcest fleet onboard <owner/repo>")
+    console.print("  4. Onboard a repo:   orcest fleet onboard <owner/repo>")
 
 
 @fleet.command()
@@ -605,7 +620,19 @@ def update(config: str) -> None:
     except Exception as exc:
         console.print(f"[yellow]failed: {exc}[/yellow]")
 
-    # Step 3: Restart all project stacks
+    # Step 3: Update pool manager (if template and Proxmox creds are configured)
+    if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
+        console.print("  Updating pool manager...", end=" ")
+        try:
+            from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+
+            upload_fleet_config(ssh_target, config)
+            ensure_pool_manager(ssh_target)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]failed: {exc}[/yellow]")
+
+    # Step 4: Restart all project stacks
     from orcest.fleet.orchestrator import restart_stack
 
     for project in cfg.projects:
