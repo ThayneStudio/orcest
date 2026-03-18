@@ -12,12 +12,17 @@ import re
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import click
 from rich.console import Console
 from rich.table import Table
 
 from orcest.fleet.config import DEFAULT_CONFIG_PATH
+
+if TYPE_CHECKING:
+    from orcest.fleet.config import FleetConfig
+    from orcest.fleet.proxmox_api import ProxmoxClient
 
 _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -77,8 +82,6 @@ def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
             text=True,
         )
         if mac_result.returncode == 0:
-            import re
-
             mac_match = re.search(r"([0-9A-Fa-f:]{17})", mac_result.stdout)
             if mac_match:
                 mac = mac_match.group(1).lower()
@@ -135,7 +138,7 @@ _SSH_OPTS = [
 ]
 
 
-def _create_proxmox_client(cfg):
+def _create_proxmox_client(cfg: FleetConfig) -> ProxmoxClient:
     """Create a ProxmoxClient from fleet config."""
     from orcest.fleet.proxmox_api import ProxmoxClient
 
@@ -207,7 +210,11 @@ def fleet() -> None:
 
 @fleet.command("add-org")
 @click.argument("org_name")
-@click.option("--github-token", required=True, help="GitHub PAT (classic: repo+workflow scopes; fine-grained: contents, issues, pull-requests, actions R/W).")
+@click.option(
+    "--github-token", required=True,
+    help="GitHub PAT (classic: repo+workflow scopes; "
+    "fine-grained: contents, issues, pull-requests, actions R/W).",
+)
 @click.option("--claude-token", required=True, help="Claude OAuth token for this org.")
 @click.option(
     "--config",
@@ -312,7 +319,7 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
     orch_ip = _get_vm_ip(vm_id, console)
     if not orch_ip:
         console.print("  [yellow]Could not determine IP. VM may still be booting.[/yellow]")
-        console.print(f"  Saving config. Re-run after VM is ready.")
+        console.print("  Saving config. Re-run after VM is ready.")
         save_config(cfg, config)
         sys.exit(1)
 
@@ -326,18 +333,11 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
 
     # Step 5: Wait for cloud-init to finish (installs Docker, etc.)
     ssh_target = f"{cfg.orchestrator.user}@{orch_ip}"
-    console.print("  Waiting for cloud-init to finish...", end=" ")
-    ci_result = subprocess.run(
-        ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status --wait"],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if ci_result.returncode == 0:
-        console.print("[green]ok[/green]")
-    else:
-        console.print("[yellow]warning[/yellow]")
-        console.print(f"    cloud-init may have errors: {ci_result.stderr.strip()}")
+    if not _wait_for_cloud_init(orch_ip, cfg.orchestrator.user, console):
+        console.print("[red]Cloud-init timed out. Saving config with partial state.[/red]")
+        cfg.orchestrator.host = orch_ip
+        save_config(cfg, config)
+        sys.exit(1)
 
     # Step 6: Upload source and build Docker image
     try:
@@ -357,7 +357,7 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 6: Start shared Redis stack
+    # Step 7: Start shared Redis stack
     try:
         from orcest.fleet.orchestrator import ensure_redis_stack
 
@@ -371,7 +371,7 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 7: Update config with orchestrator host
+    # Step 8: Update config with orchestrator host
     cfg.orchestrator.host = orch_ip
     save_config(cfg, config)
 
@@ -490,7 +490,11 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print("  Stack deployed [green]ok[/green]")
     except Exception as exc:
         console.print(f"  Deploy stack [red]failed[/red]: {exc}")
-        console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
+        console.print(
+            "  [yellow]Config saved with project entry. To retry, run:[/yellow]\n"
+            f"  [yellow]  orcest fleet destroy {project_name} --yes && "
+            f"orcest fleet onboard {repo}[/yellow]"
+        )
         save_config(cfg, config)
         sys.exit(1)
 
@@ -624,7 +628,7 @@ def update(config: str) -> None:
 )
 def status(config: str) -> None:
     """Show fleet status: orchestrator, projects, and workers."""
-    from orcest.fleet.config import load_config
+    from orcest.fleet.config import load_config, validate_project_name
 
     console = Console()
     cfg = load_config(config)
@@ -682,7 +686,16 @@ def status(config: str) -> None:
     proj_table.add_column("Stack Status", style="magenta")
 
     for project in cfg.projects:
-        _validate_project_name(project.name)
+        if not validate_project_name(project.name):
+            # Skip projects with invalid names rather than aborting the
+            # entire status display.  This can happen if the config file
+            # was hand-edited with an invalid name.
+            proj_table.add_row(
+                project.name,
+                project.repo,
+                "[red]invalid name[/red]",
+            )
+            continue
         stack_status = "[dim]unknown[/dim]"
         if cfg.orchestrator.host:
             ssh_target = cfg.ssh_target()
@@ -716,7 +729,8 @@ def status(config: str) -> None:
     pool_table.add_column("Property", style="cyan")
     pool_table.add_column("Value", style="white")
     pool_table.add_row("Target Size", str(cfg.pool.size))
-    pool_table.add_row("Template VM ID", str(cfg.pool.template_vm_id) if cfg.pool.template_vm_id else "[dim]not set[/dim]")
+    tmpl_id = str(cfg.pool.template_vm_id) if cfg.pool.template_vm_id else "[dim]not set[/dim]"
+    pool_table.add_row("Template VM ID", tmpl_id)
     pool_table.add_row("Storage", cfg.pool.storage)
     pool_table.add_row("Worker Memory", f"{cfg.pool.worker_memory} MB")
     pool_table.add_row("Worker Cores", str(cfg.pool.worker_cores))
@@ -773,6 +787,27 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
         console.print(f"[red]failed[/red]: {exc}")
         sys.exit(1)
 
+    # Steps 2-9 can all fail; on any failure we destroy the cloned VM
+    # to avoid leaving orphaned resources.
+    def _cleanup_vm() -> None:
+        console.print("  Cleaning up: destroying cloned VM...")
+        try:
+            # Stop the VM first -- Proxmox refuses to delete running VMs.
+            # Best-effort; the VM may already be stopped or never started.
+            try:
+                px.stop_vm(vm_id)
+                # Brief wait for it to actually stop before destroying
+                stop_deadline = time.monotonic() + 15
+                while time.monotonic() < stop_deadline:
+                    if px.get_vm_status(vm_id) == "stopped":
+                        break
+                    time.sleep(1)
+            except Exception:
+                pass  # VM may already be stopped or never started
+            px.destroy_vm(vm_id)
+        except Exception:
+            console.print("  [yellow]Warning: cleanup failed; VM may need manual removal.[/yellow]")
+
     # Step 2: Configure cloud-init userdata
     console.print("  Configuring cloud-init...", end=" ")
     try:
@@ -783,11 +818,7 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
-        console.print("  Cleaning up: destroying cloned VM...")
-        try:
-            px.destroy_vm(vm_id)
-        except Exception:
-            pass
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 3: Start the VM
@@ -797,6 +828,7 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 4: Wait for IP
@@ -805,17 +837,20 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
     if not vm_ip:
         console.print("[red]timed out[/red]")
         console.print("  Could not get VM IP. Template creation aborted.")
+        _cleanup_vm()
         sys.exit(1)
     console.print(f"[green]{vm_ip}[/green]")
 
     # Step 5: Wait for SSH
     if not _wait_for_ssh(vm_ip, cfg.orchestrator.user, console):
         console.print("[red]SSH not available. Template creation aborted.[/red]")
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 6: Wait for cloud-init to finish
     if not _wait_for_cloud_init(vm_ip, cfg.orchestrator.user, console):
         console.print("[red]Cloud-init timed out. Template creation aborted.[/red]")
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 7: Disable cloud-init so clones don't re-run it
@@ -823,6 +858,7 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
     result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo touch /etc/cloud/cloud-init.disabled")
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        _cleanup_vm()
         sys.exit(1)
     console.print("[green]ok[/green]")
 
@@ -832,14 +868,21 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
         px.stop_vm(vm_id)
         # Wait for it to actually stop
         deadline = time.monotonic() + 60
+        stopped = False
         while time.monotonic() < deadline:
             vm_status = px.get_vm_status(vm_id)
             if vm_status == "stopped":
+                stopped = True
                 break
             time.sleep(2)
+        if not stopped:
+            console.print("[red]timed out waiting for VM to stop[/red]")
+            _cleanup_vm()
+            sys.exit(1)
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 9: Convert to template
@@ -849,6 +892,7 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
+        _cleanup_vm()
         sys.exit(1)
 
     # Step 10: Save template_vm_id in config
@@ -859,22 +903,12 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
     console.print(f"  Saved template_vm_id={vm_id} to fleet config.")
 
 
-def _set_vm_cloud_init(px, vm_id: int, userdata: str) -> None:
+def _set_vm_cloud_init(px: ProxmoxClient, vm_id: int, userdata: str) -> None:
     """Set cloud-init user-data on a VM via the Proxmox API.
 
-    Writes the userdata as a snippet to the local storage and attaches
-    it to the VM's cloud-init drive configuration via cicustom.
+    Delegates to :meth:`ProxmoxClient.set_cloud_init_userdata`.
     """
-    # Upload the snippet file to the node's local storage
-    px._api.nodes(px._node).storage("local").upload.post(
-        content="snippets",
-        filename=f"orcest-template-{vm_id}-user.yaml",
-        file=userdata.encode(),
-    )
-    # Attach the snippet as custom cloud-init user-data
-    px._api.nodes(px._node).qemu(vm_id).config.put(
-        cicustom=f"user=local:snippets/orcest-template-{vm_id}-user.yaml",
-    )
+    px.set_cloud_init_userdata(vm_id, userdata)
 
 
 @fleet.command("pool-status")
@@ -937,11 +971,9 @@ def pool_status(config: str) -> None:
     # List worker VMs (VMs named orcest-worker-*)
     console.print("\n  Scanning for worker VMs...")
     try:
-        vms = px._api.nodes(px._node).qemu.get()
         worker_vms = [
-            vm for vm in vms
-            if vm.get("name", "").startswith("orcest-worker-")
-            and not vm.get("template", False)
+            vm for vm in px.list_vms(name_prefix="orcest-worker-")
+            if not vm.get("template", False)
         ]
     except Exception as exc:
         console.print(f"  [red]Failed to list VMs[/red]: {exc}")

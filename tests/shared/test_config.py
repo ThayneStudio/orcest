@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from orcest.shared.config import RunnerConfig, load_orchestrator_config, load_worker_config
+from orcest.shared.config import (
+    RunnerConfig,
+    build_redis_config,
+    load_orchestrator_config,
+    load_worker_config,
+)
 
 # ---------------------------------------------------------------------------
 # Env vars that config.py reads -- we must ensure they are unset in every
@@ -14,6 +19,7 @@ _ENV_VARS_TO_CLEAR = [
     "ORCEST_REDIS_HOST",
     "ORCEST_REDIS_PORT",
     "ORCEST_REDIS_PASSWORD",
+    "ORCEST_REDIS_KEY_PREFIX",
     "GITHUB_TOKEN",
     "ORCEST_REPO",
     "ORCEST_DEFAULT_RUNNER",
@@ -251,3 +257,280 @@ def test_redis_socket_timeout_from_yaml_worker(tmp_path: Path):
 
     assert config.redis.socket_timeout == 15
     assert config.redis.socket_connect_timeout == 7
+
+
+# -- build_redis_config (standalone) ----------------------------------------
+
+
+def test_build_redis_config_no_args():
+    """build_redis_config() with no arguments returns defaults."""
+    cfg = build_redis_config()
+
+    assert cfg.host == "localhost"
+    assert cfg.port == 6379
+    assert cfg.db == 0
+    assert cfg.password is None
+    assert cfg.key_prefix == "orcest"
+
+
+def test_build_redis_config_none_arg():
+    """build_redis_config(None) behaves the same as no arguments."""
+    cfg = build_redis_config(None)
+
+    assert cfg.host == "localhost"
+    assert cfg.port == 6379
+    assert cfg.key_prefix == "orcest"
+
+
+def test_build_redis_config_from_raw_dict():
+    """build_redis_config reads values from a raw dict's 'redis' sub-key."""
+    raw = {
+        "redis": {
+            "host": "redis.internal",
+            "port": 6380,
+            "db": 3,
+            "key_prefix": "myproject",
+        }
+    }
+    cfg = build_redis_config(raw)
+
+    assert cfg.host == "redis.internal"
+    assert cfg.port == 6380
+    assert cfg.db == 3
+    assert cfg.key_prefix == "myproject"
+
+
+def test_build_redis_config_env_vars_override_raw(monkeypatch):
+    """Environment variables take precedence over raw dict values."""
+    raw = {
+        "redis": {
+            "host": "yaml-host",
+            "port": 6380,
+            "key_prefix": "yaml-prefix",
+        }
+    }
+    monkeypatch.setenv("ORCEST_REDIS_HOST", "env-host")
+    monkeypatch.setenv("ORCEST_REDIS_PORT", "6381")
+    monkeypatch.setenv("ORCEST_REDIS_PASSWORD", "secret")
+    monkeypatch.setenv("ORCEST_REDIS_KEY_PREFIX", "env-prefix")
+
+    cfg = build_redis_config(raw)
+
+    assert cfg.host == "env-host"
+    assert cfg.port == 6381
+    assert cfg.password == "secret"
+    assert cfg.key_prefix == "env-prefix"
+
+
+def test_build_redis_config_env_vars_only(monkeypatch):
+    """build_redis_config() with no raw dict reads purely from env vars."""
+    monkeypatch.setenv("ORCEST_REDIS_HOST", "10.0.0.5")
+    monkeypatch.setenv("ORCEST_REDIS_PORT", "6382")
+    monkeypatch.setenv("ORCEST_REDIS_KEY_PREFIX", "poolmgr")
+
+    cfg = build_redis_config()
+
+    assert cfg.host == "10.0.0.5"
+    assert cfg.port == 6382
+    assert cfg.key_prefix == "poolmgr"
+
+
+def test_build_redis_config_password_from_env_only(monkeypatch):
+    """Password comes from env var only, never from the raw dict."""
+    raw = {"redis": {"password": "yaml-password-should-be-ignored"}}
+    monkeypatch.setenv("ORCEST_REDIS_PASSWORD", "env-password")
+
+    cfg = build_redis_config(raw)
+
+    # Password always comes from the env var
+    assert cfg.password == "env-password"
+
+
+def test_build_redis_config_password_none_without_env():
+    """Password is None when ORCEST_REDIS_PASSWORD is not set."""
+    raw = {"redis": {"host": "somehost"}}
+
+    cfg = build_redis_config(raw)
+
+    assert cfg.password is None
+
+
+def test_build_redis_config_password_in_yaml_ignored_without_env():
+    """Password specified in the YAML raw dict is silently ignored when the
+    ORCEST_REDIS_PASSWORD env var is not set.  This ensures the code path
+    never reads a password from the config file (security policy)."""
+    raw = {"redis": {"password": "yaml-secret-that-must-be-ignored"}}
+
+    cfg = build_redis_config(raw)
+
+    assert cfg.password is None
+
+
+def test_build_redis_config_invalid_port_raises(monkeypatch):
+    """Non-numeric port in env var raises ValueError."""
+    monkeypatch.setenv("ORCEST_REDIS_PORT", "not-a-number")
+
+    with pytest.raises(ValueError, match="redis.port"):
+        build_redis_config()
+
+
+# -- Worker ephemeral mode --------------------------------------------------
+
+
+def test_worker_ephemeral_defaults_to_false(tmp_path: Path):
+    """WorkerConfig.ephemeral defaults to False when not set in YAML."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("worker_id: worker-0\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.ephemeral is False
+
+
+def test_worker_ephemeral_true_from_yaml(tmp_path: Path):
+    """WorkerConfig.ephemeral=true is correctly parsed from YAML."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("worker_id: worker-0\nephemeral: true\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.ephemeral is True
+
+
+def test_worker_ephemeral_quoted_string_raises(tmp_path: Path):
+    """Quoted string 'true' for ephemeral raises ValueError (must be unquoted YAML bool)."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text('worker_id: worker-0\nephemeral: "true"\n')
+
+    with pytest.raises(ValueError, match="ephemeral"):
+        load_worker_config(cfg_file)
+
+
+# -- Empty YAML file ----------------------------------------------------------
+
+
+def test_load_worker_config_empty_yaml_file(tmp_path: Path):
+    """An empty YAML file uses defaults (worker_id defaults to 'worker-0')."""
+    cfg_file = tmp_path / "empty.yaml"
+    cfg_file.write_text("")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.worker_id == "worker-0"
+
+
+def test_load_worker_config_comments_only_yaml(tmp_path: Path):
+    """A YAML file with only comments is treated as empty."""
+    cfg_file = tmp_path / "comments.yaml"
+    cfg_file.write_text("# This file is intentionally empty\n# No config here\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.worker_id == "worker-0"
+
+
+# -- Non-mapping YAML root ---------------------------------------------------
+
+
+def test_load_orchestrator_config_non_mapping_root(tmp_path: Path):
+    """Config file with a YAML list root raises ValueError."""
+    cfg_file = tmp_path / "list-root.yaml"
+    cfg_file.write_text("- item1\n- item2\n")
+
+    with pytest.raises(ValueError, match="YAML mapping"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_worker_config_non_mapping_root(tmp_path: Path):
+    """Config file with a YAML list root raises ValueError."""
+    cfg_file = tmp_path / "list-root.yaml"
+    cfg_file.write_text("- item1\n- item2\n")
+
+    with pytest.raises(ValueError, match="YAML mapping"):
+        load_worker_config(cfg_file)
+
+
+# -- Empty worker_id validation -----------------------------------------------
+
+
+def test_load_worker_config_empty_worker_id_raises(tmp_path: Path):
+    """Empty string worker_id (from YAML or env) raises ValueError."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text('worker_id: ""\n')
+
+    with pytest.raises(ValueError, match="worker_id is required"):
+        load_worker_config(cfg_file)
+
+
+# -- Deployment validation ----------------------------------------------------
+
+
+def test_deployment_health_check_timeout_zero_raises(tmp_path: Path):
+    """health_check_timeout <= 0 with a health_check_url set raises ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "deployment:\n"
+        "  enabled: true\n"
+        "  command: deploy.sh\n"
+        "  health_check_url: http://localhost/health\n"
+        "  health_check_timeout: 0\n"
+    )
+
+    with pytest.raises(ValueError, match="health_check_timeout"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_deployment_health_check_timeout_negative_raises(tmp_path: Path):
+    """health_check_timeout < 0 with a health_check_url set raises ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "deployment:\n"
+        "  enabled: true\n"
+        "  command: deploy.sh\n"
+        "  health_check_url: http://localhost/health\n"
+        "  health_check_timeout: -5\n"
+    )
+
+    with pytest.raises(ValueError, match="health_check_timeout"):
+        load_orchestrator_config(cfg_file)
+
+
+# -- stale_pending_timeout_seconds validation ----------------------------------
+
+
+def test_stale_pending_timeout_seconds_zero_raises(tmp_path: Path):
+    """stale_pending_timeout_seconds <= 0 raises ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: 0\n"
+    )
+
+    with pytest.raises(ValueError, match="stale_pending_timeout_seconds"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_stale_pending_timeout_seconds_negative_raises(tmp_path: Path):
+    """stale_pending_timeout_seconds < 0 raises ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: -1\n"
+    )
+
+    with pytest.raises(ValueError, match="stale_pending_timeout_seconds"):
+        load_orchestrator_config(cfg_file)
+
+
+# -- Null integer field --------------------------------------------------------
+
+
+def test_null_integer_field_raises(tmp_path: Path):
+    """An explicitly null integer field in YAML raises ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\npolling:\n  interval: null\n"
+    )
+
+    with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)

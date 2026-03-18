@@ -48,11 +48,11 @@ class TestGenerateEnvFile:
             key_prefix="myproj",
             project_name="myproj",
         )
-        assert "GITHUB_TOKEN=ghp_test" in env
-        assert "GH_TOKEN=ghp_test" in env
-        assert "ORCEST_REDIS_KEY_PREFIX=myproj" in env
-        assert "ORCEST_IMAGE=orcest:latest" in env
-        assert "ORCEST_CONFIG_DIR=/opt/orcest/projects/myproj/config" in env
+        assert "GITHUB_TOKEN='ghp_test'" in env
+        assert "GH_TOKEN='ghp_test'" in env
+        assert "ORCEST_REDIS_KEY_PREFIX='myproj'" in env
+        assert "ORCEST_IMAGE='orcest:latest'" in env
+        assert "ORCEST_CONFIG_DIR='/opt/orcest/projects/myproj/config'" in env
 
     def test_project_name_in_config_dir(self):
         env = generate_env_file(
@@ -60,6 +60,59 @@ class TestGenerateEnvFile:
             project_name="special-name",
         )
         assert "projects/special-name/config" in env
+
+    def test_rejects_newline_in_key_prefix(self):
+        with pytest.raises(ValueError, match="key_prefix"):
+            generate_env_file(
+                github_token="tok",
+                key_prefix="bad\nINJECTED_VAR=evil",
+                project_name="proj",
+            )
+
+    def test_rejects_newline_in_project_name(self):
+        # project_name with newline is caught by _validate_project_name (called
+        # before _validate_env_value), which raises "Invalid project name".
+        with pytest.raises(ValueError, match="Invalid project name"):
+            generate_env_file(
+                github_token="tok",
+                key_prefix="ok",
+                project_name="bad\nINJECTED=evil",
+            )
+
+    def test_rejects_newline_in_github_token(self):
+        with pytest.raises(ValueError, match="github_token"):
+            generate_env_file(
+                github_token="tok\nINJECTED=evil",
+                key_prefix="ok",
+                project_name="proj",
+            )
+
+    def test_rejects_single_quote_in_value(self):
+        with pytest.raises(ValueError, match="single quotes"):
+            generate_env_file(
+                github_token="tok'evil",
+                key_prefix="ok",
+                project_name="proj",
+            )
+
+    def test_rejects_path_traversal_in_project_name(self):
+        """project_name is embedded in a path; reject names that would traverse."""
+        with pytest.raises(ValueError):
+            generate_env_file(
+                github_token="tok",
+                key_prefix="ok",
+                project_name="../../etc",
+            )
+
+    def test_values_are_single_quoted(self):
+        """Values must be single-quoted to prevent $-expansion by Docker Compose."""
+        env = generate_env_file(
+            github_token="ghp_has$dollar",
+            key_prefix="pfx",
+            project_name="proj",
+        )
+        # The $dollar should be preserved literally inside single quotes
+        assert "GITHUB_TOKEN='ghp_has$dollar'" in env
 
 
 class TestGenerateOrchestratorConfig:
@@ -96,3 +149,24 @@ class TestImageExists:
             return_value=subprocess.CompletedProcess(args=[], returncode=1),
         )
         assert image_exists("user@host") is False
+
+    def test_rejects_shell_injection_in_image_name(self):
+        with pytest.raises(ValueError, match="Invalid Docker image"):
+            image_exists("user@host", image="; rm -rf /")
+
+    def test_rejects_backtick_injection(self):
+        with pytest.raises(ValueError, match="Invalid Docker image"):
+            image_exists("user@host", image="`whoami`")
+
+    def test_accepts_valid_image_references(self, mocker):
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        for img in [
+            "orcest:latest",
+            "registry.example.com/orcest:v1.0",
+            "ghcr.io/org/image:sha-abc123",
+            "ubuntu",
+        ]:
+            assert image_exists("user@host", image=img) is True

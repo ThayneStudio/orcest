@@ -3,13 +3,18 @@
 Maintains a target number of pre-booted worker VMs that process one task
 each, then get destroyed and replaced. Uses the Proxmox API for VM lifecycle
 and Redis for coordination with workers.
+
+IMPORTANT: Only one pool manager instance should run at a time. The VMID
+allocation (next_free_vmid + clone_vm) is not atomic, so concurrent
+instances could clash.
 """
 
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 import time
-from dataclasses import dataclass, field
 
 from orcest.fleet.config import FleetConfig
 from orcest.fleet.proxmox_api import ProxmoxClient
@@ -28,14 +33,8 @@ _VM_NAME_PREFIX = "orcest-worker-"
 # Consumer group used by workers (must match worker/loop.py)
 _CONSUMER_GROUP = "workers"
 
-
-@dataclass
-class PoolState:
-    """Current state of the warm pool."""
-
-    idle: set[int] = field(default_factory=set)
-    active: dict[int, float] = field(default_factory=dict)
-    target_size: int = 4
+# Task stream names (must match orchestrator task publisher)
+_TASK_STREAMS = ("tasks:claude", "tasks:issue:claude")
 
 
 class PoolManager:
@@ -69,13 +68,15 @@ class PoolManager:
     def reconcile(self) -> None:
         """Single reconciliation pass.
 
-        Checks for done workers, detects active, replaces VMs, and runs health checks.
+        Checks for done workers, detects active, replaces VMs, runs health
+        checks, and cleans up stale Redis entries.
         """
         try:
             self._check_done_workers()
             self._detect_active_workers()
             self._fill_pool()
             self._health_check()
+            self._reconcile_stale_redis()
         except Exception:
             logger.error("Reconciliation pass failed", exc_info=True)
 
@@ -85,6 +86,9 @@ class PoolManager:
         Workers set ``pool:done:{worker_id}`` (e.g. ``pool:done:orcest-worker-300``)
         when they finish their task. This method finds those keys, destroys the
         corresponding VMs, and cleans up Redis state.
+
+        Each done key is processed independently so that a failure destroying
+        one VM does not prevent the remaining done workers from being cleaned up.
         """
         destroyed: list[int] = []
         done_keys = self._redis.scan_iter(match="pool:done:*")
@@ -98,10 +102,17 @@ class PoolManager:
                 self._redis.delete(key)
                 continue
 
-            logger.info("Worker %s (VM %d) reported done, destroying", worker_id, vm_id)
+            logger.info(
+                "Worker %s (VM %d) reported done, destroying", worker_id, vm_id
+            )
+            # _destroy_vm handles all exceptions internally (Proxmox and
+            # Redis failures are logged and swallowed).  Any partial
+            # failure is recovered by _reconcile_orphans (Proxmox side)
+            # or _reconcile_stale_redis (Redis side) on subsequent passes.
             self._destroy_vm(vm_id)
-            self._redis.delete(key)
             destroyed.append(vm_id)
+            # Always delete the done key so it does not accumulate.
+            self._redis.delete(key)
 
         return destroyed
 
@@ -112,26 +123,23 @@ class PoolManager:
         pending entries (indicating they claimed a task). VMs with pending
         entries are moved from ``pool:idle`` to ``pool:active``.
         """
-        idle_members = self._redis.client.smembers(
-            self._redis._prefixed(_POOL_IDLE_KEY)
-        )
+        idle_members = self._redis.smembers(_POOL_IDLE_KEY)
         if not idle_members:
             return
 
         # Get consumers with pending entries from task streams
         active_consumers: set[str] = set()
-        for stream in ("tasks:claude", "tasks:issue:claude"):
+        for stream_name in _TASK_STREAMS:
             try:
-                groups = self._redis.xinfo_groups(stream)
+                groups = self._redis.xinfo_groups(stream_name)
             except Exception:
                 continue
             for group in groups:
                 if group.get("name") != _CONSUMER_GROUP:
                     continue
-                # Check individual consumers in this group
                 try:
-                    consumers = self._redis.client.xinfo_consumers(
-                        self._redis._prefixed(stream), _CONSUMER_GROUP
+                    consumers = self._redis.xinfo_consumers(
+                        stream_name, _CONSUMER_GROUP
                     )
                 except Exception:
                     continue
@@ -140,7 +148,9 @@ class PoolManager:
                         active_consumers.add(str(consumer.get("name", "")))
 
         # Move idle VMs to active if their consumer has pending entries
+        # Batch all transitions into a single pipeline
         now = time.time()
+        transitions: list[int] = []
         for member in idle_members:
             member_str = str(member)
             try:
@@ -151,23 +161,27 @@ class PoolManager:
             worker_id = self._vm_id_to_worker_id(vm_id)
             if worker_id in active_consumers:
                 logger.info("VM %d picked up a task, moving to active", vm_id)
-                pipe = self._redis.client.pipeline()
-                pipe.srem(self._redis._prefixed(_POOL_IDLE_KEY), str(vm_id))
-                pipe.hset(
-                    self._redis._prefixed(_POOL_ACTIVE_KEY),
-                    str(vm_id),
-                    str(now),
-                )
+                transitions.append(vm_id)
+
+        if transitions:
+            try:
+                pipe = self._redis.pipeline()
+                for vm_id in transitions:
+                    pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+                    pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(now))
                 pipe.execute()
+            except Exception:
+                logger.error(
+                    "Failed to move %d VMs from idle to active; transitions "
+                    "will be retried on the next pass",
+                    len(transitions),
+                    exc_info=True,
+                )
 
     def _fill_pool(self) -> None:
         """Clone and boot VMs until pool reaches target size."""
-        idle_count = self._redis.client.scard(
-            self._redis._prefixed(_POOL_IDLE_KEY)
-        )
-        active_count = self._redis.client.hlen(
-            self._redis._prefixed(_POOL_ACTIVE_KEY)
-        )
+        idle_count = self._redis.scard(_POOL_IDLE_KEY)
+        active_count = self._redis.hlen(_POOL_ACTIVE_KEY)
         total = int(idle_count) + int(active_count)
         deficit = self._pool.size - total
 
@@ -176,7 +190,10 @@ class PoolManager:
 
         logger.info(
             "Pool deficit: %d (idle=%d, active=%d, target=%d)",
-            deficit, idle_count, active_count, self._pool.size,
+            deficit,
+            idle_count,
+            active_count,
+            self._pool.size,
         )
 
         for _ in range(deficit):
@@ -189,6 +206,15 @@ class PoolManager:
         """Stop and destroy a VM, remove from tracking sets."""
         try:
             self._proxmox.stop_vm(vm_id)
+            # Brief wait for VM to stop before destroying
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                try:
+                    if self._proxmox.get_vm_status(vm_id) == "stopped":
+                        break
+                except Exception:
+                    break
+                time.sleep(1)
         except Exception:
             logger.warning("Failed to stop VM %d (may already be stopped)", vm_id)
 
@@ -197,16 +223,30 @@ class PoolManager:
         except Exception:
             logger.error("Failed to destroy VM %d", vm_id, exc_info=True)
 
-        # Remove from all tracking sets regardless of Proxmox errors
-        pipe = self._redis.client.pipeline()
-        pipe.srem(self._redis._prefixed(_POOL_IDLE_KEY), str(vm_id))
-        pipe.hdel(self._redis._prefixed(_POOL_ACTIVE_KEY), str(vm_id))
-        pipe.execute()
+        # Remove from all tracking sets regardless of Proxmox errors.
+        # If this pipeline fails, the stale Redis entry will be cleaned up
+        # by _reconcile_stale_redis on the next reconciliation pass.
+        try:
+            pipe = self._redis.pipeline()
+            pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+            pipe.hdel(_POOL_ACTIVE_KEY, str(vm_id))
+            pipe.execute()
+        except Exception:
+            logger.error(
+                "Failed to clean Redis tracking for VM %d; stale entry will be "
+                "reconciled on next pass",
+                vm_id,
+                exc_info=True,
+            )
 
     def _clone_and_boot(self) -> int | None:
         """Clone a new VM from template, start it, add to idle set.
 
         Returns the new VM ID, or None if the operation fails.
+
+        Note: next_free_vmid() + clone_vm() is not atomic. This is safe
+        as long as only one pool manager instance is running. See module
+        docstring.
         """
         template_id = self._pool.template_vm_id
         if not template_id:
@@ -216,29 +256,59 @@ class PoolManager:
         new_id = self._proxmox.next_free_vmid()
         name = self._vm_id_to_worker_id(new_id)
 
-        logger.info("Cloning VM %d from template %d (name=%s)", new_id, template_id, name)
-
-        self._proxmox.clone_vm(
-            template_id=template_id,
-            new_id=new_id,
-            name=name,
-            storage=self._pool.storage,
-            linked=True,
+        logger.info(
+            "Cloning VM %d from template %d (name=%s)", new_id, template_id, name
         )
 
-        self._proxmox.start_vm(new_id)
+        try:
+            self._proxmox.clone_vm(
+                template_id=template_id,
+                new_id=new_id,
+                name=name,
+                storage=self._pool.storage,
+                linked=True,
+            )
+        except Exception:
+            logger.error(
+                "Failed to clone VM %d, attempting cleanup", new_id, exc_info=True
+            )
+            # clone_vm may have partially created the VM before failing
+            # (e.g. Proxmox task timeout after clone completed).  Best-effort
+            # cleanup to avoid orphaned VMs in Proxmox.
+            try:
+                self._proxmox.destroy_vm(new_id)
+            except Exception:
+                pass  # VM may not exist; either way, nothing more we can do
+            return None
 
-        # Wait for guest agent to report an IP (confirms VM is booted)
-        ip = self._proxmox.get_vm_ip(new_id)
-        if ip is None:
-            logger.warning("VM %d did not get an IP, destroying", new_id)
+        try:
+            self._proxmox.start_vm(new_id)
+
+            # Wait for guest agent to report an IP (confirms VM is booted)
+            ip = self._proxmox.get_vm_ip(new_id)
+            if ip is None:
+                logger.warning("VM %d did not get an IP, destroying", new_id)
+                self._destroy_vm(new_id)
+                return None
+        except Exception:
+            logger.error(
+                "Failed to boot VM %d, destroying clone", new_id, exc_info=True
+            )
             self._destroy_vm(new_id)
             return None
 
         logger.info("VM %d booted with IP %s, adding to idle pool", new_id, ip)
-        self._redis.client.sadd(
-            self._redis._prefixed(_POOL_IDLE_KEY), str(new_id)
-        )
+        try:
+            self._redis.sadd(_POOL_IDLE_KEY, str(new_id))
+        except Exception:
+            logger.error(
+                "Failed to add VM %d to idle pool in Redis, destroying to "
+                "avoid orphan",
+                new_id,
+                exc_info=True,
+            )
+            self._destroy_vm(new_id)
+            return None
 
         return new_id
 
@@ -258,7 +328,8 @@ class PoolManager:
             except (ValueError, TypeError):
                 logger.warning(
                     "Invalid active pool entry: vm_id=%s, start_ts=%s",
-                    vm_id_str, start_ts_str,
+                    vm_id_str,
+                    start_ts_str,
                 )
                 continue
 
@@ -266,28 +337,172 @@ class PoolManager:
             if elapsed > max_duration:
                 logger.warning(
                     "VM %d exceeded max task duration (%.0fs > %ds), force-destroying",
-                    vm_id, elapsed, max_duration,
+                    vm_id,
+                    elapsed,
+                    max_duration,
                 )
+                # _destroy_vm handles all exceptions internally.
                 self._destroy_vm(vm_id)
+
+    def _reconcile_orphans(self) -> None:
+        """Detect and clean up orphaned VMs not tracked in Redis.
+
+        Cross-references Proxmox VMs (by name prefix) against the
+        ``pool:idle`` and ``pool:active`` Redis sets.  VMs that exist in
+        Proxmox but are absent from both sets are either:
+
+        - Leftovers from a pool manager crash between clone and Redis add.
+        - VMs whose Redis tracking was lost (e.g. pipeline failure in
+          ``_destroy_vm`` after the Proxmox destroy failed).
+
+        Orphans are destroyed to prevent resource leaks.  This method is
+        called once at startup and does not need to run every reconciliation
+        pass since orphans can only be created by pool manager crashes.
+        """
+        try:
+            proxmox_vms = self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX)
+        except Exception:
+            logger.warning(
+                "Failed to list VMs for orphan reconciliation", exc_info=True
+            )
+            return
+
+        idle_members = self._redis.smembers(_POOL_IDLE_KEY)
+        active_members = set(self._redis.hgetall(_POOL_ACTIVE_KEY).keys())
+        tracked_vm_ids: set[int] = set()
+        for member in idle_members | active_members:
+            try:
+                tracked_vm_ids.add(int(member))
+            except (ValueError, TypeError):
+                continue
+
+        for vm_info in proxmox_vms:
+            vm_id = vm_info.get("vmid")
+            if vm_id is None:
+                continue
+            vm_id = int(vm_id)
+
+            # Skip the template itself
+            if vm_id == self._pool.template_vm_id:
+                continue
+
+            if vm_id not in tracked_vm_ids:
+                logger.warning(
+                    "Orphaned VM %d (%s) found in Proxmox but not tracked"
+                    " in Redis, destroying",
+                    vm_id,
+                    vm_info.get("name", "unknown"),
+                )
+                # _destroy_vm handles all exceptions internally.
+                self._destroy_vm(vm_id)
+
+    def _reconcile_stale_redis(self) -> None:
+        """Remove Redis pool entries whose VMs no longer exist in Proxmox.
+
+        This is the complement of ``_reconcile_orphans`` (which finds Proxmox
+        VMs not tracked in Redis).  Stale entries occur when:
+
+        - ``_destroy_vm`` successfully destroys the Proxmox VM but the Redis
+          pipeline that removes the tracking entry fails (e.g. transient
+          connection error).
+        - A VM is removed externally (admin action, Proxmox host crash).
+
+        Stale idle entries block ``_fill_pool`` from seeing a deficit.  Stale
+        active entries cause ``_health_check`` to repeatedly try to destroy
+        a non-existent VM.  Both are cleaned up here.
+
+        Runs on every reconciliation pass (not just startup) because stale
+        entries can be created by pipeline failures during normal operation.
+        """
+        try:
+            proxmox_vms = self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX)
+        except Exception:
+            logger.warning(
+                "Failed to list VMs for stale Redis reconciliation",
+                exc_info=True,
+            )
+            return
+
+        proxmox_vm_ids: set[int] = set()
+        for vm_info in proxmox_vms:
+            vm_id = vm_info.get("vmid")
+            if vm_id is not None:
+                try:
+                    proxmox_vm_ids.add(int(vm_id))
+                except (ValueError, TypeError):
+                    continue
+
+        # Check idle set for stale entries
+        idle_members = self._redis.smembers(_POOL_IDLE_KEY)
+        for member in idle_members:
+            try:
+                vm_id = int(member)
+            except (ValueError, TypeError):
+                continue
+            if vm_id not in proxmox_vm_ids and vm_id != self._pool.template_vm_id:
+                logger.warning(
+                    "Stale idle entry VM %d not found in Proxmox, removing from Redis",
+                    vm_id,
+                )
+                try:
+                    self._redis.srem(_POOL_IDLE_KEY, str(vm_id))
+                except Exception:
+                    logger.error(
+                        "Failed to remove stale idle entry VM %d from Redis",
+                        vm_id,
+                        exc_info=True,
+                    )
+
+        # Check active hash for stale entries
+        active_members = self._redis.hgetall(_POOL_ACTIVE_KEY)
+        for vm_id_str in active_members:
+            try:
+                vm_id = int(vm_id_str)
+            except (ValueError, TypeError):
+                continue
+            if vm_id not in proxmox_vm_ids and vm_id != self._pool.template_vm_id:
+                logger.warning(
+                    "Stale active entry VM %d not found in Proxmox, removing from Redis",
+                    vm_id,
+                )
+                try:
+                    self._redis.hdel(_POOL_ACTIVE_KEY, str(vm_id))
+                except Exception:
+                    logger.error(
+                        "Failed to remove stale active entry VM %d from Redis",
+                        vm_id,
+                        exc_info=True,
+                    )
 
     def run(self, interval: float = 10.0) -> None:
         """Main loop: reconcile every ``interval`` seconds.
 
         Runs indefinitely until interrupted (KeyboardInterrupt or SIGTERM).
+        On startup, runs orphan reconciliation to clean up VMs that may have
+        been left behind by a previous crash.
 
         Args:
             interval: Seconds between reconciliation passes.
         """
         logger.info(
             "Pool manager starting (target_size=%d, interval=%.1fs)",
-            self._pool.size, interval,
+            self._pool.size,
+            interval,
         )
+        self._reconcile_orphans()
+        stop_event = threading.Event()
+
+        def _handle_term(*_: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _handle_term)
         try:
-            while True:
+            while not stop_event.is_set():
                 self.reconcile()
-                time.sleep(interval)
+                stop_event.wait(timeout=interval)
         except KeyboardInterrupt:
-            logger.info("Pool manager interrupted, shutting down.")
+            pass
+        logger.info("Pool manager shutting down.")
 
     # ── helpers ──────────────────────────────────────────────
 

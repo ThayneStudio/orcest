@@ -226,6 +226,20 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
         if delivery_count >= MAX_DELIVERY_COUNT:
             _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
+            if config.ephemeral:
+                # Ephemeral workers must exit after encountering any task,
+                # including dead-lettered ones.  Without this the worker
+                # would loop indefinitely on an empty queue until the pool
+                # manager's SIGTERM timeout fires, wasting a VM slot.
+                try:
+                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
+                except Exception:
+                    logger.warning("Failed to set pool:done key", exc_info=True)
+                logger.info(
+                    "Ephemeral mode: dead-lettered task, shutting down."
+                )
+                shutdown = True
+                shutdown_event.set()
             continue
 
         # Try to acquire lock (use resource-type-aware key)
@@ -303,38 +317,70 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             lock_lost.set()
 
         # Publish result with retry + dead-letter fallback; ACK only on success.
-        if not _publish_result_with_retry(redis, result, task, logger, current_stream, entry_id):
-            continue
-        logger.info(f"Published result for task {task.id}: {result.status.value}")
+        published = _publish_result_with_retry(
+            redis, result, task, logger, current_stream, entry_id,
+        )
 
-        try:
-            redis.xack(current_stream, CONSUMER_GROUP, entry_id)
-        except Exception:
-            logger.error(
-                f"Failed to ACK task {task.id} (will be redelivered)",
-                exc_info=True,
-            )
+        if published:
+            logger.info(f"Published result for task {task.id}: {result.status.value}")
 
-        # Clear pending-task marker promptly so the orchestrator can
-        # re-enqueue if needed (belt-and-suspenders with the orchestrator's
-        # clear in _handle_result).
-        try:
-            resource_type = task.resource_type
-            clear_pending_task(redis, task.repo, resource_type, task.resource_id)
-        except Exception:
-            logger.warning(
-                f"Failed to clear pending task marker for {task.resource_type} #{task.resource_id}",
-                exc_info=True,
-            )
+            try:
+                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+            except Exception:
+                logger.error(
+                    f"Failed to ACK task {task.id} (will be redelivered)",
+                    exc_info=True,
+                )
+
+            # Clear pending-task marker promptly so the orchestrator can
+            # re-enqueue if needed (belt-and-suspenders with the orchestrator's
+            # clear in _handle_result).
+            try:
+                resource_type = task.resource_type
+                clear_pending_task(redis, task.repo, resource_type, task.resource_id)
+            except Exception:
+                logger.warning(
+                    "Failed to clear pending task marker for "
+                    f"{task.resource_type} #{task.resource_id}",
+                    exc_info=True,
+                )
 
         # Ephemeral mode: signal pool manager and exit after one task.
+        # Exit regardless of publish success — the VM will be destroyed.
         if config.ephemeral:
+            # In ephemeral mode, if result publish failed the entry is still
+            # unACKed.  ACK it now to prevent a permanently orphaned PEL entry
+            # (the VM will be destroyed, so no future drain will ever claim it).
+            if not published:
+                try:
+                    redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+                except Exception:
+                    logger.error(
+                        f"Failed to ACK task {task.id} on ephemeral exit "
+                        "(PEL entry will be orphaned)",
+                        exc_info=True,
+                    )
+                # Clear pending-task marker so the orchestrator can re-enqueue.
+                # When publish succeeded this was already done above; when it
+                # failed the marker would otherwise linger until TTL expiry
+                # (~95 min) since the VM is about to be destroyed.
+                try:
+                    clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to clear pending task marker for "
+                        f"{task.resource_type} #{task.resource_id} on ephemeral exit",
+                        exc_info=True,
+                    )
             try:
                 redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
             except Exception:
                 logger.warning("Failed to set pool:done key", exc_info=True)
             logger.info("Ephemeral mode: task complete, shutting down.")
             shutdown = True
+            shutdown_event.set()  # Must mirror handle_signal; abort_event watches this
+        elif not published:
+            continue
 
     logger.info("Worker shut down cleanly.")
 
@@ -370,6 +416,7 @@ def _drain_pending_tasks(
             break
         for entry_id, fields in entries:
             drained += 1
+            task: Task | None = None
             try:
                 task = Task.from_dict(fields)
                 logger.warning(
@@ -388,7 +435,7 @@ def _drain_pending_tasks(
                     duration_seconds=0,
                 )
                 try:
-                    redis.xadd(RESULTS_STREAM, result.to_dict())
+                    redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
                 except Exception:
                     logger.error(
                         f"Failed to publish recovery result for task {task.id}",
@@ -406,6 +453,22 @@ def _drain_pending_tasks(
                     f"Failed to ACK pending entry {entry_id}",
                     exc_info=True,
                 )
+            # Clear the pending-task marker so the orchestrator can
+            # re-enqueue promptly.  Without this, the marker lingers
+            # until TTL expiry (~95 min with defaults) — especially
+            # problematic when the result publish above also failed,
+            # since the orchestrator never learns the task ended.
+            if task is not None:
+                try:
+                    clear_pending_task(
+                        redis, task.repo, task.resource_type, task.resource_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to clear pending task marker for "
+                        f"{task.resource_type} #{task.resource_id} during drain",
+                        exc_info=True,
+                    )
     if drained:
         logger.info(f"Drained {drained} pending task(s) from previous lifecycle")
 
@@ -424,6 +487,10 @@ def _dead_letter_task(
     why it was dead-lettered, then ACKs the original entry so the main stream
     does not stall.  ACK happens even if the dead-letter publish fails so the
     worker can make progress.
+
+    Also clears the pending-task marker so the orchestrator can re-enqueue
+    work for this resource immediately rather than waiting for marker TTL
+    expiry (~95 min).
 
     At-least-once delivery caveat: if ``xadd_capped`` succeeds but the
     subsequent ``xack`` fails, the entry remains in the PEL.  The next time
@@ -456,6 +523,18 @@ def _dead_letter_task(
     except Exception:
         logger.error(
             f"Failed to ACK dead-lettered task {task.id} (entry {entry_id})",
+            exc_info=True,
+        )
+    # Clear the pending-task marker so the orchestrator can re-enqueue
+    # promptly.  Dead-lettered tasks never produce a result on RESULTS_STREAM,
+    # so the orchestrator's normal _handle_result path never fires; without
+    # this the marker lingers until TTL expiry (~95 min with defaults).
+    try:
+        clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+    except Exception:
+        logger.warning(
+            "Failed to clear pending task marker for "
+            f"{task.resource_type} #{task.resource_id} during dead-letter",
             exc_info=True,
         )
 

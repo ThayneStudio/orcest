@@ -159,9 +159,14 @@ def _safe_dict(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _build_redis_config(raw: dict[str, Any]) -> RedisConfig:
-    """Build RedisConfig from a raw dict with env var overrides."""
-    redis_raw = _safe_dict(raw, "redis")
+def build_redis_config(raw: dict[str, Any] | None = None) -> RedisConfig:
+    """Build RedisConfig from a raw dict with env var overrides.
+
+    Can be called with no arguments to build config purely from
+    environment variables (ORCEST_REDIS_HOST, ORCEST_REDIS_PORT,
+    ORCEST_REDIS_PASSWORD, ORCEST_REDIS_KEY_PREFIX).
+    """
+    redis_raw = _safe_dict(raw or {}, "redis")
 
     host = os.environ.get("ORCEST_REDIS_HOST", redis_raw.get("host", "localhost"))
     port_raw = os.environ.get("ORCEST_REDIS_PORT", redis_raw.get("port", 6379))
@@ -201,7 +206,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     raw = _load_yaml(path)
 
     # Redis
-    redis_config = _build_redis_config(raw)
+    redis_config = build_redis_config(raw)
 
     # GitHub
     github_raw = _safe_dict(raw, "github")
@@ -322,7 +327,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     raw = _load_yaml(path)
 
     # Redis
-    redis_config = _build_redis_config(raw)
+    redis_config = build_redis_config(raw)
 
     # Worker-level fields
     worker_id = str(os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0")))
