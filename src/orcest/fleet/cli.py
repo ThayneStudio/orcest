@@ -278,8 +278,22 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 5: Upload source and build Docker image
+    # Step 5: Wait for cloud-init to finish (installs Docker, etc.)
     ssh_target = f"{cfg.orchestrator.user}@{orch_ip}"
+    console.print("  Waiting for cloud-init to finish...", end=" ")
+    ci_result = subprocess.run(
+        ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status --wait"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if ci_result.returncode == 0:
+        console.print("[green]ok[/green]")
+    else:
+        console.print("[yellow]warning[/yellow]")
+        console.print(f"    cloud-init may have errors: {ci_result.stderr.strip()}")
+
+    # Step 6: Upload source and build Docker image
     try:
         from orcest.fleet.orchestrator import build_image, upload_source
 
