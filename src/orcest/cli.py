@@ -541,11 +541,40 @@ def init():
     else:
         console.print("  [red]No public key found — SSH setup incomplete.[/red]")
 
-    # Step 6: Write config
+    # Step 6: Detect Proxmox host IP (for remote API access from orchestrator VM)
+    proxmox_ip = "127.0.0.1"
+    if is_proxmox:
+        console.print("  Detecting host IP...", end=" ")
+        try:
+            result = subprocess.run(
+                ["hostname", "-I"], capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                all_ips = result.stdout.strip().split()
+                # Prefer IPv4 addresses (avoid IPv6 which needs bracket
+                # notation in URLs and is rarely the Proxmox management IP).
+                ipv4_ips = [ip for ip in all_ips if ":" not in ip]
+                chosen_ips = ipv4_ips or all_ips
+                if chosen_ips:
+                    proxmox_ip = chosen_ips[0]
+                    console.print(f"[green]{proxmox_ip}[/green]")
+                    if len(all_ips) > 1:
+                        console.print(
+                            f"    [dim](multiple IPs detected: {', '.join(all_ips)})[/dim]"
+                        )
+                else:
+                    console.print("[yellow]no IPs found, using 127.0.0.1[/yellow]")
+            else:
+                console.print("[yellow]failed, using 127.0.0.1[/yellow]")
+        except FileNotFoundError:
+            console.print("[yellow]hostname not found, using 127.0.0.1[/yellow]")
+
+    # Step 7: Write config
     console.print("  Writing config...", end=" ")
     try:
         config = FleetConfig(
             proxmox=ProxmoxConfig(
+                endpoint=f"https://{proxmox_ip}:8006",
                 node=node_name,
                 storage=storage,
                 api_token_id=api_token_id,
@@ -565,7 +594,7 @@ def init():
         console.print("    [dim]Run with sudo or create /etc/orcest/ manually.[/dim]")
         raise SystemExit(1)
 
-    # Step 7: Copy Terraform HCL templates
+    # Step 8: Copy Terraform HCL templates
     console.print("  Copying Terraform templates...", end=" ")
     terraform_src = Path(__file__).parent / "fleet" / "terraform"
     terraform_dest = DEFAULT_CONFIG_DIR / "terraform"
@@ -579,7 +608,7 @@ def init():
         console.print("[yellow]no bundled templates found[/yellow]")
         console.print(f"    [dim]Expected at {terraform_src}[/dim]")
 
-    # Step 8: Run tofu init
+    # Step 9: Run tofu init
     if terraform_dest.is_dir():
         console.print("  Running tofu init...", end=" ")
         try:
@@ -603,16 +632,19 @@ def init():
             f"  {step}. Set proxmox.api_token_secret in config (edit {DEFAULT_CONFIG_PATH})"
         )
         step += 1
+    console.print(f"  {step}. Create orchestrator VM:    orcest fleet create-orchestrator")
+    console.print(f"  {step + 1}. Create worker template:    orcest fleet create-template")
+    console.print(f"  {step + 2}. Set pool size:             orcest fleet set-pool-size <N>")
+    org_step = step + 3
+    console.print(f"  {org_step}. Register an org:           orcest fleet add-org <org>"
+                  " --github-token ... --claude-token ...")
+    # Indent the hint to align under the step text (e.g. "  4. " -> 5 chars).
+    hint_indent = " " * (len(str(org_step)) + 4)
     console.print(
-        f"  {step}. Register an org:           orcest fleet add-org <org>"
-        " --github-token ... --claude-token ..."
-    )
-    console.print(
-        "     GitHub token: classic PAT with [bold]repo + workflow[/bold] scopes,"
+        f"{hint_indent}GitHub token: classic PAT with [bold]repo + workflow[/bold] scopes,"
         " or fine-grained with contents/issues/PRs/actions R/W"
     )
-    console.print(f"  {step + 1}. Create orchestrator VM:    orcest fleet create-orchestrator")
-    console.print(f"  {step + 2}. Onboard a repo:            orcest fleet onboard <owner/repo>")
+    console.print(f"  {step + 4}. Onboard a repo:            orcest fleet onboard <owner/repo>")
 
 
 @main.command()

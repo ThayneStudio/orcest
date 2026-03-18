@@ -190,6 +190,51 @@ def ensure_redis_stack(ssh_target: str) -> None:
     logger.info("Shared Redis stack running on %s", ssh_target)
 
 
+def upload_fleet_config(
+    ssh_target: str, local_config_path: str = "/etc/orcest/config.yaml",
+) -> None:
+    """Upload the fleet config from the Proxmox host to the orchestrator VM.
+
+    Copies to ``/etc/orcest/config.yaml`` on the orchestrator so the pool
+    manager container can mount it.  Uses temp file + scp + mv for atomicity.
+    """
+    logger.info("Uploading fleet config to %s", ssh_target)
+
+    if not os.path.isfile(local_config_path):
+        raise FileNotFoundError(
+            f"Fleet config not found: {local_config_path}"
+        )
+
+    remote_dest = "/etc/orcest/config.yaml"
+    remote_tmp = "/etc/orcest/.config.yaml.tmp"
+
+    # Ensure target directory exists on the orchestrator VM
+    result = _ssh(ssh_target, "sudo mkdir -p /etc/orcest")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}"
+        )
+
+    # SCP to a temp file in the same directory as the destination so that
+    # the subsequent ``mv`` is an atomic same-filesystem rename (avoids the
+    # copy+delete fallback that would happen across filesystems, e.g. /tmp
+    # on tmpfs vs /etc on rootfs).
+    result = _scp(local_config_path, ssh_target, remote_tmp)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
+
+    result = _ssh(
+        ssh_target,
+        f"sudo mv {shlex.quote(remote_tmp)} {shlex.quote(remote_dest)}"
+        f" && sudo chmod 600 {shlex.quote(remote_dest)}",
+    )
+    if result.returncode != 0:
+        _ssh(ssh_target, f"rm -f {shlex.quote(remote_tmp)}")
+        raise RuntimeError(f"Failed to install fleet config: {result.stderr.strip()}")
+
+    logger.info("Fleet config uploaded to %s:%s", ssh_target, remote_dest)
+
+
 def ensure_pool_manager(
     ssh_target: str, fleet_config_path: str = "/etc/orcest/config.yaml",
 ) -> None:

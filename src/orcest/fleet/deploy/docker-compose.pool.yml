@@ -2,7 +2,7 @@ services:
   pool-manager:
     image: ${ORCEST_IMAGE:-orcest:latest}
     volumes:
-      - ${FLEET_CONFIG:-/etc/orcest/fleet.yaml}:/home/orcest/app/config/fleet.yaml:ro
+      - ${FLEET_CONFIG:-/etc/orcest/config.yaml}:/home/orcest/app/config/fleet.yaml:ro
     entrypoint: ["orcest", "pool-manage", "--config", "/home/orcest/app/config/fleet.yaml"]
     restart: unless-stopped
     # Host networking is required so the pool manager can reach the Proxmox
