@@ -1,0 +1,27 @@
+services:
+  orchestrator:
+    image: ${ORCEST_IMAGE:-orcest:latest}
+    build: .
+    volumes:
+      - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
+    environment:
+      - GITHUB_TOKEN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    mem_limit: 1g
+    networks:
+      - orcest
+
+networks:
+  orcest:
+    external: true
+    name: orcest
