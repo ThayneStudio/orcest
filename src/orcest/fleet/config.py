@@ -55,7 +55,7 @@ class OrchestratorConfig:
 
     vm_id: int = 199
     host: str = ""  # filled after create-orchestrator
-    user: str = "thayne"
+    user: str = "orcest"
     ssh_key: str = ""
     memory: int = 4096
     cores: int = 2
@@ -158,7 +158,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     orchestrator = OrchestratorConfig(
         vm_id=orch.get("vm_id", 199),
         host=orch.get("host", ""),
-        user=orch.get("user", "thayne"),
+        user=orch.get("user", "orcest"),
         ssh_key=orch.get("ssh_key", ""),
         memory=orch.get("memory", 4096),
         cores=orch.get("cores", 2),
