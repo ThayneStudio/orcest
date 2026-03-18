@@ -65,7 +65,8 @@ def orchestrate(config: str) -> None:
 @click.option("--id", "worker_id", required=True, help="Unique worker identifier.")
 @click.option("--config", default="config/worker.yaml", help="Path to worker config.")
 @click.option("--runner", default=None, help="Runner type override (claude, noop, etc.)")
-def work(worker_id: str, config: str, runner: str | None) -> None:
+@click.option("--once", is_flag=True, help="Ephemeral mode: process one task and exit.")
+def work(worker_id: str, config: str, runner: str | None, once: bool) -> None:
     """Start a worker loop."""
     from orcest.shared.config import load_worker_config
     from orcest.worker.loop import run_worker
@@ -75,6 +76,8 @@ def work(worker_id: str, config: str, runner: str | None) -> None:
     if runner:
         cfg.runner.type = runner
         cfg.backend = runner
+    if once:
+        cfg.ephemeral = True
     run_worker(cfg)
 
 
@@ -862,6 +865,73 @@ def provision(host: str, user: str, worker_config: str, env_file: str) -> None:
     console.print(f"\n[bold]Worker provisioned on {host}.[/bold]")
     console.print("\n  To authenticate Claude Code, run:")
     console.print(f"  ssh -t {ssh_target} 'sudo -u orcest claude login'")
+
+
+@main.command("pool-manage")
+@click.option("--config", default="/etc/orcest/config.yaml", help="Fleet config path.")
+@click.option("--interval", default=10.0, type=float, help="Reconciliation interval in seconds.")
+def pool_manage(config: str, interval: float) -> None:
+    """Run the warm pool manager (long-running service).
+
+    Maintains a pool of pre-booted ephemeral worker VMs. Monitors for
+    completed workers, destroys finished VMs, and clones replacements
+    to maintain the target pool size.
+    """
+    import logging as _logging
+
+    from orcest.fleet.config import load_config
+    from orcest.fleet.pool_manager import PoolManager
+    from orcest.fleet.proxmox_api import ProxmoxClient
+    from orcest.shared.config import RedisConfig
+    from orcest.shared.redis_client import RedisClient
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.pool.template_vm_id:
+        console.print("[red]Error: pool.template_vm_id not configured in fleet config.[/red]")
+        raise SystemExit(1)
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Error: Proxmox API credentials not configured.[/red]")
+        raise SystemExit(1)
+
+    if interval <= 0:
+        console.print("[red]Error: --interval must be positive.[/red]")
+        raise SystemExit(1)
+
+    proxmox = ProxmoxClient(
+        endpoint=cfg.proxmox.endpoint,
+        token_id=cfg.proxmox.api_token_id,
+        token_secret=cfg.proxmox.api_token_secret,
+        node=cfg.proxmox.node,
+    )
+
+    # Connect to Redis on the orchestrator host
+    redis_host = cfg.orchestrator.host or "localhost"
+    redis_cfg = RedisConfig(host=redis_host, port=6379, key_prefix="orcest")
+    redis = RedisClient(redis_cfg)
+
+    if not redis.health_check():
+        redis.close()
+        console.print("[red]Error: Cannot connect to Redis.[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        f"[bold]Starting pool manager[/bold]"
+        f" (target={cfg.pool.size}, interval={interval}s)"
+    )
+
+    manager = PoolManager(config=cfg, proxmox=proxmox, redis=redis)
+    try:
+        manager.run(interval=interval)
+    finally:
+        redis.close()
 
 
 main.add_command(fleet)

@@ -135,6 +135,52 @@ _SSH_OPTS = [
 ]
 
 
+def _create_proxmox_client(cfg):
+    """Create a ProxmoxClient from fleet config."""
+    from orcest.fleet.proxmox_api import ProxmoxClient
+
+    return ProxmoxClient(
+        endpoint=cfg.proxmox.endpoint,
+        token_id=cfg.proxmox.api_token_id,
+        token_secret=cfg.proxmox.api_token_secret,
+        node=cfg.proxmox.node,
+    )
+
+
+def _wait_for_cloud_init(
+    host: str, user: str, console: Console, timeout: int = 600,
+) -> bool:
+    """Wait for cloud-init to finish on a remote host. Returns True on success."""
+    ssh_target = f"{user}@{host}"
+    console.print(f"  Waiting for cloud-init to finish on {host}...", end=" ")
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status --wait"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode == 0:
+            console.print("[green]ok[/green]")
+            return True
+        console.print("[yellow]warning[/yellow]")
+        console.print(f"    cloud-init may have errors: {result.stderr.strip()}")
+        return True  # cloud-init finished, possibly with errors
+    except subprocess.TimeoutExpired:
+        console.print("[red]timed out[/red]")
+        return False
+
+
+def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess:
+    """Run a command over SSH and return the result."""
+    ssh_target = f"{user}@{host}"
+    return subprocess.run(
+        ["ssh", *_SSH_OPTS, ssh_target, cmd],
+        capture_output=True,
+        text=True,
+    )
+
+
 def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) -> bool:
     """Poll until SSH connects or timeout expires. Returns True on success."""
     ssh_target = f"{user}@{host}"
@@ -340,17 +386,17 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
 @fleet.command()
 @click.argument("repo")
 @click.option("--name", default=None, help="Project name (default: derived from repo).")
-@click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the worker.")
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def onboard(repo: str, name: str | None, vm_id: int | None, config: str) -> None:
-    """Onboard a new repo: deploy orchestrator stack + create worker VM(s).
+def onboard(repo: str, name: str | None, config: str) -> None:
+    """Onboard a new repo: register project and deploy orchestrator stack.
 
     REPO is in "owner/repo" format (e.g. ThayneStudio/my-project).
+    Workers are managed by the pool manager, not per-project.
     Requires the orchestrator VM to be created first (fleet create-orchestrator).
     """
     from orcest.fleet.config import ProjectEntry, load_config, save_config
@@ -388,44 +434,17 @@ def onboard(repo: str, name: str | None, vm_id: int | None, config: str) -> None
         console.print(f"[red]Project '{project_name}' already exists in fleet config.[/red]")
         sys.exit(1)
 
-    # Prompt for worker VM ID
-    if vm_id is None:
-        default_id = _next_free_vmid() or 200
-        vm_id = click.prompt("  VM ID for worker", default=default_id, type=int)
-
     # Add project to config
     project = ProjectEntry(
         name=project_name,
         repo=repo,
-        workers=1,
-        worker_vm_ids=[vm_id],
     )
     cfg.projects.append(project)
 
     console.print(f"  Project: {project_name}")
     console.print(f"  Repo: {repo}")
-    console.print(f"  Key prefix: {project_name}")
-    console.print("  Workers: 1")
 
-    # Step 1: Generate tfvars and apply Terraform (creates worker VM)
-    console.print("\n  Provisioning worker VM(s) via Terraform...")
-    try:
-        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
-
-        tfvars = generate_tfvars(cfg)
-        write_tfvars(tfvars)
-        apply()
-        console.print("  Terraform apply [green]ok[/green]")
-    except Exception as exc:
-        console.print(f"  Terraform apply [red]failed[/red]: {exc}")
-        # Remove the project we just added since provisioning failed
-        cfg.projects = [p for p in cfg.projects if p.name != project_name]
-        sys.exit(1)
-
-    # Save config now — worker VM exists in Terraform state, must be tracked
-    save_config(cfg, config)
-
-    # Step 2: Write project files to orchestrator
+    # Step 1: Write project files to orchestrator
     ssh_target = cfg.ssh_target()
     console.print("\n  Deploying orchestrator stack...")
     try:
@@ -447,10 +466,10 @@ def onboard(repo: str, name: str | None, vm_id: int | None, config: str) -> None
         console.print("  Project files written [green]ok[/green]")
     except Exception as exc:
         console.print(f"  Writing project files [red]failed[/red]: {exc}")
-        console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
+        cfg.projects = [p for p in cfg.projects if p.name != project_name]
         sys.exit(1)
 
-    # Step 3: Ensure shared Redis stack is running, then deploy project stack
+    # Step 2: Ensure shared Redis stack is running, then deploy project stack
     try:
         from orcest.fleet.orchestrator import (
             deploy_stack,
@@ -472,67 +491,11 @@ def onboard(repo: str, name: str | None, vm_id: int | None, config: str) -> None
     except Exception as exc:
         console.print(f"  Deploy stack [red]failed[/red]: {exc}")
         console.print("  [yellow]Config saved. Re-run onboard to retry stack deployment.[/yellow]")
-        sys.exit(1)
-
-    console.print(f"\n[bold]Project '{project_name}' onboarded.[/bold]")
-
-
-@fleet.command("add-worker")
-@click.argument("project_name")
-@click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the new worker.")
-@click.option(
-    "--config",
-    default=str(DEFAULT_CONFIG_PATH),
-    help="Fleet config path.",
-    show_default=True,
-)
-def add_worker(project_name: str, vm_id: int | None, config: str) -> None:
-    """Add a worker VM to an existing project.
-
-    Increments the worker count for PROJECT_NAME and applies Terraform
-    to create the new VM.
-    """
-    from orcest.fleet.config import load_config, save_config
-
-    console = Console()
-    cfg = load_config(config)
-
-    project = cfg.get_project(project_name)
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found in fleet config.[/red]")
-        sys.exit(1)
-
-    # Prompt for VM ID
-    if vm_id is None:
-        default_id = _next_free_vmid() or 200
-        vm_id = click.prompt("  VM ID for new worker", default=default_id, type=int)
-
-    old_count = project.workers
-    project.workers += 1
-    project.worker_vm_ids.append(vm_id)
-
-    console.print(f"\n[bold]Adding worker to '{project_name}'[/bold]")
-    console.print(f"  Workers: {old_count} -> {project.workers} (VM ID {vm_id})")
-
-    # Generate tfvars and apply Terraform
-    console.print("  Applying Terraform...")
-    try:
-        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
-
-        tfvars = generate_tfvars(cfg)
-        write_tfvars(tfvars)
-        apply()
-        console.print("  Terraform apply [green]ok[/green]")
-    except Exception as exc:
-        console.print(f"  Terraform apply [red]failed[/red]: {exc}")
-        project.workers = old_count  # rollback
-        project.worker_vm_ids.pop()
+        save_config(cfg, config)
         sys.exit(1)
 
     save_config(cfg, config)
-    console.print(
-        f"\n[bold]Worker added to '{project_name}' (now {project.workers} workers).[/bold]"
-    )
+    console.print(f"\n[bold]Project '{project_name}' onboarded.[/bold]")
 
 
 @fleet.command()
@@ -545,10 +508,10 @@ def add_worker(project_name: str, vm_id: int | None, config: str) -> None:
 )
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
 def destroy(project_name: str, config: str, yes: bool) -> None:
-    """Destroy a project: remove orchestrator stack and all worker VMs.
+    """Destroy a project: remove orchestrator stack and deregister.
 
-    Tears down the Docker Compose stack on the orchestrator, removes the
-    project from config, and applies Terraform to destroy worker VMs.
+    Tears down the Docker Compose stack on the orchestrator and removes
+    the project from config. Workers are managed by the pool manager.
     """
     from orcest.fleet.config import load_config, save_config
 
@@ -562,13 +525,13 @@ def destroy(project_name: str, config: str, yes: bool) -> None:
 
     if not yes:
         click.confirm(
-            f"Destroy project '{project_name}' ({project.workers} worker(s))?",
+            f"Destroy project '{project_name}'?",
             abort=True,
         )
 
     console.print(f"\n[bold]Destroying project '{project_name}'[/bold]")
 
-    # Step 1: Teardown orchestrator stack
+    # Teardown orchestrator stack
     if cfg.orchestrator.host:
         ssh_target = cfg.ssh_target()
         console.print("  Tearing down orchestrator stack...", end=" ")
@@ -580,24 +543,8 @@ def destroy(project_name: str, config: str, yes: bool) -> None:
         except Exception as exc:
             console.print(f"[yellow]failed: {exc}[/yellow]")
 
-    # Step 2: Remove project from config and apply Terraform
-    # (worker VMs no longer in tfvars, will be destroyed)
+    # Remove project from config
     cfg.projects = [p for p in cfg.projects if p.name != project_name]
-    console.print("  Applying Terraform to remove workers...")
-    try:
-        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
-
-        tfvars = generate_tfvars(cfg)
-        write_tfvars(tfvars)
-        apply()
-        console.print("  Terraform apply [green]ok[/green]")
-    except Exception as exc:
-        console.print(f"  Terraform apply [yellow]failed: {exc}[/yellow]")
-        console.print(
-            "  [yellow]Workers may still be running. Run 'tofu destroy' manually.[/yellow]"
-        )
-
-    # Save config only after Terraform has been applied (or attempted)
     save_config(cfg, config)
     console.print(f"\n[bold]Project '{project_name}' destroyed.[/bold]")
 
@@ -610,13 +557,13 @@ def destroy(project_name: str, config: str, yes: bool) -> None:
     show_default=True,
 )
 def update(config: str) -> None:
-    """Update the fleet: rebuild Docker image, restart stacks, recreate workers.
+    """Update the fleet: rebuild Docker image and restart stacks.
 
     Uploads fresh source to the orchestrator, rebuilds the Docker image,
-    restarts all project stacks, and applies Terraform to recreate workers
-    with fresh cloud-init.
+    and restarts all project stacks. Worker VMs are managed by the pool
+    manager and will pick up changes on next clone cycle.
     """
-    from orcest.fleet.config import load_config, save_config
+    from orcest.fleet.config import load_config
 
     console = Console()
     cfg = load_config(config)
@@ -665,19 +612,6 @@ def update(config: str) -> None:
         except Exception as exc:
             console.print(f"[yellow]failed: {exc}[/yellow]")
 
-    # Step 4: Regenerate tfvars and apply Terraform (ensures workers match current config)
-    console.print("\n  Applying Terraform to ensure workers match current config...")
-    try:
-        from orcest.fleet.provisioner import apply, generate_tfvars, write_tfvars
-
-        tfvars = generate_tfvars(cfg)
-        write_tfvars(tfvars)
-        apply()
-        console.print("  Terraform apply [green]ok[/green]")
-    except Exception as exc:
-        console.print(f"  Terraform apply [yellow]failed: {exc}[/yellow]")
-
-    save_config(cfg, config)
     console.print("\n[bold]Fleet update complete.[/bold]")
 
 
@@ -745,7 +679,6 @@ def status(config: str) -> None:
     proj_table = Table(title="Projects")
     proj_table.add_column("Project", style="cyan")
     proj_table.add_column("Repo", style="white")
-    proj_table.add_column("Workers", style="green")
     proj_table.add_column("Stack Status", style="magenta")
 
     for project in cfg.projects:
@@ -773,10 +706,306 @@ def status(config: str) -> None:
         proj_table.add_row(
             project.name,
             project.repo,
-            str(project.workers),
             stack_status,
         )
 
     console.print(proj_table)
 
+    # Pool info
+    pool_table = Table(title="Worker Pool")
+    pool_table.add_column("Property", style="cyan")
+    pool_table.add_column("Value", style="white")
+    pool_table.add_row("Target Size", str(cfg.pool.size))
+    pool_table.add_row("Template VM ID", str(cfg.pool.template_vm_id) if cfg.pool.template_vm_id else "[dim]not set[/dim]")
+    pool_table.add_row("Storage", cfg.pool.storage)
+    pool_table.add_row("Worker Memory", f"{cfg.pool.worker_memory} MB")
+    pool_table.add_row("Worker Cores", str(cfg.pool.worker_cores))
+    console.print(pool_table)
 
+
+@fleet.command("create-template")
+@click.option("--base-vm-id", type=int, default=9000, help="Base VM/template to clone from.")
+@click.option("--vm-id", type=int, default=None, help="VM ID for the new template.")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
+    """Create a worker VM template for the warm pool.
+
+    Clones a base image, installs worker tools via cloud-init,
+    then converts to a template for fast linked cloning.
+    """
+    from orcest.fleet.cloud_init import render_template_userdata
+    from orcest.fleet.config import load_config, save_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Proxmox API credentials not configured.[/red]")
+        console.print("  Set proxmox.api_token_id and proxmox.api_token_secret in fleet config.")
+        sys.exit(1)
+
+    px = _create_proxmox_client(cfg)
+
+    # Determine VM ID for the template
+    if vm_id is None:
+        vm_id = px.next_free_vmid()
+        console.print(f"  Auto-assigned VM ID: {vm_id}")
+
+    console.print(f"\n[bold]Creating worker template (VM {vm_id}) from base {base_vm_id}[/bold]\n")
+
+    # Step 1: Clone from base image
+    console.print(f"  Cloning base VM {base_vm_id} -> {vm_id}...", end=" ")
+    try:
+        px.clone_vm(
+            template_id=base_vm_id,
+            new_id=vm_id,
+            name="orcest-worker-template",
+            storage=cfg.pool.storage,
+            linked=False,  # Full clone — template needs independent storage
+        )
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 2: Configure cloud-init userdata
+    console.print("  Configuring cloud-init...", end=" ")
+    try:
+        userdata = render_template_userdata(
+            ssh_public_key=cfg.orchestrator.ssh_key,
+        )
+        _set_vm_cloud_init(px, vm_id, userdata)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        console.print("  Cleaning up: destroying cloned VM...")
+        try:
+            px.destroy_vm(vm_id)
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # Step 3: Start the VM
+    console.print("  Starting VM...", end=" ")
+    try:
+        px.start_vm(vm_id)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 4: Wait for IP
+    console.print("  Waiting for VM IP...", end=" ")
+    vm_ip = px.get_vm_ip(vm_id, timeout=300)
+    if not vm_ip:
+        console.print("[red]timed out[/red]")
+        console.print("  Could not get VM IP. Template creation aborted.")
+        sys.exit(1)
+    console.print(f"[green]{vm_ip}[/green]")
+
+    # Step 5: Wait for SSH
+    if not _wait_for_ssh(vm_ip, cfg.orchestrator.user, console):
+        console.print("[red]SSH not available. Template creation aborted.[/red]")
+        sys.exit(1)
+
+    # Step 6: Wait for cloud-init to finish
+    if not _wait_for_cloud_init(vm_ip, cfg.orchestrator.user, console):
+        console.print("[red]Cloud-init timed out. Template creation aborted.[/red]")
+        sys.exit(1)
+
+    # Step 7: Disable cloud-init so clones don't re-run it
+    console.print("  Disabling cloud-init...", end=" ")
+    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo touch /etc/cloud/cloud-init.disabled")
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
+    # Step 8: Stop the VM
+    console.print("  Stopping VM...", end=" ")
+    try:
+        px.stop_vm(vm_id)
+        # Wait for it to actually stop
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            vm_status = px.get_vm_status(vm_id)
+            if vm_status == "stopped":
+                break
+            time.sleep(2)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 9: Convert to template
+    console.print("  Converting to template...", end=" ")
+    try:
+        px.convert_to_template(vm_id)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    # Step 10: Save template_vm_id in config
+    cfg.pool.template_vm_id = vm_id
+    save_config(cfg, config)
+
+    console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
+    console.print(f"  Saved template_vm_id={vm_id} to fleet config.")
+
+
+def _set_vm_cloud_init(px, vm_id: int, userdata: str) -> None:
+    """Set cloud-init user-data on a VM via the Proxmox API.
+
+    Writes the userdata as a snippet to the local storage and attaches
+    it to the VM's cloud-init drive configuration via cicustom.
+    """
+    # Upload the snippet file to the node's local storage
+    px._api.nodes(px._node).storage("local").upload.post(
+        content="snippets",
+        filename=f"orcest-template-{vm_id}-user.yaml",
+        file=userdata.encode(),
+    )
+    # Attach the snippet as custom cloud-init user-data
+    px._api.nodes(px._node).qemu(vm_id).config.put(
+        cicustom=f"user=local:snippets/orcest-template-{vm_id}-user.yaml",
+    )
+
+
+@fleet.command("pool-status")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def pool_status(config: str) -> None:
+    """Show worker pool status: template info, idle/active VMs."""
+    from orcest.fleet.config import load_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    # Pool configuration table
+    pool_table = Table(title="Worker Pool Configuration")
+    pool_table.add_column("Property", style="cyan")
+    pool_table.add_column("Value", style="white")
+
+    pool_table.add_row("Target Size", str(cfg.pool.size))
+    pool_table.add_row(
+        "Template VM ID",
+        str(cfg.pool.template_vm_id) if cfg.pool.template_vm_id else "[dim]not set[/dim]",
+    )
+    pool_table.add_row("Storage", cfg.pool.storage)
+    pool_table.add_row("Worker Memory", f"{cfg.pool.worker_memory} MB")
+    pool_table.add_row("Worker Cores", str(cfg.pool.worker_cores))
+    pool_table.add_row("Worker Disk Size", f"{cfg.pool.worker_disk_size} GB")
+    pool_table.add_row("Max Task Duration", f"{cfg.pool.max_task_duration}s")
+    console.print(pool_table)
+
+    if not cfg.pool.template_vm_id:
+        console.print(
+            "\n[yellow]No template configured.[/yellow]\n"
+            "  Run 'orcest fleet create-template' first."
+        )
+        return
+
+    # Check template status via Proxmox API
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print(
+            "\n[yellow]Proxmox API credentials not configured"
+            " -- cannot query VMs.[/yellow]"
+        )
+        return
+
+    px = _create_proxmox_client(cfg)
+
+    # Check if template exists
+    console.print(f"\n  Checking template VM {cfg.pool.template_vm_id}...", end=" ")
+    try:
+        tpl_status = px.get_vm_status(cfg.pool.template_vm_id)
+        console.print(f"[green]{tpl_status}[/green]")
+    except Exception as exc:
+        console.print(f"[red]not found[/red]: {exc}")
+        return
+
+    # List worker VMs (VMs named orcest-worker-*)
+    console.print("\n  Scanning for worker VMs...")
+    try:
+        vms = px._api.nodes(px._node).qemu.get()
+        worker_vms = [
+            vm for vm in vms
+            if vm.get("name", "").startswith("orcest-worker-")
+            and not vm.get("template", False)
+        ]
+    except Exception as exc:
+        console.print(f"  [red]Failed to list VMs[/red]: {exc}")
+        return
+
+    if not worker_vms:
+        console.print("  [dim]No worker VMs found.[/dim]")
+        return
+
+    vm_table = Table(title="Worker VMs")
+    vm_table.add_column("VM ID", style="cyan")
+    vm_table.add_column("Name", style="white")
+    vm_table.add_column("Status", style="magenta")
+    vm_table.add_column("CPU", style="yellow")
+    vm_table.add_column("Memory", style="yellow")
+
+    running = 0
+    stopped = 0
+    for vm in sorted(worker_vms, key=lambda v: v.get("vmid", 0)):
+        vm_status = vm.get("status", "unknown")
+        if vm_status == "running":
+            running += 1
+            status_str = "[green]running[/green]"
+        elif vm_status == "stopped":
+            stopped += 1
+            status_str = "[dim]stopped[/dim]"
+        else:
+            status_str = f"[yellow]{vm_status}[/yellow]"
+
+        mem_mb = vm.get("maxmem", 0) // (1024 * 1024)
+        vm_table.add_row(
+            str(vm.get("vmid", "?")),
+            vm.get("name", "?"),
+            status_str,
+            str(vm.get("cpus", "?")),
+            f"{mem_mb} MB",
+        )
+
+    console.print(vm_table)
+    console.print(f"\n  Total: {len(worker_vms)} VMs ({running} running, {stopped} stopped)")
+    console.print(f"  Target pool size: {cfg.pool.size}")
+
+
+@fleet.command("set-pool-size")
+@click.argument("size", type=int)
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def set_pool_size(size: int, config: str) -> None:
+    """Set the target warm pool size."""
+    from orcest.fleet.config import load_config, save_config
+
+    console = Console()
+
+    if size < 0:
+        console.print("[red]Pool size must be non-negative.[/red]")
+        sys.exit(1)
+
+    cfg = load_config(config)
+    old_size = cfg.pool.size
+    cfg.pool.size = size
+    save_config(cfg, config)
+
+    console.print(f"Pool size updated: {old_size} -> {size}")

@@ -33,19 +33,10 @@ variable "orchestrator" {
   # See comment on var.workers for why this is not marked sensitive.
 }
 
+# Workers are managed by the pool manager via Proxmox API, not Terraform.
+# The variable is kept (empty) for backward compatibility with existing state.
 variable "workers" {
-  description = "Map of worker VMs keyed by project-name + index."
-  type = map(object({
-    vm_id              = number
-    project_name       = string
-    memory             = number
-    cores              = number
-    disk_size          = number # in GB
-    cloud_init_content = string
-  }))
-  default = {}
-  # Not marked sensitive at the variable level because Terraform forbids
-  # sensitive values in for_each.  The cloud_init_content (which contains
-  # tokens) is protected by the snippets being written to Proxmox storage
-  # and the tfvars file having 0600 permissions.
+  description = "Unused — kept for Terraform state compatibility."
+  type        = map(any)
+  default     = {}
 }

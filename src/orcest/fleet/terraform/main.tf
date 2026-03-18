@@ -28,19 +28,6 @@ resource "proxmox_virtual_environment_file" "orchestrator_cloud_init" {
   }
 }
 
-resource "proxmox_virtual_environment_file" "worker_cloud_init" {
-  for_each = var.workers
-
-  content_type = "snippets"
-  datastore_id = "local"
-  node_name    = var.proxmox_node
-
-  source_raw {
-    data      = each.value.cloud_init_content
-    file_name = "orcest-worker-${each.key}-ci.yaml"
-  }
-}
-
 # ── Orchestrator VM ─────────────────────────────────────────
 
 resource "proxmox_virtual_environment_vm" "orchestrator" {
@@ -92,58 +79,5 @@ resource "proxmox_virtual_environment_vm" "orchestrator" {
   started = true
 }
 
-# ── Worker VMs ──────────────────────────────────────────────
-
-resource "proxmox_virtual_environment_vm" "worker" {
-  for_each = var.workers
-
-  name      = "orcest-${each.value.project_name}-worker-${each.value.vm_id}"
-  node_name = var.proxmox_node
-  vm_id     = each.value.vm_id
-
-  agent {
-    enabled = true
-  }
-
-  cpu {
-    cores = each.value.cores
-    type  = "host"
-  }
-
-  memory {
-    dedicated = each.value.memory
-  }
-
-  # Boot disk cloned from the cloud image
-  disk {
-    datastore_id = var.proxmox_storage
-    file_id      = proxmox_virtual_environment_download_file.ubuntu_cloud_image.id
-    interface    = "scsi0"
-    size         = each.value.disk_size
-    discard      = "on"
-    ssd          = true
-  }
-
-  network_device {
-    model  = "virtio"
-    bridge = "vmbr0"
-  }
-
-  initialization {
-    datastore_id = var.proxmox_storage
-
-    ip_config {
-      ipv4 {
-        address = "dhcp"
-      }
-    }
-
-    user_data_file_id = proxmox_virtual_environment_file.worker_cloud_init[each.key].id
-  }
-
-  # Start the VM on creation
-  started = true
-
-  # Wait for the QEMU guest agent to report the IP
-  timeout_create = 300
-}
+# Worker VMs are managed by the pool manager via Proxmox API,
+# not by Terraform. See src/orcest/fleet/pool_manager.py.

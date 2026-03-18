@@ -10,6 +10,7 @@ from orcest.fleet.config import (
     FleetConfig,
     OrchestratorConfig,
     OrgEntry,
+    PoolConfig,
     ProjectEntry,
     ProxmoxConfig,
     _parse_disk_size,
@@ -125,8 +126,9 @@ class TestConfigPersistence:
             orchestrator=OrchestratorConfig(vm_id=200, host="10.0.0.1", disk_size=40),
             orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_token="sk_def")},
             projects=[
-                ProjectEntry(name="proj", repo="Org/proj", workers=3),
+                ProjectEntry(name="proj", repo="Org/proj"),
             ],
+            pool=PoolConfig(size=6, template_vm_id=9000, storage="nvme-pool"),
         )
         save_config(original, path)
         loaded = load_config(path)
@@ -139,7 +141,9 @@ class TestConfigPersistence:
         assert loaded.orgs["Org"].github_token == "ghp_abc"
         assert len(loaded.projects) == 1
         assert loaded.projects[0].name == "proj"
-        assert loaded.projects[0].workers == 3
+        assert loaded.pool.size == 6
+        assert loaded.pool.template_vm_id == 9000
+        assert loaded.pool.storage == "nvme-pool"
 
     def test_load_missing_file(self, tmp_path):
         cfg = load_config(tmp_path / "does-not-exist.yaml")
@@ -165,41 +169,44 @@ class TestConfigPersistence:
         cfg = load_config(path)
         assert cfg.orchestrator.disk_size == 30
 
-    def test_round_trip_worker_specs(self, tmp_path):
+    def test_round_trip_pool_config(self, tmp_path):
         path = tmp_path / "config.yaml"
         original = FleetConfig(
-            projects=[
-                ProjectEntry(
-                    name="p",
-                    repo="O/p",
-                    worker_memory=32768,
-                    worker_cores=16,
-                    worker_disk_size=100,
-                ),
-            ],
+            pool=PoolConfig(
+                size=8,
+                template_vm_id=9000,
+                storage="ssd-pool",
+                worker_memory=32768,
+                worker_cores=16,
+                worker_disk_size=100,
+                max_task_duration=7200,
+            ),
         )
         save_config(original, path)
         loaded = load_config(path)
-        assert loaded.projects[0].worker_memory == 32768
-        assert loaded.projects[0].worker_cores == 16
-        assert loaded.projects[0].worker_disk_size == 100
+        assert loaded.pool.size == 8
+        assert loaded.pool.template_vm_id == 9000
+        assert loaded.pool.worker_memory == 32768
+        assert loaded.pool.worker_cores == 16
+        assert loaded.pool.worker_disk_size == 100
+        assert loaded.pool.max_task_duration == 7200
 
-    def test_load_legacy_config_without_worker_specs(self, tmp_path):
-        """Old configs without worker_memory/cores/disk_size get correct defaults."""
+    def test_load_legacy_config_without_pool(self, tmp_path):
+        """Old configs without pool section get correct defaults."""
         path = tmp_path / "config.yaml"
         path.write_text(
             yaml.dump(
                 {
                     "projects": [
-                        {"name": "old", "repo": "O/old", "workers": 1}
+                        {"name": "old", "repo": "O/old"}
                     ]
                 }
             )
         )
         cfg = load_config(path)
-        assert cfg.projects[0].worker_memory == 16384
-        assert cfg.projects[0].worker_cores == 8
-        assert cfg.projects[0].worker_disk_size == 30
+        assert cfg.pool.size == 4
+        assert cfg.pool.template_vm_id == 0
+        assert cfg.pool.worker_memory == 16384
 
     def test_save_creates_parent_dirs(self, tmp_path):
         path = tmp_path / "sub" / "dir" / "config.yaml"

@@ -1,0 +1,28 @@
+services:
+  pool-manager:
+    image: ${ORCEST_IMAGE:-orcest:latest}
+    volumes:
+      - ${FLEET_CONFIG:-/etc/orcest/fleet.yaml}:/home/orcest/app/config/fleet.yaml:ro
+    entrypoint: ["orcest", "pool-manage", "--config", "/home/orcest/app/config/fleet.yaml"]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    mem_limit: 512m
+    networks:
+      - orcest
+
+networks:
+  orcest:
+    external: true
+    name: orcest

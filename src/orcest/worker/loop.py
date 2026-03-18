@@ -327,6 +327,15 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 exc_info=True,
             )
 
+        # Ephemeral mode: signal pool manager and exit after one task.
+        if config.ephemeral:
+            try:
+                redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
+            except Exception:
+                logger.warning("Failed to set pool:done key", exc_info=True)
+            logger.info("Ephemeral mode: task complete, shutting down.")
+            shutdown = True
+
     logger.info("Worker shut down cleanly.")
 
 
