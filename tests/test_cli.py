@@ -423,6 +423,22 @@ def test_dead_letters_cli_redis_connection_failure(mocker, runner):
     assert "Cannot connect to Redis" in result.stderr
 
 
+def test_dead_letters_cli_zero_count_exits_error(runner):
+    """dead-letters --count=0 exits 1 with a clear error before connecting to Redis."""
+    result = runner.invoke(main, ["dead-letters", "localhost", "--count", "0"])
+
+    assert result.exit_code == 1
+    assert "count must be a positive integer" in result.stderr
+
+
+def test_dead_letters_cli_negative_count_exits_error(runner):
+    """dead-letters --count=-1 exits 1 with a clear error before connecting to Redis."""
+    result = runner.invoke(main, ["dead-letters", "localhost", "--count", "-1"])
+
+    assert result.exit_code == 1
+    assert "count must be a positive integer" in result.stderr
+
+
 def test_dead_letters_cli_lists_tasks(mocker, runner, fake_redis_client):
     """dead-letters command lists entries via the CLI runner."""
     fake_redis_client.xadd("orcest:dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)

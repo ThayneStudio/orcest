@@ -145,8 +145,11 @@ class RedisClient:
             raise ValueError(f"maxlen must be positive, got {maxlen}")
         if not fields:
             raise ValueError("fields must be a non-empty dict")
-        entry_id: str = self._client.xadd(  # type: ignore[assignment, arg-type]
-            self._prefixed(stream), fields, maxlen=maxlen, approximate=True
+        entry_id: str = self._client.xadd(  # type: ignore[assignment]
+            self._prefixed(stream),
+            fields,  # type: ignore[arg-type]
+            maxlen=maxlen,
+            approximate=True,
         )
         return entry_id
 
@@ -248,7 +251,9 @@ class RedisClient:
         return int(count)
 
     def xdel(self, stream: str, *entry_ids: str) -> int:
-        """Delete entries from a stream by ID. Returns number deleted."""
+        """Delete entries from a stream by ID. Returns 0 immediately if no IDs given."""
+        if not entry_ids:
+            return 0
         result: int = self._client.xdel(self._prefixed(stream), *entry_ids)  # type: ignore[assignment]
         return result
 
@@ -288,8 +293,11 @@ class RedisClient:
         return bool(self._client.exists(self._prefixed(key)))
 
     def delete(self, *keys: str) -> int:
-        """DEL key [key ...]."""
-        return self._client.delete(*(self._prefixed(k) for k in keys))
+        """DEL key [key ...]. Returns 0 immediately if no keys given."""
+        if not keys:
+            return 0
+        result: int = self._client.delete(*(self._prefixed(k) for k in keys))  # type: ignore[assignment]
+        return result
 
     def incr(self, key: str) -> int:
         """INCR key."""
@@ -320,6 +328,59 @@ class RedisClient:
         result: int = self._client.hset(self._prefixed(key), field, value)  # type: ignore[assignment]
         return result
 
+    # ------------------------------------------------------------------
+    # Set operations (auto-prefix)
+    # ------------------------------------------------------------------
+
+    def sadd(self, key: str, *members: str) -> int:
+        """SADD key member [member ...]. Returns 0 immediately if no members given."""
+        if not members:
+            return 0
+        result: int = self._client.sadd(self._prefixed(key), *members)  # type: ignore[assignment]
+        return result
+
+    def srem(self, key: str, *members: str) -> int:
+        """SREM key member [member ...]. Returns 0 immediately if no members given."""
+        if not members:
+            return 0
+        result: int = self._client.srem(self._prefixed(key), *members)  # type: ignore[assignment]
+        return result
+
+    def smembers(self, key: str) -> set[str]:
+        """SMEMBERS key."""
+        result: set[str] = self._client.smembers(self._prefixed(key))  # type: ignore[assignment]
+        return result
+
+    def scard(self, key: str) -> int:
+        """SCARD key."""
+        result: int = self._client.scard(self._prefixed(key))  # type: ignore[assignment]
+        return result
+
+    # ------------------------------------------------------------------
+    # Additional hash operations (auto-prefix)
+    # ------------------------------------------------------------------
+
+    def hlen(self, key: str) -> int:
+        """HLEN key."""
+        result: int = self._client.hlen(self._prefixed(key))  # type: ignore[assignment]
+        return result
+
+    def hdel(self, key: str, *fields: str) -> int:
+        """HDEL key field [field ...]. Returns 0 immediately if no fields given."""
+        if not fields:
+            return 0
+        result: int = self._client.hdel(self._prefixed(key), *fields)  # type: ignore[assignment]
+        return result
+
+    # ------------------------------------------------------------------
+    # Stream info operations (auto-prefix)
+    # ------------------------------------------------------------------
+
+    def xinfo_consumers(self, stream: str, group: str) -> list[dict[str, Any]]:
+        """XINFO CONSUMERS stream group."""
+        result: list[dict[str, Any]] = self._client.xinfo_consumers(self._prefixed(stream), group)  # type: ignore[assignment]
+        return result
+
     def scan_iter(self, match: str) -> list[str]:
         """SCAN with match pattern. Returns list of unprefixed keys."""
         return [
@@ -348,11 +409,27 @@ class RedisClient:
 
 
 class PrefixedPipeline:
-    """Pipeline wrapper that automatically prefixes keys."""
+    """Pipeline wrapper that automatically prefixes keys.
+
+    Supports the same context-manager protocol as ``redis.client.Pipeline``:
+    the underlying pipeline is reset on exit so resources are released even
+    if an exception interrupts the batch.
+    """
 
     def __init__(self, pipe: redis.client.Pipeline, prefix: str):  # type: ignore[type-arg]
         self._pipe = pipe
         self._prefix = prefix
+
+    def __enter__(self) -> "PrefixedPipeline":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        self._pipe.reset()
 
     def _prefixed(self, key: str) -> str:
         return self._prefix + key
@@ -373,5 +450,30 @@ class PrefixedPipeline:
         self._pipe.incr(self._prefixed(key))
         return self
 
+    def delete(self, *keys: str) -> "PrefixedPipeline":
+        """DEL key [key ...] (queued in pipeline). No-op if no keys given."""
+        if keys:
+            self._pipe.delete(*(self._prefixed(k) for k in keys))
+        return self
+
+    def sadd(self, key: str, *members: str) -> "PrefixedPipeline":
+        """SADD key member [member ...] (queued in pipeline). No-op if no members given."""
+        if members:
+            self._pipe.sadd(self._prefixed(key), *members)
+        return self
+
+    def srem(self, key: str, *members: str) -> "PrefixedPipeline":
+        """SREM key member [member ...] (queued in pipeline). No-op if no members given."""
+        if members:
+            self._pipe.srem(self._prefixed(key), *members)
+        return self
+
+    def hdel(self, key: str, *fields: str) -> "PrefixedPipeline":
+        """HDEL key field [field ...] (queued in pipeline). No-op if no fields given."""
+        if fields:
+            self._pipe.hdel(self._prefixed(key), *fields)
+        return self
+
     def execute(self) -> list[Any]:
+        """Execute all queued commands. Returns a list with one result per command."""
         return self._pipe.execute()

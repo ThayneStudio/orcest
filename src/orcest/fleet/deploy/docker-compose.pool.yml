@@ -5,24 +5,21 @@ services:
       - ${FLEET_CONFIG:-/etc/orcest/fleet.yaml}:/home/orcest/app/config/fleet.yaml:ro
     entrypoint: ["orcest", "pool-manage", "--config", "/home/orcest/app/config/fleet.yaml"]
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    # Host networking is required so the pool manager can reach the Proxmox
+    # API at 127.0.0.1:8006. Redis is also reachable via 127.0.0.1:6379
+    # (exposed by the redis compose project).
+    network_mode: host
+    environment:
+      ORCEST_REDIS_HOST: "127.0.0.1"
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
+      test: ["CMD", "python", "-c", "import redis; redis.Redis('127.0.0.1').ping()"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
     mem_limit: 512m
-    networks:
-      - orcest
-
-networks:
-  orcest:
-    external: true
-    name: orcest

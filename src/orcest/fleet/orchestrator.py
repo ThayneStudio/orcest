@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 
@@ -61,8 +63,13 @@ def build_image(ssh_target: str) -> None:
     logger.info("Image build succeeded on %s", ssh_target)
 
 
+_DOCKER_IMAGE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$")
+
+
 def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
     """Check whether a Docker image exists on the orchestrator VM."""
+    if not _DOCKER_IMAGE_RE.match(image) or len(image) > 256:
+        raise ValueError(f"Invalid Docker image reference: {image!r}")
     result = _ssh(ssh_target, f"docker image inspect {image} >/dev/null 2>&1")
     return result.returncode == 0
 
@@ -91,7 +98,12 @@ def upload_source(ssh_target: str) -> None:
     staging = tempfile.mkdtemp(prefix="orcest-upload-")
     try:
         # Copy deploy files (Dockerfile, compose files, pyproject.toml) to staging root
-        for fname in ("Dockerfile", "docker-compose.yml", "docker-compose.redis.yml", "pyproject.toml"):
+        deploy_files = (
+            "Dockerfile", "docker-compose.yml",
+            "docker-compose.redis.yml", "docker-compose.pool.yml",
+            "pyproject.toml",
+        )
+        for fname in deploy_files:
             src_path = os.path.join(deploy_dir, fname)
             if not os.path.exists(src_path):
                 raise RuntimeError(f"Missing deploy file: {src_path}")
@@ -106,11 +118,7 @@ def upload_source(ssh_target: str) -> None:
             tarball_path = tmp.name
 
         tar_result = subprocess.run(
-            [
-                "tar", "czf", tarball_path,
-                "Dockerfile", "docker-compose.yml", "docker-compose.redis.yml",
-                "pyproject.toml", "src/",
-            ],
+            ["tar", "czf", tarball_path, *deploy_files, "src/"],
             cwd=staging,
             capture_output=True,
             text=True,
@@ -123,11 +131,22 @@ def upload_source(ssh_target: str) -> None:
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload tarball: {result.stderr.strip()}")
 
-        # Ensure /opt/orcest exists and extract on orchestrator
+        # Ensure /opt/orcest exists, clean stale build-context files (but
+        # preserve the projects/ directory which holds per-project config),
+        # then extract the fresh tarball.
         mkdir_result = _ssh(ssh_target, "mkdir -p /opt/orcest")
         if mkdir_result.returncode != 0:
             raise RuntimeError(
                 f"Failed to create /opt/orcest on {ssh_target}: {mkdir_result.stderr.strip()}"
+            )
+        clean_result = _ssh(
+            ssh_target,
+            "cd /opt/orcest"
+            " && rm -rf src/ Dockerfile docker-compose*.yml pyproject.toml",
+        )
+        if clean_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to clean /opt/orcest on {ssh_target}: {clean_result.stderr.strip()}"
             )
         result = _ssh(ssh_target, "tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/")
         if result.returncode != 0:
@@ -142,11 +161,10 @@ def upload_source(ssh_target: str) -> None:
     finally:
         shutil.rmtree(staging, ignore_errors=True)
         if "tarball_path" in locals():
-            with open(os.devnull, "w"):
-                try:
-                    os.unlink(tarball_path)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tarball_path)
+            except OSError:
+                pass
 
 
 def ensure_redis_stack(ssh_target: str) -> None:
@@ -154,7 +172,7 @@ def ensure_redis_stack(ssh_target: str) -> None:
 
     Starts (or updates) the shared Redis service from docker-compose.redis.yml.
     This creates the ``orcest`` Docker network that per-project stacks join.
-    Idempotent — safe to call if Redis is already running.
+    Idempotent -- safe to call if Redis is already running.
     """
     logger.info("Ensuring shared Redis stack on %s", ssh_target)
     result = _ssh(
@@ -172,16 +190,19 @@ def ensure_redis_stack(ssh_target: str) -> None:
     logger.info("Shared Redis stack running on %s", ssh_target)
 
 
-def ensure_pool_manager(ssh_target: str, fleet_config_path: str = "/etc/orcest/fleet.yaml") -> None:
+def ensure_pool_manager(
+    ssh_target: str, fleet_config_path: str = "/etc/orcest/config.yaml",
+) -> None:
     """Ensure the pool manager stack is running.
 
     Starts (or updates) the pool manager service from docker-compose.pool.yml.
     Requires the Redis stack to be running first.
     """
     logger.info("Ensuring pool manager on %s", ssh_target)
+    quoted_path = shlex.quote(fleet_config_path)
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && FLEET_CONFIG={fleet_config_path} docker compose"
+        f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
         " -f docker-compose.pool.yml"
         " -p orcest-pool"
         " up -d",
@@ -291,9 +312,13 @@ def write_project_files(
             f"mv {remote_tmp_env} {pdir}/.env && chmod 600 {pdir}/.env",
         )
         if result.returncode != 0:
+            _ssh(ssh_target, f"rm -f {remote_tmp_env}")
             raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
     finally:
-        os.unlink(tmp_env_path)
+        try:
+            os.unlink(tmp_env_path)
+        except OSError:
+            pass
 
     # Write config/orchestrator.yaml via temp file + scp + mv
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
@@ -311,11 +336,28 @@ def write_project_files(
             f" && chmod 644 {pdir}/config/orchestrator.yaml",
         )
         if result.returncode != 0:
+            _ssh(ssh_target, f"rm -f {remote_tmp_config}")
             raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
     finally:
-        os.unlink(tmp_config_path)
+        try:
+            os.unlink(tmp_config_path)
+        except OSError:
+            pass
 
     logger.info("Project files written for %s on %s", project_name, ssh_target)
+
+
+def _validate_env_value(value: str, name: str) -> None:
+    """Raise ValueError if *value* contains characters unsafe for .env files.
+
+    Values are single-quoted in the generated .env file, so single quotes
+    within the value would break quoting.  Newlines, carriage returns, and
+    null bytes are always forbidden.
+    """
+    if any(c in value for c in ("\n", "\r", "\0")):
+        raise ValueError(f"{name} must not contain newlines or null bytes")
+    if "'" in value:
+        raise ValueError(f"{name} must not contain single quotes")
 
 
 def generate_env_file(
@@ -323,15 +365,21 @@ def generate_env_file(
     key_prefix: str,
     project_name: str,
 ) -> str:
-    """Generate .env file content for a project's Docker Compose stack."""
-    if any(c in github_token for c in ("\n", "\r", "\0")):
-        raise ValueError("github_token must not contain newlines or null bytes")
+    """Generate .env file content for a project's Docker Compose stack.
+
+    Values are single-quoted to prevent Docker Compose from performing
+    variable interpolation (``$`` references) or word splitting.
+    """
+    _validate_project_name(project_name)
+    _validate_env_value(github_token, "github_token")
+    _validate_env_value(key_prefix, "key_prefix")
+    _validate_env_value(project_name, "project_name")
     return (
-        f"GITHUB_TOKEN={github_token}\n"
-        f"GH_TOKEN={github_token}\n"
-        f"ORCEST_REDIS_KEY_PREFIX={key_prefix}\n"
-        f"ORCEST_IMAGE=orcest:latest\n"
-        f"ORCEST_CONFIG_DIR=/opt/orcest/projects/{project_name}/config\n"
+        f"GITHUB_TOKEN='{github_token}'\n"
+        f"GH_TOKEN='{github_token}'\n"
+        f"ORCEST_REDIS_KEY_PREFIX='{key_prefix}'\n"
+        f"ORCEST_IMAGE='orcest:latest'\n"
+        f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'\n"
     )
 
 

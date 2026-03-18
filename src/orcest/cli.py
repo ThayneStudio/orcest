@@ -17,6 +17,7 @@ from orcest.fleet.cli import fleet
 from orcest.shared.models import DEAD_LETTER_METADATA_FIELDS, DEAD_LETTER_STREAM
 
 if TYPE_CHECKING:
+    from orcest.shared.config import RedisConfig
     from orcest.shared.redis_client import RedisClient
 
 _SSH_INPUT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -43,6 +44,46 @@ def _parse_redis_host(redis_host: str) -> tuple[str, int]:
     else:
         host, port = redis_host, 6379
     return host, port
+
+
+def _resolve_redis_config(
+    redis_host: str | None,
+    config_path: str,
+    prefix: str | None,
+) -> RedisConfig:
+    """Build a RedisConfig from a CLI redis_host argument or config file.
+
+    When ``redis_host`` is provided (e.g. ``10.0.0.5`` or ``10.0.0.5:6380``),
+    host/port are parsed from it (taking precedence over ORCEST_REDIS_HOST /
+    ORCEST_REDIS_PORT env vars) while remaining fields (password, key_prefix)
+    come from env vars via ``build_redis_config``.  Otherwise the YAML at
+    ``config_path`` is loaded and its redis section is used (again via
+    ``build_redis_config`` so env vars take precedence).
+
+    Only the ``redis`` section of the config file is needed -- the full
+    orchestrator validation (e.g. github.repo required) is intentionally
+    skipped so that ``orcest status`` and ``orcest dead-letters`` work
+    without a fully populated orchestrator config.
+
+    The optional ``prefix`` overrides the key_prefix in either case.
+    """
+    from orcest.shared.config import _load_yaml, build_redis_config
+
+    if redis_host:
+        host, port = _parse_redis_host(redis_host)
+        # Build config from env vars (picks up ORCEST_REDIS_PASSWORD,
+        # ORCEST_REDIS_KEY_PREFIX, etc.), then override host/port with
+        # the explicit CLI argument which should take highest precedence.
+        redis_cfg = build_redis_config()
+        redis_cfg.host = host
+        redis_cfg.port = port
+    else:
+        raw = _load_yaml(config_path)
+        redis_cfg = build_redis_config(raw)
+
+    if prefix:
+        redis_cfg.key_prefix = prefix
+    return redis_cfg
 
 
 @click.group()
@@ -97,23 +138,9 @@ def status(
     Use --once for single-shot output. Use --prefix to specify the project's
     key prefix when connecting directly via REDIS_HOST.
     """
-    from orcest.shared.config import RedisConfig
     from orcest.shared.redis_client import RedisClient
 
-    if redis_host:
-        host, port = _parse_redis_host(redis_host)
-        redis_cfg = RedisConfig(
-            host=host, port=port, db=0,
-            key_prefix=prefix or "orcest",
-        )
-    else:
-        from orcest.shared.config import load_orchestrator_config
-
-        cfg = load_orchestrator_config(config)
-        redis_cfg = cfg.redis
-        if prefix:
-            redis_cfg.key_prefix = prefix
-
+    redis_cfg = _resolve_redis_config(redis_host, config, prefix)
     redis = RedisClient(redis_cfg)
 
     if not redis.health_check():
@@ -234,23 +261,13 @@ def dead_letters(
     Connects to Redis directly via REDIS_HOST (e.g. 10.20.0.19 or
     10.20.0.19:6380), or falls back to --config file.
     """
-    from orcest.shared.config import RedisConfig
     from orcest.shared.redis_client import RedisClient
 
-    if redis_host:
-        host, port = _parse_redis_host(redis_host)
-        redis_cfg = RedisConfig(
-            host=host, port=port, db=0,
-            key_prefix=prefix or "orcest",
-        )
-    else:
-        from orcest.shared.config import load_orchestrator_config
+    if count < 1:
+        click.echo("Error: --count must be a positive integer.", err=True)
+        raise SystemExit(1)
 
-        cfg = load_orchestrator_config(config)
-        redis_cfg = cfg.redis
-        if prefix:
-            redis_cfg.key_prefix = prefix
-
+    redis_cfg = _resolve_redis_config(redis_host, config, prefix)
     redis = RedisClient(redis_cfg)
 
     if not redis.health_check():
@@ -591,7 +608,7 @@ def init():
         " --github-token ... --claude-token ..."
     )
     console.print(
-        f"     GitHub token: classic PAT with [bold]repo + workflow[/bold] scopes,"
+        "     GitHub token: classic PAT with [bold]repo + workflow[/bold] scopes,"
         " or fine-grained with contents/issues/PRs/actions R/W"
     )
     console.print(f"  {step + 1}. Create orchestrator VM:    orcest fleet create-orchestrator")
@@ -625,7 +642,7 @@ def upgrade():
         text=True,
     )
     if result.returncode != 0:
-        console.print(f"[red]failed[/red]")
+        console.print("[red]failed[/red]")
         console.print(f"    {result.stderr.strip()}")
         raise SystemExit(1)
     console.print("[green]ok[/green]")
@@ -882,7 +899,7 @@ def pool_manage(config: str, interval: float) -> None:
     from orcest.fleet.config import load_config
     from orcest.fleet.pool_manager import PoolManager
     from orcest.fleet.proxmox_api import ProxmoxClient
-    from orcest.shared.config import RedisConfig
+    from orcest.shared.config import build_redis_config
     from orcest.shared.redis_client import RedisClient
 
     _logging.basicConfig(
@@ -912,9 +929,9 @@ def pool_manage(config: str, interval: float) -> None:
         node=cfg.proxmox.node,
     )
 
-    # Connect to Redis on the orchestrator host
-    redis_host = cfg.orchestrator.host or "localhost"
-    redis_cfg = RedisConfig(host=redis_host, port=6379, key_prefix="orcest")
+    # Build Redis config from ORCEST_REDIS_* env vars (set by Docker Compose),
+    # falling back to defaults (localhost:6379, prefix "orcest").
+    redis_cfg = build_redis_config()
     redis = RedisClient(redis_cfg)
 
     if not redis.health_check():

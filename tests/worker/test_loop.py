@@ -642,6 +642,46 @@ class TestRunWorker:
         assert result_fields["status"] == ResultStatus.COMPLETED.value
         assert result_fields["task_id"] == sample_task.id
 
+    def test_worker_processes_issue_task_from_fallback_stream(
+        self, mocker, worker_config, sample_task
+    ):
+        """When the PR stream is empty, the worker falls through to the issue
+        stream and processes the task found there.  The ACK targets the issue
+        stream, not the PR stream."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+
+        task_fields = sample_task.to_dict()
+        normal_call_count = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal normal_call_count
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            # PR stream is checked first (non-blocking) -- return empty
+            # Issue stream is checked second (blocking) -- return task on first pass
+            if normal_call_count == 1:
+                return []  # PR stream empty
+            if normal_call_count == 2:
+                return [("entry-1", task_fields)]  # issue stream has task
+            # Trigger shutdown on subsequent calls
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
+            if handler:
+                handler(signal.SIGTERM, None)
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner was called
+        mocks["runner"].run.assert_called_once()
+        # ACK must target the issue stream (not the PR stream)
+        issue_stream = f"tasks:issue:{worker_config.backend}"
+        mock_redis.xack.assert_any_call(issue_stream, CONSUMER_GROUP, "entry-1")
+
     def test_worker_acquires_lock(self, mocker, worker_config, sample_task):
         """run_worker acquires a Redis lock keyed by the task's resource_id."""
         mock_redis = self._build_mock_redis()
@@ -703,6 +743,21 @@ class TestRunWorker:
         assert parsed.task_id == sample_task.id
         assert parsed.worker_id == worker_config.worker_id
         assert parsed.resource_id == sample_task.resource_id
+
+    def test_worker_clears_pending_marker_after_success(self, mocker, worker_config, sample_task):
+        """After a successful task, the pending-task marker is cleared so the
+        orchestrator can re-enqueue if needed."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        mock_clear = mocker.patch("orcest.worker.loop.clear_pending_task")
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        mock_clear.assert_called_once_with(
+            mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+        )
 
     def test_worker_handles_runner_failure(self, mocker, worker_config, sample_task):
         """When the runner returns success=False, the result has FAILED status."""
@@ -792,9 +847,11 @@ class TestRunWorker:
 
     def test_worker_drains_pending_on_startup(self, mocker, worker_config, sample_task):
         """On startup, pending (unACKed) tasks from a previous lifecycle are
-        drained: a FAILED result is published and the entry is ACKed."""
+        drained: a FAILED result is published, the entry is ACKed, and the
+        pending-task marker is cleared so the orchestrator can re-enqueue."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_clear = mocker.patch("orcest.worker.loop.clear_pending_task")
 
         task_fields = sample_task.to_dict()
         pending_calls = 0
@@ -819,8 +876,12 @@ class TestRunWorker:
         # Runner should NOT have been called (pending tasks are not re-executed)
         mocks["runner"].run.assert_not_called()
         # A FAILED result should have been published for the pending task
-        mock_redis.xadd.assert_called_once()
-        stream, result_dict = mock_redis.xadd.call_args[0]
+        # (via xadd_capped to cap the results stream)
+        drain_results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(drain_results_calls) == 1
+        stream, result_dict = drain_results_calls[0][0][:2]
         assert stream == RESULTS_STREAM
         parsed = TaskResult.from_dict(result_dict)
         assert parsed.status == ResultStatus.FAILED
@@ -829,6 +890,50 @@ class TestRunWorker:
         # The pending entry must be ACKed
         expected_stream = f"tasks:{worker_config.backend}"
         mock_redis.xack.assert_any_call(expected_stream, CONSUMER_GROUP, "pending-1")
+        # The pending-task marker must be cleared so the orchestrator can re-enqueue
+        mock_clear.assert_any_call(
+            mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+        )
+
+    def test_worker_drain_clears_pending_marker_even_on_publish_failure(
+        self, mocker, worker_config, sample_task
+    ):
+        """When the recovery result publish fails during drain, the pending-task
+        marker must still be cleared so the orchestrator can re-enqueue the task
+        instead of waiting for the marker's TTL to expire (~95 min)."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_clear = mocker.patch("orcest.worker.loop.clear_pending_task")
+
+        # Make the results-stream publish fail during drain
+        mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
+
+        task_fields = sample_task.to_dict()
+        pending_calls = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal pending_calls
+            if kwargs.get("pending", False):
+                pending_calls += 1
+                if pending_calls == 1:
+                    return [("pending-1", task_fields)]
+                return []
+            # No new tasks -- trigger shutdown immediately
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
+            if handler:
+                handler(signal.SIGTERM, None)
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner should NOT have been called (pending tasks are not re-executed)
+        mocks["runner"].run.assert_not_called()
+        # The pending-task marker must still be cleared despite publish failure
+        mock_clear.assert_any_call(
+            mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+        )
 
     def test_abort_event_fires_on_sigterm(self, mocker, worker_config, sample_task):
         """The abort_event passed to _execute_task is set when SIGTERM fires,
@@ -998,6 +1103,31 @@ class TestRunWorker:
         ]
         assert len(dl_calls) == 1, "expected exactly one dead-letter entry"
 
+    def test_worker_dead_letter_clears_pending_marker(
+        self, mocker, worker_config, sample_task
+    ):
+        """When a task is dead-lettered, the pending-task marker is cleared so
+        the orchestrator can re-enqueue work for the resource immediately
+        rather than waiting ~95 min for marker TTL expiry."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_clear = mocker.patch("orcest.worker.loop.clear_pending_task")
+
+        # Delivery count above threshold triggers dead-letter path
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT + 1
+
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called (task was dead-lettered)
+        mocks["runner"].run.assert_not_called()
+
+        # Pending-task marker must be cleared
+        mock_clear.assert_called_once_with(
+            mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+        )
+
     def test_worker_processes_task_below_max_delivery_count(
         self, mocker, worker_config, sample_task
     ):
@@ -1109,6 +1239,83 @@ class TestRunWorker:
         # Worker still exited (runner was called once, no hang)
         mocks["runner"].run.assert_called_once()
 
+    def test_ephemeral_worker_exits_even_on_publish_failure(
+        self, mocker, worker_config, sample_task
+    ):
+        """Ephemeral worker still exits and sets pool:done even when result publish fails.
+
+        When the result cannot be published, the ephemeral exit path ACKs the
+        entry and clears the pending-task marker to prevent an orphaned PEL
+        entry and a stale marker blocking re-enqueue (the VM will be destroyed
+        so no future drain will ever claim it).
+        """
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        # Make result publish fail (xadd_capped raises on every attempt)
+        mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
+        mocker.patch("orcest.worker.loop.time.sleep")  # avoid real sleeps during retries
+        mock_clear = mocker.patch("orcest.worker.loop.clear_pending_task")
+
+        task_fields = sample_task.to_dict()
+        expected_stream = f"tasks:{worker_config.backend}"
+
+        def xreadgroup_side_effect(**kwargs):
+            if kwargs.get("pending", False):
+                return []
+            return [("entry-1", task_fields)]
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Worker still exited (runner was called once, no hang)
+        mocks["runner"].run.assert_called_once()
+        # pool:done key was still set despite publish failure
+        mock_redis.set_ex.assert_called_once()
+        assert "pool:done:" in mock_redis.set_ex.call_args[0][0]
+        # Entry was ACKed on the ephemeral exit path to prevent orphaned PEL
+        mock_redis.xack.assert_called_once_with(expected_stream, CONSUMER_GROUP, "entry-1")
+        # Pending-task marker was cleared so orchestrator can re-enqueue
+        mock_clear.assert_called_once_with(
+            mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+        )
+
+    def test_ephemeral_worker_exits_on_runner_failure(
+        self, mocker, worker_config, sample_task
+    ):
+        """Ephemeral worker exits and sets pool:done even when the runner fails."""
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _failure_runner_result()
+
+        task_fields = sample_task.to_dict()
+
+        def xreadgroup_side_effect(**kwargs):
+            if kwargs.get("pending", False):
+                return []
+            return [("entry-1", task_fields)]
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner was called exactly once
+        mocks["runner"].run.assert_called_once()
+        # Result was published with FAILED status
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_fields = results_calls[0][0][1]
+        assert result_fields["status"] == ResultStatus.FAILED.value
+        # pool:done key was set despite task failure
+        mock_redis.set_ex.assert_called_once_with(
+            f"pool:done:{worker_config.worker_id}", "1", ttl=300
+        )
+
     def test_non_ephemeral_worker_continues_looping(self, mocker, worker_config, sample_task):
         """Default (non-ephemeral) worker does NOT exit after one task and
         does NOT set pool:done key."""
@@ -1124,6 +1331,89 @@ class TestRunWorker:
         mocks["runner"].run.assert_called_once()
         # pool:done key must NOT have been set
         mock_redis.set_ex.assert_not_called()
+
+    def test_ephemeral_worker_exits_after_dead_lettered_task(
+        self, mocker, worker_config, sample_task
+    ):
+        """When an ephemeral worker receives a task that gets dead-lettered
+        (delivery count >= MAX_DELIVERY_COUNT), the worker sets pool:done
+        and exits cleanly instead of looping indefinitely on an empty queue.
+        """
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Delivery count above threshold triggers dead-letter path
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT + 1
+
+        task_fields = sample_task.to_dict()
+        normal_call_count = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal normal_call_count
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            if normal_call_count == 1:
+                return [("entry-1", task_fields)]
+            # Should never reach here -- ephemeral mode exits after dead-letter
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called (task was dead-lettered)
+        mocks["runner"].run.assert_not_called()
+        # Dead-letter stream received the task
+        dl_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == DEAD_LETTER_STREAM
+        ]
+        assert len(dl_calls) == 1
+        # pool:done key was set (ephemeral exit)
+        mock_redis.set_ex.assert_called_once_with(
+            f"pool:done:{worker_config.worker_id}", "1", ttl=300
+        )
+        # Worker exited after one task (no second xreadgroup for normal tasks)
+        assert normal_call_count == 1
+
+    def test_non_ephemeral_worker_continues_after_dead_lettered_task(
+        self, mocker, worker_config, sample_task
+    ):
+        """Non-ephemeral workers loop back to read more tasks after dead-lettering."""
+        assert not worker_config.ephemeral
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Delivery count above threshold triggers dead-letter path
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT + 1
+
+        task_fields = sample_task.to_dict()
+        normal_call_count = 0
+
+        def xreadgroup_side_effect(**kwargs):
+            nonlocal normal_call_count
+            if kwargs.get("pending", False):
+                return []
+            normal_call_count += 1
+            if normal_call_count == 1:
+                return [("entry-1", task_fields)]
+            # After dead-lettering, trigger SIGTERM to exit
+            handler = mocks["signal_handlers"].get(signal.SIGTERM)
+            if handler:
+                handler(signal.SIGTERM, None)
+            return []
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # Runner must NOT have been called (task was dead-lettered)
+        mocks["runner"].run.assert_not_called()
+        # pool:done was NOT set (not ephemeral)
+        mock_redis.set_ex.assert_not_called()
+        # Worker looped back after dead-lettering (second xreadgroup call happened)
+        assert normal_call_count >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1469,50 @@ class TestDeadLetterTask:
 
         # xack must still be called despite the publish failure
         mock_redis.xack.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-99")
+
+    def test_clears_pending_task_marker(self, local_worker_config, sample_task):
+        """_dead_letter_task clears the pending-task marker so the orchestrator
+        can re-enqueue work for the resource immediately."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xack.return_value = 1
+
+        with patch("orcest.worker.loop.clear_pending_task") as mock_clear:
+            _dead_letter_task(
+                mock_redis,
+                "tasks:claude",
+                "entry-42",
+                sample_task,
+                5,
+                logging.getLogger("test"),
+            )
+
+            mock_clear.assert_called_once_with(
+                mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+            )
+
+    def test_clears_pending_marker_even_when_publish_and_ack_fail(
+        self, local_worker_config, sample_task
+    ):
+        """Pending-task marker is cleared even if both the dead-letter publish
+        and ACK fail, so the orchestrator is not blocked for ~95 min."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
+        mock_redis.xack.side_effect = ConnectionError("Redis unavailable")
+
+        with patch("orcest.worker.loop.clear_pending_task") as mock_clear:
+            _dead_letter_task(
+                mock_redis,
+                "tasks:claude",
+                "entry-99",
+                sample_task,
+                3,
+                logging.getLogger("test"),
+            )
+
+            mock_clear.assert_called_once_with(
+                mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1667,7 @@ class TestPublishResultWithRetry:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.unit
 class TestCheckGhCredentials:
     """Unit tests for the startup OAuth-token detector."""
 
@@ -1414,3 +1749,64 @@ class TestCheckGhCredentials:
         with caplog.at_level(logging.WARNING, logger="test.creds"):
             self._run(tmp_path, logger)
         assert not caplog.records
+
+    def test_corrupt_hosts_yml_logs_warning(self, tmp_path, caplog, monkeypatch):
+        """When hosts.yml contains invalid YAML, a warning is logged but no crash."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text("[invalid yaml {{{{")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert any("Could not read" in r.message for r in caplog.records)
+
+    def test_non_dict_hosts_yml_no_crash(self, tmp_path, caplog, monkeypatch):
+        """When hosts.yml parses to a non-dict (e.g. a list), no crash occurs."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text("- item1\n- item2\n")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        # Should not crash, and no OAuth warning should be emitted
+        assert not any("OAuth" in r.message for r in caplog.records)
+
+    def test_non_dict_host_entry_skipped(self, tmp_path, caplog, monkeypatch):
+        """When a host entry is a non-dict (e.g. a string), it is skipped."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text("github.com: just-a-string\n")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not any("OAuth" in r.message for r in caplog.records)
+
+    def test_non_string_token_skipped(self, tmp_path, caplog, monkeypatch):
+        """When oauth_token is not a string (e.g. an integer or null), it is skipped."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text("github.com:\n  oauth_token: 12345\n  user: testuser\n")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not any("OAuth" in r.message for r in caplog.records)
+
+    def test_null_token_skipped(self, tmp_path, caplog, monkeypatch):
+        """When oauth_token is null, it is skipped without error."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts_file = tmp_path / ".config" / "gh" / "hosts.yml"
+        hosts_file.parent.mkdir(parents=True)
+        hosts_file.write_text("github.com:\n  oauth_token: null\n  user: testuser\n")
+        logger = logging.getLogger("test.creds")
+        with caplog.at_level(logging.WARNING, logger="test.creds"):
+            self._run(tmp_path, logger)
+        assert not any("OAuth" in r.message for r in caplog.records)

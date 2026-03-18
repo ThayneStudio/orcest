@@ -6,12 +6,16 @@ services:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
     environment:
       - GITHUB_TOKEN
+      - GH_TOKEN=${GITHUB_TOKEN}
+      - ORCEST_REDIS_HOST=redis
+      - ORCEST_REDIS_KEY_PREFIX
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:

@@ -1,5 +1,7 @@
 """Tests for orcest.fleet.cli."""
 
+import time
+
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -258,6 +260,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.provisioner.apply")
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.99")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
@@ -498,7 +501,7 @@ def test_create_template_cloud_init_failure_cleans_up(runner, cfg_path, mocker):
 
 
 def test_create_template_ip_timeout(runner, cfg_path, mocker):
-    """create-template aborts if VM IP times out."""
+    """create-template aborts and cleans up if VM IP times out."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
@@ -512,14 +515,15 @@ def test_create_template_ip_timeout(runner, cfg_path, mocker):
     )
     assert result.exit_code != 0
     assert "timed out" in result.output
+    mock_px.destroy_vm.assert_called_once_with(200)
 
 
 def test_create_template_ssh_timeout(runner, cfg_path, mocker):
-    """create-template aborts if SSH times out."""
+    """create-template aborts and cleans up if SSH times out."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
-    _mock_proxmox_client(mocker)
+    mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
 
@@ -529,14 +533,15 @@ def test_create_template_ssh_timeout(runner, cfg_path, mocker):
     )
     assert result.exit_code != 0
     assert "SSH not available" in result.output
+    mock_px.destroy_vm.assert_called_once_with(200)
 
 
 def test_create_template_cloud_init_timeout(runner, cfg_path, mocker):
-    """create-template aborts if cloud-init times out."""
+    """create-template aborts and cleans up if cloud-init times out."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
-    _mock_proxmox_client(mocker)
+    mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=False)
@@ -547,14 +552,15 @@ def test_create_template_cloud_init_timeout(runner, cfg_path, mocker):
     )
     assert result.exit_code != 0
     assert "Cloud-init timed out" in result.output
+    mock_px.destroy_vm.assert_called_once_with(200)
 
 
 def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
-    """create-template aborts if disabling cloud-init fails."""
+    """create-template aborts and cleans up if disabling cloud-init fails."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
-    _mock_proxmox_client(mocker)
+    mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -569,6 +575,46 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     )
     assert result.exit_code != 0
     assert "permission denied" in result.output
+    mock_px.destroy_vm.assert_called_once_with(200)
+
+
+def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
+    """create-template aborts and cleans up if VM stop times out."""
+    cfg = _proxmox_cfg()
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch(
+        "orcest.fleet.cli._ssh_run",
+        return_value=mocker.MagicMock(returncode=0),
+    )
+    # VM never reaches "stopped" state
+    mock_px.get_vm_status.return_value = "running"
+    # Patch time.monotonic to simulate deadline expiry without sleeping
+    original_monotonic = time.monotonic
+    call_count = 0
+
+    def fast_monotonic():
+        nonlocal call_count
+        call_count += 1
+        # First call sets the deadline, subsequent calls exceed it
+        if call_count <= 1:
+            return original_monotonic()
+        return original_monotonic() + 120  # well past 60s deadline
+
+    mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=fast_monotonic)
+    mocker.patch("orcest.fleet.cli.time.sleep")
+
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
+    )
+    assert result.exit_code != 0
+    assert "timed out" in result.output
+    mock_px.destroy_vm.assert_called_once_with(200)
 
 
 # ── pool-status tests ───────────────────────────────────────
@@ -618,8 +664,9 @@ def test_pool_status_with_template_and_vms(runner, cfg_path, mocker):
 
     mock_px = _mock_proxmox_client(mocker)
     mock_px.get_vm_status.return_value = "stopped"
-    # Mock listing VMs
-    mock_px._api.nodes.return_value.qemu.get.return_value = [
+    # Mock listing VMs -- list_vms(name_prefix="orcest-worker-") already
+    # filters by prefix, so only return matching VMs.
+    mock_px.list_vms.return_value = [
         {
             "vmid": 201,
             "name": "orcest-worker-1",
@@ -633,13 +680,6 @@ def test_pool_status_with_template_and_vms(runner, cfg_path, mocker):
             "status": "stopped",
             "cpus": 8,
             "maxmem": 16384 * 1024 * 1024,
-        },
-        {
-            "vmid": 100,
-            "name": "unrelated-vm",
-            "status": "running",
-            "cpus": 4,
-            "maxmem": 4096 * 1024 * 1024,
         },
     ]
 
@@ -674,7 +714,7 @@ def test_pool_status_no_worker_vms(runner, cfg_path, mocker):
 
     mock_px = _mock_proxmox_client(mocker)
     mock_px.get_vm_status.return_value = "stopped"
-    mock_px._api.nodes.return_value.qemu.get.return_value = []
+    mock_px.list_vms.return_value = []
 
     result = runner.invoke(fleet, ["pool-status", "--config", cfg_path])
     assert result.exit_code == 0

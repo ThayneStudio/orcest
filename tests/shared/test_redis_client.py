@@ -395,3 +395,453 @@ def test_xpending_count_returns_zero_on_error(fake_redis_client, mocker):
     )
     count = fake_redis_client.xpending_count("test-stream", "test-group", "1-0")
     assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for set operations (sadd, srem, smembers, scard)
+# ---------------------------------------------------------------------------
+
+
+def test_sadd_adds_members(fake_redis_client):
+    """sadd adds members to a set and returns the number added."""
+    result = fake_redis_client.sadd("myset", "a", "b", "c")
+    assert result == 3
+
+
+def test_sadd_returns_zero_for_existing_members(fake_redis_client):
+    """sadd returns 0 when all members already exist."""
+    fake_redis_client.sadd("myset", "a", "b")
+    result = fake_redis_client.sadd("myset", "a", "b")
+    assert result == 0
+
+
+def test_srem_removes_members(fake_redis_client):
+    """srem removes members from a set and returns the number removed."""
+    fake_redis_client.sadd("myset", "a", "b", "c")
+    result = fake_redis_client.srem("myset", "a", "c")
+    assert result == 2
+
+
+def test_srem_returns_zero_for_missing_members(fake_redis_client):
+    """srem returns 0 for members that don't exist."""
+    fake_redis_client.sadd("myset", "a")
+    result = fake_redis_client.srem("myset", "z")
+    assert result == 0
+
+
+def test_smembers_returns_set_of_strings(fake_redis_client):
+    """smembers returns a set of strings, not bytes."""
+    fake_redis_client.sadd("myset", "a", "b", "c")
+    result = fake_redis_client.smembers("myset")
+    assert isinstance(result, set)
+    assert result == {"a", "b", "c"}
+    for member in result:
+        assert isinstance(member, str)
+
+
+def test_smembers_empty_set(fake_redis_client):
+    """smembers returns an empty set for a non-existent key."""
+    result = fake_redis_client.smembers("nonexistent")
+    assert result == set()
+
+
+def test_scard_returns_count(fake_redis_client):
+    """scard returns the number of members in the set."""
+    fake_redis_client.sadd("myset", "a", "b", "c")
+    assert fake_redis_client.scard("myset") == 3
+
+
+def test_scard_empty_set(fake_redis_client):
+    """scard returns 0 for a non-existent key."""
+    assert fake_redis_client.scard("nonexistent") == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for hash operations (hlen, hdel)
+# ---------------------------------------------------------------------------
+
+
+def test_hlen_returns_field_count(fake_redis_client):
+    """hlen returns the number of fields in a hash."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+    fake_redis_client.hset("myhash", "f2", "v2")
+    assert fake_redis_client.hlen("myhash") == 2
+
+
+def test_hlen_empty_hash(fake_redis_client):
+    """hlen returns 0 for a non-existent key."""
+    assert fake_redis_client.hlen("nonexistent") == 0
+
+
+def test_hdel_removes_fields(fake_redis_client):
+    """hdel removes fields from a hash and returns the number removed."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+    fake_redis_client.hset("myhash", "f2", "v2")
+    fake_redis_client.hset("myhash", "f3", "v3")
+    result = fake_redis_client.hdel("myhash", "f1", "f3")
+    assert result == 2
+    assert fake_redis_client.hlen("myhash") == 1
+
+
+def test_hdel_returns_zero_for_missing_fields(fake_redis_client):
+    """hdel returns 0 for fields that don't exist."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+    result = fake_redis_client.hdel("myhash", "nonexistent")
+    assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for xinfo_consumers
+# ---------------------------------------------------------------------------
+
+
+def test_xinfo_consumers_returns_consumer_list(fake_redis_client):
+    """xinfo_consumers returns consumer info after a consumer reads from a stream."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"k": "v"})
+    fake_redis_client.xreadgroup(
+        group=group, consumer="c1", stream=stream, block_ms=None
+    )
+
+    consumers = fake_redis_client.xinfo_consumers(stream, group)
+    assert isinstance(consumers, list)
+    assert len(consumers) == 1
+    assert consumers[0]["name"] == "c1"
+    assert consumers[0]["pending"] == 1
+
+
+def test_xinfo_consumers_empty_group(fake_redis_client):
+    """xinfo_consumers returns empty list for a group with no consumers."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    consumers = fake_redis_client.xinfo_consumers(stream, group)
+    assert consumers == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for key prefixing on new methods
+# ---------------------------------------------------------------------------
+
+
+def test_set_operations_use_prefixed_keys(fake_redis_client):
+    """Verify that set operations actually store under prefixed keys."""
+    fake_redis_client.sadd("myset", "a")
+
+    # The raw client should see the key under the prefix
+    raw_keys = list(fake_redis_client.client.scan_iter(match="*myset*"))
+    assert len(raw_keys) == 1
+    assert raw_keys[0] == fake_redis_client._prefix + "myset"
+
+
+def test_hash_operations_use_prefixed_keys(fake_redis_client):
+    """Verify that hlen/hdel operate on prefixed keys."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+
+    # Direct client check to verify prefix
+    raw_val = fake_redis_client.client.hget(
+        fake_redis_client._prefix + "myhash", "f1"
+    )
+    assert raw_val == "v1"
+
+    # hlen via wrapper
+    assert fake_redis_client.hlen("myhash") == 1
+
+    # hdel via wrapper
+    fake_redis_client.hdel("myhash", "f1")
+    assert fake_redis_client.hlen("myhash") == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for PrefixedPipeline
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_sadd_srem_execute(fake_redis_client):
+    """Pipeline sadd and srem batch operations correctly."""
+    fake_redis_client.sadd("myset", "a", "b", "c")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.srem("myset", "a")
+    pipe.sadd("myset", "d")
+    results = pipe.execute()
+
+    assert results[0] == 1  # srem removed 1
+    assert results[1] == 1  # sadd added 1
+    assert fake_redis_client.smembers("myset") == {"b", "c", "d"}
+
+
+def test_pipeline_hdel_execute(fake_redis_client):
+    """Pipeline hdel batches hash field deletions correctly."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+    fake_redis_client.hset("myhash", "f2", "v2")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.hdel("myhash", "f1")
+    pipe.hset("myhash", "f3", "v3")
+    results = pipe.execute()
+
+    assert results[0] == 1  # hdel removed 1
+    assert fake_redis_client.hlen("myhash") == 2
+    assert fake_redis_client.hget("myhash", "f3") == "v3"
+
+
+def test_pipeline_chaining(fake_redis_client):
+    """Pipeline methods return self for fluent chaining."""
+    pipe = fake_redis_client.pipeline()
+    result = (
+        pipe.sadd("myset", "a")
+        .srem("myset", "b")
+        .hdel("myhash", "f1")
+        .hset("myhash", "f2", "v2")
+        .incr("counter")
+        .expire("counter", 60)
+        .hincrby("myhash", "count", 1)
+        .execute()
+    )
+    assert isinstance(result, list)
+
+
+def test_pipeline_uses_prefixed_keys(fake_redis_client):
+    """Pipeline operations actually use prefixed keys in Redis."""
+    pipe = fake_redis_client.pipeline()
+    pipe.sadd("myset", "a")
+    pipe.execute()
+
+    # Verify the key is stored with the prefix
+    raw_members = fake_redis_client.client.smembers(
+        fake_redis_client._prefix + "myset"
+    )
+    assert "a" in raw_members
+
+
+def test_pipeline_delete(fake_redis_client):
+    """Pipeline delete removes keys using the prefix."""
+    fake_redis_client.sadd("myset", "a")
+    fake_redis_client.hset("myhash", "f1", "v1")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.delete("myset", "myhash")
+    results = pipe.execute()
+
+    assert results[0] == 2  # deleted 2 keys
+    assert fake_redis_client.smembers("myset") == set()
+    assert fake_redis_client.hgetall("myhash") == {}
+
+
+def test_pipeline_delete_chaining(fake_redis_client):
+    """Pipeline delete returns self for fluent chaining."""
+    fake_redis_client.sadd("myset", "a")
+
+    result = (
+        fake_redis_client.pipeline()
+        .delete("myset")
+        .sadd("myset", "b")
+        .execute()
+    )
+    assert isinstance(result, list)
+    assert fake_redis_client.smembers("myset") == {"b"}
+
+
+def test_pipeline_context_manager(fake_redis_client):
+    """Pipeline supports context manager protocol."""
+    fake_redis_client.sadd("myset", "a")
+
+    with fake_redis_client.pipeline() as pipe:
+        pipe.sadd("myset", "b")
+        pipe.srem("myset", "a")
+        results = pipe.execute()
+
+    assert results[0] == 1  # sadd added 1
+    assert results[1] == 1  # srem removed 1
+    assert fake_redis_client.smembers("myset") == {"b"}
+
+
+def test_pipeline_context_manager_resets_on_exception(fake_redis_client):
+    """Pipeline resets on exception exit without raising a secondary error."""
+    fake_redis_client.sadd("myset", "a")
+
+    with pytest.raises(ValueError, match="test error"):
+        with fake_redis_client.pipeline() as pipe:
+            pipe.sadd("myset", "b")
+            raise ValueError("test error")
+
+    # The pipeline was not executed, so only "a" should remain
+    assert fake_redis_client.smembers("myset") == {"a"}
+
+
+# ---------------------------------------------------------------------------
+# Tests for empty variadic argument guards
+# ---------------------------------------------------------------------------
+
+
+def test_delete_no_keys_returns_zero(fake_redis_client):
+    """delete() with no keys returns 0 without hitting Redis."""
+    assert fake_redis_client.delete() == 0
+
+
+def test_xdel_no_entry_ids_returns_zero(fake_redis_client):
+    """xdel() with no entry IDs returns 0 without hitting Redis."""
+    fake_redis_client.xadd("test-stream", {"k": "v"})
+    assert fake_redis_client.xdel("test-stream") == 0
+    # The entry should still be in the stream
+    assert fake_redis_client.xlen("test-stream") == 1
+
+
+def test_sadd_no_members_returns_zero(fake_redis_client):
+    """sadd() with no members returns 0 without hitting Redis."""
+    assert fake_redis_client.sadd("myset") == 0
+
+
+def test_srem_no_members_returns_zero(fake_redis_client):
+    """srem() with no members returns 0 without hitting Redis."""
+    fake_redis_client.sadd("myset", "a")
+    assert fake_redis_client.srem("myset") == 0
+    assert fake_redis_client.smembers("myset") == {"a"}
+
+
+def test_hdel_no_fields_returns_zero(fake_redis_client):
+    """hdel() with no fields returns 0 without hitting Redis."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+    assert fake_redis_client.hdel("myhash") == 0
+    assert fake_redis_client.hlen("myhash") == 1
+
+
+def test_pipeline_delete_no_keys_is_noop(fake_redis_client):
+    """Pipeline delete() with no keys is a no-op (does not queue a command)."""
+    fake_redis_client.sadd("myset", "a")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.delete()  # no keys -- should not queue anything
+    pipe.sadd("myset", "b")
+    results = pipe.execute()
+
+    # Only the sadd should have been queued
+    assert len(results) == 1
+    assert results[0] == 1
+    assert fake_redis_client.smembers("myset") == {"a", "b"}
+
+
+def test_pipeline_sadd_no_members_is_noop(fake_redis_client):
+    """Pipeline sadd() with no members is a no-op."""
+    pipe = fake_redis_client.pipeline()
+    pipe.sadd("myset")
+    pipe.incr("counter")
+    results = pipe.execute()
+
+    # Only incr should have been queued
+    assert len(results) == 1
+
+
+def test_pipeline_srem_no_members_is_noop(fake_redis_client):
+    """Pipeline srem() with no members is a no-op."""
+    fake_redis_client.sadd("myset", "a")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.srem("myset")
+    pipe.incr("counter")
+    results = pipe.execute()
+
+    assert len(results) == 1
+    assert fake_redis_client.smembers("myset") == {"a"}
+
+
+def test_pipeline_hdel_no_fields_is_noop(fake_redis_client):
+    """Pipeline hdel() with no fields is a no-op."""
+    fake_redis_client.hset("myhash", "f1", "v1")
+
+    pipe = fake_redis_client.pipeline()
+    pipe.hdel("myhash")
+    pipe.incr("counter")
+    results = pipe.execute()
+
+    assert len(results) == 1
+    assert fake_redis_client.hlen("myhash") == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for xdel (with actual deletions)
+# ---------------------------------------------------------------------------
+
+
+def test_xdel_removes_entries_from_stream(fake_redis_client):
+    """xdel removes entries by ID and returns the number deleted."""
+    stream = "test-stream"
+    id1 = fake_redis_client.xadd(stream, {"k": "v1"})
+    id2 = fake_redis_client.xadd(stream, {"k": "v2"})
+    fake_redis_client.xadd(stream, {"k": "v3"})
+
+    deleted = fake_redis_client.xdel(stream, id1, id2)
+    assert deleted == 2
+    assert fake_redis_client.xlen(stream) == 1
+
+
+def test_xdel_nonexistent_entry_returns_zero(fake_redis_client):
+    """xdel returns 0 when the entry ID does not exist."""
+    stream = "test-stream"
+    fake_redis_client.xadd(stream, {"k": "v1"})
+
+    deleted = fake_redis_client.xdel(stream, "9999999999999-0")
+    assert deleted == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for xrevrange
+# ---------------------------------------------------------------------------
+
+
+def test_xrevrange_returns_entries_in_reverse_order(fake_redis_client):
+    """xrevrange returns entries newest-first."""
+    stream = "test-stream"
+    fake_redis_client.xadd(stream, {"line": "first"})
+    fake_redis_client.xadd(stream, {"line": "second"})
+    fake_redis_client.xadd(stream, {"line": "third"})
+
+    entries = fake_redis_client.xrevrange(stream, count=3)
+    assert len(entries) == 3
+    assert entries[0][1]["line"] == "third"
+    assert entries[2][1]["line"] == "first"
+
+
+def test_xrevrange_respects_count(fake_redis_client):
+    """xrevrange limits the number of returned entries."""
+    stream = "test-stream"
+    for i in range(10):
+        fake_redis_client.xadd(stream, {"line": f"line-{i}"})
+
+    entries = fake_redis_client.xrevrange(stream, count=3)
+    assert len(entries) == 3
+    # Should be the 3 most recent entries
+    assert entries[0][1]["line"] == "line-9"
+    assert entries[2][1]["line"] == "line-7"
+
+
+def test_xrevrange_empty_stream(fake_redis_client):
+    """xrevrange on a nonexistent stream returns empty list."""
+    entries = fake_redis_client.xrevrange("nonexistent", count=10)
+    assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for scan_iter
+# ---------------------------------------------------------------------------
+
+
+def test_scan_iter_returns_unprefixed_keys(fake_redis_client):
+    """scan_iter strips the key prefix from returned keys."""
+    fake_redis_client.sadd("set:a", "val")
+    fake_redis_client.sadd("set:b", "val")
+    fake_redis_client.hset("hash:c", "f", "v")
+
+    keys = fake_redis_client.scan_iter("set:*")
+    assert set(keys) == {"set:a", "set:b"}
+
+
+def test_scan_iter_no_matches(fake_redis_client):
+    """scan_iter returns empty list when no keys match."""
+    fake_redis_client.sadd("myset", "val")
+    keys = fake_redis_client.scan_iter("nonexistent:*")
+    assert keys == []

@@ -7,6 +7,7 @@ starting/stopping/destroying VMs, and querying guest-agent networking.
 
 from __future__ import annotations
 
+import io
 import logging
 import time
 
@@ -74,11 +75,11 @@ class ProxmoxClient:
 
         # Split token_id into user and token name
         # e.g. "root@pam!orcest" -> user="root@pam", token_name="orcest"
-        if "!" in token_id:
-            user, token_name = token_id.split("!", 1)
-        else:
-            user = token_id
-            token_name = ""
+        if "!" not in token_id:
+            raise ValueError(
+                f"Invalid token_id {token_id!r}: expected 'user@realm!tokenname' format"
+            )
+        user, token_name = token_id.split("!", 1)
 
         self._api = ProxmoxAPI(
             host,
@@ -121,7 +122,7 @@ class ProxmoxClient:
             .clone.post(
                 newid=new_id,
                 name=name,
-                target=storage,
+                storage=storage,
                 full=0 if linked else 1,
             )
         )
@@ -154,7 +155,12 @@ class ProxmoxClient:
             purge: If True, also remove disks and any related resources.
         """
         logger.info("Destroying VM %d (purge=%s)", vm_id, purge)
-        self._api.nodes(self._node).qemu(vm_id).delete(purge=1 if purge else 0)
+        params: dict[str, int] = {"purge": 1 if purge else 0}
+        if purge:
+            # Explicitly request disk cleanup to avoid orphaned disks across
+            # Proxmox versions (some older releases don't default this on).
+            params["destroy-unreferenced-disks"] = 1
+        self._api.nodes(self._node).qemu(vm_id).delete(**params)
 
     def get_vm_status(self, vm_id: int) -> str:
         """Get the current status of a VM.
@@ -215,6 +221,52 @@ class ProxmoxClient:
         """
         vmid = self._api.cluster.nextid.get()
         return int(vmid)
+
+    def list_vms(self, name_prefix: str = "") -> list[dict]:
+        """List VMs on the node, optionally filtering by name prefix.
+
+        Args:
+            name_prefix: If non-empty, only return VMs whose name starts
+                with this string.
+
+        Returns:
+            List of VM info dicts from the Proxmox API, each containing
+            at least ``vmid``, ``name``, and ``status`` keys.
+        """
+        vms: list[dict] = self._api.nodes(self._node).qemu.get()
+        if name_prefix:
+            vms = [vm for vm in vms if vm.get("name", "").startswith(name_prefix)]
+        return vms
+
+    def set_cloud_init_userdata(
+        self, vm_id: int, userdata: str, storage: str = "local",
+    ) -> None:
+        """Set cloud-init user-data on a VM.
+
+        Uploads a snippet file to the specified storage and attaches it to
+        the VM's cloud-init drive configuration via ``cicustom``.
+
+        Args:
+            vm_id: The VM ID to configure.
+            userdata: The cloud-init user-data YAML content.
+            storage: Proxmox storage name for snippets (default ``"local"``).
+        """
+        snippet_name = f"orcest-template-{vm_id}-user.yaml"
+        logger.info("Uploading cloud-init snippet %s for VM %d", snippet_name, vm_id)
+        # Wrap in BytesIO so proxmoxer detects it as a file-like object
+        # (isinstance(v, io.IOBase)) and sends it as a multipart upload.
+        # Raw bytes would be sent as plain form data, which the Proxmox
+        # upload endpoint rejects.
+        payload = io.BytesIO(userdata.encode())
+        payload.name = snippet_name
+        self._api.nodes(self._node).storage(storage).upload.post(
+            content="snippets",
+            filename=snippet_name,
+            file=payload,
+        )
+        self._api.nodes(self._node).qemu(vm_id).config.put(
+            cicustom=f"user={storage}:snippets/{snippet_name}",
+        )
 
     def convert_to_template(self, vm_id: int) -> None:
         """Convert a VM to a template.

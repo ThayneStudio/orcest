@@ -13,6 +13,8 @@ dependencies = [
     "click>=8.1",  # 8.2 removed mix_stderr; fixture detects and handles both versions
     "rich>=13.0",
     "textual>=0.75",
+    "proxmoxer>=2.0",
+    "requests>=2.31",
 ]
 
 [project.scripts]

@@ -38,15 +38,11 @@ def require_valid_project_name(name: str) -> None:
 class ProxmoxConfig:
     """Proxmox connection details (auto-detected by ``orcest init``)."""
 
+    endpoint: str = "https://127.0.0.1:8006"  # Proxmox API URL
     node: str = "pve"
     storage: str = "local-lvm"
     api_token_id: str = ""  # e.g. "root@pam!orcest"
     api_token_secret: str = ""
-
-    @property
-    def endpoint(self) -> str:
-        """Proxmox API endpoint URL (always localhost on the host itself)."""
-        return "https://127.0.0.1:8006"
 
 
 @dataclass
@@ -157,6 +153,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
 
     px = data.get("proxmox") or {}
     proxmox = ProxmoxConfig(
+        endpoint=px.get("endpoint", "https://127.0.0.1:8006"),
         node=px.get("node", "pve"),
         storage=px.get("storage", "local-lvm"),
         api_token_id=px.get("api_token_id", ""),
@@ -217,6 +214,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
 
     data: dict = {
         "proxmox": {
+            "endpoint": config.proxmox.endpoint,
             "node": config.proxmox.node,
             "storage": config.proxmox.storage,
             "api_token_id": config.proxmox.api_token_id,

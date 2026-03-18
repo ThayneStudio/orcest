@@ -9,7 +9,7 @@ from orcest.fleet.proxmox_api import ProxmoxClient, parse_vm_ip
 pytestmark = pytest.mark.unit
 
 
-# ── parse_vm_ip ──────────────────────────────────────────────
+# -- parse_vm_ip --------------------------------------------------------------
 
 
 class TestParseVmIp:
@@ -118,7 +118,7 @@ class TestParseVmIp:
         assert parse_vm_ip(interfaces) == "10.0.0.5"
 
 
-# ── Helper to build a mocked ProxmoxClient ──────────────────
+# -- Helper to build a mocked ProxmoxClient -----------------------------------
 
 
 def _make_client() -> tuple[ProxmoxClient, MagicMock]:
@@ -139,7 +139,7 @@ def _make_client() -> tuple[ProxmoxClient, MagicMock]:
     return client, mock_api
 
 
-# ── ProxmoxClient tests ─────────────────────────────────────
+# -- ProxmoxClient tests ------------------------------------------------------
 
 
 class TestProxmoxClientInit:
@@ -161,6 +161,17 @@ class TestProxmoxClientInit:
                 verify_ssl=False,
                 backend="https",
             )
+
+    def test_rejects_token_id_without_separator(self):
+        with pytest.raises(ValueError, match="expected 'user@realm!tokenname' format"):
+            with patch("orcest.fleet.proxmox_api.ProxmoxAPI") as mock_cls:
+                mock_cls.return_value = MagicMock()
+                ProxmoxClient(
+                    endpoint="https://10.20.0.1:8006",
+                    token_id="root@pam",  # missing !tokenname
+                    token_secret="secret123",
+                    node="pve",
+                )
 
 
 class TestCloneVm:
@@ -189,9 +200,11 @@ class TestCloneVm:
         mock_clone.post.assert_called_once_with(
             newid=200,
             name="worker-200",
-            target="local-lvm",
+            storage="local-lvm",
             full=0,
         )
+        # Verify wait_for_task was called (clone_vm blocks until task completes)
+        mock_task_status.get.assert_called()
 
     def test_full_clone(self):
         client, mock_api = _make_client()
@@ -216,7 +229,7 @@ class TestCloneVm:
         mock_clone.post.assert_called_once_with(
             newid=200,
             name="worker-200",
-            target="local-lvm",
+            storage="local-lvm",
             full=1,
         )
 
@@ -236,10 +249,14 @@ class TestStopVm:
 
 
 class TestDestroyVm:
-    def test_calls_delete_with_purge(self):
+    def test_calls_delete_with_purge_and_disk_cleanup(self):
         client, mock_api = _make_client()
         client.destroy_vm(200)
-        mock_api.nodes("pve").qemu(200).delete.assert_called_once_with(purge=1)
+        mock_api.nodes("pve").qemu(200).delete.assert_called_once()
+        call_kwargs = mock_api.nodes("pve").qemu(200).delete.call_args.kwargs
+        assert call_kwargs["purge"] == 1
+        # destroy-unreferenced-disks should be set when purging
+        assert call_kwargs["destroy-unreferenced-disks"] == 1
 
     def test_calls_delete_without_purge(self):
         client, mock_api = _make_client()
@@ -301,21 +318,6 @@ class TestGetVmIp:
         mock_time.monotonic.side_effect = [0, 1, 2, 3]
 
         mock_agent = MagicMock()
-        # First call: agent not ready; second call: returns IP
-        mock_agent_result = MagicMock()
-        mock_agent_result.get.side_effect = [
-            Exception("not ready"),
-            {
-                "result": [
-                    {
-                        "name": "eth0",
-                        "ip-addresses": [
-                            {"ip-address": "10.20.0.50", "ip-address-type": "ipv4"},
-                        ],
-                    },
-                ],
-            },
-        ]
         # The agent() call should raise on first call, succeed on second
         mock_api.nodes("pve").qemu(200).agent.side_effect = [
             Exception("not ready"),
@@ -334,6 +336,8 @@ class TestGetVmIp:
 
         ip = client.get_vm_ip(200, timeout=120)
         assert ip == "10.20.0.50"
+        # Verify it actually retried (slept between attempts)
+        mock_time.sleep.assert_called_with(2)
 
 
 class TestNextFreeVmid:
@@ -346,6 +350,75 @@ class TestNextFreeVmid:
         client, mock_api = _make_client()
         mock_api.cluster.nextid.get.return_value = 301
         assert client.next_free_vmid() == 301
+
+
+class TestListVms:
+    def test_returns_all_vms_without_prefix(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.get.return_value = [
+            {"vmid": 100, "name": "my-vm", "status": "running"},
+            {"vmid": 200, "name": "orcest-worker-200", "status": "stopped"},
+        ]
+        result = client.list_vms()
+        assert len(result) == 2
+
+    def test_filters_by_name_prefix(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.get.return_value = [
+            {"vmid": 100, "name": "my-vm", "status": "running"},
+            {"vmid": 200, "name": "orcest-worker-200", "status": "stopped"},
+            {"vmid": 201, "name": "orcest-worker-201", "status": "running"},
+        ]
+        result = client.list_vms(name_prefix="orcest-worker-")
+        assert len(result) == 2
+        assert all(vm["name"].startswith("orcest-worker-") for vm in result)
+
+    def test_empty_result(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.get.return_value = []
+        result = client.list_vms(name_prefix="orcest-worker-")
+        assert result == []
+
+    def test_no_match(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.get.return_value = [
+            {"vmid": 100, "name": "unrelated-vm", "status": "running"},
+        ]
+        result = client.list_vms(name_prefix="orcest-worker-")
+        assert result == []
+
+
+class TestSetCloudInitUserdata:
+    def test_uploads_snippet_and_sets_cicustom(self):
+        import io
+
+        client, mock_api = _make_client()
+        client.set_cloud_init_userdata(100, "#cloud-config\npackages: []")
+
+        # Verify upload was called with a BytesIO file object
+        upload_call = mock_api.nodes("pve").storage("local").upload.post
+        upload_call.assert_called_once()
+        call_kwargs = upload_call.call_args.kwargs
+        assert call_kwargs["content"] == "snippets"
+        assert call_kwargs["filename"] == "orcest-template-100-user.yaml"
+        # The file should be a BytesIO (io.IOBase), not raw bytes
+        assert isinstance(call_kwargs["file"], io.BytesIO)
+        call_kwargs["file"].seek(0)
+        assert call_kwargs["file"].read() == b"#cloud-config\npackages: []"
+
+        # Verify cicustom was set on the VM config
+        mock_api.nodes("pve").qemu(100).config.put.assert_called_once_with(
+            cicustom="user=local:snippets/orcest-template-100-user.yaml",
+        )
+
+    def test_custom_storage(self):
+        client, mock_api = _make_client()
+        client.set_cloud_init_userdata(200, "data", storage="nfs-share")
+
+        mock_api.nodes("pve").storage("nfs-share").upload.post.assert_called_once()
+        mock_api.nodes("pve").qemu(200).config.put.assert_called_once_with(
+            cicustom="user=nfs-share:snippets/orcest-template-200-user.yaml",
+        )
 
 
 class TestConvertToTemplate:
