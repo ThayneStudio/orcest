@@ -25,10 +25,10 @@ def render_orchestrator_userdata(
     """
     orcest_user: dict = {
         "name": "orcest",
-        "system": True,
         "shell": "/bin/bash",
-        "home": "/home/orcest",
-        "groups": ["docker"],
+        "groups": ["docker", "sudo"],
+        "sudo": "ALL=(ALL) NOPASSWD:ALL",
+        "lock_passwd": True,
     }
 
     # Inject SSH key via cloud-init's native ssh_authorized_keys directive
@@ -156,9 +156,10 @@ def render_worker_userdata(
             "default",
             {
                 "name": "orcest",
-                "system": True,
                 "shell": "/bin/bash",
-                "home": "/home/orcest",
+                "groups": ["docker", "sudo"],
+                "sudo": "ALL=(ALL) NOPASSWD:ALL",
+                "lock_passwd": True,
             },
         ],
         "package_update": True,
