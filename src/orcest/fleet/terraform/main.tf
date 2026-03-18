@@ -90,9 +90,6 @@ resource "proxmox_virtual_environment_vm" "orchestrator" {
 
   # Start the VM on creation
   started = true
-
-  # Wait for the QEMU guest agent to report the IP
-  timeout_create = 300
 }
 
 # ── Worker VMs ──────────────────────────────────────────────

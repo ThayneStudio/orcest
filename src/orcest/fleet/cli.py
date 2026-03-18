@@ -39,6 +39,66 @@ def _next_free_vmid() -> int | None:
     return None
 
 
+def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
+    """Wait for a VM to get an IP address via the QEMU guest agent.
+
+    Falls back to ARP table scanning if the guest agent is unavailable.
+    """
+    import json
+
+    deadline = time.monotonic() + timeout
+    console.print(f"  Waiting for VM {vm_id} to get an IP...", end=" ")
+
+    while time.monotonic() < deadline:
+        # Try QEMU guest agent first
+        result = subprocess.run(
+            ["qm", "guest", "cmd", str(vm_id), "network-get-interfaces"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            try:
+                interfaces = json.loads(result.stdout)
+                for iface in interfaces:
+                    if iface.get("name") == "lo":
+                        continue
+                    for addr in iface.get("ip-addresses", []):
+                        if addr.get("ip-address-type") == "ipv4":
+                            ip = addr["ip-address"]
+                            console.print(f"[green]{ip}[/green]")
+                            return ip
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Try ARP table as fallback — match the VM's MAC address
+        mac_result = subprocess.run(
+            ["qm", "config", str(vm_id)],
+            capture_output=True,
+            text=True,
+        )
+        if mac_result.returncode == 0:
+            import re
+
+            mac_match = re.search(r"([0-9A-Fa-f:]{17})", mac_result.stdout)
+            if mac_match:
+                mac = mac_match.group(1).lower()
+                arp_result = subprocess.run(
+                    ["ip", "neigh"], capture_output=True, text=True,
+                )
+                for line in arp_result.stdout.splitlines():
+                    if mac in line.lower():
+                        parts = line.split()
+                        if parts:
+                            ip = parts[0]
+                            console.print(f"[green]{ip}[/green] (via ARP)")
+                            return ip
+
+        time.sleep(5)
+
+    console.print("[yellow]timed out[/yellow]")
+    return None
+
+
 def _validate_project_name(name: str) -> None:
     """Validate project name, exit on failure."""
     from orcest.fleet.config import require_valid_project_name
@@ -203,15 +263,12 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
         console.print(f"  Terraform apply [red]failed[/red]: {exc}")
         sys.exit(1)
 
-    # Step 3: Get orchestrator IP from Terraform output
-    console.print("  Reading orchestrator IP...", end=" ")
-    try:
-        from orcest.fleet.provisioner import get_output
-
-        orch_ip = get_output("orchestrator_ip")
-        console.print(f"[green]{orch_ip}[/green]")
-    except Exception as exc:
-        console.print(f"[red]failed[/red]: {exc}")
+    # Step 3: Get orchestrator IP (via guest agent or ARP)
+    orch_ip = _get_vm_ip(vm_id, console)
+    if not orch_ip:
+        console.print("  [yellow]Could not determine IP. VM may still be booting.[/yellow]")
+        console.print(f"  Saving config. Re-run after VM is ready.")
+        save_config(cfg, config)
         sys.exit(1)
 
     # Step 4: Wait for SSH
