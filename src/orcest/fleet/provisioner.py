@@ -35,12 +35,10 @@ def plan(config_dir: Path = TERRAFORM_DIR) -> str:
 def apply(config_dir: Path = TERRAFORM_DIR) -> None:
     """Run ``tofu apply -auto-approve``.
 
-    Automatically runs ``tofu init`` first if the ``.terraform`` directory
-    does not exist yet (e.g. first run after copying HCL templates).
+    Always runs ``tofu init`` first to ensure any new .tf files (e.g.
+    outputs.tf added by ``orcest upgrade``) are picked up by the state.
     """
-    if not (config_dir / ".terraform").is_dir():
-        logger.info("No .terraform directory found, running init first")
-        init(config_dir)
+    init(config_dir)
     _run_tofu(["apply", "-auto-approve", "-input=false"], cwd=config_dir)
 
 
