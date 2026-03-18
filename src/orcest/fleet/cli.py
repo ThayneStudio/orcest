@@ -126,6 +126,15 @@ def _repo_to_project_name(repo: str) -> str:
     return repo.rsplit("/", 1)[-1]
 
 
+_SSH_OPTS = [
+    "-o", "ConnectTimeout=5",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "BatchMode=yes",
+    "-o", "LogLevel=ERROR",
+]
+
+
 def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) -> bool:
     """Poll until SSH connects or timeout expires. Returns True on success."""
     ssh_target = f"{user}@{host}"
@@ -133,17 +142,7 @@ def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) ->
     console.print(f"  Waiting for SSH on {host}...", end=" ")
     while time.monotonic() < deadline:
         result = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "BatchMode=yes",
-                ssh_target,
-                "true",
-            ],
+            ["ssh", *_SSH_OPTS, ssh_target, "true"],
             capture_output=True,
             text=True,
         )
@@ -695,15 +694,7 @@ def status(config: str) -> None:
     if cfg.orchestrator.host:
         ssh_target = cfg.ssh_target()
         result = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "BatchMode=yes",
-                ssh_target,
-                "true",
-            ],
+            ["ssh", *_SSH_OPTS, ssh_target, "true"],
             capture_output=True,
             text=True,
         )
@@ -750,12 +741,7 @@ def status(config: str) -> None:
             ssh_target = cfg.ssh_target()
             result = subprocess.run(
                 [
-                    "ssh",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "BatchMode=yes",
-                    ssh_target,
+                    "ssh", *_SSH_OPTS, ssh_target,
                     f"cd /opt/orcest && docker compose"
                     f" -p orcest-{project.name}"
                     f" ps --format json 2>/dev/null",
