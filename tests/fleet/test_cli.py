@@ -377,7 +377,7 @@ def test_create_template_success(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code == 0, result.output
     assert "Worker template created" in result.output
@@ -401,13 +401,13 @@ def test_create_template_success(runner, cfg_path, mocker):
     assert data["pool"]["template_vm_id"] == 200
 
 
-def test_create_template_auto_assigns_vmid(runner, cfg_path, mocker):
-    """create-template gets next free VM ID when --vm-id is not provided."""
+def test_create_template_prompts_for_ids(runner, cfg_path, mocker):
+    """create-template prompts for base VM ID and template VM ID when not provided."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
-    mock_px.next_free_vmid.return_value = 300
+    mocker.patch("orcest.fleet.cli._next_free_vmid", return_value=300)
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -416,16 +416,17 @@ def test_create_template_auto_assigns_vmid(runner, cfg_path, mocker):
         return_value=mocker.MagicMock(returncode=0),
     )
 
+    # Provide input for both prompts: base VM ID, then accept default template VM ID
     result = runner.invoke(
         fleet,
         ["create-template", "--config", cfg_path],
+        input="9000\n\n",
     )
     assert result.exit_code == 0, result.output
-    assert "Auto-assigned VM ID: 300" in result.output
+    assert "Base VM ID" in result.output
 
-    mock_px.next_free_vmid.assert_called_once()
     mock_px.clone_vm.assert_called_once()
-    # Verify the auto-assigned ID was used
+    # Verify the prompted IDs were used
     assert mock_px.clone_vm.call_args.kwargs["new_id"] == 300
 
 
@@ -458,7 +459,7 @@ def test_create_template_no_proxmox_creds(runner, cfg_path):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "Proxmox API credentials not configured" in result.output
@@ -474,7 +475,7 @@ def test_create_template_clone_failure(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "clone failed" in result.output
@@ -493,7 +494,7 @@ def test_create_template_cloud_init_failure_cleans_up(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     # Should attempt cleanup
@@ -511,7 +512,7 @@ def test_create_template_ip_timeout(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "timed out" in result.output
@@ -529,7 +530,7 @@ def test_create_template_ssh_timeout(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "SSH not available" in result.output
@@ -548,7 +549,7 @@ def test_create_template_cloud_init_timeout(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "Cloud-init timed out" in result.output
@@ -571,7 +572,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "permission denied" in result.output
@@ -593,24 +594,26 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     )
     # VM never reaches "stopped" state
     mock_px.get_vm_status.return_value = "running"
-    # Patch time.monotonic to simulate deadline expiry without sleeping
-    original_monotonic = time.monotonic
+    # Patch time.monotonic to simulate deadline expiry without sleeping.
+    # The base time is captured once; the first call returns it, all
+    # subsequent calls jump far past any deadline (both the stop-wait
+    # loop and the _cleanup_vm stop-wait).
+    base = time.monotonic()
     call_count = 0
 
     def fast_monotonic():
         nonlocal call_count
         call_count += 1
-        # First call sets the deadline, subsequent calls exceed it
-        if call_count <= 1:
-            return original_monotonic()
-        return original_monotonic() + 120  # well past 60s deadline
+        # Each call advances 120s, so any deadline (15s or 60s) is blown
+        # on the second check.
+        return base + (call_count - 1) * 120
 
-    mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=fast_monotonic)
-    mocker.patch("orcest.fleet.cli.time.sleep")
+    mocker.patch("orcest.fleet.cli.time.monotonic", new=fast_monotonic)
+    mocker.patch("orcest.fleet.cli.time.sleep", new=lambda _: None)
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "timed out" in result.output
