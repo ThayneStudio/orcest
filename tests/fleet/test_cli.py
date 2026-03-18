@@ -312,7 +312,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
     mocker.patch("orcest.fleet.provisioner.write_tfvars")
     mocker.patch("orcest.fleet.provisioner.apply")
-    mocker.patch("orcest.fleet.provisioner.get_output", return_value="10.20.0.99")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.99")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
@@ -340,7 +340,7 @@ def test_create_orchestrator_ssh_timeout(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
     mocker.patch("orcest.fleet.provisioner.write_tfvars")
     mocker.patch("orcest.fleet.provisioner.apply")
-    mocker.patch("orcest.fleet.provisioner.get_output", return_value="10.20.0.99")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.99")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
 
     result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])

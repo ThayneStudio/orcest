@@ -63,6 +63,10 @@ def render_orchestrator_userdata(
 def _orchestrator_runcmd() -> list[str]:
     """Return the list of runcmd entries for orchestrator cloud-init."""
     return [
+        # Start QEMU guest agent (installed via packages above) so Terraform
+        # can read the VM's IP address via the Proxmox API.
+        "systemctl enable qemu-guest-agent",
+        "systemctl start qemu-guest-agent",
         # Create directory structure
         "mkdir -p /opt/orcest/projects",
         "chown -R orcest:orcest /opt/orcest",
@@ -244,6 +248,9 @@ WantedBy=multi-user.target
 def _runcmd(repo: str) -> list[str]:
     """Return the list of runcmd entries for cloud-init."""
     return [
+        # Start QEMU guest agent so Terraform can read the VM's IP
+        "systemctl enable qemu-guest-agent",
+        "systemctl start qemu-guest-agent",
         # Create workspace directories
         "mkdir -p /opt/orcest/workspaces",
         "chown -R orcest:orcest /opt/orcest",
