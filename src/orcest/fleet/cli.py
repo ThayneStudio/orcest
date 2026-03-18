@@ -765,7 +765,7 @@ def status(config: str) -> None:
 
 
 @fleet.command("create-template")
-@click.option("--base-vm-id", type=int, default=9000, help="Base VM/template to clone from.")
+@click.option("--base-vm-id", type=int, default=None, help="Base VM/template to clone from.")
 @click.option("--vm-id", type=int, default=None, help="VM ID for the new template.")
 @click.option(
     "--config",
@@ -773,7 +773,7 @@ def status(config: str) -> None:
     help="Fleet config path.",
     show_default=True,
 )
-def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
+def create_template(base_vm_id: int | None, vm_id: int | None, config: str) -> None:
     """Create a worker VM template for the warm pool.
 
     Clones a base image, installs worker tools via cloud-init,
@@ -792,10 +792,14 @@ def create_template(base_vm_id: int, vm_id: int | None, config: str) -> None:
 
     px = _create_proxmox_client(cfg)
 
-    # Determine VM ID for the template
+    # Prompt for base VM ID (the cloud-init capable image to clone from)
+    if base_vm_id is None:
+        base_vm_id = click.prompt("  Base VM ID to clone from", type=int)
+
+    # Prompt for new template VM ID
     if vm_id is None:
-        vm_id = px.next_free_vmid()
-        console.print(f"  Auto-assigned VM ID: {vm_id}")
+        default_id = _next_free_vmid()
+        vm_id = click.prompt("  VM ID for new template", default=default_id, type=int)
 
     console.print(f"\n[bold]Creating worker template (VM {vm_id}) from base {base_vm_id}[/bold]\n")
 
