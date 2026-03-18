@@ -61,33 +61,48 @@ def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
 def upload_source(ssh_target: str) -> None:
     """Create a source tarball locally and upload+extract it on the orchestrator.
 
-    Tarballs: Dockerfile, docker-compose.yml, pyproject.toml, src/
+    Assembles a Docker build context from the installed package:
+    deploy files (Dockerfile, compose files, pyproject.toml) from package data,
+    and source code from the installed orcest package.
+
     Extracts to /opt/orcest/ on the orchestrator VM.
     """
+    import shutil
+
     logger.info("Uploading source to %s", ssh_target)
 
-    # Find the project root (where pyproject.toml lives)
-    project_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
+    # Locate the deploy files bundled as package data
+    fleet_dir = os.path.dirname(os.path.abspath(__file__))
+    deploy_dir = os.path.join(fleet_dir, "deploy")
 
-    # Create tarball in /tmp
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        tarball_path = tmp.name
+    # Locate the installed orcest package source
+    orcest_pkg_dir = os.path.dirname(fleet_dir)  # .../site-packages/orcest/
 
+    # Assemble build context in a temp directory
+    staging = tempfile.mkdtemp(prefix="orcest-upload-")
     try:
+        # Copy deploy files (Dockerfile, compose files, pyproject.toml) to staging root
+        for fname in ("Dockerfile", "docker-compose.yml", "docker-compose.redis.yml", "pyproject.toml"):
+            src_path = os.path.join(deploy_dir, fname)
+            if not os.path.exists(src_path):
+                raise RuntimeError(f"Missing deploy file: {src_path}")
+            shutil.copy2(src_path, os.path.join(staging, fname))
+
+        # Copy orcest source to staging/src/orcest/
+        dest_src = os.path.join(staging, "src", "orcest")
+        shutil.copytree(orcest_pkg_dir, dest_src, ignore=shutil.ignore_patterns("__pycache__"))
+
+        # Create tarball
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tarball_path = tmp.name
+
         tar_result = subprocess.run(
             [
-                "tar",
-                "czf",
-                tarball_path,
-                "Dockerfile",
-                "docker-compose.yml",
-                "docker-compose.redis.yml",
-                "pyproject.toml",
-                "src/",
+                "tar", "czf", tarball_path,
+                "Dockerfile", "docker-compose.yml", "docker-compose.redis.yml",
+                "pyproject.toml", "src/",
             ],
-            cwd=project_root,
+            cwd=staging,
             capture_output=True,
             text=True,
         )
@@ -116,8 +131,13 @@ def upload_source(ssh_target: str) -> None:
 
         logger.info("Source uploaded and extracted on %s", ssh_target)
     finally:
-        # Clean up local tarball
-        os.unlink(tarball_path)
+        shutil.rmtree(staging, ignore_errors=True)
+        if "tarball_path" in locals():
+            with open(os.devnull, "w"):
+                try:
+                    os.unlink(tarball_path)
+                except OSError:
+                    pass
 
 
 def ensure_redis_stack(ssh_target: str) -> None:

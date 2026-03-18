@@ -22,7 +22,7 @@ orcest = "orcest.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"orcest.fleet" = ["terraform/*.tf"]
+"orcest.fleet" = ["terraform/*.tf", "deploy/*"]
 
 [project.optional-dependencies]
 dev = [
