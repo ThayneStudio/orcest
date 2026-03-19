@@ -448,3 +448,59 @@ def test_dead_letters_cli_lists_tasks(mocker, runner, fake_redis_client):
 
     assert result.exit_code == 0
     assert "task-abc" in result.stdout
+
+
+# ── check commands ──────────────────────────────────────────
+
+
+def test_check_github_token_success(runner, mocker):
+    """check github-token exits 0 and prints username when gh api user succeeds."""
+    mock_run = mocker.patch(
+        "subprocess.run",
+        return_value=MagicMock(
+            returncode=0,
+            stdout='{"login": "testuser", "id": 12345}',
+            stderr="",
+        ),
+    )
+    result = runner.invoke(main, ["check", "github-token"], input="ghp_test123\n")
+    assert result.exit_code == 0
+    assert "testuser" in result.output
+    # Verify GH_TOKEN was set in the subprocess environment
+    call_kwargs = mock_run.call_args
+    env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+    assert env["GH_TOKEN"] == "ghp_test123"
+    assert env["GITHUB_TOKEN"] == "ghp_test123"
+    mock_run.assert_called_once()
+
+
+def test_check_github_token_failure(runner, mocker):
+    """check github-token exits 1 and prints error when gh api user fails."""
+    mock_run = mocker.patch(
+        "subprocess.run",
+        return_value=MagicMock(returncode=1, stdout="", stderr="bad credentials"),
+    )
+    result = runner.invoke(main, ["check", "github-token"], input="ghp_bad\n")
+    assert result.exit_code == 1
+    mock_run.assert_called_once()
+
+
+def test_check_github_token_no_input(runner):
+    """check github-token exits 1 when no token is provided on stdin."""
+    result = runner.invoke(main, ["check", "github-token"], input="")
+    assert result.exit_code == 1
+    assert "no token provided" in (result.output + (result.stderr or ""))
+
+
+def test_check_github_token_whitespace_only(runner):
+    """check github-token exits 1 when only whitespace is provided."""
+    result = runner.invoke(main, ["check", "github-token"], input="   \n  ")
+    assert result.exit_code == 1
+    assert "no token provided" in (result.output + (result.stderr or ""))
+
+
+def test_check_github_token_multiline_rejected(runner):
+    """check github-token rejects input containing multiple lines."""
+    result = runner.invoke(main, ["check", "github-token"], input="ghp_first\nghp_second\n")
+    assert result.exit_code == 1
+    assert "newlines" in (result.output + (result.stderr or ""))

@@ -7,7 +7,6 @@ Docker Compose, driven by a single config file.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -25,6 +24,10 @@ if TYPE_CHECKING:
     from orcest.fleet.proxmox_api import ProxmoxClient
 
 _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
+
+_DEFAULT_CLOUD_IMAGE_URL = (
+    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+)
 
 
 def _next_free_vmid() -> int | None:
@@ -138,6 +141,42 @@ _SSH_OPTS = [
 ]
 
 
+def _run_on_orchestrator(
+    cfg: FleetConfig,
+    cmd: list[str],
+    input_data: str | None = None,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Run an orcest CLI command on the orchestrator in a throwaway Docker container.
+
+    SSHes to the orchestrator VM and executes ``docker run --rm -i orcest <cmd>``
+    in an ephemeral container. Useful for self-test commands that need tools
+    only available inside the orchestrator image (e.g. ``gh``).
+
+    Args:
+        cfg: Fleet config (must have orchestrator host set).
+        cmd: Command arguments to run inside the container
+            (e.g. ``["orcest", "check", "github-token"]``).
+        input_data: Optional data to pipe to the container's stdin.
+        timeout: Maximum seconds to wait for the command to complete.
+
+    Returns:
+        The completed process result.
+    """
+    import shlex
+
+    ssh_target = cfg.ssh_target()
+    quoted = " ".join(shlex.quote(c) for c in cmd)
+    docker_cmd = f"docker run --rm -i orcest {quoted}"
+    return subprocess.run(
+        ["ssh", *_SSH_OPTS, ssh_target, docker_cmd],
+        input=input_data,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
 def _create_proxmox_client(cfg: FleetConfig) -> ProxmoxClient:
     """Create a ProxmoxClient from fleet config."""
     from orcest.fleet.proxmox_api import ProxmoxClient
@@ -174,7 +213,7 @@ def _wait_for_cloud_init(
         return False
 
 
-def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess:
+def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess[str]:
     """Run a command over SSH and return the result."""
     ssh_target = f"{user}@{host}"
     return subprocess.run(
@@ -241,25 +280,25 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
     if org_name in cfg.orgs:
         console.print(f"[yellow]Org '{org_name}' already exists, updating credentials.[/yellow]")
 
-    # Validate the GitHub token (best-effort; gh may not be installed on the Proxmox host)
+    # Validate the GitHub token via the orchestrator's Docker image (which has gh installed)
     console.print("  Validating GitHub token...", end=" ")
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GITHUB_TOKEN": github_token, "GH_TOKEN": github_token},
-        )
-        if result.returncode != 0:
-            console.print("[red]failed[/red]")
-            stderr = result.stderr.strip()
-            if stderr:
-                console.print(f"    {stderr}")
-            console.print("[yellow]Warning: token validation failed, saving anyway.[/yellow]")
-        else:
-            console.print("[green]ok[/green]")
-    except FileNotFoundError:
-        console.print("[yellow]skipped (gh CLI not installed)[/yellow]")
+    if not cfg.orchestrator.host:
+        console.print("[yellow]skipped (orchestrator not set up yet)[/yellow]")
+    else:
+        try:
+            result = _run_on_orchestrator(
+                cfg, ["orcest", "check", "github-token"], input_data=github_token + "\n",
+            )
+            if result.returncode != 0:
+                console.print("[red]failed[/red]")
+                output = (result.stderr or result.stdout or "").strip()
+                if output:
+                    console.print(f"    {output}")
+                console.print("[yellow]Warning: token validation failed, saving anyway.[/yellow]")
+            else:
+                console.print("[green]ok[/green]")
+        except (OSError, subprocess.SubprocessError) as exc:
+            console.print(f"[yellow]skipped ({exc})[/yellow]")
 
     cfg.orgs[org_name] = OrgEntry(
         github_token=github_token,
@@ -764,20 +803,83 @@ def status(config: str) -> None:
     console.print(pool_table)
 
 
+def _create_vm_from_cloud_image(
+    px: ProxmoxClient,
+    cfg: FleetConfig,
+    vm_id: int,
+    image_url: str,
+    console: Console,
+) -> None:
+    """Download a cloud image and create a VM with it as the boot disk.
+
+    Uses the Proxmox ``download-url`` API to fetch the image, then creates
+    a VM with ``import-from`` to use the downloaded image as the boot disk.
+    Disk is resized to ``cfg.pool.worker_disk_size``.
+
+    Raises on any failure — caller is responsible for destroying the VM.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(image_url)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(f"Invalid image URL scheme: {parsed.scheme!r} (expected http or https)")
+
+    storage = cfg.pool.storage
+    # Derive filename from the URL path and sanitize it
+    raw_filename = image_url.rsplit("/", 1)[-1].split("?")[0] or "cloud-image.img"
+    filename = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_filename)
+    if not filename or filename.startswith("."):
+        filename = "cloud-image.img"
+
+    # Step 1: Download cloud image to Proxmox local storage
+    download_storage = "local"
+    console.print("  Downloading cloud image...", end=" ")
+    px.download_image(image_url, filename, storage=download_storage)
+    console.print("[green]ok[/green]")
+
+    # Step 2: Create VM with imported disk
+    console.print("  Creating VM...", end=" ")
+    px.create_vm(
+        vm_id=vm_id,
+        name="orcest-worker-template",
+        memory=cfg.pool.worker_memory,
+        cores=cfg.pool.worker_cores,
+        scsihw="virtio-scsi-pci",
+        scsi0=f"{storage}:0,import-from={download_storage}:iso/{filename}",
+        ide2=f"{storage}:cloudinit",
+        net0="virtio,bridge=vmbr0",
+        boot="order=scsi0",
+        serial0="socket",
+        vga="serial0",
+        agent="1",
+    )
+    console.print("[green]ok[/green]")
+
+    # Step 3: Resize disk to configured worker size
+    console.print(f"  Resizing disk to {cfg.pool.worker_disk_size}G...", end=" ")
+    px.resize_disk(vm_id, "scsi0", f"{cfg.pool.worker_disk_size}G")
+    console.print("[green]ok[/green]")
+
+
 @fleet.command("create-template")
-@click.option("--base-vm-id", type=int, default=None, help="Base VM/template to clone from.")
 @click.option("--vm-id", type=int, default=None, help="VM ID for the new template.")
+@click.option(
+    "--image-url",
+    default=_DEFAULT_CLOUD_IMAGE_URL,
+    help="Cloud image URL to download.",
+    show_default=True,
+)
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def create_template(base_vm_id: int | None, vm_id: int | None, config: str) -> None:
+def create_template(vm_id: int | None, image_url: str, config: str) -> None:
     """Create a worker VM template for the warm pool.
 
-    Clones a base image, installs worker tools via cloud-init,
-    then converts to a template for fast linked cloning.
+    Downloads a cloud image, creates a VM, installs worker tools
+    via cloud-init, then converts to a template for fast linked cloning.
     """
     from orcest.fleet.cloud_init import render_template_userdata
     from orcest.fleet.config import load_config, save_config
@@ -792,36 +894,29 @@ def create_template(base_vm_id: int | None, vm_id: int | None, config: str) -> N
 
     px = _create_proxmox_client(cfg)
 
-    # Prompt for base VM ID (the cloud-init capable image to clone from)
-    if base_vm_id is None:
-        base_vm_id = click.prompt("  Base VM ID to clone from", type=int)
-
-    # Prompt for new template VM ID
+    # Prompt for template VM ID
     if vm_id is None:
         default_id = _next_free_vmid()
         vm_id = click.prompt("  VM ID for new template", default=default_id, type=int)
 
-    console.print(f"\n[bold]Creating worker template (VM {vm_id}) from base {base_vm_id}[/bold]\n")
+    console.print(f"\n[bold]Creating worker template (VM {vm_id})[/bold]\n")
 
-    # Step 1: Clone from base image
-    console.print(f"  Cloning base VM {base_vm_id} -> {vm_id}...", end=" ")
+    # Step 1: Create VM from cloud image
     try:
-        px.clone_vm(
-            template_id=base_vm_id,
-            new_id=vm_id,
-            name="orcest-worker-template",
-            storage=cfg.pool.storage,
-            linked=False,  # Full clone — template needs independent storage
-        )
-        console.print("[green]ok[/green]")
+        _create_vm_from_cloud_image(px, cfg, vm_id, image_url, console)
     except Exception as exc:
-        console.print(f"[red]failed[/red]: {exc}")
+        console.print(f"  [red]failed[/red]: {exc}")
+        # Best-effort cleanup of partially-created VM
+        try:
+            px.destroy_vm(vm_id)
+        except Exception:
+            pass
         sys.exit(1)
 
-    # Steps 2-9 can all fail; on any failure we destroy the cloned VM
+    # Steps 2-8 can all fail; on any failure we destroy the VM
     # to avoid leaving orphaned resources.
     def _cleanup_vm() -> None:
-        console.print("  Cleaning up: destroying cloned VM...")
+        console.print("  Cleaning up: destroying VM...")
         try:
             # Stop the VM first -- Proxmox refuses to delete running VMs.
             # Best-effort; the VM may already be stopped or never started.

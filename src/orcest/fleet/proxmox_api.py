@@ -268,6 +268,70 @@ class ProxmoxClient:
             cicustom=f"user={storage}:snippets/{snippet_name}",
         )
 
+    def download_image(
+        self,
+        url: str,
+        filename: str,
+        storage: str = "local",
+        content_type: str = "iso",
+        timeout: int = 600,
+    ) -> str:
+        """Download a file from a URL to Proxmox storage.
+
+        Uses the ``/storage/{storage}/download-url`` endpoint to fetch
+        a cloud image (or other file) directly onto the Proxmox node.
+
+        Args:
+            url: URL to download from.
+            filename: Target filename on storage.
+            storage: Proxmox storage name (default ``"local"``).
+            content_type: Storage content type (default ``"iso"``).
+            timeout: Seconds to wait for the download task to complete.
+
+        Returns:
+            The Proxmox task UPID string.
+        """
+        logger.info("Downloading %s -> %s:%s/%s", url, storage, content_type, filename)
+        upid = (
+            self._api.nodes(self._node)
+            .storage(storage)("download-url")
+            .post(
+                content=content_type,
+                filename=filename,
+                url=url,
+            )
+        )
+        self.wait_for_task(upid, timeout=timeout)
+        return upid
+
+    def create_vm(self, vm_id: int, name: str, **kwargs: object) -> None:
+        """Create a new VM with the given configuration.
+
+        When ``import-from`` is used in disk parameters, the API may return
+        a task UPID for the async disk import. This method waits for it.
+
+        Args:
+            vm_id: The VM ID for the new VM.
+            name: Name for the new VM.
+            **kwargs: Additional Proxmox VM configuration parameters
+                (e.g. ``memory``, ``cores``, ``scsihw``, ``net0``).
+        """
+        logger.info("Creating VM %d (name=%s)", vm_id, name)
+        upid = self._api.nodes(self._node).qemu.post(vmid=vm_id, name=name, **kwargs)
+        if upid:
+            self.wait_for_task(upid)
+
+    def resize_disk(self, vm_id: int, disk: str, size: str) -> None:
+        """Resize a VM disk.
+
+        Args:
+            vm_id: The VM ID.
+            disk: Disk identifier (e.g. ``"scsi0"``).
+            size: New size (e.g. ``"30G"``).
+        """
+        logger.info("Resizing VM %d disk %s to %s", vm_id, disk, size)
+        self._api.nodes(self._node).qemu(vm_id).resize.put(disk=disk, size=size)
+
     def convert_to_template(self, vm_id: int) -> None:
         """Convert a VM to a template.
 
