@@ -147,7 +147,7 @@ def _run_on_orchestrator(
 
     ssh_target = cfg.ssh_target()
     quoted = " ".join(shlex.quote(c) for c in cmd)
-    docker_cmd = f"docker run --rm -i orcest {quoted}"
+    docker_cmd = f"docker run --rm -i --entrypoint '' orcest {quoted}"
     return subprocess.run(
         ["ssh", *_SSH_OPTS, ssh_target, docker_cmd],
         input=input_data,
