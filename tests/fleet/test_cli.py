@@ -485,6 +485,7 @@ def test_create_template_success(runner, cfg_path, mocker):
     mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch(
@@ -501,7 +502,6 @@ def test_create_template_success(runner, cfg_path, mocker):
 
     # Verify Proxmox operations happened in order
     mock_px.start_vm.assert_called_once_with(200)
-    mock_px.get_vm_ip.assert_called_once_with(200, timeout=300)
     mock_px.stop_vm.assert_called_once_with(200)
     mock_px.convert_to_template.assert_called_once_with(200)
 
@@ -520,6 +520,7 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._next_free_vmid", return_value=300)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch(
@@ -598,16 +599,16 @@ def test_create_template_ip_timeout(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
-    mock_px.get_vm_ip.return_value = None
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value=None)
 
     result = runner.invoke(
         fleet,
         ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
-    assert "timed out" in result.output
+    assert "Could not get VM IP" in result.output
     mock_px.destroy_vm.assert_called_once_with(200)
 
 
@@ -619,6 +620,7 @@ def test_create_template_ssh_timeout(runner, cfg_path, mocker):
     mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
 
     result = runner.invoke(
@@ -638,6 +640,7 @@ def test_create_template_cloud_init_timeout(runner, cfg_path, mocker):
     mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=False)
 
@@ -658,6 +661,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch(
@@ -682,6 +686,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     mock_px = _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch(
