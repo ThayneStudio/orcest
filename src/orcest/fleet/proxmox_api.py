@@ -97,7 +97,7 @@ class ProxmoxClient:
         template_id: int,
         new_id: int,
         name: str,
-        storage: str,
+        storage: str = "",
         linked: bool = True,
     ) -> str:
         """Clone a VM from a template.
@@ -106,25 +106,29 @@ class ProxmoxClient:
             template_id: VM ID of the template to clone from.
             new_id: VM ID for the new clone.
             name: Name for the new VM.
-            storage: Target storage for the clone.
+            storage: Target storage for full clones. Ignored for linked clones
+                (linked clones must use the same storage as the template).
             linked: If True, create a linked clone (faster, less disk). Otherwise full clone.
 
         Returns:
             The Proxmox task UPID string.
         """
         logger.info(
-            "Cloning VM %d -> %d (name=%s, storage=%s, linked=%s)",
-            template_id, new_id, name, storage, linked,
+            "Cloning VM %d -> %d (name=%s, linked=%s)",
+            template_id, new_id, name, linked,
         )
+        params: dict[str, object] = {
+            "newid": new_id,
+            "name": name,
+            "full": 0 if linked else 1,
+        }
+        # Proxmox rejects the 'storage' parameter for linked clones
+        if not linked and storage:
+            params["storage"] = storage
         upid = (
             self._api.nodes(self._node)
             .qemu(template_id)
-            .clone.post(
-                newid=new_id,
-                name=name,
-                storage=storage,
-                full=0 if linked else 1,
-            )
+            .clone.post(**params)
         )
         self.wait_for_task(upid)
         return upid

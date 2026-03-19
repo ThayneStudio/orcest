@@ -18,6 +18,7 @@ pytestmark = pytest.mark.unit
 def _make_config(
     pool_size: int = 4,
     template_vm_id: int = 9000,
+    vm_id_start: int = 300,
     storage: str = "ssd-pool",
     max_task_duration: int = 3600,
 ) -> FleetConfig:
@@ -27,24 +28,44 @@ def _make_config(
         pool=PoolConfig(
             size=pool_size,
             template_vm_id=template_vm_id,
+            vm_id_start=vm_id_start,
             storage=storage,
             max_task_duration=max_task_duration,
         ),
     )
 
 
-def _make_redis() -> MagicMock:
-    """Build a mock RedisClient with the needed interface."""
+def _make_redis(idle_set: set[str] | None = None) -> MagicMock:
+    """Build a mock RedisClient with the needed interface.
+
+    The mock tracks sadd calls so that smembers returns accumulated
+    state — needed because _next_vm_id reads smembers to avoid ID collisions.
+
+    Pass *idle_set* to pre-populate the idle pool (e.g. ``{"301"}``).
+    The internal set is exposed as ``mock._idle_set`` for tests that need
+    to pre-populate it after construction.
+    """
     mock = MagicMock()
-    # Default: empty pool state
+    mock._idle_set: set[str] = set(idle_set or set())
+
+    def _sadd(key: str, value: str) -> int:
+        if key == "pool:idle":
+            mock._idle_set.add(value)
+        return 1
+
+    def _smembers(key: str) -> set[str]:
+        if key == "pool:idle":
+            return set(mock._idle_set)
+        return set()
+
     mock.scan_iter.return_value = []
     mock.hgetall.return_value = {}
-    mock.smembers.return_value = set()
+    mock.smembers.side_effect = _smembers
     mock.scard.return_value = 0
     mock.hlen.return_value = 0
     mock.xinfo_groups.return_value = []
     mock.xinfo_consumers.return_value = []
-    mock.sadd.return_value = 1
+    mock.sadd.side_effect = _sadd
     mock.pipeline.return_value = MagicMock()
     return mock
 
@@ -52,7 +73,6 @@ def _make_redis() -> MagicMock:
 def _make_proxmox() -> MagicMock:
     """Build a mock ProxmoxClient."""
     mock = MagicMock()
-    mock.next_free_vmid.return_value = 300
     mock.get_vm_ip.return_value = "10.20.0.50"
     mock.get_vm_status.return_value = "stopped"
     mock.list_vms.return_value = []
@@ -294,7 +314,6 @@ class TestDestroyVm:
 class TestCloneAndBoot:
     def test_success(self):
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         vm_id = manager._clone_and_boot()
@@ -304,7 +323,6 @@ class TestCloneAndBoot:
             template_id=9000,
             new_id=300,
             name="orcest-worker-300",
-            storage="ssd-pool",
             linked=True,
         )
         proxmox.start_vm.assert_called_once_with(300)
@@ -322,7 +340,6 @@ class TestCloneAndBoot:
 
     def test_vm_no_ip_destroys(self):
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = None
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
@@ -358,7 +375,6 @@ class TestCloneAndBoot:
     def test_start_vm_failure_destroys_clone(self):
         """If start_vm raises, the cloned VM should be destroyed."""
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.start_vm.side_effect = RuntimeError("start failed")
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
@@ -373,7 +389,6 @@ class TestCloneAndBoot:
 
     def test_uses_linked_clone(self):
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         manager._clone_and_boot()
@@ -382,8 +397,8 @@ class TestCloneAndBoot:
         assert kwargs["linked"] is True
 
     def test_correct_vm_naming(self):
-        manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 42
+        config = _make_config(vm_id_start=42)
+        manager, proxmox, redis = _make_manager(config=config)
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         manager._clone_and_boot()
@@ -394,7 +409,6 @@ class TestCloneAndBoot:
     def test_no_ip_does_not_add_to_idle_pool(self):
         """When get_vm_ip returns None, the VM should not be in the idle set."""
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = None
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
@@ -406,7 +420,6 @@ class TestCloneAndBoot:
     def test_sadd_failure_destroys_vm(self):
         """If sadd to idle pool fails, the VM should be destroyed to avoid orphan."""
         manager, proxmox, redis = _make_manager()
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = "10.20.0.50"
         redis.sadd.side_effect = ConnectionError("Redis down")
         pipe = MagicMock()
@@ -429,7 +442,7 @@ class TestCloneAndBoot:
 class TestDetectActiveWorkers:
     def test_no_idle_workers_noop(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
 
         manager._detect_active_workers()
 
@@ -438,7 +451,7 @@ class TestDetectActiveWorkers:
 
     def test_idle_worker_becomes_active(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.xinfo_groups.return_value = [
             {"name": "workers", "pending": 1},
         ]
@@ -458,7 +471,7 @@ class TestDetectActiveWorkers:
 
     def test_idle_worker_stays_idle(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.xinfo_groups.return_value = [
             {"name": "workers", "pending": 0},
         ]
@@ -473,7 +486,7 @@ class TestDetectActiveWorkers:
 
     def test_handles_xinfo_groups_error(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.xinfo_groups.side_effect = Exception("stream not found")
 
         # Should not raise
@@ -481,7 +494,7 @@ class TestDetectActiveWorkers:
 
     def test_handles_xinfo_consumers_error(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.xinfo_groups.return_value = [
             {"name": "workers", "pending": 1},
         ]
@@ -492,7 +505,7 @@ class TestDetectActiveWorkers:
 
     def test_non_integer_idle_member_skipped(self):
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"not-a-number", "300"}
+        redis._idle_set = {"not-a-number", "300"}
         redis.xinfo_groups.return_value = [
             {"name": "workers", "pending": 1},
         ]
@@ -512,7 +525,7 @@ class TestDetectActiveWorkers:
     def test_pipeline_failure_does_not_crash(self):
         """If the Redis pipeline fails, the error is logged but does not propagate."""
         manager, proxmox, redis = _make_manager()
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.xinfo_groups.return_value = [
             {"name": "workers", "pending": 1},
         ]
@@ -541,7 +554,6 @@ class TestFillPool:
         manager, proxmox, redis = _make_manager(config=config)
         redis.scard.return_value = 1
         redis.hlen.return_value = 0
-        proxmox.next_free_vmid.side_effect = [300, 301]
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         manager._fill_pool()
@@ -574,7 +586,6 @@ class TestFillPool:
         manager, proxmox, redis = _make_manager(config=config)
         redis.scard.return_value = 0
         redis.hlen.return_value = 0
-        proxmox.next_free_vmid.side_effect = [300, 301, 302]
         proxmox.clone_vm.side_effect = [
             RuntimeError("first clone failed"),
             None,  # second succeeds
@@ -608,7 +619,6 @@ class TestFillPool:
         redis.scard.return_value = 1  # 1 idle
         redis.hlen.return_value = 2  # 2 active
         # Total = 3, deficit = 1
-        proxmox.next_free_vmid.return_value = 300
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         manager._fill_pool()
@@ -775,7 +785,7 @@ class TestReconcileOrphans:
         proxmox.list_vms.return_value = [
             {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
         ]
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.hgetall.return_value = {}
 
         manager._reconcile_orphans()
@@ -793,7 +803,7 @@ class TestReconcileOrphans:
             {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
             {"vmid": 301, "name": "orcest-worker-301", "status": "stopped"},
         ]
-        redis.smembers.return_value = {"300"}  # Only 300 is tracked
+        redis._idle_set = {"300"}  # Only 300 is tracked
         redis.hgetall.return_value = {}
 
         manager._reconcile_orphans()
@@ -808,7 +818,7 @@ class TestReconcileOrphans:
         proxmox.list_vms.return_value = [
             {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
         ]
-        redis.smembers.return_value = set()  # Not in idle
+        redis._idle_set = set()  # Not in idle
         redis.hgetall.return_value = {"300": "1000.0"}  # But in active
 
         manager._reconcile_orphans()
@@ -823,7 +833,7 @@ class TestReconcileOrphans:
         proxmox.list_vms.return_value = [
             {"vmid": 9000, "name": "orcest-worker-9000", "status": "stopped"},
         ]
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
         redis.hgetall.return_value = {}
 
         manager._reconcile_orphans()
@@ -848,7 +858,7 @@ class TestReconcileOrphans:
             {"vmid": 300, "name": "orcest-worker-300", "status": "stopped"},
             {"vmid": 301, "name": "orcest-worker-301", "status": "stopped"},
         ]
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
         redis.hgetall.return_value = {}
 
         call_count = 0
@@ -872,7 +882,7 @@ class TestReconcileOrphans:
         """No VMs in Proxmox means nothing to reconcile."""
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
         redis.hgetall.return_value = {}
 
         manager._reconcile_orphans()
@@ -890,7 +900,7 @@ class TestReconcileStaleRedis:
         proxmox.list_vms.return_value = [
             {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
         ]
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.hgetall.return_value = {}
 
         manager._reconcile_stale_redis()
@@ -903,7 +913,7 @@ class TestReconcileStaleRedis:
         """Idle entry with no matching Proxmox VM is removed."""
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []  # No VMs in Proxmox
-        redis.smembers.return_value = {"300"}
+        redis._idle_set = {"300"}
         redis.hgetall.return_value = {}
 
         manager._reconcile_stale_redis()
@@ -914,7 +924,7 @@ class TestReconcileStaleRedis:
         """Active entry with no matching Proxmox VM is removed."""
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []  # No VMs in Proxmox
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
         redis.hgetall.return_value = {"301": "1000.0"}
 
         manager._reconcile_stale_redis()
@@ -927,7 +937,7 @@ class TestReconcileStaleRedis:
         proxmox.list_vms.return_value = [
             {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
         ]
-        redis.smembers.return_value = {"300", "301"}  # 301 is stale
+        redis._idle_set = {"300", "301"}  # 301 is stale
         redis.hgetall.return_value = {"302": "1000.0"}  # 302 is stale
 
         manager._reconcile_stale_redis()
@@ -948,7 +958,7 @@ class TestReconcileStaleRedis:
         config = _make_config(template_vm_id=9000)
         manager, proxmox, redis = _make_manager(config=config)
         proxmox.list_vms.return_value = []
-        redis.smembers.return_value = {"9000"}
+        redis._idle_set = {"9000"}
         redis.hgetall.return_value = {}
 
         manager._reconcile_stale_redis()
@@ -959,7 +969,7 @@ class TestReconcileStaleRedis:
         """Non-integer members in Redis sets are ignored (not crashed on)."""
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []
-        redis.smembers.return_value = {"not-a-number", "300"}
+        redis._idle_set = {"not-a-number", "300"}
         redis.hgetall.return_value = {"bad-id": "1000.0"}
 
         manager._reconcile_stale_redis()
@@ -974,7 +984,7 @@ class TestReconcileStaleRedis:
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []  # No VMs in Proxmox
         # Use a list to get deterministic iteration order
-        redis.smembers.return_value = {"300", "301"}
+        redis._idle_set = {"300", "301"}
         redis.hgetall.return_value = {}
 
         call_count = 0
@@ -998,7 +1008,7 @@ class TestReconcileStaleRedis:
         """If hdel fails for one entry, the rest are still processed."""
         manager, proxmox, redis = _make_manager()
         proxmox.list_vms.return_value = []  # No VMs in Proxmox
-        redis.smembers.return_value = set()
+        redis._idle_set = set()
         redis.hgetall.return_value = {"300": "1000.0", "301": "1000.0"}
 
         call_count = 0
@@ -1177,17 +1187,18 @@ class TestFullCycle:
 
         manager = PoolManager(config=config, proxmox=proxmox, redis=redis)
 
+        # Pre-populate idle set with VM 301 (simulating an existing idle worker)
+        redis._idle_set.add("301")
+
         # One done worker, one idle -> total currently 1, deficit 1
         redis.scan_iter.return_value = ["pool:done:orcest-worker-300"]
         redis.scard.return_value = 1  # 1 idle remaining after destroy
         redis.hlen.return_value = 0
         redis.hgetall.return_value = {}
-        redis.smembers.return_value = {"301"}
         redis.xinfo_groups.return_value = []
 
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
-        proxmox.next_free_vmid.return_value = 302
         proxmox.get_vm_ip.return_value = "10.20.0.51"
 
         manager.reconcile()
@@ -1197,11 +1208,11 @@ class TestFullCycle:
         proxmox.destroy_vm.assert_any_call(300)
         redis.delete.assert_any_call("pool:done:orcest-worker-300")
 
-        # New worker cloned to fill deficit
+        # New worker cloned to fill deficit — 300 was destroyed and is free,
+        # 301 is in idle set, so next available is 300 (reused after destroy)
         proxmox.clone_vm.assert_called_once_with(
             template_id=9000,
-            new_id=302,
-            name="orcest-worker-302",
-            storage="ssd-pool",
+            new_id=300,
+            name="orcest-worker-300",
             linked=True,
         )

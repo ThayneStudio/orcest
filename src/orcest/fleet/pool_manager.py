@@ -253,7 +253,11 @@ class PoolManager:
             logger.error("No template VM ID configured (pool.template_vm_id)")
             return None
 
-        new_id = self._proxmox.next_free_vmid()
+        if not self._pool.vm_id_start:
+            logger.error("No worker VM ID range configured (pool.vm_id_start)")
+            return None
+
+        new_id = self._next_vm_id()
         name = self._vm_id_to_worker_id(new_id)
 
         logger.info(
@@ -265,7 +269,6 @@ class PoolManager:
                 template_id=template_id,
                 new_id=new_id,
                 name=name,
-                storage=self._pool.storage,
                 linked=True,
             )
         except Exception:
@@ -505,6 +508,40 @@ class PoolManager:
         logger.info("Pool manager shutting down.")
 
     # ── helpers ──────────────────────────────────────────────
+
+    def _next_vm_id(self) -> int:
+        """Allocate the next VM ID from the configured pool range.
+
+        Scans existing orcest-worker-* VMs in Proxmox and picks the next
+        ID starting from ``pool.vm_id_start``, skipping any that are
+        already in use.
+        """
+        start = self._pool.vm_id_start
+        existing: set[int] = set()
+        try:
+            for vm in self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX):
+                vm_id = vm.get("vmid")
+                if vm_id is not None:
+                    existing.add(int(vm_id))
+        except Exception:
+            logger.warning("Failed to list VMs for ID allocation", exc_info=True)
+
+        # Also include IDs tracked in Redis (may not yet be visible in Proxmox)
+        for member in self._redis.smembers(_POOL_IDLE_KEY):
+            try:
+                existing.add(int(member))
+            except (ValueError, TypeError):
+                pass
+        for member in self._redis.hgetall(_POOL_ACTIVE_KEY):
+            try:
+                existing.add(int(member))
+            except (ValueError, TypeError):
+                pass
+
+        candidate = start
+        while candidate in existing:
+            candidate += 1
+        return candidate
 
     @staticmethod
     def _worker_id_to_vm_id(worker_id: str) -> int | None:
