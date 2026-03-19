@@ -179,28 +179,44 @@ class PoolManager:
                 )
 
     def _fill_pool(self) -> None:
-        """Clone and boot VMs until pool reaches target size."""
+        """Adjust pool to target size: clone new VMs or drain idle excess."""
         idle_count = self._redis.scard(_POOL_IDLE_KEY)
         active_count = self._redis.hlen(_POOL_ACTIVE_KEY)
         total = int(idle_count) + int(active_count)
         deficit = self._pool.size - total
 
-        if deficit <= 0:
-            return
-
-        logger.info(
-            "Pool deficit: %d (idle=%d, active=%d, target=%d)",
-            deficit,
-            idle_count,
-            active_count,
-            self._pool.size,
-        )
-
-        for _ in range(deficit):
-            try:
-                self._clone_and_boot()
-            except Exception:
-                logger.error("Failed to clone and boot VM", exc_info=True)
+        if deficit > 0:
+            logger.info(
+                "Pool deficit: %d (idle=%d, active=%d, target=%d)",
+                deficit,
+                idle_count,
+                active_count,
+                self._pool.size,
+            )
+            for _ in range(deficit):
+                try:
+                    self._clone_and_boot()
+                except Exception:
+                    logger.error("Failed to clone and boot VM", exc_info=True)
+        elif deficit < 0 and int(idle_count) > 0:
+            # Excess VMs — destroy idle ones (never kill active workers).
+            excess = min(-deficit, int(idle_count))
+            logger.info(
+                "Pool excess: %d (idle=%d, active=%d, target=%d), draining %d idle",
+                -deficit,
+                idle_count,
+                active_count,
+                self._pool.size,
+                excess,
+            )
+            idle_members = list(self._redis.smembers(_POOL_IDLE_KEY))
+            for member in idle_members[:excess]:
+                try:
+                    vm_id = int(member)
+                except (ValueError, TypeError):
+                    continue
+                logger.info("Draining excess idle VM %d", vm_id)
+                self._destroy_vm(vm_id)
 
     def _destroy_vm(self, vm_id: int) -> None:
         """Stop and destroy a VM, remove from tracking sets."""

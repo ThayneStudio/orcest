@@ -625,6 +625,39 @@ class TestFillPool:
 
         assert proxmox.clone_vm.call_count == 1
 
+    def test_drains_excess_idle(self):
+        """When pool size shrinks, excess idle VMs are destroyed."""
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 3  # 3 idle
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300", "301", "302"}
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._fill_pool()
+
+        # Should destroy 2 excess idle VMs (3 idle, target 1)
+        assert proxmox.stop_vm.call_count == 2
+        assert proxmox.destroy_vm.call_count == 2
+        proxmox.clone_vm.assert_not_called()
+
+    def test_drain_does_not_kill_active(self):
+        """Draining only removes idle VMs, never active ones."""
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 1  # 1 idle
+        redis.hlen.return_value = 2  # 2 active
+        redis._idle_set = {"300"}
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._fill_pool()
+
+        # Only the 1 idle VM should be destroyed, not the 2 active
+        assert proxmox.stop_vm.call_count == 1
+        assert proxmox.destroy_vm.call_count == 1
+
 
 # ── _health_check ────────────────────────────────────────────
 
