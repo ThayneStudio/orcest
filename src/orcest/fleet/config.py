@@ -44,6 +44,13 @@ class ProxmoxConfig:
     api_token_id: str = ""  # e.g. "root@pam!orcest"
     api_token_secret: str = ""
 
+    def is_localhost(self) -> bool:
+        """Return True if the endpoint points to localhost (unreachable from VMs)."""
+        from urllib.parse import urlparse
+
+        host = urlparse(self.endpoint).hostname or ""
+        return host in ("127.0.0.1", "localhost", "::1")
+
 
 @dataclass
 class OrchestratorConfig:

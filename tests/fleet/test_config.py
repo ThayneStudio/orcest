@@ -234,3 +234,20 @@ class TestRequireValidProjectName:
     def test_shell_injection_raises(self):
         with pytest.raises(ValueError):
             require_valid_project_name("; rm -rf /")
+
+
+class TestProxmoxConfigIsLocalhost:
+    def test_default_is_localhost(self):
+        assert ProxmoxConfig().is_localhost() is True
+
+    def test_localhost_hostname(self):
+        assert ProxmoxConfig(endpoint="https://localhost:8006").is_localhost() is True
+
+    def test_ipv6_loopback(self):
+        assert ProxmoxConfig(endpoint="https://[::1]:8006").is_localhost() is True
+
+    def test_real_ip_is_not_localhost(self):
+        assert ProxmoxConfig(endpoint="https://10.20.0.1:8006").is_localhost() is False
+
+    def test_hostname_is_not_localhost(self):
+        assert ProxmoxConfig(endpoint="https://pve.local:8006").is_localhost() is False

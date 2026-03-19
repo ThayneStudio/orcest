@@ -541,33 +541,57 @@ def init():
     else:
         console.print("  [red]No public key found — SSH setup incomplete.[/red]")
 
-    # Step 6: Detect Proxmox host IP (for remote API access from orchestrator VM)
+    # Step 6: Detect Proxmox host IP (for remote API access from orchestrator VM).
+    # The pool manager runs in Docker on the orchestrator, so this must be a
+    # real IP reachable from VMs — never 127.0.0.1.
     proxmox_ip = "127.0.0.1"
     if is_proxmox:
-        console.print("  Detecting host IP...", end=" ")
+        console.print("  Detecting host IP...")
+        detected_ip = None
+
+        # Prefer the IP on vmbr0 (VM bridge) — guaranteed reachable from VMs.
         try:
             result = subprocess.run(
-                ["hostname", "-I"], capture_output=True, text=True,
+                ["ip", "-4", "-o", "addr", "show", "vmbr0"],
+                capture_output=True, text=True,
             )
-            if result.returncode == 0:
-                all_ips = result.stdout.strip().split()
-                # Prefer IPv4 addresses (avoid IPv6 which needs bracket
-                # notation in URLs and is rarely the Proxmox management IP).
-                ipv4_ips = [ip for ip in all_ips if ":" not in ip]
-                chosen_ips = ipv4_ips or all_ips
-                if chosen_ips:
-                    proxmox_ip = chosen_ips[0]
-                    console.print(f"[green]{proxmox_ip}[/green]")
-                    if len(all_ips) > 1:
-                        console.print(
-                            f"    [dim](multiple IPs detected: {', '.join(all_ips)})[/dim]"
-                        )
-                else:
-                    console.print("[yellow]no IPs found, using 127.0.0.1[/yellow]")
-            else:
-                console.print("[yellow]failed, using 127.0.0.1[/yellow]")
+            if result.returncode == 0 and result.stdout.strip():
+                # Parse "2: vmbr0  inet 10.20.0.1/24 ..."
+                import re as _re
+
+                m = _re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+                if m:
+                    detected_ip = m.group(1)
         except FileNotFoundError:
-            console.print("[yellow]hostname not found, using 127.0.0.1[/yellow]")
+            pass
+
+        # Fall back to hostname -I if vmbr0 detection failed.
+        all_ipv4: list[str] = []
+        if not detected_ip:
+            try:
+                result = subprocess.run(
+                    ["hostname", "-I"], capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    all_ips = result.stdout.strip().split()
+                    all_ipv4 = [ip for ip in all_ips if ":" not in ip]
+                    if all_ipv4:
+                        detected_ip = all_ipv4[0]
+            except FileNotFoundError:
+                pass
+
+        if detected_ip:
+            # Always prompt so the user can verify/override, especially on
+            # multi-NIC hosts where auto-detection may pick the wrong IP.
+            proxmox_ip = click.prompt(
+                "    Proxmox API IP (must be reachable from VMs)",
+                default=detected_ip,
+            )
+        else:
+            proxmox_ip = click.prompt(
+                "    Proxmox API IP (must be reachable from VMs)",
+                default="127.0.0.1",
+            )
 
     # Step 7: Write config
     console.print("  Writing config...", end=" ")
