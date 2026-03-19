@@ -681,32 +681,20 @@ def upgrade():
     import subprocess
     from pathlib import Path
 
+    from orcest.fleet.cli import _upgrade_cli
     from orcest.fleet.config import DEFAULT_CONFIG_DIR
 
     console = Console()
     console.print("\n[bold]Updating orcest[/bold]\n")
 
     # Step 1: Reinstall from GitHub
-    console.print("  Installing latest version...", end=" ")
-    pip = Path(sys.executable).parent / "pip"
-    result = subprocess.run(
-        [
-            str(pip), "install", "--quiet", "--no-cache-dir",
-            "--force-reinstall", "git+https://github.com/ThayneStudio/orcest.git",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        console.print("[red]failed[/red]")
-        console.print(f"    {result.stderr.strip()}")
-        raise SystemExit(1)
-    console.print("[green]ok[/green]")
+    _upgrade_cli(console)
 
     # Step 2: Copy Terraform templates if config dir exists
     terraform_dest = DEFAULT_CONFIG_DIR / "terraform"
     if terraform_dest.is_dir():
         console.print("  Updating Terraform templates...", end=" ")
+        pip = Path(sys.executable).parent / "pip"
         # Use pip show to find the installed package location (importlib.reload
         # may not pick up the new path after force-reinstall).
         loc_result = subprocess.run(

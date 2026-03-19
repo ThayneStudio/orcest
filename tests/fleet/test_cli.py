@@ -1040,3 +1040,47 @@ def test_start_rejects_localhost_endpoint(runner, cfg_path):
     result = runner.invoke(fleet, ["start", "--config", cfg_path])
     assert result.exit_code != 0
     assert "localhost" in result.output.lower()
+
+
+# ── deploy tests ───────────────────────────────────────────
+
+
+def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
+    """deploy runs upgrade, stop, update, and start in order."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    # Mock all external calls
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mock_upload_cfg = mocker.patch(
+        "orcest.fleet.orchestrator.upload_fleet_config",
+    )
+    mock_ensure_pool = mocker.patch(
+        "orcest.fleet.orchestrator.ensure_pool_manager",
+    )
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    assert "Deploy complete" in result.output
+
+    # Start step should have uploaded config and started pool manager
+    mock_upload_cfg.assert_called()
+    mock_ensure_pool.assert_called()
