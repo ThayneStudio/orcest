@@ -851,7 +851,7 @@ def _create_vm_from_cloud_image(
         memory=cfg.pool.worker_memory,
         cores=cfg.pool.worker_cores,
         scsihw="virtio-scsi-pci",
-        scsi0=f"{storage}:0,import-from={download_storage}:iso/{filename}",
+        scsi0=f"{storage}:0,import-from=/var/lib/vz/template/iso/{filename}",
         ide2=f"{storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
         boot="order=scsi0",
