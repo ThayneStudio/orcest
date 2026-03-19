@@ -843,7 +843,8 @@ def _create_vm_from_cloud_image(
         else:
             raise
 
-    # Step 2: Create VM with imported disk
+    # Step 2: Create VM (without disk — import-from requires root which
+    # API tokens don't have, so we import the disk via qm CLI in step 3)
     console.print("  Creating VM...", end=" ")
     px.create_vm(
         vm_id=vm_id,
@@ -851,17 +852,32 @@ def _create_vm_from_cloud_image(
         memory=cfg.pool.worker_memory,
         cores=cfg.pool.worker_cores,
         scsihw="virtio-scsi-pci",
-        scsi0=f"{storage}:0,import-from=/var/lib/vz/template/iso/{filename}",
         ide2=f"{storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
-        boot="order=scsi0",
         serial0="socket",
         vga="serial0",
         agent="1",
     )
     console.print("[green]ok[/green]")
 
-    # Step 3: Resize disk to configured worker size
+    # Step 3: Import cloud image as boot disk via qm CLI (runs as root
+    # on the Proxmox host, bypassing API token filesystem path restrictions)
+    image_path = f"/var/lib/vz/template/iso/{filename}"
+    console.print("  Importing boot disk...", end=" ")
+    result = subprocess.run(
+        [
+            "qm", "set", str(vm_id),
+            "--scsi0", f"{storage}:0,import-from={image_path}",
+            "--boot", "order=scsi0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"qm set failed: {(result.stderr or result.stdout).strip()}")
+    console.print("[green]ok[/green]")
+
+    # Step 4: Resize disk to configured worker size
     console.print(f"  Resizing disk to {cfg.pool.worker_disk_size}G...", end=" ")
     px.resize_disk(vm_id, "scsi0", f"{cfg.pool.worker_disk_size}G")
     console.print("[green]ok[/green]")
