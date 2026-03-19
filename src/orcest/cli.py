@@ -1000,7 +1000,10 @@ def pool_manage(config: str, interval: float) -> None:
         f" (target={cfg.pool.size}, interval={interval}s)"
     )
 
-    manager = PoolManager(config=cfg, proxmox=proxmox, redis=redis)
+    manager = PoolManager(
+        config=cfg, proxmox=proxmox, redis=redis,
+        key_prefix=redis_cfg.key_prefix,
+    )
     try:
         manager.run(interval=interval)
     finally:

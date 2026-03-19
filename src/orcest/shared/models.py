@@ -43,6 +43,7 @@ class Task:
     type: TaskType
     repo: str  # "owner/repo"
     token: str  # GitHub PAT for clone + gh auth
+    claude_token: str  # Claude Code OAuth token (per-task, from org config)
     resource_type: str  # "pr" or "issue"
     resource_id: int  # PR/issue number
     prompt: str  # Full rendered prompt
@@ -57,6 +58,7 @@ class Task:
             "type": self.type.value,
             "repo": self.repo,
             "token": self.token,
+            "claude_token": self.claude_token,
             "resource_type": self.resource_type,
             "resource_id": str(self.resource_id),
             "prompt": self.prompt,
@@ -73,6 +75,7 @@ class Task:
             type=TaskType(data["type"]),
             repo=data["repo"],
             token=data["token"],
+            claude_token=data.get("claude_token", ""),
             resource_type=data["resource_type"],
             resource_id=int(data["resource_id"]),
             prompt=data["prompt"],
@@ -92,6 +95,7 @@ class Task:
         prompt: str,
         branch: str | None = None,
         base_branch: str | None = None,
+        claude_token: str = "",
     ) -> "Task":
         """Factory with auto-generated ID and timestamp."""
         return cls(
@@ -99,6 +103,7 @@ class Task:
             type=task_type,
             repo=repo,
             token=token,
+            claude_token=claude_token,
             resource_type=resource_type,
             resource_id=resource_id,
             prompt=prompt,

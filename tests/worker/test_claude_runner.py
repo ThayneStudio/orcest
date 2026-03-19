@@ -17,6 +17,7 @@ import pytest
 from orcest.worker.claude_runner import (
     ClaudeResult,
     ClaudeRunner,
+    _build_env,
     _extract_summary,
     _is_usage_exhausted,
     run_claude,
@@ -257,6 +258,28 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
     # Token vars must be set
     assert env["GITHUB_TOKEN"] == TOKEN
     assert env["GH_TOKEN"] == TOKEN
+
+
+@pytest.mark.unit
+def test_build_env_claude_token_set():
+    """_build_env sets CLAUDE_CODE_OAUTH_TOKEN when claude_token is provided."""
+    env = _build_env("ghp_test", claude_token="sk-ant-oat01-test")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
+    assert env["GITHUB_TOKEN"] == "ghp_test"
+
+
+@pytest.mark.unit
+def test_build_env_claude_token_empty():
+    """_build_env does NOT set CLAUDE_CODE_OAUTH_TOKEN when claude_token is empty."""
+    env = _build_env("ghp_test", claude_token="")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+
+@pytest.mark.unit
+def test_build_env_claude_token_default():
+    """_build_env does NOT set CLAUDE_CODE_OAUTH_TOKEN by default."""
+    env = _build_env("ghp_test")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,22 @@ def test_result_status_enum_round_trip():
         assert ResultStatus(member.value) is member
 
 
+def test_task_claude_token_round_trip():
+    task = _make_task(claude_token="sk-ant-oat01-test")
+    d = task.to_dict()
+    assert d["claude_token"] == "sk-ant-oat01-test"
+    rebuilt = Task.from_dict(d)
+    assert rebuilt.claude_token == "sk-ant-oat01-test"
+
+
+def test_task_from_dict_missing_claude_token_defaults_empty():
+    task = _make_task()
+    d = task.to_dict()
+    del d["claude_token"]
+    rebuilt = Task.from_dict(d)
+    assert rebuilt.claude_token == ""
+
+
 def test_task_from_dict_missing_key_raises():
     task = _make_task()
     d = task.to_dict()

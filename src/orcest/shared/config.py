@@ -27,6 +27,7 @@ class RedisConfig:
 class GithubConfig:
     token: str = ""
     repo: str = ""  # "owner/repo" format
+    claude_token: str = ""  # Claude Code OAuth token (from org config)
 
 
 @dataclass
@@ -213,9 +214,13 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     github_token = os.environ.get("GITHUB_TOKEN", github_raw.get("token", ""))
     github_repo = os.environ.get("ORCEST_REPO", github_raw.get("repo", ""))
 
+    claude_token = os.environ.get(
+        "CLAUDE_CODE_OAUTH_TOKEN", github_raw.get("claude_token", ""),
+    )
     github_config = GithubConfig(
         token=str(github_token),
         repo=str(github_repo),
+        claude_token=str(claude_token),
     )
 
     # Polling

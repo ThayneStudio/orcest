@@ -91,11 +91,12 @@ class ClaudeResult:
     usage_exhausted: bool = False
 
 
-def _build_env(token: str) -> dict[str, str]:
+def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
     """Build a minimal environment for the Claude subprocess.
 
     Uses an allowlist of safe variables from the parent process, then
-    injects GITHUB_TOKEN (also as GH_TOKEN for gh CLI compatibility).
+    injects GITHUB_TOKEN (also as GH_TOKEN for gh CLI compatibility)
+    and CLAUDE_CODE_OAUTH_TOKEN if provided (per-task credential).
     """
     env: dict[str, str] = {}
     for key in _ENV_ALLOWLIST:
@@ -105,6 +106,9 @@ def _build_env(token: str) -> dict[str, str]:
     # Always set GITHUB_TOKEN and GH_TOKEN for gh CLI compatibility
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token
+    # Per-task Claude token overrides any env-level token
+    if claude_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
     return env
 
 
@@ -216,6 +220,7 @@ def run_claude(
     logger: logging.Logger | None = None,
     on_output: Callable[[str], None] | None = None,
     abort_event: threading.Event | None = None,
+    claude_token: str = "",
 ) -> ClaudeResult:
     """Execute Claude CLI and return parsed result.
 
@@ -254,7 +259,7 @@ def run_claude(
     # never set so event.wait(timeout=N) behaves like time.sleep(N).
     _abort = abort_event if abort_event is not None else threading.Event()
 
-    env = _build_env(token)
+    env = _build_env(token, claude_token=claude_token)
 
     cmd = [
         "claude",
@@ -627,6 +632,7 @@ class ClaudeRunner:
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
+        claude_token: str = "",
     ) -> RunnerResult:
 
         result = run_claude(
@@ -639,6 +645,7 @@ class ClaudeRunner:
             logger=logger,
             on_output=on_output,
             abort_event=abort_event,
+            claude_token=claude_token,
         )
         return RunnerResult(
             success=result.success,
