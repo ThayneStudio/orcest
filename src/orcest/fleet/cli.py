@@ -1045,12 +1045,19 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         _cleanup_vm()
         sys.exit(1)
 
-    # Step 10: Save template_vm_id in config
+    # Step 10: Save template_vm_id and prompt for worker VM ID range
     cfg.pool.template_vm_id = vm_id
+    default_start = vm_id + 1
+    vm_id_start = click.prompt(
+        "  Worker VM ID range starts at",
+        default=default_start,
+        type=int,
+    )
+    cfg.pool.vm_id_start = vm_id_start
     save_config(cfg, config)
 
     console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
-    console.print(f"  Saved template_vm_id={vm_id} to fleet config.")
+    console.print(f"  Saved template_vm_id={vm_id}, vm_id_start={vm_id_start} to fleet config.")
 
 
 def _set_vm_cloud_init(px: ProxmoxClient, vm_id: int, userdata: str) -> None:
@@ -1183,13 +1190,14 @@ def pool_status(config: str) -> None:
 
 @fleet.command("set-pool-size")
 @click.argument("size", type=int)
+@click.option("--vm-id-start", type=int, default=None, help="First VM ID for worker clones.")
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def set_pool_size(size: int, config: str) -> None:
+def set_pool_size(size: int, vm_id_start: int | None, config: str) -> None:
     """Set the target warm pool size."""
     from orcest.fleet.config import load_config, save_config
 
@@ -1202,6 +1210,9 @@ def set_pool_size(size: int, config: str) -> None:
     cfg = load_config(config)
     old_size = cfg.pool.size
     cfg.pool.size = size
+    if vm_id_start is not None:
+        cfg.pool.vm_id_start = vm_id_start
+        console.print(f"Worker VM ID start: {vm_id_start}")
     save_config(cfg, config)
 
     console.print(f"Pool size updated: {old_size} -> {size}")

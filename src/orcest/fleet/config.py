@@ -87,6 +87,7 @@ class PoolConfig:
 
     size: int = 4  # Target warm pool size
     template_vm_id: int = 0  # Template to clone from (0 = not configured)
+    vm_id_start: int = 0  # First VM ID for worker clones (0 = not configured)
     storage: str = "ssd-pool"  # ZFS pool for linked clones
     worker_memory: int = 16384  # MB per worker VM
     worker_cores: int = 8
@@ -198,6 +199,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     pool = PoolConfig(
         size=pl.get("size", 4),
         template_vm_id=pl.get("template_vm_id", 0),
+        vm_id_start=pl.get("vm_id_start", 0),
         storage=pl.get("storage", "ssd-pool"),
         worker_memory=pl.get("worker_memory", 16384),
         worker_cores=pl.get("worker_cores", 8),
@@ -253,6 +255,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         "pool": {
             "size": config.pool.size,
             "template_vm_id": config.pool.template_vm_id,
+            "vm_id_start": config.pool.vm_id_start,
             "storage": config.pool.storage,
             "worker_memory": config.pool.worker_memory,
             "worker_cores": config.pool.worker_cores,

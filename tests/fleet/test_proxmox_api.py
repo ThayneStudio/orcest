@@ -193,14 +193,14 @@ class TestCloneVm:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         upid = client.clone_vm(
-            template_id=100, new_id=200, name="worker-200", storage="local-lvm",
+            template_id=100, new_id=200, name="worker-200",
         )
 
         assert upid == "UPID:pve:00001234:ABCDEF:clone"
+        # Linked clone: storage must NOT be passed (Proxmox rejects it)
         mock_clone.post.assert_called_once_with(
             newid=200,
             name="worker-200",
-            storage="local-lvm",
             full=0,
         )
         # Verify wait_for_task was called (clone_vm blocks until task completes)
