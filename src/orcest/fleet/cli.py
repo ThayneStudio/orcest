@@ -48,9 +48,11 @@ def _next_free_vmid() -> int | None:
 
 
 def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
-    """Wait for a VM to get an IP address via the QEMU guest agent.
+    """Wait for a VM to get an IPv4 address via the QEMU guest agent.
 
-    Falls back to ARP table scanning if the guest agent is unavailable.
+    Polls ``qm guest cmd network-get-interfaces`` until a non-loopback
+    IPv4 address appears or the timeout expires.  The guest agent must
+    be installed and running — there is no fallback.
     """
     import json
 
@@ -58,7 +60,6 @@ def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
     console.print(f"  Waiting for VM {vm_id} to get an IP...", end=" ")
 
     while time.monotonic() < deadline:
-        # Try QEMU guest agent first
         result = subprocess.run(
             ["qm", "guest", "cmd", str(vm_id), "network-get-interfaces"],
             capture_output=True,
@@ -77,30 +78,6 @@ def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
                             return ip
             except (json.JSONDecodeError, KeyError):
                 pass
-
-        # Try ARP table as fallback — match the VM's MAC address
-        mac_result = subprocess.run(
-            ["qm", "config", str(vm_id)],
-            capture_output=True,
-            text=True,
-        )
-        if mac_result.returncode == 0:
-            mac_match = re.search(r"([0-9A-Fa-f:]{17})", mac_result.stdout)
-            if mac_match:
-                mac = mac_match.group(1).lower()
-                arp_result = subprocess.run(
-                    ["ip", "neigh"], capture_output=True, text=True,
-                )
-                for line in arp_result.stdout.splitlines():
-                    if mac in line.lower():
-                        parts = line.split()
-                        if parts:
-                            ip = parts[0]
-                            # Skip IPv6 link-local addresses — we need a routable IPv4
-                            if ip.startswith("fe80:") or ":" in ip:
-                                continue
-                            console.print(f"[green]{ip}[/green] (via ARP)")
-                            return ip
 
         time.sleep(5)
 
