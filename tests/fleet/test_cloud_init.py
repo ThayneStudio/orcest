@@ -209,7 +209,16 @@ class TestTemplateUserdata:
         data = yaml.safe_load(render_template_userdata())
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "orcest-worker" not in runcmd
-        assert "write_files" not in data
+
+    def test_netplan_dhcp_identifier_mac(self):
+        data = yaml.safe_load(render_template_userdata())
+        netplan_file = next(
+            f for f in data["write_files"] if f["path"] == "/etc/netplan/99-orcest.yaml"
+        )
+        netplan = yaml.safe_load(netplan_file["content"])
+        eth0 = netplan["network"]["ethernets"]["eth0"]
+        assert eth0["dhcp4"] is True
+        assert eth0["dhcp-identifier"] == "mac"
 
     def test_creates_venv_without_installing_orcest(self):
         data = yaml.safe_load(render_template_userdata())
