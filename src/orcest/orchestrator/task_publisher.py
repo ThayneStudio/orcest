@@ -19,7 +19,7 @@ from orcest.orchestrator.pr_ops import (
     increment_transient_attempts,
 )
 from orcest.shared.config import RunnerConfig
-from orcest.shared.coordination import compute_pending_task_ttl, set_pending_task
+from orcest.shared.coordination import clear_pending_task, compute_pending_task_ttl, set_pending_task
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
@@ -81,6 +81,23 @@ _LOG_ERROR_RE = re.compile(
 # RunnerConfig defaults.  Functions that have a live RunnerConfig available
 # should receive the TTL explicitly; this constant is used only as a fallback.
 _DEFAULT_PENDING_TASK_TTL: int = compute_pending_task_ttl(RunnerConfig())
+
+
+def _clear_pending_safe(
+    redis: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+    logger: logging.Logger,
+) -> None:
+    """Best-effort clear of pending task marker on publish failure."""
+    try:
+        clear_pending_task(redis, repo, resource_type, resource_id)
+    except Exception:
+        logger.warning(
+            "Failed to clear pending marker for %s #%d",
+            resource_type, resource_id, exc_info=True,
+        )
 
 
 def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
@@ -181,11 +198,20 @@ def _publish_and_notify(
             f"avoid an un-counted attempt — will retry next poll cycle",
             exc_info=True,
         )
+        _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
         return
 
     # Publish to backend-specific stream
-    tasks_stream = f"tasks:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+    try:
+        tasks_stream = f"tasks:{default_runner}"
+        redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+    except Exception:
+        _log.error(
+            f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
+            exc_info=True,
+        )
+        _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
+        raise
 
     _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
 
@@ -563,11 +589,20 @@ def _publish_issue_and_notify(
             f"avoid an un-counted attempt — will retry next poll cycle",
             exc_info=True,
         )
+        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
         return
 
     # Publish to issue-specific stream (lower priority than PR tasks)
-    tasks_stream = f"tasks:issue:{default_runner}"
-    redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+    try:
+        tasks_stream = f"tasks:issue:{default_runner}"
+        redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+    except Exception:
+        _log.error(
+            f"Failed to publish task {task.id} for issue #{issue_state.number} to Redis",
+            exc_info=True,
+        )
+        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
+        raise
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
 
