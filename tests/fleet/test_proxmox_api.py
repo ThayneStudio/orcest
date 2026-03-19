@@ -251,6 +251,7 @@ class TestStopVm:
 class TestDestroyVm:
     def test_calls_delete_with_purge_and_disk_cleanup(self):
         client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(200).delete.return_value = None
         client.destroy_vm(200)
         mock_api.nodes("pve").qemu(200).delete.assert_called_once()
         call_kwargs = mock_api.nodes("pve").qemu(200).delete.call_args.kwargs
@@ -260,8 +261,18 @@ class TestDestroyVm:
 
     def test_calls_delete_without_purge(self):
         client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(200).delete.return_value = None
         client.destroy_vm(200, purge=False)
         mock_api.nodes("pve").qemu(200).delete.assert_called_once_with(purge=0)
+
+    def test_waits_for_task_when_upid_returned(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(200).delete.return_value = "UPID:pve:destroy"
+        mock_api.nodes("pve").tasks("UPID:pve:destroy").status.get.return_value = {
+            "status": "stopped", "exitstatus": "OK",
+        }
+        client.destroy_vm(200)
+        mock_api.nodes("pve").tasks("UPID:pve:destroy").status.get.assert_called()
 
 
 class TestGetVmStatus:

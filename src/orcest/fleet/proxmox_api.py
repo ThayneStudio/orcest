@@ -164,7 +164,9 @@ class ProxmoxClient:
             # Explicitly request disk cleanup to avoid orphaned disks across
             # Proxmox versions (some older releases don't default this on).
             params["destroy-unreferenced-disks"] = 1
-        self._api.nodes(self._node).qemu(vm_id).delete(**params)
+        upid = self._api.nodes(self._node).qemu(vm_id).delete(**params)
+        if upid:
+            self.wait_for_task(upid)
 
     def get_vm_status(self, vm_id: int) -> str:
         """Get the current status of a VM.
