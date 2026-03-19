@@ -851,6 +851,7 @@ def _create_vm_from_cloud_image(
         name="orcest-worker-template",
         memory=cfg.pool.worker_memory,
         cores=cfg.pool.worker_cores,
+        cpu="host",
         scsihw="virtio-scsi-pci",
         ide2=f"{storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
@@ -868,7 +869,7 @@ def _create_vm_from_cloud_image(
     result = subprocess.run(
         [
             "qm", "set", str(vm_id),
-            "--scsi0", f"{storage}:0,import-from={image_path}",
+            "--scsi0", f"{storage}:0,import-from={image_path},discard=on,ssd=1",
             "--boot", "order=scsi0",
         ],
         capture_output=True,
