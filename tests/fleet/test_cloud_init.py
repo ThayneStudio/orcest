@@ -3,7 +3,11 @@
 import pytest
 import yaml
 
-from orcest.fleet.cloud_init import render_worker_userdata
+from orcest.fleet.cloud_init import (
+    render_orchestrator_userdata,
+    render_template_userdata,
+    render_worker_userdata,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -117,3 +121,109 @@ def test_packages_include_golang():
     output = _render()
     data = yaml.safe_load(output)
     assert "golang-go" in data["packages"]
+
+
+def test_worker_no_ssh_keys():
+    """Workers are ephemeral — no SSH key injection."""
+    output = _render()
+    data = yaml.safe_load(output)
+    assert "ssh_authorized_keys" not in data
+    assert "ssh_authorized_keys" not in data["users"][1]
+
+
+# ── Orchestrator userdata tests ─────────────────────────────
+
+
+class TestOrchestratorUserdata:
+    def test_valid_yaml_with_cloud_config_header(self):
+        output = render_orchestrator_userdata()
+        assert output.startswith("#cloud-config\n")
+        data = yaml.safe_load(output)
+        assert isinstance(data, dict)
+
+    def test_has_orcest_user(self):
+        data = yaml.safe_load(render_orchestrator_userdata())
+        users = data["users"]
+        assert users[0] == "default"
+        orcest = users[1]
+        assert orcest["name"] == "orcest"
+        assert "docker" in orcest["groups"]
+        assert "sudo" in orcest["groups"]
+
+    def test_installs_docker_with_compose_plugin(self):
+        data = yaml.safe_load(render_orchestrator_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "docker-compose-plugin" in runcmd
+
+    def test_enables_qemu_guest_agent(self):
+        data = yaml.safe_load(render_orchestrator_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "systemctl enable qemu-guest-agent" in runcmd
+        assert "systemctl start qemu-guest-agent" in runcmd
+
+    def test_ssh_key_injection(self):
+        data = yaml.safe_load(render_orchestrator_userdata(ssh_public_key="ssh-ed25519 AAAA"))
+        # Key on orcest user
+        assert "ssh-ed25519 AAAA" in data["users"][1]["ssh_authorized_keys"]
+        # Key on default user (top-level)
+        assert "ssh-ed25519 AAAA" in data["ssh_authorized_keys"]
+
+    def test_no_ssh_key_without_arg(self):
+        data = yaml.safe_load(render_orchestrator_userdata())
+        assert "ssh_authorized_keys" not in data
+        assert "ssh_authorized_keys" not in data["users"][1]
+
+    def test_does_not_install_worker_tools(self):
+        data = yaml.safe_load(render_orchestrator_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "claude-code" not in runcmd
+        assert "nodesource" not in runcmd
+
+
+# ── Template userdata tests ─────────────────────────────────
+
+
+class TestTemplateUserdata:
+    def test_valid_yaml_with_cloud_config_header(self):
+        output = render_template_userdata()
+        assert output.startswith("#cloud-config\n")
+        data = yaml.safe_load(output)
+        assert isinstance(data, dict)
+
+    def test_installs_worker_tooling(self):
+        data = yaml.safe_load(render_template_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "claude-code" in runcmd
+        assert "nodesource" in runcmd
+        assert "docker-ce" in runcmd
+        assert "gh" in runcmd
+        assert "supabase" in runcmd
+        assert "playwright" in runcmd
+
+    def test_no_compose_plugin(self):
+        data = yaml.safe_load(render_template_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "docker-compose-plugin" not in runcmd
+
+    def test_no_worker_service(self):
+        data = yaml.safe_load(render_template_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "orcest-worker" not in runcmd
+        assert "write_files" not in data
+
+    def test_creates_venv_without_installing_orcest(self):
+        data = yaml.safe_load(render_template_userdata())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "python3 -m venv /opt/orcest/venv" in runcmd
+        assert "pip install" not in runcmd
+
+    def test_ssh_key_injection(self):
+        data = yaml.safe_load(render_template_userdata(ssh_public_key="ssh-ed25519 BBBB"))
+        assert "ssh-ed25519 BBBB" in data["users"][1]["ssh_authorized_keys"]
+        assert "ssh-ed25519 BBBB" in data["ssh_authorized_keys"]
+
+    def test_includes_worker_packages(self):
+        data = yaml.safe_load(render_template_userdata())
+        assert "golang-go" in data["packages"]
+        assert "python3" in data["packages"]
+        assert "qemu-guest-agent" in data["packages"]
