@@ -198,9 +198,36 @@ def render_template_userdata(
     Args:
         ssh_public_key: Optional SSH public key for the ``thayne`` user.
     """
+    # Linked clones share the template's disk, including /etc/machine-id.
+    # Ubuntu's default DHCP identifier (DUID) is derived from machine-id,
+    # so all clones get the same DHCP lease.  Write a netplan config that
+    # uses MAC-based DHCP identifiers — Proxmox assigns a unique MAC to
+    # each clone.
+    netplan_content = yaml.dump(
+        {
+            "network": {
+                "version": 2,
+                "ethernets": {
+                    "eth0": {
+                        "dhcp4": True,
+                        "dhcp-identifier": "mac",
+                    },
+                },
+            },
+        },
+        default_flow_style=False,
+    )
+
     cloud_config = _base_cloud_config(
         ssh_public_key=ssh_public_key,
         packages=list(_WORKER_PACKAGES),
+        write_files=[
+            {
+                "path": "/etc/netplan/99-orcest.yaml",
+                "permissions": "0644",
+                "content": netplan_content,
+            },
+        ],
         runcmd=[
             *_guest_agent_runcmd(),
             *_worker_workspace_runcmd(),
