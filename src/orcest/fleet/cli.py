@@ -979,15 +979,13 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         _cleanup_vm()
         sys.exit(1)
 
-    # Step 4: Wait for IP
-    console.print("  Waiting for VM IP...", end=" ")
-    vm_ip = px.get_vm_ip(vm_id, timeout=300)
+    # Step 4: Wait for IP (uses ARP fallback so we don't need to wait
+    # for cloud-init to install qemu-guest-agent first)
+    vm_ip = _get_vm_ip(vm_id, console)
     if not vm_ip:
-        console.print("[red]timed out[/red]")
         console.print("  Could not get VM IP. Template creation aborted.")
         _cleanup_vm()
         sys.exit(1)
-    console.print(f"[green]{vm_ip}[/green]")
 
     # Step 5: Wait for SSH
     if not _wait_for_ssh(vm_ip, cfg.orchestrator.user, console):
