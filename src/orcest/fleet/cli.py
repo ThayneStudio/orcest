@@ -396,16 +396,28 @@ def create_orchestrator(vm_id: int | None, config: str) -> None:
 
     # Step 9: Start pool manager (if template and Proxmox creds are configured)
     if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
-        try:
-            from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+        if cfg.proxmox.is_localhost():
+            console.print(
+                "  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]"
+            )
+            console.print(
+                "  The pool manager runs on the orchestrator VM and needs the"
+                " Proxmox host's real IP."
+            )
+            console.print("  Fix with: orcest init  (or edit /etc/orcest/config.yaml)")
+        else:
+            try:
+                from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
 
-            console.print("  Uploading fleet config and starting pool manager...")
-            upload_fleet_config(ssh_target, config)
-            ensure_pool_manager(ssh_target)
-            console.print("  Pool manager [green]ok[/green]")
-        except Exception as exc:
-            console.print(f"  Pool manager [yellow]failed: {exc}[/yellow]")
-            console.print("  (Pool manager can be started later with 'orcest fleet update')")
+                console.print("  Uploading fleet config and starting pool manager...")
+                upload_fleet_config(ssh_target, config)
+                ensure_pool_manager(ssh_target)
+                console.print("  Pool manager [green]ok[/green]")
+            except Exception as exc:
+                console.print(f"  Pool manager [yellow]failed: {exc}[/yellow]")
+                console.print(
+                    "  (Pool manager can be started later with 'orcest fleet update')"
+                )
 
     console.print(f"\n[bold]Orchestrator created at {orch_ip}.[/bold]")
     console.print("\n  Next steps:")
@@ -641,15 +653,25 @@ def update(config: str) -> None:
 
     # Step 3: Update pool manager (if template and Proxmox creds are configured)
     if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
-        console.print("  Updating pool manager...", end=" ")
-        try:
-            from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+        if cfg.proxmox.is_localhost():
+            console.print(
+                "  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]"
+            )
+            console.print(
+                "  The pool manager runs on the orchestrator VM and needs the"
+                " Proxmox host's real IP."
+            )
+            console.print("  Fix with: orcest init  (or edit /etc/orcest/config.yaml)")
+        else:
+            console.print("  Updating pool manager...", end=" ")
+            try:
+                from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
 
-            upload_fleet_config(ssh_target, config)
-            ensure_pool_manager(ssh_target)
-            console.print("[green]ok[/green]")
-        except Exception as exc:
-            console.print(f"[yellow]failed: {exc}[/yellow]")
+                upload_fleet_config(ssh_target, config)
+                ensure_pool_manager(ssh_target)
+                console.print("[green]ok[/green]")
+            except Exception as exc:
+                console.print(f"[yellow]failed: {exc}[/yellow]")
 
     # Step 4: Restart all project stacks
     from orcest.fleet.orchestrator import restart_stack
