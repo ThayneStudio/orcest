@@ -1423,3 +1423,89 @@ def start(config: str) -> None:
         sys.exit(1)
 
     console.print(f"\n  Pool manager started (target size: {cfg.pool.size}).")
+
+
+@fleet.command()
+@click.option(
+    "--rebuild-template",
+    is_flag=True,
+    help="Also recreate the worker template VM.",
+)
+@click.option(
+    "--drain-active",
+    is_flag=True,
+    help="Destroy active workers (interrupts running tasks).",
+)
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+@click.pass_context
+def deploy(ctx: click.Context, rebuild_template: bool, drain_active: bool, config: str) -> None:
+    """Full deploy: upgrade CLI, rebuild images, restart fleet.
+
+    Runs the full deployment sequence in order:
+
+    \b
+      1. Upgrade CLI (pip install from GitHub)
+      2. Stop fleet (stop pool manager, destroy workers, clean Redis)
+      3. Update orchestrator (upload source, rebuild Docker image, restart stacks)
+      4. Rebuild template (only with --rebuild-template)
+      5. Start fleet (start pool manager, begin cloning workers)
+    """
+    console = Console()
+
+    total = 5 if rebuild_template else 4
+    step = 0
+
+    # Step 1: Upgrade CLI
+    step += 1
+    console.print(f"\n[bold]Step {step}/{total}: Upgrading CLI[/bold]\n")
+    _upgrade_cli(console)
+
+    # Step 2: Stop fleet
+    step += 1
+    console.print(f"\n[bold]Step {step}/{total}: Stopping fleet[/bold]\n")
+    ctx.invoke(stop, drain_active=drain_active, config=config)
+
+    # Step 3: Update orchestrator
+    step += 1
+    console.print(f"\n[bold]Step {step}/{total}: Updating orchestrator[/bold]\n")
+    ctx.invoke(update, config=config)
+
+    # Step 4: Rebuild template (optional)
+    if rebuild_template:
+        step += 1
+        console.print(f"\n[bold]Step {step}/{total}: Rebuilding template[/bold]\n")
+        ctx.invoke(create_template, config=config)
+
+    # Step 5: Start fleet
+    step += 1
+    console.print(f"\n[bold]Step {step}/{total}: Starting fleet[/bold]\n")
+    ctx.invoke(start, config=config)
+
+    console.print("\n[bold green]Deploy complete.[/bold green]")
+
+
+def _upgrade_cli(console: Console) -> None:
+    """Upgrade the orcest CLI from GitHub."""
+    import subprocess
+    from pathlib import Path
+
+    console.print("  Installing latest version...", end=" ")
+    pip = Path(sys.executable).parent / "pip"
+    result = subprocess.run(
+        [
+            str(pip), "install", "--quiet", "--no-cache-dir",
+            "--force-reinstall", "git+https://github.com/ThayneStudio/orcest.git",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print("[red]failed[/red]")
+        console.print(f"    {result.stderr.strip()}")
+        raise SystemExit(1)
+    console.print("[green]ok[/green]")
