@@ -925,6 +925,25 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         default_id = _next_free_vmid()
         vm_id = click.prompt("  VM ID for new template", default=default_id, type=int)
 
+    # Check if VM already exists and offer to replace
+    existing_vms = {int(v["vmid"]) for v in px.list_vms() if "vmid" in v}
+    if vm_id in existing_vms:
+        if not click.confirm(f"  VM {vm_id} already exists. Destroy and replace it?"):
+            console.print("Aborted.")
+            sys.exit(0)
+        console.print(f"  Destroying existing VM {vm_id}...", end=" ")
+        try:
+            px.stop_vm(vm_id)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if px.get_vm_status(vm_id) == "stopped":
+                    break
+                time.sleep(1)
+        except Exception:
+            pass  # May already be stopped or a template
+        px.destroy_vm(vm_id)
+        console.print("[green]ok[/green]")
+
     console.print(f"\n[bold]Creating worker template (VM {vm_id})[/bold]\n")
 
     # Step 1: Create VM from cloud image

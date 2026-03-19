@@ -473,6 +473,7 @@ def _mock_proxmox_client(mocker):
     mock_px.next_free_vmid.return_value = 200
     mock_px.get_vm_ip.return_value = "10.20.0.50"
     mock_px.get_vm_status.return_value = "stopped"
+    mock_px.list_vms.return_value = []
     mocker.patch("orcest.fleet.cli._create_proxmox_client", return_value=mock_px)
     return mock_px
 
