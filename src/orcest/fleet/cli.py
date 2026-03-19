@@ -96,6 +96,9 @@ def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
                         parts = line.split()
                         if parts:
                             ip = parts[0]
+                            # Skip IPv6 link-local addresses — we need a routable IPv4
+                            if ip.startswith("fe80:") or ":" in ip:
+                                continue
                             console.print(f"[green]{ip}[/green] (via ARP)")
                             return ip
 
