@@ -320,6 +320,20 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
     _ssh(ssh_target, " && ".join(cmds))
 
 
+def clean_pending_tasks(ssh_target: str) -> int:
+    """Delete all pending task markers from Redis. Returns count deleted."""
+    result = _ssh(
+        ssh_target,
+        "redis-cli --raw KEYS 'orcest:pending:*'",
+    )
+    keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
+    if not keys:
+        return 0
+    quoted = " ".join(shlex.quote(k) for k in keys)
+    _ssh(ssh_target, f"redis-cli DEL {quoted}")
+    return len(keys)
+
+
 def deploy_stack(ssh_target: str, project_name: str) -> None:
     """Start/update a per-project Docker Compose stack.
 

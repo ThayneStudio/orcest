@@ -7,6 +7,7 @@ import yaml
 
 from orcest.fleet.config import require_valid_project_name as _validate_project_name
 from orcest.fleet.orchestrator import (
+    clean_pending_tasks,
     generate_env_file,
     generate_orchestrator_config,
     image_exists,
@@ -321,3 +322,41 @@ class TestCleanPoolRedis:
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh")
         clean_pool_redis("user@host", [])
         ssh.assert_not_called()
+
+
+class TestCleanPendingTasks:
+    def _ok(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def test_deletes_found_keys(self, mocker):
+        call_count = 0
+
+        def ssh_side_effect(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:  # KEYS
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0,
+                    stdout="orcest:pending:issue:Org/repo:1\norcest:pending:issue:Org/repo:2\n",
+                    stderr="",
+                )
+            return self._ok()  # DEL
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+        count = clean_pending_tasks("user@host")
+        assert count == 2
+        assert ssh.call_count == 2
+        del_cmd = ssh.call_args_list[1][0][1]
+        assert "DEL" in del_cmd
+        assert "orcest:pending:issue:Org/repo:1" in del_cmd
+        assert "orcest:pending:issue:Org/repo:2" in del_cmd
+
+    def test_noop_when_no_keys(self, mocker):
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="",
+            ),
+        )
+        count = clean_pending_tasks("user@host")
+        assert count == 0

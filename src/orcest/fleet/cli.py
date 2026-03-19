@@ -1265,6 +1265,7 @@ def stop(drain_active: bool, config: str) -> None:
     """Stop the pool manager and destroy idle worker VMs."""
     from orcest.fleet.config import load_config
     from orcest.fleet.orchestrator import (
+        clean_pending_tasks,
         clean_pool_redis,
         get_pool_redis_members,
         stop_pool_manager,
@@ -1347,6 +1348,14 @@ def stop(drain_active: bool, config: str) -> None:
             console.print("[green]ok[/green]")
         except Exception as exc:
             console.print(f"[yellow]warning[/yellow]: {exc}")
+
+    # Step 5: Clean pending task markers
+    console.print("  Cleaning pending tasks...", end=" ")
+    try:
+        count = clean_pending_tasks(ssh_target)
+        console.print(f"[green]ok[/green] ({count} cleared)")
+    except Exception as exc:
+        console.print(f"[yellow]warning[/yellow]: {exc}")
 
     console.print(f"\n  Destroyed {len(destroyed)} VMs", end="")
     if skipped:
