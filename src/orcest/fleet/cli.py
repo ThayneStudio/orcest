@@ -1012,6 +1012,23 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         sys.exit(1)
     console.print("[green]ok[/green]")
 
+    # Step 7b: Clear machine-id and DHCP leases so each clone gets a unique identity.
+    # systemd regenerates /etc/machine-id on first boot when the file is empty.
+    # Without this, all linked clones share the same DHCP client-id and get
+    # the same IP address.
+    console.print("  Cleaning machine identity for cloning...", end=" ")
+    result = _ssh_run(
+        vm_ip,
+        cfg.orchestrator.user,
+        "sudo truncate -s 0 /etc/machine-id"
+        " && sudo rm -f /var/lib/dhcp/* /var/lib/dbus/machine-id",
+    )
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        _cleanup_vm()
+        sys.exit(1)
+    console.print("[green]ok[/green]")
+
     # Step 8: Stop the VM
     console.print("  Stopping VM...", end=" ")
     try:
