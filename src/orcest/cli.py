@@ -984,3 +984,52 @@ def pool_manage(config: str, interval: float) -> None:
 
 
 main.add_command(fleet)
+
+
+# ── check commands ──────────────────────────────────────────
+
+
+@main.group()
+def check() -> None:
+    """Self-test commands for validating tokens, connectivity, etc."""
+
+
+@check.command("github-token")
+def check_github_token() -> None:
+    """Validate a GitHub token read from stdin.
+
+    Reads a token from stdin, sets GH_TOKEN, and runs ``gh api user``
+    to verify validity against the GitHub API. Exits 0 on success, 1 on failure.
+    """
+    import json
+    import os
+    import subprocess
+
+    token = sys.stdin.read().strip()
+    if not token:
+        click.echo("Error: no token provided on stdin", err=True)
+        raise SystemExit(1)
+    if "\n" in token or "\r" in token:
+        click.echo("Error: token contains newlines; provide exactly one token on stdin", err=True)
+        raise SystemExit(1)
+
+    env = {**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token}
+    result = subprocess.run(
+        ["gh", "api", "user"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode == 0:
+        try:
+            user = json.loads(result.stdout)
+            click.echo(f"Token valid: authenticated as {user.get('login', 'unknown')}")
+        except json.JSONDecodeError:
+            click.echo("Token valid")
+    else:
+        stderr = (result.stderr or "").strip()
+        if stderr:
+            click.echo(stderr, err=True)
+        else:
+            click.echo("Token validation failed", err=True)
+    raise SystemExit(result.returncode)

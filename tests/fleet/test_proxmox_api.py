@@ -421,6 +421,115 @@ class TestSetCloudInitUserdata:
         )
 
 
+class TestDownloadImage:
+    def test_downloads_and_waits_for_task(self):
+        client, mock_api = _make_client()
+        mock_storage = mock_api.nodes("pve").storage("local")
+        mock_storage("download-url").post.return_value = "UPID:pve:download"
+
+        # Make wait_for_task succeed
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        upid = client.download_image(
+            "https://example.com/image.img", "image.img", storage="local",
+        )
+        assert upid == "UPID:pve:download"
+        mock_storage("download-url").post.assert_called_once_with(
+            content="iso", filename="image.img", url="https://example.com/image.img",
+        )
+
+    def test_custom_content_type(self):
+        client, mock_api = _make_client()
+        mock_storage = mock_api.nodes("pve").storage("nfs")
+        mock_storage("download-url").post.return_value = "UPID:pve:dl2"
+
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        client.download_image(
+            "https://example.com/disk.qcow2", "disk.qcow2",
+            storage="nfs", content_type="images",
+        )
+        mock_storage("download-url").post.assert_called_once_with(
+            content="images", filename="disk.qcow2", url="https://example.com/disk.qcow2",
+        )
+
+    @patch("orcest.fleet.proxmox_api.time")
+    def test_propagates_task_failure(self, mock_time):
+        client, mock_api = _make_client()
+        mock_storage = mock_api.nodes("pve").storage("local")
+        mock_storage("download-url").post.return_value = "UPID:pve:dl-fail"
+
+        mock_time.monotonic.side_effect = [0, 1]
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {
+            "status": "stopped",
+            "exitstatus": "download failed: connection refused",
+        }
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        with pytest.raises(RuntimeError, match="download failed"):
+            client.download_image("https://example.com/bad.img", "bad.img")
+
+
+class TestCreateVm:
+    def test_creates_vm_with_kwargs(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.post.return_value = None
+
+        client.create_vm(vm_id=200, name="test-vm", memory=2048, cores=2)
+        mock_api.nodes("pve").qemu.post.assert_called_once_with(
+            vmid=200, name="test-vm", memory=2048, cores=2,
+        )
+
+    def test_waits_for_task_when_upid_returned(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.post.return_value = "UPID:pve:create"
+
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        client.create_vm(vm_id=200, name="test-vm")
+        # Verify wait_for_task was actually invoked
+        mock_task_status.get.assert_called()
+
+    def test_forwards_import_from_kwargs(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu.post.return_value = None
+
+        client.create_vm(
+            vm_id=200, name="test-vm",
+            scsihw="virtio-scsi-pci",
+            scsi0="ssd-pool:0,import-from=local:iso/noble-server-cloudimg-amd64.img",
+        )
+        mock_api.nodes("pve").qemu.post.assert_called_once_with(
+            vmid=200, name="test-vm",
+            scsihw="virtio-scsi-pci",
+            scsi0="ssd-pool:0,import-from=local:iso/noble-server-cloudimg-amd64.img",
+        )
+
+
+class TestResizeDisk:
+    def test_calls_resize_endpoint(self):
+        client, mock_api = _make_client()
+        client.resize_disk(200, "scsi0", "30G")
+        mock_api.nodes("pve").qemu(200).resize.put.assert_called_once_with(
+            disk="scsi0", size="30G",
+        )
+
+
 class TestConvertToTemplate:
     def test_calls_template_endpoint(self):
         client, mock_api = _make_client()

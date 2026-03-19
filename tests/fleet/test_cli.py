@@ -221,8 +221,12 @@ def test_destroy_missing_project(runner, cfg_path):
 
 def test_add_org_registers_credentials(runner, cfg_path, mocker):
     """fleet add-org registers an org with credentials."""
-    _save(FleetConfig(), cfg_path)
-    mocker.patch("subprocess.run")  # mock gh auth status
+    cfg = FleetConfig(orchestrator=OrchestratorConfig(host="10.20.0.23"))
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.cli._run_on_orchestrator",
+        return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""),
+    )
     result = runner.invoke(
         fleet,
         [
@@ -243,6 +247,118 @@ def test_add_org_registers_credentials(runner, cfg_path, mocker):
         data = yaml.safe_load(f)
     assert "MyOrg" in data["orgs"]
     assert data["orgs"]["MyOrg"]["github_token"] == "ghp_test123"
+
+
+def test_add_org_skips_validation_without_orchestrator(runner, cfg_path):
+    """fleet add-org skips token validation when orchestrator is not configured."""
+    _save(FleetConfig(), cfg_path)
+    result = runner.invoke(
+        fleet,
+        [
+            "add-org",
+            "MyOrg",
+            "--github-token",
+            "ghp_test123",
+            "--claude-token",
+            "sk-test456",
+            "--config",
+            cfg_path,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "skipped" in result.output
+    # Credentials should still be saved
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f)
+    assert "MyOrg" in data["orgs"]
+
+
+def test_add_org_saves_on_validation_failure(runner, cfg_path, mocker):
+    """fleet add-org warns but saves credentials when token validation fails."""
+    cfg = FleetConfig(orchestrator=OrchestratorConfig(host="10.20.0.23"))
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.cli._run_on_orchestrator",
+        return_value=mocker.MagicMock(returncode=1, stdout="", stderr="bad token"),
+    )
+    result = runner.invoke(
+        fleet,
+        [
+            "add-org",
+            "MyOrg",
+            "--github-token",
+            "ghp_bad",
+            "--claude-token",
+            "sk-test456",
+            "--config",
+            cfg_path,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "failed" in result.output
+    assert "saving anyway" in result.output
+    # Credentials should still be saved
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f)
+    assert data["orgs"]["MyOrg"]["github_token"] == "ghp_bad"
+
+
+def test_add_org_skips_on_connection_error(runner, cfg_path, mocker):
+    """fleet add-org skips validation when orchestrator is unreachable."""
+    cfg = FleetConfig(orchestrator=OrchestratorConfig(host="10.20.0.23"))
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.cli._run_on_orchestrator",
+        side_effect=OSError("Connection refused"),
+    )
+    result = runner.invoke(
+        fleet,
+        [
+            "add-org",
+            "MyOrg",
+            "--github-token",
+            "ghp_test123",
+            "--claude-token",
+            "sk-test456",
+            "--config",
+            cfg_path,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "skipped" in result.output
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f)
+    assert "MyOrg" in data["orgs"]
+
+
+def test_add_org_skips_on_timeout(runner, cfg_path, mocker):
+    """fleet add-org skips validation when orchestrator command times out."""
+    import subprocess
+
+    cfg = FleetConfig(orchestrator=OrchestratorConfig(host="10.20.0.23"))
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.cli._run_on_orchestrator",
+        side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=30),
+    )
+    result = runner.invoke(
+        fleet,
+        [
+            "add-org",
+            "MyOrg",
+            "--github-token",
+            "ghp_test123",
+            "--claude-token",
+            "sk-test456",
+            "--config",
+            cfg_path,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "skipped" in result.output
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f)
+    assert "MyOrg" in data["orgs"]
 
 
 def test_create_orchestrator(runner, cfg_path, mocker):
@@ -362,11 +478,12 @@ def _mock_proxmox_client(mocker):
 
 
 def test_create_template_success(runner, cfg_path, mocker):
-    """create-template clones, boots, provisions, and converts to template."""
+    """create-template creates VM from cloud image, provisions, and converts to template."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -377,19 +494,12 @@ def test_create_template_success(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code == 0, result.output
     assert "Worker template created" in result.output
 
     # Verify Proxmox operations happened in order
-    mock_px.clone_vm.assert_called_once_with(
-        template_id=9000,
-        new_id=200,
-        name="orcest-worker-template",
-        storage="ssd-pool",
-        linked=False,
-    )
     mock_px.start_vm.assert_called_once_with(200)
     mock_px.get_vm_ip.assert_called_once_with(200, timeout=300)
     mock_px.stop_vm.assert_called_once_with(200)
@@ -401,13 +511,14 @@ def test_create_template_success(runner, cfg_path, mocker):
     assert data["pool"]["template_vm_id"] == 200
 
 
-def test_create_template_prompts_for_ids(runner, cfg_path, mocker):
-    """create-template prompts for base VM ID and template VM ID when not provided."""
+def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
+    """create-template prompts for template VM ID when not provided."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
-    mock_px = _mock_proxmox_client(mocker)
+    _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.cli._next_free_vmid", return_value=300)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -416,40 +527,14 @@ def test_create_template_prompts_for_ids(runner, cfg_path, mocker):
         return_value=mocker.MagicMock(returncode=0),
     )
 
-    # Provide input for both prompts: base VM ID, then accept default template VM ID
+    # Accept default template VM ID
     result = runner.invoke(
         fleet,
         ["create-template", "--config", cfg_path],
-        input="9000\n\n",
+        input="\n",
     )
     assert result.exit_code == 0, result.output
-    assert "Base VM ID" in result.output
-
-    mock_px.clone_vm.assert_called_once()
-    # Verify the prompted IDs were used
-    assert mock_px.clone_vm.call_args.kwargs["new_id"] == 300
-
-
-def test_create_template_custom_base_vm(runner, cfg_path, mocker):
-    """create-template respects --base-vm-id option."""
-    cfg = _proxmox_cfg()
-    _save(cfg, cfg_path)
-
-    mock_px = _mock_proxmox_client(mocker)
-    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
-    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
-    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
-    mocker.patch(
-        "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0),
-    )
-
-    result = runner.invoke(
-        fleet,
-        ["create-template", "--base-vm-id", "5000", "--vm-id", "200", "--config", cfg_path],
-    )
-    assert result.exit_code == 0, result.output
-    assert mock_px.clone_vm.call_args.kwargs["template_id"] == 5000
+    assert "VM ID for new template" in result.output
 
 
 def test_create_template_no_proxmox_creds(runner, cfg_path):
@@ -459,34 +544,40 @@ def test_create_template_no_proxmox_creds(runner, cfg_path):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "Proxmox API credentials not configured" in result.output
 
 
-def test_create_template_clone_failure(runner, cfg_path, mocker):
-    """create-template exits on clone failure."""
+def test_create_template_image_import_failure(runner, cfg_path, mocker):
+    """create-template exits on cloud image creation failure."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
-    mock_px.clone_vm.side_effect = RuntimeError("clone failed")
+    mocker.patch(
+        "orcest.fleet.cli._create_vm_from_cloud_image",
+        side_effect=RuntimeError("download failed"),
+    )
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
-    assert "clone failed" in result.output
+    assert "download failed" in result.output
+    # Should attempt best-effort cleanup
+    mock_px.destroy_vm.assert_called_once_with(200)
 
 
 def test_create_template_cloud_init_failure_cleans_up(runner, cfg_path, mocker):
-    """create-template destroys the cloned VM if cloud-init config fails."""
+    """create-template destroys the VM if cloud-init config fails."""
     cfg = _proxmox_cfg()
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch(
         "orcest.fleet.cli._set_vm_cloud_init",
         side_effect=RuntimeError("upload failed"),
@@ -494,7 +585,7 @@ def test_create_template_cloud_init_failure_cleans_up(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     # Should attempt cleanup
@@ -508,11 +599,12 @@ def test_create_template_ip_timeout(runner, cfg_path, mocker):
 
     mock_px = _mock_proxmox_client(mocker)
     mock_px.get_vm_ip.return_value = None
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "timed out" in result.output
@@ -525,12 +617,13 @@ def test_create_template_ssh_timeout(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "SSH not available" in result.output
@@ -543,13 +636,14 @@ def test_create_template_cloud_init_timeout(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=False)
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "Cloud-init timed out" in result.output
@@ -562,6 +656,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -572,7 +667,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "permission denied" in result.output
@@ -585,6 +680,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
 
     mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
     mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
@@ -613,7 +709,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-template", "--base-vm-id", "9000", "--vm-id", "200", "--config", cfg_path],
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
     assert "timed out" in result.output
