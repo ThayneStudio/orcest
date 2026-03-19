@@ -232,10 +232,67 @@ def render_template_userdata(
             *_guest_agent_runcmd(),
             *_worker_workspace_runcmd(),
             *_worker_tooling_runcmd(),
-            # Create Python virtualenv (orcest will be installed at clone time)
+            # Create Python virtualenv and pre-install orcest
             "sudo -u orcest python3 -m venv /opt/orcest/venv",
+            "sudo -u orcest /opt/orcest/venv/bin/pip install -q"
+            " 'git+https://github.com/ThayneStudio/orcest.git'",
         ],
     )
+    return _render(cloud_config)
+
+
+# ── Warm-pool clone (lightweight cloud-init for cloned VMs) ──
+
+
+def render_clone_userdata(
+    *,
+    redis_host: str,
+    key_prefix: str,
+    worker_id: str,
+) -> str:
+    """Render cloud-init user-data for a warm-pool clone.
+
+    This is a lightweight config — the template already has all tooling
+    and orcest pre-installed. We just write the worker config and start
+    the systemd service.
+
+    Args:
+        redis_host: Redis host (orchestrator VM IP).
+        key_prefix: Redis key prefix for namespace isolation.
+        worker_id: Unique worker identifier (e.g. ``orcest-worker-10002``).
+    """
+    worker_yaml = yaml.dump(
+        {
+            "redis": {"host": redis_host, "port": 6379, "key_prefix": key_prefix},
+            "worker_id": worker_id,
+            "workspace_dir": "/opt/orcest/workspaces",
+            "backend": "claude",
+            "ephemeral": True,
+        },
+        default_flow_style=False,
+    )
+
+    systemd_unit = _systemd_unit()
+
+    cloud_config = {
+        "write_files": [
+            {
+                "path": "/opt/orcest/worker.yaml",
+                "owner": "orcest:orcest",
+                "permissions": "0644",
+                "content": worker_yaml,
+            },
+            {
+                "path": "/etc/systemd/system/orcest-worker.service",
+                "permissions": "0644",
+                "content": systemd_unit,
+            },
+        ],
+        "runcmd": [
+            "systemctl daemon-reload",
+            "systemctl enable --now orcest-worker",
+        ],
+    }
     return _render(cloud_config)
 
 
@@ -378,7 +435,7 @@ ReadWritePaths=/opt/orcest/workspaces /home/orcest/.claude /home/orcest/.cache
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
-EnvironmentFile=/opt/orcest/.env
+EnvironmentFile=-/opt/orcest/.env
 
 [Install]
 WantedBy=multi-user.target

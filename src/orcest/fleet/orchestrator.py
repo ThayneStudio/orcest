@@ -483,6 +483,7 @@ def generate_env_file(
     github_token: str,
     key_prefix: str,
     project_name: str,
+    claude_token: str = "",
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
@@ -493,13 +494,17 @@ def generate_env_file(
     _validate_env_value(github_token, "github_token")
     _validate_env_value(key_prefix, "key_prefix")
     _validate_env_value(project_name, "project_name")
-    return (
-        f"GITHUB_TOKEN='{github_token}'\n"
-        f"GH_TOKEN='{github_token}'\n"
-        f"ORCEST_REDIS_KEY_PREFIX='{key_prefix}'\n"
-        f"ORCEST_IMAGE='orcest:latest'\n"
-        f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'\n"
-    )
+    lines = [
+        f"GITHUB_TOKEN='{github_token}'",
+        f"GH_TOKEN='{github_token}'",
+        f"ORCEST_REDIS_KEY_PREFIX='{key_prefix}'",
+        "ORCEST_IMAGE='orcest:latest'",
+        f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'",
+    ]
+    if claude_token:
+        _validate_env_value(claude_token, "claude_token")
+        lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{claude_token}'")
+    return "\n".join(lines) + "\n"
 
 
 def generate_orchestrator_config(repo: str, key_prefix: str) -> str:

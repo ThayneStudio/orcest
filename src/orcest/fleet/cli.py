@@ -504,6 +504,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             github_token=org.github_token,
             key_prefix=project_name,
             project_name=project_name,
+            claude_token=org.claude_oauth_token,
         )
         config_yaml = generate_orchestrator_config(
             repo=repo, key_prefix=project_name,
@@ -1022,9 +1023,10 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         _cleanup_vm()
         sys.exit(1)
 
-    # Step 7: Disable cloud-init so clones don't re-run it
-    console.print("  Disabling cloud-init...", end=" ")
-    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo touch /etc/cloud/cloud-init.disabled")
+    # Step 7: Clean cloud-init state so clones run fresh cloud-init
+    # (clones get per-VM cloud-init userdata from the pool manager)
+    console.print("  Cleaning cloud-init state...", end=" ")
+    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo rm -rf /var/lib/cloud/*")
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
         _cleanup_vm()

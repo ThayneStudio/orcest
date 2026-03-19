@@ -16,6 +16,7 @@ import signal
 import threading
 import time
 
+from orcest.fleet.cloud_init import render_clone_userdata
 from orcest.fleet.config import FleetConfig
 from orcest.fleet.proxmox_api import ProxmoxClient
 from orcest.shared.redis_client import RedisClient
@@ -59,11 +60,13 @@ class PoolManager:
         config: FleetConfig,
         proxmox: ProxmoxClient,
         redis: RedisClient,
+        key_prefix: str = "orcest",
     ) -> None:
         self._config = config
         self._proxmox = proxmox
         self._redis = redis
         self._pool = config.pool
+        self._key_prefix = key_prefix
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -298,6 +301,21 @@ class PoolManager:
                 self._proxmox.destroy_vm(new_id)
             except Exception:
                 pass  # VM may not exist; either way, nothing more we can do
+            return None
+
+        # Set cloud-init userdata so the clone starts the worker service
+        try:
+            userdata = render_clone_userdata(
+                redis_host=self._config.orchestrator.host,
+                key_prefix=self._key_prefix,
+                worker_id=name,
+            )
+            self._proxmox.set_cloud_init_userdata(new_id, userdata)
+        except Exception:
+            logger.error(
+                "Failed to set cloud-init on VM %d, destroying", new_id, exc_info=True
+            )
+            self._destroy_vm(new_id)
             return None
 
         try:

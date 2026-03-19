@@ -40,6 +40,7 @@ class Runner(Protocol):
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
+        claude_token: str = "",
     ) -> RunnerResult: ...
 
 

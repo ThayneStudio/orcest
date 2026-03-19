@@ -165,6 +165,7 @@ def _poll_cycle(
                             merge_error=err_msg[:200],
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
+                            claude_token=config.github.claude_token,
                         )
                         enqueued += 1
                     except Exception as rebase_err:
@@ -284,6 +285,7 @@ def _poll_cycle(
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
+                    claude_token=config.github.claude_token,
                 )
                 if result is not None:
                     enqueued += 1
@@ -305,6 +307,7 @@ def _poll_cycle(
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
+                    claude_token=config.github.claude_token,
                 )
                 enqueued += 1
             except Exception as e:
@@ -329,6 +332,7 @@ def _poll_cycle(
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
+                    claude_token=config.github.claude_token,
                 )
                 enqueued += 1
             except Exception as e:
@@ -679,6 +683,7 @@ def _poll_cycle(
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
+                    claude_token=config.github.claude_token,
                 )
                 enqueued += 1
             except Exception as e:

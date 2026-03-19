@@ -663,6 +663,7 @@ def _execute_task(
             logger=logger,
             on_output=on_output,
             abort_event=abort_event,
+            claude_token=task.claude_token,
         )
 
         duration = int(time.monotonic() - start)

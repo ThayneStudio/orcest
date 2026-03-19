@@ -33,6 +33,7 @@ class NoopRunner:
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
+        claude_token: str = "",
     ) -> RunnerResult:
         sleep_duration = max(0.0, min(self.duration, max(timeout, 0)))
         if logger:

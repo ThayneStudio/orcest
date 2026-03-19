@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    render_clone_userdata,
     render_orchestrator_userdata,
     render_template_userdata,
     render_worker_userdata,
@@ -220,11 +221,12 @@ class TestTemplateUserdata:
         assert eth0["dhcp4"] is True
         assert eth0["dhcp-identifier"] == "mac"
 
-    def test_creates_venv_without_installing_orcest(self):
+    def test_creates_venv_and_installs_orcest(self):
         data = yaml.safe_load(render_template_userdata())
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "python3 -m venv /opt/orcest/venv" in runcmd
-        assert "pip install" not in runcmd
+        assert "pip install" in runcmd
+        assert "orcest.git" in runcmd
 
     def test_ssh_key_injection(self):
         data = yaml.safe_load(render_template_userdata(ssh_public_key="ssh-ed25519 BBBB"))
@@ -236,3 +238,64 @@ class TestTemplateUserdata:
         assert "golang-go" in data["packages"]
         assert "python3" in data["packages"]
         assert "qemu-guest-agent" in data["packages"]
+
+
+# ── Clone userdata tests ──────────────────────────────────
+
+
+class TestCloneUserdata:
+    def _render(self, **overrides):
+        defaults = {
+            "redis_host": "10.20.0.23",
+            "key_prefix": "orcest",
+            "worker_id": "orcest-worker-10002",
+        }
+        defaults.update(overrides)
+        return render_clone_userdata(**defaults)
+
+    def test_valid_yaml_with_cloud_config_header(self):
+        output = self._render()
+        assert output.startswith("#cloud-config\n")
+        data = yaml.safe_load(output)
+        assert isinstance(data, dict)
+
+    def test_worker_yaml_content(self):
+        output = self._render(redis_host="10.0.0.1", key_prefix="myprefix", worker_id="w-99")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["redis"]["host"] == "10.0.0.1"
+        assert cfg["redis"]["port"] == 6379
+        assert cfg["redis"]["key_prefix"] == "myprefix"
+        assert cfg["worker_id"] == "w-99"
+        assert cfg["ephemeral"] is True
+
+    def test_systemd_unit_written(self):
+        data = yaml.safe_load(self._render())
+        svc_path = "/etc/systemd/system/orcest-worker.service"
+        unit_file = next(f for f in data["write_files"] if f["path"] == svc_path)
+        assert "ExecStart=/opt/orcest/venv/bin/orcest work" in unit_file["content"]
+
+    def test_runcmd_starts_service(self):
+        data = yaml.safe_load(self._render())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "systemctl daemon-reload" in runcmd
+        assert "systemctl enable --now orcest-worker" in runcmd
+
+    def test_no_package_installation(self):
+        data = yaml.safe_load(self._render())
+        assert "packages" not in data
+
+    def test_no_tooling_commands(self):
+        data = yaml.safe_load(self._render())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "nodesource" not in runcmd
+        assert "docker-ce" not in runcmd
+        assert "claude-code" not in runcmd
+
+    def test_systemd_env_file_optional(self):
+        """EnvironmentFile uses - prefix so missing .env doesn't fail."""
+        data = yaml.safe_load(self._render())
+        svc_path = "/etc/systemd/system/orcest-worker.service"
+        unit_file = next(f for f in data["write_files"] if f["path"] == svc_path)
+        assert "EnvironmentFile=-/opt/orcest/.env" in unit_file["content"]
