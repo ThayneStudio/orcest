@@ -854,6 +854,7 @@ def _create_vm_from_cloud_image(
         scsihw="virtio-scsi-pci",
         ide2=f"{storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
+        ipconfig0="ip=dhcp",
         serial0="socket",
         vga="serial0",
         agent="1",
