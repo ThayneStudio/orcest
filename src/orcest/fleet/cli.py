@@ -831,11 +831,17 @@ def _create_vm_from_cloud_image(
     if not filename or filename.startswith("."):
         filename = "cloud-image.img"
 
-    # Step 1: Download cloud image to Proxmox local storage
+    # Step 1: Download cloud image to Proxmox local storage (skip if already present)
     download_storage = "local"
     console.print("  Downloading cloud image...", end=" ")
-    px.download_image(image_url, filename, storage=download_storage)
-    console.print("[green]ok[/green]")
+    try:
+        px.download_image(image_url, filename, storage=download_storage)
+        console.print("[green]ok[/green]")
+    except RuntimeError as exc:
+        if "already exists" in str(exc) or "override existing" in str(exc):
+            console.print("[yellow]already cached[/yellow]")
+        else:
+            raise
 
     # Step 2: Create VM with imported disk
     console.print("  Creating VM...", end=" ")
