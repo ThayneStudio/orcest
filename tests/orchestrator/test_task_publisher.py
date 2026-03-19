@@ -1114,6 +1114,10 @@ def test_publish_and_notify_skips_xadd_on_increment_failure(
     entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert not any(f["id"] == task.id for _, f in entries)
 
+    # Pending marker should be cleared so the PR can be retried immediately
+    pending_key = fake_redis_client._prefixed(f"pending:pr:test-org/test-repo:800")
+    assert fake_redis_client.client.get(pending_key) is None
+
     # Error should be logged with skip rationale
     error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
     assert any("Failed to increment attempt counter" in m for m in error_msgs)
@@ -1153,6 +1157,10 @@ def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
     # Task should NOT be published to Redis
     entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:issue:claude"))
     assert not any(f["id"] == task.id for _, f in entries)
+
+    # Pending marker should be cleared so the issue can be retried immediately
+    pending_key = fake_redis_client._prefixed("pending:issue:test-org/test-repo:801")
+    assert fake_redis_client.client.get(pending_key) is None
 
     # Error should be logged with skip rationale
     error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
