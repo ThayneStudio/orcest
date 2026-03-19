@@ -193,12 +193,12 @@ class TestUploadFleetConfig:
         ssh.assert_any_call("user@host", "sudo mkdir -p /etc/orcest")
         ssh.assert_any_call(
             "user@host",
-            "sudo mv /etc/orcest/.config.yaml.tmp /etc/orcest/config.yaml"
+            "sudo mv /tmp/.orcest-config.yaml.tmp /etc/orcest/config.yaml"
             " && sudo chmod 600 /etc/orcest/config.yaml",
         )
         # Verify SCP uploads the local file to the temp path on the remote
         scp.assert_called_once_with(
-            str(cfg_file), "user@host", "/etc/orcest/.config.yaml.tmp",
+            str(cfg_file), "user@host", "/tmp/.orcest-config.yaml.tmp",
         )
 
     def test_missing_config_raises(self):
@@ -246,5 +246,5 @@ class TestUploadFleetConfig:
         # Verify the cleanup call removes the temp file
         cleanup_call = ssh.call_args_list[2]
         assert cleanup_call == mocker.call(
-            "user@host", "rm -f /etc/orcest/.config.yaml.tmp",
+            "user@host", "rm -f /tmp/.orcest-config.yaml.tmp",
         )

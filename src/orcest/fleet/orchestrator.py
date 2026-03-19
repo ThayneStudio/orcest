@@ -206,7 +206,8 @@ def upload_fleet_config(
         )
 
     remote_dest = "/etc/orcest/config.yaml"
-    remote_tmp = "/etc/orcest/.config.yaml.tmp"
+    # SCP as the orcest user to a writable location, then sudo mv into place.
+    remote_tmp = "/tmp/.orcest-config.yaml.tmp"
 
     # Ensure target directory exists on the orchestrator VM
     result = _ssh(ssh_target, "sudo mkdir -p /etc/orcest")
@@ -215,10 +216,6 @@ def upload_fleet_config(
             f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}"
         )
 
-    # SCP to a temp file in the same directory as the destination so that
-    # the subsequent ``mv`` is an atomic same-filesystem rename (avoids the
-    # copy+delete fallback that would happen across filesystems, e.g. /tmp
-    # on tmpfs vs /etc on rootfs).
     result = _scp(local_config_path, ssh_target, remote_tmp)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
