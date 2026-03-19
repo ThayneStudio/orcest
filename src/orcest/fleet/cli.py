@@ -1031,16 +1031,26 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         sys.exit(1)
     console.print("[green]ok[/green]")
 
-    # Step 7b: Clear machine-id and DHCP leases so each clone gets a unique identity.
-    # systemd regenerates /etc/machine-id on first boot when the file is empty.
-    # Without this, all linked clones share the same DHCP client-id and get
-    # the same IP address.
-    console.print("  Cleaning machine identity for cloning...", end=" ")
+    # Step 7b: Prepare template for unique clone identities.
+    # By default, Ubuntu's netplan uses DUID (derived from /etc/machine-id) as
+    # the DHCP client identifier. Linked clones share the base disk, so they
+    # all have the same machine-id and get the same DHCP lease.
+    #
+    # Fix: patch netplan to use `dhcp-identifier: mac` so DHCP uses the MAC
+    # address (which Proxmox generates uniquely per clone). Also clear
+    # machine-id so each clone gets a unique one on first boot.
+    #
+    # See: https://forum.proxmox.com/threads/84237/
+    console.print("  Preparing template for cloning...", end=" ")
     result = _ssh_run(
         vm_ip,
         cfg.orchestrator.user,
-        "sudo truncate -s 0 /etc/machine-id"
-        " && sudo rm -f /var/lib/dhcp/* /var/lib/dbus/machine-id",
+        # Patch all netplan configs to use MAC-based DHCP identifier
+        "sudo sed -i '/dhcp4: true/a\\            dhcp-identifier: mac'"
+        " /etc/netplan/*.yaml"
+        # Clear machine-id (systemd regenerates on first boot)
+        " && sudo truncate -s 0 /etc/machine-id"
+        " && sudo rm -f /var/lib/dbus/machine-id",
     )
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
