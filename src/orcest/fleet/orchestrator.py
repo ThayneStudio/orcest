@@ -257,6 +257,69 @@ def ensure_pool_manager(
     logger.info("Pool manager running on %s", ssh_target)
 
 
+def stop_pool_manager(ssh_target: str) -> None:
+    """Stop the pool manager stack.
+
+    Counterpart to :func:`ensure_pool_manager`. Idempotent — safe to
+    call when the pool manager is already stopped.
+    """
+    logger.info("Stopping pool manager on %s", ssh_target)
+    result = _ssh(
+        ssh_target,
+        "cd /opt/orcest && docker compose"
+        " -f docker-compose.pool.yml"
+        " -p orcest-pool"
+        " down",
+    )
+    if result.returncode != 0:
+        logger.error("Pool manager stop failed: %s", result.stderr.strip())
+        raise RuntimeError(
+            f"Failed to stop pool manager: {result.stderr.strip()}"
+        )
+    logger.info("Pool manager stopped on %s", ssh_target)
+
+
+def get_pool_redis_members(
+    ssh_target: str,
+) -> tuple[set[str], dict[str, str]]:
+    """Read pool tracking sets from Redis on the orchestrator via SSH.
+
+    Returns ``(idle_vm_ids, active_vm_id_to_timestamp)``.
+
+    Uses ``redis-cli --raw`` for predictable line-per-value output.
+    """
+    # Read idle set
+    result = _ssh(ssh_target, "redis-cli --raw SMEMBERS orcest:pool:idle")
+    idle: set[str] = set()
+    if result.returncode == 0:
+        for line in result.stdout.strip().splitlines():
+            stripped = line.strip()
+            if stripped:
+                idle.add(stripped)
+
+    # Read active hash (returns alternating key, value lines)
+    result = _ssh(ssh_target, "redis-cli --raw HGETALL orcest:pool:active")
+    active: dict[str, str] = {}
+    if result.returncode == 0:
+        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        for i in range(0, len(lines) - 1, 2):
+            active[lines[i]] = lines[i + 1]
+
+    return idle, active
+
+
+def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
+    """Remove VM IDs from pool:idle and pool:active in Redis."""
+    if not vm_ids:
+        return
+    cmds: list[str] = []
+    for vm_id in vm_ids:
+        quoted = shlex.quote(vm_id)
+        cmds.append(f"redis-cli SREM orcest:pool:idle {quoted}")
+        cmds.append(f"redis-cli HDEL orcest:pool:active {quoted}")
+    _ssh(ssh_target, " && ".join(cmds))
+
+
 def deploy_stack(ssh_target: str, project_name: str) -> None:
     """Start/update a per-project Docker Compose stack.
 

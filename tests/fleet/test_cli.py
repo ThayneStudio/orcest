@@ -864,3 +864,179 @@ def test_set_pool_size_negative(runner, cfg_path):
     result = runner.invoke(fleet, ["set-pool-size", "--config", cfg_path, "--", "-1"])
     assert result.exit_code != 0
     assert "non-negative" in result.output
+
+
+# ── fleet stop ──────────────────────────────────────────────
+
+
+def test_stop_destroys_idle_vms(runner, cfg_path, mocker):
+    """stop destroys idle worker VMs and cleans Redis."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "301"}, {}),
+    )
+    mock_clean = mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+    assert result.exit_code == 0
+    assert mock_px.destroy_vm.call_count == 2
+    mock_clean.assert_called_once()
+
+
+def test_stop_leaves_active_vms(runner, cfg_path, mocker):
+    """stop leaves active VMs running unless --drain-active."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {"301": "1000.0"}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+    assert result.exit_code == 0
+    # Only idle VM 300 destroyed, active VM 301 left
+    mock_px.destroy_vm.assert_called_once_with(300)
+    assert "Leaving active VM 301" in result.output
+
+
+def test_stop_drain_active_destroys_all(runner, cfg_path, mocker):
+    """stop --drain-active also destroys active VMs."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {"301": "1000.0"}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    result = runner.invoke(fleet, ["stop", "--drain-active", "--config", cfg_path])
+    assert result.exit_code == 0
+    assert mock_px.destroy_vm.call_count == 2
+
+
+def test_stop_requires_orchestrator_host(runner, cfg_path):
+    """stop fails if orchestrator host not set."""
+    _save(FleetConfig(), cfg_path)
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+    assert result.exit_code != 0
+    assert "Orchestrator host not set" in result.output
+
+
+def test_stop_no_vms(runner, cfg_path, mocker):
+    """stop succeeds cleanly when no worker VMs exist."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = []
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+    assert result.exit_code == 0
+    assert "Destroyed 0 VMs" in result.output
+
+
+# ── fleet start ─────────────────────────────────────────────
+
+
+def test_start_uploads_config_and_starts(runner, cfg_path, mocker):
+    """start uploads config and starts pool manager."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, size=4),
+    )
+    _save(cfg, cfg_path)
+
+    mock_upload = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mock_ensure = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+    assert result.exit_code == 0
+    mock_upload.assert_called_once()
+    mock_ensure.assert_called_once()
+    assert "target size: 4" in result.output
+
+
+def test_start_requires_orchestrator_host(runner, cfg_path):
+    """start fails if orchestrator host not set."""
+    _save(FleetConfig(), cfg_path)
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+    assert result.exit_code != 0
+    assert "Orchestrator host not set" in result.output
+
+
+def test_start_requires_template(runner, cfg_path):
+    """start fails if no template VM configured."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=0),
+    )
+    _save(cfg, cfg_path)
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+    assert result.exit_code != 0
+    assert "template" in result.output.lower()
+
+
+def test_start_rejects_localhost_endpoint(runner, cfg_path):
+    """start fails if Proxmox endpoint is localhost."""
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(
+            endpoint="https://127.0.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+    assert result.exit_code != 0
+    assert "localhost" in result.output.lower()
