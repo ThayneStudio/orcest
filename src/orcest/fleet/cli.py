@@ -1052,11 +1052,25 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
 
 
 def _set_vm_cloud_init(px: ProxmoxClient, vm_id: int, userdata: str) -> None:
-    """Set cloud-init user-data on a VM via the Proxmox API.
+    """Set cloud-init user-data on a VM.
 
-    Delegates to :meth:`ProxmoxClient.set_cloud_init_userdata`.
+    Writes the snippet directly to the Proxmox host filesystem and
+    configures ``cicustom`` via ``qm set``. This avoids the snippet
+    upload API which can fail with certain API token configurations.
     """
-    px.set_cloud_init_userdata(vm_id, userdata)
+    from pathlib import Path
+
+    snippet_name = f"orcest-template-{vm_id}-user.yaml"
+    snippets_dir = Path("/var/lib/vz/snippets")
+    snippets_dir.mkdir(parents=True, exist_ok=True)
+    (snippets_dir / snippet_name).write_text(userdata)
+    result = subprocess.run(
+        ["qm", "set", str(vm_id), "--cicustom", f"user=local:snippets/{snippet_name}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"qm set --cicustom failed: {(result.stderr or result.stdout).strip()}")
 
 
 @fleet.command("pool-status")
