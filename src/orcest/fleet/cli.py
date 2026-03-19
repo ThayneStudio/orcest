@@ -1252,3 +1252,164 @@ def set_pool_size(size: int, vm_id_start: int | None, config: str) -> None:
     save_config(cfg, config)
 
     console.print(f"Pool size updated: {old_size} -> {size}")
+
+
+@fleet.command()
+@click.option("--drain-active", is_flag=True, help="Also destroy active workers (interrupts running tasks).")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def stop(drain_active: bool, config: str) -> None:
+    """Stop the pool manager and destroy idle worker VMs."""
+    from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import (
+        clean_pool_redis,
+        get_pool_redis_members,
+        stop_pool_manager,
+    )
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.orchestrator.host:
+        console.print("[red]Orchestrator host not set.[/red]")
+        console.print("  Run: orcest fleet create-orchestrator")
+        sys.exit(1)
+
+    ssh_target = cfg.ssh_target()
+
+    # Step 1: Stop pool manager
+    console.print("  Stopping pool manager...", end=" ")
+    try:
+        stop_pool_manager(ssh_target)
+        console.print("[green]ok[/green]")
+    except RuntimeError as exc:
+        console.print(f"[yellow]warning[/yellow]: {exc}")
+
+    # Step 2: Read Redis state
+    console.print("  Reading pool state...", end=" ")
+    try:
+        idle_ids, active_ids = get_pool_redis_members(ssh_target)
+        console.print(f"[green]ok[/green] ({len(idle_ids)} idle, {len(active_ids)} active)")
+    except Exception as exc:
+        console.print(f"[yellow]warning[/yellow]: {exc}")
+        idle_ids, active_ids = set(), {}
+
+    # Step 3: Destroy worker VMs
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[yellow]Proxmox API credentials not configured — skipping VM destruction.[/yellow]")
+        console.print("  VMs must be destroyed manually or via Proxmox UI.")
+        return
+
+    px = _create_proxmox_client(cfg)
+    worker_vms = px.list_vms(name_prefix="orcest-worker-")
+    # Exclude the template itself
+    worker_vms = [v for v in worker_vms if int(v.get("vmid", 0)) != cfg.pool.template_vm_id]
+
+    destroyed: list[str] = []
+    skipped: list[str] = []
+    for vm in worker_vms:
+        vm_id = int(vm["vmid"])
+        vm_id_str = str(vm_id)
+        is_idle = vm_id_str in idle_ids
+        is_active = vm_id_str in active_ids
+
+        if is_active and not drain_active:
+            console.print(f"  Leaving active VM {vm_id} ({vm.get('name', '')})")
+            skipped.append(vm_id_str)
+            continue
+
+        label = "active" if is_active else ("idle" if is_idle else "orphan")
+        console.print(f"  Destroying {label} VM {vm_id}...", end=" ")
+        try:
+            try:
+                px.stop_vm(vm_id)
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if px.get_vm_status(vm_id) == "stopped":
+                        break
+                    time.sleep(1)
+            except Exception:
+                pass
+            px.destroy_vm(vm_id)
+            console.print("[green]ok[/green]")
+            destroyed.append(vm_id_str)
+        except Exception as exc:
+            console.print(f"[yellow]failed[/yellow]: {exc}")
+
+    # Step 4: Clean Redis
+    if destroyed:
+        console.print("  Cleaning Redis state...", end=" ")
+        try:
+            clean_pool_redis(ssh_target, destroyed)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]warning[/yellow]: {exc}")
+
+    console.print(f"\n  Destroyed {len(destroyed)} VMs", end="")
+    if skipped:
+        console.print(f", left {len(skipped)} active", end="")
+    console.print(".")
+
+
+@fleet.command()
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def start(config: str) -> None:
+    """Start the pool manager.
+
+    Uploads the current fleet config and starts the pool manager, which
+    will begin cloning worker VMs to reach the target pool size.
+    """
+    from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.orchestrator.host:
+        console.print("[red]Orchestrator host not set.[/red]")
+        console.print("  Run: orcest fleet create-orchestrator")
+        sys.exit(1)
+
+    if not cfg.pool.template_vm_id:
+        console.print("[red]No worker template configured.[/red]")
+        console.print("  Run: orcest fleet create-template")
+        sys.exit(1)
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Proxmox API credentials not configured.[/red]")
+        console.print("  Run: orcest init")
+        sys.exit(1)
+
+    if cfg.proxmox.is_localhost():
+        console.print("[red]Proxmox endpoint is localhost — unreachable from orchestrator VM.[/red]")
+        console.print("  Run: orcest init")
+        sys.exit(1)
+
+    ssh_target = cfg.ssh_target()
+
+    console.print("  Uploading fleet config...", end=" ")
+    try:
+        upload_fleet_config(ssh_target, config)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    console.print("  Starting pool manager...", end=" ")
+    try:
+        ensure_pool_manager(ssh_target)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+    console.print(f"\n  Pool manager started (target size: {cfg.pool.size}).")

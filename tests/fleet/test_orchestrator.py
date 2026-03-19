@@ -248,3 +248,76 @@ class TestUploadFleetConfig:
         assert cleanup_call == mocker.call(
             "user@host", "rm -f /tmp/.orcest-config.yaml.tmp",
         )
+
+
+class TestStopPoolManager:
+    def _ok(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fail(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="oops")
+
+    def test_success(self, mocker):
+        from orcest.fleet.orchestrator import stop_pool_manager
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        stop_pool_manager("user@host")
+        ssh.assert_called_once()
+        assert "docker compose" in ssh.call_args[0][1]
+        assert "down" in ssh.call_args[0][1]
+
+    def test_failure_raises(self, mocker):
+        from orcest.fleet.orchestrator import stop_pool_manager
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._fail)
+        with pytest.raises(RuntimeError, match="Failed to stop pool manager"):
+            stop_pool_manager("user@host")
+
+
+class TestGetPoolRedisMembers:
+    def test_parses_idle_and_active(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+        def ssh_side_effect(target, cmd):
+            if "SMEMBERS" in cmd:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="300\n301\n", stderr="",
+                )
+            if "HGETALL" in cmd:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="302\n1000.0\n303\n2000.0\n", stderr="",
+                )
+            return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+        idle, active = get_pool_redis_members("user@host")
+        assert idle == {"300", "301"}
+        assert active == {"302": "1000.0", "303": "2000.0"}
+
+    def test_handles_empty(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        )
+        idle, active = get_pool_redis_members("user@host")
+        assert idle == set()
+        assert active == {}
+
+
+class TestCleanPoolRedis:
+    def test_builds_correct_commands(self, mocker):
+        from orcest.fleet.orchestrator import clean_pool_redis
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        )
+        clean_pool_redis("user@host", ["300", "301"])
+        ssh.assert_called_once()
+        cmd = ssh.call_args[0][1]
+        assert "SREM orcest:pool:idle" in cmd
+        assert "HDEL orcest:pool:active" in cmd
+        assert "300" in cmd
+        assert "301" in cmd
+
+    def test_noop_for_empty_list(self, mocker):
+        from orcest.fleet.orchestrator import clean_pool_redis
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh")
+        clean_pool_redis("user@host", [])
+        ssh.assert_not_called()
