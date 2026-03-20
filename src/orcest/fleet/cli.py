@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
@@ -306,6 +307,83 @@ def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) ->
     return False
 
 
+def _ensure_orchestrator_ssh(
+    ssh_target: str, proxmox_ip: str, console: Console,
+) -> None:
+    """Ensure the orchestrator VM can SSH to the Proxmox host.
+
+    The pool manager runs on the orchestrator and needs SSH access to the
+    Proxmox host to write cloud-init snippets and run ``qm`` commands.
+
+    Idempotent: skips if SSH already works.
+    """
+    # Quick check: does SSH already work?
+    verify = subprocess.run(
+        [
+            "ssh", *_SSH_OPTS, ssh_target,
+            f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes"
+            f" -o ConnectTimeout=3 root@{proxmox_ip} true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if verify.returncode == 0:
+        console.print("  Orchestrator SSH to Proxmox... [green]ok[/green]")
+        return
+
+    console.print("  Setting up orchestrator SSH to Proxmox...", end=" ")
+
+    # Generate key if missing
+    subprocess.run(
+        [
+            "ssh", *_SSH_OPTS, ssh_target,
+            "test -f ~/.ssh/id_ed25519 || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    # Read public key
+    result = subprocess.run(
+        ["ssh", *_SSH_OPTS, ssh_target, "cat ~/.ssh/id_ed25519.pub"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        console.print("[red]failed (could not read key)[/red]")
+        return
+    pub_key = result.stdout.strip()
+
+    # Add to Proxmox authorized_keys (local — this command runs on the Proxmox host)
+    auth_keys = Path("/root/.ssh/authorized_keys")
+    if auth_keys.exists() and pub_key in auth_keys.read_text():
+        pass  # already present
+    else:
+        auth_keys.parent.mkdir(parents=True, exist_ok=True)
+        with auth_keys.open("a") as f:
+            f.write(f"\n{pub_key}\n")
+
+    # Verify
+    verify = subprocess.run(
+        [
+            "ssh", *_SSH_OPTS, ssh_target,
+            f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes"
+            f" -o ConnectTimeout=5 root@{proxmox_ip} hostname",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if verify.returncode == 0:
+        console.print("[green]ok[/green]")
+    else:
+        console.print("[yellow]failed (SSH verify failed)[/yellow]")
+        console.print(f"    {verify.stderr.strip()}")
+
+
 @click.group()
 def fleet() -> None:
     """Manage the orcest fleet: orchestrators, workers, and VMs."""
@@ -454,6 +532,13 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
         cfg.orchestrator.host = orch_ip
         save_config(cfg, config)
         sys.exit(1)
+
+    # Step 5b: Set up SSH from orchestrator to Proxmox host
+    # (needed by pool manager to write cloud-init snippets)
+    from urllib.parse import urlparse
+
+    proxmox_ip = urlparse(cfg.proxmox.endpoint).hostname or "127.0.0.1"
+    _ensure_orchestrator_ssh(ssh_target, proxmox_ip, console)
 
     # Step 6: Upload source and build Docker image
     try:
@@ -1129,7 +1214,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
 
     # Step 4: Wait for IP (uses ARP fallback so we don't need to wait
     # for cloud-init to install qemu-guest-agent first)
-    vm_ip = _get_vm_ip(vm_id, console)
+    vm_ip = _get_vm_ip(vm_id, console, timeout=600)
     if not vm_ip:
         console.print("  Could not get VM IP. Template creation aborted.")
         _cleanup_vm()
@@ -1541,6 +1626,12 @@ def start(config: str) -> None:
         sys.exit(1)
 
     ssh_target = cfg.ssh_target()
+
+    # Ensure orchestrator can SSH to Proxmox host (for cloud-init snippets)
+    from urllib.parse import urlparse
+
+    proxmox_ip = urlparse(cfg.proxmox.endpoint).hostname or "127.0.0.1"
+    _ensure_orchestrator_ssh(ssh_target, proxmox_ip, console)
 
     console.print("  Uploading fleet config...", end=" ")
     try:
