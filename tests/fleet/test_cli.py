@@ -381,7 +381,10 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.build_image")
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
 
-    result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])
+    result = runner.invoke(
+        fleet,
+        ["create-orchestrator", "--storage", "local-lvm", "--config", cfg_path],
+    )
     assert result.exit_code == 0, result.output
     assert "10.20.0.99" in result.output
 
@@ -406,7 +409,10 @@ def test_create_orchestrator_ssh_timeout(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.99")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=False)
 
-    result = runner.invoke(fleet, ["create-orchestrator", "--config", cfg_path])
+    result = runner.invoke(
+        fleet,
+        ["create-orchestrator", "--storage", "local-lvm", "--config", cfg_path],
+    )
     assert result.exit_code != 0
 
     # Config should still be saved with the IP
@@ -474,6 +480,19 @@ def _mock_proxmox_client(mocker):
     mock_px.get_vm_ip.return_value = "10.20.0.50"
     mock_px.get_vm_status.return_value = "stopped"
     mock_px.list_vms.return_value = []
+    _all_storage = [
+        {"storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir",
+         "avail": 1e12, "enabled": 1, "active": 1},
+        {"storage": "local", "type": "dir", "content": "snippets,iso,backup",
+         "avail": 1e11, "enabled": 1, "active": 1},
+    ]
+
+    def _list_storage(content_type=None):
+        if content_type:
+            return [s for s in _all_storage if content_type in s["content"].split(",")]
+        return _all_storage
+
+    mock_px.list_storage.side_effect = _list_storage
     mocker.patch("orcest.fleet.cli._create_proxmox_client", return_value=mock_px)
     return mock_px
 

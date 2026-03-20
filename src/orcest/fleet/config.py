@@ -93,6 +93,7 @@ class PoolConfig:
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
     max_task_duration: int = 3600  # seconds before force-kill
+    snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
 
 
 @dataclass
@@ -205,6 +206,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_cores=pl.get("worker_cores", 8),
         worker_disk_size=pl.get("worker_disk_size", 30),
         max_task_duration=pl.get("max_task_duration", 3600),
+        snippet_storage=pl.get("snippet_storage", "local"),
     )
 
     return FleetConfig(
@@ -261,6 +263,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "worker_cores": config.pool.worker_cores,
             "worker_disk_size": config.pool.worker_disk_size,
             "max_task_duration": config.pool.max_task_duration,
+            "snippet_storage": config.pool.snippet_storage,
         },
     }
 
