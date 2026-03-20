@@ -227,6 +227,12 @@ def render_template_userdata(
                 "permissions": "0644",
                 "content": netplan_content,
             },
+            {
+                "path": "/home/orcest/.claude.json",
+                "owner": "orcest:orcest",
+                "permissions": "0644",
+                "content": '{"hasCompletedOnboarding": true}',
+            },
         ],
         runcmd=[
             *_guest_agent_runcmd(),
@@ -287,6 +293,12 @@ def render_clone_userdata(
                 "path": "/etc/systemd/system/orcest-worker.service",
                 "permissions": "0644",
                 "content": systemd_unit,
+            },
+            {
+                "path": "/home/orcest/.claude.json",
+                "owner": "orcest:orcest",
+                "permissions": "0644",
+                "content": '{"hasCompletedOnboarding": true}',
             },
         ],
         "runcmd": [
