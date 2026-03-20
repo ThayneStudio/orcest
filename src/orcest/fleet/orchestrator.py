@@ -56,7 +56,7 @@ def build_image(ssh_target: str) -> None:
     Expects the source tarball to already be extracted at /opt/orcest/.
     """
     logger.info("Building orcest:latest image on %s", ssh_target)
-    result = _ssh(ssh_target, "cd /opt/orcest && docker compose build")
+    result = _ssh(ssh_target, "cd /opt/orcest && docker compose build --no-cache")
     if result.returncode != 0:
         logger.error("Image build failed: %s", result.stderr.strip())
         raise RuntimeError(f"Docker image build failed on {ssh_target}: {result.stderr.strip()}")
