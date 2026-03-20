@@ -7,6 +7,7 @@ services:
     environment:
       - GITHUB_TOKEN
       - GH_TOKEN=${GITHUB_TOKEN}
+      - CLAUDE_CODE_OAUTH_TOKEN
       - ORCEST_REDIS_HOST=redis
       - ORCEST_REDIS_KEY_PREFIX
     restart: unless-stopped
