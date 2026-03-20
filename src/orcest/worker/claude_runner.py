@@ -47,9 +47,9 @@ _RATE_LIMIT_RE = re.compile(
 )
 
 # Environment variables that are safe to forward to the Claude subprocess.
-# We use an allowlist rather than os.environ.copy() to avoid leaking secrets
+# We use a whitelist rather than os.environ.copy() to avoid leaking secrets
 # (database passwords, API keys for other services, SSH credentials, etc.).
-_ENV_ALLOWLIST: set[str] = {
+_ENV_WHITELIST: set[str] = {
     # Basic system vars needed by most programs
     "PATH",
     "HOME",
@@ -99,7 +99,7 @@ def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
     and CLAUDE_CODE_OAUTH_TOKEN if provided (per-task credential).
     """
     env: dict[str, str] = {}
-    for key in _ENV_ALLOWLIST:
+    for key in _ENV_WHITELIST:
         val = os.environ.get(key)
         if val is not None:
             env[key] = val
@@ -272,6 +272,13 @@ def run_claude(
         prompt,
     ]
 
+    if logger:
+        env_keys = sorted(env.keys())
+        logger.info(
+            "Launching Claude: cwd=%s, timeout=%ds, env_vars=%s",
+            work_dir, timeout, env_keys,
+        )
+
     start_time = time.monotonic()
     # Initialise outside the loop so the "all retries exhausted" fallthrough
     # can report output from the last attempt.
@@ -309,6 +316,9 @@ def run_claude(
                 duration_seconds=duration,
                 raw_output="",
             )
+
+        if logger:
+            logger.info("Claude process started (pid=%d)", proc.pid)
 
         # Drain stderr in background to avoid pipe deadlock
         try:
@@ -478,7 +488,13 @@ def run_claude(
             if watchdog_killed.is_set():
                 duration = int(time.monotonic() - start_time)
                 if logger:
-                    logger.error(f"Claude timed out after {timeout}s")
+                    stderr_text = "".join(stderr_lines).strip()
+                    logger.error(
+                        "Claude timed out after %ds (watchdog kill, stdout_lines=%d, stderr=%s)",
+                        timeout,
+                        len(stdout_lines),
+                        stderr_text[:1000] if stderr_text else "(empty)",
+                    )
                 return ClaudeResult(
                     success=False,
                     summary=f"Timed out after {timeout}s",
@@ -513,22 +529,26 @@ def run_claude(
 
         if timed_out:
             duration = int(time.monotonic() - start_time)
-            if logger:
-                logger.error(f"Claude timed out after {timeout}s")
             _kill_process_tree(proc)
             stderr_thread.join(timeout=5)
             _close_pipes(proc)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                # _kill_process_tree already sent SIGKILL to the
-                # process group; this direct kill is a last-ditch
-                # attempt in case the pgid lookup failed above.
                 proc.kill()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass  # Zombie; will be reaped on process exit
+            if logger:
+                stderr_text = "".join(stderr_lines).strip()
+                logger.error(
+                    "Claude timed out after %ds (pid=%d, stdout_lines=%d, stderr=%s)",
+                    timeout,
+                    proc.pid,
+                    len(stdout_lines),
+                    stderr_text[:1000] if stderr_text else "(empty)",
+                )
             return ClaudeResult(
                 success=False,
                 summary=f"Timed out after {timeout}s",

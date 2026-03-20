@@ -448,9 +448,6 @@ RestartSec=10
 TimeoutStopSec=120
 MemoryMax=4G
 Environment=PYTHONUNBUFFERED=1
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/opt/orcest/workspaces /home/orcest/.claude /home/orcest/.cache
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
