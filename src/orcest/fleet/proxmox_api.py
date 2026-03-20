@@ -91,6 +91,7 @@ class ProxmoxClient:
             backend="https",
         )
         self._node = node
+        self._host = host
 
     def clone_vm(
         self,
@@ -311,7 +312,7 @@ class ProxmoxClient:
         logger.info("Uploading cloud-init snippet %s for VM %d", snippet_name, vm_id)
 
         # Try SSH first (works from pool manager on orchestrator VM)
-        host = self._api._store["host"]
+        host = self._host
         if self._write_snippet_ssh(host, snippet_name, userdata, storage, vm_id):
             return
 
