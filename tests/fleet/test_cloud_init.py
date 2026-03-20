@@ -72,8 +72,7 @@ def test_systemd_unit_in_write_files():
         f for f in data["write_files"] if f["path"] == "/etc/systemd/system/orcest-worker.service"
     )
     assert "ExecStart=/opt/orcest/venv/bin/orcest work" in unit_file["content"]
-    assert "ReadWritePaths=" in unit_file["content"]
-    assert "/home/orcest/.cache" in unit_file["content"]
+    assert "NoNewPrivileges=yes" in unit_file["content"]
 
 
 def test_claude_json_onboarding_bypass():
