@@ -143,13 +143,39 @@ class ProxmoxClient:
         self._api.nodes(self._node).qemu(vm_id).status.start.post()
 
     def stop_vm(self, vm_id: int) -> None:
-        """Stop a VM.
+        """Stop a VM (hard stop — like pulling the power cord).
 
         Args:
             vm_id: The VM ID to stop.
         """
         logger.info("Stopping VM %d", vm_id)
         self._api.nodes(self._node).qemu(vm_id).status.stop.post()
+
+    def shutdown_vm(self, vm_id: int, timeout: int = 60) -> None:
+        """Gracefully shut down a VM via ACPI and wait for it to stop.
+
+        Sends an ACPI shutdown signal and polls until the VM reaches
+        ``stopped`` state. Falls back to a hard stop on timeout.
+
+        This is preferred over :meth:`stop_vm` when the guest filesystem
+        must be cleanly flushed (e.g. before converting to a template).
+
+        Args:
+            vm_id: The VM ID to shut down.
+            timeout: Seconds to wait before falling back to hard stop.
+        """
+        logger.info("Shutting down VM %d (timeout=%ds)", vm_id, timeout)
+        self._api.nodes(self._node).qemu(vm_id).status.shutdown.post()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.get_vm_status(vm_id) == "stopped":
+                logger.info("VM %d shut down gracefully", vm_id)
+                return
+            time.sleep(2)
+
+        logger.warning("VM %d did not shut down in %ds, forcing stop", vm_id, timeout)
+        self.stop_vm(vm_id)
 
     def destroy_vm(self, vm_id: int, purge: bool = True) -> None:
         """Destroy a VM and optionally purge its disks.
