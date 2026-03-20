@@ -296,8 +296,11 @@ class ProxmoxClient:
     ) -> None:
         """Set cloud-init user-data on a VM.
 
-        Uploads a snippet file to the specified storage and attaches it to
-        the VM's cloud-init drive configuration via ``cicustom``.
+        Writes the snippet to the Proxmox host via SSH and attaches it to
+        the VM's cloud-init drive via ``qm set --cicustom``.
+
+        Falls back to the API upload endpoint if SSH fails (e.g. when
+        running directly on the Proxmox host without SSH configured).
 
         Args:
             vm_id: The VM ID to configure.
@@ -306,10 +309,14 @@ class ProxmoxClient:
         """
         snippet_name = f"orcest-template-{vm_id}-user.yaml"
         logger.info("Uploading cloud-init snippet %s for VM %d", snippet_name, vm_id)
-        # Wrap in BytesIO so proxmoxer detects it as a file-like object
-        # (isinstance(v, io.IOBase)) and sends it as a multipart upload.
-        # Raw bytes would be sent as plain form data, which the Proxmox
-        # upload endpoint rejects.
+
+        # Try SSH first (works from pool manager on orchestrator VM)
+        host = self._api._store["host"]
+        if self._write_snippet_ssh(host, snippet_name, userdata, storage, vm_id):
+            return
+
+        # Fallback: API upload (may fail on some PVE versions)
+        logger.info("SSH failed, falling back to API upload for VM %d", vm_id)
         payload = io.BytesIO(userdata.encode())
         payload.name = snippet_name
         self._api.nodes(self._node).storage(storage).upload.post(
@@ -320,6 +327,56 @@ class ProxmoxClient:
         self._api.nodes(self._node).qemu(vm_id).config.put(
             cicustom=f"user={storage}:snippets/{snippet_name}",
         )
+
+    def _write_snippet_ssh(
+        self, host: str, snippet_name: str, userdata: str,
+        storage: str, vm_id: int,
+    ) -> bool:
+        """Write a cloud-init snippet via SSH and set cicustom.
+
+        Returns ``True`` on success, ``False`` if SSH is not available.
+        Raises on SSH errors after connection succeeds.
+        """
+        import subprocess
+
+        ssh_target = f"root@{host}"
+        ssh_opts = [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+        ]
+
+        # Write snippet content via stdin
+        write_cmd = (
+            f"mkdir -p /var/lib/vz/snippets && "
+            f"cat > /var/lib/vz/snippets/{snippet_name}"
+        )
+        result = subprocess.run(
+            ["ssh", *ssh_opts, ssh_target, write_cmd],
+            input=userdata,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            logger.debug("SSH snippet write failed: %s", result.stderr.strip())
+            return False
+
+        # Set cicustom on the VM
+        cicustom_cmd = (
+            f"qm set {vm_id} --cicustom user={storage}:snippets/{snippet_name}"
+        )
+        result = subprocess.run(
+            ["ssh", *ssh_opts, ssh_target, cicustom_cmd],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"qm set --cicustom failed: {result.stderr.strip()}"
+            )
+        return True
 
     def download_image(
         self,
