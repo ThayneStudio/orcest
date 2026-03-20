@@ -16,6 +16,23 @@ from proxmoxer import ProxmoxAPI
 logger = logging.getLogger(__name__)
 
 
+def mac_for_vm_id(vm_id: int) -> str:
+    """Derive a deterministic MAC address from a VM ID.
+
+    Uses the locally-administered unicast prefix ``02:4F:52`` (``OR`` in
+    ASCII, for *orcest*), leaving 3 bytes for the VM ID — enough for
+    16 million unique IDs.  The ``02`` first octet sets the U/L bit
+    (locally administered) and clears the I/G bit (unicast).
+
+    This avoids collision with Proxmox auto-generated MACs (OUI
+    ``BC:24:11``) and with any real hardware vendor OUIs.
+    """
+    b1 = (vm_id >> 16) & 0xFF
+    b2 = (vm_id >> 8) & 0xFF
+    b3 = vm_id & 0xFF
+    return f"02:4F:52:{b1:02X}:{b2:02X}:{b3:02X}"
+
+
 def parse_vm_ip(interfaces: list[dict]) -> str | None:
     """Extract the first non-loopback IPv4 address from guest-agent interface data.
 
@@ -133,6 +150,24 @@ class ProxmoxClient:
         )
         self.wait_for_task(upid)
         return upid
+
+    def set_vm_network(
+        self, vm_id: int, mac: str, bridge: str = "vmbr0",
+    ) -> None:
+        """Set the network adapter configuration on a VM.
+
+        Typically called after cloning (before boot) to assign a
+        deterministic MAC address via :func:`mac_for_vm_id`.
+
+        Args:
+            vm_id: The VM ID to configure.
+            mac: MAC address (e.g. ``"02:4F:52:00:01:2C"``).
+            bridge: Proxmox bridge name (default ``"vmbr0"``).
+        """
+        logger.info("Setting VM %d MAC to %s (bridge=%s)", vm_id, mac, bridge)
+        self._api.nodes(self._node).qemu(vm_id).config.put(
+            net0=f"virtio={mac},bridge={bridge}",
+        )
 
     def start_vm(self, vm_id: int) -> None:
         """Start a VM.

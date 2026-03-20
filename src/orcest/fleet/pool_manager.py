@@ -18,7 +18,7 @@ import time
 
 from orcest.fleet.cloud_init import render_clone_userdata
 from orcest.fleet.config import FleetConfig
-from orcest.fleet.proxmox_api import ProxmoxClient
+from orcest.fleet.proxmox_api import ProxmoxClient, mac_for_vm_id
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -301,6 +301,18 @@ class PoolManager:
                 self._proxmox.destroy_vm(new_id)
             except Exception:
                 pass  # VM may not exist; either way, nothing more we can do
+            return None
+
+        # Assign a deterministic MAC so DHCP leases are recycled when
+        # VMs are destroyed and recreated with the same ID.
+        try:
+            mac = mac_for_vm_id(new_id)
+            self._proxmox.set_vm_network(new_id, mac=mac)
+        except Exception:
+            logger.error(
+                "Failed to set MAC on VM %d, destroying", new_id, exc_info=True
+            )
+            self._destroy_vm(new_id)
             return None
 
         # Set cloud-init userdata so the clone starts the worker service

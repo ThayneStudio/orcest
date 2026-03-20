@@ -4,9 +4,40 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from orcest.fleet.proxmox_api import ProxmoxClient, parse_vm_ip
+from orcest.fleet.proxmox_api import ProxmoxClient, mac_for_vm_id, parse_vm_ip
 
 pytestmark = pytest.mark.unit
+
+
+# -- mac_for_vm_id ------------------------------------------------------------
+
+
+class TestMacForVmId:
+    def test_format(self):
+        mac = mac_for_vm_id(300)
+        parts = mac.split(":")
+        assert len(parts) == 6
+        assert all(len(p) == 2 for p in parts)
+
+    def test_locally_administered_prefix(self):
+        mac = mac_for_vm_id(0)
+        assert mac.startswith("02:4F:52:")
+
+    def test_vm_id_zero(self):
+        assert mac_for_vm_id(0) == "02:4F:52:00:00:00"
+
+    def test_vm_id_300(self):
+        assert mac_for_vm_id(300) == "02:4F:52:00:01:2C"
+
+    def test_vm_id_65535(self):
+        assert mac_for_vm_id(65535) == "02:4F:52:00:FF:FF"
+
+    def test_uniqueness(self):
+        macs = {mac_for_vm_id(i) for i in range(1000)}
+        assert len(macs) == 1000
+
+    def test_deterministic(self):
+        assert mac_for_vm_id(42) == mac_for_vm_id(42)
 
 
 # -- parse_vm_ip --------------------------------------------------------------
@@ -453,6 +484,22 @@ class TestSetCloudInitUserdata:
         mock_api.nodes("pve").storage("nfs-share").upload.post.assert_called_once()
         mock_api.nodes("pve").qemu(200).config.put.assert_called_once_with(
             cicustom="user=nfs-share:snippets/orcest-template-200-user.yaml",
+        )
+
+
+class TestSetVmNetwork:
+    def test_sets_net0_with_mac_and_bridge(self):
+        client, mock_api = _make_client()
+        client.set_vm_network(200, mac="02:4F:52:00:00:C8")
+        mock_api.nodes("pve").qemu(200).config.put.assert_called_once_with(
+            net0="virtio=02:4F:52:00:00:C8,bridge=vmbr0",
+        )
+
+    def test_custom_bridge(self):
+        client, mock_api = _make_client()
+        client.set_vm_network(200, mac="02:4F:52:00:00:C8", bridge="vmbr1")
+        mock_api.nodes("pve").qemu(200).config.put.assert_called_once_with(
+            net0="virtio=02:4F:52:00:00:C8,bridge=vmbr1",
         )
 
 

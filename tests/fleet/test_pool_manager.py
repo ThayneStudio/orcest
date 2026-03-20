@@ -325,6 +325,9 @@ class TestCloneAndBoot:
             name="orcest-worker-300",
             linked=True,
         )
+        proxmox.set_vm_network.assert_called_once_with(
+            300, mac="02:4F:52:00:01:2C",
+        )
         proxmox.start_vm.assert_called_once_with(300)
         proxmox.get_vm_ip.assert_called_once_with(300)
         redis.sadd.assert_called_once_with("pool:idle", "300")
@@ -350,6 +353,21 @@ class TestCloneAndBoot:
         # VM should be destroyed since it didn't get an IP
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
+
+    def test_set_mac_failure_destroys_clone(self):
+        """If setting the MAC address fails, the clone should be destroyed."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.set_vm_network.side_effect = RuntimeError("API error")
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        vm_id = manager._clone_and_boot()
+
+        assert vm_id is None
+        proxmox.clone_vm.assert_called_once()
+        proxmox.stop_vm.assert_called_once_with(300)
+        proxmox.destroy_vm.assert_called_once_with(300)
+        proxmox.start_vm.assert_not_called()
 
     def test_clone_failure_returns_none_and_cleans_up(self):
         """Clone failure returns None and attempts best-effort cleanup."""
@@ -1248,4 +1266,8 @@ class TestFullCycle:
             new_id=300,
             name="orcest-worker-300",
             linked=True,
+        )
+        # Deterministic MAC assigned before boot
+        proxmox.set_vm_network.assert_called_once_with(
+            300, mac="02:4F:52:00:01:2C",
         )
