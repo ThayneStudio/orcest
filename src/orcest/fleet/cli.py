@@ -962,7 +962,7 @@ def _create_vm_from_cloud_image(
         cores=cfg.pool.worker_cores,
         cpu="host",
         scsihw="virtio-scsi-pci",
-        ide2=f"{snippet_storage}:cloudinit",
+        ide2=f"{storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
         ipconfig0="ip=dhcp",
         serial0="socket",
