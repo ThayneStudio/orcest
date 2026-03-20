@@ -503,7 +503,7 @@ def test_create_template_success(runner, cfg_path, mocker):
 
     # Verify Proxmox operations happened in order
     mock_px.start_vm.assert_called_once_with(200)
-    mock_px.stop_vm.assert_called_once_with(200)
+    mock_px.shutdown_vm.assert_called_once_with(200, timeout=60)
     mock_px.convert_to_template.assert_called_once_with(200)
 
     # Verify config was updated with template_vm_id
@@ -718,7 +718,7 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
         ["create-template", "--vm-id", "200", "--config", cfg_path],
     )
     assert result.exit_code != 0
-    assert "timed out" in result.output
+    assert "VM did not stop" in result.output
     mock_px.destroy_vm.assert_called_once_with(200)
 
 

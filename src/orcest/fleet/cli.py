@@ -1049,21 +1049,19 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         sys.exit(1)
     console.print("[green]ok[/green]")
 
-    # Step 8: Stop the VM
-    console.print("  Stopping VM...", end=" ")
+    # Step 8: Flush filesystem and gracefully shut down the VM.
+    # A hard stop (qm stop) can lose up to 30 seconds of unflushed ext4
+    # writes (commit=30 in the Ubuntu cloud image fstab), which corrupts
+    # the venv and other recently-written files on ZFS-backed storage.
+    console.print("  Syncing filesystem...", end=" ")
+    _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
+    console.print("[green]ok[/green]")
+
+    console.print("  Shutting down VM...", end=" ")
     try:
-        px.stop_vm(vm_id)
-        # Wait for it to actually stop
-        deadline = time.monotonic() + 60
-        stopped = False
-        while time.monotonic() < deadline:
-            vm_status = px.get_vm_status(vm_id)
-            if vm_status == "stopped":
-                stopped = True
-                break
-            time.sleep(2)
-        if not stopped:
-            console.print("[red]timed out waiting for VM to stop[/red]")
+        px.shutdown_vm(vm_id, timeout=60)
+        if px.get_vm_status(vm_id) != "stopped":
+            console.print("[red]VM did not stop[/red]")
             _cleanup_vm()
             sys.exit(1)
         console.print("[green]ok[/green]")
@@ -1256,7 +1254,10 @@ def set_pool_size(size: int, vm_id_start: int | None, config: str) -> None:
 
 
 @fleet.command()
-@click.option("--drain-active", is_flag=True, help="Also destroy active workers (interrupts running tasks).")
+@click.option(
+    "--drain-active", is_flag=True,
+    help="Also destroy active workers (interrupts running tasks).",
+)
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
@@ -1302,7 +1303,10 @@ def stop(drain_active: bool, config: str) -> None:
 
     # Step 3: Destroy worker VMs
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
-        console.print("[yellow]Proxmox API credentials not configured — skipping VM destruction.[/yellow]")
+        console.print(
+            "[yellow]Proxmox API credentials not configured"
+            " — skipping VM destruction.[/yellow]"
+        )
         console.print("  VMs must be destroyed manually or via Proxmox UI.")
         return
 
@@ -1400,7 +1404,10 @@ def start(config: str) -> None:
         sys.exit(1)
 
     if cfg.proxmox.is_localhost():
-        console.print("[red]Proxmox endpoint is localhost — unreachable from orchestrator VM.[/red]")
+        console.print(
+            "[red]Proxmox endpoint is localhost"
+            " — unreachable from orchestrator VM.[/red]"
+        )
         console.print("  Run: orcest init")
         sys.exit(1)
 

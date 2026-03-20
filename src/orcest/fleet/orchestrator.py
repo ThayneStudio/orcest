@@ -301,7 +301,7 @@ def get_pool_redis_members(
     result = _ssh(ssh_target, "redis-cli --raw HGETALL orcest:pool:active")
     active: dict[str, str] = {}
     if result.returncode == 0:
-        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
         for i in range(0, len(lines) - 1, 2):
             active[lines[i]] = lines[i + 1]
 

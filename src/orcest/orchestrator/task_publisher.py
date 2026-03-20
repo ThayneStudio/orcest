@@ -19,7 +19,11 @@ from orcest.orchestrator.pr_ops import (
     increment_transient_attempts,
 )
 from orcest.shared.config import RunnerConfig
-from orcest.shared.coordination import clear_pending_task, compute_pending_task_ttl, set_pending_task
+from orcest.shared.coordination import (
+    clear_pending_task,
+    compute_pending_task_ttl,
+    set_pending_task,
+)
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 

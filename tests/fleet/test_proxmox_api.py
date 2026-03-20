@@ -248,6 +248,30 @@ class TestStopVm:
         mock_api.nodes("pve").qemu(200).status.stop.post.assert_called_once()
 
 
+class TestShutdownVm:
+    @patch("orcest.fleet.proxmox_api.time")
+    def test_graceful_shutdown_succeeds(self, mock_time):
+        client, mock_api = _make_client()
+        mock_time.monotonic.side_effect = [0, 1, 2]
+        mock_api.nodes("pve").qemu(200).status.current.get.return_value = {
+            "status": "stopped",
+        }
+        client.shutdown_vm(200, timeout=30)
+        mock_api.nodes("pve").qemu(200).status.shutdown.post.assert_called_once()
+
+    @patch("orcest.fleet.proxmox_api.time")
+    def test_falls_back_to_hard_stop_on_timeout(self, mock_time):
+        client, mock_api = _make_client()
+        # monotonic: deadline, first check (in range), sleep, second check (past deadline)
+        mock_time.monotonic.side_effect = [0, 1, 100]
+        mock_api.nodes("pve").qemu(200).status.current.get.return_value = {
+            "status": "running",
+        }
+        client.shutdown_vm(200, timeout=30)
+        mock_api.nodes("pve").qemu(200).status.shutdown.post.assert_called_once()
+        mock_api.nodes("pve").qemu(200).status.stop.post.assert_called_once()
+
+
 class TestDestroyVm:
     def test_calls_delete_with_purge_and_disk_cleanup(self):
         client, mock_api = _make_client()

@@ -1115,7 +1115,7 @@ def test_publish_and_notify_skips_xadd_on_increment_failure(
     assert not any(f["id"] == task.id for _, f in entries)
 
     # Pending marker should be cleared so the PR can be retried immediately
-    pending_key = fake_redis_client._prefixed(f"pending:pr:test-org/test-repo:800")
+    pending_key = fake_redis_client._prefixed("pending:pr:test-org/test-repo:800")
     assert fake_redis_client.client.get(pending_key) is None
 
     # Error should be logged with skip rationale
