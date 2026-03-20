@@ -47,6 +47,90 @@ def _next_free_vmid() -> int | None:
     return None
 
 
+def _humanize_bytes(n: float) -> str:
+    """Format bytes as a human-readable string (e.g. '1.7 TiB')."""
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+
+def _prompt_storage(
+    px: ProxmoxClient,
+    content_type: str,
+    purpose: str,
+    console: Console,
+    default: str | None = None,
+) -> str:
+    """Interactively select a Proxmox storage pool.
+
+    Queries available storage filtered by *content_type* (e.g. ``"images"``),
+    displays a Rich table, and prompts the user to pick one.
+
+    Args:
+        px: Proxmox API client.
+        content_type: Required content type (``"images"``, ``"snippets"``, etc.).
+        purpose: Human description shown in the prompt (e.g. ``"template VM disk"``).
+        console: Rich console for output.
+        default: Pre-selected storage name (highlighted as default).
+
+    Returns:
+        The chosen storage name.
+    """
+    storages = px.list_storage(content_type=content_type)
+    if not storages:
+        console.print(f"[red]No storage found supporting '{content_type}' content.[/red]")
+        raise SystemExit(1)
+
+    if len(storages) == 1:
+        name = storages[0]["storage"]
+        console.print(f"  Storage for {purpose}: [green]{name}[/green] (only option)")
+        return name
+
+    # Build table
+    table = Table(title=f"Available storage ({purpose})")
+    table.add_column("#", style="bold", width=3)
+    table.add_column("Name")
+    table.add_column("Type")
+    table.add_column("Free")
+
+    default_idx = 0
+    for i, s in enumerate(storages):
+        if default and s["storage"] == default:
+            default_idx = i
+        table.add_row(
+            str(i + 1),
+            s["storage"],
+            s.get("type", "?"),
+            _humanize_bytes(s.get("avail", 0)),
+        )
+
+    console.print(table)
+    choice = click.prompt(
+        f"  Select storage for {purpose}",
+        default=default_idx + 1,
+        type=click.IntRange(1, len(storages)),
+    )
+    selected = storages[choice - 1]["storage"]
+    return selected
+
+
+def _find_snippet_storage(px: ProxmoxClient, console: Console) -> str:
+    """Auto-detect a storage pool that supports cloud-init snippets.
+
+    Returns the first enabled storage with ``snippets`` content type.
+    """
+    storages = px.list_storage(content_type="snippets")
+    if not storages:
+        console.print("[red]No storage found supporting 'snippets' content.[/red]")
+        console.print("  Cloud-init requires a storage with snippets enabled (usually 'local').")
+        raise SystemExit(1)
+    name = storages[0]["storage"]
+    console.print(f"  Snippet storage (cloud-init): [green]{name}[/green]")
+    return name
+
+
 def _get_vm_ip(vm_id: int, console: Console, timeout: int = 300) -> str | None:
     """Wait for a VM to get an IPv4 address via the QEMU guest agent.
 
@@ -291,17 +375,30 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
 @fleet.command("create-orchestrator")
 @click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the orchestrator.")
 @click.option(
+    "--storage", default=None,
+    help="Proxmox storage for VM disk (skip interactive prompt).",
+)
+@click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def create_orchestrator(vm_id: int | None, config: str) -> None:
+def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> None:
     """Create the orchestrator VM via Terraform and deploy the Docker stack."""
     from orcest.fleet.config import load_config, save_config
 
     console = Console()
     cfg = load_config(config)
+
+    # Select storage for orchestrator VM disk
+    if storage is None and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
+        px = _create_proxmox_client(cfg)
+        storage = _prompt_storage(
+            px, "images", "orchestrator VM disk", console, default=cfg.proxmox.storage,
+        )
+    if storage:
+        cfg.proxmox.storage = storage
 
     # Prompt for VM ID
     if vm_id is None:
@@ -812,12 +909,20 @@ def _create_vm_from_cloud_image(
     vm_id: int,
     image_url: str,
     console: Console,
+    *,
+    storage: str | None = None,
+    snippet_storage: str = "local",
 ) -> None:
     """Download a cloud image and create a VM with it as the boot disk.
 
     Uses the Proxmox ``download-url`` API to fetch the image, then creates
     a VM with ``import-from`` to use the downloaded image as the boot disk.
     Disk is resized to ``cfg.pool.worker_disk_size``.
+
+    Args:
+        storage: Proxmox storage for the VM boot disk. Falls back to
+            ``cfg.pool.storage``.
+        snippet_storage: Proxmox storage for cloud-init drive.
 
     Raises on any failure — caller is responsible for destroying the VM.
     """
@@ -827,7 +932,8 @@ def _create_vm_from_cloud_image(
     if parsed.scheme not in ("https", "http"):
         raise ValueError(f"Invalid image URL scheme: {parsed.scheme!r} (expected http or https)")
 
-    storage = cfg.pool.storage
+    if storage is None:
+        storage = cfg.pool.storage
     # Derive filename from the URL path and sanitize it
     raw_filename = image_url.rsplit("/", 1)[-1].split("?")[0] or "cloud-image.img"
     filename = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_filename)
@@ -856,7 +962,7 @@ def _create_vm_from_cloud_image(
         cores=cfg.pool.worker_cores,
         cpu="host",
         scsihw="virtio-scsi-pci",
-        ide2=f"{storage}:cloudinit",
+        ide2=f"{snippet_storage}:cloudinit",
         net0="virtio,bridge=vmbr0",
         ipconfig0="ip=dhcp",
         serial0="socket",
@@ -897,12 +1003,16 @@ def _create_vm_from_cloud_image(
     show_default=True,
 )
 @click.option(
+    "--storage", default=None,
+    help="Proxmox storage for VM disk (skip interactive prompt).",
+)
+@click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def create_template(vm_id: int | None, image_url: str, config: str) -> None:
+def create_template(vm_id: int | None, image_url: str, storage: str | None, config: str) -> None:
     """Create a worker VM template for the warm pool.
 
     Downloads a cloud image, creates a VM, installs worker tools
@@ -920,6 +1030,17 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         sys.exit(1)
 
     px = _create_proxmox_client(cfg)
+
+    # Select storage for VM disk
+    if storage is None:
+        storage = _prompt_storage(
+            px, "images", "template VM disk", console, default=cfg.pool.storage,
+        )
+    cfg.pool.storage = storage
+
+    # Auto-detect snippet storage for cloud-init
+    snippet_storage = _find_snippet_storage(px, console)
+    cfg.pool.snippet_storage = snippet_storage
 
     # Prompt for template VM ID
     if vm_id is None:
@@ -949,7 +1070,10 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
 
     # Step 1: Create VM from cloud image
     try:
-        _create_vm_from_cloud_image(px, cfg, vm_id, image_url, console)
+        _create_vm_from_cloud_image(
+            px, cfg, vm_id, image_url, console,
+            storage=storage, snippet_storage=snippet_storage,
+        )
     except Exception as exc:
         console.print(f"  [red]failed[/red]: {exc}")
         # Best-effort cleanup of partially-created VM
@@ -986,7 +1110,7 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
         userdata = render_template_userdata(
             ssh_public_key=cfg.orchestrator.ssh_key,
         )
-        _set_vm_cloud_init(px, vm_id, userdata)
+        _set_vm_cloud_init(px, vm_id, userdata, snippet_storage=snippet_storage)
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
@@ -1095,12 +1219,17 @@ def create_template(vm_id: int | None, image_url: str, config: str) -> None:
     console.print(f"  Saved template_vm_id={vm_id}, vm_id_start={vm_id_start} to fleet config.")
 
 
-def _set_vm_cloud_init(px: ProxmoxClient, vm_id: int, userdata: str) -> None:
+def _set_vm_cloud_init(
+    px: ProxmoxClient, vm_id: int, userdata: str, snippet_storage: str = "local",
+) -> None:
     """Set cloud-init user-data on a VM.
 
     Writes the snippet directly to the Proxmox host filesystem and
     configures ``cicustom`` via ``qm set``. This avoids the snippet
     upload API which can fail with certain API token configurations.
+
+    Args:
+        snippet_storage: Proxmox storage name for snippets (default ``"local"``).
     """
     from pathlib import Path
 
@@ -1109,7 +1238,7 @@ def _set_vm_cloud_init(px: ProxmoxClient, vm_id: int, userdata: str) -> None:
     snippets_dir.mkdir(parents=True, exist_ok=True)
     (snippets_dir / snippet_name).write_text(userdata)
     result = subprocess.run(
-        ["qm", "set", str(vm_id), "--cicustom", f"user=local:snippets/{snippet_name}"],
+        ["qm", "set", str(vm_id), "--cicustom", f"user={snippet_storage}:snippets/{snippet_name}"],
         capture_output=True,
         text=True,
     )

@@ -270,6 +270,27 @@ class ProxmoxClient:
             vms = [vm for vm in vms if vm.get("name", "").startswith(name_prefix)]
         return vms
 
+    def list_storage(self, content_type: str | None = None) -> list[dict]:
+        """Query available storage pools on this node.
+
+        Args:
+            content_type: If given, filter to storages that support this
+                content type (e.g. ``"images"``, ``"snippets"``).
+
+        Returns:
+            List of storage info dicts with keys: ``storage``, ``type``,
+            ``content``, ``avail``, ``total``, ``enabled``.
+        """
+        storages: list[dict] = self._api.nodes(self._node).storage.get()
+        # Only include enabled/active storages
+        storages = [s for s in storages if s.get("enabled", 1) and s.get("active", 1)]
+        if content_type:
+            storages = [
+                s for s in storages
+                if content_type in s.get("content", "").split(",")
+            ]
+        return storages
+
     def set_cloud_init_userdata(
         self, vm_id: int, userdata: str, storage: str = "local",
     ) -> None:

@@ -310,7 +310,9 @@ class PoolManager:
                 key_prefix=self._key_prefix,
                 worker_id=name,
             )
-            self._proxmox.set_cloud_init_userdata(new_id, userdata)
+            self._proxmox.set_cloud_init_userdata(
+                new_id, userdata, storage=self._pool.snippet_storage,
+            )
         except Exception:
             logger.error(
                 "Failed to set cloud-init on VM %d, destroying", new_id, exc_info=True
