@@ -272,9 +272,10 @@ def render_clone_userdata(
         default_flow_style=False,
     )
 
-    systemd_unit = _systemd_unit()
+    systemd_unit = _systemd_unit(worker_id=worker_id)
 
     cloud_config = {
+        "hostname": worker_id,
         "write_files": [
             {
                 "path": "/opt/orcest/worker.yaml",
@@ -352,7 +353,7 @@ def render_worker_userdata(
         f"CLAUDE_CODE_OAUTH_TOKEN={claude_oauth_token}\n"
     )
 
-    systemd_unit = _systemd_unit()
+    systemd_unit = _systemd_unit(worker_id=worker_id)
 
     claude_json = '{"hasCompletedOnboarding": true}'
 
@@ -410,9 +411,15 @@ def render_worker_userdata(
     return _render(cloud_config)
 
 
-def _systemd_unit() -> str:
-    """Return the orcest-worker systemd unit file content."""
-    return """\
+def _systemd_unit(worker_id: str = "%H") -> str:
+    """Return the orcest-worker systemd unit file content.
+
+    Args:
+        worker_id: Worker identifier for ``--id``.  Pool clones pass
+            their VM-based ID (e.g. ``orcest-worker-9001``); the default
+            ``%H`` (hostname) is kept for legacy non-pool workers.
+    """
+    return f"""\
 [Unit]
 Description=Orcest Worker
 After=network.target
@@ -423,7 +430,7 @@ StartLimitIntervalSec=300
 Type=simple
 User=orcest
 WorkingDirectory=/opt/orcest
-ExecStart=/opt/orcest/venv/bin/orcest work --id %H --config /opt/orcest/worker.yaml
+ExecStart=/opt/orcest/venv/bin/orcest work --id {worker_id} --config /opt/orcest/worker.yaml
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
