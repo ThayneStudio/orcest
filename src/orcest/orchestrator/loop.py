@@ -296,6 +296,15 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+                try:
+                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                except Exception as clear_err:
+                    logger.error(
+                        "Failed to clear pending task marker for PR #%d: %s",
+                        pr_state.number,
+                        clear_err,
+                        exc_info=True,
+                    )
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
             logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
             try:
@@ -317,6 +326,15 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+                try:
+                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                except Exception as clear_err:
+                    logger.error(
+                        "Failed to clear pending task marker for PR #%d: %s",
+                        pr_state.number,
+                        clear_err,
+                        exc_info=True,
+                    )
         elif pr_state.action == PRAction.ENQUEUE_REBASE:
             logger.info(
                 "PR #%d (%s): merge conflicts detected, enqueueing rebase task",
@@ -342,6 +360,15 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
+                try:
+                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                except Exception as clear_err:
+                    logger.error(
+                        "Failed to clear pending task marker for PR #%d: %s",
+                        pr_state.number,
+                        clear_err,
+                        exc_info=True,
+                    )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.RETRIGGER_REVIEW:
@@ -689,6 +716,14 @@ def _poll_cycle(
                     f"Failed to publish issue task for issue #{issue_state.number}: {e}",
                     exc_info=True,
                 )
+                try:
+                    clear_pending_task(redis, config.github.repo, "issue", issue_state.number)
+                except Exception as clear_err:
+                    logger.error(
+                        f"Failed to clear pending task marker for issue #{issue_state.number}: "
+                        f"{clear_err}",
+                        exc_info=True,
+                    )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             logger.warning(
                 f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
