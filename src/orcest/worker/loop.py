@@ -40,7 +40,8 @@ _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
     raise ValueError(
-        "_RESULT_PUBLISH_BACKOFF must have exactly _RESULT_PUBLISH_RETRIES - 1 entries"
+        f"_RESULT_PUBLISH_BACKOFF must have exactly {_RESULT_PUBLISH_RETRIES - 1} "
+        f"entries (got {len(_RESULT_PUBLISH_BACKOFF)})"
     )
 
 
