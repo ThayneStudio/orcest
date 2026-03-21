@@ -503,9 +503,7 @@ def test_deployment_health_check_timeout_negative_raises(tmp_path: Path):
 def test_stale_pending_timeout_seconds_zero_raises(tmp_path: Path):
     """stale_pending_timeout_seconds <= 0 raises ValueError."""
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: 0\n"
-    )
+    cfg_file.write_text("github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: 0\n")
 
     with pytest.raises(ValueError, match="stale_pending_timeout_seconds"):
         load_orchestrator_config(cfg_file)
@@ -514,9 +512,7 @@ def test_stale_pending_timeout_seconds_zero_raises(tmp_path: Path):
 def test_stale_pending_timeout_seconds_negative_raises(tmp_path: Path):
     """stale_pending_timeout_seconds < 0 raises ValueError."""
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: -1\n"
-    )
+    cfg_file.write_text("github:\n  repo: acme/widgets\nstale_pending_timeout_seconds: -1\n")
 
     with pytest.raises(ValueError, match="stale_pending_timeout_seconds"):
         load_orchestrator_config(cfg_file)
@@ -528,9 +524,7 @@ def test_stale_pending_timeout_seconds_negative_raises(tmp_path: Path):
 def test_null_integer_field_raises(tmp_path: Path):
     """An explicitly null integer field in YAML raises ValueError."""
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "github:\n  repo: acme/widgets\npolling:\n  interval: null\n"
-    )
+    cfg_file.write_text("github:\n  repo: acme/widgets\npolling:\n  interval: null\n")
 
     with pytest.raises(ValueError, match="explicitly set to null"):
         load_orchestrator_config(cfg_file)
