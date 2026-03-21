@@ -1373,6 +1373,64 @@ class TestRunWorker:
         # Worker exited after one task (no second xreadgroup for normal tasks)
         assert normal_call_count == 1
 
+    def test_ephemeral_worker_releases_lock_before_shutdown_on_dead_letter(
+        self, mocker, worker_config, sample_task
+    ):
+        """The lock must be released before shutdown=True is set when an
+        ephemeral worker dead-letters a task.  Without this the lock lingers
+        for LOCK_TTL seconds, blocking other workers from claiming the same
+        resource."""
+        worker_config.ephemeral = True
+        mock_redis = self._build_mock_redis()
+        self._setup_run_worker(mocker, worker_config, mock_redis)
+
+        # Delivery count above threshold triggers dead-letter path
+        mock_redis.xpending_count.return_value = MAX_DELIVERY_COUNT + 1
+
+        release_called_before_set_ex: list[bool] = []
+        set_ex_called: list[bool] = [False]
+
+        def make_mock_lock(redis, key, *, ttl, owner):
+            mock_lock = MagicMock()
+            mock_lock.acquire.return_value = True
+
+            def release_side_effect():
+                # Record whether set_ex (pool:done) has NOT yet been called
+                release_called_before_set_ex.append(not set_ex_called[0])
+
+            mock_lock.release.side_effect = release_side_effect
+            return mock_lock
+
+        mocker.patch("orcest.worker.loop.RedisLock", side_effect=make_mock_lock)
+
+        original_set_ex = mock_redis.set_ex
+
+        def set_ex_side_effect(key, value, **kwargs):
+            if "pool:done" in key:
+                set_ex_called[0] = True
+            return original_set_ex(key, value, **kwargs)
+
+        mock_redis.set_ex.side_effect = set_ex_side_effect
+
+        task_fields = sample_task.to_dict()
+
+        def xreadgroup_side_effect(**kwargs):
+            if kwargs.get("pending", False):
+                return []
+            return [("entry-1", task_fields)]
+
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
+
+        run_worker(worker_config)
+
+        # lock.release() must have been called exactly once (in dead-letter path)
+        assert len(release_called_before_set_ex) == 1
+        # release() must precede the pool:done set_ex call (i.e. before shutdown)
+        assert release_called_before_set_ex[0], (
+            "lock.release() was called AFTER pool:done set_ex; "
+            "it must be called BEFORE shutdown is set"
+        )
+
     def test_non_ephemeral_worker_continues_after_dead_lettered_task(
         self, mocker, worker_config, sample_task
     ):
