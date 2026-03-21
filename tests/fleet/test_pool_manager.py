@@ -754,7 +754,7 @@ class TestHealthCheck:
         """Invalid entries are skipped but valid expired entries are still destroyed."""
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
-        mock_time.monotonic.side_effect = [10000.0, 0, 100]  # health_check now + _destroy_vm stop-wait
+        mock_time.monotonic.side_effect = [10000.0, 0, 100]  # health_check now + _destroy_vm
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
 
