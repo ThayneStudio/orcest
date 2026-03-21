@@ -757,7 +757,7 @@ class TestHealthCheck:
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
         mock_time.time.return_value = 10000.0
-        mock_time.monotonic.side_effect = [0, 100]  # for _destroy_vm stop-wait
+        mock_time.monotonic.side_effect = [0, 100]  # _destroy_vm stop-wait
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
 
@@ -798,7 +798,6 @@ class TestHealthCheck:
         """If destroying one timed-out VM fails, the rest are still processed."""
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
-        mock_time.time.return_value = 10000.0
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
 
@@ -818,6 +817,7 @@ class TestHealthCheck:
             return []
 
         pipe.execute.side_effect = pipeline_execute_side_effect
+        mock_time.time.return_value = 10000.0
         mock_time.monotonic.side_effect = [0, 100, 0, 100]
 
         # Should not raise
