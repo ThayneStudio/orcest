@@ -78,7 +78,9 @@ class TestGenerateTfvars:
     def test_disk_size_is_int(self):
         cfg = _cfg(
             orchestrator=OrchestratorConfig(
-                vm_id=199, host="10.0.0.1", disk_size=50,
+                vm_id=199,
+                host="10.0.0.1",
+                disk_size=50,
             ),
         )
         tfvars = generate_tfvars(cfg)

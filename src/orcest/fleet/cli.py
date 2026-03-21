@@ -198,11 +198,16 @@ def _repo_to_project_name(repo: str) -> str:
 
 
 _SSH_OPTS = [
-    "-o", "ConnectTimeout=5",
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "BatchMode=yes",
-    "-o", "LogLevel=ERROR",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "LogLevel=ERROR",
 ]
 
 
@@ -255,7 +260,10 @@ def _create_proxmox_client(cfg: FleetConfig) -> ProxmoxClient:
 
 
 def _wait_for_cloud_init(
-    host: str, user: str, console: Console, timeout: int = 600,
+    host: str,
+    user: str,
+    console: Console,
+    timeout: int = 600,
 ) -> bool:
     """Wait for cloud-init to finish on a remote host. Returns True on success."""
     ssh_target = f"{user}@{host}"
@@ -308,7 +316,9 @@ def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) ->
 
 
 def _ensure_orchestrator_ssh(
-    ssh_target: str, proxmox_ip: str, console: Console,
+    ssh_target: str,
+    proxmox_ip: str,
+    console: Console,
 ) -> None:
     """Ensure the orchestrator VM can SSH to the Proxmox host.
 
@@ -320,7 +330,9 @@ def _ensure_orchestrator_ssh(
     # Quick check: does SSH already work?
     verify = subprocess.run(
         [
-            "ssh", *_SSH_OPTS, ssh_target,
+            "ssh",
+            *_SSH_OPTS,
+            ssh_target,
             f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes"
             f" -o ConnectTimeout=3 root@{proxmox_ip} true",
         ],
@@ -337,7 +349,9 @@ def _ensure_orchestrator_ssh(
     # Generate key if missing
     subprocess.run(
         [
-            "ssh", *_SSH_OPTS, ssh_target,
+            "ssh",
+            *_SSH_OPTS,
+            ssh_target,
             "test -f ~/.ssh/id_ed25519 || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''",
         ],
         capture_output=True,
@@ -369,7 +383,9 @@ def _ensure_orchestrator_ssh(
     # Verify
     verify = subprocess.run(
         [
-            "ssh", *_SSH_OPTS, ssh_target,
+            "ssh",
+            *_SSH_OPTS,
+            ssh_target,
             f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes"
             f" -o ConnectTimeout=5 root@{proxmox_ip} hostname",
         ],
@@ -392,7 +408,8 @@ def fleet() -> None:
 @fleet.command("add-org")
 @click.argument("org_name")
 @click.option(
-    "--github-token", required=True,
+    "--github-token",
+    required=True,
     help="GitHub PAT (classic: repo+workflow scopes; "
     "fine-grained: contents, issues, pull-requests, actions R/W).",
 )
@@ -429,7 +446,9 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
     else:
         try:
             result = _run_on_orchestrator(
-                cfg, ["orcest", "check", "github-token"], input_data=github_token + "\n",
+                cfg,
+                ["orcest", "check", "github-token"],
+                input_data=github_token + "\n",
             )
             if result.returncode != 0:
                 console.print("[red]failed[/red]")
@@ -453,7 +472,8 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
 @fleet.command("create-orchestrator")
 @click.option("--vm-id", type=int, default=None, help="Proxmox VM ID for the orchestrator.")
 @click.option(
-    "--storage", default=None,
+    "--storage",
+    default=None,
     help="Proxmox storage for VM disk (skip interactive prompt).",
 )
 @click.option(
@@ -473,7 +493,11 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
     if storage is None and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
         px = _create_proxmox_client(cfg)
         storage = _prompt_storage(
-            px, "images", "orchestrator VM disk", console, default=cfg.proxmox.storage,
+            px,
+            "images",
+            "orchestrator VM disk",
+            console,
+            default=cfg.proxmox.storage,
         )
     if storage:
         cfg.proxmox.storage = storage
@@ -579,9 +603,7 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
     # Step 9: Start pool manager (if template and Proxmox creds are configured)
     if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
         if cfg.proxmox.is_localhost():
-            console.print(
-                "  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]"
-            )
+            console.print("  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]")
             console.print(
                 "  The pool manager runs on the orchestrator VM and needs the"
                 " Proxmox host's real IP."
@@ -597,9 +619,7 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
                 console.print("  Pool manager [green]ok[/green]")
             except Exception as exc:
                 console.print(f"  Pool manager [yellow]failed: {exc}[/yellow]")
-                console.print(
-                    "  (Pool manager can be started later with 'orcest fleet update')"
-                )
+                console.print("  (Pool manager can be started later with 'orcest fleet update')")
 
     console.print(f"\n[bold]Orchestrator created at {orch_ip}.[/bold]")
     console.print("\n  Next steps:")
@@ -689,7 +709,8 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             claude_token=org.claude_oauth_token,
         )
         config_yaml = generate_orchestrator_config(
-            repo=repo, key_prefix=project_name,
+            repo=repo,
+            key_prefix=project_name,
         )
         write_project_files(ssh_target, project_name, env_content, config_yaml)
         console.print("  Project files written [green]ok[/green]")
@@ -837,9 +858,7 @@ def update(config: str) -> None:
     # Step 3: Update pool manager (if template and Proxmox creds are configured)
     if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
         if cfg.proxmox.is_localhost():
-            console.print(
-                "  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]"
-            )
+            console.print("  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]")
             console.print(
                 "  The pool manager runs on the orchestrator VM and needs the"
                 " Proxmox host's real IP."
@@ -952,7 +971,9 @@ def status(config: str) -> None:
             ssh_target = cfg.ssh_target()
             result = subprocess.run(
                 [
-                    "ssh", *_SSH_OPTS, ssh_target,
+                    "ssh",
+                    *_SSH_OPTS,
+                    ssh_target,
                     f"cd /opt/orcest && docker compose"
                     f" -p orcest-{project.name}"
                     f" ps --format json 2>/dev/null",
@@ -1062,9 +1083,13 @@ def _create_vm_from_cloud_image(
     console.print("  Importing boot disk...", end=" ")
     result = subprocess.run(
         [
-            "qm", "set", str(vm_id),
-            "--scsi0", f"{storage}:0,import-from={image_path},discard=on,ssd=1",
-            "--boot", "order=scsi0",
+            "qm",
+            "set",
+            str(vm_id),
+            "--scsi0",
+            f"{storage}:0,import-from={image_path},discard=on,ssd=1",
+            "--boot",
+            "order=scsi0",
         ],
         capture_output=True,
         text=True,
@@ -1088,7 +1113,8 @@ def _create_vm_from_cloud_image(
     show_default=True,
 )
 @click.option(
-    "--storage", default=None,
+    "--storage",
+    default=None,
     help="Proxmox storage for VM disk (skip interactive prompt).",
 )
 @click.option(
@@ -1119,7 +1145,11 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # Select storage for VM disk
     if storage is None:
         storage = _prompt_storage(
-            px, "images", "template VM disk", console, default=cfg.pool.storage,
+            px,
+            "images",
+            "template VM disk",
+            console,
+            default=cfg.pool.storage,
         )
     cfg.pool.storage = storage
 
@@ -1156,8 +1186,13 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # Step 1: Create VM from cloud image
     try:
         _create_vm_from_cloud_image(
-            px, cfg, vm_id, image_url, console,
-            storage=storage, snippet_storage=snippet_storage,
+            px,
+            cfg,
+            vm_id,
+            image_url,
+            console,
+            storage=storage,
+            snippet_storage=snippet_storage,
         )
     except Exception as exc:
         console.print(f"  [red]failed[/red]: {exc}")
@@ -1249,8 +1284,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     result = _ssh_run(
         vm_ip,
         cfg.orchestrator.user,
-        "sudo truncate -s 0 /etc/machine-id"
-        " && sudo rm -f /var/lib/dbus/machine-id",
+        "sudo truncate -s 0 /etc/machine-id && sudo rm -f /var/lib/dbus/machine-id",
     )
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
@@ -1305,7 +1339,10 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
 
 
 def _set_vm_cloud_init(
-    px: ProxmoxClient, vm_id: int, userdata: str, snippet_storage: str = "local",
+    px: ProxmoxClient,
+    vm_id: int,
+    userdata: str,
+    snippet_storage: str = "local",
 ) -> None:
     """Set cloud-init user-data on a VM.
 
@@ -1372,8 +1409,7 @@ def pool_status(config: str) -> None:
     # Check template status via Proxmox API
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
         console.print(
-            "\n[yellow]Proxmox API credentials not configured"
-            " -- cannot query VMs.[/yellow]"
+            "\n[yellow]Proxmox API credentials not configured -- cannot query VMs.[/yellow]"
         )
         return
 
@@ -1392,8 +1428,7 @@ def pool_status(config: str) -> None:
     console.print("\n  Scanning for worker VMs...")
     try:
         worker_vms = [
-            vm for vm in px.list_vms(name_prefix="orcest-worker-")
-            if not vm.get("template", False)
+            vm for vm in px.list_vms(name_prefix="orcest-worker-") if not vm.get("template", False)
         ]
     except Exception as exc:
         console.print(f"  [red]Failed to list VMs[/red]: {exc}")
@@ -1469,7 +1504,8 @@ def set_pool_size(size: int, vm_id_start: int | None, config: str) -> None:
 
 @fleet.command()
 @click.option(
-    "--drain-active", is_flag=True,
+    "--drain-active",
+    is_flag=True,
     help="Also destroy active workers (interrupts running tasks).",
 )
 @click.option(
@@ -1518,8 +1554,7 @@ def stop(drain_active: bool, config: str) -> None:
     # Step 3: Destroy worker VMs
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
         console.print(
-            "[yellow]Proxmox API credentials not configured"
-            " — skipping VM destruction.[/yellow]"
+            "[yellow]Proxmox API credentials not configured — skipping VM destruction.[/yellow]"
         )
         console.print("  VMs must be destroyed manually or via Proxmox UI.")
         return
@@ -1619,8 +1654,7 @@ def start(config: str) -> None:
 
     if cfg.proxmox.is_localhost():
         console.print(
-            "[red]Proxmox endpoint is localhost"
-            " — unreachable from orchestrator VM.[/red]"
+            "[red]Proxmox endpoint is localhost — unreachable from orchestrator VM.[/red]"
         )
         console.print("  Run: orcest init")
         sys.exit(1)
@@ -1725,8 +1759,12 @@ def _upgrade_cli(console: Console) -> None:
     pip = Path(sys.executable).parent / "pip"
     result = subprocess.run(
         [
-            str(pip), "install", "--quiet", "--no-cache-dir",
-            "--force-reinstall", "git+https://github.com/ThayneStudio/orcest.git",
+            str(pip),
+            "install",
+            "--quiet",
+            "--no-cache-dir",
+            "--force-reinstall",
+            "git+https://github.com/ThayneStudio/orcest.git",
         ],
         capture_output=True,
         text=True,

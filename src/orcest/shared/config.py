@@ -215,7 +215,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     github_repo = os.environ.get("ORCEST_REPO", github_raw.get("repo", ""))
 
     claude_token = os.environ.get(
-        "CLAUDE_CODE_OAUTH_TOKEN", github_raw.get("claude_token", ""),
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        github_raw.get("claude_token", ""),
     )
     github_config = GithubConfig(
         token=str(github_token),

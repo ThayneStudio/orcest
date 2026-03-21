@@ -481,10 +481,22 @@ def _mock_proxmox_client(mocker):
     mock_px.get_vm_status.return_value = "stopped"
     mock_px.list_vms.return_value = []
     _all_storage = [
-        {"storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir",
-         "avail": 1e12, "enabled": 1, "active": 1},
-        {"storage": "local", "type": "dir", "content": "snippets,iso,backup",
-         "avail": 1e11, "enabled": 1, "active": 1},
+        {
+            "storage": "local-lvm",
+            "type": "lvmthin",
+            "content": "images,rootdir",
+            "avail": 1e12,
+            "enabled": 1,
+            "active": 1,
+        },
+        {
+            "storage": "local",
+            "type": "dir",
+            "content": "snippets,iso,backup",
+            "avail": 1e11,
+            "enabled": 1,
+            "active": 1,
+        },
     ]
 
     def _list_storage(content_type=None):
