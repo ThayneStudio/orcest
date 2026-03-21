@@ -383,6 +383,14 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             shutdown = True
             shutdown_event.set()  # Must mirror handle_signal; abort_event watches this
         elif not published:
+            try:
+                clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+            except Exception:
+                logger.warning(
+                    "Failed to clear pending task marker for "
+                    f"{task.resource_type} #{task.resource_id} after publish failure",
+                    exc_info=True,
+                )
             continue
 
     logger.info("Worker shut down cleanly.")
