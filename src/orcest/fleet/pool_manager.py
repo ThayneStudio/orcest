@@ -371,7 +371,18 @@ class PoolManager:
                 )
                 continue
 
-            elapsed = max(0.0, now - start_ts)
+            raw_elapsed = now - start_ts
+            if raw_elapsed < 0:
+                logger.warning(
+                    "VM %d: clock skew detected (start_ts=%.3f now=%.3f, delta=%.3f);"
+                    " skipping health check",
+                    vm_id,
+                    start_ts,
+                    now,
+                    raw_elapsed,
+                )
+                continue
+            elapsed = raw_elapsed
             if elapsed > max_duration:
                 logger.warning(
                     "VM %d exceeded max task duration (%.0fs > %ds), force-destroying",
