@@ -167,7 +167,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List all open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
-    headRefOid, isDraft, author, createdAt, labels, reviewDecision,
+    headRefOid, isDraft, createdAt, labels, reviewDecision,
     mergeable.
 
     Args:
@@ -185,7 +185,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
             "--state",
             "open",
             "--json",
-            "number,title,headRefName,baseRefName,headRefOid,isDraft,author,createdAt,labels,reviewDecision,mergeable",
+            "number,title,headRefName,baseRefName,headRefOid,isDraft,createdAt,labels,reviewDecision,mergeable",
             "--limit",
             str(limit),
         ],
@@ -206,7 +206,7 @@ def get_pr(repo: str, number: int, token: str) -> dict:
             repo,
             "--json",
             "number,title,body,headRefName,baseRefName,state,"
-            "author,labels,reviewDecision,reviews,"
+            "labels,reviewDecision,reviews,"
             "statusCheckRollup,commits,additions,deletions",
         ],
         token,
@@ -463,9 +463,6 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             pageInfo { hasNextPage }
             nodes {
               body
-              author {
-                login
-              }
             }
           }
         }
