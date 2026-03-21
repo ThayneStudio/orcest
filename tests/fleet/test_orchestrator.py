@@ -28,7 +28,7 @@ class TestValidateProjectName:
 
     def test_rejects_shell_injection(self):
         with pytest.raises(ValueError):
-            _validate_project_name('; rm -rf /')
+            _validate_project_name("; rm -rf /")
 
     def test_rejects_spaces(self):
         with pytest.raises(ValueError):
@@ -58,7 +58,8 @@ class TestGenerateEnvFile:
 
     def test_project_name_in_config_dir(self):
         env = generate_env_file(
-            github_token="t", key_prefix="special-name",
+            github_token="t",
+            key_prefix="special-name",
             project_name="special-name",
         )
         assert "projects/special-name/config" in env
@@ -120,7 +121,8 @@ class TestGenerateEnvFile:
 class TestGenerateOrchestratorConfig:
     def test_basic_structure(self):
         config_yaml = generate_orchestrator_config(
-            repo="Org/repo", key_prefix="myproj",
+            repo="Org/repo",
+            key_prefix="myproj",
         )
         data = yaml.safe_load(config_yaml)
 
@@ -131,9 +133,7 @@ class TestGenerateOrchestratorConfig:
 
     def test_key_prefix_matches_project(self):
         """The key_prefix in the config matches what was passed."""
-        data = yaml.safe_load(
-            generate_orchestrator_config(repo="O/r", key_prefix="alpha")
-        )
+        data = yaml.safe_load(generate_orchestrator_config(repo="O/r", key_prefix="alpha"))
         assert data["redis"]["key_prefix"] == "alpha"
 
 
@@ -199,7 +199,9 @@ class TestUploadFleetConfig:
         )
         # Verify SCP uploads the local file to the temp path on the remote
         scp.assert_called_once_with(
-            str(cfg_file), "user@host", "/tmp/.orcest-config.yaml.tmp",
+            str(cfg_file),
+            "user@host",
+            "/tmp/.orcest-config.yaml.tmp",
         )
 
     def test_missing_config_raises(self):
@@ -247,7 +249,8 @@ class TestUploadFleetConfig:
         # Verify the cleanup call removes the temp file
         cleanup_call = ssh.call_args_list[2]
         assert cleanup_call == mocker.call(
-            "user@host", "rm -f /tmp/.orcest-config.yaml.tmp",
+            "user@host",
+            "rm -f /tmp/.orcest-config.yaml.tmp",
         )
 
 
@@ -260,6 +263,7 @@ class TestStopPoolManager:
 
     def test_success(self, mocker):
         from orcest.fleet.orchestrator import stop_pool_manager
+
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
         stop_pool_manager("user@host")
         ssh.assert_called_once()
@@ -268,6 +272,7 @@ class TestStopPoolManager:
 
     def test_failure_raises(self, mocker):
         from orcest.fleet.orchestrator import stop_pool_manager
+
         mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._fail)
         with pytest.raises(RuntimeError, match="Failed to stop pool manager"):
             stop_pool_manager("user@host")
@@ -276,16 +281,24 @@ class TestStopPoolManager:
 class TestGetPoolRedisMembers:
     def test_parses_idle_and_active(self, mocker):
         from orcest.fleet.orchestrator import get_pool_redis_members
+
         def ssh_side_effect(target, cmd):
             if "SMEMBERS" in cmd:
                 return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="300\n301\n", stderr="",
+                    args=[],
+                    returncode=0,
+                    stdout="300\n301\n",
+                    stderr="",
                 )
             if "HGETALL" in cmd:
                 return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="302\n1000.0\n303\n2000.0\n", stderr="",
+                    args=[],
+                    returncode=0,
+                    stdout="302\n1000.0\n303\n2000.0\n",
+                    stderr="",
                 )
             return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+
         mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         idle, active = get_pool_redis_members("user@host")
         assert idle == {"300", "301"}
@@ -293,6 +306,7 @@ class TestGetPoolRedisMembers:
 
     def test_handles_empty(self, mocker):
         from orcest.fleet.orchestrator import get_pool_redis_members
+
         mocker.patch(
             "orcest.fleet.orchestrator._ssh",
             return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
@@ -305,6 +319,7 @@ class TestGetPoolRedisMembers:
 class TestCleanPoolRedis:
     def test_builds_correct_commands(self, mocker):
         from orcest.fleet.orchestrator import clean_pool_redis
+
         ssh = mocker.patch(
             "orcest.fleet.orchestrator._ssh",
             return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
@@ -319,6 +334,7 @@ class TestCleanPoolRedis:
 
     def test_noop_for_empty_list(self, mocker):
         from orcest.fleet.orchestrator import clean_pool_redis
+
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh")
         clean_pool_redis("user@host", [])
         ssh.assert_not_called()
@@ -336,7 +352,8 @@ class TestCleanPendingTasks:
             call_count += 1
             if call_count == 1:  # KEYS
                 return subprocess.CompletedProcess(
-                    args=[], returncode=0,
+                    args=[],
+                    returncode=0,
                     stdout="orcest:pending:issue:Org/repo:1\norcest:pending:issue:Org/repo:2\n",
                     stderr="",
                 )
@@ -355,7 +372,10 @@ class TestCleanPendingTasks:
         mocker.patch(
             "orcest.fleet.orchestrator._ssh",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr="",
+                args=[],
+                returncode=0,
+                stdout="",
+                stderr="",
             ),
         )
         count = clean_pending_tasks("user@host")

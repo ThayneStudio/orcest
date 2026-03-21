@@ -129,7 +129,11 @@ def work(worker_id: str, config: str, runner: str | None, once: bool) -> None:
 @click.option("--once", is_flag=True, help="Print status once and exit (no TUI).")
 @click.option("--interval", default=3.0, type=float, help="TUI refresh interval in seconds.")
 def status(
-    redis_host: str | None, config: str, prefix: str | None, once: bool, interval: float,
+    redis_host: str | None,
+    config: str,
+    prefix: str | None,
+    once: bool,
+    interval: float,
 ) -> None:
     """Show system status: workers, queue depth, active tasks.
 
@@ -250,7 +254,11 @@ def _status_once(redis: RedisClient) -> None:
     help="Maximum number of entries to list (also caps replay scope when --replay is used).",
 )
 def dead_letters(
-    redis_host: str | None, config: str, prefix: str | None, replay: bool, count: int,
+    redis_host: str | None,
+    config: str,
+    prefix: str | None,
+    replay: bool,
+    count: int,
 ) -> None:
     """List and optionally replay dead-lettered tasks.
 
@@ -359,7 +367,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
 
 @main.command()
-def init():
+def init() -> None:
     """Initialize orcest on this Proxmox host.
 
     Auto-detects Proxmox settings, creates an API token, reads the SSH
@@ -477,10 +485,16 @@ def init():
                     )
                     result = subprocess.run(
                         [
-                            "pveum", "user", "token", "add",
-                            "root@pam", "orcest",
-                            "--privsep", "0",
-                            "--output-format", "json",
+                            "pveum",
+                            "user",
+                            "token",
+                            "add",
+                            "root@pam",
+                            "orcest",
+                            "--privsep",
+                            "0",
+                            "--output-format",
+                            "json",
                         ],
                         capture_output=True,
                         text=True,
@@ -553,7 +567,8 @@ def init():
         try:
             result = subprocess.run(
                 ["ip", "-4", "-o", "addr", "show", "vmbr0"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             if result.returncode == 0 and result.stdout.strip():
                 # Parse "2: vmbr0  inet 10.20.0.1/24 ..."
@@ -570,7 +585,9 @@ def init():
         if not detected_ip:
             try:
                 result = subprocess.run(
-                    ["hostname", "-I"], capture_output=True, text=True,
+                    ["hostname", "-I"],
+                    capture_output=True,
+                    text=True,
                 )
                 if result.returncode == 0:
                     all_ips = result.stdout.strip().split()
@@ -660,8 +677,10 @@ def init():
     console.print(f"  {step + 1}. Create worker template:    orcest fleet create-template")
     console.print(f"  {step + 2}. Set pool size:             orcest fleet set-pool-size <N>")
     org_step = step + 3
-    console.print(f"  {org_step}. Register an org:           orcest fleet add-org <org>"
-                  " --github-token ... --claude-token ...")
+    console.print(
+        f"  {org_step}. Register an org:           orcest fleet add-org <org>"
+        " --github-token ... --claude-token ..."
+    )
     # Indent the hint to align under the step text (e.g. "  4. " -> 5 chars).
     hint_indent = " " * (len(str(org_step)) + 4)
     console.print(
@@ -672,7 +691,7 @@ def init():
 
 
 @main.command()
-def upgrade():
+def upgrade() -> None:
     """Update the orcest CLI to the latest version from GitHub.
 
     Reinstalls the package and refreshes Terraform templates.
@@ -984,12 +1003,13 @@ def pool_manage(config: str, interval: float) -> None:
         raise SystemExit(1)
 
     console.print(
-        f"[bold]Starting pool manager[/bold]"
-        f" (target={cfg.pool.size}, interval={interval}s)"
+        f"[bold]Starting pool manager[/bold] (target={cfg.pool.size}, interval={interval}s)"
     )
 
     manager = PoolManager(
-        config=cfg, proxmox=proxmox, redis=redis,
+        config=cfg,
+        proxmox=proxmox,
+        redis=redis,
         key_prefix=redis_cfg.key_prefix,
     )
     try:

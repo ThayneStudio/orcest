@@ -133,7 +133,10 @@ class ProxmoxClient:
         """
         logger.info(
             "Cloning VM %d -> %d (name=%s, linked=%s)",
-            template_id, new_id, name, linked,
+            template_id,
+            new_id,
+            name,
+            linked,
         )
         params: dict[str, object] = {
             "newid": new_id,
@@ -143,16 +146,15 @@ class ProxmoxClient:
         # Proxmox rejects the 'storage' parameter for linked clones
         if not linked and storage:
             params["storage"] = storage
-        upid = (
-            self._api.nodes(self._node)
-            .qemu(template_id)
-            .clone.post(**params)
-        )
+        upid = self._api.nodes(self._node).qemu(template_id).clone.post(**params)
         self.wait_for_task(upid)
         return upid
 
     def set_vm_network(
-        self, vm_id: int, mac: str, bridge: str = "vmbr0",
+        self,
+        vm_id: int,
+        mac: str,
+        bridge: str = "vmbr0",
     ) -> None:
         """Set the network adapter configuration on a VM.
 
@@ -262,10 +264,7 @@ class ProxmoxClient:
         while time.monotonic() < deadline:
             try:
                 result = (
-                    self._api.nodes(self._node)
-                    .qemu(vm_id)
-                    .agent("network-get-interfaces")
-                    .get()
+                    self._api.nodes(self._node).qemu(vm_id).agent("network-get-interfaces").get()
                 )
                 interfaces = result.get("result", [])
                 ip = parse_vm_ip(interfaces)
@@ -321,14 +320,14 @@ class ProxmoxClient:
         # Only include enabled/active storages
         storages = [s for s in storages if s.get("enabled", 1) and s.get("active", 1)]
         if content_type:
-            storages = [
-                s for s in storages
-                if content_type in s.get("content", "").split(",")
-            ]
+            storages = [s for s in storages if content_type in s.get("content", "").split(",")]
         return storages
 
     def set_cloud_init_userdata(
-        self, vm_id: int, userdata: str, storage: str = "local",
+        self,
+        vm_id: int,
+        userdata: str,
+        storage: str = "local",
     ) -> None:
         """Set cloud-init user-data on a VM.
 
@@ -365,8 +364,12 @@ class ProxmoxClient:
         )
 
     def _write_snippet_ssh(
-        self, host: str, snippet_name: str, userdata: str,
-        storage: str, vm_id: int,
+        self,
+        host: str,
+        snippet_name: str,
+        userdata: str,
+        storage: str,
+        vm_id: int,
     ) -> bool:
         """Write a cloud-init snippet via SSH and set cicustom.
 
@@ -377,16 +380,16 @@ class ProxmoxClient:
 
         ssh_target = f"root@{host}"
         ssh_opts = [
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
         ]
 
         # Write snippet content via stdin
-        write_cmd = (
-            f"mkdir -p /var/lib/vz/snippets && "
-            f"cat > /var/lib/vz/snippets/{snippet_name}"
-        )
+        write_cmd = f"mkdir -p /var/lib/vz/snippets && cat > /var/lib/vz/snippets/{snippet_name}"
         result = subprocess.run(
             ["ssh", *ssh_opts, ssh_target, write_cmd],
             input=userdata,
@@ -399,9 +402,7 @@ class ProxmoxClient:
             return False
 
         # Set cicustom on the VM
-        cicustom_cmd = (
-            f"qm set {vm_id} --cicustom user={storage}:snippets/{snippet_name}"
-        )
+        cicustom_cmd = f"qm set {vm_id} --cicustom user={storage}:snippets/{snippet_name}"
         result = subprocess.run(
             ["ssh", *ssh_opts, ssh_target, cicustom_cmd],
             capture_output=True,
@@ -409,9 +410,7 @@ class ProxmoxClient:
             timeout=15,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                f"qm set --cicustom failed: {result.stderr.strip()}"
-            )
+            raise RuntimeError(f"qm set --cicustom failed: {result.stderr.strip()}")
         return True
 
     def download_image(
@@ -506,18 +505,14 @@ class ProxmoxClient:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
-            task_status = (
-                self._api.nodes(self._node).tasks(upid).status.get()
-            )
+            task_status = self._api.nodes(self._node).tasks(upid).status.get()
             status = task_status.get("status")
             if status == "stopped":
                 exitstatus = task_status.get("exitstatus", "")
                 if exitstatus == "OK":
                     logger.debug("Task %s completed successfully", upid)
                     return True
-                raise RuntimeError(
-                    f"Proxmox task {upid} failed with exit status: {exitstatus}"
-                )
+                raise RuntimeError(f"Proxmox task {upid} failed with exit status: {exitstatus}")
 
             time.sleep(1)
 

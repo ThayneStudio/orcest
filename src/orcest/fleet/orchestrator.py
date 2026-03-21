@@ -22,11 +22,16 @@ logger = logging.getLogger(__name__)
 
 
 _SSH_OPTS = [
-    "-o", "ConnectTimeout=5",
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "BatchMode=yes",
-    "-o", "LogLevel=ERROR",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "LogLevel=ERROR",
 ]
 
 
@@ -99,8 +104,10 @@ def upload_source(ssh_target: str) -> None:
     try:
         # Copy deploy files (Dockerfile, compose files, pyproject.toml) to staging root
         deploy_files = (
-            "Dockerfile", "docker-compose.yml",
-            "docker-compose.redis.yml", "docker-compose.pool.yml",
+            "Dockerfile",
+            "docker-compose.yml",
+            "docker-compose.redis.yml",
+            "docker-compose.pool.yml",
             "pyproject.toml",
         )
         for fname in deploy_files:
@@ -141,8 +148,7 @@ def upload_source(ssh_target: str) -> None:
             )
         clean_result = _ssh(
             ssh_target,
-            "cd /opt/orcest"
-            " && rm -rf src/ Dockerfile docker-compose*.yml pyproject.toml",
+            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose*.yml pyproject.toml",
         )
         if clean_result.returncode != 0:
             raise RuntimeError(
@@ -177,21 +183,17 @@ def ensure_redis_stack(ssh_target: str) -> None:
     logger.info("Ensuring shared Redis stack on %s", ssh_target)
     result = _ssh(
         ssh_target,
-        "cd /opt/orcest && docker compose"
-        " -f docker-compose.redis.yml"
-        " -p orcest-redis"
-        " up -d",
+        "cd /opt/orcest && docker compose -f docker-compose.redis.yml -p orcest-redis up -d",
     )
     if result.returncode != 0:
         logger.error("Redis stack failed: %s", result.stderr.strip())
-        raise RuntimeError(
-            f"Failed to start shared Redis stack: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to start shared Redis stack: {result.stderr.strip()}")
     logger.info("Shared Redis stack running on %s", ssh_target)
 
 
 def upload_fleet_config(
-    ssh_target: str, local_config_path: str = "/etc/orcest/config.yaml",
+    ssh_target: str,
+    local_config_path: str = "/etc/orcest/config.yaml",
 ) -> None:
     """Upload the fleet config from the Proxmox host to the orchestrator VM.
 
@@ -201,9 +203,7 @@ def upload_fleet_config(
     logger.info("Uploading fleet config to %s", ssh_target)
 
     if not os.path.isfile(local_config_path):
-        raise FileNotFoundError(
-            f"Fleet config not found: {local_config_path}"
-        )
+        raise FileNotFoundError(f"Fleet config not found: {local_config_path}")
 
     remote_dest = "/etc/orcest/config.yaml"
     # SCP as the orcest user to a writable location, then sudo mv into place.
@@ -212,9 +212,7 @@ def upload_fleet_config(
     # Ensure target directory exists on the orchestrator VM
     result = _ssh(ssh_target, "sudo mkdir -p /etc/orcest")
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}")
 
     result = _scp(local_config_path, ssh_target, remote_tmp)
     if result.returncode != 0:
@@ -233,7 +231,8 @@ def upload_fleet_config(
 
 
 def ensure_pool_manager(
-    ssh_target: str, fleet_config_path: str = "/etc/orcest/config.yaml",
+    ssh_target: str,
+    fleet_config_path: str = "/etc/orcest/config.yaml",
 ) -> None:
     """Ensure the pool manager stack is running.
 
@@ -251,9 +250,7 @@ def ensure_pool_manager(
     )
     if result.returncode != 0:
         logger.error("Pool manager failed: %s", result.stderr.strip())
-        raise RuntimeError(
-            f"Failed to start pool manager: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to start pool manager: {result.stderr.strip()}")
     logger.info("Pool manager running on %s", ssh_target)
 
 
@@ -266,16 +263,11 @@ def stop_pool_manager(ssh_target: str) -> None:
     logger.info("Stopping pool manager on %s", ssh_target)
     result = _ssh(
         ssh_target,
-        "cd /opt/orcest && docker compose"
-        " -f docker-compose.pool.yml"
-        " -p orcest-pool"
-        " down",
+        "cd /opt/orcest && docker compose -f docker-compose.pool.yml -p orcest-pool down",
     )
     if result.returncode != 0:
         logger.error("Pool manager stop failed: %s", result.stderr.strip())
-        raise RuntimeError(
-            f"Failed to stop pool manager: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to stop pool manager: {result.stderr.strip()}")
     logger.info("Pool manager stopped on %s", ssh_target)
 
 

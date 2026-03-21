@@ -100,7 +100,9 @@ def _clear_pending_safe(
     except Exception:
         logger.warning(
             "Failed to clear pending marker for %s #%d",
-            resource_type, resource_id, exc_info=True,
+            resource_type,
+            resource_id,
+            exc_info=True,
         )
 
 

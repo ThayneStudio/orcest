@@ -224,7 +224,9 @@ class TestCloneVm:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         upid = client.clone_vm(
-            template_id=100, new_id=200, name="worker-200",
+            template_id=100,
+            new_id=200,
+            name="worker-200",
         )
 
         assert upid == "UPID:pve:00001234:ABCDEF:clone"
@@ -253,8 +255,11 @@ class TestCloneVm:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         client.clone_vm(
-            template_id=100, new_id=200, name="worker-200",
-            storage="local-lvm", linked=False,
+            template_id=100,
+            new_id=200,
+            name="worker-200",
+            storage="local-lvm",
+            linked=False,
         )
 
         mock_clone.post.assert_called_once_with(
@@ -324,7 +329,8 @@ class TestDestroyVm:
         client, mock_api = _make_client()
         mock_api.nodes("pve").qemu(200).delete.return_value = "UPID:pve:destroy"
         mock_api.nodes("pve").tasks("UPID:pve:destroy").status.get.return_value = {
-            "status": "stopped", "exitstatus": "OK",
+            "status": "stopped",
+            "exitstatus": "OK",
         }
         client.destroy_vm(200)
         mock_api.nodes("pve").tasks("UPID:pve:destroy").status.get.assert_called()
@@ -517,11 +523,15 @@ class TestDownloadImage:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         upid = client.download_image(
-            "https://example.com/image.img", "image.img", storage="local",
+            "https://example.com/image.img",
+            "image.img",
+            storage="local",
         )
         assert upid == "UPID:pve:download"
         mock_storage("download-url").post.assert_called_once_with(
-            content="iso", filename="image.img", url="https://example.com/image.img",
+            content="iso",
+            filename="image.img",
+            url="https://example.com/image.img",
         )
 
     def test_custom_content_type(self):
@@ -536,11 +546,15 @@ class TestDownloadImage:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         client.download_image(
-            "https://example.com/disk.qcow2", "disk.qcow2",
-            storage="nfs", content_type="images",
+            "https://example.com/disk.qcow2",
+            "disk.qcow2",
+            storage="nfs",
+            content_type="images",
         )
         mock_storage("download-url").post.assert_called_once_with(
-            content="images", filename="disk.qcow2", url="https://example.com/disk.qcow2",
+            content="images",
+            filename="disk.qcow2",
+            url="https://example.com/disk.qcow2",
         )
 
     @patch("orcest.fleet.proxmox_api.time")
@@ -570,7 +584,10 @@ class TestCreateVm:
 
         client.create_vm(vm_id=200, name="test-vm", memory=2048, cores=2)
         mock_api.nodes("pve").qemu.post.assert_called_once_with(
-            vmid=200, name="test-vm", memory=2048, cores=2,
+            vmid=200,
+            name="test-vm",
+            memory=2048,
+            cores=2,
         )
 
     def test_waits_for_task_when_upid_returned(self):
@@ -592,12 +609,14 @@ class TestCreateVm:
         mock_api.nodes("pve").qemu.post.return_value = None
 
         client.create_vm(
-            vm_id=200, name="test-vm",
+            vm_id=200,
+            name="test-vm",
             scsihw="virtio-scsi-pci",
             scsi0="ssd-pool:0,import-from=local:iso/noble-server-cloudimg-amd64.img",
         )
         mock_api.nodes("pve").qemu.post.assert_called_once_with(
-            vmid=200, name="test-vm",
+            vmid=200,
+            name="test-vm",
             scsihw="virtio-scsi-pci",
             scsi0="ssd-pool:0,import-from=local:iso/noble-server-cloudimg-amd64.img",
         )
@@ -608,7 +627,8 @@ class TestResizeDisk:
         client, mock_api = _make_client()
         client.resize_disk(200, "scsi0", "30G")
         mock_api.nodes("pve").qemu(200).resize.put.assert_called_once_with(
-            disk="scsi0", size="30G",
+            disk="scsi0",
+            size="30G",
         )
 
 
@@ -621,9 +641,9 @@ class TestConvertToTemplate:
 
     def test_waits_for_task_when_upid_returned(self):
         client, mock_api = _make_client()
-        mock_api.nodes("pve").qemu(100).template.post.return_value = (
-            "UPID:pve:00001234:ABCDEF:template"
-        )
+        mock_api.nodes("pve").qemu(
+            100
+        ).template.post.return_value = "UPID:pve:00001234:ABCDEF:template"
 
         # Make wait_for_task succeed
         mock_task_status = MagicMock()
