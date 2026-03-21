@@ -112,10 +112,7 @@ class RedisLock:
         Unlike ``is_held``, this reflects actual Redis state at the moment of
         the call, at the cost of a round-trip.
         """
-        value = self.redis.client.get(self.key)
-        if isinstance(value, bytes):
-            return value.decode() == self.owner
-        return value == self.owner
+        return self.redis.client.get(self.key) == self.owner
 
 
 def make_pr_lock_key(repo: str, pr_number: int) -> str:
