@@ -462,6 +462,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     all_thread_nodes: list[dict] = []
     cursor: str | None = None
     page_count = 0
+    review_threads: dict = {}
 
     while page_count < _MAX_PAGES:
         page_count += 1
@@ -529,7 +530,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             break
     else:
         # Loop exhausted _MAX_PAGES without a natural break.
-        page_info = review_threads.get("pageInfo") or {}  # type: ignore[possibly-undefined]
+        page_info = review_threads.get("pageInfo") or {}
         if page_info.get("hasNextPage"):
             logger.warning(
                 "PR #%d in %s: reached MAX_PAGES (%d) pagination limit; "
