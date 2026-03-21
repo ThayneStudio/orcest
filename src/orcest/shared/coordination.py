@@ -92,7 +92,27 @@ class RedisLock:
 
     @property
     def is_held(self) -> bool:
+        """Advisory flag indicating whether this client believes it holds the lock.
+
+        This reflects client-side state only and does NOT guarantee that the
+        lock is still present in Redis.  The flag becomes stale when the TTL
+        expires without a refresh, or when the process is paused long enough
+        for the key to vanish.  The heartbeat loop in the worker mitigates
+        this in normal operation, but callers that need a hard guarantee should
+        call ``verify()`` instead.
+        """
         return self._held
+
+    def verify(self) -> bool:
+        """Check whether this client still owns the lock in Redis.
+
+        Performs a GET and compares the stored value against our owner token.
+        Returns True only if the key exists *and* its value matches our owner.
+
+        Unlike ``is_held``, this reflects actual Redis state at the moment of
+        the call, at the cost of a round-trip.
+        """
+        return self.redis.client.get(self.key) == self.owner
 
 
 def make_pr_lock_key(repo: str, pr_number: int) -> str:
