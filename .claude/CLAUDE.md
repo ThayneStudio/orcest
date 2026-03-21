@@ -51,7 +51,7 @@ make format
 ## Dashboard
 
 GitHub itself is the dashboard:
-- Labels: `orcest:queued`, `orcest:in-progress`, `orcest:blocked`, `orcest:needs-human`
+- Labels: `orcest:ready`, `orcest:blocked`, `orcest:needs-human`
 - Comments on PRs/issues for status updates
 - `orcest status` CLI for system health
 
