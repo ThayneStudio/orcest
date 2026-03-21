@@ -66,6 +66,13 @@ class DeadLetterEntry:
     timestamp_ms: int | None
     reason: str | None
 
+    def format_timestamp(self) -> str:
+        if self.timestamp_ms is not None:
+            return datetime.fromtimestamp(self.timestamp_ms / 1000, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+        return self.entry_id
+
 
 @dataclass
 class SystemSnapshot:
@@ -600,13 +607,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             dl_table.clear()
             if snapshot.dead_letter_entries:
                 for entry in snapshot.dead_letter_entries:
-                    ts = (
-                        datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
-                            "%Y-%m-%d %H:%M UTC"
-                        )
-                        if entry.timestamp_ms is not None
-                        else entry.entry_id
-                    )
+                    ts = entry.format_timestamp()
                     reason_str = truncate(entry.reason) if entry.reason is not None else "?"
                     dl_table.add_row(
                         ts,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import click
@@ -194,13 +193,7 @@ def _status_once(redis: RedisClient) -> None:
         dl_detail_table.add_column("Resource", style="yellow")
         dl_detail_table.add_column("Reason", style="red")
         for entry in snapshot.dead_letter_entries:
-            ts = (
-                datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M UTC"
-                )
-                if entry.timestamp_ms is not None
-                else entry.entry_id
-            )
+            ts = entry.format_timestamp()
             dl_detail_table.add_row(
                 ts,
                 entry.task_type,
