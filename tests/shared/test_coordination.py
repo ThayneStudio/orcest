@@ -118,6 +118,40 @@ def test_context_manager_releases_on_exception(fake_redis_client):
     assert RedisLock(fake_redis_client, "test-lock").acquire() is True
 
 
+def test_verify_returns_true_when_lock_held(fake_redis_client):
+    """verify() returns True when this client owns the lock in Redis."""
+    lock = RedisLock(fake_redis_client, "test-lock")
+    lock.acquire()
+    assert lock.verify() is True
+
+
+def test_verify_returns_false_after_release(fake_redis_client):
+    """verify() returns False once the lock has been released."""
+    lock = RedisLock(fake_redis_client, "test-lock")
+    lock.acquire()
+    lock.release()
+    assert lock.verify() is False
+
+
+def test_verify_returns_false_for_non_owner(fake_redis_client):
+    """verify() returns False when another client holds the lock."""
+    lock1 = RedisLock(fake_redis_client, "test-lock", owner="owner-1")
+    lock2 = RedisLock(fake_redis_client, "test-lock", owner="owner-2")
+    lock1.acquire()
+    assert lock2.verify() is False
+
+
+def test_verify_returns_false_when_key_expired(fake_redis_client):
+    """verify() returns False when the Redis key no longer exists (simulated expiry)."""
+    lock = RedisLock(fake_redis_client, "test-lock")
+    lock.acquire()
+    # Manually delete the key to simulate TTL expiry.
+    fake_redis_client.client.delete(lock.key)
+    # is_held is still True (advisory/stale), but verify() reflects reality.
+    assert lock.is_held is True
+    assert lock.verify() is False
+
+
 def test_compute_pending_task_ttl_uses_runner_values():
     """compute_pending_task_ttl returns timeout × max_retries + 300."""
     rc = RunnerConfig(timeout=1800, max_retries=3)
