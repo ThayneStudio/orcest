@@ -148,7 +148,7 @@ class PoolManager:
 
         # Move idle VMs to active if their consumer has pending entries
         # Batch all transitions into a single pipeline
-        now = time.monotonic()
+        now = time.time()
         transitions: list[int] = []
         for member in idle_members:
             member_str = str(member)
@@ -356,7 +356,7 @@ class PoolManager:
         if not active:
             return
 
-        now = time.monotonic()
+        now = time.time()
         max_duration = self._pool.max_task_duration
 
         for vm_id_str, start_ts_str in active.items():
@@ -371,7 +371,7 @@ class PoolManager:
                 )
                 continue
 
-            elapsed = now - start_ts
+            elapsed = max(0.0, now - start_ts)
             if elapsed > max_duration:
                 logger.warning(
                     "VM %d exceeded max task duration (%.0fs > %ds), force-destroying",

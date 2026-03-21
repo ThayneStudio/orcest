@@ -481,7 +481,7 @@ class TestDetectActiveWorkers:
         redis.pipeline.return_value = pipe
 
         with patch("orcest.fleet.pool_manager.time") as mock_time:
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
             manager._detect_active_workers()
 
         pipe.srem.assert_called_once_with("pool:idle", "300")
@@ -535,7 +535,7 @@ class TestDetectActiveWorkers:
         redis.pipeline.return_value = pipe
 
         with patch("orcest.fleet.pool_manager.time") as mock_time:
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
             manager._detect_active_workers()
 
         # Only VM 300 should be moved, the invalid member skipped
@@ -694,7 +694,7 @@ class TestHealthCheck:
     def test_healthy_worker_not_destroyed(self, mock_time):
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
-        mock_time.monotonic.return_value = 10000.0
+        mock_time.time.return_value = 10000.0
         redis.hgetall.return_value = {"300": str(10000.0 - 100)}
 
         manager._health_check()
@@ -708,7 +708,8 @@ class TestHealthCheck:
         manager, proxmox, redis = _make_manager(config=config)
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
-        mock_time.monotonic.side_effect = [10000.0, 0, 100]
+        mock_time.time.return_value = 10000.0
+        mock_time.monotonic.side_effect = [0, 100]
         redis.hgetall.return_value = {"300": str(10000.0 - 4000)}
 
         manager._health_check()
@@ -722,7 +723,8 @@ class TestHealthCheck:
         manager, proxmox, redis = _make_manager(config=config)
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
-        mock_time.monotonic.side_effect = [10000.0, 0, 100]
+        mock_time.time.return_value = 10000.0
+        mock_time.monotonic.side_effect = [0, 100]
         redis.hgetall.return_value = {
             "300": str(10000.0 - 100),  # healthy
             "301": str(10000.0 - 5000),  # expired
@@ -754,7 +756,8 @@ class TestHealthCheck:
         """Invalid entries are skipped but valid expired entries are still destroyed."""
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
-        mock_time.monotonic.side_effect = [10000.0, 0, 100]  # health_check now + _destroy_vm
+        mock_time.time.return_value = 10000.0
+        mock_time.monotonic.side_effect = [0, 100]  # _destroy_vm stop-wait
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
 
@@ -781,7 +784,7 @@ class TestHealthCheck:
         """A VM at exactly max_task_duration should not be destroyed (> not >=)."""
         config = _make_config(max_task_duration=3600)
         manager, proxmox, redis = _make_manager(config=config)
-        mock_time.monotonic.return_value = 10000.0
+        mock_time.time.return_value = 10000.0
 
         # elapsed = 10000 - 6400 = 3600, which is NOT > 3600
         redis.hgetall.return_value = {"300": "6400.0"}
@@ -814,7 +817,8 @@ class TestHealthCheck:
             return []
 
         pipe.execute.side_effect = pipeline_execute_side_effect
-        mock_time.monotonic.side_effect = [10000.0, 0, 100, 0, 100]
+        mock_time.time.return_value = 10000.0
+        mock_time.monotonic.side_effect = [0, 100, 0, 100]
 
         # Should not raise
         manager._health_check()
