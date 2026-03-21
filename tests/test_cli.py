@@ -244,6 +244,7 @@ def test_status_once_wrongtype_results_key_shows_zero(fake_redis_client):
     output = buf.getvalue()
     # fetch_snapshot catches the ResponseError and returns results_depth=0
     assert "results" in output
+    assert "0" in output  # ResponseError → results_depth=0
     assert "Orcest System Status" in output
 
 
