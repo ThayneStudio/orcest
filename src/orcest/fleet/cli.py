@@ -740,12 +740,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print("  Stack deployed [green]ok[/green]")
     except Exception as exc:
         console.print(f"  Deploy stack [red]failed[/red]: {exc}")
-        console.print(
-            "  [yellow]Config saved with project entry. To retry, run:[/yellow]\n"
-            f"  [yellow]  orcest fleet destroy {project_name} --yes && "
-            f"orcest fleet onboard {repo}[/yellow]"
-        )
-        save_config(cfg, config)
+        cfg.projects = [p for p in cfg.projects if p.name != project_name]
         sys.exit(1)
 
     save_config(cfg, config)
