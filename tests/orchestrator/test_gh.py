@@ -161,7 +161,7 @@ def test_get_ci_status_returns_failed_checks(mocker):
 
 
 def test_add_label_calls_correct_args(mocker):
-    """add_label passes --add-label with the correct gh pr edit args."""
+    """add_label uses the REST API to add a label."""
     mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="", stderr=""),
@@ -170,14 +170,9 @@ def test_add_label_calls_correct_args(mocker):
 
     args_passed = mock_run.call_args[0][0]
     assert args_passed[0] == "gh"
-    assert "pr" in args_passed
-    assert "edit" in args_passed
-    assert "--add-label" in args_passed
-    label_idx = args_passed.index("--add-label")
-    assert args_passed[label_idx + 1] == "orcest:queued"
-    assert "--repo" in args_passed
-    repo_idx = args_passed.index("--repo")
-    assert args_passed[repo_idx + 1] == REPO
+    assert "api" in args_passed
+    assert f"repos/{REPO}/issues/7/labels" in args_passed
+    assert "labels[]=orcest:queued" in args_passed
 
 
 # ---------------------------------------------------------------------------

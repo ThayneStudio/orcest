@@ -328,44 +328,31 @@ def get_failed_run_logs(repo: str, run_id: int, token: str) -> str:
 
 
 def add_label(repo: str, number: int, label: str, token: str) -> None:
-    """Add a label to a PR/issue."""
+    """Add a label to a PR/issue via REST API.
+
+    Uses the REST API instead of ``gh pr edit --add-label`` because the
+    GraphQL mutation behind ``gh edit`` requires ``read:org`` scope on
+    classic PATs.
+    """
     _validate_repo(repo)
     _run_gh(
-        [
-            "pr",
-            "edit",
-            str(number),
-            "--repo",
-            repo,
-            "--add-label",
-            label,
-        ],
+        ["api", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={label}"],
         token,
     )
 
 
 def remove_label(repo: str, number: int, label: str, token: str) -> None:
-    """Remove a label from a PR/issue. Silently succeeds if not present."""
+    """Remove a label from a PR/issue via REST API. Silently succeeds if not present."""
     _validate_repo(repo)
     try:
         _run_gh(
-            [
-                "pr",
-                "edit",
-                str(number),
-                "--repo",
-                repo,
-                "--remove-label",
-                label,
-            ],
+            ["api", f"repos/{repo}/issues/{number}/labels/{label}", "-X", "DELETE"],
             token,
         )
     except GhCliError as exc:
-        # gh pr edit --remove-label exits non-zero when the label isn't
-        # present. We swallow that specific case but re-raise others.
         if "not found" in (exc.stderr or "").lower():
             logger.debug(
-                "remove_label: label %r not on PR #%d, ignoring",
+                "remove_label: label %r not on #%d, ignoring",
                 label,
                 number,
             )
@@ -686,36 +673,20 @@ def get_issue(repo: str, number: int, token: str) -> dict:
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:
-    """Add a label to an issue."""
+    """Add a label to an issue via REST API."""
     _validate_repo(repo)
     _run_gh(
-        [
-            "issue",
-            "edit",
-            str(number),
-            "--repo",
-            repo,
-            "--add-label",
-            label,
-        ],
+        ["api", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={label}"],
         token,
     )
 
 
 def remove_issue_label(repo: str, number: int, label: str, token: str) -> None:
-    """Remove a label from an issue. Silently succeeds if not present."""
+    """Remove a label from an issue via REST API. Silently succeeds if not present."""
     _validate_repo(repo)
     try:
         _run_gh(
-            [
-                "issue",
-                "edit",
-                str(number),
-                "--repo",
-                repo,
-                "--remove-label",
-                label,
-            ],
+            ["api", f"repos/{repo}/issues/{number}/labels/{label}", "-X", "DELETE"],
             token,
         )
     except GhCliError as exc:
