@@ -326,7 +326,8 @@ class TestCloneAndBoot:
             linked=True,
         )
         proxmox.set_vm_network.assert_called_once_with(
-            300, mac="02:4F:52:00:01:2C",
+            300,
+            mac="02:4F:52:00:01:2C",
         )
         proxmox.start_vm.assert_called_once_with(300)
         proxmox.get_vm_ip.assert_called_once_with(300)
@@ -1088,9 +1089,7 @@ class TestReconcile:
         manager, proxmox, redis = _make_manager()
 
         with (
-            patch.object(
-                manager, "_check_done_workers", return_value=[]
-            ) as mock_done,
+            patch.object(manager, "_check_done_workers", return_value=[]) as mock_done,
             patch.object(manager, "_detect_active_workers") as mock_detect,
             patch.object(manager, "_fill_pool") as mock_fill,
             patch.object(manager, "_health_check") as mock_health,
@@ -1107,9 +1106,7 @@ class TestReconcile:
     def test_error_does_not_crash(self):
         manager, proxmox, redis = _make_manager()
 
-        with patch.object(
-            manager, "_check_done_workers", side_effect=Exception("Redis down")
-        ):
+        with patch.object(manager, "_check_done_workers", side_effect=Exception("Redis down")):
             # Should not raise
             manager.reconcile()
 
@@ -1158,9 +1155,7 @@ class TestReconcile:
         manager, proxmox, redis = _make_manager()
 
         with (
-            patch.object(
-                manager, "_check_done_workers", side_effect=RuntimeError("boom")
-            ),
+            patch.object(manager, "_check_done_workers", side_effect=RuntimeError("boom")),
             patch("orcest.fleet.pool_manager.logger") as mock_logger,
         ):
             manager.reconcile()
@@ -1269,5 +1264,6 @@ class TestFullCycle:
         )
         # Deterministic MAC assigned before boot
         proxmox.set_vm_network.assert_called_once_with(
-            300, mac="02:4F:52:00:01:2C",
+            300,
+            mac="02:4F:52:00:01:2C",
         )

@@ -105,9 +105,7 @@ class PoolManager:
                 self._redis.delete(key)
                 continue
 
-            logger.info(
-                "Worker %s (VM %d) reported done, destroying", worker_id, vm_id
-            )
+            logger.info("Worker %s (VM %d) reported done, destroying", worker_id, vm_id)
             # _destroy_vm handles all exceptions internally (Proxmox and
             # Redis failures are logged and swallowed).  Any partial
             # failure is recovered by _reconcile_orphans (Proxmox side)
@@ -141,9 +139,7 @@ class PoolManager:
                 if group.get("name") != _CONSUMER_GROUP:
                     continue
                 try:
-                    consumers = self._redis.xinfo_consumers(
-                        stream_name, _CONSUMER_GROUP
-                    )
+                    consumers = self._redis.xinfo_consumers(stream_name, _CONSUMER_GROUP)
                 except Exception:
                     continue
                 for consumer in consumers:
@@ -279,9 +275,7 @@ class PoolManager:
         new_id = self._next_vm_id()
         name = self._vm_id_to_worker_id(new_id)
 
-        logger.info(
-            "Cloning VM %d from template %d (name=%s)", new_id, template_id, name
-        )
+        logger.info("Cloning VM %d from template %d (name=%s)", new_id, template_id, name)
 
         try:
             self._proxmox.clone_vm(
@@ -291,9 +285,7 @@ class PoolManager:
                 linked=True,
             )
         except Exception:
-            logger.error(
-                "Failed to clone VM %d, attempting cleanup", new_id, exc_info=True
-            )
+            logger.error("Failed to clone VM %d, attempting cleanup", new_id, exc_info=True)
             # clone_vm may have partially created the VM before failing
             # (e.g. Proxmox task timeout after clone completed).  Best-effort
             # cleanup to avoid orphaned VMs in Proxmox.
@@ -309,9 +301,7 @@ class PoolManager:
             mac = mac_for_vm_id(new_id)
             self._proxmox.set_vm_network(new_id, mac=mac)
         except Exception:
-            logger.error(
-                "Failed to set MAC on VM %d, destroying", new_id, exc_info=True
-            )
+            logger.error("Failed to set MAC on VM %d, destroying", new_id, exc_info=True)
             self._destroy_vm(new_id)
             return None
 
@@ -323,12 +313,12 @@ class PoolManager:
                 worker_id=name,
             )
             self._proxmox.set_cloud_init_userdata(
-                new_id, userdata, storage=self._pool.snippet_storage,
+                new_id,
+                userdata,
+                storage=self._pool.snippet_storage,
             )
         except Exception:
-            logger.error(
-                "Failed to set cloud-init on VM %d, destroying", new_id, exc_info=True
-            )
+            logger.error("Failed to set cloud-init on VM %d, destroying", new_id, exc_info=True)
             self._destroy_vm(new_id)
             return None
 
@@ -342,9 +332,7 @@ class PoolManager:
                 self._destroy_vm(new_id)
                 return None
         except Exception:
-            logger.error(
-                "Failed to boot VM %d, destroying clone", new_id, exc_info=True
-            )
+            logger.error("Failed to boot VM %d, destroying clone", new_id, exc_info=True)
             self._destroy_vm(new_id)
             return None
 
@@ -353,8 +341,7 @@ class PoolManager:
             self._redis.sadd(_POOL_IDLE_KEY, str(new_id))
         except Exception:
             logger.error(
-                "Failed to add VM %d to idle pool in Redis, destroying to "
-                "avoid orphan",
+                "Failed to add VM %d to idle pool in Redis, destroying to avoid orphan",
                 new_id,
                 exc_info=True,
             )
@@ -413,9 +400,7 @@ class PoolManager:
         try:
             proxmox_vms = self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX)
         except Exception:
-            logger.warning(
-                "Failed to list VMs for orphan reconciliation", exc_info=True
-            )
+            logger.warning("Failed to list VMs for orphan reconciliation", exc_info=True)
             return
 
         idle_members = self._redis.smembers(_POOL_IDLE_KEY)
@@ -439,8 +424,7 @@ class PoolManager:
 
             if vm_id not in tracked_vm_ids:
                 logger.warning(
-                    "Orphaned VM %d (%s) found in Proxmox but not tracked"
-                    " in Redis, destroying",
+                    "Orphaned VM %d (%s) found in Proxmox but not tracked in Redis, destroying",
                     vm_id,
                     vm_info.get("name", "unknown"),
                 )
@@ -595,7 +579,7 @@ class PoolManager:
     def _worker_id_to_vm_id(worker_id: str) -> int | None:
         """Extract VM ID from worker ID (e.g. 'orcest-worker-300' -> 300)."""
         if worker_id.startswith(_VM_NAME_PREFIX):
-            suffix = worker_id[len(_VM_NAME_PREFIX):]
+            suffix = worker_id[len(_VM_NAME_PREFIX) :]
             try:
                 return int(suffix)
             except ValueError:

@@ -237,9 +237,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                     redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
                 except Exception:
                     logger.warning("Failed to set pool:done key", exc_info=True)
-                logger.info(
-                    "Ephemeral mode: dead-lettered task, shutting down."
-                )
+                logger.info("Ephemeral mode: dead-lettered task, shutting down.")
                 shutdown = True
                 shutdown_event.set()
             continue
@@ -320,7 +318,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         # Publish result with retry + dead-letter fallback; ACK only on success.
         published = _publish_result_with_retry(
-            redis, result, task, logger, current_stream, entry_id,
+            redis,
+            result,
+            task,
+            logger,
+            current_stream,
+            entry_id,
         )
 
         if published:
@@ -462,9 +465,7 @@ def _drain_pending_tasks(
             # since the orchestrator never learns the task ended.
             if task is not None:
                 try:
-                    clear_pending_task(
-                        redis, task.repo, task.resource_type, task.resource_id
-                    )
+                    clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
                 except Exception:
                     logger.warning(
                         "Failed to clear pending task marker for "

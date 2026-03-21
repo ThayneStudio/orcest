@@ -501,9 +501,7 @@ def test_xinfo_consumers_returns_consumer_list(fake_redis_client):
     group = "test-group"
     fake_redis_client.ensure_consumer_group(stream, group)
     fake_redis_client.xadd(stream, {"k": "v"})
-    fake_redis_client.xreadgroup(
-        group=group, consumer="c1", stream=stream, block_ms=None
-    )
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
 
     consumers = fake_redis_client.xinfo_consumers(stream, group)
     assert isinstance(consumers, list)
@@ -542,9 +540,7 @@ def test_hash_operations_use_prefixed_keys(fake_redis_client):
     fake_redis_client.hset("myhash", "f1", "v1")
 
     # Direct client check to verify prefix
-    raw_val = fake_redis_client.client.hget(
-        fake_redis_client._prefix + "myhash", "f1"
-    )
+    raw_val = fake_redis_client.client.hget(fake_redis_client._prefix + "myhash", "f1")
     assert raw_val == "v1"
 
     # hlen via wrapper
@@ -612,9 +608,7 @@ def test_pipeline_uses_prefixed_keys(fake_redis_client):
     pipe.execute()
 
     # Verify the key is stored with the prefix
-    raw_members = fake_redis_client.client.smembers(
-        fake_redis_client._prefix + "myset"
-    )
+    raw_members = fake_redis_client.client.smembers(fake_redis_client._prefix + "myset")
     assert "a" in raw_members
 
 
@@ -636,12 +630,7 @@ def test_pipeline_delete_chaining(fake_redis_client):
     """Pipeline delete returns self for fluent chaining."""
     fake_redis_client.sadd("myset", "a")
 
-    result = (
-        fake_redis_client.pipeline()
-        .delete("myset")
-        .sadd("myset", "b")
-        .execute()
-    )
+    result = fake_redis_client.pipeline().delete("myset").sadd("myset", "b").execute()
     assert isinstance(result, list)
     assert fake_redis_client.smembers("myset") == {"b"}
 
