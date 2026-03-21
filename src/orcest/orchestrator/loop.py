@@ -512,14 +512,16 @@ def _poll_cycle(
                             pr_state.number,
                             e,
                         )
+                # Always set cooldown after attempting — prevents a busy retry
+                # loop if the run can't be cancelled or immediately rerun.
+                set_stale_retrigger_sha(
+                    redis,
+                    config.github.repo,
+                    pr_state.number,
+                    pr_state.head_sha,
+                    ex=config.stale_pending_timeout_seconds,
+                )
                 if any_cancel_succeeded:
-                    set_stale_retrigger_sha(
-                        redis,
-                        config.github.repo,
-                        pr_state.number,
-                        pr_state.head_sha,
-                        ex=config.stale_pending_timeout_seconds,
-                    )
                     try:
                         gh.post_comment(
                             config.github.repo,
