@@ -73,8 +73,10 @@ _ENV_WHITELIST: set[str] = {
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
     # Claude CLI auth
+    # Note: CLAUDE_CODE_OAUTH_TOKEN is intentionally excluded — it is a
+    # per-task credential injected explicitly via the claude_token parameter,
+    # not inherited from the parent process environment.
     "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 }
@@ -276,7 +278,9 @@ def run_claude(
         env_keys = sorted(env.keys())
         logger.info(
             "Launching Claude: cwd=%s, timeout=%ds, env_vars=%s",
-            work_dir, timeout, env_keys,
+            work_dir,
+            timeout,
+            env_keys,
         )
 
     start_time = time.monotonic()

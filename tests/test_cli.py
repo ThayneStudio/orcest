@@ -1,6 +1,7 @@
 """Tests for the orcest CLI entry points (src/orcest/cli.py)."""
 
 import io
+import re
 from unittest.mock import MagicMock, patch
 
 import click
@@ -243,7 +244,11 @@ def test_status_once_wrongtype_results_key_shows_zero(fake_redis_client):
 
     output = buf.getvalue()
     # fetch_snapshot catches the ResponseError and returns results_depth=0
-    assert "results" in output
+    # Assert the results row in the table specifically shows 0, not just that "0"
+    # appears somewhere in the output.
+    assert re.search(r"│\s*results\s*│\s*0\b", output), (
+        "Expected 'results' table row to show depth 0, got:\n" + output
+    )
     assert "Orcest System Status" in output
 
 

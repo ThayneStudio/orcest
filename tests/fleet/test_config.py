@@ -194,15 +194,7 @@ class TestConfigPersistence:
     def test_load_legacy_config_without_pool(self, tmp_path):
         """Old configs without pool section get correct defaults."""
         path = tmp_path / "config.yaml"
-        path.write_text(
-            yaml.dump(
-                {
-                    "projects": [
-                        {"name": "old", "repo": "O/old"}
-                    ]
-                }
-            )
-        )
+        path.write_text(yaml.dump({"projects": [{"name": "old", "repo": "O/old"}]}))
         cfg = load_config(path)
         assert cfg.pool.size == 4
         assert cfg.pool.template_vm_id == 0

@@ -1282,9 +1282,7 @@ def test_transient_retries_counted_separately(gh_mock, fake_redis_client):
             redis=fake_redis_client,
             default_runner="claude",
         )
-        count = get_transient_attempt_count(
-            fake_redis_client, "test-org/test-repo", 902, "abc123"
-        )
+        count = get_transient_attempt_count(fake_redis_client, "test-org/test-repo", 902, "abc123")
         assert count == expected_count
 
 
