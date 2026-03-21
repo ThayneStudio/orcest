@@ -1297,7 +1297,11 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # writes (commit=30 in the Ubuntu cloud image fstab), which corrupts
     # the venv and other recently-written files on ZFS-backed storage.
     console.print("  Syncing filesystem...", end=" ")
-    _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
+    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
+    if result.returncode != 0:
+        console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        _cleanup_vm()
+        sys.exit(1)
     console.print("[green]ok[/green]")
 
     console.print("  Shutting down VM...", end=" ")
