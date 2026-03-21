@@ -120,14 +120,19 @@ def _ensure_ssh_agent() -> dict[str, str]:
 
     # Check if an agent is already usable
     check = subprocess.run(
-        ["ssh-add", "-l"], capture_output=True, text=True, env=env,
+        ["ssh-add", "-l"],
+        capture_output=True,
+        text=True,
+        env=env,
     )
     if check.returncode == 0:
         return env  # agent running with keys
 
     # Start a new agent
     result = subprocess.run(
-        ["ssh-agent", "-s"], capture_output=True, text=True,
+        ["ssh-agent", "-s"],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         logger.warning("Could not start ssh-agent: %s", result.stderr)
@@ -143,7 +148,10 @@ def _ensure_ssh_agent() -> dict[str, str]:
 
     # Load default key
     add = subprocess.run(
-        ["ssh-add"], capture_output=True, text=True, env=env,
+        ["ssh-add"],
+        capture_output=True,
+        text=True,
+        env=env,
     )
     if add.returncode != 0:
         logger.warning("ssh-add failed: %s", add.stderr)

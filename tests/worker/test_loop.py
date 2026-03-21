@@ -1103,9 +1103,7 @@ class TestRunWorker:
         ]
         assert len(dl_calls) == 1, "expected exactly one dead-letter entry"
 
-    def test_worker_dead_letter_clears_pending_marker(
-        self, mocker, worker_config, sample_task
-    ):
+    def test_worker_dead_letter_clears_pending_marker(self, mocker, worker_config, sample_task):
         """When a task is dead-lettered, the pending-task marker is cleared so
         the orchestrator can re-enqueue work for the resource immediately
         rather than waiting ~95 min for marker TTL expiry."""
@@ -1282,9 +1280,7 @@ class TestRunWorker:
             mock_redis, sample_task.repo, sample_task.resource_type, sample_task.resource_id
         )
 
-    def test_ephemeral_worker_exits_on_runner_failure(
-        self, mocker, worker_config, sample_task
-    ):
+    def test_ephemeral_worker_exits_on_runner_failure(self, mocker, worker_config, sample_task):
         """Ephemeral worker exits and sets pool:done even when the runner fails."""
         worker_config.ephemeral = True
         mock_redis = self._build_mock_redis()

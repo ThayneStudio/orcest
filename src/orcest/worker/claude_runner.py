@@ -275,7 +275,9 @@ def run_claude(
         env_keys = sorted(env.keys())
         logger.info(
             "Launching Claude: cwd=%s, timeout=%ds, env_vars=%s",
-            work_dir, timeout, env_keys,
+            work_dir,
+            timeout,
+            env_keys,
         )
 
     start_time = time.monotonic()
