@@ -905,24 +905,24 @@ def _handle_result(
         # Clear the per-SHA attempt counter so the PR can be re-enqueued once
         # the cooldown expires. The total-attempts counter is intentionally
         # preserved as a circuit-breaker across rate-limit cycles.
-        attempts_cleared = False
+        cooldown_set = False
         try:
-            clear_attempts(redis, repo, resource_id)
-            attempts_cleared = True
+            set_usage_exhausted_cooldown(redis, repo, resource_id)
+            cooldown_set = True
         except Exception as e:
             logger.error(
-                f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
-                f"after USAGE_EXHAUSTED: {e}",
+                f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
                 exc_info=True,
             )
-        # Only set the cooldown when the attempt counter was actually cleared;
-        # otherwise the PR will re-stall after the cooldown expires.
-        if attempts_cleared:
+        # Only clear the per-SHA attempt counter once the cooldown is confirmed;
+        # otherwise the PR would be immediately re-enqueued with no rate-limit protection.
+        if cooldown_set:
             try:
-                set_usage_exhausted_cooldown(redis, repo, resource_id)
+                clear_attempts(redis, repo, resource_id)
             except Exception as e:
                 logger.error(
-                    f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
+                    f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
+                    f"after USAGE_EXHAUSTED: {e}",
                     exc_info=True,
                 )
 
