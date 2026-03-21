@@ -293,6 +293,7 @@ def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess[str]
         ["ssh", *_SSH_OPTS, ssh_target, cmd],
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
 
