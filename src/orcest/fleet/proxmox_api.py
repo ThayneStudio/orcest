@@ -398,7 +398,7 @@ class ProxmoxClient:
             timeout=15,
         )
         if result.returncode != 0:
-            logger.debug("SSH snippet write failed: %s", result.stderr.strip())
+            logger.warning("SSH snippet write failed: %s", result.stderr.strip())
             return False
 
         # Set cicustom on the VM
