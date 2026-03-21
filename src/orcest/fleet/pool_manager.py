@@ -148,7 +148,7 @@ class PoolManager:
 
         # Move idle VMs to active if their consumer has pending entries
         # Batch all transitions into a single pipeline
-        now = time.time()
+        now = time.monotonic()
         transitions: list[int] = []
         for member in idle_members:
             member_str = str(member)
@@ -356,7 +356,7 @@ class PoolManager:
         if not active:
             return
 
-        now = time.time()
+        now = time.monotonic()
         max_duration = self._pool.max_task_duration
 
         for vm_id_str, start_ts_str in active.items():
