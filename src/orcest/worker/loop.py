@@ -220,26 +220,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             f"for {task.resource_type} #{task.resource_id}"
         )
 
-        # Dead-letter guard: if this entry has been delivered too many times
-        # (result-publish failures leaving it unACKed), route it to the
-        # dead-letter stream instead of running Claude again.
-        delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
-        if delivery_count >= MAX_DELIVERY_COUNT:
-            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
-            if config.ephemeral:
-                # Ephemeral workers must exit after encountering any task,
-                # including dead-lettered ones.  Without this the worker
-                # would loop indefinitely on an empty queue until the pool
-                # manager's SIGTERM timeout fires, wasting a VM slot.
-                try:
-                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
-                except Exception:
-                    logger.warning("Failed to set pool:done key", exc_info=True)
-                logger.info("Ephemeral mode: dead-lettered task, shutting down.")
-                shutdown = True
-                shutdown_event.set()
-            continue
-
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
             lock_key = make_issue_lock_key(task.repo, task.resource_id)
@@ -263,6 +243,27 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             continue
 
         logger.info(f"Acquired lock {lock_key}")
+
+        # Dead-letter guard: if this entry has been delivered too many times
+        # (result-publish failures leaving it unACKed), route it to the
+        # dead-letter stream instead of running Claude again.
+        delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
+        if delivery_count >= MAX_DELIVERY_COUNT:
+            lock.release()
+            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
+            if config.ephemeral:
+                # Ephemeral workers must exit after encountering any task,
+                # including dead-lettered ones.  Without this the worker
+                # would loop indefinitely on an empty queue until the pool
+                # manager's SIGTERM timeout fires, wasting a VM slot.
+                try:
+                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
+                except Exception:
+                    logger.warning("Failed to set pool:done key", exc_info=True)
+                logger.info("Ephemeral mode: dead-lettered task, shutting down.")
+                shutdown = True
+                shutdown_event.set()
+            continue
 
         # Start heartbeat; signal lock_lost if the lock cannot be refreshed.
         # LOCK_TTL = 3 * HEARTBEAT_INTERVAL so the lock survives up to 2 missed
