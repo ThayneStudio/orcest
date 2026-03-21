@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import time
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +463,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     all_thread_nodes: list[dict] = []
     cursor: str | None = None
     page_count = 0
-    review_threads: dict = {}
+    review_threads: dict[str, Any] = {}
 
     while page_count < _MAX_PAGES:
         page_count += 1
