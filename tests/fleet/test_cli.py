@@ -383,7 +383,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-orchestrator", "--storage", "local-lvm", "--config", cfg_path],
+        ["create-orchestrator", "--vm-id", "199", "--storage", "local-lvm", "--config", cfg_path],
     )
     assert result.exit_code == 0, result.output
     assert "10.20.0.99" in result.output
@@ -411,7 +411,7 @@ def test_create_orchestrator_ssh_timeout(runner, cfg_path, mocker):
 
     result = runner.invoke(
         fleet,
-        ["create-orchestrator", "--storage", "local-lvm", "--config", cfg_path],
+        ["create-orchestrator", "--vm-id", "199", "--storage", "local-lvm", "--config", cfg_path],
     )
     assert result.exit_code != 0
 
@@ -516,6 +516,7 @@ def test_create_template_success(runner, cfg_path, mocker):
     result = runner.invoke(
         fleet,
         ["create-template", "--vm-id", "200", "--config", cfg_path],
+        input="\n",
     )
     assert result.exit_code == 0, result.output
     assert "Worker template created" in result.output
@@ -548,11 +549,11 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
         return_value=mocker.MagicMock(returncode=0),
     )
 
-    # Accept default template VM ID
+    # Accept defaults for template VM ID and worker VM ID range start
     result = runner.invoke(
         fleet,
         ["create-template", "--config", cfg_path],
-        input="\n",
+        input="\n\n",
     )
     assert result.exit_code == 0, result.output
     assert "VM ID for new template" in result.output
