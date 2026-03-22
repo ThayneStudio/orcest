@@ -23,7 +23,6 @@ from orcest.worker.loop import (
     MAX_DELIVERY_COUNT,
     RESULTS_STREAM,
     _check_gh_credentials,
-    _clear_pending_task_for_task,
     _dead_letter_task,
     _execute_task,
     _make_abort_event,
@@ -1395,7 +1394,9 @@ class TestRunWorker:
         # Worker exited after one task (no second xreadgroup for normal tasks)
         assert normal_call_count == 1
 
-    @pytest.mark.skip(reason="Dead-letter now happens before lock acquisition; test needs redesign per issue #398")
+    @pytest.mark.skip(
+        reason="Dead-letter now happens before lock acquisition; test needs redesign per issue #398"
+    )
     def test_ephemeral_worker_releases_lock_before_shutdown_on_dead_letter(
         self, mocker, worker_config, sample_task
     ):

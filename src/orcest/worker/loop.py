@@ -178,10 +178,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     key_prefixes = config.key_prefixes or [config.redis.key_prefix]
     pr_fq_streams, issue_fq_streams = _build_stream_names(key_prefixes, config.backend)
 
-    # Legacy single-prefix stream names (used for backward-compatible drain)
-    pr_tasks_stream = f"tasks:{config.backend}"
-    issue_tasks_stream = f"tasks:issue:{config.backend}"
-
     # Verify Redis connection
     if not redis.health_check():
         logger.error("Cannot connect to Redis. Exiting.")
@@ -406,7 +402,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # re-enqueue if needed (belt-and-suspenders with the orchestrator's
             # clear in _handle_result).
             try:
-                resource_type = task.resource_type
                 _clear_pending_task_for_task(redis, task)
             except Exception:
                 logger.warning(
@@ -595,9 +590,13 @@ def _drain_pending_tasks_raw(
                     # Publish result to the correct project's results stream
                     if task.key_prefix:
                         fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                        redis.xadd_capped_raw(fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                        redis.xadd_capped_raw(
+                            fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                        )
                     else:
-                        redis.xadd_capped(RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                        redis.xadd_capped(
+                            RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                        )
                 except Exception:
                     logger.error(
                         f"Failed to publish recovery result for task {task.id}",
