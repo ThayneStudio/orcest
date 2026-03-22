@@ -137,14 +137,14 @@ class PoolManager:
         active_consumers: set[str] = set()
         for stream_name in self._task_streams():
             try:
-                groups = self._redis.xinfo_groups(stream_name)
+                groups = self._redis.xinfo_groups_raw(stream_name)
             except Exception:
                 continue
             for group in groups:
                 if group.get("name") != _CONSUMER_GROUP:
                     continue
                 try:
-                    consumers = self._redis.xinfo_consumers(stream_name, _CONSUMER_GROUP)
+                    consumers = self._redis.xinfo_consumers_raw(stream_name, _CONSUMER_GROUP)
                 except Exception:
                     continue
                 for consumer in consumers:
@@ -558,19 +558,16 @@ class PoolManager:
     # ── helpers ──────────────────────────────────────────────
 
     def _task_streams(self) -> tuple[str, ...]:
-        """Build task stream names from the projects list."""
+        """Build fully-qualified task stream names from the projects list."""
         streams: list[str] = []
-        for project in self._projects:
-            streams.append("tasks:claude")
-            streams.append("tasks:issue:claude")
-        # Deduplicate while preserving order
         seen: set[str] = set()
-        result: list[str] = []
-        for s in streams:
-            if s not in seen:
-                seen.add(s)
-                result.append(s)
-        return tuple(result)
+        for project in self._projects:
+            for suffix in ("tasks:claude", "tasks:issue:claude"):
+                fq = f"{project}:{suffix}"
+                if fq not in seen:
+                    seen.add(fq)
+                    streams.append(fq)
+        return tuple(streams)
 
     def _next_vm_id(self) -> int:
         """Allocate the next VM ID from the configured pool range.

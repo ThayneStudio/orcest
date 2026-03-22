@@ -786,12 +786,12 @@ def _execute_task(
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
-        # Setup workspace
+        # Setup workspace. For REBASE_PR tasks, skip auto-rebase — Claude
+        # handles the rebase itself (including conflict resolution).
+        # For REBASE_PR tasks, skip auto-rebase — Claude handles it itself.
+        base_branch = None if task.type == TaskType.REBASE_PR else task.base_branch
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
-        # For REBASE_PR tasks, skip the automatic rebase so Claude can resolve
-        # conflicts itself — the task prompt instructs Claude to rebase.
-        setup_base_branch = None if task.type == TaskType.REBASE_PR else task.base_branch
-        work_dir = workspace.setup(task.repo, task.branch, task.token, setup_base_branch)
+        work_dir = workspace.setup(task.repo, task.branch, task.token, base_branch)
 
         output_errors = 0
 
