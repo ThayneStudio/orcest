@@ -135,9 +135,7 @@ def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
         clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
 
 
-def _build_stream_names(
-    key_prefixes: list[str], backend: str
-) -> tuple[list[str], list[str]]:
+def _build_stream_names(key_prefixes: list[str], backend: str) -> tuple[list[str], list[str]]:
     """Build fully-qualified stream names for multi-project reading.
 
     Returns (pr_streams, issue_streams) where each stream name is
@@ -280,7 +278,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 shutdown = True
                 shutdown_event.set()
             continue
-
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":

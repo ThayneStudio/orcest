@@ -352,9 +352,7 @@ class RedisClient:
         Idempotent -- safe to call on every startup.
         """
         try:
-            self._client.xgroup_create(
-                name=fq_stream, groupname=group, id="0", mkstream=True
-            )
+            self._client.xgroup_create(name=fq_stream, groupname=group, id="0", mkstream=True)
         except redis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
