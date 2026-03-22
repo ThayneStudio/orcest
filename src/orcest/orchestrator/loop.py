@@ -287,11 +287,14 @@ def _poll_cycle(
                     if other_pr.number == pr_state.number:
                         continue  # skip the one we just merged
                     if other_pr.action in (
+                        PRAction.MERGE,
                         PRAction.SKIP_LABELED,
                         PRAction.SKIP_MAX_ATTEMPTS,
                         PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                        PRAction.SKIP_ACTIVE,
+                        PRAction.SKIP_LOCKED,
                     ):
-                        continue  # skip terminal states
+                        continue  # skip terminal states and in-flight PRs
                     try:
                         publish_rebase_task(
                             pr_state=other_pr,
