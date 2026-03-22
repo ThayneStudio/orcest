@@ -246,7 +246,7 @@ class TestCloneUserdata:
     def _render(self, **overrides):
         defaults = {
             "redis_host": "10.20.0.23",
-            "key_prefix": "orcest",
+            "key_prefixes": ["orcest"],
             "worker_id": "orcest-worker-10002",
         }
         defaults.update(overrides)
@@ -259,13 +259,14 @@ class TestCloneUserdata:
         assert isinstance(data, dict)
 
     def test_worker_yaml_content(self):
-        output = self._render(redis_host="10.0.0.1", key_prefix="myprefix", worker_id="w-99")
+        output = self._render(redis_host="10.0.0.1", key_prefixes=["myprefix"], worker_id="w-99")
         data = yaml.safe_load(output)
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["redis"]["host"] == "10.0.0.1"
         assert cfg["redis"]["port"] == 6379
         assert cfg["redis"]["key_prefix"] == "myprefix"
+        assert cfg["redis"]["key_prefixes"] == ["myprefix"]
         assert cfg["worker_id"] == "w-99"
         assert cfg["ephemeral"] is True
 

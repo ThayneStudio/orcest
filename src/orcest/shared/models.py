@@ -49,6 +49,7 @@ class Task:
     prompt: str  # Full rendered prompt
     branch: str | None  # Existing branch (for PR fixes)
     base_branch: str | None  # Base branch to rebase onto (e.g. "main", "master")
+    key_prefix: str  # Redis key prefix for multi-project routing
     created_at: datetime
 
     def to_dict(self) -> dict[str, str]:
@@ -64,6 +65,7 @@ class Task:
             "prompt": self.prompt,
             "branch": self.branch or "",
             "base_branch": self.base_branch or "",
+            "key_prefix": self.key_prefix,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -81,6 +83,7 @@ class Task:
             prompt=data["prompt"],
             branch=data["branch"] or None,
             base_branch=data.get("base_branch") or None,
+            key_prefix=data.get("key_prefix", ""),
             created_at=datetime.fromisoformat(data["created_at"]),
         )
 
@@ -96,6 +99,7 @@ class Task:
         branch: str | None = None,
         base_branch: str | None = None,
         claude_token: str = "",
+        key_prefix: str = "",
     ) -> "Task":
         """Factory with auto-generated ID and timestamp."""
         return cls(
@@ -109,6 +113,7 @@ class Task:
             prompt=prompt,
             branch=branch,
             base_branch=base_branch,
+            key_prefix=key_prefix,
             created_at=datetime.now(timezone.utc),
         )
 

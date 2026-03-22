@@ -120,6 +120,46 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
     return combined
 
 
+def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
+    """Clear the pending-task marker using the task's key_prefix for correct routing.
+
+    When the task carries a key_prefix, use it to ensure the marker is cleared
+    in the correct project namespace. Falls back to the redis client's default
+    prefix if the task has no key_prefix set.
+    """
+    if task.key_prefix:
+        # Build the fully-qualified pending key directly
+        fq_key = f"{task.key_prefix}:pending:{task.resource_type}:{task.repo}:{task.resource_id}"
+        redis.delete_raw(fq_key)
+    else:
+        clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+
+
+def _build_stream_names(
+    key_prefixes: list[str], backend: str
+) -> tuple[list[str], list[str]]:
+    """Build fully-qualified stream names for multi-project reading.
+
+    Returns (pr_streams, issue_streams) where each stream name is
+    fully qualified (e.g. ``"myproject:tasks:claude"``).
+    """
+    pr_streams: list[str] = []
+    issue_streams: list[str] = []
+    seen_pr: set[str] = set()
+    seen_issue: set[str] = set()
+    for prefix in key_prefixes:
+        fq_prefix = prefix + ":"
+        pr_name = f"{fq_prefix}tasks:{backend}"
+        issue_name = f"{fq_prefix}tasks:issue:{backend}"
+        if pr_name not in seen_pr:
+            seen_pr.add(pr_name)
+            pr_streams.append(pr_name)
+        if issue_name not in seen_issue:
+            seen_issue.add(issue_name)
+            issue_streams.append(issue_name)
+    return pr_streams, issue_streams
+
+
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -133,6 +173,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     _check_gh_credentials(logger)
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
+
+    # Build stream names from key_prefixes for multi-project support
+    key_prefixes = config.key_prefixes or [config.redis.key_prefix]
+    pr_fq_streams, issue_fq_streams = _build_stream_names(key_prefixes, config.backend)
+
+    # Legacy single-prefix stream names (used for backward-compatible drain)
     pr_tasks_stream = f"tasks:{config.backend}"
     issue_tasks_stream = f"tasks:issue:{config.backend}"
 
@@ -141,16 +187,13 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
 
-    # Ensure consumer groups exist on both streams
-    redis.ensure_consumer_group(pr_tasks_stream, CONSUMER_GROUP)
-    redis.ensure_consumer_group(issue_tasks_stream, CONSUMER_GROUP)
+    # Ensure consumer groups exist on all streams
+    for fq_stream in pr_fq_streams + issue_fq_streams:
+        redis.ensure_consumer_group_raw(fq_stream, CONSUMER_GROUP)
 
     # Drain pending tasks from previous worker lifecycle.
-    # If this worker was killed mid-execution, the task was delivered but
-    # never ACKed.  Publish a FAILED result so the orchestrator cleans up
-    # labels, then ACK to avoid re-processing stale work.
-    _drain_pending_tasks(redis, pr_tasks_stream, config, logger)
-    _drain_pending_tasks(redis, issue_tasks_stream, config, logger)
+    for fq_stream in pr_fq_streams + issue_fq_streams:
+        _drain_pending_tasks_raw(redis, fq_stream, config, logger)
 
     # Graceful shutdown
     shutdown = False
@@ -169,36 +212,42 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
     logger.info(
         f"Worker {config.worker_id} started (backend={config.backend}, "
-        f"runner={config.runner.type}). Waiting for tasks..."
+        f"runner={config.runner.type}, prefixes={key_prefixes}). Waiting for tasks..."
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
         # PR tasks have priority — non-blocking check first
-        entries = redis.xreadgroup(
+        pr_stream_dict = {s: ">" for s in pr_fq_streams}
+        multi_entries = redis.xreadgroup_multi(
+            streams=pr_stream_dict,
             group=CONSUMER_GROUP,
             consumer=config.worker_id,
-            stream=pr_tasks_stream,
             count=1,
-            block_ms=None,
+            block=None,
         )
-        current_stream = pr_tasks_stream
-        if not entries:
+        current_stream: str | None = None
+        entry_id: str | None = None
+        fields: dict[str, str] | None = None
+
+        if multi_entries:
+            current_stream, entry_id, fields = multi_entries[0]
+        else:
             if shutdown:
                 break
-            # No PR work — block on issue stream (5s timeout to recheck PRs)
-            entries = redis.xreadgroup(
+            # No PR work — block on all issue streams (5s timeout to recheck PRs)
+            issue_stream_dict = {s: ">" for s in issue_fq_streams}
+            multi_entries = redis.xreadgroup_multi(
+                streams=issue_stream_dict,
                 group=CONSUMER_GROUP,
                 consumer=config.worker_id,
-                stream=issue_tasks_stream,
                 count=1,
-                block_ms=5000,
+                block=5000,
             )
-            current_stream = issue_tasks_stream
+            if multi_entries:
+                current_stream, entry_id, fields = multi_entries[0]
 
-        if not entries:
+        if not current_stream or entry_id is None or fields is None:
             continue  # Timeout, loop back to check shutdown
-
-        entry_id, fields = entries[0]
         try:
             task = Task.from_dict(fields)
         except (KeyError, ValueError) as e:
@@ -207,7 +256,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 exc_info=True,
             )
             try:
-                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
                 logger.error(
                     f"Failed to ACK malformed entry {entry_id}",
@@ -219,6 +268,23 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             f"Received task {task.id}: {task.type.value} "
             f"for {task.resource_type} #{task.resource_id}"
         )
+
+        # Dead-letter guard: if this entry has been delivered too many times
+        # (result-publish failures leaving it unACKed), route it to the
+        # dead-letter stream instead of running Claude again.
+        delivery_count = redis.xpending_count_raw(current_stream, CONSUMER_GROUP, entry_id)
+        if delivery_count >= MAX_DELIVERY_COUNT:
+            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
+            if config.ephemeral:
+                try:
+                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
+                except Exception:
+                    logger.warning("Failed to set pool:done key", exc_info=True)
+                logger.info("Ephemeral mode: dead-lettered task, shutting down.")
+                shutdown = True
+                shutdown_event.set()
+            continue
+
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
@@ -237,7 +303,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
             try:
-                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
                 logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
             continue
@@ -329,7 +395,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             logger.info(f"Published result for task {task.id}: {result.status.value}")
 
             try:
-                redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
                 logger.error(
                     f"Failed to ACK task {task.id} (will be redelivered)",
@@ -341,7 +407,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # clear in _handle_result).
             try:
                 resource_type = task.resource_type
-                clear_pending_task(redis, task.repo, resource_type, task.resource_id)
+                _clear_pending_task_for_task(redis, task)
             except Exception:
                 logger.warning(
                     "Failed to clear pending task marker for "
@@ -357,7 +423,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # (the VM will be destroyed, so no future drain will ever claim it).
             if not published:
                 try:
-                    redis.xack(current_stream, CONSUMER_GROUP, entry_id)
+                    redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
                 except Exception:
                     logger.error(
                         f"Failed to ACK task {task.id} on ephemeral exit "
@@ -369,7 +435,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 # failed the marker would otherwise linger until TTL expiry
                 # (~95 min) since the VM is about to be destroyed.
                 try:
-                    clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+                    _clear_pending_task_for_task(redis, task)
                 except Exception:
                     logger.warning(
                         "Failed to clear pending task marker for "
@@ -483,6 +549,85 @@ def _drain_pending_tasks(
         logger.info(f"Drained {drained} pending task(s) from previous lifecycle")
 
 
+def _drain_pending_tasks_raw(
+    redis: RedisClient,
+    fq_stream: str,
+    config: WorkerConfig,
+    logger: logging.Logger,
+) -> None:
+    """Drain pending tasks from a fully-qualified stream name.
+
+    Same logic as _drain_pending_tasks but uses raw (un-prefixed) Redis
+    operations for multi-project stream support.
+    """
+    drained = 0
+    while True:
+        result = redis.xreadgroup_multi(
+            streams={fq_stream: "0"},
+            group=CONSUMER_GROUP,
+            consumer=config.worker_id,
+            count=10,
+            block=None,
+        )
+        if not result:
+            break
+        for stream_name, entry_id, fields in result:
+            drained += 1
+            task: Task | None = None
+            try:
+                task = Task.from_dict(fields)
+                logger.warning(
+                    f"Recovering pending task {task.id} ({task.type.value} "
+                    f"for {task.resource_type} #{task.resource_id}) — "
+                    f"publishing FAILED result"
+                )
+                task_result = TaskResult(
+                    task_id=task.id,
+                    worker_id=config.worker_id,
+                    status=ResultStatus.FAILED,
+                    resource_type=task.resource_type,
+                    resource_id=task.resource_id,
+                    branch=task.branch,
+                    summary="Worker restarted mid-execution; task was not completed.",
+                    duration_seconds=0,
+                )
+                try:
+                    # Publish result to the correct project's results stream
+                    if task.key_prefix:
+                        fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
+                        redis.xadd_capped_raw(fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                    else:
+                        redis.xadd_capped(RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                except Exception:
+                    logger.error(
+                        f"Failed to publish recovery result for task {task.id}",
+                        exc_info=True,
+                    )
+            except (KeyError, ValueError) as e:
+                logger.error(
+                    f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
+                    exc_info=True,
+                )
+            try:
+                redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
+            except Exception:
+                logger.error(
+                    f"Failed to ACK pending entry {entry_id}",
+                    exc_info=True,
+                )
+            if task is not None:
+                try:
+                    _clear_pending_task_for_task(redis, task)
+                except Exception:
+                    logger.warning(
+                        "Failed to clear pending task marker for "
+                        f"{task.resource_type} #{task.resource_id} during drain",
+                        exc_info=True,
+                    )
+    if drained:
+        logger.info(f"Drained {drained} pending task(s) from {fq_stream}")
+
+
 def _dead_letter_task(
     redis: RedisClient,
     tasks_stream: str,
@@ -529,7 +674,7 @@ def _dead_letter_task(
             exc_info=True,
         )
     try:
-        redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
+        redis.xack_raw(tasks_stream, CONSUMER_GROUP, entry_id)
     except Exception:
         logger.error(
             f"Failed to ACK dead-lettered task {task.id} (entry {entry_id})",
@@ -540,7 +685,7 @@ def _dead_letter_task(
     # so the orchestrator's normal _handle_result path never fires; without
     # this the marker lingers until TTL expiry (~95 min with defaults).
     try:
-        clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+        _clear_pending_task_for_task(redis, task)
     except Exception:
         logger.warning(
             "Failed to clear pending task marker for "
@@ -573,7 +718,12 @@ def _publish_result_with_retry(
         if attempt > 0:
             time.sleep(_RESULT_PUBLISH_BACKOFF[attempt - 1])
         try:
-            redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
+            # Publish to the correct project's results stream
+            if task.key_prefix:
+                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
+                redis.xadd_capped_raw(fq_results, result.to_dict(), maxlen=_STREAM_MAXLEN)
+            else:
+                redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
             return True
         except Exception as exc:
             last_exc = exc

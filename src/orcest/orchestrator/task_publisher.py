@@ -231,6 +231,7 @@ def publish_fix_task(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     claude_token: str = "",
+    key_prefix: str = "",
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -381,6 +382,7 @@ def publish_fix_task(
         branch=pr_state.branch,
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
+        key_prefix=key_prefix,
     )
 
     _publish_and_notify(
@@ -406,6 +408,7 @@ def publish_followup_task(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     claude_token: str = "",
+    key_prefix: str = "",
 ) -> Task:
     """Create and publish a triage-followups task for a PR.
 
@@ -446,6 +449,7 @@ def publish_followup_task(
         branch=pr_state.branch,
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
+        key_prefix=key_prefix,
     )
 
     _publish_and_notify(
@@ -472,6 +476,7 @@ def publish_rebase_task(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     claude_token: str = "",
+    key_prefix: str = "",
 ) -> Task:
     """Create and publish a rebase task for a PR with merge conflicts.
 
@@ -498,6 +503,7 @@ def publish_rebase_task(
         branch=pr_state.branch,
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
+        key_prefix=key_prefix,
     )
 
     _publish_and_notify(
@@ -523,6 +529,7 @@ def publish_issue_task(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     claude_token: str = "",
+    key_prefix: str = "",
 ) -> Task:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -547,6 +554,7 @@ def publish_issue_task(
         prompt=prompt,
         branch=None,
         claude_token=claude_token,
+        key_prefix=key_prefix,
     )
 
     _publish_issue_and_notify(
