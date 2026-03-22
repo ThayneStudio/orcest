@@ -63,8 +63,8 @@ def _make_redis(idle_set: set[str] | None = None) -> MagicMock:
     mock.smembers.side_effect = _smembers
     mock.scard.return_value = 0
     mock.hlen.return_value = 0
-    mock.xinfo_groups.return_value = []
-    mock.xinfo_consumers.return_value = []
+    mock.xinfo_groups_raw.return_value = []
+    mock.xinfo_consumers_raw.return_value = []
     mock.sadd.side_effect = _sadd
     mock.pipeline.return_value = MagicMock()
     return mock
@@ -466,15 +466,15 @@ class TestDetectActiveWorkers:
         manager._detect_active_workers()
 
         redis.smembers.assert_called_once_with("pool:idle")
-        redis.xinfo_groups.assert_not_called()
+        redis.xinfo_groups_raw.assert_not_called()
 
     def test_idle_worker_becomes_active(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.xinfo_groups.return_value = [
+        redis.xinfo_groups_raw.return_value = [
             {"name": "workers", "pending": 1},
         ]
-        redis.xinfo_consumers.return_value = [
+        redis.xinfo_consumers_raw.return_value = [
             {"name": "orcest-worker-300", "pending": 1},
         ]
         pipe = MagicMock()
@@ -491,10 +491,10 @@ class TestDetectActiveWorkers:
     def test_idle_worker_stays_idle(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.xinfo_groups.return_value = [
+        redis.xinfo_groups_raw.return_value = [
             {"name": "workers", "pending": 0},
         ]
-        redis.xinfo_consumers.return_value = [
+        redis.xinfo_consumers_raw.return_value = [
             {"name": "orcest-worker-300", "pending": 0},
         ]
 
@@ -503,21 +503,21 @@ class TestDetectActiveWorkers:
         # No pipeline calls for moving to active
         redis.pipeline.assert_not_called()
 
-    def test_handles_xinfo_groups_error(self):
+    def test_handles_xinfo_groups_raw_error(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.xinfo_groups.side_effect = Exception("stream not found")
+        redis.xinfo_groups_raw.side_effect = Exception("stream not found")
 
         # Should not raise
         manager._detect_active_workers()
 
-    def test_handles_xinfo_consumers_error(self):
+    def test_handles_xinfo_consumers_raw_error(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.xinfo_groups.return_value = [
+        redis.xinfo_groups_raw.return_value = [
             {"name": "workers", "pending": 1},
         ]
-        redis.xinfo_consumers.side_effect = Exception("group not found")
+        redis.xinfo_consumers_raw.side_effect = Exception("group not found")
 
         # Should not raise
         manager._detect_active_workers()
@@ -525,10 +525,10 @@ class TestDetectActiveWorkers:
     def test_non_integer_idle_member_skipped(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"not-a-number", "300"}
-        redis.xinfo_groups.return_value = [
+        redis.xinfo_groups_raw.return_value = [
             {"name": "workers", "pending": 1},
         ]
-        redis.xinfo_consumers.return_value = [
+        redis.xinfo_consumers_raw.return_value = [
             {"name": "orcest-worker-300", "pending": 1},
         ]
         pipe = MagicMock()
@@ -545,10 +545,10 @@ class TestDetectActiveWorkers:
         """If the Redis pipeline fails, the error is logged but does not propagate."""
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.xinfo_groups.return_value = [
+        redis.xinfo_groups_raw.return_value = [
             {"name": "workers", "pending": 1},
         ]
-        redis.xinfo_consumers.return_value = [
+        redis.xinfo_consumers_raw.return_value = [
             {"name": "orcest-worker-300", "pending": 1},
         ]
         pipe = MagicMock()
@@ -1241,7 +1241,7 @@ class TestFullCycle:
         redis.scard.return_value = 1  # 1 idle remaining after destroy
         redis.hlen.return_value = 0
         redis.hgetall.return_value = {}
-        redis.xinfo_groups.return_value = []
+        redis.xinfo_groups_raw.return_value = []
 
         pipe = MagicMock()
         redis.pipeline.return_value = pipe

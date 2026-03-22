@@ -506,7 +506,8 @@ class TestExecuteTask:
         mock_runner.run.assert_called_once()
 
     def test_rebase_pr_skips_auto_rebase(self, local_worker_config, mock_workspace):
-        """REBASE_PR tasks pass None as base_branch so Claude resolves conflicts itself."""
+        """REBASE_PR tasks pass base_branch=None to workspace.setup so the
+        workspace doesn't auto-rebase — Claude handles the rebase itself."""
         task = Task.create(
             task_type=TaskType.REBASE_PR,
             repo="owner/repo",
@@ -521,21 +522,15 @@ class TestExecuteTask:
         mock_runner.run.return_value = _success_runner_result()
         mock_redis = MagicMock()
         mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xadd_capped_raw.return_value = "1-0"
 
         _execute_task(
-            task,
-            local_worker_config,
-            mock_runner,
-            mock_workspace,
-            mock_redis,
+            task, local_worker_config, mock_runner, mock_workspace, mock_redis,
             logging.getLogger("test"),
         )
 
         mock_workspace.setup.assert_called_once_with(
-            task.repo,
-            task.branch,
-            task.token,
-            None,  # base_branch suppressed
+            task.repo, task.branch, task.token, None,  # base_branch suppressed
         )
 
 

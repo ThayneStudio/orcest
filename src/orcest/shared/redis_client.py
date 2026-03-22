@@ -514,6 +514,16 @@ class RedisClient:
         result: list[dict[str, Any]] = self._client.xinfo_groups(self._prefixed(stream))  # type: ignore[assignment]
         return result
 
+    def xinfo_groups_raw(self, fq_stream: str) -> list[dict[str, Any]]:
+        """XINFO GROUPS on a fully-qualified stream name (no prefix added)."""
+        result: list[dict[str, Any]] = self._client.xinfo_groups(fq_stream)  # type: ignore[assignment]
+        return result
+
+    def xinfo_consumers_raw(self, fq_stream: str, group: str) -> list[dict[str, Any]]:
+        """XINFO CONSUMERS on a fully-qualified stream name (no prefix added)."""
+        result: list[dict[str, Any]] = self._client.xinfo_consumers(fq_stream, group)  # type: ignore[assignment]
+        return result
+
     def xrevrange(self, stream: str, count: int) -> list[tuple[str, dict[str, str]]]:
         """XREVRANGE stream + - COUNT count."""
         result: list[Any] = self._client.xrevrange(self._prefixed(stream), count=count)  # type: ignore[assignment]
