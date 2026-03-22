@@ -166,6 +166,7 @@ def _poll_cycle(
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
                             claude_token=config.github.claude_token,
+                            key_prefix=config.redis.key_prefix,
                         )
                         enqueued += 1
                     except Exception as rebase_err:
@@ -286,6 +287,7 @@ def _poll_cycle(
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=config.github.claude_token,
+                    key_prefix=config.redis.key_prefix,
                 )
                 if result is not None:
                     enqueued += 1
@@ -317,6 +319,7 @@ def _poll_cycle(
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=config.github.claude_token,
+                    key_prefix=config.redis.key_prefix,
                 )
                 enqueued += 1
             except Exception as e:
@@ -711,6 +714,7 @@ def _poll_cycle(
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=config.github.claude_token,
+                    key_prefix=config.redis.key_prefix,
                 )
                 enqueued += 1
             except Exception as e:
