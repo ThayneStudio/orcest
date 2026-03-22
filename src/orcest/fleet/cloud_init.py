@@ -306,6 +306,10 @@ def render_clone_userdata(
             },
         ],
         "runcmd": [
+            # Upgrade orcest to latest before starting the worker service.
+            # The template may have an older version baked in.
+            "sudo -u orcest /opt/orcest/venv/bin/pip install -q --upgrade"
+            " 'git+https://github.com/ThayneStudio/orcest.git'",
             "systemctl daemon-reload",
             "systemctl enable --now orcest-worker",
         ],
