@@ -24,7 +24,7 @@ from orcest.shared.coordination import (
     make_pr_lock_key,
 )
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult
+from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult, TaskType
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import Runner, RunnerResult, create_runner
@@ -135,9 +135,7 @@ def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
         clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
 
 
-def _build_stream_names(
-    key_prefixes: list[str], backend: str
-) -> tuple[list[str], list[str]]:
+def _build_stream_names(key_prefixes: list[str], backend: str) -> tuple[list[str], list[str]]:
     """Build fully-qualified stream names for multi-project reading.
 
     Returns (pr_streams, issue_streams) where each stream name is
@@ -177,10 +175,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     # Build stream names from key_prefixes for multi-project support
     key_prefixes = config.key_prefixes or [config.redis.key_prefix]
     pr_fq_streams, issue_fq_streams = _build_stream_names(key_prefixes, config.backend)
-
-    # Legacy single-prefix stream names (used for backward-compatible drain)
-    pr_tasks_stream = f"tasks:{config.backend}"
-    issue_tasks_stream = f"tasks:issue:{config.backend}"
 
     # Verify Redis connection
     if not redis.health_check():
@@ -284,7 +278,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 shutdown = True
                 shutdown_event.set()
             continue
-
 
         # Try to acquire lock (use resource-type-aware key)
         if task.resource_type == "issue":
@@ -406,7 +399,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # re-enqueue if needed (belt-and-suspenders with the orchestrator's
             # clear in _handle_result).
             try:
-                resource_type = task.resource_type
                 _clear_pending_task_for_task(redis, task)
             except Exception:
                 logger.warning(
@@ -595,9 +587,13 @@ def _drain_pending_tasks_raw(
                     # Publish result to the correct project's results stream
                     if task.key_prefix:
                         fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                        redis.xadd_capped_raw(fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                        redis.xadd_capped_raw(
+                            fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                        )
                     else:
-                        redis.xadd_capped(RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN)
+                        redis.xadd_capped(
+                            RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                        )
                 except Exception:
                     logger.error(
                         f"Failed to publish recovery result for task {task.id}",
@@ -792,7 +788,10 @@ def _execute_task(
 
         # Setup workspace
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
-        work_dir = workspace.setup(task.repo, task.branch, task.token, task.base_branch)
+        # For REBASE_PR tasks, skip the automatic rebase so Claude can resolve
+        # conflicts itself — the task prompt instructs Claude to rebase.
+        setup_base_branch = None if task.type == TaskType.REBASE_PR else task.base_branch
+        work_dir = workspace.setup(task.repo, task.branch, task.token, setup_base_branch)
 
         output_errors = 0
 

@@ -561,8 +561,8 @@ class PoolManager:
         """Build task stream names from the projects list."""
         streams: list[str] = []
         for project in self._projects:
-            streams.append(f"tasks:claude")
-            streams.append(f"tasks:issue:claude")
+            streams.append("tasks:claude")
+            streams.append("tasks:issue:claude")
         # Deduplicate while preserving order
         seen: set[str] = set()
         result: list[str] = []
