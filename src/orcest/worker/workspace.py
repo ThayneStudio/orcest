@@ -170,44 +170,8 @@ class Workspace:
         _git_config(repo_dir, "user.name", "orcest-bot")
         _git_config(repo_dir, "user.email", "orcest-bot@users.noreply.github.com")
 
-        # Rebase onto the base branch so the worker operates on up-to-date
-        # code (e.g. picks up workflow changes, avoids stale conflicts).
-        if base_branch and branch:
-            self._rebase_onto(repo_dir, base_branch)
-
         self._work_dir = repo_dir
         return self._work_dir
-
-    def _rebase_onto(self, repo_dir: Path, base_branch: str) -> None:
-        """Fetch and rebase the current branch onto the base branch."""
-        try:
-            subprocess.run(
-                ["git", "-C", str(repo_dir), "fetch", "origin", base_branch],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            safe_msg = f"git fetch origin {base_branch} failed"
-            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
-                safe_msg += f": {exc.stderr.strip()}"
-            raise WorkspaceError(safe_msg) from None
-
-        result = subprocess.run(
-            ["git", "-C", str(repo_dir), "rebase", f"origin/{base_branch}"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            # Abort the failed rebase to leave the repo in a clean state
-            subprocess.run(
-                ["git", "-C", str(repo_dir), "rebase", "--abort"],
-                capture_output=True,
-                timeout=30,
-            )
-            raise WorkspaceError(f"rebase onto origin/{base_branch} failed with conflicts")
 
     def cleanup(self) -> None:
         """Remove the workspace directory.
