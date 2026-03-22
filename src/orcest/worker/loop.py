@@ -24,7 +24,7 @@ from orcest.shared.coordination import (
     make_pr_lock_key,
 )
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult
+from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult, TaskType
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import Runner, RunnerResult, create_runner
@@ -792,7 +792,10 @@ def _execute_task(
 
         # Setup workspace
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
-        work_dir = workspace.setup(task.repo, task.branch, task.token, task.base_branch)
+        # For REBASE_PR tasks, skip the automatic rebase so Claude can resolve
+        # conflicts itself — the task prompt instructs Claude to rebase.
+        setup_base_branch = None if task.type == TaskType.REBASE_PR else task.base_branch
+        work_dir = workspace.setup(task.repo, task.branch, task.token, setup_base_branch)
 
         output_errors = 0
 
