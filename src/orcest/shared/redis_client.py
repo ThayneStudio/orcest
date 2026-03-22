@@ -162,14 +162,14 @@ class RedisClient:
         result = self._client.xreadgroup(
             groupname=group,
             consumername=consumer,
-            streams=streams,
+            streams=streams,  # type: ignore[arg-type]
             count=count,
             block=block,
         )
         if not result:
             return []
         entries: list[tuple[str, str, dict[str, str]]] = []
-        for stream_name, stream_entries in result:
+        for stream_name, stream_entries in result:  # type: ignore[union-attr]
             for entry_id, fields in stream_entries:
                 entries.append((stream_name, entry_id, fields))
         return entries
