@@ -532,7 +532,10 @@ class TestExecuteTask:
         )
 
         mock_workspace.setup.assert_called_once_with(
-            task.repo, task.branch, task.token, None  # base_branch suppressed
+            task.repo,
+            task.branch,
+            task.token,
+            None,  # base_branch suppressed
         )
 
 
