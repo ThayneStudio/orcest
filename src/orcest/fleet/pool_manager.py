@@ -34,9 +34,6 @@ _VM_NAME_PREFIX = "orcest-worker-"
 # Consumer group used by workers (must match worker/loop.py)
 _CONSUMER_GROUP = "workers"
 
-# Task stream names (must match orchestrator task publisher)
-_TASK_STREAMS = ("tasks:claude", "tasks:issue:claude")
-
 
 class PoolManager:
     """Manages a warm pool of ephemeral worker VMs.
@@ -61,12 +58,20 @@ class PoolManager:
         proxmox: ProxmoxClient,
         redis: RedisClient,
         key_prefix: str = "orcest",
+        projects: list[str] | None = None,
     ) -> None:
         self._config = config
         self._proxmox = proxmox
         self._redis = redis
         self._pool = config.pool
         self._key_prefix = key_prefix
+        # Derive project names from FleetConfig if not explicitly provided
+        if projects is not None:
+            self._projects = projects
+        elif config.projects:
+            self._projects = [p.name for p in config.projects]
+        else:
+            self._projects = [key_prefix]
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -130,7 +135,7 @@ class PoolManager:
 
         # Get consumers with pending entries from task streams
         active_consumers: set[str] = set()
-        for stream_name in _TASK_STREAMS:
+        for stream_name in self._task_streams():
             try:
                 groups = self._redis.xinfo_groups(stream_name)
             except Exception:
@@ -309,7 +314,7 @@ class PoolManager:
         try:
             userdata = render_clone_userdata(
                 redis_host=self._config.orchestrator.host,
-                key_prefix=self._key_prefix,
+                key_prefixes=self._projects,
                 worker_id=name,
             )
             self._proxmox.set_cloud_init_userdata(
@@ -551,6 +556,21 @@ class PoolManager:
         logger.info("Pool manager shutting down.")
 
     # ── helpers ──────────────────────────────────────────────
+
+    def _task_streams(self) -> tuple[str, ...]:
+        """Build task stream names from the projects list."""
+        streams: list[str] = []
+        for project in self._projects:
+            streams.append(f"tasks:claude")
+            streams.append(f"tasks:issue:claude")
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        result: list[str] = []
+        for s in streams:
+            if s not in seen:
+                seen.add(s)
+                result.append(s)
+        return tuple(result)
 
     def _next_vm_id(self) -> int:
         """Allocate the next VM ID from the configured pool range.

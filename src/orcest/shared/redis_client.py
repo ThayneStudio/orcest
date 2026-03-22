@@ -128,6 +128,52 @@ class RedisClient:
         # result shape: [[stream_name, [(id, fields), ...]]]
         return result[0][1]  # type: ignore[index]
 
+    def xreadgroup_multi(
+        self,
+        streams: dict[str, str],
+        group: str,
+        consumer: str,
+        count: int = 1,
+        block: int | None = None,
+    ) -> list[tuple[str, str, dict[str, str]]]:
+        """Read entries from multiple streams via XREADGROUP.
+
+        Unlike ``xreadgroup()``, the *streams* dict keys are fully-qualified
+        (already-prefixed) stream names. This allows reading from streams
+        with different prefixes in a single call, which is required for
+        multi-project workers.
+
+        Args:
+            streams: Mapping of fully-qualified stream name to entry ID
+                (``">"`` for new entries, ``"0"`` for pending).
+            group: Consumer group name.
+            consumer: Consumer name within the group.
+            count: Maximum number of entries to return.
+            block: Milliseconds to block waiting for data.
+                ``None`` means non-blocking.
+                ``0`` means block indefinitely.
+
+        Returns:
+            List of ``(stream_name, entry_id, fields)`` tuples.
+            Returns empty list on timeout or when no entries are available.
+        """
+        if not streams:
+            return []
+        result = self._client.xreadgroup(
+            groupname=group,
+            consumername=consumer,
+            streams=streams,
+            count=count,
+            block=block,
+        )
+        if not result:
+            return []
+        entries: list[tuple[str, str, dict[str, str]]] = []
+        for stream_name, stream_entries in result:
+            for entry_id, fields in stream_entries:
+                entries.append((stream_name, entry_id, fields))
+        return entries
+
     def xack(self, stream: str, group: str, entry_id: str) -> int:
         """Acknowledge a stream entry. Returns number acknowledged."""
         result: int = self._client.xack(self._prefixed(stream), group, entry_id)  # type: ignore[assignment]
@@ -255,6 +301,78 @@ class RedisClient:
         if not entry_ids:
             return 0
         result: int = self._client.xdel(self._prefixed(stream), *entry_ids)  # type: ignore[assignment]
+        return result
+
+    def xadd_capped_raw(self, fq_stream: str, fields: dict[str, str], maxlen: int) -> str:
+        """Add entry to a capped stream using a fully-qualified (already-prefixed) name.
+
+        Used by multi-project workers that need to publish to streams with
+        different prefixes than the client's own prefix.
+        """
+        if maxlen < 1:
+            raise ValueError(f"maxlen must be positive, got {maxlen}")
+        if not fields:
+            raise ValueError("fields must be a non-empty dict")
+        entry_id: str = self._client.xadd(  # type: ignore[assignment]
+            fq_stream,
+            fields,  # type: ignore[arg-type]
+            maxlen=maxlen,
+            approximate=True,
+        )
+        return entry_id
+
+    def xack_raw(self, fq_stream: str, group: str, entry_id: str) -> int:
+        """Acknowledge a stream entry using a fully-qualified stream name."""
+        result: int = self._client.xack(fq_stream, group, entry_id)  # type: ignore[assignment]
+        return result
+
+    def xpending_count_raw(self, fq_stream: str, group: str, entry_id: str) -> int:
+        """Return delivery count for a pending entry using a fully-qualified stream name."""
+        try:
+            entries = self._client.xpending_range(
+                fq_stream, group, min=entry_id, max=entry_id, count=1
+            )
+        except Exception:
+            logger.warning(
+                "xpending_count_raw failed for stream %s entry %s; treating as 0 deliveries",
+                fq_stream,
+                entry_id,
+                exc_info=True,
+            )
+            return 0
+        if not entries:
+            return 0
+        count = entries[0].get("times_delivered", 0)  # type: ignore[index]
+        return int(count)
+
+    def ensure_consumer_group_raw(self, fq_stream: str, group: str) -> None:
+        """Create consumer group on a fully-qualified stream name.
+
+        Also creates the stream if needed (MKSTREAM).
+        Idempotent -- safe to call on every startup.
+        """
+        try:
+            self._client.xgroup_create(
+                name=fq_stream, groupname=group, id="0", mkstream=True
+            )
+        except redis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+    def set_nx_ex_raw(self, fq_key: str, value: str, ttl: int) -> bool:
+        """SET key value NX EX ttl using a fully-qualified key."""
+        return self._client.set(fq_key, value, nx=True, ex=ttl) is not None
+
+    def get_raw(self, fq_key: str) -> str | None:
+        """GET using a fully-qualified key."""
+        val = self._client.get(fq_key)
+        return str(val) if val is not None else None
+
+    def delete_raw(self, *fq_keys: str) -> int:
+        """DEL using fully-qualified keys."""
+        if not fq_keys:
+            return 0
+        result: int = self._client.delete(*fq_keys)  # type: ignore[assignment]
         return result
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:

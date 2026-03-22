@@ -253,7 +253,7 @@ def render_template_userdata(
 def render_clone_userdata(
     *,
     redis_host: str,
-    key_prefix: str,
+    key_prefixes: list[str],
     worker_id: str,
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
@@ -264,12 +264,16 @@ def render_clone_userdata(
 
     Args:
         redis_host: Redis host (orchestrator VM IP).
-        key_prefix: Redis key prefix for namespace isolation.
+        key_prefixes: Redis key prefixes for multi-project support.
         worker_id: Unique worker identifier (e.g. ``orcest-worker-10002``).
     """
+    redis_section: dict = {"host": redis_host, "port": 6379, "key_prefixes": key_prefixes}
+    # Set key_prefix to the first prefix for backward compatibility
+    if key_prefixes:
+        redis_section["key_prefix"] = key_prefixes[0]
     worker_yaml = yaml.dump(
         {
-            "redis": {"host": redis_host, "port": 6379, "key_prefix": key_prefix},
+            "redis": redis_section,
             "worker_id": worker_id,
             "workspace_dir": "/opt/orcest/workspaces",
             "backend": "claude",
