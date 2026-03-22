@@ -1315,6 +1315,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        _cleanup_vm()
         sys.exit(1)
     console.print("[green]ok[/green]")
 
