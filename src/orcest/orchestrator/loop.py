@@ -282,6 +282,35 @@ def _poll_cycle(
                             issue_err,
                             exc_info=True,
                         )
+                # After successful merge, rebase other open PRs onto updated master
+                for other_pr in pr_states:
+                    if other_pr.number == pr_state.number:
+                        continue  # skip the one we just merged
+                    if other_pr.action in (
+                        PRAction.SKIP_LABELED,
+                        PRAction.SKIP_MAX_ATTEMPTS,
+                        PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                    ):
+                        continue  # skip terminal states
+                    try:
+                        publish_rebase_task(
+                            pr_state=other_pr,
+                            repo=config.github.repo,
+                            token=config.github.token,
+                            redis=redis,
+                            default_runner=config.default_runner,
+                            merge_error="",
+                            pending_task_ttl=pending_task_ttl,
+                            logger=logger,
+                            claude_token=config.github.claude_token,
+                            key_prefix=config.redis.key_prefix,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to enqueue rebase for PR #%d",
+                            other_pr.number,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
