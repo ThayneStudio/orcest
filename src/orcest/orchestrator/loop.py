@@ -298,8 +298,14 @@ def _poll_cycle(
                         PRAction.ENQUEUE_FOLLOWUP,
                         PRAction.SKIP_BACKOFF,
                         PRAction.SKIP_USAGE_COOLDOWN,
+                        PRAction.SKIP_GREEN,
+                        PRAction.SKIP_PENDING,
+                        PRAction.SKIP_NO_CHECKS,
+                        PRAction.SKIP_QUEUED,
+                        PRAction.RETRIGGER_REVIEW,
+                        PRAction.RETRIGGER_STALE_CHECKS,
                     ):
-                        continue  # skip terminal states, in-flight PRs, drafts, and cooldowns
+                        continue  # skip PRs that don't need proactive rebase
                     try:
                         publish_rebase_task(
                             pr_state=other_pr,
