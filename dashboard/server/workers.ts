@@ -70,7 +70,7 @@ async function findWorkerStream(workerId: string): Promise<string | null> {
  * Get a starting position near the tail of a worker's stream.
  * Returns the entry ID to start reading from (the last 200 entries).
  */
-export async function getStreamTailId(
+async function getStreamTailId(
   workerId: string,
 ): Promise<string> {
   const stream = await findWorkerStream(workerId);
@@ -90,7 +90,7 @@ export async function getStreamTailId(
 /**
  * Non-blocking read of worker output using XRANGE.
  */
-export async function readWorkerOutputNonBlocking(
+async function readWorkerOutputNonBlocking(
   workerId: string,
   lastId: string,
   count = 50
@@ -139,8 +139,9 @@ export async function findTaskStartId(
   workerId: string,
   taskId?: string,
 ): Promise<string | null> {
-  const cacheKey = `${workerId}:${taskId ?? "latest"}`;
-  const cached = taskStartCache.get(cacheKey);
+  // Don't cache the "latest" case — a new task may have started since last lookup
+  const cacheKey = taskId ? `${workerId}:${taskId}` : null;
+  const cached = cacheKey ? taskStartCache.get(cacheKey) : undefined;
   if (cached) return cached;
 
   const stream = await findWorkerStream(workerId);
@@ -161,7 +162,7 @@ export async function findTaskStartId(
 
         if (fieldMap.type === "task_start") {
           if (!taskId || fieldMap.task_id === taskId) {
-            taskStartCache.set(cacheKey, entryId);
+            if (cacheKey) taskStartCache.set(cacheKey, entryId);
             return entryId;
           }
         }
