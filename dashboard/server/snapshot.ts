@@ -193,7 +193,10 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
       // Key format: prefix:pr:repo:number:attempts — extract PR number (last segment)
       const parts = key.replace(/:attempts$/, "").split(":");
       const prNum = parts[parts.length - 1];
-      attemptCounts[`PR #${prNum}`] = parseInt(data.count, 10);
+      const count = parseInt(data.count, 10);
+      if (!isNaN(count)) {
+        attemptCounts[`PR #${prNum}`] = count;
+      }
     }
   }
 

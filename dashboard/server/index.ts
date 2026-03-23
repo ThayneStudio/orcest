@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import type { Duplex } from "stream";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
-import { healthCheck } from "./redis.js";
+import { healthCheck, redis } from "./redis.js";
 import { fetchSnapshot } from "./snapshot.js";
 import { detectStuck } from "./stuck.js";
 import { discoverWorkers, findTaskStartId, readTaskOutput } from "./workers.js";
@@ -12,6 +12,7 @@ import type { DashboardMessage, TaskOutputMessage } from "./types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "8080", 10);
+const PING_INTERVAL = 30000;
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN;
 
 function isAuthorized(req: IncomingMessage): boolean {
@@ -129,6 +130,16 @@ snapshotWss.on("connection", (ws) => {
   } else {
     refreshSharedSnapshot();
   }
+
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, PING_INTERVAL);
+
+  ws.on("close", () => clearInterval(pingTimer));
+  ws.on("error", (err) => {
+    console.error("Snapshot WS error:", err);
+    clearInterval(pingTimer);
+  });
 });
 
 // --- Task Output WebSocket ---
@@ -192,10 +203,34 @@ taskOutputWss.on("connection", (ws, req) => {
 
   poll();
   interval = setInterval(poll, 500);
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, PING_INTERVAL);
 
-  ws.on("close", () => clearInterval(interval));
-  ws.on("error", () => clearInterval(interval));
+  ws.on("close", () => {
+    clearInterval(interval);
+    clearInterval(pingTimer);
+  });
+  ws.on("error", (err) => {
+    console.error("Task output WS error:", err);
+    clearInterval(interval);
+    clearInterval(pingTimer);
+  });
 });
+
+// --- Graceful Shutdown ---
+
+function shutdown() {
+  console.log("Shutting down...");
+  snapshotWss.clients.forEach((ws) => ws.close(1001, "Server shutting down"));
+  taskOutputWss.clients.forEach((ws) => ws.close(1001, "Server shutting down"));
+  server.close(() => {
+    redis.quit().then(() => process.exit(0));
+  });
+  setTimeout(() => process.exit(1), 5000);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // --- Start ---
 

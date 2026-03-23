@@ -38,26 +38,26 @@ export async function discoverWorkers(): Promise<string[]> {
 /**
  * Find the prefixed stream key for a worker (e.g., orcest:output:worker-1).
  */
-// Cache resolved stream keys — worker stream names don't change during uptime
+// Cache resolved stream keys with TTL — worker stream names rarely change
 // Capped at 100 entries to prevent unbounded growth from invalid worker IDs
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const STREAM_CACHE_MAX = 100;
-const streamCache = new Map<string, string>();
+const streamCache = new Map<string, { key: string; cachedAt: number }>();
 
 async function findWorkerStream(workerId: string): Promise<string | null> {
   // Validate workerId to prevent glob injection in SCAN patterns
   if (!/^[\w-]+$/.test(workerId)) return null;
 
   const cached = streamCache.get(workerId);
-  if (cached) return cached;
+  if (cached && Date.now() - cached.cachedAt < CACHE_TTL) return cached.key;
   try {
     const matches = await scanKeys(`*:output:${workerId}`);
     if (matches.length > 0) {
       if (streamCache.size >= STREAM_CACHE_MAX) {
-        // Evict the oldest entry
         const firstKey = streamCache.keys().next().value;
         if (firstKey !== undefined) streamCache.delete(firstKey);
       }
-      streamCache.set(workerId, matches[0]);
+      streamCache.set(workerId, { key: matches[0], cachedAt: Date.now() });
       return matches[0];
     }
     return null;

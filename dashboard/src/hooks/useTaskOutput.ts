@@ -58,7 +58,9 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
               done: msg.done,
             };
           });
+          if (msg.done) doneRef.current = true;
         } else if (msg.done) {
+          doneRef.current = true;
           setState((prev) => ({ ...prev, done: true }));
         }
         if (msg.done) doneRef.current = true;
