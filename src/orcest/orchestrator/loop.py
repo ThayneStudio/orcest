@@ -298,7 +298,6 @@ def _poll_cycle(
                         PRAction.ENQUEUE_FOLLOWUP,
                         PRAction.SKIP_BACKOFF,
                         PRAction.SKIP_USAGE_COOLDOWN,
-                        PRAction.SKIP_GREEN,
                         PRAction.SKIP_PENDING,
                         PRAction.SKIP_NO_CHECKS,
                         PRAction.SKIP_QUEUED,
