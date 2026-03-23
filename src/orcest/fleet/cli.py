@@ -286,13 +286,18 @@ def _wait_for_cloud_init(
         return False
 
 
-def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess[str]:
-    """Run a command over SSH and return the result."""
+def _ssh_run(host: str, user: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    """Run a command over SSH and return the result.
+
+    Raises:
+        subprocess.TimeoutExpired: if the command does not complete within ``timeout`` seconds.
+    """
     ssh_target = f"{user}@{host}"
     return subprocess.run(
         ["ssh", *_SSH_OPTS, ssh_target, cmd],
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -1265,7 +1270,12 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # Step 7: Clean cloud-init state so clones run fresh cloud-init
     # (clones get per-VM cloud-init userdata from the pool manager)
     console.print("  Cleaning cloud-init state...", end=" ")
-    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo rm -rf /var/lib/cloud/*")
+    try:
+        result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo rm -rf /var/lib/cloud/*")
+    except subprocess.TimeoutExpired:
+        console.print("[red]timed out[/red]")
+        _cleanup_vm()
+        sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
         _cleanup_vm()
@@ -1276,11 +1286,16 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # Clear machine-id so each linked clone gets a unique one on first boot.
     # (The netplan DHCP fix is handled via cloud-init write_files in cloud_init.py.)
     console.print("  Preparing template for cloning...", end=" ")
-    result = _ssh_run(
-        vm_ip,
-        cfg.orchestrator.user,
-        "sudo truncate -s 0 /etc/machine-id && sudo rm -f /var/lib/dbus/machine-id",
-    )
+    try:
+        result = _ssh_run(
+            vm_ip,
+            cfg.orchestrator.user,
+            "sudo truncate -s 0 /etc/machine-id && sudo rm -f /var/lib/dbus/machine-id",
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]timed out[/red]")
+        _cleanup_vm()
+        sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
         _cleanup_vm()
@@ -1292,9 +1307,15 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # writes (commit=30 in the Ubuntu cloud image fstab), which corrupts
     # the venv and other recently-written files on ZFS-backed storage.
     console.print("  Syncing filesystem...", end=" ")
-    result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
+    try:
+        result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync", timeout=120)
+    except subprocess.TimeoutExpired:
+        console.print("[red]timed out[/red]")
+        _cleanup_vm()
+        sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+        _cleanup_vm()
         sys.exit(1)
     console.print("[green]ok[/green]")
 
