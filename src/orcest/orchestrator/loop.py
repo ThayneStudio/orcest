@@ -304,6 +304,7 @@ def _poll_cycle(
                         PRAction.SKIP_QUEUED,
                         PRAction.RETRIGGER_REVIEW,
                         PRAction.RETRIGGER_STALE_CHECKS,
+                        PRAction.ENQUEUE_REBASE,
                     ):
                         continue  # skip PRs that don't need proactive rebase
                     try:
