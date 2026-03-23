@@ -45,6 +45,7 @@ def _setup_gh_defaults(gh_mock):
     """Set sensible default return values for gh mock functions."""
     gh_mock.get_pr_diff.return_value = "diff --git a/foo.py b/foo.py\n+pass"
     gh_mock.get_pr_review_comments.return_value = []
+    gh_mock.get_unresolved_review_threads.return_value = []
     gh_mock.post_comment.return_value = None
 
 
@@ -404,15 +405,17 @@ def test_publish_review_fix_includes_thread_details(
         default_runner="claude",
     )
 
-    # Check thread details appear in the prompt
+    # Check thread details appear in the prompt (including thread IDs)
     assert "src/handler.py" in task.prompt
     assert "55" in task.prompt
+    assert "PRRT_abc" in task.prompt
     assert "alice" in task.prompt
     assert "This function is too long, split it up." in task.prompt
     assert "bob" in task.prompt
     assert "Agreed, especially the parsing logic." in task.prompt
     assert "tests/test_handler.py" in task.prompt
     assert "12" in task.prompt
+    assert "PRRT_def" in task.prompt
     assert "Missing edge case test for empty input." in task.prompt
 
 
@@ -439,6 +442,8 @@ def test_publish_review_fix_resolve_instructions(
     )
 
     assert "resolve" in task.prompt.lower()
+    assert "gh api graphql" in task.prompt
+    assert "resolveReviewThread" in task.prompt
     assert "Do NOT call `gh pr review" in task.prompt
 
 
@@ -898,16 +903,18 @@ def test_publish_ci_fix_includes_inline_review_comments(
     gh_mock,
     fake_redis_client,
 ):
-    """When CI failures are present, inline review comments from
-    get_pr_review_comments are fetched and included in the prompt."""
+    """When CI failures are present, unresolved review threads are fetched
+    via GraphQL and included in the prompt."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
-    gh_mock.get_pr_review_comments.return_value = [
+    gh_mock.get_unresolved_review_threads.return_value = [
         {
+            "id": "PRRT_foo42",
             "path": "src/foo.py",
             "line": 42,
-            "author": "reviewer",
-            "body": "fix this variable on line 42",
+            "comments": [
+                {"author": "reviewer", "body": "fix this variable on line 42"},
+            ],
         },
     ]
     ci_failures = [
@@ -927,41 +934,41 @@ def test_publish_ci_fix_includes_inline_review_comments(
         default_runner="claude",
     )
 
-    # get_pr_review_comments should be called for CI fix tasks
-    gh_mock.get_pr_review_comments.assert_called_once_with("test-org/test-repo", 700, "fake-token")
-    # Inline comment content should appear in the prompt
+    # get_unresolved_review_threads should be called for CI fix tasks
+    gh_mock.get_unresolved_review_threads.assert_called_once_with(
+        "test-org/test-repo", 700, "fake-token"
+    )
+    # Review thread content should appear in the prompt
     assert "src/foo.py" in task.prompt
     assert "42" in task.prompt
     assert "fix this variable on line 42" in task.prompt
     assert "reviewer" in task.prompt
 
 
-def test_publish_ci_fix_multiple_inline_comments_same_line(
+def test_publish_ci_fix_multiple_review_threads(
     gh_mock,
     fake_redis_client,
 ):
-    """Multiple inline comments on the same (path, line) are grouped into
-    a single thread entry."""
+    """Multiple review threads from GraphQL are included in the prompt."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
-    gh_mock.get_pr_review_comments.return_value = [
+    gh_mock.get_unresolved_review_threads.return_value = [
         {
+            "id": "PRRT_t1",
             "path": "src/bar.py",
             "line": 10,
-            "author": "alice",
-            "body": "First comment on this line",
+            "comments": [
+                {"author": "alice", "body": "First comment on this line"},
+                {"author": "bob", "body": "Second comment on this line"},
+            ],
         },
         {
-            "path": "src/bar.py",
-            "line": 10,
-            "author": "bob",
-            "body": "Second comment on this line",
-        },
-        {
+            "id": "PRRT_t2",
             "path": "src/bar.py",
             "line": 20,
-            "author": "alice",
-            "body": "Comment on a different line",
+            "comments": [
+                {"author": "alice", "body": "Comment on a different line"},
+            ],
         },
     ]
     ci_failures = [
@@ -981,21 +988,21 @@ def test_publish_ci_fix_multiple_inline_comments_same_line(
         default_runner="claude",
     )
 
-    # All three comment bodies should appear in the prompt
+    # All comment bodies should appear in the prompt
     assert "First comment on this line" in task.prompt
     assert "Second comment on this line" in task.prompt
     assert "Comment on a different line" in task.prompt
 
 
-def test_publish_ci_fix_graceful_on_inline_comment_fetch_failure(
+def test_publish_ci_fix_graceful_on_review_thread_fetch_failure(
     gh_mock,
     fake_redis_client,
 ):
-    """If get_pr_review_comments raises, task creation still succeeds
+    """If get_unresolved_review_threads raises, task creation still succeeds
     and the prompt still includes CI failure info."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = ""
-    gh_mock.get_pr_review_comments.side_effect = GhCliError(
+    gh_mock.get_unresolved_review_threads.side_effect = GhCliError(
         "gh command failed (exit 1): not found", stderr="not found"
     )
     ci_failures = [
@@ -1020,12 +1027,12 @@ def test_publish_ci_fix_graceful_on_inline_comment_fetch_failure(
     assert "pytest" in task.prompt
 
 
-def test_publish_review_fix_does_not_call_get_pr_review_comments(
+def test_publish_review_fix_uses_pr_state_threads(
     gh_mock,
     fake_redis_client,
 ):
-    """When there are no CI failures, get_pr_review_comments is NOT called.
-    Review feedback comes from pr_state.review_threads (GraphQL path)."""
+    """When there are no CI failures, pr_state.review_threads is used directly.
+    No additional GitHub API calls are made for review threads."""
     _setup_gh_defaults(gh_mock)
     threads = _make_sample_threads()
     pr_state = _make_pr_state(
@@ -1042,8 +1049,8 @@ def test_publish_review_fix_does_not_call_get_pr_review_comments(
         default_runner="claude",
     )
 
-    # Should not call get_pr_review_comments — use GraphQL threads instead
-    gh_mock.get_pr_review_comments.assert_not_called()
+    # Should not call get_unresolved_review_threads — use pr_state threads instead
+    gh_mock.get_unresolved_review_threads.assert_not_called()
     # Existing review thread details should still appear
     assert "src/handler.py" in task.prompt
     assert isinstance(task, Task)
