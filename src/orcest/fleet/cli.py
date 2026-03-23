@@ -286,18 +286,18 @@ def _wait_for_cloud_init(
         return False
 
 
-def _ssh_run(host: str, user: str, cmd: str) -> subprocess.CompletedProcess[str]:
+def _ssh_run(host: str, user: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     """Run a command over SSH and return the result.
 
     Raises:
-        subprocess.TimeoutExpired: if the command does not complete within 60 seconds.
+        subprocess.TimeoutExpired: if the command does not complete within ``timeout`` seconds.
     """
     ssh_target = f"{user}@{host}"
     return subprocess.run(
         ["ssh", *_SSH_OPTS, ssh_target, cmd],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=timeout,
     )
 
 
@@ -1274,6 +1274,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo rm -rf /var/lib/cloud/*")
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
+        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
@@ -1293,6 +1294,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         )
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
+        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
@@ -1306,9 +1308,10 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # the venv and other recently-written files on ZFS-backed storage.
     console.print("  Syncing filesystem...", end=" ")
     try:
-        result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
+        result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync", timeout=120)
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
+        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
