@@ -67,64 +67,6 @@ async function findWorkerStream(workerId: string): Promise<string | null> {
 }
 
 /**
- * Get a starting position near the tail of a worker's stream.
- * Returns the entry ID to start reading from (the last 200 entries).
- */
-async function getStreamTailId(
-  workerId: string,
-): Promise<string> {
-  const stream = await findWorkerStream(workerId);
-  if (!stream) return "0-0";
-  try {
-    // Read the last 200 entries in reverse, take the oldest one's ID as our start
-    const entries = await redis.xrevrange(stream, "+", "-", "COUNT", 200);
-    if (entries.length === 0) return "0-0";
-    // The last entry in xrevrange (oldest of the batch) — start just before it
-    const oldestId = entries[entries.length - 1][0];
-    return oldestId;
-  } catch {
-    return "0-0";
-  }
-}
-
-/**
- * Non-blocking read of worker output using XRANGE.
- */
-async function readWorkerOutputNonBlocking(
-  workerId: string,
-  lastId: string,
-  count = 50
-): Promise<{ entries: Array<{ id: string; line: string }>; lastId: string }> {
-  const stream = await findWorkerStream(workerId);
-  if (!stream) return { entries: [], lastId };
-  try {
-    const startId = lastId === "0-0" ? "-" : `(${lastId}`;
-    const result = await redis.xrange(stream, startId, "+", "COUNT", count);
-    if (!result || result.length === 0) return { entries: [], lastId };
-
-    const entries: Array<{ id: string; line: string }> = [];
-    let newLastId = lastId;
-
-    for (const [entryId, fields] of result) {
-      newLastId = entryId;
-      const fieldMap: Record<string, string> = {};
-      for (let i = 0; i < fields.length; i += 2) {
-        fieldMap[fields[i]] = fields[i + 1];
-      }
-
-      const formatted = formatStreamLine(fieldMap);
-      if (formatted) {
-        entries.push({ id: entryId, line: formatted });
-      }
-    }
-
-    return { entries, lastId: newLastId };
-  } catch {
-    return { entries: [], lastId };
-  }
-}
-
-/**
  * Cache resolved task start IDs — once found, the entry ID doesn't change.
  * Key: `${workerId}:${taskId ?? "latest"}`
  */

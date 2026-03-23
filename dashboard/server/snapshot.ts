@@ -86,12 +86,8 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
       const dlRaw = await redis.xrevrange(dlKey, "+", "-", "COUNT", 5);
       for (const [entryId, fields] of dlRaw) {
         const fieldMap = arrayToMap(fields);
-        let timestampMs: number | null = null;
-        try {
-          timestampMs = parseInt(entryId.split("-")[0], 10);
-        } catch {
-          // ignore
-        }
+        const ms = parseInt(entryId.split("-")[0], 10);
+        const timestampMs: number | null = isNaN(ms) ? null : ms;
         deadLetterEntries.push({
           entry_id: entryId,
           task_type: fieldMap.type || "?",

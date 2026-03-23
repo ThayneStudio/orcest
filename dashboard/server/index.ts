@@ -65,12 +65,8 @@ const snapshotWss = new WebSocketServer({ noServer: true });
 const taskOutputWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-  if (!isAuthorized(req)) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-
+  // Note: DASHBOARD_TOKEN only gates REST API routes — WebSocket clients
+  // do not send credentials, so auth is not enforced on WS upgrades.
   const pathname = new URL(req.url || "", `http://localhost:${PORT}`).pathname;
 
   if (pathname === "/ws/snapshot") {
@@ -87,35 +83,42 @@ server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
 });
 
 // --- Snapshot WebSocket ---
+// Single shared refresh loop: all connected clients get the same data,
+// fetched once per interval regardless of how many clients are connected.
+
+let sharedSnapshotMsg: string | null = null;
+let snapshotInFlight = false;
+
+async function refreshSharedSnapshot(): Promise<void> {
+  if (snapshotInFlight) return;
+  snapshotInFlight = true;
+  try {
+    const snapshot = await fetchSnapshot();
+    const stuckTasks = await detectStuck(snapshot);
+    const workers = await discoverWorkers();
+    const msg: DashboardMessage = { snapshot, stuck_tasks: stuckTasks, workers };
+    sharedSnapshotMsg = JSON.stringify(msg);
+    for (const client of snapshotWss.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(sharedSnapshotMsg);
+      }
+    }
+  } catch (err) {
+    console.error("Error refreshing snapshot:", err);
+  } finally {
+    snapshotInFlight = false;
+  }
+}
+
+setInterval(refreshSharedSnapshot, 2000);
 
 snapshotWss.on("connection", (ws) => {
-  let inFlight = false;
-
-  const sendSnapshot = async () => {
-    if (ws.readyState !== WebSocket.OPEN || inFlight) return;
-    inFlight = true;
-    try {
-      const snapshot = await fetchSnapshot();
-      const stuckTasks = await detectStuck(snapshot);
-      const workers = await discoverWorkers();
-      const msg: DashboardMessage = {
-        snapshot,
-        stuck_tasks: stuckTasks,
-        workers,
-      };
-      ws.send(JSON.stringify(msg));
-    } catch (err) {
-      console.error("Error sending snapshot:", err);
-    } finally {
-      inFlight = false;
-    }
-  };
-
-  sendSnapshot();
-  const interval = setInterval(sendSnapshot, 2000);
-
-  ws.on("close", () => clearInterval(interval));
-  ws.on("error", () => clearInterval(interval));
+  // Send current cached snapshot immediately if available; otherwise trigger a fetch
+  if (sharedSnapshotMsg) {
+    ws.send(sharedSnapshotMsg);
+  } else {
+    refreshSharedSnapshot();
+  }
 });
 
 // --- Task Output WebSocket ---
@@ -136,6 +139,7 @@ taskOutputWss.on("connection", (ws, req) => {
   let initialized = false;
   let taskDone = false;
   let inFlight = false;
+  let interval: ReturnType<typeof setInterval>;
 
   const poll = async () => {
     if (ws.readyState !== WebSocket.OPEN || taskDone || inFlight) return;
@@ -165,6 +169,7 @@ taskOutputWss.on("connection", (ws, req) => {
       }
       if (result.done) {
         taskDone = true;
+        clearInterval(interval);
       }
     } catch (err) {
       console.error("Error reading task output:", err);
@@ -174,7 +179,7 @@ taskOutputWss.on("connection", (ws, req) => {
   };
 
   poll();
-  const interval = setInterval(poll, 500);
+  interval = setInterval(poll, 500);
 
   ws.on("close", () => clearInterval(interval));
   ws.on("error", () => clearInterval(interval));
