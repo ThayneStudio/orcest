@@ -575,58 +575,6 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     return results
 
 
-def get_pr_review_comments(repo: str, number: int, token: str) -> list[dict]:
-    """Get inline review comments for a PR.
-
-    Uses the /pulls/{number}/comments REST endpoint to fetch line-specific
-    review comments left by reviewers. Unlike get_unresolved_review_threads,
-    this returns all inline comments (not just unresolved ones) and uses the
-    REST API rather than GraphQL.
-
-    Fetches all pages of results using --paginate.
-
-    Returns list of dicts with keys: path, line, author, body.
-    """
-    _validate_repo(repo)
-    output = _run_gh(
-        [
-            "api",
-            "--method",
-            "GET",
-            "--paginate",
-            f"repos/{repo}/pulls/{number}/comments",
-            "-F",
-            "per_page=100",  # fetch 100 per page for efficiency
-        ],
-        token,
-    )
-    if not output:
-        return []
-    # --paginate concatenates one JSON array per page: [page1][page2]...
-    # Parse all pages and flatten into a single list.
-    comments: list[dict] = []
-    decoder = json.JSONDecoder()
-    idx = 0
-    text = output.strip()
-    while idx < len(text):
-        page, end_idx = decoder.raw_decode(text, idx)
-        comments.extend(page)
-        idx = end_idx
-        while idx < len(text) and text[idx].isspace():
-            idx += 1
-    results = []
-    for comment in comments:
-        line = comment.get("line")
-        results.append(
-            {
-                "path": comment.get("path", ""),
-                "line": line if line is not None else comment.get("original_line"),
-                "author": (comment.get("user") or {}).get("login", ""),
-                "body": comment.get("body", ""),
-            }
-        )
-    return results
-
 
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
     """List open issues with a specific label.

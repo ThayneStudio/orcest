@@ -642,24 +642,6 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
-def _group_inline_comments(comments: list[dict]) -> list[dict]:
-    """Group flat inline review comments by (path, line) into thread-like dicts.
-
-    Input dicts have keys: path, line, author, body (as returned by
-    gh.get_pr_review_comments). Output dicts match the format expected by
-    _render_review_threads: {path, line, comments: [{author, body}]}.
-    """
-    groups: dict[tuple, list[dict]] = {}
-    for c in comments:
-        key = (c.get("path", ""), c.get("line"))
-        if key not in groups:
-            groups[key] = []
-        groups[key].append({"author": c.get("author", ""), "body": c.get("body", "")})
-    return [
-        {"path": path, "line": line, "comments": thread_comments}
-        for (path, line), thread_comments in groups.items()
-    ]
-
 
 def _render_issue_prompt(
     issue_number: int,

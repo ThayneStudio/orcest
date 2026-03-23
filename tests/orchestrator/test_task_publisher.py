@@ -44,7 +44,6 @@ def _make_pr_state(
 def _setup_gh_defaults(gh_mock):
     """Set sensible default return values for gh mock functions."""
     gh_mock.get_pr_diff.return_value = "diff --git a/foo.py b/foo.py\n+pass"
-    gh_mock.get_pr_review_comments.return_value = []
     gh_mock.get_unresolved_review_threads.return_value = []
     gh_mock.post_comment.return_value = None
 
@@ -1055,39 +1054,6 @@ def test_publish_review_fix_uses_pr_state_threads(
     assert "src/handler.py" in task.prompt
     assert isinstance(task, Task)
 
-
-def test_group_inline_comments_direct():
-    """Direct tests for _group_inline_comments: groups by (path, line)."""
-    from orcest.orchestrator.task_publisher import _group_inline_comments
-
-    comments = [
-        {"path": "a.py", "line": 1, "author": "u1", "body": "first"},
-        {"path": "a.py", "line": 1, "author": "u2", "body": "second"},
-        {"path": "b.py", "line": 5, "author": "u1", "body": "third"},
-    ]
-    threads = _group_inline_comments(comments)
-
-    # Should produce two thread groups
-    assert len(threads) == 2
-
-    # Find the a.py group
-    a_thread = next(t for t in threads if t["path"] == "a.py")
-    assert a_thread["line"] == 1
-    assert len(a_thread["comments"]) == 2
-    assert {"author": "u1", "body": "first"} in a_thread["comments"]
-    assert {"author": "u2", "body": "second"} in a_thread["comments"]
-
-    # Find the b.py group
-    b_thread = next(t for t in threads if t["path"] == "b.py")
-    assert b_thread["line"] == 5
-    assert b_thread["comments"] == [{"author": "u1", "body": "third"}]
-
-
-def test_group_inline_comments_empty():
-    """_group_inline_comments returns empty list for empty input."""
-    from orcest.orchestrator.task_publisher import _group_inline_comments
-
-    assert _group_inline_comments([]) == []
 
 
 # --- increment_attempts failure: Option A early-return behavior ---
