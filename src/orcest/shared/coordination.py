@@ -198,7 +198,10 @@ def set_backoff_cooldown(redis_client: RedisClient, repo: str, number: int, step
 
 
 def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int | None:
-    """Get the current backoff step. Returns None if not in backoff (cooldown expired or never set)."""
+    """Get the current backoff step.
+
+    Returns None if not in backoff (cooldown expired or never set).
+    """
     key = f"backoff:pr:{repo}:{number}"
     val = redis_client.get(key)
     if val is None:
