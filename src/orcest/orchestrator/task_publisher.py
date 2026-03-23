@@ -360,9 +360,7 @@ def publish_fix_task(
     # so we get thread IDs for resolution.
     if pr_state.ci_failures:
         try:
-            review_threads = gh.get_unresolved_review_threads(
-                repo, pr_state.number, token
-            )
+            review_threads = gh.get_unresolved_review_threads(repo, pr_state.number, token)
         except Exception as exc:
             _log.warning(
                 "Failed to fetch review threads for PR #%s; proceeding without them: %s",
@@ -900,8 +898,7 @@ def _render_fix_prompt(
         sections.append("Address the review feedback above. For each thread:")
         sections.append("- If it requests a code change, make the fix.")
         sections.append(
-            "- If it is purely positive feedback or has no actionable request, "
-            "skip it."
+            "- If it is purely positive feedback or has no actionable request, skip it."
         )
         sections.append(
             "- After handling each thread, resolve it with:\n"
