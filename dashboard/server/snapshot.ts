@@ -140,10 +140,16 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
           consumers: Number(g.consumers || 0),
           pending: Number(g.pending || 0),
         });
-        // Keep the highest last-delivered-id across all groups on this stream
+        // Keep the highest last-delivered-id across all groups on this stream.
+        // Compare numerically — stream IDs are "<ms>-<seq>" and string comparison
+        // fails when sequence numbers have different digit counts.
         const lastId = String(g["last-delivered-id"] || "0-0");
         const current = streamLastDeliveredId.get(stream) || "0-0";
-        if (lastId > current) streamLastDeliveredId.set(stream, lastId);
+        const [lastMs, lastSeq] = lastId.split("-").map(Number);
+        const [curMs, curSeq] = current.split("-").map(Number);
+        if (lastMs > curMs || (lastMs === curMs && lastSeq > curSeq)) {
+          streamLastDeliveredId.set(stream, lastId);
+        }
       }
     } catch {
       // Stream has no consumer groups
@@ -178,8 +184,14 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
       // ignore
     }
   }
-  // Sort by entry ID descending (most recent first) and trim
-  resultEntries.sort((a, b) => (a.entryId > b.entryId ? -1 : a.entryId < b.entryId ? 1 : 0));
+  // Sort by entry ID descending (most recent first) and trim.
+  // Stream IDs are "<ms>-<seq>" — use numeric comparison to avoid string-comparison bugs
+  // (e.g., "9" > "10" lexicographically).
+  resultEntries.sort((a, b) => {
+    const [aMs, aSeq] = a.entryId.split("-").map(Number);
+    const [bMs, bSeq] = b.entryId.split("-").map(Number);
+    return bMs - aMs || bSeq - aSeq;
+  });
   const recentResults = resultEntries.slice(0, maxResults).map((e) => e.result);
 
   // Attempt counters — keys are prefixed: orcest:pr:*:attempts, transit-platform:pr:*:attempts
@@ -190,12 +202,16 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
     if (key.includes(":total_attempts")) continue;
     const data = await redis.hgetall(key);
     if (data && data.count) {
-      // Key format: prefix:pr:repo:number:attempts — extract PR number (last segment)
+      // Key format: prefix:pr:repo:number:attempts — extract repo and PR number.
+      // After stripping ":attempts", the PR number is the last segment,
+      // and the repo is everything between "pr:" and the number.
       const parts = key.replace(/:attempts$/, "").split(":");
       const prNum = parts[parts.length - 1];
+      // parts[0] = prefix, parts[1] = "pr", parts[2..n-1] = repo segments, parts[n] = number
+      const repo = parts.slice(2, -1).join("/");
       const count = parseInt(data.count, 10);
       if (!isNaN(count)) {
-        attemptCounts[`PR #${prNum}`] = count;
+        attemptCounts[`${repo} PR #${prNum}`] = count;
       }
     }
   }
@@ -204,7 +220,9 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
   const queuedTasks: QueuedTask[] = [];
   for (const stream of taskStreamKeys) {
     try {
-      // Start after the highest last-delivered-id so we skip in-progress/completed tasks
+      // Start after the highest last-delivered-id so we skip in-progress/completed tasks.
+      // NOTE: COUNT 50 caps the entries returned for performance; the true queue depth
+      // is available in queue_depths (from XLEN) and may be larger.
       const lastDeliveredId = streamLastDeliveredId.get(stream);
       const startId = lastDeliveredId && lastDeliveredId !== "0-0" ? `(${lastDeliveredId}` : "-";
       const entries = await redis.xrange(stream, startId, "+", "COUNT", 50);

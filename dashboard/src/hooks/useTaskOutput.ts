@@ -63,7 +63,6 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
           doneRef.current = true;
           setState((prev) => ({ ...prev, done: true }));
         }
-        if (msg.done) doneRef.current = true;
       } catch {
         // ignore
       }

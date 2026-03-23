@@ -1,7 +1,7 @@
 import { redis, scanKeys } from "./redis.js";
 import type { SystemSnapshot, StuckTask } from "./types.js";
 
-const LOCK_TTL = 180; // seconds — matches Python LOCK_TTL
+const LOCK_TTL = 180; // seconds — must match Python LOCK_TTL in src/orcest/worker/loop.py
 const MAX_PER_SHA_ATTEMPTS = 3;
 
 export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]> {
@@ -24,7 +24,7 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
 
     if (!lockExists) {
       const ttl = await redis.ttl(key);
-      if (ttl === -1 || (ttl > 0 && ttl < 1200)) {
+      if (ttl === -1 || (ttl > 0 && ttl < 1200)) {  // 1200s = 20 min — maximum expected pending lifetime
         stuck.push({
           resource_type: resourceType,
           resource_id: resourceId,
@@ -38,18 +38,21 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
   }
 
   // 2. High attempt counts
+  // Label format: "owner/repo PR #N" — extract just the PR number for resource_id
   for (const [label, count] of Object.entries(snapshot.attempt_counts)) {
+    const prMatch = label.match(/PR #(\d+)$/);
+    const resourceId = prMatch ? prMatch[1] : label;
     if (count >= MAX_PER_SHA_ATTEMPTS) {
       stuck.push({
         resource_type: "pr",
-        resource_id: label.replace("PR #", ""),
+        resource_id: resourceId,
         reason: `Attempt count at max (${count}/${MAX_PER_SHA_ATTEMPTS})`,
         severity: "critical",
       });
     } else if (count >= MAX_PER_SHA_ATTEMPTS - 1) {
       stuck.push({
         resource_type: "pr",
-        resource_id: label.replace("PR #", ""),
+        resource_id: resourceId,
         reason: `Attempt count near max (${count}/${MAX_PER_SHA_ATTEMPTS})`,
         severity: "warning",
       });

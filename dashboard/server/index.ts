@@ -19,6 +19,9 @@ function isAuthorized(req: IncomingMessage): boolean {
   if (!DASHBOARD_TOKEN) return true;
   const auth = (req as { headers: Record<string, string | string[] | undefined> }).headers.authorization;
   if (typeof auth === "string" && auth.startsWith("Bearer ") && auth.slice(7) === DASHBOARD_TOKEN) return true;
+  // Fallback to query-param token for WebSocket connections — browsers cannot
+  // set custom headers (Authorization) on the WebSocket handshake request,
+  // so the token must be passed as a query parameter instead.
   const url = new URL(req.url || "", `http://localhost:${PORT}`);
   if (url.searchParams.get("token") === DASHBOARD_TOKEN) return true;
   return false;
