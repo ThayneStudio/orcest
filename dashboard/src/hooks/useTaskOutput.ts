@@ -32,6 +32,8 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const qs = new URLSearchParams({ worker_id: params.workerId });
     if (params.taskId) qs.set("task_id", params.taskId);
+    const token = new URLSearchParams(window.location.search).get("token");
+    if (token) qs.set("token", token);
     const ws = new WebSocket(
       `${protocol}//${window.location.host}/ws/task-output?${qs}`
     );

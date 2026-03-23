@@ -65,8 +65,11 @@ const snapshotWss = new WebSocketServer({ noServer: true });
 const taskOutputWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-  // Note: DASHBOARD_TOKEN only gates REST API routes — WebSocket clients
-  // do not send credentials, so auth is not enforced on WS upgrades.
+  if (!isAuthorized(req)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
   const pathname = new URL(req.url || "", `http://localhost:${PORT}`).pathname;
 
   if (pathname === "/ws/snapshot") {
@@ -166,6 +169,8 @@ taskOutputWss.on("connection", (ws, req) => {
           done: result.done,
         };
         ws.send(JSON.stringify(msg));
+      } else if (result.done) {
+        ws.send(JSON.stringify({ lines: [], last_id: lastId, done: true } satisfies TaskOutputMessage));
       }
       if (result.done) {
         taskDone = true;

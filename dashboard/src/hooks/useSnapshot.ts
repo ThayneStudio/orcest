@@ -24,7 +24,11 @@ export function useSnapshot(): SnapshotState {
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/snapshot`);
+    const qs = new URLSearchParams();
+    const token = new URLSearchParams(window.location.search).get("token");
+    if (token) qs.set("token", token);
+    const qsStr = qs.toString();
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/snapshot${qsStr ? `?${qsStr}` : ""}`);
     wsRef.current = ws;
 
     ws.onopen = () => {

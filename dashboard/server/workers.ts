@@ -68,8 +68,10 @@ async function findWorkerStream(workerId: string): Promise<string | null> {
 
 /**
  * Cache resolved task start IDs — once found, the entry ID doesn't change.
- * Key: `${workerId}:${taskId ?? "latest"}`
+ * Key: `${workerId}:${taskId}` (never caches the "latest" case)
+ * Capped at 500 entries to prevent unbounded growth.
  */
+const TASK_START_CACHE_MAX = 500;
 const taskStartCache = new Map<string, string>();
 
 /**
@@ -104,7 +106,13 @@ export async function findTaskStartId(
 
         if (fieldMap.type === "task_start") {
           if (!taskId || fieldMap.task_id === taskId) {
-            if (cacheKey) taskStartCache.set(cacheKey, entryId);
+            if (cacheKey) {
+              if (taskStartCache.size >= TASK_START_CACHE_MAX) {
+                const firstKey = taskStartCache.keys().next().value;
+                if (firstKey !== undefined) taskStartCache.delete(firstKey);
+              }
+              taskStartCache.set(cacheKey, entryId);
+            }
             return entryId;
           }
         }
