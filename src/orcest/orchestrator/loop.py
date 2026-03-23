@@ -293,8 +293,13 @@ def _poll_cycle(
                         PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
                         PRAction.SKIP_ACTIVE,
                         PRAction.SKIP_LOCKED,
+                        PRAction.SKIP_DRAFT,
+                        PRAction.ENQUEUE_FIX,
+                        PRAction.ENQUEUE_FOLLOWUP,
+                        PRAction.SKIP_BACKOFF,
+                        PRAction.SKIP_USAGE_COOLDOWN,
                     ):
-                        continue  # skip terminal states and in-flight PRs
+                        continue  # skip terminal states, in-flight PRs, drafts, and cooldowns
                     try:
                         publish_rebase_task(
                             pr_state=other_pr,

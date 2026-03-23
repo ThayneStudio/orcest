@@ -763,11 +763,15 @@ def _render_rebase_prompt(
     base_branch: str = "main",
 ) -> str:
     """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
+    if merge_error:
+        preamble = "This PR has merge conflicts that prevent it from being merged."
+    else:
+        preamble = "Rebase this PR proactively onto the latest base branch after an upstream merge."
     sections: list[str] = [
         f"# Rebase PR #{pr_number}: {pr_title}",
         "",
         f"You are on branch `{branch}`.",
-        "This PR has merge conflicts that prevent it from being merged.",
+        preamble,
         "",
     ]
 
