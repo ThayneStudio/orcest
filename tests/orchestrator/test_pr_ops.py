@@ -28,7 +28,12 @@ from orcest.orchestrator.pr_ops import (
     set_review_retrigger_sha,
     set_usage_exhausted_cooldown,
 )
-from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
+from orcest.shared.coordination import (
+    get_backoff_step,
+    make_pending_task_key,
+    make_pr_lock_key,
+    set_backoff_cooldown,
+)
 
 REPO = "test-org/test-repo"
 
@@ -1109,11 +1114,19 @@ def test_no_skip_usage_cooldown_when_not_set(gh_mock, fake_redis_client, label_c
 # ---------------------------------------------------------------------------
 
 
-def test_total_attempts_circuit_breaker(gh_mock, fake_redis_client, label_config):
-    """A PR exceeding max_total_attempts is classified as SKIP_MAX_TOTAL_ATTEMPTS."""
+def test_total_attempts_backoff_first_hit_falls_through(gh_mock, fake_redis_client, label_config):
+    """A PR first exceeding max_total_attempts sets backoff cooldown and falls through.
+
+    On the first poll after hitting the limit, the PR sets a backoff cooldown,
+    clears per-SHA attempts, and falls through to normal CI/review routing
+    (allowing one more retry round).
+    """
     pr_number = 700
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
     ]
     # Set total attempts to the limit
     for _ in range(10):
@@ -1128,7 +1141,36 @@ def test_total_attempts_circuit_breaker(gh_mock, fake_redis_client, label_config
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    # Falls through to normal routing — CI failure detected
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    # Backoff cooldown was set
+    assert get_backoff_step(fake_redis_client, REPO, pr_number) is not None
+    # Per-SHA attempts were cleared
+    assert get_attempt_count(fake_redis_client, REPO, pr_number, "") == 0
+
+
+def test_total_attempts_backoff_in_cooldown(gh_mock, fake_redis_client, label_config):
+    """A PR in backoff cooldown is classified as SKIP_BACKOFF."""
+    pr_number = 701
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    # Set total attempts above the limit
+    for _ in range(10):
+        increment_total_attempts(fake_redis_client, REPO, pr_number)
+    # Set an active backoff cooldown
+    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=0)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_total_attempts=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_BACKOFF
     gh_mock.get_ci_status.assert_not_called()
 
 
@@ -1180,20 +1222,20 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
     assert results[0].action == PRAction.ENQUEUE_FIX
 
 
-def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client, label_config):
-    """When exhausted_notified flag is NOT set and total_attempts >= limit, PR is skipped.
+def test_total_attempts_backoff_no_flag_sets_cooldown(gh_mock, fake_redis_client, label_config):
+    """When total_attempts >= limit and no backoff cooldown active, cooldown is set.
 
-    This is the first-time exhaustion case: the orchestrator hasn't yet posted the
-    notification, so we return SKIP_MAX_TOTAL_ATTEMPTS (loop.py will add the label
-    and set the flag).
+    This is the first-time exhaustion case: the PR sets a backoff cooldown
+    and falls through to normal routing. The total attempt counter is preserved.
     """
     pr_number = 740
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
     ]
+    gh_mock.get_ci_status.return_value = []
     for _ in range(10):
         increment_total_attempts(fake_redis_client, REPO, pr_number)
-    # No exhausted_notified flag set
+    # No backoff cooldown set
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1204,9 +1246,12 @@ def test_total_attempts_circuit_breaker_no_flag_skip(gh_mock, fake_redis_client,
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    # Falls through to normal routing (SKIP_NO_CHECKS with empty CI)
+    assert results[0].action == PRAction.SKIP_NO_CHECKS
     # Counter was NOT reset
     assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 10
+    # Backoff cooldown was set
+    assert get_backoff_step(fake_redis_client, REPO, pr_number) is not None
 
 
 def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
@@ -1253,7 +1298,7 @@ def test_total_attempts_no_recovery_when_needs_human_label_still_present(
     SKIP_LABELED fires first (needs_human is in terminal_labels), so the PR
     never reaches the circuit-breaker block.  This test documents that invariant:
     counters are not cleared, and the result is SKIP_LABELED, not
-    SKIP_MAX_TOTAL_ATTEMPTS.
+    SKIP_BACKOFF.
     """
     pr_number = 751
     gh_mock.list_open_prs.return_value = [

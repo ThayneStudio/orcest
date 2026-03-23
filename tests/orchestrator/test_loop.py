@@ -18,7 +18,6 @@ from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
     get_attempt_count,
-    get_exhausted_notified,
     get_total_attempt_count,
     has_usage_exhausted_cooldown,
     increment_attempts,
@@ -264,14 +263,14 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
     assert str(orchestrator_config.max_attempts) in comment_body
 
 
-def test_poll_cycle_skip_max_total_attempts_labels_and_sets_flag(
+def test_poll_cycle_skip_backoff_no_label_no_comment(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """SKIP_MAX_TOTAL_ATTEMPTS adds needs-human label, posts comment, and sets exhausted flag."""
-    pr_state = _make_pr_state(number=51, action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS)
+    """SKIP_BACKOFF simply logs — no labels added, no comments posted."""
+    pr_state = _make_pr_state(number=51, action=PRAction.SKIP_BACKOFF)
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -284,22 +283,10 @@ def test_poll_cycle_skip_max_total_attempts_labels_and_sets_flag(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
 
-    # Should add needs-human label
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        51,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    # Should post a comment about exhausted total retry budget
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "exhausted" in comment_body
-    assert str(orchestrator_config.max_total_attempts) in comment_body
-    assert "Remove the" in comment_body
-
-    # Should set the exhausted_notified flag so label-removal recovery works
-    assert get_exhausted_notified(fake_redis_client, orchestrator_config.github.repo, 51)
+    # No labels should be added
+    gh_mock.add_label.assert_not_called()
+    # No comments should be posted
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):

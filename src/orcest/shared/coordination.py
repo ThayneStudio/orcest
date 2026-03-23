@@ -173,3 +173,39 @@ def clear_pending_task(
     """Clear the pending task marker for a resource."""
     key = make_pending_task_key(repo, resource_type, resource_id)
     redis_client.delete(key)
+
+
+# ---------------------------------------------------------------------------
+# Fibonacci-inspired backoff for total-attempt circuit breaker
+# ---------------------------------------------------------------------------
+
+# Cooldown durations in seconds, roughly following a Fibonacci progression
+# and capping at 2 hours (7200s).
+_BACKOFF_COOLDOWNS_SECONDS = [300, 300, 600, 900, 1500, 2400, 3900, 7200]
+
+
+def get_backoff_cooldown_seconds(step: int) -> int:
+    """Get cooldown duration for the given backoff step (0-indexed)."""
+    return _BACKOFF_COOLDOWNS_SECONDS[min(step, len(_BACKOFF_COOLDOWNS_SECONDS) - 1)]
+
+
+def set_backoff_cooldown(redis_client: RedisClient, repo: str, number: int, step: int) -> None:
+    """Set a backoff cooldown for a PR. The key expires after the cooldown duration."""
+    cooldown = get_backoff_cooldown_seconds(step)
+    key = f"backoff:pr:{repo}:{number}"
+    redis_client.set_ex(key, str(step), ttl=cooldown)
+
+
+def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int | None:
+    """Get the current backoff step. Returns None if not in backoff (cooldown expired or never set)."""
+    key = f"backoff:pr:{repo}:{number}"
+    val = redis_client.get(key)
+    if val is None:
+        return None
+    return int(val)
+
+
+def clear_backoff(redis_client: RedisClient, repo: str, number: int) -> None:
+    """Clear backoff state (e.g. when a new commit is pushed)."""
+    key = f"backoff:pr:{repo}:{number}"
+    redis_client.delete(key)

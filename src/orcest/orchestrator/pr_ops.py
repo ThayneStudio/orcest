@@ -14,7 +14,13 @@ from enum import Enum
 
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
-from orcest.shared.coordination import make_pending_task_key, make_pr_lock_key
+from orcest.shared.coordination import (
+    clear_backoff,
+    get_backoff_step,
+    make_pending_task_key,
+    make_pr_lock_key,
+    set_backoff_cooldown,
+)
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,7 @@ class PRAction(str, Enum):
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
+    SKIP_BACKOFF = "skip_backoff"  # In fibonacci backoff cooldown after total attempts exceeded
 
 
 @dataclass
@@ -506,64 +513,71 @@ def discover_actionable_prs(
             )
             continue
 
-        # Skip if total cross-SHA attempt limit exceeded (circuit breaker).
-        # Check this before the usage cooldown so the circuit-breaker state is
-        # visible immediately rather than being masked for 30 minutes.
+        # Fibonacci backoff when total cross-SHA attempt limit is exceeded.
+        # Instead of permanently labeling needs-human, we enter a cooldown
+        # that increases with each cycle past the limit (5m, 5m, 10m, 15m,
+        # 25m, 40m, 65m, 2h cap). This lets stubborn PRs keep retrying
+        # with decreasing frequency.
         #
         # Recovery path: if the exhausted_notified flag is set and the
         # needs-human label is gone, reset the counters and fall through to
         # normal processing. Any actor (human or automation) that removes the
-        # label is treated as approval — the code cannot distinguish between
-        # deliberate human intent and automated label removal.
+        # label is treated as approval.
         # Note: the label is *not* re-checked here because needs_human is in
         # terminal_labels — any PR still carrying it is caught by SKIP_LABELED
         # above and never reaches this block.
-        # TTL cliff prevention: exhausted_notified has a 30-day TTL. The SKIP_LABELED
-        # block above refreshes the flag on every poll while the needs-human label is
-        # present, so the flag stays live as long as the label is there.
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
             if get_exhausted_notified(redis, repo, number):
                 # exhausted_notified is set and needs-human label is absent (inferred
                 # via SKIP_LABELED invariant above); treat as retry signal and reset.
-                # The three deletes are intentionally non-atomic. A crash between steps
-                # leaves a partial reset, but the ordering is chosen to minimise the
-                # window where SKIP_ACTIVE can fire spuriously:
-                #   - After step 1 (total=0, sha=max, exhausted=1): next poll skips the
-                #     circuit-breaker block (total < max) but SKIP_ACTIVE fires. Window
-                #     is narrower than before because exhausted_notified is still present
-                #     and harmless (only read inside the total >= max guard).
-                #   - After step 2 (total=0, sha=0, exhausted=1): next poll skips the
-                #     circuit-breaker block entirely and the stale exhausted_notified flag
-                #     is a harmless orphan — normal processing proceeds.
-                # clear_exhausted_notified is last so its removal is the final
-                # confirmation that the full reset succeeded.
                 clear_total_attempts(redis, repo, number)
                 clear_attempts(redis, repo, number)
                 clear_exhausted_notified(redis, repo, number)
+                clear_backoff(redis, repo, number)
                 logger.info(
                     "PR #%d: exhausted_notified set and needs-human label absent"
                     " (inferred via SKIP_LABELED invariant);"
                     " resetting total attempt counter, exhausted_notified flag,"
-                    " and per-SHA attempt counter for retry",
+                    " backoff state, and per-SHA attempt counter for retry",
                     number,
                 )
                 # Fall through to normal processing (all Redis counters now reset).
             else:
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
+                # Calculate backoff step: how many full cycles past the limit
+                step = (total_attempts - max_total_attempts) // max_total_attempts
+                current_step = get_backoff_step(redis, repo, number)
+                if current_step is not None:
+                    # Still in cooldown — skip this PR
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_BACKOFF,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
                     )
-                )
-                continue
+                    continue
+                else:
+                    # Cooldown expired or first time hitting the limit.
+                    # Set a new cooldown, clear per-SHA attempts so the PR
+                    # can be retried, and fall through to normal routing.
+                    set_backoff_cooldown(redis, repo, number, step)
+                    clear_attempts(redis, repo, number)
+                    logger.info(
+                        "PR #%d: total attempts (%d) >= limit (%d), "
+                        "backoff step %d, clearing per-SHA attempts for retry",
+                        number,
+                        total_attempts,
+                        max_total_attempts,
+                        step,
+                    )
+                    # Fall through to normal processing for one more round.
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).
@@ -587,6 +601,14 @@ def discover_actionable_prs(
                 )
             )
             continue
+
+        # Clear backoff state when a new SHA is pushed, since new context
+        # makes the previous backoff cycle irrelevant. We detect this by
+        # checking the stored SHA in the per-SHA attempt counter before
+        # get_attempt_count resets it.
+        stored_sha_data = redis.hgetall(_make_attempts_key(repo, number))
+        if stored_sha_data and stored_sha_data.get("head_sha", "") != head_sha:
+            clear_backoff(redis, repo, number)
 
         # Skip if previously attempted on this SHA (awaiting new commits)
         # or max attempts reached.

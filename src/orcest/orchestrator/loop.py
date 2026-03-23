@@ -21,7 +21,6 @@ from orcest.orchestrator.pr_ops import (
     clear_total_attempts,
     discover_actionable_prs,
     get_stale_retrigger_sha,
-    set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
@@ -33,7 +32,7 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
 )
 from orcest.shared.config import OrchestratorConfig
-from orcest.shared.coordination import clear_pending_task, compute_pending_task_ttl
+from orcest.shared.coordination import clear_backoff, clear_pending_task, compute_pending_task_ttl
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -229,6 +228,14 @@ def _poll_cycle(
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_total_attempts for PR #%d",
+                        pr_state.number,
+                        exc_info=True,
+                    )  # Best-effort cleanup; key has TTL anyway
+                try:
+                    clear_backoff(redis, config.github.repo, pr_state.number)
+                except Exception:
+                    logger.debug(
+                        "cleanup failed: clear_backoff for PR #%d",
                         pr_state.number,
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
@@ -587,62 +594,8 @@ def _poll_cycle(
                     e,
                     exc_info=True,
                 )
-        elif pr_state.action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS:
-            logger.warning(
-                "PR #%d: total attempt limit reached (%d), adding needs-human label",
-                pr_state.number,
-                config.max_total_attempts,
-            )
-            labeled = False
-            try:
-                gh.add_label(
-                    config.github.repo,
-                    pr_state.number,
-                    config.labels.needs_human,
-                    config.github.token,
-                )
-                labeled = True
-            except Exception as e:
-                logger.error(
-                    "Failed to label PR #%d as needs-human: %s",
-                    pr_state.number,
-                    e,
-                    exc_info=True,
-                )
-            if labeled:
-                try:
-                    set_exhausted_notified(redis, config.github.repo, pr_state.number)
-                except Exception as e:
-                    logger.error(
-                        "Failed to set exhausted_notified flag for PR #%d: %s",
-                        pr_state.number,
-                        e,
-                        exc_info=True,
-                    )
-            try:
-                label_note = (
-                    f"Labeling as `{config.labels.needs_human}` for manual review."
-                    if labeled
-                    else f"Failed to add `{config.labels.needs_human}` "
-                    f"label — please triage manually."
-                )
-                gh.post_comment(
-                    config.github.repo,
-                    pr_state.number,
-                    f"**orcest** has exhausted its total retry budget "
-                    f"({config.max_total_attempts} attempts across all commits) "
-                    f"for this PR. {label_note}\n\n"
-                    f"Remove the `{config.labels.needs_human}` label to allow "
-                    f"orcest to try again.",
-                    config.github.token,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to comment on PR #%d about max total attempts: %s",
-                    pr_state.number,
-                    e,
-                    exc_info=True,
-                )
+        elif pr_state.action == PRAction.SKIP_BACKOFF:
+            logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_DRAFT:
             logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:
@@ -672,7 +625,6 @@ def _poll_cycle(
             PRAction.ENQUEUE_FOLLOWUP,
             PRAction.ENQUEUE_REBASE,
             PRAction.SKIP_LOCKED,
-            PRAction.SKIP_ACTIVE,
             PRAction.SKIP_QUEUED,
         )
         for pr_state in pr_states

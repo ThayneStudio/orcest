@@ -74,7 +74,7 @@ class OrchestratorConfig:
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
-    max_total_attempts: int = 10  # Max total attempts across all SHAs (circuit breaker)
+    max_total_attempts: int = 25  # Max total attempts across all SHAs (circuit breaker)
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
