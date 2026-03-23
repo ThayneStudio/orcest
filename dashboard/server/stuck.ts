@@ -24,12 +24,14 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
 
     if (!lockExists) {
       const ttl = await redis.ttl(key);
-      if (ttl > 0 && ttl < 1200) {
+      if (ttl === -1 || (ttl > 0 && ttl < 1200)) {
         stuck.push({
           resource_type: resourceType,
           resource_id: resourceId,
-          reason: `Queued but no worker has picked it up (pending TTL: ${ttl}s)`,
-          severity: ttl < 600 ? "critical" : "warning",
+          reason: ttl === -1
+            ? "Queued with no TTL — pending marker will never expire"
+            : `Queued but no worker has picked it up (pending TTL: ${ttl}s)`,
+          severity: ttl === -1 || ttl < 600 ? "critical" : "warning",
         });
       }
     }
