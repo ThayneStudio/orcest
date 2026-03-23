@@ -286,26 +286,8 @@ def _poll_cycle(
                 for other_pr in pr_states:
                     if other_pr.number == pr_state.number:
                         continue  # skip the one we just merged
-                    if other_pr.action in (
-                        PRAction.MERGE,
-                        PRAction.SKIP_LABELED,
-                        PRAction.SKIP_MAX_ATTEMPTS,
-                        PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
-                        PRAction.SKIP_ACTIVE,
-                        PRAction.SKIP_LOCKED,
-                        PRAction.SKIP_DRAFT,
-                        PRAction.ENQUEUE_FIX,
-                        PRAction.ENQUEUE_FOLLOWUP,
-                        PRAction.SKIP_BACKOFF,
-                        PRAction.SKIP_USAGE_COOLDOWN,
-                        PRAction.SKIP_PENDING,
-                        PRAction.SKIP_NO_CHECKS,
-                        PRAction.SKIP_QUEUED,
-                        PRAction.RETRIGGER_REVIEW,
-                        PRAction.RETRIGGER_STALE_CHECKS,
-                        PRAction.ENQUEUE_REBASE,
-                    ):
-                        continue  # skip PRs that don't need proactive rebase
+                    if other_pr.action != PRAction.SKIP_GREEN:
+                        continue  # only proactively rebase green PRs
                     try:
                         publish_rebase_task(
                             pr_state=other_pr,
