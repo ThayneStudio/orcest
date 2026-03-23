@@ -186,7 +186,8 @@ _BACKOFF_COOLDOWNS_SECONDS = [300, 300, 600, 900, 1500, 2400, 3900, 7200]
 
 def get_backoff_cooldown_seconds(step: int) -> int:
     """Get cooldown duration for the given backoff step (0-indexed)."""
-    return _BACKOFF_COOLDOWNS_SECONDS[min(step, len(_BACKOFF_COOLDOWNS_SECONDS) - 1)]
+    clamped = max(0, min(step, len(_BACKOFF_COOLDOWNS_SECONDS) - 1))
+    return _BACKOFF_COOLDOWNS_SECONDS[clamped]
 
 
 def set_backoff_cooldown(redis_client: RedisClient, repo: str, number: int, step: int) -> None:

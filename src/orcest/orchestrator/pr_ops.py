@@ -544,8 +544,8 @@ def discover_actionable_prs(
                 )
                 # Fall through to normal processing (all Redis counters now reset).
             else:
-                # Calculate backoff step: how many full cycles past the limit
-                step = (total_attempts - max_total_attempts) // max_total_attempts
+                # Calculate backoff step: each attempt past the limit increases the step
+                step = total_attempts - max_total_attempts
                 current_step = get_backoff_step(redis, repo, number)
                 if current_step is not None:
                     # Still in cooldown — skip this PR
