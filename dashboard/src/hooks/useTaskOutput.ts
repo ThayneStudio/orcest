@@ -24,6 +24,7 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
   const wsRef = useRef<WebSocket | null>(null);
   const retryRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const doneRef = useRef(false);
 
   const connect = useCallback(() => {
     if (!params) return;
@@ -58,6 +59,7 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
         } else if (msg.done) {
           setState((prev) => ({ ...prev, done: true }));
         }
+        if (msg.done) doneRef.current = true;
       } catch {
         // ignore
       }
@@ -68,7 +70,7 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
       wsRef.current = null;
 
       // Don't reconnect if task is done
-      if (state.done) return;
+      if (doneRef.current) return;
 
       const delay = Math.min(1000 * Math.pow(2, retryRef.current), 30000);
       retryRef.current++;
@@ -82,6 +84,7 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
 
   useEffect(() => {
     setState({ lines: [], connected: false, done: false });
+    doneRef.current = false;
     wsRef.current?.close();
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     retryRef.current = 0;

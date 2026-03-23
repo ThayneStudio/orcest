@@ -174,7 +174,7 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
     }
   }
   // Sort by entry ID descending (most recent first) and trim
-  resultEntries.sort((a, b) => b.entryId.localeCompare(a.entryId));
+  resultEntries.sort((a, b) => (a.entryId > b.entryId ? -1 : a.entryId < b.entryId ? 1 : 0));
   const recentResults = resultEntries.slice(0, maxResults).map((e) => e.result);
 
   // Attempt counters — keys are prefixed: orcest:pr:*:attempts, transit-platform:pr:*:attempts

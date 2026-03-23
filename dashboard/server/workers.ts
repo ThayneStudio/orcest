@@ -39,14 +39,24 @@ export async function discoverWorkers(): Promise<string[]> {
  * Find the prefixed stream key for a worker (e.g., orcest:output:worker-1).
  */
 // Cache resolved stream keys — worker stream names don't change during uptime
+// Capped at 100 entries to prevent unbounded growth from invalid worker IDs
+const STREAM_CACHE_MAX = 100;
 const streamCache = new Map<string, string>();
 
 async function findWorkerStream(workerId: string): Promise<string | null> {
+  // Validate workerId to prevent glob injection in SCAN patterns
+  if (!/^[\w-]+$/.test(workerId)) return null;
+
   const cached = streamCache.get(workerId);
   if (cached) return cached;
   try {
     const matches = await scanKeys(`*:output:${workerId}`);
     if (matches.length > 0) {
+      if (streamCache.size >= STREAM_CACHE_MAX) {
+        // Evict the oldest entry
+        const firstKey = streamCache.keys().next().value;
+        if (firstKey !== undefined) streamCache.delete(firstKey);
+      }
       streamCache.set(workerId, matches[0]);
       return matches[0];
     }
@@ -115,6 +125,12 @@ export async function readWorkerOutputNonBlocking(
 }
 
 /**
+ * Cache resolved task start IDs — once found, the entry ID doesn't change.
+ * Key: `${workerId}:${taskId ?? "latest"}`
+ */
+const taskStartCache = new Map<string, string>();
+
+/**
  * Find the stream entry ID where a task started on a given worker.
  * Scans backward from the end of the stream looking for a task_start marker.
  * If taskId is provided, matches that specific task; otherwise finds the most recent task.
@@ -123,6 +139,10 @@ export async function findTaskStartId(
   workerId: string,
   taskId?: string,
 ): Promise<string | null> {
+  const cacheKey = `${workerId}:${taskId ?? "latest"}`;
+  const cached = taskStartCache.get(cacheKey);
+  if (cached) return cached;
+
   const stream = await findWorkerStream(workerId);
   if (!stream) return null;
 
@@ -141,6 +161,7 @@ export async function findTaskStartId(
 
         if (fieldMap.type === "task_start") {
           if (!taskId || fieldMap.task_id === taskId) {
+            taskStartCache.set(cacheKey, entryId);
             return entryId;
           }
         }
