@@ -58,12 +58,6 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
   for (const group of snapshot.consumer_groups) {
     if (group.pending === 0) continue;
     try {
-      const pending = await redis.xpending(group.stream, group.name) as unknown[];
-      if (!Array.isArray(pending) || pending.length < 4) continue;
-
-      const pendingCount = pending[0] as number;
-      if (pendingCount === 0) continue;
-
       const details = await redis.call(
         "XPENDING", group.stream, group.name, "-", "+", "10"
       ) as unknown[][];

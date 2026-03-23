@@ -113,7 +113,9 @@ async function refreshSharedSnapshot(): Promise<void> {
   }
 }
 
-setInterval(refreshSharedSnapshot, 2000);
+setInterval(() => {
+  if (snapshotWss.clients.size > 0) refreshSharedSnapshot();
+}, 2000);
 
 snapshotWss.on("connection", (ws) => {
   // Send current cached snapshot immediately if available; otherwise trigger a fetch
