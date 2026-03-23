@@ -283,6 +283,10 @@ def _poll_cycle(
                             exc_info=True,
                         )
                 # After successful merge, rebase other open PRs onto updated master
+                logger.info(
+                    "PR #%d merged; checking for SKIP_GREEN PRs to proactively rebase",
+                    pr_state.number,
+                )
                 for other_pr in pr_states:
                     if other_pr.number == pr_state.number:
                         continue  # skip the one we just merged
