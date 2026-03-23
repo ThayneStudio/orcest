@@ -53,6 +53,11 @@ app.get("/api/workers", async (_req, res) => {
 const distPath = path.resolve(__dirname, "../../dist");
 app.use(express.static(distPath));
 
+// API 404 — must come before the SPA fallback
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "Not Found" });
+});
+
 // SPA fallback
 app.get("*", (_req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
