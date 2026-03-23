@@ -1274,7 +1274,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo rm -rf /var/lib/cloud/*")
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
-        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
@@ -1294,7 +1293,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         )
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
-        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
@@ -1311,7 +1309,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync")
     except subprocess.TimeoutExpired:
         console.print("[red]timed out[/red]")
-        _cleanup_vm()
         sys.exit(1)
     if result.returncode != 0:
         console.print(f"[red]failed[/red]: {result.stderr.strip()}")
