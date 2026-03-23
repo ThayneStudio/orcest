@@ -112,8 +112,10 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
   for (const pattern of ["*:lock:pr:*", "*:lock:issue:*"]) {
     const lockKeys = await scanKeys(pattern);
     for (const key of lockKeys) {
-      const owner = (await redis.get(key)) || "(expired)";
-      const ttl = await redis.ttl(key);
+      // Pipeline GET + TTL to avoid TOCTOU and reduce round-trips
+      const results = await redis.pipeline().get(key).ttl(key).exec();
+      const owner = (results?.[0]?.[1] as string | null) || "(expired)";
+      const ttl = (results?.[1]?.[1] as number) ?? -1;
       // Strip prefix and lock:pr: / lock:issue: to get the resource
       const resource = key.replace(/^[^:]+:lock:(pr|issue):/, "");
       locks.push({ resource, owner, ttl });
@@ -122,6 +124,8 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
 
   // Consumer groups
   const consumerGroups: ConsumerGroupInfo[] = [];
+  // Track the most recently delivered entry ID per stream (for Queued column filtering)
+  const streamLastDeliveredId = new Map<string, string>();
   for (const stream of taskStreamKeys) {
     try {
       const groups = await redis.xinfo("GROUPS", stream) as unknown[];
@@ -136,6 +140,10 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
           consumers: Number(g.consumers || 0),
           pending: Number(g.pending || 0),
         });
+        // Keep the highest last-delivered-id across all groups on this stream
+        const lastId = String(g["last-delivered-id"] || "0-0");
+        const current = streamLastDeliveredId.get(stream) || "0-0";
+        if (lastId > current) streamLastDeliveredId.set(stream, lastId);
       }
     } catch {
       // Stream has no consumer groups
@@ -182,22 +190,21 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
     if (key.includes(":total_attempts")) continue;
     const data = await redis.hgetall(key);
     if (data && data.count) {
-      // Key format: prefix:pr:repo:number:attempts — extract PR number (second-to-last segment)
+      // Key format: prefix:pr:repo:number:attempts — extract PR number (last segment)
       const parts = key.replace(/:attempts$/, "").split(":");
       const prNum = parts[parts.length - 1];
-      try {
-        attemptCounts[`PR #${prNum}`] = parseInt(data.count, 10);
-      } catch {
-        // ignore
-      }
+      attemptCounts[`PR #${prNum}`] = parseInt(data.count, 10);
     }
   }
 
-  // Queued tasks — read actual entries from task streams for kanban view
+  // Queued tasks — read only entries not yet delivered to any consumer
   const queuedTasks: QueuedTask[] = [];
   for (const stream of taskStreamKeys) {
     try {
-      const entries = await redis.xrange(stream, "-", "+", "COUNT", 50);
+      // Start after the highest last-delivered-id so we skip in-progress/completed tasks
+      const lastDeliveredId = streamLastDeliveredId.get(stream);
+      const startId = lastDeliveredId && lastDeliveredId !== "0-0" ? `(${lastDeliveredId}` : "-";
+      const entries = await redis.xrange(stream, startId, "+", "COUNT", 50);
       for (const [, fields] of entries) {
         const f = arrayToMap(fields);
         queuedTasks.push({
