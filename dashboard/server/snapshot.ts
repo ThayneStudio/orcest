@@ -28,7 +28,8 @@ export async function fetchSnapshot(maxResults = 20): Promise<SystemSnapshot> {
 
   try {
     return await fetchSnapshotInner(maxResults);
-  } catch {
+  } catch (err) {
+    console.error("Error fetching snapshot:", err);
     return {
       redis_ok: false,
       fetched_at: new Date().toISOString(),
