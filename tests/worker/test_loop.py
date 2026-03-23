@@ -525,12 +525,19 @@ class TestExecuteTask:
         mock_redis.xadd_capped_raw.return_value = "1-0"
 
         _execute_task(
-            task, local_worker_config, mock_runner, mock_workspace, mock_redis,
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
             logging.getLogger("test"),
         )
 
         mock_workspace.setup.assert_called_once_with(
-            task.repo, task.branch, task.token, None,  # base_branch suppressed
+            task.repo,
+            task.branch,
+            task.token,
+            None,  # base_branch suppressed
         )
 
 
