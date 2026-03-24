@@ -164,6 +164,17 @@ def set_pending_task(
     return redis_client.set_nx_ex(key, task_id, ttl)
 
 
+def get_pending_task(
+    redis_client: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+) -> str | None:
+    """Return the active pending task ID for a resource, or None if absent."""
+    key = make_pending_task_key(repo, resource_type, resource_id)
+    return redis_client.get(key)
+
+
 def clear_pending_task(
     redis_client: RedisClient,
     repo: str,

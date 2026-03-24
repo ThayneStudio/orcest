@@ -32,7 +32,12 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
 )
 from orcest.shared.config import OrchestratorConfig
-from orcest.shared.coordination import clear_backoff, clear_pending_task, compute_pending_task_ttl
+from orcest.shared.coordination import (
+    clear_backoff,
+    clear_pending_task,
+    compute_pending_task_ttl,
+    get_pending_task,
+)
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX, ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -885,6 +890,34 @@ def _handle_result(
     is_issue = result.resource_type == "issue"
     resource_label = "issue" if is_issue else "PR"
     resource_type = result.resource_type or ("issue" if is_issue else "pr")
+
+    # Guard against stale/duplicate task IDs.
+    # When result publishing fails in a worker, the pending-task marker is cleared
+    # so the orchestrator can re-enqueue. If the old task entry stays unACKed in the
+    # Redis PEL and a drain later publishes a FAILED result for it, the orchestrator
+    # may have already enqueued a newer task. In that case the pending-task marker
+    # holds the *new* task's ID, and applying label/comment side-effects for the old
+    # task would be incorrect. Skip processing entirely for stale results.
+    try:
+        current_task_id = get_pending_task(redis, repo, resource_type, resource_id)
+        if current_task_id is not None and current_task_id != result.task_id:
+            logger.warning(
+                "Stale result for %s #%d: result task_id=%s but active task_id=%s; "
+                "skipping label/comment side-effects",
+                resource_label,
+                resource_id,
+                result.task_id,
+                current_task_id,
+            )
+            return
+    except Exception as e:
+        logger.error(
+            "Failed to check pending task ID for %s #%d: %s; proceeding with result processing",
+            resource_label,
+            resource_id,
+            e,
+            exc_info=True,
+        )
 
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label

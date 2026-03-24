@@ -23,6 +23,7 @@ from orcest.orchestrator.pr_ops import (
     increment_attempts,
     increment_total_attempts,
 )
+from orcest.shared.coordination import set_pending_task
 from orcest.shared.models import ResultStatus, TaskResult
 
 
@@ -1173,3 +1174,56 @@ def test_poll_cycle_proactive_rebase_exception_does_not_propagate(
     logger = logging.getLogger("test")
     # Must not raise
     _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+
+# ---------------------------------------------------------------------------
+# Stale task ID guard tests
+# ---------------------------------------------------------------------------
+
+
+def test_handle_result_stale_task_id_skips_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A FAILED result for an old task ID is silently dropped when a newer task is active.
+
+    Scenario: result publishing failed for old_task, so the pending-task marker was
+    cleared to allow re-enqueueing. The orchestrator enqueued new_task. When the worker
+    drains its PEL and publishes a FAILED result for old_task, _handle_result must not
+    add labels or post comments because the resource is already being handled by new_task.
+    """
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    pr_number = 200
+    old_task_id = "old-task-aaa"
+    new_task_id = "new-task-bbb"
+
+    # Simulate the orchestrator having enqueued a newer task after the old one failed
+    set_pending_task(fake_redis_client, repo, "pr", pr_number, new_task_id, ttl=3600)
+
+    # The drained FAILED result carries the old task's ID
+    stale_result = TaskResult(
+        task_id=old_task_id,
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/stale",
+        summary="Something went wrong",
+        duration_seconds=30,
+        resource_type="pr",
+        resource_id=pr_number,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, stale_result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Label and comment side-effects must be skipped for stale results
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+    # The pending-task marker for new_task must remain intact
+    from orcest.shared.coordination import get_pending_task
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == new_task_id
