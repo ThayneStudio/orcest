@@ -1,0 +1,300 @@
+import { redis, healthCheck, scanKeys } from "./redis.js";
+import type {
+  SystemSnapshot,
+  LockInfo,
+  ConsumerGroupInfo,
+  RecentResult,
+  DeadLetterEntry,
+  QueuedTask,
+} from "./types.js";
+
+export async function fetchSnapshot(maxResults = 20): Promise<SystemSnapshot> {
+  const ok = await healthCheck();
+  if (!ok) {
+    return {
+      redis_ok: false,
+      fetched_at: new Date().toISOString(),
+      queue_depths: {},
+      results_depth: 0,
+      dead_letter_count: 0,
+      locks: [],
+      consumer_groups: [],
+      recent_results: [],
+      attempt_counts: {},
+      dead_letter_entries: [],
+      queued_tasks: [],
+    };
+  }
+
+  try {
+    return await fetchSnapshotInner(maxResults);
+  } catch (err) {
+    console.error("Error fetching snapshot:", err);
+    return {
+      redis_ok: false,
+      fetched_at: new Date().toISOString(),
+      queue_depths: {},
+      results_depth: 0,
+      dead_letter_count: 0,
+      locks: [],
+      consumer_groups: [],
+      recent_results: [],
+      attempt_counts: {},
+      dead_letter_entries: [],
+      queued_tasks: [],
+    };
+  }
+}
+
+async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
+  // Queue depths — keys are prefixed: orcest:tasks:claude, transit-platform:tasks:issue:claude, etc.
+  const taskStreamKeys = (await scanKeys("*:tasks:*")).sort();
+  const queueDepths: Record<string, number> = {};
+  if (taskStreamKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const stream of taskStreamKeys) pipeline.xlen(stream);
+    const results = await pipeline.exec();
+    for (let i = 0; i < taskStreamKeys.length; i++) {
+      const [err, len] = results?.[i] ?? [null, 0];
+      if (!err) queueDepths[taskStreamKeys[i]] = len as number;
+    }
+  }
+
+  // Results — each project prefix has its own results stream: orcest:results, transit-platform:results
+  let resultsDepth = 0;
+  const resultsKeys = await scanKeys("*:results");
+  if (resultsKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const key of resultsKeys) pipeline.xlen(key);
+    const results = await pipeline.exec();
+    for (const r of results ?? []) {
+      if (!r[0]) resultsDepth += r[1] as number;
+    }
+  }
+
+  // Dead-letter streams: *:dead-letter
+  let deadLetterCount = 0;
+  const dlKeys = await scanKeys("*:dead-letter");
+  if (dlKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const key of dlKeys) pipeline.xlen(key);
+    const results = await pipeline.exec();
+    for (const r of results ?? []) {
+      if (!r[0]) deadLetterCount += r[1] as number;
+    }
+  }
+
+  // Dead-letter entries (most recent 5, across all dead-letter streams)
+  const deadLetterEntries: DeadLetterEntry[] = [];
+  for (const dlKey of dlKeys) {
+    try {
+      const dlRaw = await redis.xrevrange(dlKey, "+", "-", "COUNT", 5);
+      for (const [entryId, fields] of dlRaw) {
+        const fieldMap = arrayToMap(fields);
+        const ms = parseInt(entryId.split("-")[0], 10);
+        const timestampMs: number | null = isNaN(ms) ? null : ms;
+        deadLetterEntries.push({
+          entry_id: entryId,
+          task_type: fieldMap.type || "?",
+          repo: fieldMap.repo || "?",
+          resource_type: fieldMap.resource_type || "?",
+          resource_id: fieldMap.resource_id || "?",
+          timestamp_ms: timestampMs,
+          reason: fieldMap.dead_letter_reason || null,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+  // Sort by timestamp descending, keep top 5
+  deadLetterEntries.sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0));
+  deadLetterEntries.splice(5);
+
+  // Active locks — keys are prefixed: orcest:lock:pr:*, orcest:lock:issue:*
+  const locks: LockInfo[] = [];
+  const allLockKeys: string[] = [];
+  for (const pattern of ["*:lock:pr:*", "*:lock:issue:*"]) {
+    const lockKeys = await scanKeys(pattern);
+    allLockKeys.push(...lockKeys);
+  }
+  if (allLockKeys.length > 0) {
+    // Batch all GET + TTL calls into a single pipeline to avoid N round-trips
+    const lockPipeline = redis.pipeline();
+    for (const key of allLockKeys) {
+      lockPipeline.get(key);
+      lockPipeline.ttl(key);
+    }
+    const lockResults = await lockPipeline.exec();
+    for (let i = 0; i < allLockKeys.length; i++) {
+      const key = allLockKeys[i];
+      const owner = (lockResults?.[i * 2]?.[1] as string | null) || "(expired)";
+      const ttl = (lockResults?.[i * 2 + 1]?.[1] as number) ?? -1;
+      const resource = key.replace(/^[^:]+:lock:(pr|issue):/, "");
+      locks.push({ resource, owner, ttl });
+    }
+  }
+
+  // Consumer groups
+  const consumerGroups: ConsumerGroupInfo[] = [];
+  // Track the most recently delivered entry ID per stream (for Queued column filtering)
+  const streamLastDeliveredId = new Map<string, string>();
+  for (const stream of taskStreamKeys) {
+    try {
+      const groups = await redis.xinfo("GROUPS", stream) as unknown[];
+      for (const group of groups) {
+        // ioredis v5+ returns objects directly; older versions return flat arrays
+        const g = typeof (group as Record<string, unknown>).name === "string"
+          ? group as Record<string, unknown>
+          : flatArrayToMap(group as string[]);
+        consumerGroups.push({
+          stream,
+          name: String(g.name || "?"),
+          consumers: Number(g.consumers || 0),
+          pending: Number(g.pending || 0),
+        });
+        // Keep the highest last-delivered-id across all groups on this stream.
+        // Compare numerically — stream IDs are "<ms>-<seq>" and string comparison
+        // fails when sequence numbers have different digit counts.
+        const lastId = String(g["last-delivered-id"] || "0-0");
+        const current = streamLastDeliveredId.get(stream) || "0-0";
+        const [lastMs, lastSeq] = lastId.split("-").map(Number);
+        const [curMs, curSeq] = current.split("-").map(Number);
+        if (lastMs > curMs || (lastMs === curMs && lastSeq > curSeq)) {
+          streamLastDeliveredId.set(stream, lastId);
+        }
+      }
+    } catch {
+      // Stream has no consumer groups
+    }
+  }
+
+  // Recent results (across all result streams, merged by recency)
+  const resultEntries: Array<{ entryId: string; result: RecentResult }> = [];
+  for (const resultsKey of resultsKeys) {
+    try {
+      const entries = await redis.xrevrange(resultsKey, "+", "-", "COUNT", maxResults);
+      for (const [entryId, fields] of entries) {
+        const f = arrayToMap(fields);
+        try {
+          resultEntries.push({
+            entryId,
+            result: {
+              task_id: f.task_id || "",
+              worker_id: f.worker_id || "",
+              status: f.status || "",
+              resource_type: f.resource_type || "",
+              resource_id: f.resource_id || "",
+              duration_seconds: parseInt(f.duration_seconds || "0", 10),
+              summary: f.summary || "",
+            },
+          });
+        } catch {
+          // skip malformed entry
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  // Sort by entry ID descending (most recent first) and trim.
+  // Stream IDs are "<ms>-<seq>" — use numeric comparison to avoid string-comparison bugs
+  // (e.g., "9" > "10" lexicographically).
+  resultEntries.sort((a, b) => {
+    const [aMs, aSeq] = a.entryId.split("-").map(Number);
+    const [bMs, bSeq] = b.entryId.split("-").map(Number);
+    return bMs - aMs || bSeq - aSeq;
+  });
+  const recentResults = resultEntries.slice(0, maxResults).map((e) => e.result);
+
+  // Attempt counters — keys are prefixed: orcest:pr:*:attempts, transit-platform:pr:*:attempts
+  const attemptCounts: Record<string, number> = {};
+  const attemptKeys = await scanKeys("*:pr:*:attempts");
+  const filteredAttemptKeys = attemptKeys.filter(k => !k.includes(":total_attempts"));
+  if (filteredAttemptKeys.length > 0) {
+    const attemptPipeline = redis.pipeline();
+    for (const key of filteredAttemptKeys) attemptPipeline.hgetall(key);
+    const attemptResults = await attemptPipeline.exec();
+    for (let i = 0; i < filteredAttemptKeys.length; i++) {
+      const key = filteredAttemptKeys[i];
+      const data = (attemptResults?.[i]?.[1] as Record<string, string> | null);
+      if (data && data.count) {
+        // Key format: prefix:pr:repo:number:attempts — extract repo and PR number.
+        // After stripping ":attempts", the PR number is the last segment,
+        // and the repo is everything between "pr:" and the number.
+        const parts = key.replace(/:attempts$/, "").split(":");
+        const prNum = parts[parts.length - 1];
+        // parts[0] = prefix, parts[1] = "pr", parts[2..n-1] = repo segments, parts[n] = number
+        const repo = parts.slice(2, -1).join("/");
+        const count = parseInt(data.count, 10);
+        if (!isNaN(count)) {
+          attemptCounts[`${repo} PR #${prNum}`] = count;
+        }
+      }
+    }
+  }
+
+  // Queued tasks — read only entries not yet delivered to any consumer
+  const queuedTasks: QueuedTask[] = [];
+  for (const stream of taskStreamKeys) {
+    try {
+      // Start after the highest last-delivered-id so we skip in-progress/completed tasks.
+      // NOTE: COUNT 50 caps the entries returned for performance; the true queue depth
+      // is available in queue_depths (from XLEN) and may be larger.
+      const lastDeliveredId = streamLastDeliveredId.get(stream);
+      const startId = lastDeliveredId && lastDeliveredId !== "0-0" ? `(${lastDeliveredId}` : "-";
+      const entries = await redis.xrange(stream, startId, "+", "COUNT", 50);
+      for (const [, fields] of entries) {
+        const f = arrayToMap(fields);
+        queuedTasks.push({
+          task_id: f.id || "",
+          task_type: f.type || "?",
+          repo: f.repo || "?",
+          resource_type: f.resource_type || "?",
+          resource_id: f.resource_id || "?",
+          created_at: f.created_at || null,
+          stream,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    redis_ok: true,
+    fetched_at: new Date().toISOString(),
+    queue_depths: queueDepths,
+    results_depth: resultsDepth,
+    dead_letter_count: deadLetterCount,
+    locks,
+    consumer_groups: consumerGroups,
+    recent_results: recentResults,
+    attempt_counts: attemptCounts,
+    dead_letter_entries: deadLetterEntries,
+    queued_tasks: queuedTasks,
+  };
+}
+
+/**
+ * ioredis returns xrevrange fields as flat arrays: [key, val, key, val, ...].
+ * Convert to a map.
+ */
+function arrayToMap(arr: string[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (let i = 0; i < arr.length; i += 2) {
+    map[arr[i]] = arr[i + 1];
+  }
+  return map;
+}
+
+/**
+ * XINFO GROUPS returns each group as a flat array: [field, value, field, value, ...].
+ */
+function flatArrayToMap(arr: unknown[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (let i = 0; i < arr.length; i += 2) {
+    map[String(arr[i])] = String(arr[i + 1]);
+  }
+  return map;
+}
