@@ -123,7 +123,7 @@ export async function findTaskStartId(
       // Decrement the ID to exclude it from next read
       const [ms, seq] = oldestId.split("-");
       const newSeq = parseInt(seq, 10) - 1;
-      endId = newSeq >= 0 ? `${ms}-${newSeq}` : `${parseInt(ms, 10) - 1}-99999`;
+      endId = newSeq >= 0 ? `${ms}-${newSeq}` : `${parseInt(ms, 10) - 1}-4294967295`;
     }
   } catch {
     // ignore

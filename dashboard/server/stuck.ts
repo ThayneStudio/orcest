@@ -1,7 +1,7 @@
 import { redis, scanKeys } from "./redis.js";
 import type { SystemSnapshot, StuckTask } from "./types.js";
 
-const LOCK_TTL = 180; // seconds — must match Python LOCK_TTL in src/orcest/worker/loop.py
+const LOCK_TTL = parseInt(process.env.LOCK_TTL_SECONDS || "180", 10); // seconds — must match Python LOCK_TTL
 const MAX_PER_SHA_ATTEMPTS = 3;
 
 export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]> {

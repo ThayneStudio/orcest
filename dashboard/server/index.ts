@@ -53,6 +53,15 @@ app.get("/api/workers", async (_req, res) => {
 });
 
 // --- Static files (Vite build output) ---
+// Auth check applies to static assets and the SPA fallback as well.
+
+app.use((req, res, next) => {
+  if (!isAuthorized(req)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+});
 
 const distPath = path.resolve(__dirname, "../../dist");
 app.use(express.static(distPath));
@@ -122,7 +131,7 @@ async function refreshSharedSnapshot(): Promise<void> {
   }
 }
 
-setInterval(() => {
+const snapshotInterval = setInterval(() => {
   if (snapshotWss.clients.size > 0) refreshSharedSnapshot();
 }, 2000);
 
@@ -225,6 +234,7 @@ taskOutputWss.on("connection", (ws, req) => {
 
 function shutdown() {
   console.log("Shutting down...");
+  clearInterval(snapshotInterval);
   snapshotWss.clients.forEach((ws) => ws.close(1001, "Server shutting down"));
   taskOutputWss.clients.forEach((ws) => ws.close(1001, "Server shutting down"));
   server.close(() => {
