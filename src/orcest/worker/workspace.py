@@ -37,7 +37,16 @@ class WorkspaceError(Exception):
 
     Unlike a raw subprocess.CalledProcessError, this exception is
     guaranteed not to contain secrets (tokens) in its message.
+
+    ``transient=True`` indicates a failure that is safe to retry automatically
+    (e.g. a clone timeout due to a transient network issue).  Permanent
+    failures such as bad credentials or a deleted branch leave the flag False
+    so the orchestrator can label the PR for human review.
     """
+
+    def __init__(self, message: str, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 class Workspace:
@@ -117,7 +126,8 @@ class Workspace:
         except subprocess.TimeoutExpired:
             raise WorkspaceError(
                 f"git clone timed out after {_CLONE_TIMEOUT_SECONDS}s "
-                f"for {repo}" + (f" branch {branch}" if branch else "")
+                f"for {repo}" + (f" branch {branch}" if branch else ""),
+                transient=True,
             )
         except subprocess.CalledProcessError as exc:
             # Sanitise stderr/stdout so the token doesn't leak into logs.

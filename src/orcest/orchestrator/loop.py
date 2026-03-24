@@ -34,7 +34,7 @@ from orcest.orchestrator.task_publisher import (
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.coordination import clear_backoff, clear_pending_task, compute_pending_task_ttl
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import ResultStatus, TaskResult
+from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX, ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
@@ -952,11 +952,34 @@ def _handle_result(
                     exc_info=True,
                 )
 
+    # Transient failures (clone timeout, worker restart) should be retried
+    # automatically — don't label needs-human or burn attempt slots.
+    is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
+        TRANSIENT_SUMMARY_PREFIX
+    )
+
+    if is_transient:
+        # Clear per-SHA attempts so the PR will be re-enqueued on the next
+        # poll cycle. Total_attempts is left incremented as a circuit-breaker
+        # against persistent infra failures (fibonacci backoff kicks in).
+        try:
+            if is_issue:
+                clear_issue_attempts(redis, repo, resource_id)
+            else:
+                clear_attempts(redis, repo, resource_id)
+        except Exception as e:
+            logger.error(
+                f"Failed to clear attempts for transient failure on "
+                f"{resource_label} #{resource_id}: {e}",
+                exc_info=True,
+            )
+
     # Manage labels based on result status.
     # Only terminal statuses (FAILED, BLOCKED) add labels.
     # USAGE_EXHAUSTED adds no labels — the PR will resume via the cooldown mechanism.
+    # Transient failures skip labeling — they will be retried automatically.
     labeled = False
-    if result.status == ResultStatus.FAILED:
+    if result.status == ResultStatus.FAILED and not is_transient:
         try:
             _add_label(repo, resource_id, labels.needs_human, token)
             labeled = True
@@ -980,7 +1003,11 @@ def _handle_result(
     if result.status != ResultStatus.COMPLETED:
         safe_summary = result.summary[:500] if result.summary else ""
 
-        if result.status == ResultStatus.FAILED:
+        if result.status == ResultStatus.FAILED and is_transient:
+            # Transient failures are retried silently — no comment to avoid
+            # accumulating noise if infrastructure is degraded across many attempts.
+            return
+        elif result.status == ResultStatus.FAILED:
             label_note = (
                 f"Labeling as `{labels.needs_human}` for manual review."
                 if labeled
