@@ -208,21 +208,26 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
   // Attempt counters — keys are prefixed: orcest:pr:*:attempts, transit-platform:pr:*:attempts
   const attemptCounts: Record<string, number> = {};
   const attemptKeys = await scanKeys("*:pr:*:attempts");
-  for (const key of attemptKeys) {
-    // Skip total_attempts keys
-    if (key.includes(":total_attempts")) continue;
-    const data = await redis.hgetall(key);
-    if (data && data.count) {
-      // Key format: prefix:pr:repo:number:attempts — extract repo and PR number.
-      // After stripping ":attempts", the PR number is the last segment,
-      // and the repo is everything between "pr:" and the number.
-      const parts = key.replace(/:attempts$/, "").split(":");
-      const prNum = parts[parts.length - 1];
-      // parts[0] = prefix, parts[1] = "pr", parts[2..n-1] = repo segments, parts[n] = number
-      const repo = parts.slice(2, -1).join("/");
-      const count = parseInt(data.count, 10);
-      if (!isNaN(count)) {
-        attemptCounts[`${repo} PR #${prNum}`] = count;
+  const filteredAttemptKeys = attemptKeys.filter(k => !k.includes(":total_attempts"));
+  if (filteredAttemptKeys.length > 0) {
+    const attemptPipeline = redis.pipeline();
+    for (const key of filteredAttemptKeys) attemptPipeline.hgetall(key);
+    const attemptResults = await attemptPipeline.exec();
+    for (let i = 0; i < filteredAttemptKeys.length; i++) {
+      const key = filteredAttemptKeys[i];
+      const data = (attemptResults?.[i]?.[1] as Record<string, string> | null);
+      if (data && data.count) {
+        // Key format: prefix:pr:repo:number:attempts — extract repo and PR number.
+        // After stripping ":attempts", the PR number is the last segment,
+        // and the repo is everything between "pr:" and the number.
+        const parts = key.replace(/:attempts$/, "").split(":");
+        const prNum = parts[parts.length - 1];
+        // parts[0] = prefix, parts[1] = "pr", parts[2..n-1] = repo segments, parts[n] = number
+        const repo = parts.slice(2, -1).join("/");
+        const count = parseInt(data.count, 10);
+        if (!isNaN(count)) {
+          attemptCounts[`${repo} PR #${prNum}`] = count;
+        }
       }
     }
   }

@@ -30,6 +30,13 @@ function isAuthorized(req: IncomingMessage): boolean {
 const app = express();
 const server = createServer(app);
 
+// --- Health check (intentionally unauthenticated so the container runtime can poll it) ---
+
+app.get("/api/health", async (_req, res) => {
+  const ok = await healthCheck();
+  res.status(ok ? 200 : 503).json({ ok });
+});
+
 // --- Auth middleware for API routes ---
 
 app.use("/api", (req, res, next) => {
@@ -41,11 +48,6 @@ app.use("/api", (req, res, next) => {
 });
 
 // --- REST endpoints ---
-
-app.get("/api/health", async (_req, res) => {
-  const ok = await healthCheck();
-  res.status(ok ? 200 : 503).json({ ok });
-});
 
 app.get("/api/workers", async (_req, res) => {
   const workers = await discoverWorkers();

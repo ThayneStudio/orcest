@@ -118,12 +118,9 @@ export async function findTaskStartId(
         }
       }
 
-      // Move cursor before the oldest entry in this batch
+      // Move cursor before the oldest entry in this batch using exclusive range syntax
       const oldestId = entries[entries.length - 1][0];
-      // Decrement the ID to exclude it from next read
-      const [ms, seq] = oldestId.split("-");
-      const newSeq = parseInt(seq, 10) - 1;
-      endId = newSeq >= 0 ? `${ms}-${newSeq}` : `${parseInt(ms, 10) - 1}-4294967295`;
+      endId = `(${oldestId}`;
     }
   } catch {
     // ignore

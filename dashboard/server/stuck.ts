@@ -9,6 +9,10 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
 
   // 1. Orphaned pending: pending marker exists but no corresponding lock
   const pendingKeys = await scanKeys("*:pending:*");
+
+  // Parse all pending keys upfront so we can batch Redis calls
+  type PendingEntry = { key: string; lockKey: string; resourceType: string; resourceId: string };
+  const pendingEntries: PendingEntry[] = [];
   for (const key of pendingKeys) {
     // key format: prefix:pending:resource_type:repo:resource_id
     const afterPending = key.replace(/^[^:]+:pending:/, "");
@@ -18,21 +22,34 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
     const resourceId = parts[parts.length - 1];
     const repo = parts.slice(1, -1).join(":");
     const prefix = key.split(":")[0];
-
     const lockKey = `${prefix}:lock:${resourceType}:${repo}:${resourceId}`;
-    const lockExists = await redis.exists(lockKey);
+    pendingEntries.push({ key, lockKey, resourceType, resourceId });
+  }
 
-    if (!lockExists) {
-      const ttl = await redis.ttl(key);
-      if (ttl === -1 || (ttl > 0 && ttl < 1200)) {  // 1200s = 20 min — maximum expected pending lifetime
-        stuck.push({
-          resource_type: resourceType,
-          resource_id: resourceId,
-          reason: ttl === -1
-            ? "Queued with no TTL — pending marker will never expire"
-            : `Queued but no worker has picked it up (pending TTL: ${ttl}s)`,
-          severity: ttl === -1 || ttl < 600 ? "critical" : "warning",
-        });
+  if (pendingEntries.length > 0) {
+    // Batch all EXISTS + TTL calls into a single pipeline
+    const lockPipeline = redis.pipeline();
+    for (const { lockKey, key } of pendingEntries) {
+      lockPipeline.exists(lockKey);
+      lockPipeline.ttl(key);
+    }
+    const results = await lockPipeline.exec();
+
+    for (let i = 0; i < pendingEntries.length; i++) {
+      const { resourceType, resourceId } = pendingEntries[i];
+      const lockExists = (results?.[i * 2]?.[1] as number) ?? 0;
+      if (!lockExists) {
+        const ttl = (results?.[i * 2 + 1]?.[1] as number) ?? -1;
+        if (ttl === -1 || (ttl > 0 && ttl < 1200)) {  // 1200s = 20 min — maximum expected pending lifetime
+          stuck.push({
+            resource_type: resourceType,
+            resource_id: resourceId,
+            reason: ttl === -1
+              ? "Queued with no TTL — pending marker will never expire"
+              : `Queued but no worker has picked it up (pending TTL: ${ttl}s)`,
+            severity: ttl === -1 || ttl < 600 ? "critical" : "warning",
+          });
+        }
       }
     }
   }
