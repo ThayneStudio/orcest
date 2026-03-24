@@ -10,6 +10,8 @@ import pytest
 
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
+)
+from orcest.orchestrator.issue_ops import (
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.loop import (
