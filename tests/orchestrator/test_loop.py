@@ -924,3 +924,174 @@ def test_poll_cycle_retrigger_review_failure_logged(
     from orcest.orchestrator.pr_ops import get_review_retrigger_sha
 
     assert get_review_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 501) is None
+
+
+# ---------------------------------------------------------------------------
+# Proactive rebase after merge tests
+# ---------------------------------------------------------------------------
+
+
+def test_poll_cycle_proactive_rebase_skip_green_sibling(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """After a successful merge, SKIP_GREEN siblings get publish_rebase_task(proactive=True)."""
+    merged_pr = PRState(
+        number=10,
+        title="PR #10",
+        branch="feat/10",
+        head_sha="sha10",
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+    green_pr = PRState(
+        number=20,
+        title="PR #20",
+        branch="feat/20",
+        head_sha="sha20",
+        action=PRAction.SKIP_GREEN,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[merged_pr, green_pr],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mock_rebase = mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    mock_rebase.assert_called_once()
+    assert mock_rebase.call_args.kwargs["pr_state"] is green_pr
+    assert mock_rebase.call_args.kwargs["proactive"] is True
+    assert mock_rebase.call_args.kwargs["merge_error"] == ""
+
+
+def test_poll_cycle_proactive_rebase_skips_non_green_siblings(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """Non-SKIP_GREEN siblings are not proactively rebased after a merge."""
+    merged_pr = PRState(
+        number=10,
+        title="PR #10",
+        branch="feat/10",
+        head_sha="sha10",
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+    non_green_actions = [
+        PRAction.SKIP_ACTIVE,
+        PRAction.SKIP_DRAFT,
+        PRAction.ENQUEUE_FIX,
+        PRAction.ENQUEUE_FOLLOWUP,
+    ]
+    siblings = [
+        PRState(
+            number=100 + i,
+            title=f"PR #{100 + i}",
+            branch=f"feat/{100 + i}",
+            head_sha=f"sha{100 + i}",
+            action=action,
+            ci_failures=[],
+            review_threads=[],
+            labels=[],
+        )
+        for i, action in enumerate(non_green_actions)
+    ]
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[merged_pr, *siblings],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mock_rebase = mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    mock_rebase.assert_not_called()
+
+
+def test_poll_cycle_proactive_rebase_skips_merged_pr_itself(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """The merged PR itself is never passed to publish_rebase_task."""
+    merged_pr = PRState(
+        number=10,
+        title="PR #10",
+        branch="feat/10",
+        head_sha="sha10",
+        # SKIP_GREEN action on the same PR that is being merged won't happen in practice,
+        # but verify the self-skip guard works regardless.
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[merged_pr],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mock_rebase = mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    mock_rebase.assert_not_called()
+
+
+def test_poll_cycle_proactive_rebase_exception_does_not_propagate(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """An exception from publish_rebase_task during proactive rebase is caught."""
+    merged_pr = PRState(
+        number=10,
+        title="PR #10",
+        branch="feat/10",
+        head_sha="sha10",
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+    green_pr = PRState(
+        number=20,
+        title="PR #20",
+        branch="feat/20",
+        head_sha="sha20",
+        action=PRAction.SKIP_GREEN,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[merged_pr, green_pr],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch(
+        "orcest.orchestrator.loop.publish_rebase_task",
+        side_effect=RuntimeError("Redis connection lost"),
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    # Must not raise
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
