@@ -762,7 +762,7 @@ def _render_rebase_prompt(
     merge_error: str = "",
     base_branch: str = "main",
 ) -> str:
-    """Render a prompt for rebasing a PR branch to resolve merge conflicts."""
+    """Render a prompt for rebasing a PR branch (conflict resolution or proactive rebase)."""
     if merge_error:
         preamble = "This PR has merge conflicts that prevent it from being merged."
     else:
