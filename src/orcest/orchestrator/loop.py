@@ -34,7 +34,7 @@ from orcest.orchestrator.task_publisher import (
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.coordination import clear_backoff, clear_pending_task, compute_pending_task_ttl
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import ResultStatus, TaskResult, TRANSIENT_SUMMARY_PREFIX
+from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX, ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
@@ -954,7 +954,10 @@ def _handle_result(
 
     # Transient failures (clone timeout, worker restart) should be retried
     # automatically — don't label needs-human or burn attempt slots.
-    is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(TRANSIENT_SUMMARY_PREFIX)
+    is_transient = (
+        result.status == ResultStatus.FAILED
+        and result.summary.startswith(TRANSIENT_SUMMARY_PREFIX)
+    )
 
     if is_transient:
         # Clear per-SHA attempts so the PR will be re-enqueued on the next

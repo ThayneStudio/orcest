@@ -24,7 +24,14 @@ from orcest.shared.coordination import (
     make_pr_lock_key,
 )
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskResult, TaskType, TRANSIENT_SUMMARY_PREFIX
+from orcest.shared.models import (
+    DEAD_LETTER_STREAM,
+    TRANSIENT_SUMMARY_PREFIX,
+    ResultStatus,
+    Task,
+    TaskResult,
+    TaskType,
+)
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import Runner, RunnerResult, create_runner
@@ -501,7 +508,10 @@ def _drain_pending_tasks(
                     resource_type=task.resource_type,
                     resource_id=task.resource_id,
                     branch=task.branch,
-                    summary=f"{TRANSIENT_SUMMARY_PREFIX}Worker restarted mid-execution; task was not completed.",
+                    summary=(
+                        f"{TRANSIENT_SUMMARY_PREFIX}"
+                        "Worker restarted mid-execution; task was not completed."
+                    ),
                     duration_seconds=0,
                 )
                 try:
@@ -580,7 +590,10 @@ def _drain_pending_tasks_raw(
                     resource_type=task.resource_type,
                     resource_id=task.resource_id,
                     branch=task.branch,
-                    summary=f"{TRANSIENT_SUMMARY_PREFIX}Worker restarted mid-execution; task was not completed.",
+                    summary=(
+                        f"{TRANSIENT_SUMMARY_PREFIX}"
+                        "Worker restarted mid-execution; task was not completed."
+                    ),
                     duration_seconds=0,
                 )
                 try:
