@@ -137,7 +137,11 @@ def _run_gh(args: list[str], token: str) -> str:
                     else None
                 )
                 if attempt < len(_RATE_LIMIT_BACKOFF_SECONDS):
-                    wait = retry_after if retry_after is not None else _RATE_LIMIT_BACKOFF_SECONDS[attempt]
+                    wait = (
+                        retry_after
+                        if retry_after is not None
+                        else _RATE_LIMIT_BACKOFF_SECONDS[attempt]
+                    )
                     logger.warning(
                         "GitHub rate limit hit; retrying in %ds (attempt %d/%d)",
                         wait,
