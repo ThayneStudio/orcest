@@ -111,14 +111,23 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
 
   // Active locks — keys are prefixed: orcest:lock:pr:*, orcest:lock:issue:*
   const locks: LockInfo[] = [];
+  const allLockKeys: string[] = [];
   for (const pattern of ["*:lock:pr:*", "*:lock:issue:*"]) {
     const lockKeys = await scanKeys(pattern);
-    for (const key of lockKeys) {
-      // Pipeline GET + TTL to avoid TOCTOU and reduce round-trips
-      const results = await redis.pipeline().get(key).ttl(key).exec();
-      const owner = (results?.[0]?.[1] as string | null) || "(expired)";
-      const ttl = (results?.[1]?.[1] as number) ?? -1;
-      // Strip prefix and lock:pr: / lock:issue: to get the resource
+    allLockKeys.push(...lockKeys);
+  }
+  if (allLockKeys.length > 0) {
+    // Batch all GET + TTL calls into a single pipeline to avoid N round-trips
+    const lockPipeline = redis.pipeline();
+    for (const key of allLockKeys) {
+      lockPipeline.get(key);
+      lockPipeline.ttl(key);
+    }
+    const lockResults = await lockPipeline.exec();
+    for (let i = 0; i < allLockKeys.length; i++) {
+      const key = allLockKeys[i];
+      const owner = (lockResults?.[i * 2]?.[1] as string | null) || "(expired)";
+      const ttl = (lockResults?.[i * 2 + 1]?.[1] as number) ?? -1;
       const resource = key.replace(/^[^:]+:lock:(pr|issue):/, "");
       locks.push({ resource, owner, ttl });
     }

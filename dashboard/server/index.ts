@@ -160,7 +160,7 @@ snapshotWss.on("connection", (ws) => {
 const MAX_TASK_OUTPUT_CONNECTIONS = 20;
 
 taskOutputWss.on("connection", (ws, req) => {
-  if (taskOutputWss.clients.size > MAX_TASK_OUTPUT_CONNECTIONS) {
+  if (taskOutputWss.clients.size >= MAX_TASK_OUTPUT_CONNECTIONS) {
     ws.close(1013, "Too many connections");
     return;
   }
