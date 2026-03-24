@@ -282,7 +282,10 @@ def _poll_cycle(
                             issue_err,
                             exc_info=True,
                         )
-                # After successful merge, rebase other open PRs onto updated master
+                # After successful merge, rebase other open PRs onto updated master.
+                # If multiple PRs are merged in the same poll cycle, this loop runs
+                # once per merged PR; publish_rebase_task calls set_pending_task (SET
+                # NX EX), which silently deduplicates redundant enqueue attempts.
                 logger.info(
                     "PR #%d merged; checking for SKIP_GREEN PRs to proactively rebase",
                     pr_state.number,

@@ -202,6 +202,10 @@ def _publish_and_notify(
     # max-attempts guard in discover_actionable_prs prevents runaway loops.
     # Proactive rebases skip incrementing: they are no-ops when already
     # up-to-date, so counting them would unfairly drain the attempt budget.
+    # When the branch is behind, a successful rebase changes head_sha,
+    # resetting the per-SHA counter on the next poll cycle anyway.
+    # If a proactive rebase fails (genuine conflicts), the worker is expected
+    # to transition the PR away from SKIP_GREEN, preventing unbounded retries.
     if not proactive:
         try:
             increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
