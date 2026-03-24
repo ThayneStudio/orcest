@@ -954,9 +954,8 @@ def _handle_result(
 
     # Transient failures (clone timeout, worker restart) should be retried
     # automatically — don't label needs-human or burn attempt slots.
-    is_transient = (
-        result.status == ResultStatus.FAILED
-        and result.summary.startswith(TRANSIENT_SUMMARY_PREFIX)
+    is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
+        TRANSIENT_SUMMARY_PREFIX
     )
 
     if is_transient:
