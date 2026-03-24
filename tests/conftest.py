@@ -151,7 +151,6 @@ def gh_mock(mocker):
         "remove_label",
         "post_comment",
         "get_unresolved_review_threads",
-        "get_pr_review_comments",
         "resolve_review_thread",
         "merge_pr",
         "rerun_workflow",
