@@ -1,4 +1,4 @@
-.PHONY: test test-unit redis-up redis-down lint format lock
+.PHONY: test test-unit redis-up redis-down lint format lock build-dashboard dev-dashboard deploy-dashboard
 
 # Unit tests only (no Redis needed)
 test-unit:
@@ -26,3 +26,12 @@ format:
 
 lock:
 	pip-compile pyproject.toml --output-file requirements.lock --strip-extras
+
+build-dashboard:
+	cd dashboard && npm ci && npm run build
+
+dev-dashboard:
+	cd dashboard && npm run dev
+
+deploy-dashboard:
+	docker compose -f docker-compose.dashboard.yml up -d --build
