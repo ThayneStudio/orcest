@@ -13,6 +13,7 @@ from orcest.shared.config import (
     LabelConfig,
     OrchestratorConfig,
     PollingConfig,
+    ProjectConfig,
     RedisConfig,
     RunnerConfig,
     WorkerConfig,
@@ -84,11 +85,22 @@ def label_config():
 
 @pytest.fixture
 def orchestrator_config(redis_config, label_config):
+    github = GithubConfig(token="fake-token-123", repo="owner/testrepo")
+    # key_prefix must match fake_redis_client's prefix ("test") so auto-prefixed
+    # Redis operations hit the same keyspace in tests.
     return OrchestratorConfig(
         redis=redis_config,
-        github=GithubConfig(token="fake-token-123", repo="owner/testrepo"),
+        github=github,
         polling=PollingConfig(interval=1),
         labels=label_config,
+        projects=[
+            ProjectConfig(
+                repo=github.repo,
+                token=github.token,
+                claude_token=github.claude_token,
+                key_prefix="test",
+            ),
+        ],
     )
 
 
