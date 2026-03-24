@@ -12,6 +12,10 @@ from enum import Enum
 # Redis stream / key name constants
 DEAD_LETTER_STREAM = "orcest:dead-letter"
 
+# Wire-protocol prefix used by workers to signal a transient failure.
+# The orchestrator parses this to decide whether to retry or label for human review.
+TRANSIENT_SUMMARY_PREFIX = "[transient] "
+
 # Fields added by the dead-letter handler that are not part of the original task.
 # Shared here so both the writer (worker/loop.py) and the reader (cli.py dead-letters
 # command) reference the same canonical set — a rename stays consistent automatically.
