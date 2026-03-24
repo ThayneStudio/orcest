@@ -877,9 +877,10 @@ def _render_fix_prompt(
         sections.append("")
         sections.extend(_render_review_threads(review_threads))
         sections.append("Address the review feedback above. For each thread:")
-        sections.append("- If it requests a code change, make the fix.")
+        sections.append("- If it requests a code change, make the fix and resolve the thread.")
         sections.append(
-            "- If it is purely positive feedback or has no actionable request, skip it."
+            "- If it is purely positive feedback or has no actionable request, "
+            "resolve it without making code changes."
         )
         sections.append(
             "- After handling each thread, resolve it with:\n"
