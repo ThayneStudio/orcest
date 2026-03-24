@@ -409,11 +409,8 @@ def test_consume_results_transient_failure_no_needs_human(
     # Should NOT add needs-human label
     gh_mock.add_label.assert_not_called()
 
-    # Should post a comment mentioning transient / retry
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "transient" in comment_body
-    assert "retry" in comment_body.lower()
+    # Transient failures are retried silently — no comment should be posted
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_consume_results_transient_failure_clears_attempts(

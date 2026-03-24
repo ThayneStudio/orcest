@@ -1004,13 +1004,9 @@ def _handle_result(
         safe_summary = result.summary[:500] if result.summary else ""
 
         if result.status == ResultStatus.FAILED and is_transient:
-            body = (
-                f"**orcest** task `{result.task_id}` hit a transient failure "
-                f"({result.duration_seconds}s, "
-                f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary.removeprefix(TRANSIENT_SUMMARY_PREFIX)}\n\n"
-                f"Will retry automatically on the next poll cycle."
-            )
+            # Transient failures are retried silently — no comment to avoid
+            # accumulating noise if infrastructure is degraded across many attempts.
+            return
         elif result.status == ResultStatus.FAILED:
             label_note = (
                 f"Labeling as `{labels.needs_human}` for manual review."
