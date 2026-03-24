@@ -169,6 +169,7 @@ def _publish_and_notify(
     default_runner: str,
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
+    proactive: bool = False,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
 
@@ -179,6 +180,11 @@ def _publish_and_notify(
     crash between the two operations still counts the attempt, preventing
     unbounded retries.  If commenting fails afterwards, the error is logged
     but the task is not lost.
+
+    When ``proactive`` is True (proactive rebase after an upstream merge), the
+    attempt counters are *not* incremented.  Proactive rebases are no-ops when
+    the branch is already up-to-date, so burning the per-SHA attempt budget
+    would incorrectly push PRs toward SKIP_MAX_ATTEMPTS.
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
@@ -194,18 +200,21 @@ def _publish_and_notify(
     # increment, the attempt would never be counted, allowing unbounded
     # retries.  An increment without a subsequent xadd is safe -- the
     # max-attempts guard in discover_actionable_prs prevents runaway loops.
-    try:
-        increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
-        increment_total_attempts(redis, repo, pr_state.number)
-    except Exception:
-        _log.error(
-            f"Failed to increment attempt counter for PR #{pr_state.number} "
-            f"before publishing task {task.id} to Redis; skipping publish to "
-            f"avoid an un-counted attempt — will retry next poll cycle",
-            exc_info=True,
-        )
-        _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
-        return
+    # Proactive rebases skip incrementing: they are no-ops when already
+    # up-to-date, so counting them would unfairly drain the attempt budget.
+    if not proactive:
+        try:
+            increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
+            increment_total_attempts(redis, repo, pr_state.number)
+        except Exception:
+            _log.error(
+                f"Failed to increment attempt counter for PR #{pr_state.number} "
+                f"before publishing task {task.id} to Redis; skipping publish to "
+                f"avoid an un-counted attempt — will retry next poll cycle",
+                exc_info=True,
+            )
+            _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
+            return
 
     # Publish to backend-specific stream
     try:
@@ -477,12 +486,14 @@ def publish_rebase_task(
     logger: logging.Logger | None = None,
     claude_token: str = "",
     key_prefix: str = "",
+    proactive: bool = False,
 ) -> Task:
-    """Create and publish a rebase task for a PR with merge conflicts.
+    """Create and publish a rebase task for a PR.
 
-    Enqueued when ``gh pr merge`` fails due to merge conflicts. The worker
-    will rebase the branch onto the base branch and resolve any conflicts,
-    then push. The orchestrator will attempt to merge again on the next cycle.
+    Enqueued either when ``gh pr merge`` fails due to merge conflicts, or
+    proactively after an upstream merge to keep SKIP_GREEN PRs up-to-date.
+    When ``proactive`` is True the attempt counters are not incremented (see
+    ``_publish_and_notify``).
     """
     prompt = _render_rebase_prompt(
         pr_number=pr_state.number,
@@ -515,6 +526,7 @@ def publish_rebase_task(
         default_runner=default_runner,
         pending_task_ttl=pending_task_ttl,
         logger=logger,
+        proactive=proactive,
     )
 
     return task

@@ -304,6 +304,7 @@ def _poll_cycle(
                             logger=logger,
                             claude_token=config.github.claude_token,
                             key_prefix=config.redis.key_prefix,
+                            proactive=True,
                         )
                     except Exception:
                         logger.warning(
