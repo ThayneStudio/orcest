@@ -1006,7 +1006,7 @@ def _handle_result(
                 f"**orcest** task `{result.task_id}` hit a transient failure "
                 f"({result.duration_seconds}s, "
                 f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary}\n\n"
+                f"Summary: {safe_summary.removeprefix('[transient] ')}\n\n"
                 f"Will retry automatically on the next poll cycle."
             )
         elif result.status == ResultStatus.FAILED:

@@ -237,7 +237,7 @@ class TestExecuteTask:
     ):
         """WorkspaceError (clone timeout, network) produces [transient] summary prefix."""
         mock_workspace.setup.side_effect = WorkspaceError(
-            "git clone timed out after 300s for owner/repo"
+            "git clone timed out after 300s for owner/repo", transient=True
         )
         mock_runner = MagicMock()
         mock_redis = MagicMock()
