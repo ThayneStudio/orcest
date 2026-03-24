@@ -880,7 +880,7 @@ def _render_fix_prompt(
         sections.append("- If it requests a code change, make the fix and resolve the thread.")
         sections.append(
             "- If it is purely positive feedback or has no actionable request, "
-            "resolve it without making code changes."
+            "skip making code changes but still resolve the thread as described below."
         )
         sections.append(
             "- After handling each thread, resolve it with:\n"

@@ -1055,7 +1055,6 @@ def test_publish_review_fix_uses_pr_state_threads(
     assert isinstance(task, Task)
 
 
-
 # --- increment_attempts failure: Option A early-return behavior ---
 
 

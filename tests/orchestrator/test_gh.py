@@ -1041,7 +1041,6 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
     assert len(result) == _MAX_PAGES
 
 
-
 # ---------------------------------------------------------------------------
 # Timeout handling
 # ---------------------------------------------------------------------------
