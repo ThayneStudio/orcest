@@ -130,12 +130,14 @@ def _run_gh(args: list[str], token: str) -> str:
             ) from exc
         except subprocess.CalledProcessError as exc:
             if _is_rate_limited(exc.stderr):
-                retry_after = _extract_retry_after(exc.stderr)
+                retry_after_raw = _extract_retry_after(exc.stderr)
+                retry_after = (
+                    min(retry_after_raw, _MAX_RETRY_AFTER_SECONDS)
+                    if retry_after_raw is not None
+                    else None
+                )
                 if attempt < len(_RATE_LIMIT_BACKOFF_SECONDS):
-                    if retry_after is not None:
-                        wait = min(retry_after, _MAX_RETRY_AFTER_SECONDS)
-                    else:
-                        wait = _RATE_LIMIT_BACKOFF_SECONDS[attempt]
+                    wait = retry_after if retry_after is not None else _RATE_LIMIT_BACKOFF_SECONDS[attempt]
                     logger.warning(
                         "GitHub rate limit hit; retrying in %ds (attempt %d/%d)",
                         wait,
@@ -148,11 +150,7 @@ def _run_gh(args: list[str], token: str) -> str:
                     f"gh command rate-limited (exit {exc.returncode}): {exc.stderr.strip()}",
                     stderr=exc.stderr,
                     returncode=exc.returncode,
-                    retry_after=(
-                        min(retry_after, _MAX_RETRY_AFTER_SECONDS)
-                        if retry_after is not None
-                        else None
-                    ),
+                    retry_after=retry_after,
                 ) from exc
             raise GhCliError(
                 f"gh command failed (exit {exc.returncode}): {exc.stderr.strip()}",
