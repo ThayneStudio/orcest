@@ -34,7 +34,7 @@ from orcest.orchestrator.task_publisher import (
 from orcest.shared.config import OrchestratorConfig
 from orcest.shared.coordination import clear_backoff, clear_pending_task, compute_pending_task_ttl
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import ResultStatus, TaskResult
+from orcest.shared.models import ResultStatus, TaskResult, TRANSIENT_SUMMARY_PREFIX
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
@@ -954,7 +954,7 @@ def _handle_result(
 
     # Transient failures (clone timeout, worker restart) should be retried
     # automatically — don't label needs-human or burn attempt slots.
-    is_transient = result.status == ResultStatus.FAILED and result.summary.startswith("[transient]")
+    is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(TRANSIENT_SUMMARY_PREFIX)
 
     if is_transient:
         # Clear per-SHA attempts so the PR will be re-enqueued on the next
@@ -1006,7 +1006,7 @@ def _handle_result(
                 f"**orcest** task `{result.task_id}` hit a transient failure "
                 f"({result.duration_seconds}s, "
                 f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary.removeprefix('[transient] ')}\n\n"
+                f"Summary: {safe_summary.removeprefix(TRANSIENT_SUMMARY_PREFIX)}\n\n"
                 f"Will retry automatically on the next poll cycle."
             )
         elif result.status == ResultStatus.FAILED:
