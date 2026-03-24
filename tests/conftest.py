@@ -155,6 +155,9 @@ def gh_mock(mocker):
         "merge_pr",
         "rerun_workflow",
         "create_issue",
+        "add_issue_label",
+        "remove_issue_label",
+        "post_issue_comment",
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
