@@ -31,7 +31,7 @@ from orcest.orchestrator.task_publisher import (
     publish_issue_task,
     publish_rebase_task,
 )
-from orcest.shared.config import OrchestratorConfig
+from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
     clear_backoff,
     clear_pending_task,
@@ -56,8 +56,10 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
 
-    # Ensure consumer group for results stream
-    redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    # Ensure consumer group for results stream (per-project)
+    for project in config.projects:
+        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+        project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     # Graceful shutdown
     shutdown = False
@@ -72,9 +74,10 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     pending_task_ttl = compute_pending_task_ttl(config.runner)
 
+    repos = ", ".join(p.repo for p in config.projects) if config.projects else "(none)"
     logger.info(
-        "Orchestrator started. Repo: %s, poll interval: %ds",
-        config.github.repo,
+        "Orchestrator started. Projects: %s, poll interval: %ds",
+        repos,
         config.polling.interval,
     )
 
@@ -100,22 +103,70 @@ def _poll_cycle(
     logger: logging.Logger,
     pending_task_ttl: int,
 ) -> None:
-    """Single orchestrator poll cycle."""
-    # Step 1: Consume results from workers
-    _consume_results(config, redis, logger)
+    """Single orchestrator poll cycle across all configured projects."""
+    # Step 1: Consume results per project
+    for project in config.projects:
+        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+        try:
+            _consume_results_for_project(project, project_redis, config.labels, logger)
+        except Exception:
+            logger.error(f"Failed to consume results for {project.repo}", exc_info=True)
 
-    # Step 2: Discover PRs needing action
+    # Step 2: Poll each project
+    total_enqueued = 0
+    total_merged = 0
+    total_prs = 0
+    total_issues = 0
+    for project in config.projects:
+        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+        try:
+            enqueued, merged, prs_checked, issues_checked = _poll_project(
+                project, project_redis, config, logger, pending_task_ttl
+            )
+            total_enqueued += enqueued
+            total_merged += merged
+            total_prs += prs_checked
+            total_issues += issues_checked
+        except Exception:
+            logger.error(f"Failed to poll {project.repo}", exc_info=True)
+
+    logger.info(
+        "Poll cycle complete. %d tasks enqueued, %d merged, %d PRs checked, %d issues checked.",
+        total_enqueued,
+        total_merged,
+        total_prs,
+        total_issues,
+    )
+
+
+def _poll_project(
+    project: ProjectConfig,
+    redis: RedisClient,
+    config: OrchestratorConfig,
+    logger: logging.Logger,
+    pending_task_ttl: int,
+) -> tuple[int, int, int, int]:
+    """Poll a single project for actionable PRs and issues.
+
+    Returns (enqueued, merged, prs_checked, issues_checked).
+    """
+    repo = project.repo
+    token = project.token
+    claude_token = project.claude_token
+    key_prefix = project.key_prefix
+    labels = config.labels
+
+    # Discover PRs needing action
     pr_states = discover_actionable_prs(
-        repo=config.github.repo,
-        token=config.github.token,
+        repo=repo,
+        token=token,
         redis=redis,
-        label_config=config.labels,
+        label_config=labels,
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
         stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
     )
 
-    # Step 3: Act on PRs
     # Sort: merges first (quick wins), then fixes/followups oldest-first
     # (lowest PR number = longest waiting). Skips don't matter but sort
     # them last so actionable items are processed first.
@@ -138,9 +189,9 @@ def _poll_cycle(
             logger.info("PR #%d (%s): merging", pr_state.number, pr_state.title)
             try:
                 gh.merge_pr(
-                    config.github.repo,
+                    repo,
                     pr_state.number,
-                    config.github.token,
+                    token,
                     delete_branch=config.delete_branch_on_merge,
                 )
                 merged += 1
@@ -162,15 +213,15 @@ def _poll_cycle(
                     try:
                         publish_rebase_task(
                             pr_state=pr_state,
-                            repo=config.github.repo,
-                            token=config.github.token,
+                            repo=repo,
+                            token=token,
                             redis=redis,
                             default_runner=config.default_runner,
                             merge_error=err_msg[:200],
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
-                            claude_token=config.github.claude_token,
-                            key_prefix=config.redis.key_prefix,
+                            claude_token=claude_token,
+                            key_prefix=key_prefix,
                         )
                         enqueued += 1
                     except Exception as rebase_err:
@@ -186,10 +237,10 @@ def _poll_cycle(
                     labeled = False
                     try:
                         gh.add_label(
-                            config.github.repo,
+                            repo,
                             pr_state.number,
-                            config.labels.needs_human,
-                            config.github.token,
+                            labels.needs_human,
+                            token,
                         )
                         labeled = True
                     except Exception as label_err:
@@ -201,16 +252,16 @@ def _poll_cycle(
                     try:
                         safe_err = err_msg[:200]
                         label_note = (
-                            f"Labeling as `{config.labels.needs_human}` for manual review."
+                            f"Labeling as `{labels.needs_human}` for manual review."
                             if labeled
-                            else f"Failed to add `{config.labels.needs_human}` "
+                            else f"Failed to add `{labels.needs_human}` "
                             f"label — please triage manually."
                         )
                         gh.post_comment(
-                            config.github.repo,
+                            repo,
                             pr_state.number,
                             f"**orcest** failed to merge this PR: {safe_err}\n\n{label_note}",
-                            config.github.token,
+                            token,
                         )
                     except Exception as comment_err:
                         logger.error(
@@ -221,7 +272,7 @@ def _poll_cycle(
             else:
                 # Clean up state on successful merge
                 try:
-                    clear_review_retrigger(redis, config.github.repo, pr_state.number)
+                    clear_review_retrigger(redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_review_retrigger for PR #%d",
@@ -229,7 +280,7 @@ def _poll_cycle(
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
-                    clear_total_attempts(redis, config.github.repo, pr_state.number)
+                    clear_total_attempts(redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_total_attempts for PR #%d",
@@ -237,7 +288,7 @@ def _poll_cycle(
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
-                    clear_backoff(redis, config.github.repo, pr_state.number)
+                    clear_backoff(redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_backoff for PR #%d",
@@ -246,10 +297,10 @@ def _poll_cycle(
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
                     gh.post_comment(
-                        config.github.repo,
+                        repo,
                         pr_state.number,
                         "**orcest** merged this PR.",
-                        config.github.token,
+                        token,
                     )
                 except Exception as comment_err:
                     logger.warning(
@@ -267,12 +318,12 @@ def _poll_cycle(
                     logger.error("PR #%d: deployment failed: %s", pr_state.number, err_msg)
                     try:
                         issue_number = gh.create_issue(
-                            config.github.repo,
+                            repo,
                             f"Deployment failed after merge of PR #{pr_state.number}",
                             f"**orcest** deployment failed after merging "
                             f"PR #{pr_state.number} ({pr_state.title}).\n\n"
                             f"Error: {err_msg[:500]}",
-                            config.github.token,
+                            token,
                             labels=["orcest:needs-human"],
                         )
                         logger.info(
@@ -303,15 +354,15 @@ def _poll_cycle(
                     try:
                         publish_rebase_task(
                             pr_state=other_pr,
-                            repo=config.github.repo,
-                            token=config.github.token,
+                            repo=repo,
+                            token=token,
                             redis=redis,
                             default_runner=config.default_runner,
                             merge_error="",
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
-                            claude_token=config.github.claude_token,
-                            key_prefix=config.redis.key_prefix,
+                            claude_token=claude_token,
+                            key_prefix=key_prefix,
                             proactive=True,
                         )
                     except Exception:
@@ -325,14 +376,14 @@ def _poll_cycle(
             try:
                 result = publish_fix_task(
                     pr_state=pr_state,
-                    repo=config.github.repo,
-                    token=config.github.token,
+                    repo=repo,
+                    token=token,
                     redis=redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
-                    claude_token=config.github.claude_token,
-                    key_prefix=config.redis.key_prefix,
+                    claude_token=claude_token,
+                    key_prefix=key_prefix,
                 )
                 if result is not None:
                     enqueued += 1
@@ -344,7 +395,7 @@ def _poll_cycle(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                    clear_pending_task(redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -357,14 +408,14 @@ def _poll_cycle(
             try:
                 publish_followup_task(
                     pr_state=pr_state,
-                    repo=config.github.repo,
-                    token=config.github.token,
+                    repo=repo,
+                    token=token,
                     redis=redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
-                    claude_token=config.github.claude_token,
-                    key_prefix=config.redis.key_prefix,
+                    claude_token=claude_token,
+                    key_prefix=key_prefix,
                 )
                 enqueued += 1
             except Exception as e:
@@ -375,7 +426,7 @@ def _poll_cycle(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                    clear_pending_task(redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -392,13 +443,13 @@ def _poll_cycle(
             try:
                 publish_rebase_task(
                     pr_state=pr_state,
-                    repo=config.github.repo,
-                    token=config.github.token,
+                    repo=repo,
+                    token=token,
                     redis=redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
-                    claude_token=config.github.claude_token,
+                    claude_token=claude_token,
                 )
                 enqueued += 1
             except Exception as e:
@@ -409,7 +460,7 @@ def _poll_cycle(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, config.github.repo, "pr", pr_state.number)
+                    clear_pending_task(redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -434,13 +485,11 @@ def _poll_cycle(
                 )
                 try:
                     gh.rerun_workflow(
-                        config.github.repo,
+                        repo,
                         run_id,
-                        config.github.token,
+                        token,
                     )
-                    set_review_retrigger_sha(
-                        redis, config.github.repo, pr_state.number, pr_state.head_sha
-                    )
+                    set_review_retrigger_sha(redis, repo, pr_state.number, pr_state.head_sha)
                 except Exception as e:
                     logger.error(
                         "Failed to re-trigger review for PR #%d: %s",
@@ -451,7 +500,7 @@ def _poll_cycle(
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
             # Cooldown guard: skip if we already acted on this SHA
-            stale_sha = get_stale_retrigger_sha(redis, config.github.repo, pr_state.number)
+            stale_sha = get_stale_retrigger_sha(redis, repo, pr_state.number)
             if stale_sha == pr_state.head_sha:
                 logger.debug(
                     "PR #%d: stale checks already handled for SHA %s, skipping",
@@ -468,10 +517,10 @@ def _poll_cycle(
                 )
                 try:
                     gh.add_label(
-                        config.github.repo,
+                        repo,
                         pr_state.number,
-                        config.labels.needs_human,
-                        config.github.token,
+                        labels.needs_human,
+                        token,
                     )
                 except Exception as e:
                     logger.error(
@@ -482,13 +531,13 @@ def _poll_cycle(
                     )
                 try:
                     gh.post_comment(
-                        config.github.repo,
+                        repo,
                         pr_state.number,
                         f"**orcest** detected stale CI checks that have been pending for "
                         f"more than {config.stale_pending_timeout_seconds // 60}m but "
                         f"could not re-trigger them automatically. "
                         f"Please investigate the stuck checks manually.",
-                        config.github.token,
+                        token,
                     )
                 except Exception as e:
                     logger.error(
@@ -499,7 +548,7 @@ def _poll_cycle(
                     )
                 set_stale_retrigger_sha(
                     redis,
-                    config.github.repo,
+                    repo,
                     pr_state.number,
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
@@ -517,9 +566,9 @@ def _poll_cycle(
                 for run_id in run_ids:
                     try:
                         gh.cancel_workflow(
-                            config.github.repo,
+                            repo,
                             run_id,
-                            config.github.token,
+                            token,
                         )
                         any_cancel_succeeded = True
                         cancelled_count += 1
@@ -543,9 +592,9 @@ def _poll_cycle(
                     # poll cycle and be handled by the normal fix flow.
                     try:
                         gh.rerun_workflow(
-                            config.github.repo,
+                            repo,
                             run_id,
-                            config.github.token,
+                            token,
                         )
                         logger.info(
                             "PR #%d: re-triggered stale workflow run %d",
@@ -564,7 +613,7 @@ def _poll_cycle(
                 # loop if the run can't be cancelled or immediately rerun.
                 set_stale_retrigger_sha(
                     redis,
-                    config.github.repo,
+                    repo,
                     pr_state.number,
                     pr_state.head_sha,
                     ex=config.stale_pending_timeout_seconds,
@@ -572,13 +621,13 @@ def _poll_cycle(
                 if any_cancel_succeeded:
                     try:
                         gh.post_comment(
-                            config.github.repo,
+                            repo,
                             pr_state.number,
                             f"**orcest** detected CI checks stuck in pending state for"
                             f" more than {config.stale_pending_timeout_seconds // 60}m."
                             f" Cancelled {cancelled_count} of {len(run_ids)} run(s) to self-heal."
                             f" CI will restart once the cancellation propagates.",
-                            config.github.token,
+                            token,
                         )
                     except Exception as e:
                         logger.error(
@@ -596,10 +645,10 @@ def _poll_cycle(
             labeled = False
             try:
                 gh.add_label(
-                    config.github.repo,
+                    repo,
                     pr_state.number,
-                    config.labels.needs_human,
-                    config.github.token,
+                    labels.needs_human,
+                    token,
                 )
                 labeled = True
             except Exception as e:
@@ -611,19 +660,18 @@ def _poll_cycle(
                 )
             try:
                 label_note = (
-                    f"Labeling as `{config.labels.needs_human}` for manual review."
+                    f"Labeling as `{labels.needs_human}` for manual review."
                     if labeled
-                    else f"Failed to add `{config.labels.needs_human}` "
-                    f"label — please triage manually."
+                    else f"Failed to add `{labels.needs_human}` label — please triage manually."
                 )
                 gh.post_comment(
-                    config.github.repo,
+                    repo,
                     pr_state.number,
                     f"**orcest** has exhausted its retry budget "
                     f"({config.max_attempts} attempts) for this PR. "
                     f"{label_note}\n\nPush a new commit to reset "
                     f"the counter and allow orcest to try again.",
-                    config.github.token,
+                    token,
                 )
             except Exception as e:
                 logger.error(
@@ -653,7 +701,7 @@ def _poll_cycle(
                 "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action
             )
 
-    # Step 4: Discover issues needing implementation
+    # Discover issues needing implementation
     # Prioritize existing PRs over new issue work. PRs with terminal
     # labels (needs-human/blocked) are parked and don't block issue work.
     pr_work_pending = any(
@@ -679,16 +727,16 @@ def _poll_cycle(
     else:
         try:
             issue_states = discover_actionable_issues(
-                repo=config.github.repo,
-                token=config.github.token,
+                repo=repo,
+                token=token,
                 redis=redis,
-                label_config=config.labels,
+                label_config=labels,
                 max_attempts=config.max_attempts,
             )
         except Exception as e:
             logger.error(f"Issue discovery failed: {e}", exc_info=True)
 
-    # Step 5: Act on issues
+    # Act on issues
     for issue_state in issue_states:
         if issue_state.action == IssueAction.ENQUEUE_IMPLEMENT:
             logger.info(
@@ -697,14 +745,14 @@ def _poll_cycle(
             try:
                 publish_issue_task(
                     issue_state=issue_state,
-                    repo=config.github.repo,
-                    token=config.github.token,
+                    repo=repo,
+                    token=token,
                     redis=redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
-                    claude_token=config.github.claude_token,
-                    key_prefix=config.redis.key_prefix,
+                    claude_token=claude_token,
+                    key_prefix=key_prefix,
                 )
                 enqueued += 1
             except Exception as e:
@@ -713,7 +761,7 @@ def _poll_cycle(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, config.github.repo, "issue", issue_state.number)
+                    clear_pending_task(redis, repo, "issue", issue_state.number)
                 except Exception as clear_err:
                     logger.error(
                         f"Failed to clear pending task marker for issue #{issue_state.number}: "
@@ -727,10 +775,10 @@ def _poll_cycle(
             labeled = False
             try:
                 gh.add_issue_label(
-                    config.github.repo,
+                    repo,
                     issue_state.number,
-                    config.labels.needs_human,
-                    config.github.token,
+                    labels.needs_human,
+                    token,
                 )
                 labeled = True
             except Exception as e:
@@ -740,18 +788,17 @@ def _poll_cycle(
                 )
             try:
                 label_note = (
-                    f"Labeling as `{config.labels.needs_human}` for manual review."
+                    f"Labeling as `{labels.needs_human}` for manual review."
                     if labeled
-                    else f"Failed to add `{config.labels.needs_human}` "
-                    f"label — please triage manually."
+                    else f"Failed to add `{labels.needs_human}` label — please triage manually."
                 )
                 gh.post_issue_comment(
-                    config.github.repo,
+                    repo,
                     issue_state.number,
                     f"**orcest** has exhausted its retry budget "
                     f"({config.max_attempts} attempts) for this issue. "
                     f"{label_note}",
-                    config.github.token,
+                    token,
                 )
             except Exception as e:
                 logger.error(
@@ -771,20 +818,16 @@ def _poll_cycle(
                 f"Issue #{issue_state.number}: unhandled action {issue_state.action!r}, skipping"
             )
 
-    logger.info(
-        f"Poll cycle complete. "
-        f"{enqueued} tasks enqueued, {merged} merged, "
-        f"{len(pr_states)} PRs checked, "
-        f"{len(issue_states)} issues checked."
-    )
+    return enqueued, merged, len(pr_states), len(issue_states)
 
 
-def _consume_results(
-    config: OrchestratorConfig,
+def _consume_results_for_project(
+    project: ProjectConfig,
     redis: RedisClient,
+    labels: LabelConfig,
     logger: logging.Logger,
 ) -> None:
-    """Consume any pending results from workers.
+    """Consume any pending results from workers for a single project.
 
     Non-blocking: reads all available results without waiting.
 
@@ -808,7 +851,7 @@ def _consume_results(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(config, redis, result, logger)
+                _handle_result(project, labels, redis, result, logger)
                 logger.info(f"Recovered pending result {entry_id}")
             except Exception as e:
                 logger.error(
@@ -839,7 +882,7 @@ def _consume_results(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(config, redis, result, logger)
+                _handle_result(project, labels, redis, result, logger)
             except Exception as e:
                 logger.error(
                     "Failed to process result entry %s: %s",
@@ -861,7 +904,8 @@ def _consume_results(
 
 
 def _handle_result(
-    config: OrchestratorConfig,
+    project: ProjectConfig,
+    labels: LabelConfig,
     redis: RedisClient,
     result: TaskResult,
     logger: logging.Logger,
@@ -883,9 +927,8 @@ def _handle_result(
         result.duration_seconds,
     )
 
-    repo = config.github.repo
-    token = config.github.token
-    labels = config.labels
+    repo = project.repo
+    token = project.token
     resource_id = result.resource_id
     is_issue = result.resource_type == "issue"
     resource_label = "issue" if is_issue else "PR"
