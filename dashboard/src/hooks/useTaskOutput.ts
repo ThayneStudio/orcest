@@ -3,6 +3,7 @@ import type { TaskOutputMessage } from "../lib/types";
 
 interface TaskOutputState {
   lines: string[];
+  startIndex: number;
   connected: boolean;
   done: boolean;
 }
@@ -17,6 +18,7 @@ export interface TaskOutputParams {
 export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState {
   const [state, setState] = useState<TaskOutputState>({
     lines: [],
+    startIndex: 0,
     connected: false,
     done: false,
   });
@@ -50,11 +52,18 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
         if (msg.lines && msg.lines.length > 0) {
           setState((prev) => {
             const newLines = [...prev.lines, ...msg.lines];
+            if (newLines.length > MAX_LINES) {
+              const sliced = newLines.length - MAX_LINES;
+              return {
+                ...prev,
+                lines: newLines.slice(sliced),
+                startIndex: prev.startIndex + sliced,
+                done: msg.done,
+              };
+            }
             return {
               ...prev,
-              lines: newLines.length > MAX_LINES
-                ? newLines.slice(newLines.length - MAX_LINES)
-                : newLines,
+              lines: newLines,
               done: msg.done,
             };
           });
@@ -86,7 +95,7 @@ export function useTaskOutput(params: TaskOutputParams | null): TaskOutputState 
   }, [params?.workerId, params?.taskId]);
 
   useEffect(() => {
-    setState({ lines: [], connected: false, done: false });
+    setState({ lines: [], startIndex: 0, connected: false, done: false });
     doneRef.current = false;
     wsRef.current?.close();
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);

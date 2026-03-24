@@ -210,7 +210,7 @@ function TaskOutputPanel({
   label: string;
   onClose: () => void;
 }) {
-  const { lines, connected, done } = useTaskOutput(params);
+  const { lines, startIndex, connected, done } = useTaskOutput(params);
   const logRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
@@ -279,7 +279,7 @@ function TaskOutputPanel({
         ) : (
           lines.map((line, i) => (
             <div
-              key={i}
+              key={startIndex + i}
               className={
                 line.startsWith("───")
                   ? "text-cyan-400 font-bold border-t border-zinc-800 pt-2 mt-2"

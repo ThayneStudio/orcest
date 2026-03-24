@@ -157,7 +157,14 @@ snapshotWss.on("connection", (ws) => {
 // --- Task Output WebSocket ---
 // Query params: worker_id (required), task_id (optional — if omitted, streams the most recent task)
 
+const MAX_TASK_OUTPUT_CONNECTIONS = 20;
+
 taskOutputWss.on("connection", (ws, req) => {
+  if (taskOutputWss.clients.size > MAX_TASK_OUTPUT_CONNECTIONS) {
+    ws.close(1013, "Too many connections");
+    return;
+  }
+
   const url = new URL(req.url || "", `http://localhost:${PORT}`);
   const workerId = url.searchParams.get("worker_id");
   const taskId = url.searchParams.get("task_id") || undefined;

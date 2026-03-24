@@ -50,11 +50,13 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
   // Queue depths — keys are prefixed: orcest:tasks:claude, transit-platform:tasks:issue:claude, etc.
   const taskStreamKeys = (await scanKeys("*:tasks:*")).sort();
   const queueDepths: Record<string, number> = {};
-  for (const stream of taskStreamKeys) {
-    try {
-      queueDepths[stream] = await redis.xlen(stream);
-    } catch {
-      // Key exists but is not a stream
+  if (taskStreamKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const stream of taskStreamKeys) pipeline.xlen(stream);
+    const results = await pipeline.exec();
+    for (let i = 0; i < taskStreamKeys.length; i++) {
+      const [err, len] = results?.[i] ?? [null, 0];
+      if (!err) queueDepths[taskStreamKeys[i]] = len as number;
     }
   }
 
