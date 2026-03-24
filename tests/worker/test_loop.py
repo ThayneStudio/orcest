@@ -1430,7 +1430,7 @@ class TestRunWorker:
         assert normal_call_count == 1
 
     @pytest.mark.skip(
-        reason="Dead-letter now happens before lock acquisition; test needs redesign per issue #398"
+        reason="Dead-letter now happens before lock acquisition; needs redesign per issue #398"
     )
     def test_ephemeral_worker_releases_lock_before_shutdown_on_dead_letter(
         self, mocker, worker_config, sample_task

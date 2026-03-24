@@ -282,6 +282,39 @@ def _poll_cycle(
                             issue_err,
                             exc_info=True,
                         )
+                # After successful merge, rebase other open PRs onto updated master.
+                # If multiple PRs are merged in the same poll cycle, this loop runs
+                # once per merged PR; publish_rebase_task calls set_pending_task (SET
+                # NX EX), which silently deduplicates redundant enqueue attempts.
+                logger.info(
+                    "PR #%d merged; checking for SKIP_GREEN PRs to proactively rebase",
+                    pr_state.number,
+                )
+                for other_pr in pr_states:
+                    if other_pr.number == pr_state.number:
+                        continue  # skip the one we just merged
+                    if other_pr.action != PRAction.SKIP_GREEN:
+                        continue  # only proactively rebase green PRs
+                    try:
+                        publish_rebase_task(
+                            pr_state=other_pr,
+                            repo=config.github.repo,
+                            token=config.github.token,
+                            redis=redis,
+                            default_runner=config.default_runner,
+                            merge_error="",
+                            pending_task_ttl=pending_task_ttl,
+                            logger=logger,
+                            claude_token=config.github.claude_token,
+                            key_prefix=config.redis.key_prefix,
+                            proactive=True,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to enqueue rebase for PR #%d",
+                            other_pr.number,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
