@@ -356,15 +356,14 @@ def publish_fix_task(
             # Fall through to enqueue a Claude fix task below.
 
     # Use review threads from pr_state (populated by discover_actionable_prs for
-    # CHANGES_REQUESTED). For CI failures, fetch inline review comments from the
-    # REST API since discover_actionable_prs does not populate review_threads there.
+    # CHANGES_REQUESTED). For CI failures, fetch unresolved threads via GraphQL
+    # so we get thread IDs for resolution.
     if pr_state.ci_failures:
         try:
-            raw_inline = gh.get_pr_review_comments(repo, pr_state.number, token)
-            review_threads = _group_inline_comments(raw_inline)
+            review_threads = gh.get_unresolved_review_threads(repo, pr_state.number, token)
         except Exception as exc:
             _log.warning(
-                "Failed to fetch inline review comments for PR #%s; proceeding without them: %s",
+                "Failed to fetch review threads for PR #%s; proceeding without them: %s",
                 pr_state.number,
                 exc,
                 exc_info=True,
@@ -643,25 +642,6 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
-def _group_inline_comments(comments: list[dict]) -> list[dict]:
-    """Group flat inline review comments by (path, line) into thread-like dicts.
-
-    Input dicts have keys: path, line, author, body (as returned by
-    gh.get_pr_review_comments). Output dicts match the format expected by
-    _render_review_threads: {path, line, comments: [{author, body}]}.
-    """
-    groups: dict[tuple, list[dict]] = {}
-    for c in comments:
-        key = (c.get("path", ""), c.get("line"))
-        if key not in groups:
-            groups[key] = []
-        groups[key].append({"author": c.get("author", ""), "body": c.get("body", "")})
-    return [
-        {"path": path, "line": line, "comments": thread_comments}
-        for (path, line), thread_comments in groups.items()
-    ]
-
-
 def _render_issue_prompt(
     issue_number: int,
     issue_title: str,
@@ -711,7 +691,11 @@ def _render_review_threads(threads: list[dict]) -> list[str]:
     for thread in threads:
         path = thread.get("path") or "unknown"
         line_no = thread.get("line")
-        lines.append(f"### `{path}` line {line_no if line_no is not None else '?'}")
+        thread_id = thread.get("id") or ""
+        header = f"### `{path}` line {line_no if line_no is not None else '?'}"
+        if thread_id:
+            header += f" (thread ID: `{thread_id}`)"
+        lines.append(header)
         for comment in thread.get("comments") or []:
             author = comment.get("author") or "unknown"
             body = comment.get("body") or ""
@@ -896,7 +880,15 @@ def _render_fix_prompt(
         sections.append("- If it requests a code change, make the fix and resolve the thread.")
         sections.append(
             "- If it is purely positive feedback or has no actionable request, "
-            "resolve the thread without making changes."
+            "skip making code changes but still resolve the thread as described below."
+        )
+        sections.append(
+            "- After handling each thread, resolve it with:\n"
+            "  ```\n"
+            "  gh api graphql -f threadId='<THREAD_ID>' -f query='"
+            "mutation($threadId: ID!) { resolveReviewThread(input: "
+            "{threadId: $threadId}) { thread { id isResolved } } }'\n"
+            "  ```"
         )
         sections.append("")
 
