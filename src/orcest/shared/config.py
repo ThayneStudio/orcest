@@ -31,6 +31,16 @@ class GithubConfig:
 
 
 @dataclass
+class ProjectConfig:
+    """Per-project configuration for the orchestrator."""
+
+    repo: str  # "owner/repo"
+    token: str  # GitHub PAT
+    claude_token: str  # Claude Code OAuth token
+    key_prefix: str  # Redis key prefix for this project
+
+
+@dataclass
 class PollingConfig:
     interval: int = 60  # seconds between poll cycles
 
@@ -66,6 +76,7 @@ class OrchestratorConfig:
     github: GithubConfig = field(default_factory=GithubConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
+    projects: list[ProjectConfig] = field(default_factory=list)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     # Runner settings used to compute the pending-task marker TTL.  These
     # should match the timeout/max_retries deployed on worker nodes so that
@@ -229,6 +240,32 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         claude_token=str(claude_token),
     )
 
+    # Multi-project support: load projects list
+    projects_raw = raw.get("projects", [])
+    if isinstance(projects_raw, list) and projects_raw:
+        projects = []
+        for p in projects_raw:
+            if not isinstance(p, dict):
+                continue
+            projects.append(
+                ProjectConfig(
+                    repo=str(p.get("repo", "")),
+                    token=str(p.get("token", github_token)),  # default to shared token
+                    claude_token=str(p.get("claude_token", claude_token)),  # default to shared
+                    key_prefix=str(p.get("key_prefix", "")),
+                )
+            )
+    else:
+        # Backward compatibility: single-project mode
+        projects = [
+            ProjectConfig(
+                repo=str(github_repo),
+                token=str(github_token),
+                claude_token=str(claude_token),
+                key_prefix=str(redis_config.key_prefix),
+            )
+        ]
+
     # Polling
     polling_raw = _safe_dict(raw, "polling")
     polling_config = PollingConfig(
@@ -305,6 +342,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
+        projects=projects,
         polling=polling_config,
         labels=labels_config,
         deployment=deployment_config,
@@ -317,9 +355,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Validate required fields
-    if not config.github.repo:
+    if not projects or not any(p.repo for p in projects):
         raise ValueError(
-            "github.repo is required. Set it in the config file or via ORCEST_REPO env var."
+            "github.repo is required (or provide a projects list). "
+            "Set it in the config file or via ORCEST_REPO env var."
         )
 
     return config

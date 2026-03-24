@@ -17,7 +17,7 @@ from orcest.orchestrator.issue_ops import (
 from orcest.orchestrator.loop import (
     RESULTS_GROUP,
     RESULTS_STREAM,
-    _consume_results,
+    _consume_results_for_project,
     _poll_cycle,
 )
 from orcest.orchestrator.pr_ops import (
@@ -31,8 +31,15 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     set_stale_retrigger_sha,
 )
+from orcest.shared.config import OrchestratorConfig
 from orcest.shared.coordination import set_pending_task
 from orcest.shared.models import ResultStatus, TaskResult
+
+
+def _consume_results(config: OrchestratorConfig, redis, logger):
+    """Compat wrapper: calls _consume_results_for_project with the first project."""
+    project = config.projects[0]
+    _consume_results_for_project(project, redis, config.labels, logger)
 
 
 def _make_pr_state(
@@ -80,6 +87,12 @@ def _make_task_result(
 # ---------------------------------------------------------------------------
 # _poll_cycle tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _mock_issue_discovery(mocker):
+    """Mock discover_actionable_issues for all _poll_cycle tests to avoid real gh calls."""
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_issues", return_value=[])
 
 
 def test_poll_cycle_enqueues_tasks(mocker, fake_redis_client, orchestrator_config, gh_mock):
@@ -299,10 +312,9 @@ def test_poll_cycle_skip_backoff_no_label_no_comment(
 
 
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):
-    """When discover_actionable_prs raises, _poll_cycle propagates the exception.
+    """When discover_actionable_prs raises, _poll_cycle catches it per-project and continues.
 
-    The crash protection lives in run_orchestrator's while-loop (try/except),
-    so _poll_cycle itself should let the exception bubble up.
+    Per-project error isolation ensures one project's failure doesn't crash others.
     """
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -314,8 +326,8 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 
     logger = logging.getLogger("test")
 
-    with pytest.raises(RuntimeError, match="GitHub is down"):
-        _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    # Should not raise — per-project error isolation catches and logs
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
 
 
 # ---------------------------------------------------------------------------
