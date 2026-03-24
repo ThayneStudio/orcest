@@ -505,6 +505,7 @@ def publish_rebase_task(
         repo=repo,
         merge_error=merge_error,
         base_branch=pr_state.base_branch,
+        proactive=proactive,
     )
 
     task = Task.create(
@@ -761,12 +762,15 @@ def _render_rebase_prompt(
     repo: str,
     merge_error: str = "",
     base_branch: str = "main",
+    proactive: bool = False,
 ) -> str:
     """Render a prompt for rebasing a PR branch (conflict resolution or proactive rebase)."""
     if merge_error:
         preamble = "This PR has merge conflicts that prevent it from being merged."
-    else:
+    elif proactive:
         preamble = "Rebase this PR proactively onto the latest base branch after an upstream merge."
+    else:
+        preamble = "Rebase this PR branch onto the latest base branch."
     sections: list[str] = [
         f"# Rebase PR #{pr_number}: {pr_title}",
         "",
