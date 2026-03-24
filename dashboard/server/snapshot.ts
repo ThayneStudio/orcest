@@ -63,22 +63,24 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
   // Results — each project prefix has its own results stream: orcest:results, transit-platform:results
   let resultsDepth = 0;
   const resultsKeys = await scanKeys("*:results");
-  for (const key of resultsKeys) {
-    try {
-      resultsDepth += await redis.xlen(key);
-    } catch {
-      // ignore
+  if (resultsKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const key of resultsKeys) pipeline.xlen(key);
+    const results = await pipeline.exec();
+    for (const r of results ?? []) {
+      if (!r[0]) resultsDepth += r[1] as number;
     }
   }
 
   // Dead-letter streams: *:dead-letter
   let deadLetterCount = 0;
   const dlKeys = await scanKeys("*:dead-letter");
-  for (const key of dlKeys) {
-    try {
-      deadLetterCount += await redis.xlen(key);
-    } catch {
-      // ignore
+  if (dlKeys.length > 0) {
+    const pipeline = redis.pipeline();
+    for (const key of dlKeys) pipeline.xlen(key);
+    const results = await pipeline.exec();
+    for (const r of results ?? []) {
+      if (!r[0]) deadLetterCount += r[1] as number;
     }
   }
 

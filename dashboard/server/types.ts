@@ -68,11 +68,6 @@ export interface DashboardMessage {
   workers: string[];
 }
 
-export interface WorkerOutputMessage {
-  lines: string[];
-  last_id: string;
-}
-
 export interface TaskOutputMessage {
   lines: string[];
   last_id: string;

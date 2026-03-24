@@ -9,18 +9,21 @@ export async function discoverWorkers(): Promise<string[]> {
     const streams = await scanKeys("*:output:*");
     const workers: Array<{ id: string; lastEntryMs: number }> = [];
 
-    for (const stream of streams) {
-      const workerId = stream.replace(/^[^:]+:output:/, "");
-      // Check the last entry timestamp to determine recency
-      try {
-        const entries = await redis.xrevrange(stream, "+", "-", "COUNT", 1);
-        if (entries.length > 0) {
+    if (streams.length > 0) {
+      // Pipeline all XREVRANGE COUNT 1 calls to avoid N sequential round-trips
+      const pipeline = redis.pipeline();
+      for (const stream of streams) pipeline.xrevrange(stream, "+", "-", "COUNT", 1);
+      const results = await pipeline.exec();
+
+      for (let i = 0; i < streams.length; i++) {
+        const stream = streams[i];
+        const workerId = stream.replace(/^[^:]+:output:/, "");
+        const [err, entries] = (results?.[i] ?? [null, []]) as [Error | null, [string, string[]][]];
+        if (!err && entries && entries.length > 0) {
           const entryId = entries[0][0];
           const ms = parseInt(entryId.split("-")[0], 10);
           workers.push({ id: workerId, lastEntryMs: ms });
         }
-      } catch {
-        // stream might be empty or gone
       }
     }
 
