@@ -942,6 +942,7 @@ def test_publish_ci_fix_includes_inline_review_comments(
     assert "42" in task.prompt
     assert "fix this variable on line 42" in task.prompt
     assert "reviewer" in task.prompt
+    assert "PRRT_foo42" in task.prompt
 
 
 def test_publish_ci_fix_multiple_review_threads(
