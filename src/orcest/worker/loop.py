@@ -877,7 +877,7 @@ def _execute_task(
 
         # Infrastructure failures (clone timeout, network) are transient —
         # the orchestrator will retry without burning an attempt slot.
-        is_transient = isinstance(e, WorkspaceError)
+        is_transient = isinstance(e, WorkspaceError) and "timed out" in str(e)
         prefix = "[transient] " if is_transient else ""
 
         return TaskResult(

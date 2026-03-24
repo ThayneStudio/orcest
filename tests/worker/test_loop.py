@@ -256,6 +256,30 @@ class TestExecuteTask:
         assert result.summary.startswith("[transient]")
         assert "timed out" in result.summary
 
+    def test_workspace_error_without_timeout_is_not_transient(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """WorkspaceError for auth/credential failures is NOT treated as transient."""
+        mock_workspace.setup.side_effect = WorkspaceError(
+            "git clone failed: remote: Repository not found (exit code 128)"
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.FAILED
+        assert not result.summary.startswith("[transient]")
+        assert "exit code 128" in result.summary
+
     def test_non_workspace_error_produces_normal_summary(
         self, local_worker_config, sample_task, mock_workspace
     ):
