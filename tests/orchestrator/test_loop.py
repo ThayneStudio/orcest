@@ -8,6 +8,12 @@ import logging
 
 import pytest
 
+from orcest.orchestrator.issue_ops import (
+    get_attempt_count as get_issue_attempt_count,
+)
+from orcest.orchestrator.issue_ops import (
+    increment_attempts as increment_issue_attempts,
+)
 from orcest.orchestrator.loop import (
     RESULTS_GROUP,
     RESULTS_STREAM,
@@ -439,6 +445,38 @@ def test_consume_results_transient_failure_clears_attempts(
 
     # Per-SHA attempts should be cleared
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+
+
+def test_consume_results_transient_failure_clears_issue_attempts(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A transient FAILED result for an issue clears the counter via clear_issue_attempts."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    issue_number = 57
+    repo = orchestrator_config.github.repo
+
+    # Simulate a prior attempt on the issue
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+
+    result = TaskResult(
+        task_id="task-issue-001",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="",
+        summary="[transient] Worker restarted mid-execution; task was not completed.",
+        duration_seconds=10,
+        resource_type="issue",
+        resource_id=issue_number,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Issue attempts should be cleared (not PR attempts)
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
 
 
 def test_consume_results_permanent_failure_still_labels(
