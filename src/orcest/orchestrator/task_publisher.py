@@ -642,7 +642,6 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
-
 def _render_issue_prompt(
     issue_number: int,
     issue_title: str,

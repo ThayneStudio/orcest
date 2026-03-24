@@ -575,7 +575,6 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     return results
 
 
-
 def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
     """List open issues with a specific label.
 
