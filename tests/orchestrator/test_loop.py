@@ -390,6 +390,87 @@ def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock)
     )
 
 
+def test_consume_results_transient_failure_no_needs_human(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A transient FAILED result does NOT add needs-human label."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=55,
+        summary="[transient] Worker exception: git clone timed out after 300s",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Should NOT add needs-human label
+    gh_mock.add_label.assert_not_called()
+
+    # Should post a comment mentioning transient / retry
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "transient" in comment_body
+    assert "retry" in comment_body.lower()
+
+
+def test_consume_results_transient_failure_clears_attempts(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A transient FAILED result clears per-SHA attempt counter for retry."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 56
+    head_sha = "abc123"
+    repo = orchestrator_config.github.repo
+
+    # Simulate a prior attempt
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=pr_number,
+        summary="[transient] Worker restarted mid-execution; task was not completed.",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Per-SHA attempts should be cleared
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+
+
+def test_consume_results_permanent_failure_still_labels(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A non-transient FAILED result still adds needs-human label (regression test)."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=57,
+        summary="Claude crashed with exit code 1",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    labels = orchestrator_config.labels
+
+    # Should add needs-human label
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        57,
+        labels.needs_human,
+        orchestrator_config.github.token,
+    )
+
+
 def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config, gh_mock):
     """A USAGE_EXHAUSTED result posts a comment, clears per-SHA attempts, and sets cooldown."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)

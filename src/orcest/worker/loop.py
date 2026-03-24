@@ -28,7 +28,7 @@ from orcest.shared.models import DEAD_LETTER_STREAM, ResultStatus, Task, TaskRes
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import Runner, RunnerResult, create_runner
-from orcest.worker.workspace import Workspace
+from orcest.worker.workspace import Workspace, WorkspaceError
 
 RESULTS_STREAM = "results"
 CONSUMER_GROUP = "workers"
@@ -501,7 +501,7 @@ def _drain_pending_tasks(
                     resource_type=task.resource_type,
                     resource_id=task.resource_id,
                     branch=task.branch,
-                    summary="Worker restarted mid-execution; task was not completed.",
+                    summary="[transient] Worker restarted mid-execution; task was not completed.",
                     duration_seconds=0,
                 )
                 try:
@@ -580,7 +580,7 @@ def _drain_pending_tasks_raw(
                     resource_type=task.resource_type,
                     resource_id=task.resource_id,
                     branch=task.branch,
-                    summary="Worker restarted mid-execution; task was not completed.",
+                    summary="[transient] Worker restarted mid-execution; task was not completed.",
                     duration_seconds=0,
                 )
                 try:
@@ -875,6 +875,11 @@ def _execute_task(
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 
+        # Infrastructure failures (clone timeout, network) are transient —
+        # the orchestrator will retry without burning an attempt slot.
+        is_transient = isinstance(e, WorkspaceError)
+        prefix = "[transient] " if is_transient else ""
+
         return TaskResult(
             task_id=task.id,
             worker_id=config.worker_id,
@@ -882,7 +887,7 @@ def _execute_task(
             resource_type=task.resource_type,
             resource_id=task.resource_id,
             branch=task.branch,
-            summary=f"Worker exception: {e}",
+            summary=f"{prefix}Worker exception: {e}",
             duration_seconds=duration,
         )
 

@@ -30,6 +30,7 @@ from orcest.worker.loop import (
     run_worker,
 )
 from orcest.worker.runner import RunnerResult
+from orcest.worker.workspace import WorkspaceError
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures local to this module
@@ -230,6 +231,52 @@ class TestExecuteTask:
         assert result.status == ResultStatus.FAILED
         assert "clone failed" in result.summary
         mock_workspace.cleanup.assert_called_once()
+
+    def test_workspace_error_produces_transient_summary(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """WorkspaceError (clone timeout, network) produces [transient] summary prefix."""
+        mock_workspace.setup.side_effect = WorkspaceError(
+            "git clone timed out after 300s for owner/repo"
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.FAILED
+        assert result.summary.startswith("[transient]")
+        assert "timed out" in result.summary
+
+    def test_non_workspace_error_produces_normal_summary(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """Non-WorkspaceError exceptions produce summaries without [transient] prefix."""
+        mock_workspace.setup.side_effect = RuntimeError("unexpected error")
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.FAILED
+        assert not result.summary.startswith("[transient]")
+        assert "unexpected error" in result.summary
 
     def test_output_callback_publishes_to_redis(
         self, local_worker_config, sample_task, mock_workspace
