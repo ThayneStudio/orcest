@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
-import { timingSafeEqual } from "crypto";
+import { timingSafeEqual, createHash } from "crypto";
 import type { Duplex } from "stream";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -18,9 +18,9 @@ const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN;
 
 function tokenMatches(candidate: string): boolean {
   if (!DASHBOARD_TOKEN) return false;
-  const a = Buffer.from(candidate);
-  const b = Buffer.from(DASHBOARD_TOKEN);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = createHash("sha256").update(candidate).digest();
+  const b = createHash("sha256").update(DASHBOARD_TOKEN).digest();
+  return timingSafeEqual(a, b);
 }
 
 function isAuthorized(req: IncomingMessage): boolean {
