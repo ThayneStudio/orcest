@@ -10,8 +10,6 @@ import pytest
 
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
-)
-from orcest.orchestrator.issue_ops import (
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.loop import (
@@ -480,6 +478,7 @@ def test_consume_results_transient_failure_clears_issue_attempts(
 
     # Transient failures are silent — no label or comment
     gh_mock.add_issue_label.assert_not_called()
+    gh_mock.remove_issue_label.assert_not_called()
     gh_mock.post_issue_comment.assert_not_called()
 
 
