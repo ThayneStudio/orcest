@@ -726,6 +726,8 @@ def _publish_result_with_retry(
     False otherwise (dead-letter write may or may not have succeeded).
     """
     last_exc: Exception | None = None
+    # Callers that omit abort_event get a fresh, never-set Event, which means
+    # _abort.wait() will block for the full real backoff duration on each retry.
     _abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_RESULT_PUBLISH_RETRIES):
         if attempt > 0:

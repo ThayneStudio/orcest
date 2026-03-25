@@ -1843,12 +1843,13 @@ class TestPublishResultWithRetry:
         assert dl_fields["original_entry_id"] == "entry-42"
 
     def test_all_retries_fail_dead_letter_also_fails_returns_false(
-        self, sample_task, monkeypatch, caplog
+        self, sample_task, caplog
     ):
         """Returns False even when the dead-letter write itself raises."""
         mock_redis = MagicMock()
         mock_redis.xadd_capped.side_effect = ConnectionError("Redis down")
-        monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
+        abort_event = MagicMock(spec=threading.Event)
+        abort_event.wait.return_value = False  # not aborted; simulate normal timeout
         result = self._make_result(sample_task)
 
         with caplog.at_level(logging.ERROR):
@@ -1859,10 +1860,41 @@ class TestPublishResultWithRetry:
                 logging.getLogger("test"),
                 "tasks:claude",
                 "1-1",
+                abort_event=abort_event,
             )
 
         assert ok is False
         assert any("permanently lost" in r.message for r in caplog.records)
+
+    def test_abort_during_backoff_returns_false_immediately(self, sample_task):
+        """Returns False immediately when abort_event is set during backoff wait."""
+        call_count = [0]
+
+        def xadd_capped(stream, data, **kwargs):
+            call_count[0] += 1
+            raise ConnectionError("Redis down")
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = xadd_capped
+        abort_event = MagicMock(spec=threading.Event)
+        # First attempt fails; abort fires during backoff before second attempt
+        abort_event.wait.return_value = True
+        result = self._make_result(sample_task)
+
+        ok = _publish_result_with_retry(
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "1-1",
+            abort_event=abort_event,
+        )
+
+        assert ok is False
+        # Only one attempt was made before abort short-circuited the loop
+        assert call_count[0] == 1
+        abort_event.wait.assert_called_once_with(timeout=_RESULT_PUBLISH_BACKOFF[0])
 
 
 # ---------------------------------------------------------------------------
