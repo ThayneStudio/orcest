@@ -4,11 +4,14 @@ Uses Lua scripts for atomic release and refresh to prevent race conditions
 where a lock could be released by a non-owner.
 """
 
+import logging
 import types
 import uuid
 
 from orcest.shared.config import RunnerConfig
 from orcest.shared.redis_client import RedisClient
+
+logger = logging.getLogger(__name__)
 
 # Lua script for atomic check-and-delete (release).
 _RELEASE_SCRIPT = """
@@ -219,7 +222,20 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
     val = redis_client.get(key)
     if val is None:
         return None
-    return int(val)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Corrupted backoff value in Redis for %s#%s (got %r); treating as no backoff",
+            repo,
+            number,
+            val,
+        )
+        try:
+            redis_client.delete(key)
+        except Exception as exc:
+            logger.debug("Failed to delete corrupted backoff key for %s#%s: %s", repo, number, exc)
+        return None
 
 
 def clear_backoff(redis_client: RedisClient, repo: str, number: int) -> None:

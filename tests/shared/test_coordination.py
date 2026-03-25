@@ -255,13 +255,13 @@ def test_get_backoff_step_returns_none_after_key_deleted(fake_redis_client):
     assert get_backoff_step(fake_redis_client, "owner/repo", 10) is None
 
 
-def test_get_backoff_step_raises_on_corrupt_value(fake_redis_client):
-    """get_backoff_step raises ValueError when the Redis value is not an integer."""
+def test_get_backoff_step_returns_none_on_corrupt_value(fake_redis_client):
+    """get_backoff_step returns None (treating as no backoff) when Redis has a non-integer value."""
     # Write directly using the prefixed key to bypass the int-only set_ex path.
     prefixed_key = fake_redis_client._prefix + "backoff:pr:owner/repo:77"
     fake_redis_client.client.set(prefixed_key, "not-an-int")
-    with pytest.raises(ValueError):
-        get_backoff_step(fake_redis_client, "owner/repo", 77)
+    result = get_backoff_step(fake_redis_client, "owner/repo", 77)
+    assert result is None
 
 
 def test_clear_backoff_removes_key(fake_redis_client):
