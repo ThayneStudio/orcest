@@ -523,14 +523,14 @@ def test_get_pr_empty_output_raises(mocker):
 
 
 def test_get_pr_malformed_json_raises(mocker):
-    """get_pr returns non-JSON -> JSONDecodeError propagates."""
+    """get_pr returns non-JSON -> GhCliError wrapping JSONDecodeError."""
     mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout="not json at all", stderr=""
         ),
     )
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(GhCliError, match="Failed to parse"):
         get_pr(REPO, 1, TOKEN)
 
 
@@ -568,14 +568,14 @@ def test_list_open_prs_default_limit(mocker):
 
 
 def test_list_open_prs_malformed_json(mocker):
-    """list_open_prs with invalid JSON stdout -> JSONDecodeError."""
+    """list_open_prs with invalid JSON stdout -> GhCliError wrapping JSONDecodeError."""
     mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout="{not valid json", stderr=""
         ),
     )
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(GhCliError, match="Failed to parse"):
         list_open_prs(REPO, TOKEN)
 
 

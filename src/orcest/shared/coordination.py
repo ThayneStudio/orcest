@@ -219,7 +219,10 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
     val = redis_client.get(key)
     if val is None:
         return None
-    return int(val)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
 
 
 def clear_backoff(redis_client: RedisClient, repo: str, number: int) -> None:
