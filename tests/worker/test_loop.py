@@ -1752,7 +1752,7 @@ class TestPublishResultWithRetry:
         mock_redis.xadd_capped.side_effect = xadd_capped
         waited: list[float] = []
         abort_event = MagicMock(spec=threading.Event)
-        abort_event.wait.side_effect = lambda timeout: waited.append(timeout)
+        abort_event.wait.side_effect = lambda timeout: waited.append(timeout) or False
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
@@ -1784,7 +1784,7 @@ class TestPublishResultWithRetry:
         mock_redis.xadd_capped.side_effect = xadd_capped
         waited: list[float] = []
         abort_event = MagicMock(spec=threading.Event)
-        abort_event.wait.side_effect = lambda timeout: waited.append(timeout)
+        abort_event.wait.side_effect = lambda timeout: waited.append(timeout) or False
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
