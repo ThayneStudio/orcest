@@ -106,6 +106,7 @@ class ProxmoxClient:
             token_value=token_secret,
             verify_ssl=verify_ssl,
             backend="https",
+            timeout=30,
         )
         self._node = node
         self._host = host

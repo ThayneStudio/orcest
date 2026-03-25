@@ -351,7 +351,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         try:
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).
-            redis.xadd(tasks_stream, task_fields)
+            redis.xadd_raw(tasks_stream, task_fields)
             redis.xdel(DEAD_LETTER_STREAM, entry_id)
             replayed += 1
         except redis_lib.RedisError as exc:
@@ -744,7 +744,7 @@ def upgrade() -> None:
 @main.command("init-labels")
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for repo/token).")
 def init_labels(config: str) -> None:
-    """Create orcest labels on the target repo."""
+    """Create orcest labels on all configured project repos."""
     import os
     import subprocess
 
@@ -752,51 +752,61 @@ def init_labels(config: str) -> None:
 
     cfg = load_orchestrator_config(config)
     console = Console()
-    labels = [
+    label_defs = [
         (cfg.labels.blocked, "d93f0b", "Blocked — waiting for dependency"),
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
         (cfg.labels.ready, "0e8a16", "Issue is ready for orcest to implement"),
     ]
 
-    env = dict(os.environ)
-    env["GITHUB_TOKEN"] = cfg.github.token
-    env["GH_TOKEN"] = cfg.github.token
-
-    failures = 0
-    for name, color, description in labels:
-        console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
-        try:
-            subprocess.run(
-                [
-                    "gh",
-                    "label",
-                    "create",
-                    name,
-                    "--repo",
-                    cfg.github.repo,
-                    "--color",
-                    color,
-                    "--description",
-                    description,
-                    "--force",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-                env=env,
-            )
-            console.print("[green]ok[/green]")
-        except subprocess.CalledProcessError as exc:
-            console.print(f"[red]failed[/red]: {exc.stderr.strip()}")
-            failures += 1
-        except FileNotFoundError:
-            console.print("[red]gh CLI not found[/red]")
-            raise SystemExit(1)
-
-    if failures:
-        console.print(f"\n[red]{failures} label(s) failed[/red] on [bold]{cfg.github.repo}[/bold].")
+    if not cfg.projects:
+        console.print("[red]No projects configured.[/red]")
         raise SystemExit(1)
-    console.print(f"\nLabels ready on [bold]{cfg.github.repo}[/bold].")
+
+    total_failures = 0
+    for project in cfg.projects:
+        repo = project.repo
+        token = project.token
+        console.print(f"\n[bold]{repo}[/bold]")
+
+        env = dict(os.environ)
+        env["GITHUB_TOKEN"] = token
+        env["GH_TOKEN"] = token
+
+        for name, color, description in label_defs:
+            console.print(f"  Creating label [cyan]{name}[/cyan]...", end=" ")
+            try:
+                subprocess.run(
+                    [
+                        "gh",
+                        "label",
+                        "create",
+                        name,
+                        "--repo",
+                        repo,
+                        "--color",
+                        color,
+                        "--description",
+                        description,
+                        "--force",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                console.print("[green]ok[/green]")
+            except subprocess.CalledProcessError as exc:
+                console.print(f"[red]failed[/red]: {exc.stderr.strip()}")
+                total_failures += 1
+            except FileNotFoundError:
+                console.print("[red]gh CLI not found[/red]")
+                raise SystemExit(1)
+
+    if total_failures:
+        console.print(f"\n[red]{total_failures} label(s) failed.[/red]")
+        raise SystemExit(1)
+    repos = ", ".join(p.repo for p in cfg.projects)
+    console.print(f"\nLabels ready on: [bold]{repos}[/bold].")
 
 
 @main.command()
