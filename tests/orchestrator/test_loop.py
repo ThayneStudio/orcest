@@ -1321,7 +1321,7 @@ def test_poll_cycle_retrigger_stale_checks_cooldown_skips(
         orchestrator_config.github.repo,
         pr_state.number,
         pr_state.head_sha,
-        ex=3600,
+        ex=orchestrator_config.stale_pending_timeout_seconds,
     )
 
     logger = logging.getLogger("test")
@@ -1407,7 +1407,7 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
     # A comment should be posted since cancellations succeeded
     gh_mock.post_comment.assert_called_once()
     comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "2" in comment_body  # cancelled_count in message
+    assert "Cancelled 2 of 2" in comment_body
 
     # Cooldown SHA must be recorded
     recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 101)
@@ -1441,6 +1441,9 @@ def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
     # Cooldown SHA must still be set to prevent a retry busy-loop
     recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 102)
     assert recorded_sha == "stale444"
+
+    # rerun is still attempted best-effort even when cancel raises
+    gh_mock.rerun_workflow.assert_called_once()
 
     # No success comment since cancel failed
     gh_mock.post_comment.assert_not_called()
