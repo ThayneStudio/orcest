@@ -405,10 +405,6 @@ def write_project_files(
     _validate_project_name(project_name)
     logger.info("Writing project files for %s on %s", project_name, ssh_target)
     pdir = f"/opt/orcest/projects/{project_name}"
-    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
-    # defense-in-depth in case the validation is ever relaxed.
-    qpdir = shlex.quote(pdir)
-
     # Ensure project directory structure exists
     result = _ssh(ssh_target, f"mkdir -p {shlex.quote(f'{pdir}/config')}")
     if result.returncode != 0:
