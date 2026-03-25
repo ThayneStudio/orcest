@@ -343,7 +343,7 @@ _SAMPLE_DEAD_LETTER_FIELDS = {
     "base_branch": "",
     "created_at": "2024-01-01T00:00:00+00:00",
     "dead_letter_reason": "Exceeded max delivery count (3)",
-    "tasks_stream": "tasks:claude",
+    "tasks_stream": "test:tasks:claude",
     "original_entry_id": "1234-0",
     "delivery_count": "3",
 }
