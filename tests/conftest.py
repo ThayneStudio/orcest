@@ -154,6 +154,7 @@ def gh_mock(mocker):
         "resolve_review_thread",
         "merge_pr",
         "rerun_workflow",
+        "cancel_workflow",
         "create_issue",
         "add_issue_label",
         "remove_issue_label",
