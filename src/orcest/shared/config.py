@@ -257,16 +257,25 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                     key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
                 )
             )
-        for proj in projects:
-            if not proj.key_prefix:
-                raise ValueError(
-                    f"projects[].key_prefix is required (missing for repo '{proj.repo}')"
-                )
         if len(projects) > 1:
-            prefixes = [proj.key_prefix for proj in projects]
-            if len(set(prefixes)) != len(prefixes):
+            seen_prefixes: set[str] = set()
+            for proj in projects:
+                if not proj.key_prefix:
+                    raise ValueError(
+                        f"projects[].key_prefix is required in multi-project mode "
+                        f"(missing for repo '{proj.repo}')"
+                    )
+                if proj.key_prefix in seen_prefixes:
+                    raise ValueError(
+                        f"projects[].key_prefix must be unique across projects "
+                        f"(duplicate: '{proj.key_prefix}')"
+                    )
+                seen_prefixes.add(proj.key_prefix)
+            repos = [proj.repo for proj in projects]
+            if len(set(repos)) != len(repos):
                 raise ValueError(
-                    "projects[].key_prefix values must be unique in multi-project mode"
+                    "projects[].repo values must be unique "
+                    "— duplicate repos would cause double-enqueue"
                 )
     else:
         # Backward compatibility: single-project mode
@@ -368,16 +377,22 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Validate required fields
-    if not projects:
-        raise ValueError(
-            "github.repo is required (or provide a projects list). "
-            "Set it in the config file or via ORCEST_REPO env var."
-        )
-    empty_repos = [p.key_prefix or f"projects[{i}]" for i, p in enumerate(projects) if not p.repo]
-    if empty_repos:
-        raise ValueError(
-            f"Each project must have a non-empty repo: missing for {', '.join(empty_repos)}."
-        )
+    using_projects_list = isinstance(projects_raw, list) and bool(projects_raw)
+    if not using_projects_list:
+        # Single-project (legacy) mode: missing repo → point to ORCEST_REPO
+        if not github_config.repo:
+            raise ValueError(
+                "github.repo is required. "
+                "Set it in the config file or via ORCEST_REPO env var."
+            )
+    else:
+        # Multi-project mode: each entry must have a repo field
+        empty_repo_entries = [f"projects[{i}]" for i, p in enumerate(projects) if not p.repo]
+        if empty_repo_entries:
+            raise ValueError(
+                f"Each projects[] entry must have a non-empty 'repo' field: "
+                f"missing for {', '.join(empty_repo_entries)}."
+            )
 
     return config
 

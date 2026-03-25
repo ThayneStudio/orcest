@@ -56,9 +56,14 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
 
+    # Build per-project Redis clients once; reuse across all poll cycles
+    project_clients = [
+        (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
+        for project in config.projects
+    ]
+
     # Ensure consumer group for results stream (per-project)
-    for project in config.projects:
-        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+    for _, project_redis in project_clients:
         project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     # Graceful shutdown
@@ -83,7 +88,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(config, redis, logger, pending_task_ttl)
+            _poll_cycle(config, redis, logger, pending_task_ttl, project_clients)
         except Exception as e:
             logger.error("Poll cycle failed: %s", e, exc_info=True)
             # Continue after error -- don't crash the loop
@@ -102,13 +107,14 @@ def _poll_cycle(
     redis: RedisClient,
     logger: logging.Logger,
     pending_task_ttl: int,
+    project_clients: list[tuple[ProjectConfig, RedisClient]] | None = None,
 ) -> None:
     """Single orchestrator poll cycle across all configured projects."""
-    # Build per-project Redis clients once and reuse across both steps
-    project_clients = [
-        (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
-        for project in config.projects
-    ]
+    if project_clients is None:
+        project_clients = [
+            (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
+            for project in config.projects
+        ]
 
     # Step 1: Consume results per project
     for project, project_redis in project_clients:

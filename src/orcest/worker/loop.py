@@ -316,7 +316,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             )
 
         if not lock.acquire():
-            logger.warning(f"Lock {lock_key} already held, skipping task {task.id}")
+            logger.warning(f"Lock {lock.key} already held, skipping task {task.id}")
             # ACK the message so it's not redelivered to us
             # (another worker has the lock and presumably the same task)
             try:
@@ -325,7 +325,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
             continue
 
-        logger.info(f"Acquired lock {lock_key}")
+        logger.info(f"Acquired lock {lock.key}")
 
         # Dead-letter guard: if this entry has been delivered too many times
         # (result-publish failures leaving it unACKed), route it to the
@@ -381,7 +381,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # Ensure heartbeat and lock are cleaned up before re-raising.
             heartbeat.stop()
             lock.release()
-            logger.warning(f"Released lock {lock_key} after unexpected interruption")
+            logger.warning(f"Released lock {lock.key} after unexpected interruption")
             raise
         else:
             # Normal path: stop heartbeat and release lock
@@ -389,9 +389,9 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # safe no-op if lock already expired — release() verifies owner token via Lua
             lock.release()
             if lock_lost.is_set():
-                logger.warning(f"Lock {lock_key} was lost during task execution; task aborted")
+                logger.warning(f"Lock {lock.key} was lost during task execution; task aborted")
             else:
-                logger.info(f"Released lock {lock_key}")
+                logger.info(f"Released lock {lock.key}")
         finally:
             # Terminate abort_event watch threads so they don't accumulate
             # across tasks.  Setting lock_lost is idempotent when it was

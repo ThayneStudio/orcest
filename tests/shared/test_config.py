@@ -147,7 +147,7 @@ def test_load_orchestrator_config_missing_file(tmp_path: Path):
 
     # _load_yaml returns {} for missing files, but load_orchestrator_config
     # then validates that github.repo is non-empty and raises ValueError.
-    with pytest.raises(ValueError, match="non-empty repo"):
+    with pytest.raises(ValueError, match="github.repo is required"):
         load_orchestrator_config(missing)
 
 
@@ -640,7 +640,7 @@ def test_load_orchestrator_config_multi_project_duplicate_key_prefix_raises(tmp_
         "    key_prefix: same\n"
     )
 
-    with pytest.raises(ValueError, match="key_prefix values must be unique"):
+    with pytest.raises(ValueError, match="key_prefix must be unique"):
         load_orchestrator_config(cfg_file)
 
 
@@ -697,5 +697,5 @@ def test_load_orchestrator_config_empty_repo_in_project_raises(tmp_path: Path):
         "  - repo: ''\n"
         "    key_prefix: prefix-b\n"
     )
-    with pytest.raises(ValueError, match="non-empty repo"):
+    with pytest.raises(ValueError, match="non-empty 'repo' field"):
         load_orchestrator_config(cfg_file)
