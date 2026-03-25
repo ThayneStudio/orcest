@@ -233,8 +233,8 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
         )
         try:
             redis_client.delete(key)
-        except Exception:
-            pass  # best-effort cleanup; log already emitted above
+        except Exception as exc:
+            logger.debug("Failed to delete corrupted backoff key for %s#%s: %s", repo, number, exc)
         return None
 
 
