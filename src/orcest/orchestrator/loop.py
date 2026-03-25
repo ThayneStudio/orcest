@@ -454,6 +454,7 @@ def _poll_project(
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=claude_token,
+                    key_prefix=key_prefix,
                 )
                 enqueued += 1
             except Exception as e:
