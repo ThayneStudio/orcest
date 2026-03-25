@@ -314,7 +314,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # Dead-letter guard: if this entry has been delivered too many times
         # (result-publish failures leaving it unACKed), route it to the
         # dead-letter stream instead of running Claude again.
-        delivery_count = redis.xpending_count(current_stream, CONSUMER_GROUP, entry_id)
+        delivery_count = redis.xpending_count_raw(current_stream, CONSUMER_GROUP, entry_id)
         if delivery_count >= MAX_DELIVERY_COUNT:
             lock.release()
             _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
@@ -451,7 +451,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             shutdown_event.set()  # Must mirror handle_signal; abort_event watches this
         elif not published:
             try:
-                clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+                _clear_pending_task_for_task(redis, task)
             except Exception:
                 logger.warning(
                     "Failed to clear pending task marker for "
@@ -461,95 +461,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             continue
 
     logger.info("Worker shut down cleanly.")
-
-
-def _drain_pending_tasks(
-    redis: RedisClient,
-    tasks_stream: str,
-    config: WorkerConfig,
-    logger: logging.Logger,
-) -> None:
-    """Drain pending (unACKed) tasks left over from a previous worker lifecycle.
-
-    When a worker is killed mid-execution (e.g. systemd restart), the task
-    it was processing remains delivered-but-unACKed in the consumer group.
-    On restart, XREADGROUP with ``">"`` skips these entries, so they'd be
-    stuck forever — and the orchestrator never receives a result, leaving
-    labels orphaned.
-
-    This function reads all pending entries (ID ``"0"``), publishes a FAILED
-    result for each so the orchestrator can clean up, and ACKs them.
-    """
-    drained = 0
-    while True:
-        entries = redis.xreadgroup(
-            group=CONSUMER_GROUP,
-            consumer=config.worker_id,
-            stream=tasks_stream,
-            count=10,
-            block_ms=None,
-            pending=True,
-        )
-        if not entries:
-            break
-        for entry_id, fields in entries:
-            drained += 1
-            task: Task | None = None
-            try:
-                task = Task.from_dict(fields)
-                logger.warning(
-                    f"Recovering pending task {task.id} ({task.type.value} "
-                    f"for {task.resource_type} #{task.resource_id}) — "
-                    f"publishing FAILED result"
-                )
-                result = TaskResult(
-                    task_id=task.id,
-                    worker_id=config.worker_id,
-                    status=ResultStatus.FAILED,
-                    resource_type=task.resource_type,
-                    resource_id=task.resource_id,
-                    branch=task.branch,
-                    summary=(
-                        f"{TRANSIENT_SUMMARY_PREFIX}"
-                        "Worker restarted mid-execution; task was not completed."
-                    ),
-                    duration_seconds=0,
-                )
-                try:
-                    redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
-                except Exception:
-                    logger.error(
-                        f"Failed to publish recovery result for task {task.id}",
-                        exc_info=True,
-                    )
-            except (KeyError, ValueError) as e:
-                logger.error(
-                    f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
-                    exc_info=True,
-                )
-            try:
-                redis.xack(tasks_stream, CONSUMER_GROUP, entry_id)
-            except Exception:
-                logger.error(
-                    f"Failed to ACK pending entry {entry_id}",
-                    exc_info=True,
-                )
-            # Clear the pending-task marker so the orchestrator can
-            # re-enqueue promptly.  Without this, the marker lingers
-            # until TTL expiry (~95 min with defaults) — especially
-            # problematic when the result publish above also failed,
-            # since the orchestrator never learns the task ended.
-            if task is not None:
-                try:
-                    clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
-                except Exception:
-                    logger.warning(
-                        "Failed to clear pending task marker for "
-                        f"{task.resource_type} #{task.resource_id} during drain",
-                        exc_info=True,
-                    )
-    if drained:
-        logger.info(f"Drained {drained} pending task(s) from previous lifecycle")
 
 
 def _drain_pending_tasks_raw(

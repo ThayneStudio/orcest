@@ -31,7 +31,7 @@ from orcest.orchestrator.pr_ops import (
     increment_total_attempts,
     set_stale_retrigger_sha,
 )
-from orcest.shared.config import OrchestratorConfig
+from orcest.shared.config import OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import set_pending_task
 from orcest.shared.models import ResultStatus, TaskResult
 
@@ -1459,3 +1459,194 @@ def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
 
     # No success comment since cancel failed
     gh_mock.post_comment.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Multi-project tests
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_project_config(label_config=None):
+    """Build an OrchestratorConfig with two ProjectConfig entries."""
+    from orcest.shared.config import LabelConfig
+
+    if label_config is None:
+        label_config = LabelConfig()
+    return OrchestratorConfig(
+        labels=label_config,
+        projects=[
+            ProjectConfig(
+                repo="acme/frontend",
+                token="token-frontend",
+                claude_token="claude-frontend",
+                key_prefix="frontend",
+            ),
+            ProjectConfig(
+                repo="acme/backend",
+                token="token-backend",
+                claude_token="claude-backend",
+                key_prefix="backend",
+            ),
+        ],
+    )
+
+
+def test_poll_cycle_multi_project_polls_each_project(
+    mocker, fake_redis_client, gh_mock
+):
+    """_poll_cycle calls discover_actionable_prs once per project with the correct repo/token."""
+    config = _make_multi_project_config()
+
+    mock_discover_prs = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    # Override the autouse fixture's mock for discover_actionable_issues
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_issues",
+        return_value=[],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+
+    # Ensure consumer groups exist for both prefixes
+    for project in config.projects:
+        project_redis = fake_redis_client.__class__.from_client(
+            fake_redis_client.client, key_prefix=project.key_prefix
+        )
+        project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(config, fake_redis_client, logger, 3600)
+
+    # discover_actionable_prs should be called once per project
+    assert mock_discover_prs.call_count == 2
+
+    # Extract the repo and token from each call
+    calls = mock_discover_prs.call_args_list
+    call_repos = {c.kwargs["repo"] for c in calls}
+    call_tokens = {c.kwargs["token"] for c in calls}
+
+    assert call_repos == {"acme/frontend", "acme/backend"}
+    assert call_tokens == {"token-frontend", "token-backend"}
+
+
+def test_poll_cycle_multi_project_error_isolation(
+    mocker, fake_redis_client, gh_mock
+):
+    """An exception in one project does not prevent the other from being polled."""
+    config = _make_multi_project_config()
+
+    call_repos: list[str] = []
+
+    def discover_side_effect(*, repo, token, **kwargs):
+        call_repos.append(repo)
+        if repo == "acme/frontend":
+            raise RuntimeError("GitHub is down for frontend")
+        return []
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        side_effect=discover_side_effect,
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_issues",
+        return_value=[],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+
+    # Ensure consumer groups exist for both prefixes
+    for project in config.projects:
+        project_redis = fake_redis_client.__class__.from_client(
+            fake_redis_client.client, key_prefix=project.key_prefix
+        )
+        project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+
+    # Should not raise -- per-project error isolation catches and logs
+    _poll_cycle(config, fake_redis_client, logger, 3600)
+
+    # Both projects were attempted despite the first one raising
+    assert "acme/frontend" in call_repos
+    assert "acme/backend" in call_repos
+
+
+def test_consume_results_multi_project_isolates_streams(
+    fake_redis_client, gh_mock
+):
+    """Results written to project A's stream are not visible to project B."""
+    from orcest.shared.config import LabelConfig
+    from orcest.shared.redis_client import RedisClient
+
+    label_config = LabelConfig()
+
+    project_a = ProjectConfig(
+        repo="acme/frontend",
+        token="token-a",
+        claude_token="claude-a",
+        key_prefix="proj_a",
+    )
+    project_b = ProjectConfig(
+        repo="acme/backend",
+        token="token-b",
+        claude_token="claude-b",
+        key_prefix="proj_b",
+    )
+
+    # Create per-project Redis clients sharing the same underlying connection
+    # but with different key prefixes (mirrors what _poll_cycle does)
+    redis_a = RedisClient.from_client(fake_redis_client.client, key_prefix="proj_a")
+    redis_b = RedisClient.from_client(fake_redis_client.client, key_prefix="proj_b")
+
+    # Ensure consumer groups for both
+    redis_a.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    redis_b.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    # Write a result to project A's results stream
+    result_a = TaskResult(
+        task_id="task-a-001",
+        worker_id="worker-1",
+        status=ResultStatus.COMPLETED,
+        branch="fix/a",
+        summary="Fixed frontend tests",
+        duration_seconds=60,
+        resource_type="pr",
+        resource_id=10,
+    )
+    redis_a.xadd(RESULTS_STREAM, result_a.to_dict())
+
+    logger = logging.getLogger("test")
+
+    # Consume results for project A -- should process the result
+    _consume_results_for_project(project_a, redis_a, label_config, logger)
+
+    # Verify it was consumed (read again -- nothing pending)
+    entries_a = redis_a.xreadgroup(
+        group=RESULTS_GROUP,
+        consumer="orchestrator-main",
+        stream=RESULTS_STREAM,
+        count=10,
+        block_ms=None,
+    )
+    assert entries_a == []
+
+    # Consume results for project B -- should NOT see project A's result
+    _consume_results_for_project(project_b, redis_b, label_config, logger)
+
+    # Verify project B's stream is empty (no results were ever written to it)
+    entries_b = redis_b.xreadgroup(
+        group=RESULTS_GROUP,
+        consumer="orchestrator-main",
+        stream=RESULTS_STREAM,
+        count=10,
+        block_ms=None,
+    )
+    assert entries_b == []
+
+    # No GitHub operations should have been triggered for project B
+    # (gh_mock tracks all calls across both projects; only project A had a result
+    # and COMPLETED results are silent -- no comments or labels)
+    gh_mock.post_comment.assert_not_called()
+    gh_mock.add_label.assert_not_called()
