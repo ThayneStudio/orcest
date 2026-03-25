@@ -4,8 +4,8 @@ import pytest
 
 from orcest.shared.config import RunnerConfig
 from orcest.shared.coordination import (
-    RedisLock,
     _BACKOFF_COOLDOWNS_SECONDS,
+    RedisLock,
     clear_backoff,
     compute_pending_task_ttl,
     get_backoff_cooldown_seconds,
