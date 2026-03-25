@@ -1756,7 +1756,12 @@ class TestPublishResultWithRetry:
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1",
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "1-1",
             abort_event=abort_event,
         )
 
@@ -1783,7 +1788,12 @@ class TestPublishResultWithRetry:
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1",
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "1-1",
             abort_event=abort_event,
         )
 

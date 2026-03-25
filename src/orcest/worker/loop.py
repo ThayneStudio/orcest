@@ -729,7 +729,8 @@ def _publish_result_with_retry(
     _abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_RESULT_PUBLISH_RETRIES):
         if attempt > 0:
-            _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1])
+            if _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1]):
+                return False
         try:
             # Publish to the correct project's results stream
             if task.key_prefix:
