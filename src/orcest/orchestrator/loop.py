@@ -104,9 +104,14 @@ def _poll_cycle(
     pending_task_ttl: int,
 ) -> None:
     """Single orchestrator poll cycle across all configured projects."""
+    # Build per-project Redis clients once and reuse across both steps
+    project_clients = [
+        (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
+        for project in config.projects
+    ]
+
     # Step 1: Consume results per project
-    for project in config.projects:
-        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+    for project, project_redis in project_clients:
         try:
             _consume_results_for_project(project, project_redis, config.labels, logger)
         except Exception:
@@ -117,8 +122,7 @@ def _poll_cycle(
     total_merged = 0
     total_prs = 0
     total_issues = 0
-    for project in config.projects:
-        project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
+    for project, project_redis in project_clients:
         try:
             enqueued, merged, prs_checked, issues_checked = _poll_project(
                 project, project_redis, config, logger, pending_task_ttl
