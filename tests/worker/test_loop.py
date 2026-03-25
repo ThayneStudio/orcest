@@ -1842,9 +1842,7 @@ class TestPublishResultWithRetry:
         assert dl_fields["tasks_stream"] == "tasks:claude"
         assert dl_fields["original_entry_id"] == "entry-42"
 
-    def test_all_retries_fail_dead_letter_also_fails_returns_false(
-        self, sample_task, caplog
-    ):
+    def test_all_retries_fail_dead_letter_also_fails_returns_false(self, sample_task, caplog):
         """Returns False even when the dead-letter write itself raises."""
         mock_redis = MagicMock()
         mock_redis.xadd_capped.side_effect = ConnectionError("Redis down")

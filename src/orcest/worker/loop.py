@@ -723,7 +723,8 @@ def _publish_result_with_retry(
     ``orcest dead-letters --replay`` can re-enqueue it.
 
     Returns True if the result was successfully published to RESULTS_STREAM,
-    False otherwise (dead-letter write may or may not have succeeded).
+    False if all attempts fail (dead-letter write may or may not have succeeded)
+    or if ``abort_event`` is set during a backoff wait (no dead-letter written).
     """
     last_exc: Exception | None = None
     # Callers that omit abort_event get a fresh, never-set Event, which means
