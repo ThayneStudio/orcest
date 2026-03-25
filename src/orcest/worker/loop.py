@@ -406,6 +406,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             logger,
             current_stream,
             entry_id,
+            abort_event=abort_event,
         )
 
         if published:
@@ -638,6 +639,7 @@ def _publish_result_with_retry(
     logger: logging.Logger,
     tasks_stream: str,
     entry_id: str,
+    abort_event: threading.Event | None = None,
 ) -> bool:
     """Publish a task result to RESULTS_STREAM with exponential backoff retry.
 
@@ -648,12 +650,17 @@ def _publish_result_with_retry(
     ``orcest dead-letters --replay`` can re-enqueue it.
 
     Returns True if the result was successfully published to RESULTS_STREAM,
-    False otherwise (dead-letter write may or may not have succeeded).
+    False if all attempts fail (dead-letter write may or may not have succeeded)
+    or if ``abort_event`` is set during a backoff wait (no dead-letter written).
     """
     last_exc: Exception | None = None
+    # Callers that omit abort_event get a fresh, never-set Event, which means
+    # _abort.wait() will block for the full real backoff duration on each retry.
+    _abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_RESULT_PUBLISH_RETRIES):
         if attempt > 0:
-            time.sleep(_RESULT_PUBLISH_BACKOFF[attempt - 1])
+            if _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1]):
+                return False
         try:
             # Publish to the correct project's results stream
             if task.key_prefix:
