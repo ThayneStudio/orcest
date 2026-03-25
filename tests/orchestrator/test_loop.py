@@ -1372,9 +1372,7 @@ def test_poll_cycle_retrigger_stale_checks_no_run_ids_escalates(
     gh_mock.rerun_workflow.assert_not_called()
 
     # Cooldown SHA must be recorded to prevent repeated escalations
-    recorded_sha = get_stale_retrigger_sha(
-        fake_redis_client, orchestrator_config.github.repo, 100
-    )
+    recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 100)
     assert recorded_sha == "stale222"
 
 
@@ -1385,9 +1383,7 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
     gh_mock,
 ):
     """With run IDs present, cancels and re-triggers each workflow run."""
-    pr_state = _make_stale_pr_state(
-        number=101, head_sha="stale333", stale_run_ids=[2001, 2002]
-    )
+    pr_state = _make_stale_pr_state(number=101, head_sha="stale333", stale_run_ids=[2001, 2002])
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -1402,9 +1398,7 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
 
     # cancel_workflow called for each run ID
     assert gh_mock.cancel_workflow.call_count == 2
-    cancelled_run_ids = {
-        call.args[1] for call in gh_mock.cancel_workflow.call_args_list
-    }
+    cancelled_run_ids = {call.args[1] for call in gh_mock.cancel_workflow.call_args_list}
     assert cancelled_run_ids == {2001, 2002}
 
     # rerun_workflow called for each run ID (best-effort)
@@ -1416,9 +1410,7 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
     assert "2" in comment_body  # cancelled_count in message
 
     # Cooldown SHA must be recorded
-    recorded_sha = get_stale_retrigger_sha(
-        fake_redis_client, orchestrator_config.github.repo, 101
-    )
+    recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 101)
     assert recorded_sha == "stale333"
 
 
@@ -1429,9 +1421,7 @@ def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
     gh_mock,
 ):
     """Cooldown SHA is recorded even when all cancel_workflow calls raise."""
-    pr_state = _make_stale_pr_state(
-        number=102, head_sha="stale444", stale_run_ids=[3001]
-    )
+    pr_state = _make_stale_pr_state(number=102, head_sha="stale444", stale_run_ids=[3001])
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -1449,9 +1439,7 @@ def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
     gh_mock.cancel_workflow.assert_called_once()
 
     # Cooldown SHA must still be set to prevent a retry busy-loop
-    recorded_sha = get_stale_retrigger_sha(
-        fake_redis_client, orchestrator_config.github.repo, 102
-    )
+    recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 102)
     assert recorded_sha == "stale444"
 
     # No success comment since cancel failed
