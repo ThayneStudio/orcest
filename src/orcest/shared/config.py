@@ -255,6 +255,13 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                     key_prefix=str(p.get("key_prefix", "")),
                 )
             )
+        if len(projects) > 1:
+            for proj in projects:
+                if not proj.key_prefix:
+                    raise ValueError(
+                        f"projects[].key_prefix is required in multi-project mode "
+                        f"(missing for repo '{proj.repo}')"
+                    )
     else:
         # Backward compatibility: single-project mode
         projects = [
@@ -355,7 +362,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Validate required fields
-    if not projects or not any(p.repo for p in projects):
+    if not projects or not all(p.repo for p in projects):
         raise ValueError(
             "github.repo is required (or provide a projects list). "
             "Set it in the config file or via ORCEST_REPO env var."
