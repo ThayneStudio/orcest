@@ -115,7 +115,7 @@ def _poll_cycle(
         try:
             _consume_results_for_project(project, project_redis, config.labels, logger)
         except Exception:
-            logger.error(f"Failed to consume results for {project.repo}", exc_info=True)
+            logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
     # Step 2: Poll each project
     total_enqueued = 0
@@ -132,7 +132,7 @@ def _poll_cycle(
             total_prs += prs_checked
             total_issues += issues_checked
         except Exception:
-            logger.error(f"Failed to poll {project.repo}", exc_info=True)
+            logger.error("Failed to poll %s", project.repo, exc_info=True)
 
     logger.info(
         "Poll cycle complete. %d tasks enqueued, %d merged, %d PRs checked, %d issues checked.",

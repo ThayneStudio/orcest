@@ -252,7 +252,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                     repo=str(p.get("repo", "")),
                     token=str(p.get("token", github_token)),  # default to shared token
                     claude_token=str(p.get("claude_token", claude_token)),  # default to shared
-                    key_prefix=str(p.get("key_prefix", "")),
+                    key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
                 )
             )
         if len(projects) > 1:
