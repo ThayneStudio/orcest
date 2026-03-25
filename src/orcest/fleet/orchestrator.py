@@ -334,12 +334,13 @@ def deploy_stack(ssh_target: str, project_name: str) -> None:
     """
     _validate_project_name(project_name)
     logger.info("Deploying stack orcest-%s on %s", project_name, ssh_target)
+    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
+    # defense-in-depth in case the validation is ever relaxed.
+    qname = shlex.quote(f"orcest-{project_name}")
+    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose"
-        f" -p orcest-{project_name}"
-        f" --env-file projects/{project_name}/.env"
-        f" up -d",
+        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} up -d",
     )
     if result.returncode != 0:
         logger.error("Deploy failed: %s", result.stderr.strip())
@@ -351,12 +352,13 @@ def teardown_stack(ssh_target: str, project_name: str) -> None:
     """Stop and remove a per-project Docker Compose stack."""
     _validate_project_name(project_name)
     logger.info("Tearing down stack orcest-%s on %s", project_name, ssh_target)
+    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
+    # defense-in-depth in case the validation is ever relaxed.
+    qname = shlex.quote(f"orcest-{project_name}")
+    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose"
-        f" -p orcest-{project_name}"
-        f" --env-file projects/{project_name}/.env"
-        f" down -v",
+        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} down -v",
     )
     if result.returncode != 0:
         logger.error("Teardown failed: %s", result.stderr.strip())
@@ -370,12 +372,13 @@ def restart_stack(ssh_target: str, project_name: str) -> None:
     """Force-recreate the orchestrator container for a project."""
     _validate_project_name(project_name)
     logger.info("Restarting stack orcest-%s on %s", project_name, ssh_target)
+    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
+    # defense-in-depth in case the validation is ever relaxed.
+    qname = shlex.quote(f"orcest-{project_name}")
+    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose"
-        f" -p orcest-{project_name}"
-        f" --env-file projects/{project_name}/.env"
-        f" up -d --force-recreate",
+        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} up -d --force-recreate",
     )
     if result.returncode != 0:
         logger.error("Restart failed: %s", result.stderr.strip())
@@ -402,9 +405,8 @@ def write_project_files(
     _validate_project_name(project_name)
     logger.info("Writing project files for %s on %s", project_name, ssh_target)
     pdir = f"/opt/orcest/projects/{project_name}"
-
     # Ensure project directory structure exists
-    result = _ssh(ssh_target, f"mkdir -p {pdir}/config")
+    result = _ssh(ssh_target, f"mkdir -p {shlex.quote(f'{pdir}/config')}")
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create project directory: {result.stderr.strip()}")
 
@@ -415,15 +417,17 @@ def write_project_files(
 
     try:
         remote_tmp_env = f"/tmp/orcest-{project_name}-env"
+        qremote_tmp_env = shlex.quote(remote_tmp_env)
         result = _scp(tmp_env_path, ssh_target, remote_tmp_env)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload .env: {result.stderr.strip()}")
+        qenv_dest = shlex.quote(f"{pdir}/.env")
         result = _ssh(
             ssh_target,
-            f"mv {remote_tmp_env} {pdir}/.env && chmod 600 {pdir}/.env",
+            f"mv {qremote_tmp_env} {qenv_dest} && chmod 600 {qenv_dest}",
         )
         if result.returncode != 0:
-            _ssh(ssh_target, f"rm -f {remote_tmp_env}")
+            _ssh(ssh_target, f"rm -f {qremote_tmp_env}")
             raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
     finally:
         try:
@@ -438,16 +442,17 @@ def write_project_files(
 
     try:
         remote_tmp_config = f"/tmp/orcest-{project_name}-config.yaml"
+        qremote_tmp_config = shlex.quote(remote_tmp_config)
         result = _scp(tmp_config_path, ssh_target, remote_tmp_config)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload config: {result.stderr.strip()}")
+        qconfig_dest = shlex.quote(f"{pdir}/config/orchestrator.yaml")
         result = _ssh(
             ssh_target,
-            f"mv {remote_tmp_config} {pdir}/config/orchestrator.yaml"
-            f" && chmod 644 {pdir}/config/orchestrator.yaml",
+            f"mv {qremote_tmp_config} {qconfig_dest} && chmod 644 {qconfig_dest}",
         )
         if result.returncode != 0:
-            _ssh(ssh_target, f"rm -f {remote_tmp_config}")
+            _ssh(ssh_target, f"rm -f {qremote_tmp_config}")
             raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
     finally:
         try:

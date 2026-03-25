@@ -194,7 +194,12 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
         ],
         token,
     )
-    return json.loads(output) if output else []
+    if not output:
+        return []
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
 def get_pr(repo: str, number: int, token: str) -> dict:
@@ -216,7 +221,10 @@ def get_pr(repo: str, number: int, token: str) -> dict:
     )
     if not output:
         raise GhCliError(f"gh pr view returned empty output for PR #{number}")
-    return json.loads(output)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
 def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
@@ -239,7 +247,10 @@ def get_ci_status(repo: str, pr_number: int, token: str) -> list[dict]:
     )
     if not output:
         return []
-    data = json.loads(output)
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
     return data.get("statusCheckRollup") or []
 
 
@@ -489,7 +500,10 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
         if not output:
             raise GhCliError(f"GraphQL query returned empty response for PR #{number} in {repo}")
 
-        data = json.loads(output)
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
         # GraphQL can return HTTP 200 with errors in the body. Raise so
         # callers don't mistake a failed query for "no threads" (which
@@ -600,7 +614,12 @@ def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
         ],
         token,
     )
-    return json.loads(output) if output else []
+    if not output:
+        return []
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
 def get_issue(repo: str, number: int, token: str) -> dict:
@@ -620,7 +639,10 @@ def get_issue(repo: str, number: int, token: str) -> dict:
     )
     if not output:
         raise GhCliError(f"gh issue view returned empty output for issue #{number}")
-    return json.loads(output)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:
@@ -755,7 +777,10 @@ mutation($threadId: ID!) {
     if not output:
         raise GhCliError(f"GraphQL mutation returned empty response for thread {thread_id!r}")
 
-    data = json.loads(output)
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
     if "errors" in data:
         msgs = [e.get("message", str(e)) for e in data["errors"]]
         raise GhCliError(f"GraphQL errors resolving review thread: {'; '.join(msgs)}")

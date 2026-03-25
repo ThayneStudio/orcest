@@ -290,7 +290,7 @@ def render_clone_userdata(
             {
                 "path": "/opt/orcest/worker.yaml",
                 "owner": "orcest:orcest",
-                "permissions": "0644",
+                "permissions": "0600",
                 "content": worker_yaml,
             },
             {
@@ -382,7 +382,7 @@ def render_worker_userdata(
         {
             "path": "/opt/orcest/worker.yaml",
             "owner": "orcest:orcest",
-            "permissions": "0644",
+            "permissions": "0600",
             "content": worker_yaml,
         },
         {

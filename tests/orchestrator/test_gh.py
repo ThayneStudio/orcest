@@ -23,9 +23,11 @@ from orcest.orchestrator.gh import (
     create_issue,
     get_ci_status,
     get_failed_run_logs,
+    get_issue,
     get_pr,
     get_pr_diff,
     get_unresolved_review_threads,
+    list_labeled_issues,
     list_open_prs,
     merge_pr,
     post_comment,
@@ -523,14 +525,14 @@ def test_get_pr_empty_output_raises(mocker):
 
 
 def test_get_pr_malformed_json_raises(mocker):
-    """get_pr returns non-JSON -> JSONDecodeError propagates."""
+    """get_pr returns non-JSON -> GhCliError wrapping JSONDecodeError."""
     mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout="not json at all", stderr=""
         ),
     )
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(GhCliError, match="Failed to parse"):
         get_pr(REPO, 1, TOKEN)
 
 
@@ -568,14 +570,14 @@ def test_list_open_prs_default_limit(mocker):
 
 
 def test_list_open_prs_malformed_json(mocker):
-    """list_open_prs with invalid JSON stdout -> JSONDecodeError."""
+    """list_open_prs with invalid JSON stdout -> GhCliError wrapping JSONDecodeError."""
     mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         return_value=subprocess.CompletedProcess(
             args=["gh"], returncode=0, stdout="{not valid json", stderr=""
         ),
     )
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(GhCliError, match="Failed to parse"):
         list_open_prs(REPO, TOKEN)
 
 
@@ -1273,3 +1275,64 @@ def test_run_gh_rate_limit_caps_retry_after_at_max(mocker):
     sleep_args = [call.args[0] for call in mock_sleep.call_args_list]
     assert all(v == _MAX_RETRY_AFTER_SECONDS for v in sleep_args)
     assert exc_info.value.retry_after == _MAX_RETRY_AFTER_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Malformed JSON — GhCliError wrapping for the remaining wrapped call sites
+# ---------------------------------------------------------------------------
+
+
+def test_get_ci_status_malformed_json_raises(mocker):
+    """get_ci_status with non-JSON stdout -> GhCliError wrapping JSONDecodeError."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout="{not valid json", stderr=""
+        ),
+    )
+    with pytest.raises(GhCliError, match="Failed to parse"):
+        get_ci_status(REPO, 10, TOKEN)
+
+
+def test_list_labeled_issues_malformed_json_raises(mocker):
+    """list_labeled_issues with invalid JSON stdout -> GhCliError wrapping JSONDecodeError."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout="{not valid json", stderr=""
+        ),
+    )
+    with pytest.raises(GhCliError, match="Failed to parse"):
+        list_labeled_issues(REPO, "orcest:ready", TOKEN)
+
+
+def test_get_issue_malformed_json_raises(mocker):
+    """get_issue with non-JSON stdout -> GhCliError wrapping JSONDecodeError."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout="{not valid json", stderr=""
+        ),
+    )
+    with pytest.raises(GhCliError, match="Failed to parse"):
+        get_issue(REPO, 42, TOKEN)
+
+
+def test_get_unresolved_review_threads_malformed_json_raises(mocker):
+    """get_unresolved_review_threads: non-JSON response raises GhCliError."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="{not valid json",
+    )
+    with pytest.raises(GhCliError, match="Failed to parse"):
+        get_unresolved_review_threads(REPO, 5, TOKEN)
+
+
+def test_resolve_review_thread_malformed_json_raises(mocker):
+    """resolve_review_thread with non-JSON response -> GhCliError wrapping JSONDecodeError."""
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="{not valid json",
+    )
+    with pytest.raises(GhCliError, match="Failed to parse"):
+        resolve_review_thread("thread-id-123", TOKEN)
