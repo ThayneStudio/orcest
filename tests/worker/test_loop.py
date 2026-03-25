@@ -1801,7 +1801,7 @@ class TestPublishResultWithRetry:
         assert call_count[0] == 3
         assert waited == [_RESULT_PUBLISH_BACKOFF[0], _RESULT_PUBLISH_BACKOFF[1]]
 
-    def test_all_retries_fail_writes_dead_letter(self, sample_task, monkeypatch):
+    def test_all_retries_fail_writes_dead_letter(self, sample_task):
         """Returns False and writes to DEAD_LETTER_STREAM when all retries fail."""
         mock_redis = MagicMock()
 
@@ -1812,6 +1812,7 @@ class TestPublishResultWithRetry:
 
         mock_redis.xadd_capped.side_effect = xadd_capped
         abort_event = MagicMock(spec=threading.Event)
+        abort_event.wait.return_value = False  # not aborted; simulate normal timeout
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
