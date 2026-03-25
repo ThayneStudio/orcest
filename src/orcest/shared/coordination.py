@@ -38,9 +38,11 @@ class RedisLock:
         key: str,
         ttl: int = 1800,  # 30 minutes
         owner: str | None = None,
+        *,
+        raw_key: bool = False,
     ):
         self.redis = redis_client
-        self.key = redis_client._prefixed(key)
+        self.key = key if raw_key else redis_client._prefixed(key)
         self.ttl = ttl
         self.owner = owner or str(uuid.uuid4())
         self._held = False

@@ -351,7 +351,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         try:
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).
-            redis.xadd(tasks_stream, task_fields)
+            redis.xadd_raw(tasks_stream, task_fields)
             redis.xdel(DEAD_LETTER_STREAM, entry_id)
             replayed += 1
         except redis_lib.RedisError as exc:

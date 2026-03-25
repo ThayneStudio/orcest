@@ -287,17 +287,33 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 shutdown_event.set()
             continue
 
-        # Try to acquire lock (use resource-type-aware key)
+        # Try to acquire lock (use resource-type-aware key).
+        # When the task carries a key_prefix (multi-project mode), construct
+        # the fully-qualified lock key so the worker writes the lock under the
+        # same prefix that the orchestrator checks.  Without this, the worker
+        # would write e.g. "orcest:lock:pr:…" while the orchestrator looks for
+        # "myproject:lock:pr:…" — different Redis keys.
         if task.resource_type == "issue":
             lock_key = make_issue_lock_key(task.repo, task.resource_id)
         else:
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
-        lock = RedisLock(
-            redis,
-            lock_key,
-            ttl=LOCK_TTL,
-            owner=config.worker_id,
-        )
+
+        if task.key_prefix:
+            fq_lock_key = f"{task.key_prefix}:{lock_key}"
+            lock = RedisLock(
+                redis,
+                fq_lock_key,
+                ttl=LOCK_TTL,
+                owner=config.worker_id,
+                raw_key=True,
+            )
+        else:
+            lock = RedisLock(
+                redis,
+                lock_key,
+                ttl=LOCK_TTL,
+                owner=config.worker_id,
+            )
 
         if not lock.acquire():
             logger.warning(f"Lock {lock_key} already held, skipping task {task.id}")
