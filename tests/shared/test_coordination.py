@@ -164,3 +164,58 @@ def test_compute_pending_task_ttl_reflects_non_default_values():
     ttl = compute_pending_task_ttl(rc)
     assert ttl == 3600 * 5 + 300
     assert ttl > compute_pending_task_ttl(RunnerConfig())
+
+
+# ---------------------------------------------------------------------------
+# RedisLock raw_key tests
+# ---------------------------------------------------------------------------
+
+
+def test_raw_key_bypasses_prefix(fake_redis_client):
+    """When raw_key=True, the lock key is used as-is without auto-prefixing."""
+    fq_key = "myproject:lock:pr:owner/repo:42"
+    lock = RedisLock(fake_redis_client, fq_key, raw_key=True)
+    assert lock.key == fq_key
+    assert lock.acquire() is True
+    # The raw key should be stored in Redis directly
+    assert fake_redis_client.client.get(fq_key) == lock.owner
+
+
+def test_raw_key_false_uses_prefix(fake_redis_client):
+    """When raw_key=False (default), the key is auto-prefixed."""
+    lock = RedisLock(fake_redis_client, "lock:pr:owner/repo:42")
+    # fake_redis_client uses prefix "test:" (from conftest)
+    assert lock.key == "test:lock:pr:owner/repo:42"
+
+
+def test_raw_key_lock_contention(fake_redis_client):
+    """Two locks on the same raw key contend correctly."""
+    fq_key = "myproject:lock:pr:owner/repo:42"
+    lock1 = RedisLock(fake_redis_client, fq_key, owner="worker-1", raw_key=True)
+    lock2 = RedisLock(fake_redis_client, fq_key, owner="worker-2", raw_key=True)
+    assert lock1.acquire() is True
+    assert lock2.acquire() is False
+
+
+def test_raw_key_release_and_refresh(fake_redis_client):
+    """Release and refresh work correctly with raw_key=True."""
+    fq_key = "myproject:lock:pr:owner/repo:42"
+    lock = RedisLock(fake_redis_client, fq_key, ttl=300, raw_key=True)
+    lock.acquire()
+    assert lock.refresh() is True
+    assert lock.release() is True
+    assert fake_redis_client.client.get(fq_key) is None
+
+
+def test_raw_key_does_not_collide_with_prefixed(fake_redis_client):
+    """A raw-key lock and a prefixed lock with the same logical key
+    should write to different Redis keys and not interfere."""
+    logical_key = "lock:pr:owner/repo:42"
+    # Prefixed lock writes to "test:lock:pr:owner/repo:42"
+    prefixed_lock = RedisLock(fake_redis_client, logical_key, owner="worker-A")
+    # Raw lock writes to "lock:pr:owner/repo:42" (no prefix)
+    raw_lock = RedisLock(fake_redis_client, logical_key, owner="worker-B", raw_key=True)
+
+    assert prefixed_lock.acquire() is True
+    assert raw_lock.acquire() is True  # Different key, should succeed
+    assert prefixed_lock.key != raw_lock.key
