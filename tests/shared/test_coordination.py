@@ -4,10 +4,15 @@ import pytest
 
 from orcest.shared.config import RunnerConfig
 from orcest.shared.coordination import (
+    _BACKOFF_COOLDOWNS_SECONDS,
     RedisLock,
+    clear_backoff,
     compute_pending_task_ttl,
+    get_backoff_cooldown_seconds,
+    get_backoff_step,
     make_issue_lock_key,
     make_pr_lock_key,
+    set_backoff_cooldown,
 )
 
 
@@ -164,3 +169,120 @@ def test_compute_pending_task_ttl_reflects_non_default_values():
     ttl = compute_pending_task_ttl(rc)
     assert ttl == 3600 * 5 + 300
     assert ttl > compute_pending_task_ttl(RunnerConfig())
+
+
+# ---------------------------------------------------------------------------
+# Backoff functions
+# ---------------------------------------------------------------------------
+
+
+def test_get_backoff_cooldown_seconds_first_step():
+    """Step 0 returns the first cooldown value."""
+    assert get_backoff_cooldown_seconds(0) == _BACKOFF_COOLDOWNS_SECONDS[0]
+
+
+def test_get_backoff_cooldown_seconds_last_step():
+    """The last valid step returns the final cooldown value."""
+    last = len(_BACKOFF_COOLDOWNS_SECONDS) - 1
+    assert get_backoff_cooldown_seconds(last) == _BACKOFF_COOLDOWNS_SECONDS[last]
+
+
+def test_get_backoff_cooldown_seconds_clamps_negative():
+    """Negative step is clamped to 0."""
+    assert get_backoff_cooldown_seconds(-1) == _BACKOFF_COOLDOWNS_SECONDS[0]
+    assert get_backoff_cooldown_seconds(-99) == _BACKOFF_COOLDOWNS_SECONDS[0]
+
+
+def test_get_backoff_cooldown_seconds_clamps_overflow():
+    """Step beyond the table is clamped to the last entry (max cooldown)."""
+    max_cooldown = _BACKOFF_COOLDOWNS_SECONDS[-1]
+    assert get_backoff_cooldown_seconds(len(_BACKOFF_COOLDOWNS_SECONDS)) == max_cooldown
+    assert get_backoff_cooldown_seconds(999) == max_cooldown
+
+
+def test_get_backoff_cooldown_seconds_middle_step():
+    """A middle step returns the expected Fibonacci-like value."""
+    assert get_backoff_cooldown_seconds(3) == _BACKOFF_COOLDOWNS_SECONDS[3]
+
+
+def test_set_backoff_cooldown_stores_step(fake_redis_client):
+    """set_backoff_cooldown writes the step value to Redis."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=2)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 42) == 2
+
+
+def test_set_backoff_cooldown_sets_ttl(fake_redis_client):
+    """set_backoff_cooldown sets a positive TTL on the Redis key."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1)
+    key = "backoff:pr:owner/repo:42"
+    ttl = fake_redis_client.ttl(key)
+    assert ttl > 0
+
+
+def test_set_backoff_cooldown_ttl_matches_step_duration(fake_redis_client):
+    """The TTL is approximately equal to the cooldown for the given step."""
+    step = 2
+    expected_cooldown = get_backoff_cooldown_seconds(step)
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 99, step=step)
+    key = "backoff:pr:owner/repo:99"
+    ttl = fake_redis_client.ttl(key)
+    # Allow a small margin for processing time.
+    assert expected_cooldown - 2 <= ttl <= expected_cooldown
+
+
+def test_set_backoff_cooldown_overwrites_previous_step(fake_redis_client):
+    """A second call to set_backoff_cooldown overwrites the prior step."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 7, step=0)
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 7, step=3)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 7) == 3
+
+
+def test_get_backoff_step_returns_none_when_not_set(fake_redis_client):
+    """get_backoff_step returns None when no backoff key exists."""
+    assert get_backoff_step(fake_redis_client, "owner/repo", 1) is None
+
+
+def test_get_backoff_step_returns_stored_step(fake_redis_client):
+    """get_backoff_step returns the integer step that was stored."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 5, step=4)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 5) == 4
+
+
+def test_get_backoff_step_returns_none_after_key_deleted(fake_redis_client):
+    """get_backoff_step returns None once the key has been deleted."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 10, step=1)
+    fake_redis_client.delete("backoff:pr:owner/repo:10")
+    assert get_backoff_step(fake_redis_client, "owner/repo", 10) is None
+
+
+def test_get_backoff_step_raises_on_corrupt_value(fake_redis_client):
+    """get_backoff_step raises ValueError when the Redis value is not an integer."""
+    # Write directly using the prefixed key to bypass the int-only set_ex path.
+    prefixed_key = fake_redis_client._prefix + "backoff:pr:owner/repo:77"
+    fake_redis_client.client.set(prefixed_key, "not-an-int")
+    with pytest.raises(ValueError):
+        get_backoff_step(fake_redis_client, "owner/repo", 77)
+
+
+def test_clear_backoff_removes_key(fake_redis_client):
+    """clear_backoff deletes the backoff key so get_backoff_step returns None."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 3, step=1)
+    clear_backoff(fake_redis_client, "owner/repo", 3)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 3) is None
+
+
+def test_clear_backoff_is_idempotent(fake_redis_client):
+    """Calling clear_backoff when no key exists does not raise."""
+    clear_backoff(fake_redis_client, "owner/repo", 999)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 999) is None
+
+
+def test_backoff_keys_are_isolated_per_pr(fake_redis_client):
+    """Backoff state for one PR number does not affect another."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 1, step=2)
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 2, step=5)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 1) == 2
+    assert get_backoff_step(fake_redis_client, "owner/repo", 2) == 5
+    clear_backoff(fake_redis_client, "owner/repo", 1)
+    assert get_backoff_step(fake_redis_client, "owner/repo", 1) is None
+    assert get_backoff_step(fake_redis_client, "owner/repo", 2) == 5
