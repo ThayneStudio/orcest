@@ -1491,9 +1491,7 @@ def _make_multi_project_config(label_config=None):
     )
 
 
-def test_poll_cycle_multi_project_polls_each_project(
-    mocker, fake_redis_client, gh_mock
-):
+def test_poll_cycle_multi_project_polls_each_project(mocker, fake_redis_client, gh_mock):
     """_poll_cycle calls discover_actionable_prs once per project with the correct repo/token."""
     config = _make_multi_project_config()
 
@@ -1531,9 +1529,7 @@ def test_poll_cycle_multi_project_polls_each_project(
     assert call_tokens == {"token-frontend", "token-backend"}
 
 
-def test_poll_cycle_multi_project_error_isolation(
-    mocker, fake_redis_client, gh_mock
-):
+def test_poll_cycle_multi_project_error_isolation(mocker, fake_redis_client, gh_mock):
     """An exception in one project does not prevent the other from being polled."""
     config = _make_multi_project_config()
 
@@ -1573,9 +1569,7 @@ def test_poll_cycle_multi_project_error_isolation(
     assert "acme/backend" in call_repos
 
 
-def test_consume_results_multi_project_isolates_streams(
-    fake_redis_client, gh_mock
-):
+def test_consume_results_multi_project_isolates_streams(fake_redis_client, gh_mock):
     """Results written to project A's stream are not visible to project B."""
     from orcest.shared.config import LabelConfig
     from orcest.shared.redis_client import RedisClient
