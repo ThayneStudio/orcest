@@ -382,8 +382,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         # Single-project (legacy) mode: missing repo → point to ORCEST_REPO
         if not github_config.repo:
             raise ValueError(
-                "github.repo is required. "
-                "Set it in the config file or via ORCEST_REPO env var."
+                "github.repo is required. Set it in the config file or via ORCEST_REPO env var."
             )
     else:
         # Multi-project mode: each entry must have a repo field

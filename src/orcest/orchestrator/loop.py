@@ -57,10 +57,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         sys.exit(1)
 
     # Build per-project Redis clients once; reuse across all poll cycles
-    project_clients = [
-        (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
-        for project in config.projects
-    ]
+    project_clients = _build_project_clients(config, redis)
 
     # Ensure consumer group for results stream (per-project)
     for _, project_redis in project_clients:
@@ -102,6 +99,17 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     logger.info("Orchestrator shut down cleanly.")
 
 
+def _build_project_clients(
+    config: OrchestratorConfig,
+    redis: RedisClient,
+) -> list[tuple[ProjectConfig, RedisClient]]:
+    """Build per-project Redis clients from config."""
+    return [
+        (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
+        for project in config.projects
+    ]
+
+
 def _poll_cycle(
     config: OrchestratorConfig,
     redis: RedisClient,
@@ -111,10 +119,7 @@ def _poll_cycle(
 ) -> None:
     """Single orchestrator poll cycle across all configured projects."""
     if project_clients is None:
-        project_clients = [
-            (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
-            for project in config.projects
-        ]
+        project_clients = _build_project_clients(config, redis)
 
     # Step 1: Consume results per project
     for project, project_redis in project_clients:
