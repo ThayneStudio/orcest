@@ -241,14 +241,14 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Multi-project support: load projects list
-    projects_raw = raw.get("projects", [])
+    projects_raw = raw.get("projects")
+    if projects_raw is not None and not isinstance(projects_raw, list):
+        raise ValueError(f"'projects' must be a YAML list, got {type(projects_raw).__name__}")
     if isinstance(projects_raw, list) and projects_raw:
         projects = []
         for i, p in enumerate(projects_raw):
             if not isinstance(p, dict):
-                raise ValueError(
-                    f"projects[{i}] must be a YAML mapping, got {type(p).__name__}"
-                )
+                raise ValueError(f"projects[{i}] must be a YAML mapping, got {type(p).__name__}")
             projects.append(
                 ProjectConfig(
                     repo=str(p.get("repo", "")),
@@ -260,8 +260,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         for proj in projects:
             if not proj.key_prefix:
                 raise ValueError(
-                    f"projects[].key_prefix is required "
-                    f"(missing for repo '{proj.repo}')"
+                    f"projects[].key_prefix is required (missing for repo '{proj.repo}')"
                 )
         if len(projects) > 1:
             prefixes = [proj.key_prefix for proj in projects]
@@ -369,10 +368,15 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Validate required fields
-    if not projects or not all(p.repo for p in projects):
+    if not projects:
         raise ValueError(
             "github.repo is required (or provide a projects list). "
             "Set it in the config file or via ORCEST_REPO env var."
+        )
+    empty_repos = [p.key_prefix or f"projects[{i}]" for i, p in enumerate(projects) if not p.repo]
+    if empty_repos:
+        raise ValueError(
+            f"Each project must have a non-empty repo: missing for {', '.join(empty_repos)}."
         )
 
     return config

@@ -147,7 +147,7 @@ def test_load_orchestrator_config_missing_file(tmp_path: Path):
 
     # _load_yaml returns {} for missing files, but load_orchestrator_config
     # then validates that github.repo is non-empty and raises ValueError.
-    with pytest.raises(ValueError, match="github.repo is required"):
+    with pytest.raises(ValueError, match="non-empty repo"):
         load_orchestrator_config(missing)
 
 
@@ -571,10 +571,7 @@ def test_load_orchestrator_config_single_project_backward_compat(tmp_path: Path)
     """No projects key, just github.repo: a single ProjectConfig is synthesized."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n"
-        "  token: ghp_tok\n"
-        "  repo: acme/widgets\n"
-        "  claude_token: claude_tok\n"
+        "github:\n  token: ghp_tok\n  repo: acme/widgets\n  claude_token: claude_tok\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -680,3 +677,25 @@ def test_load_orchestrator_config_single_project_in_list(tmp_path: Path):
     assert len(config.projects) == 1
     assert config.projects[0].repo == "acme/widgets"
     assert config.projects[0].key_prefix == "widgets"
+
+
+def test_load_orchestrator_config_projects_not_a_list_raises(tmp_path: Path):
+    """projects: as a scalar or mapping should raise, not silently fall back."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("github:\n  repo: owner/repo\nprojects: not-a-list\n")
+    with pytest.raises(ValueError, match="must be a YAML list"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_empty_repo_in_project_raises(tmp_path: Path):
+    """A project entry with an empty repo should raise a clear error."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "projects:\n"
+        "  - repo: owner/repo-a\n"
+        "    key_prefix: prefix-a\n"
+        "  - repo: ''\n"
+        "    key_prefix: prefix-b\n"
+    )
+    with pytest.raises(ValueError, match="non-empty repo"):
+        load_orchestrator_config(cfg_file)
