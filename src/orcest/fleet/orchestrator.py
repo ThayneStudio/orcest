@@ -410,7 +410,7 @@ def write_project_files(
     qpdir = shlex.quote(pdir)
 
     # Ensure project directory structure exists
-    result = _ssh(ssh_target, f"mkdir -p {qpdir}/config")
+    result = _ssh(ssh_target, f"mkdir -p {shlex.quote(f'{pdir}/config')}")
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create project directory: {result.stderr.strip()}")
 

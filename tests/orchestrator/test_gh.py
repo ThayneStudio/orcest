@@ -1319,7 +1319,7 @@ def test_get_issue_malformed_json_raises(mocker):
 
 
 def test_get_unresolved_review_threads_malformed_json_raises(mocker):
-    """get_unresolved_review_threads: non-JSON response raises GhCliError wrapping JSONDecodeError."""
+    """get_unresolved_review_threads: non-JSON response raises GhCliError."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value="{not valid json",

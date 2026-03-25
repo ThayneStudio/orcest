@@ -231,7 +231,10 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
             number,
             val,
         )
-        redis_client.delete(key)
+        try:
+            redis_client.delete(key)
+        except Exception:
+            pass  # best-effort cleanup; log already emitted above
         return None
 
 
