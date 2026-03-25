@@ -1738,7 +1738,7 @@ class TestPublishResultWithRetry:
             RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN
         )
 
-    def test_retries_and_succeeds_on_second_attempt(self, sample_task, monkeypatch):
+    def test_retries_and_succeeds_on_second_attempt(self, sample_task):
         """Returns True when the first attempt fails and the second succeeds."""
         call_count = [0]
 
@@ -1750,20 +1750,22 @@ class TestPublishResultWithRetry:
 
         mock_redis = MagicMock()
         mock_redis.xadd_capped.side_effect = xadd_capped
-        slept: list[float] = []
-        monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
+        waited: list[float] = []
+        abort_event = MagicMock(spec=threading.Event)
+        abort_event.wait.side_effect = lambda timeout: waited.append(timeout)
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1",
+            abort_event=abort_event,
         )
 
         assert ok is True
         assert call_count[0] == 2
-        # Should have slept once before the second attempt
-        assert slept == [_RESULT_PUBLISH_BACKOFF[0]]
+        # Should have waited once before the second attempt
+        assert waited == [_RESULT_PUBLISH_BACKOFF[0]]
 
-    def test_retries_and_succeeds_on_third_attempt(self, sample_task, monkeypatch):
+    def test_retries_and_succeeds_on_third_attempt(self, sample_task):
         """Returns True when the first two attempts fail and the third succeeds."""
         call_count = [0]
 
@@ -1775,17 +1777,19 @@ class TestPublishResultWithRetry:
 
         mock_redis = MagicMock()
         mock_redis.xadd_capped.side_effect = xadd_capped
-        slept: list[float] = []
-        monkeypatch.setattr("orcest.worker.loop.time.sleep", slept.append)
+        waited: list[float] = []
+        abort_event = MagicMock(spec=threading.Event)
+        abort_event.wait.side_effect = lambda timeout: waited.append(timeout)
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
-            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1",
+            abort_event=abort_event,
         )
 
         assert ok is True
         assert call_count[0] == 3
-        assert slept == [_RESULT_PUBLISH_BACKOFF[0], _RESULT_PUBLISH_BACKOFF[1]]
+        assert waited == [_RESULT_PUBLISH_BACKOFF[0], _RESULT_PUBLISH_BACKOFF[1]]
 
     def test_all_retries_fail_writes_dead_letter(self, sample_task, monkeypatch):
         """Returns False and writes to DEAD_LETTER_STREAM when all retries fail."""
@@ -1797,7 +1801,7 @@ class TestPublishResultWithRetry:
             return "1-0"
 
         mock_redis.xadd_capped.side_effect = xadd_capped
-        monkeypatch.setattr("orcest.worker.loop.time.sleep", lambda _: None)
+        abort_event = MagicMock(spec=threading.Event)
         result = self._make_result(sample_task)
 
         ok = _publish_result_with_retry(
@@ -1807,6 +1811,7 @@ class TestPublishResultWithRetry:
             logging.getLogger("test"),
             "tasks:claude",
             "entry-42",
+            abort_event=abort_event,
         )
 
         assert ok is False

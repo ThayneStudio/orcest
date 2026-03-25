@@ -390,6 +390,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             logger,
             current_stream,
             entry_id,
+            abort_event=abort_event,
         )
 
         if published:
@@ -711,6 +712,7 @@ def _publish_result_with_retry(
     logger: logging.Logger,
     tasks_stream: str,
     entry_id: str,
+    abort_event: threading.Event | None = None,
 ) -> bool:
     """Publish a task result to RESULTS_STREAM with exponential backoff retry.
 
@@ -724,9 +726,10 @@ def _publish_result_with_retry(
     False otherwise (dead-letter write may or may not have succeeded).
     """
     last_exc: Exception | None = None
+    _abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_RESULT_PUBLISH_RETRIES):
         if attempt > 0:
-            time.sleep(_RESULT_PUBLISH_BACKOFF[attempt - 1])
+            _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1])
         try:
             # Publish to the correct project's results stream
             if task.key_prefix:
