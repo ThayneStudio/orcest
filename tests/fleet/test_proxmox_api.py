@@ -191,6 +191,7 @@ class TestProxmoxClientInit:
                 token_value="secret123",
                 verify_ssl=False,
                 backend="https",
+                timeout=30,
             )
 
     def test_rejects_token_id_without_separator(self):
