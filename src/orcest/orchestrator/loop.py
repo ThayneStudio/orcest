@@ -154,6 +154,7 @@ def _poll_project(
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """
+    logger = logger.getChild(project.repo)
     repo = project.repo
     token = project.token
     claude_token = project.claude_token
@@ -841,6 +842,7 @@ def _consume_results_for_project(
     This prevents orphaned labels from results that were read but never
     processed after a restart.
     """
+    logger = logger.getChild(project.repo)
     # Phase 1: Drain pending (unACKed) entries from previous runs
     while True:
         entries = redis.xreadgroup(

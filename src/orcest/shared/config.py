@@ -244,9 +244,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     projects_raw = raw.get("projects", [])
     if isinstance(projects_raw, list) and projects_raw:
         projects = []
-        for p in projects_raw:
+        for i, p in enumerate(projects_raw):
             if not isinstance(p, dict):
-                continue
+                raise ValueError(
+                    f"projects[{i}] must be a YAML mapping, got {type(p).__name__}"
+                )
             projects.append(
                 ProjectConfig(
                     repo=str(p.get("repo", "")),
@@ -255,13 +257,18 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                     key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
                 )
             )
+        for proj in projects:
+            if not proj.key_prefix:
+                raise ValueError(
+                    f"projects[].key_prefix is required "
+                    f"(missing for repo '{proj.repo}')"
+                )
         if len(projects) > 1:
-            for proj in projects:
-                if not proj.key_prefix:
-                    raise ValueError(
-                        f"projects[].key_prefix is required in multi-project mode "
-                        f"(missing for repo '{proj.repo}')"
-                    )
+            prefixes = [proj.key_prefix for proj in projects]
+            if len(set(prefixes)) != len(prefixes):
+                raise ValueError(
+                    "projects[].key_prefix values must be unique in multi-project mode"
+                )
     else:
         # Backward compatibility: single-project mode
         projects = [
