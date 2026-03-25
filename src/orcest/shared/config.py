@@ -31,6 +31,16 @@ class GithubConfig:
 
 
 @dataclass
+class ProjectConfig:
+    """Per-project configuration for the orchestrator."""
+
+    repo: str  # "owner/repo"
+    token: str  # GitHub PAT
+    claude_token: str  # Claude Code OAuth token
+    key_prefix: str  # Redis key prefix for this project
+
+
+@dataclass
 class PollingConfig:
     interval: int = 60  # seconds between poll cycles
 
@@ -66,6 +76,7 @@ class OrchestratorConfig:
     github: GithubConfig = field(default_factory=GithubConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
+    projects: list[ProjectConfig] = field(default_factory=list)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     # Runner settings used to compute the pending-task marker TTL.  These
     # should match the timeout/max_retries deployed on worker nodes so that
@@ -229,6 +240,54 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         claude_token=str(claude_token),
     )
 
+    # Multi-project support: load projects list
+    projects_raw = raw.get("projects")
+    if projects_raw is not None and not isinstance(projects_raw, list):
+        raise ValueError(f"'projects' must be a YAML list, got {type(projects_raw).__name__}")
+    if isinstance(projects_raw, list) and projects_raw:
+        projects = []
+        for i, p in enumerate(projects_raw):
+            if not isinstance(p, dict):
+                raise ValueError(f"projects[{i}] must be a YAML mapping, got {type(p).__name__}")
+            projects.append(
+                ProjectConfig(
+                    repo=str(p.get("repo", "")),
+                    token=str(p.get("token", github_token)),  # default to shared token
+                    claude_token=str(p.get("claude_token", claude_token)),  # default to shared
+                    key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
+                )
+            )
+        if len(projects) > 1:
+            seen_prefixes: set[str] = set()
+            for proj in projects:
+                if not proj.key_prefix:
+                    raise ValueError(
+                        f"projects[].key_prefix is required in multi-project mode "
+                        f"(missing for repo '{proj.repo}')"
+                    )
+                if proj.key_prefix in seen_prefixes:
+                    raise ValueError(
+                        f"projects[].key_prefix must be unique across projects "
+                        f"(duplicate: '{proj.key_prefix}')"
+                    )
+                seen_prefixes.add(proj.key_prefix)
+            repos = [proj.repo for proj in projects]
+            if len(set(repos)) != len(repos):
+                raise ValueError(
+                    "projects[].repo values must be unique "
+                    "— duplicate repos would cause double-enqueue"
+                )
+    else:
+        # Backward compatibility: single-project mode
+        projects = [
+            ProjectConfig(
+                repo=str(github_repo),
+                token=str(github_token),
+                claude_token=str(claude_token),
+                key_prefix=str(redis_config.key_prefix),
+            )
+        ]
+
     # Polling
     polling_raw = _safe_dict(raw, "polling")
     polling_config = PollingConfig(
@@ -305,6 +364,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
+        projects=projects,
         polling=polling_config,
         labels=labels_config,
         deployment=deployment_config,
@@ -317,10 +377,21 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Validate required fields
-    if not config.github.repo:
-        raise ValueError(
-            "github.repo is required. Set it in the config file or via ORCEST_REPO env var."
-        )
+    using_projects_list = isinstance(projects_raw, list) and bool(projects_raw)
+    if not using_projects_list:
+        # Single-project (legacy) mode: missing repo → point to ORCEST_REPO
+        if not github_config.repo:
+            raise ValueError(
+                "github.repo is required. Set it in the config file or via ORCEST_REPO env var."
+            )
+    else:
+        # Multi-project mode: each entry must have a repo field
+        empty_repo_entries = [f"projects[{i}]" for i, p in enumerate(projects) if not p.repo]
+        if empty_repo_entries:
+            raise ValueError(
+                f"Each projects[] entry must have a non-empty 'repo' field: "
+                f"missing for {', '.join(empty_repo_entries)}."
+            )
 
     return config
 

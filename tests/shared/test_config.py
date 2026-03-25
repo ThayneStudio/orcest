@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from orcest.shared.config import (
+    ProjectConfig,
     RunnerConfig,
     build_redis_config,
     load_orchestrator_config,
@@ -25,6 +26,7 @@ _ENV_VARS_TO_CLEAR = [
     "ORCEST_DEFAULT_RUNNER",
     "ORCEST_WORKER_ID",
     "ORCEST_WORKSPACE_DIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
 ]
 
 
@@ -527,4 +529,173 @@ def test_null_integer_field_raises(tmp_path: Path):
     cfg_file.write_text("github:\n  repo: acme/widgets\npolling:\n  interval: null\n")
 
     with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)
+
+
+# -- Multi-project orchestrator config ----------------------------------------
+
+
+def test_load_orchestrator_config_multi_project(tmp_path: Path):
+    """YAML with two projects produces config.projects with correct entries."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  token: ghp_shared\n"
+        "  repo: fallback/repo\n"
+        "  claude_token: claude_shared\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    token: ghp_acme\n"
+        "    claude_token: claude_acme\n"
+        "    key_prefix: acme\n"
+        "  - repo: acme/gadgets\n"
+        "    token: ghp_gadgets\n"
+        "    claude_token: claude_gadgets\n"
+        "    key_prefix: gadgets\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 2
+    assert config.projects[0].repo == "acme/widgets"
+    assert config.projects[0].token == "ghp_acme"
+    assert config.projects[0].claude_token == "claude_acme"
+    assert config.projects[0].key_prefix == "acme"
+    assert config.projects[1].repo == "acme/gadgets"
+    assert config.projects[1].token == "ghp_gadgets"
+    assert config.projects[1].claude_token == "claude_gadgets"
+    assert config.projects[1].key_prefix == "gadgets"
+
+
+def test_load_orchestrator_config_single_project_backward_compat(tmp_path: Path):
+    """No projects key, just github.repo: a single ProjectConfig is synthesized."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  token: ghp_tok\n  repo: acme/widgets\n  claude_token: claude_tok\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 1
+    proj = config.projects[0]
+    assert isinstance(proj, ProjectConfig)
+    assert proj.repo == "acme/widgets"
+    assert proj.token == "ghp_tok"
+    assert proj.claude_token == "claude_tok"
+    assert proj.key_prefix == "orcest"  # default redis key_prefix
+
+
+def test_load_orchestrator_config_projects_token_defaults(tmp_path: Path):
+    """Project entries without token/claude_token inherit from shared github.* fields."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  token: ghp_shared\n"
+        "  repo: fallback/repo\n"
+        "  claude_token: claude_shared\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: widgets\n"
+        "  - repo: acme/gadgets\n"
+        "    key_prefix: gadgets\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 2
+    for proj in config.projects:
+        assert proj.token == "ghp_shared"
+        assert proj.claude_token == "claude_shared"
+
+
+def test_load_orchestrator_config_multi_project_empty_key_prefix_raises(tmp_path: Path):
+    """Empty key_prefix in any project entry should raise ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: fallback/repo\n"
+        "redis:\n"
+        "  key_prefix: ''\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: ''\n"
+        "  - repo: acme/gadgets\n"
+        "    key_prefix: gadgets\n"
+    )
+
+    with pytest.raises(ValueError, match="key_prefix is required"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_multi_project_duplicate_key_prefix_raises(tmp_path: Path):
+    """Duplicate key_prefix values in multi-project mode should raise ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: fallback/repo\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: same\n"
+        "  - repo: acme/gadgets\n"
+        "    key_prefix: same\n"
+    )
+
+    with pytest.raises(ValueError, match="key_prefix must be unique"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_projects_non_dict_entry_raises(tmp_path: Path):
+    """Non-dict entry in projects list should raise ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: fallback/repo\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: widgets\n"
+        "  - not-a-mapping\n"
+    )
+
+    with pytest.raises(ValueError, match=r"projects\[1\] must be a YAML mapping"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_single_project_in_list(tmp_path: Path):
+    """A single-entry projects list with valid key_prefix should work."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  token: ghp_tok\n"
+        "  repo: fallback/repo\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: widgets\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 1
+    assert config.projects[0].repo == "acme/widgets"
+    assert config.projects[0].key_prefix == "widgets"
+
+
+def test_load_orchestrator_config_projects_not_a_list_raises(tmp_path: Path):
+    """projects: as a scalar or mapping should raise, not silently fall back."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("github:\n  repo: owner/repo\nprojects: not-a-list\n")
+    with pytest.raises(ValueError, match="must be a YAML list"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_empty_repo_in_project_raises(tmp_path: Path):
+    """A project entry with an empty repo should raise a clear error."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "projects:\n"
+        "  - repo: owner/repo-a\n"
+        "    key_prefix: prefix-a\n"
+        "  - repo: ''\n"
+        "    key_prefix: prefix-b\n"
+    )
+    with pytest.raises(ValueError, match="non-empty 'repo' field"):
         load_orchestrator_config(cfg_file)

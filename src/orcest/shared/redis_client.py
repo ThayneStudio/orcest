@@ -303,6 +303,14 @@ class RedisClient:
         result: int = self._client.xdel(self._prefixed(stream), *entry_ids)  # type: ignore[assignment]
         return result
 
+    def xadd_raw(self, fq_stream: str, fields: dict[str, str]) -> str:
+        """Add entry to stream using a fully-qualified (already-prefixed) name.
+
+        Returns the entry ID.
+        """
+        entry_id: str = self._client.xadd(fq_stream, fields)  # type: ignore[assignment, arg-type]
+        return entry_id
+
     def xadd_capped_raw(self, fq_stream: str, fields: dict[str, str], maxlen: int) -> str:
         """Add entry to a capped stream using a fully-qualified (already-prefixed) name.
 

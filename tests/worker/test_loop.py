@@ -23,6 +23,7 @@ from orcest.worker.loop import (
     MAX_DELIVERY_COUNT,
     RESULTS_STREAM,
     _check_gh_credentials,
+    _clear_pending_task_for_task,
     _dead_letter_task,
     _execute_task,
     _make_abort_event,
@@ -1997,3 +1998,189 @@ class TestCheckGhCredentials:
         with caplog.at_level(logging.WARNING, logger="test.creds"):
             self._run(tmp_path, logger)
         assert not any("OAuth" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Tests for multi-project stream routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMultiProjectRouting:
+    """Tests for multi-project key_prefix routing in pending-task clearing
+    and result publishing."""
+
+    def test_clear_pending_task_for_task_uses_task_key_prefix(self):
+        """When a Task carries a key_prefix, _clear_pending_task_for_task must
+        call redis.delete_raw with the fully-qualified pending key that includes
+        the project prefix, NOT the worker's default prefix."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="projectA",
+        )
+        mock_redis = MagicMock()
+
+        _clear_pending_task_for_task(mock_redis, task)
+
+        expected_key = "projectA:pending:pr:owner/repo:42"
+        mock_redis.delete_raw.assert_called_once_with(expected_key)
+        # Must NOT fall back to the prefixed delete (clear_pending_task path)
+        mock_redis.delete.assert_not_called()
+
+    def test_clear_pending_task_for_task_falls_back_to_default(self):
+        """When a Task has an empty key_prefix, _clear_pending_task_for_task
+        must fall back to clear_pending_task which uses the worker's default
+        Redis key prefix (via redis.delete, not delete_raw)."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="",
+        )
+        mock_redis = MagicMock()
+
+        _clear_pending_task_for_task(mock_redis, task)
+
+        # Should call the prefixed delete path (clear_pending_task -> redis.delete)
+        mock_redis.delete.assert_called_once_with("pending:pr:owner/repo:42")
+        # Must NOT call the raw delete
+        mock_redis.delete_raw.assert_not_called()
+
+    def test_result_published_to_correct_project_stream(self, monkeypatch):
+        """When a Task carries a key_prefix, _publish_result_with_retry must
+        publish to the project-specific results stream via xadd_capped_raw
+        (e.g. 'projectA:results'), NOT the worker's default prefix stream."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="projectA",
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="test-worker",
+            status=ResultStatus.COMPLETED,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            branch=task.branch,
+            summary="done",
+            duration_seconds=1,
+        )
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped_raw.return_value = "1-0"
+
+        ok = _publish_result_with_retry(
+            mock_redis,
+            result,
+            task,
+            logging.getLogger("test"),
+            "projectA:tasks:claude",
+            "entry-1",
+        )
+
+        assert ok is True
+        # Must publish to the project-namespaced results stream via raw
+        mock_redis.xadd_capped_raw.assert_called_once_with(
+            "projectA:results", result.to_dict(), maxlen=_STREAM_MAXLEN
+        )
+        # Must NOT use the default-prefix xadd_capped for the results stream
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 0
+
+    def test_lock_uses_task_key_prefix_when_set(self):
+        """When a Task carries a key_prefix, the worker must acquire the lock
+        under the task's key_prefix (fully-qualified), not the worker's default
+        prefix, so the orchestrator's per-project RedisClient sees it."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="projectA",
+        )
+        mock_redis = MagicMock()
+        mock_redis.client.register_script.return_value = MagicMock(return_value=1)
+        # Lock acquire succeeds
+        mock_redis.client.set.return_value = True
+        mock_redis._prefixed = lambda key: f"orcest:{key}"
+
+        from orcest.shared.coordination import RedisLock, make_pr_lock_key
+
+        lock_key = make_pr_lock_key(task.repo, task.resource_id)
+        fq_lock_key = f"{task.key_prefix}:{lock_key}"
+        lock = RedisLock(mock_redis, fq_lock_key, ttl=LOCK_TTL, owner="w1", raw_key=True)
+
+        assert lock.key == "projectA:lock:pr:owner/repo:42"
+        assert lock.acquire() is True
+        # Verify the SET call used the fully-qualified key
+        set_call = mock_redis.client.set.call_args
+        assert set_call[0][0] == "projectA:lock:pr:owner/repo:42"
+
+    def test_lock_uses_default_prefix_when_key_prefix_empty(self):
+        """When a Task has an empty key_prefix, the worker must acquire the lock
+        using the worker's default auto-prefix (backward compatibility)."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="",
+        )
+        mock_redis = MagicMock()
+        mock_redis.client.register_script.return_value = MagicMock(return_value=1)
+        mock_redis.client.set.return_value = True
+        mock_redis._prefixed = lambda key: f"orcest:{key}"
+
+        from orcest.shared.coordination import RedisLock, make_pr_lock_key
+
+        lock_key = make_pr_lock_key(task.repo, task.resource_id)
+        lock = RedisLock(mock_redis, lock_key, ttl=LOCK_TTL, owner="w1")
+
+        # Should use the auto-prefixed key
+        assert lock.key == "orcest:lock:pr:owner/repo:42"
+
+    def test_issue_lock_uses_task_key_prefix(self):
+        """Issue locks also use the task's key_prefix for correct routing."""
+        task = Task.create(
+            task_type=TaskType.IMPLEMENT_ISSUE,
+            repo="owner/repo",
+            token="tok",
+            resource_type="issue",
+            resource_id=7,
+            prompt="implement it",
+            key_prefix="projectB",
+        )
+        mock_redis = MagicMock()
+        mock_redis.client.register_script.return_value = MagicMock(return_value=1)
+        mock_redis.client.set.return_value = True
+        mock_redis._prefixed = lambda key: f"orcest:{key}"
+
+        from orcest.shared.coordination import RedisLock, make_issue_lock_key
+
+        lock_key = make_issue_lock_key(task.repo, task.resource_id)
+        fq_lock_key = f"{task.key_prefix}:{lock_key}"
+        lock = RedisLock(mock_redis, fq_lock_key, ttl=LOCK_TTL, owner="w1", raw_key=True)
+
+        assert lock.key == "projectB:lock:issue:owner/repo:7"
