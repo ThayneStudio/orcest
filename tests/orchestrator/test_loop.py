@@ -1063,6 +1063,143 @@ def test_poll_cycle_retrigger_review_failure_logged(
 
 
 # ---------------------------------------------------------------------------
+# RETRIGGER_STALE_CHECKS tests
+# ---------------------------------------------------------------------------
+
+
+def _make_stale_pr_state(
+    number: int = 99,
+    head_sha: str = "stale111",
+    stale_run_ids: list[int] | None = None,
+) -> PRState:
+    """Build a PRState with RETRIGGER_STALE_CHECKS action."""
+    return PRState(
+        number=number,
+        title=f"PR #{number}",
+        branch=f"fix/{number}",
+        head_sha=head_sha,
+        action=PRAction.RETRIGGER_STALE_CHECKS,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+        stale_run_ids=stale_run_ids if stale_run_ids is not None else [],
+    )
+
+
+def test_poll_cycle_retrigger_stale_checks_cooldown_skips(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """If stale SHA matches head_sha, the handler skips cancel/rerun."""
+    pr_state = _make_stale_pr_state(number=99, head_sha="stale111", stale_run_ids=[2001])
+
+    # Pre-record the SHA so cooldown fires
+    repo = orchestrator_config.github.repo
+    set_stale_retrigger_sha(fake_redis_client, repo, 99, "stale111")
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    gh_mock.cancel_workflow.assert_not_called()
+    gh_mock.rerun_workflow.assert_not_called()
+
+
+def test_poll_cycle_retrigger_stale_checks_no_run_ids_escalates(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """If stale_run_ids is empty, add needs-human label and post a comment."""
+    pr_state = _make_stale_pr_state(number=99, head_sha="stale222", stale_run_ids=[])
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    gh_mock.cancel_workflow.assert_not_called()
+    gh_mock.rerun_workflow.assert_not_called()
+    gh_mock.add_label.assert_called_once()
+    gh_mock.post_comment.assert_called_once()
+
+    # SHA should be recorded so we don't escalate again
+    repo = orchestrator_config.github.repo
+    assert get_stale_retrigger_sha(fake_redis_client, repo, 99) == "stale222"
+
+
+def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """With run IDs present, cancel then rerun each workflow; check exact IDs."""
+    pr_state = _make_stale_pr_state(
+        number=99, head_sha="stale333", stale_run_ids=[2001, 2002]
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    assert gh_mock.cancel_workflow.call_count == 2
+    cancelled_run_ids = {call.args[1] for call in gh_mock.cancel_workflow.call_args_list}
+    assert cancelled_run_ids == {2001, 2002}
+
+    assert gh_mock.rerun_workflow.call_count == 2
+    rerun_run_ids = {call.args[1] for call in gh_mock.rerun_workflow.call_args_list}
+    assert rerun_run_ids == {2001, 2002}
+
+    # SHA cooldown recorded
+    repo = orchestrator_config.github.repo
+    assert get_stale_retrigger_sha(fake_redis_client, repo, 99) == "stale333"
+
+
+def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """SHA cooldown is set even when cancel_workflow raises for all run IDs."""
+    pr_state = _make_stale_pr_state(
+        number=99, head_sha="stale444", stale_run_ids=[3001, 3002]
+    )
+
+    gh_mock.cancel_workflow.side_effect = RuntimeError("cancel failed")
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    # Should not raise
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    assert gh_mock.cancel_workflow.call_count == 2
+
+    # SHA should still be recorded to prevent a busy-retry loop
+    repo = orchestrator_config.github.repo
+    assert get_stale_retrigger_sha(fake_redis_client, repo, 99) == "stale444"
+
+
+# ---------------------------------------------------------------------------
 # Proactive rebase after merge tests
 # ---------------------------------------------------------------------------
 
