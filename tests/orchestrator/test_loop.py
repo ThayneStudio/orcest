@@ -597,6 +597,44 @@ def test_consume_results_usage_exhausted_no_branch(
     assert "branch `" not in comment_body
 
 
+def test_consume_results_usage_exhausted_issue_clears_attempts(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A USAGE_EXHAUSTED result for an issue clears the attempt counter so it can be re-enqueued."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    issue_number = 62
+    repo = orchestrator_config.github.repo
+
+    # Simulate a prior attempt so the counter is non-zero
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="task-issue-ue-001",
+        branch="",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Attempt counter must be cleared so the issue is re-discoverable
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+
+    # A "paused" comment must be posted to the issue
+    gh_mock.post_issue_comment.assert_called_once()
+    comment_body = gh_mock.post_issue_comment.call_args[0][2]
+    assert "paused" in comment_body
+
+    # No label operations for USAGE_EXHAUSTED on issues
+    gh_mock.add_issue_label.assert_not_called()
+    gh_mock.remove_issue_label.assert_not_called()
+
+
 def test_consume_results_malformed_entry_is_acked(fake_redis_client, orchestrator_config, gh_mock):
     """A malformed result entry is ACKed to prevent infinite reprocessing."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
