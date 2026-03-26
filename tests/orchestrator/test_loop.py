@@ -32,7 +32,7 @@ from orcest.orchestrator.pr_ops import (
     set_stale_retrigger_sha,
 )
 from orcest.shared.config import OrchestratorConfig, ProjectConfig
-from orcest.shared.coordination import set_pending_task
+from orcest.shared.coordination import get_pending_task, set_pending_task
 from orcest.shared.models import ResultStatus, TaskResult
 
 
@@ -1281,8 +1281,6 @@ def test_handle_result_stale_task_id_skips_side_effects(
     gh_mock.post_comment.assert_not_called()
 
     # The pending-task marker for new_task must remain intact
-    from orcest.shared.coordination import get_pending_task
-
     assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == new_task_id
 
 
