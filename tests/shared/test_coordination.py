@@ -214,8 +214,7 @@ def test_set_backoff_cooldown_stores_step(fake_redis_client):
 def test_set_backoff_cooldown_sets_ttl(fake_redis_client):
     """set_backoff_cooldown sets a positive TTL on the Redis key."""
     set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1)
-    # Use the public API: a non-None result confirms the key exists (and has a TTL).
-    assert get_backoff_step(fake_redis_client, "owner/repo", 42) is not None
+    assert fake_redis_client.ttl("backoff:pr:owner/repo:42") > 0
 
 
 def test_set_backoff_cooldown_ttl_matches_step_duration(fake_redis_client):
