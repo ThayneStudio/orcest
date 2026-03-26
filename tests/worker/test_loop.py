@@ -162,7 +162,7 @@ class TestExecuteTask:
 
         # Workspace lifecycle
         mock_workspace.setup.assert_called_once_with(
-            sample_task.repo, sample_task.branch, sample_task.token, sample_task.base_branch
+            sample_task.repo, sample_task.branch, sample_task.token
         )
         mock_workspace.cleanup.assert_called_once()
 
@@ -577,9 +577,9 @@ class TestExecuteTask:
         # Runner should still have been invoked
         mock_runner.run.assert_called_once()
 
-    def test_rebase_pr_skips_auto_rebase(self, local_worker_config, mock_workspace):
-        """REBASE_PR tasks pass base_branch=None to workspace.setup so the
-        workspace doesn't auto-rebase — Claude handles the rebase itself."""
+    def test_rebase_pr_workspace_setup(self, local_worker_config, mock_workspace):
+        """REBASE_PR tasks call workspace.setup without base_branch — Claude
+        handles the rebase itself (including conflict resolution)."""
         task = Task.create(
             task_type=TaskType.REBASE_PR,
             repo="owner/repo",
@@ -609,7 +609,6 @@ class TestExecuteTask:
             task.repo,
             task.branch,
             task.token,
-            None,  # base_branch suppressed
         )
 
 

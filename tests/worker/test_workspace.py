@@ -167,7 +167,7 @@ def test_no_rebase_without_branch(mocker, tmp_path):
         return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
     )
     ws = Workspace(str(tmp_path))
-    ws.setup(REPO, None, TOKEN, base_branch="main")
+    ws.setup(REPO, None, TOKEN)
 
     all_calls = [call[0][0] for call in mock_run.call_args_list]
     assert not any("fetch" in args for args in all_calls)
