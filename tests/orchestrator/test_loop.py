@@ -70,6 +70,8 @@ def _make_task_result(
     branch: str = "fix/widget",
     summary: str = "Fixed the lint errors",
     duration: int = 120,
+    resource_type: str = "pr",
+    resource_id: int | None = None,
 ) -> TaskResult:
     """Build a TaskResult for result-handling tests."""
     return TaskResult(
@@ -79,8 +81,8 @@ def _make_task_result(
         branch=branch,
         summary=summary,
         duration_seconds=duration,
-        resource_type="pr",
-        resource_id=pr_number,
+        resource_type=resource_type,
+        resource_id=resource_id if resource_id is not None else pr_number,
     )
 
 
@@ -475,15 +477,14 @@ def test_consume_results_transient_failure_clears_issue_attempts(
     increment_issue_attempts(fake_redis_client, repo, issue_number)
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
 
-    result = TaskResult(
-        task_id="task-issue-001",
-        worker_id="worker-1",
+    result = _make_task_result(
         status=ResultStatus.FAILED,
-        branch="",
-        summary="[transient] Worker restarted mid-execution; task was not completed.",
-        duration_seconds=10,
         resource_type="issue",
         resource_id=issue_number,
+        task_id="task-issue-001",
+        branch="",
+        summary="[transient] Worker restarted mid-execution; task was not completed.",
+        duration=10,
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
