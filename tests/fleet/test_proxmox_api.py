@@ -148,6 +148,31 @@ class TestParseVmIp:
         ]
         assert parse_vm_ip(interfaces) == "10.0.0.5"
 
+    def test_link_local_only_returns_none(self):
+        """A single link-local address should yield None."""
+        interfaces = [
+            {
+                "name": "eth0",
+                "ip-addresses": [
+                    {"ip-address": "169.254.1.1", "ip-address-type": "ipv4"},
+                ],
+            },
+        ]
+        assert parse_vm_ip(interfaces) is None
+
+    def test_skips_link_local_returns_next_valid_ipv4(self):
+        """Link-local address is skipped; the next routable IPv4 is returned."""
+        interfaces = [
+            {
+                "name": "eth0",
+                "ip-addresses": [
+                    {"ip-address": "169.254.0.5", "ip-address-type": "ipv4"},
+                    {"ip-address": "10.20.0.50", "ip-address-type": "ipv4"},
+                ],
+            },
+        ]
+        assert parse_vm_ip(interfaces) == "10.20.0.50"
+
 
 # -- Helper to build a mocked ProxmoxClient -----------------------------------
 
