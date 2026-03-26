@@ -1064,8 +1064,8 @@ def _handle_result(
                     exc_info=True,
                 )
     elif result.status == ResultStatus.USAGE_EXHAUSTED and is_issue:
-        # Issues don't have per-SHA tracking; clear attempts so the issue
-        # is re-enqueued on the next poll cycle after rate limits lift.
+        # Issues don't have per-SHA tracking or a cooldown; clear attempts so
+        # the issue is re-enqueued on the next poll cycle unconditionally.
         try:
             clear_issue_attempts(redis, repo, resource_id)
         except Exception as e:

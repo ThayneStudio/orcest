@@ -625,6 +625,11 @@ def test_consume_results_usage_exhausted_issue_clears_attempts(
     # Attempt counter must be cleared so the issue is re-discoverable
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
 
+    # A "paused" comment must be posted to the issue
+    gh_mock.post_issue_comment.assert_called_once()
+    comment_body = gh_mock.post_issue_comment.call_args[0][2]
+    assert "paused" in comment_body
+
     # No label operations for USAGE_EXHAUSTED on issues
     gh_mock.add_issue_label.assert_not_called()
     gh_mock.remove_issue_label.assert_not_called()
