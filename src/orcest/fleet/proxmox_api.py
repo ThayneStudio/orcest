@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import shlex
 import time
 
 from proxmoxer import ProxmoxAPI
@@ -390,7 +391,8 @@ class ProxmoxClient:
         ]
 
         # Write snippet content via stdin
-        write_cmd = f"mkdir -p /var/lib/vz/snippets && cat > /var/lib/vz/snippets/{snippet_name}"
+        quoted_name = shlex.quote(snippet_name)
+        write_cmd = f"mkdir -p /var/lib/vz/snippets && cat > /var/lib/vz/snippets/{quoted_name}"
         result = subprocess.run(
             ["ssh", *ssh_opts, ssh_target, write_cmd],
             input=userdata,
@@ -403,7 +405,11 @@ class ProxmoxClient:
             return False
 
         # Set cicustom on the VM
-        cicustom_cmd = f"qm set {vm_id} --cicustom user={storage}:snippets/{snippet_name}"
+        quoted_storage = shlex.quote(storage)
+        cicustom_cmd = (
+            f"qm set {shlex.quote(str(vm_id))}"
+            f" --cicustom user={quoted_storage}:snippets/{quoted_name}"
+        )
         result = subprocess.run(
             ["ssh", *ssh_opts, ssh_target, cicustom_cmd],
             capture_output=True,
