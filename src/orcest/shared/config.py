@@ -124,6 +124,19 @@ def _safe_int(value: Any, field_name: str) -> int:
         ) from exc
 
 
+def _safe_str(value: Any, field_name: str) -> str:
+    """Convert a value to str, rejecting None with a clear error message.
+
+    Prevents ``str(None)`` from silently producing the literal string ``"None"``
+    when a YAML field is set to ``null``.
+    """
+    if value is None:
+        raise ValueError(
+            f"Config field '{field_name}' is explicitly set to null but a string is required."
+        )
+    return str(value)
+
+
 def _safe_bool(value: Any, field_name: str) -> bool:
     """Validate that a config value is a native bool.
 
@@ -193,12 +206,13 @@ def build_redis_config(raw: dict[str, Any] | None = None) -> RedisConfig:
 
     socket_timeout_raw = redis_raw.get("socket_timeout", 30)
     socket_connect_timeout_raw = redis_raw.get("socket_connect_timeout", 10)
-    key_prefix = str(
-        os.environ.get("ORCEST_REDIS_KEY_PREFIX", redis_raw.get("key_prefix", "orcest"))
+    key_prefix = _safe_str(
+        os.environ.get("ORCEST_REDIS_KEY_PREFIX", redis_raw.get("key_prefix", "orcest")),
+        "redis.key_prefix",
     )
 
     return RedisConfig(
-        host=str(host),
+        host=_safe_str(host, "redis.host"),
         port=_safe_int(port_raw, "redis.port"),
         db=_safe_int(db_raw, "redis.db"),
         password=password,
@@ -235,9 +249,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         github_raw.get("claude_token", ""),
     )
     github_config = GithubConfig(
-        token=str(github_token),
-        repo=str(github_repo),
-        claude_token=str(claude_token),
+        token=_safe_str(github_token, "github.token"),
+        repo=_safe_str(github_repo, "github.repo"),
+        claude_token=_safe_str(claude_token, "github.claude_token"),
     )
 
     # Multi-project support: load projects list
@@ -251,10 +265,17 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 raise ValueError(f"projects[{i}] must be a YAML mapping, got {type(p).__name__}")
             projects.append(
                 ProjectConfig(
-                    repo=str(p.get("repo", "")),
-                    token=str(p.get("token", github_token)),  # default to shared token
-                    claude_token=str(p.get("claude_token", claude_token)),  # default to shared
-                    key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
+                    repo=_safe_str(p.get("repo", ""), f"projects[{i}].repo"),
+                    # Default to shared token when not set per-project
+                    token=_safe_str(p.get("token", github_token), f"projects[{i}].token"),
+                    claude_token=_safe_str(
+                        p.get("claude_token", claude_token),
+                        f"projects[{i}].claude_token",
+                    ),
+                    key_prefix=_safe_str(
+                        p.get("key_prefix", redis_config.key_prefix),
+                        f"projects[{i}].key_prefix",
+                    ),
                 )
             )
         if len(projects) > 1:
@@ -281,10 +302,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         # Backward compatibility: single-project mode
         projects = [
             ProjectConfig(
-                repo=str(github_repo),
-                token=str(github_token),
-                claude_token=str(claude_token),
-                key_prefix=str(redis_config.key_prefix),
+                repo=_safe_str(github_repo, "github.repo"),
+                token=_safe_str(github_token, "github.token"),
+                claude_token=_safe_str(claude_token, "github.claude_token"),
+                key_prefix=_safe_str(redis_config.key_prefix, "redis.key_prefix"),
             )
         ]
 
@@ -297,9 +318,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Labels
     labels_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "labels").items()}
     labels_config = LabelConfig(
-        blocked=str(labels_raw.get("blocked", "orcest:blocked")),
-        needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),
-        ready=str(labels_raw.get("ready", "orcest:ready")),
+        blocked=_safe_str(labels_raw.get("blocked", "orcest:blocked"), "labels.blocked"),
+        needs_human=_safe_str(
+            labels_raw.get("needs_human", "orcest:needs-human"), "labels.needs_human"
+        ),
+        ready=_safe_str(labels_raw.get("ready", "orcest:ready"), "labels.ready"),
     )
 
     # Runner config — timeout and max_retries drive the pending-task marker TTL.
@@ -307,7 +330,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     runner_raw = _safe_dict(raw, "runner")
     _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
-        type=str(runner_raw.get("type", _runner_defaults.type)),
+        type=_safe_str(runner_raw.get("type", _runner_defaults.type), "runner.type"),
         timeout=_safe_int(runner_raw.get("timeout", _runner_defaults.timeout), "runner.timeout"),
         max_retries=_safe_int(
             runner_raw.get("max_retries", _runner_defaults.max_retries), "runner.max_retries"
@@ -315,12 +338,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         retry_backoff=_safe_int(
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
-        extra={str(k): str(v) for k, v in _safe_dict(runner_raw, "extra").items()},
+        extra={
+            _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
+            for k, v in _safe_dict(runner_raw, "extra").items()
+        },
     )
 
     # Default runner backend
-    default_runner = str(
-        os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude"))
+    default_runner = _safe_str(
+        os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude")),
+        "default_runner",
     )
 
     # Max attempts per PR before labeling needs-human
@@ -338,12 +365,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     deployment_raw = _safe_dict(raw, "deployment")
     deployment_config = DeploymentConfig(
         enabled=_safe_bool(deployment_raw.get("enabled", False), "deployment.enabled"),
-        command=str(deployment_raw.get("command", "")),
-        health_check_url=str(deployment_raw.get("health_check_url", "")),
+        command=_safe_str(deployment_raw.get("command", ""), "deployment.command"),
+        health_check_url=_safe_str(
+            deployment_raw.get("health_check_url", ""), "deployment.health_check_url"
+        ),
         health_check_timeout=_safe_int(
             deployment_raw.get("health_check_timeout", 30), "deployment.health_check_timeout"
         ),
-        rollback_command=str(deployment_raw.get("rollback_command", "")),
+        rollback_command=_safe_str(
+            deployment_raw.get("rollback_command", ""), "deployment.rollback_command"
+        ),
     )
     if deployment_config.health_check_url and deployment_config.health_check_timeout <= 0:
         raise ValueError(
@@ -412,9 +443,12 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     redis_config = build_redis_config(raw)
 
     # Worker-level fields
-    worker_id = str(os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0")))
-    workspace_dir = str(
-        os.environ.get("ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces"))
+    worker_id = _safe_str(
+        os.environ.get("ORCEST_WORKER_ID", raw.get("worker_id", "worker-0")), "worker_id"
+    )
+    workspace_dir = _safe_str(
+        os.environ.get("ORCEST_WORKSPACE_DIR", raw.get("workspace_dir", "/tmp/orcest-workspaces")),
+        "workspace_dir",
     )
 
     # Runner (construct first so backend can default from runner.type)
@@ -422,7 +456,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     runner_extra_raw = _safe_dict(runner_raw, "extra")
     _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
-        type=str(runner_raw.get("type", _runner_defaults.type)),
+        type=_safe_str(runner_raw.get("type", _runner_defaults.type), "runner.type"),
         timeout=_safe_int(runner_raw.get("timeout", _runner_defaults.timeout), "runner.timeout"),
         max_retries=_safe_int(
             runner_raw.get("max_retries", _runner_defaults.max_retries), "runner.max_retries"
@@ -430,11 +464,14 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         retry_backoff=_safe_int(
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
-        extra={str(k): str(v) for k, v in runner_extra_raw.items()},
+        extra={
+            _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
+            for k, v in runner_extra_raw.items()
+        },
     )
 
     # Backend — default from runner.type when not explicitly set
-    backend = str(raw.get("backend", runner_config.type))
+    backend = _safe_str(raw.get("backend", runner_config.type), "backend")
 
     # Ephemeral mode — process one task and exit (default False)
     ephemeral_raw = raw.get("ephemeral", False)
@@ -444,7 +481,9 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     redis_raw_section = _safe_dict(raw, "redis")
     raw_key_prefixes = redis_raw_section.get("key_prefixes")
     if isinstance(raw_key_prefixes, list) and raw_key_prefixes:
-        key_prefixes = [str(p) for p in raw_key_prefixes]
+        key_prefixes = [
+            _safe_str(p, f"redis.key_prefixes[{i}]") for i, p in enumerate(raw_key_prefixes)
+        ]
     else:
         key_prefixes = [redis_config.key_prefix]
 
