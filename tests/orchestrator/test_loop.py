@@ -1284,6 +1284,43 @@ def test_handle_result_stale_task_id_skips_side_effects(
     assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == new_task_id
 
 
+def test_handle_result_none_pending_applies_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A FAILED result with no pending-task marker still applies label/comment side-effects.
+
+    Scenario: the pending-task marker was already cleared (e.g. on a previous delivery)
+    so get_pending_task returns None. Because there is no active replacement task in
+    flight, the result side-effects (e.g. needs-human label) should still apply.
+    """
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 201
+    task_id = "task-no-pending"
+
+    # No pending-task marker is set — get_pending_task will return None
+    result = TaskResult(
+        task_id=task_id,
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/none-window",
+        summary="Something went wrong",
+        duration_seconds=15,
+        resource_type="pr",
+        resource_id=pr_number,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    # Side-effects must apply: needs-human label and a comment should be posted
+    gh_mock.add_label.assert_called_once()
+    gh_mock.post_comment.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # RETRIGGER_STALE_CHECKS handler tests
 # ---------------------------------------------------------------------------

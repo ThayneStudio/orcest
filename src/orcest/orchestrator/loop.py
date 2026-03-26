@@ -952,13 +952,28 @@ def _handle_result(
     resource_label = "issue" if is_issue else "PR"
     resource_type = result.resource_type or ("issue" if is_issue else "pr")
 
-    # Guard against stale/duplicate task IDs.
+    # Guard against stale task IDs.
     # When result publishing fails in a worker, the pending-task marker is cleared
     # so the orchestrator can re-enqueue. If the old task entry stays unACKed in the
     # Redis PEL and a drain later publishes a FAILED result for it, the orchestrator
     # may have already enqueued a newer task. In that case the pending-task marker
     # holds the *new* task's ID, and applying label/comment side-effects for the old
     # task would be incorrect. Skip processing entirely for stale results.
+    #
+    # When current_task_id is None, the pending marker was cleared for
+    # re-enqueueing but no new task has been set yet. Proceeding with
+    # side-effects is correct — there is no active replacement task, so
+    # the result (e.g. needs-human label) should apply.
+    #
+    # Note: true duplicate delivery (same task_id re-delivered by Redis) is NOT
+    # guarded here. When a duplicate arrives, current_task_id will either be None
+    # (marker already cleared on the first pass) or equal to result.task_id —
+    # neither path skips processing. In practice this is acceptable: the worker
+    # ACKs the stream entry immediately after publishing the result, making true
+    # re-delivery extremely rare. GitHub label operations are idempotent, so the
+    # main risk is a duplicate comment. If full idempotency is required in the
+    # future, a Redis SET of processed task IDs with a short TTL would be the
+    # approach.
     try:
         current_task_id = get_pending_task(redis, repo, resource_type, resource_id)
         if current_task_id is not None and current_task_id != result.task_id:
