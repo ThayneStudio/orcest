@@ -326,6 +326,49 @@ def test_get_unresolved_review_threads(mocker):
     assert thread["comments"][1] == {"author": "reviewer2", "body": "Agreed"}
 
 
+def test_get_unresolved_review_threads_author_login_extracted(mocker):
+    """author login is correctly extracted from the nested author { login } GraphQL response."""
+    graphql_response = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [
+                                {
+                                    "id": "PRRT_abc",
+                                    "path": "src/bar.py",
+                                    "line": 7,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "pageInfo": {"hasNextPage": False},
+                                        "nodes": [
+                                            {
+                                                "author": {"login": "octocat"},
+                                                "body": "Please fix this",
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=graphql_response,
+    )
+
+    result = get_unresolved_review_threads(REPO, 1, TOKEN)
+
+    assert len(result) == 1
+    assert result[0]["comments"] == [{"author": "octocat", "body": "Please fix this"}]
+
+
 def test_get_unresolved_threads_all_resolved(mocker):
     """When all threads are resolved, an empty list is returned."""
     graphql_response = json.dumps(
