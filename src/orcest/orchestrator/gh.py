@@ -463,6 +463,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           comments(first: 10) {
             pageInfo { hasNextPage }
             nodes {
+              author { login }
               body
             }
           }
