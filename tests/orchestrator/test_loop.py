@@ -1458,6 +1458,8 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
 
     # rerun_workflow called for each run ID (best-effort)
     assert gh_mock.rerun_workflow.call_count == 2
+    rerun_run_ids = {call.args[1] for call in gh_mock.rerun_workflow.call_args_list}
+    assert rerun_run_ids == {2001, 2002}
 
     # A comment should be posted since cancellations succeeded
     gh_mock.post_comment.assert_called_once()
