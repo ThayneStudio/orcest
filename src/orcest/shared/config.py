@@ -295,7 +295,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
 
     # Labels
-    labels_raw = _safe_dict(raw, "labels")
+    labels_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "labels").items()}
     labels_config = LabelConfig(
         blocked=str(labels_raw.get("blocked", "orcest:blocked")),
         needs_human=str(labels_raw.get("needs_human", "orcest:needs-human")),

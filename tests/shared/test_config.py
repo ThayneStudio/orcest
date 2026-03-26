@@ -699,3 +699,21 @@ def test_load_orchestrator_config_empty_repo_in_project_raises(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="non-empty 'repo' field"):
         load_orchestrator_config(cfg_file)
+
+
+def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
+    """YAML keys with hyphens (e.g. needs-human) should be treated the same as underscores."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "labels:\n"
+        "  needs-human: custom:needs-human\n"
+        "  blocked: custom:blocked\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.labels.needs_human == "custom:needs-human"
+    assert config.labels.blocked == "custom:blocked"
+    assert config.labels.ready == "orcest:ready"
