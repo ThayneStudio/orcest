@@ -318,9 +318,7 @@ def test_poll_cycle_skip_max_attempts_sets_exhausted_notified(
     # Label was applied successfully
     gh_mock.add_label.assert_called_once()
     # exhausted_notified flag must be set in Redis
-    assert get_exhausted_notified(
-        fake_redis_client, orchestrator_config.projects[0].repo, 51
-    )
+    assert get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 51)
 
 
 def test_poll_cycle_skip_max_attempts_label_failure_does_not_set_exhausted_notified(
@@ -346,9 +344,7 @@ def test_poll_cycle_skip_max_attempts_label_failure_does_not_set_exhausted_notif
     _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
 
     # exhausted_notified flag must NOT be set when labeling failed
-    assert not get_exhausted_notified(
-        fake_redis_client, orchestrator_config.projects[0].repo, 52
-    )
+    assert not get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 52)
 
 
 def test_poll_cycle_skip_backoff_no_label_no_comment(
