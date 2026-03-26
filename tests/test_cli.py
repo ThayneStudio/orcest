@@ -309,20 +309,20 @@ def test_status_once_shows_dead_letter_row(fake_redis_client):
         _status_once(fake_redis_client)
 
     output = buf.getvalue()
-    assert "orcest:dead-letter" in output
+    assert "dead-letter" in output
 
 
 def test_status_once_shows_dead_letter_count(fake_redis_client):
     """_status_once reflects dead-letter entries in the count column."""
-    fake_redis_client.xadd("orcest:dead-letter", {"id": "t1", "type": "fix_ci"})
-    fake_redis_client.xadd("orcest:dead-letter", {"id": "t2", "type": "fix_ci"})
+    fake_redis_client.xadd("dead-letter", {"id": "t1", "type": "fix_ci"})
+    fake_redis_client.xadd("dead-letter", {"id": "t2", "type": "fix_ci"})
 
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
         _status_once(fake_redis_client)
 
     output = buf.getvalue()
-    assert "orcest:dead-letter" in output
+    assert "dead-letter" in output
     # Count "2" should appear somewhere in the output
     assert "2" in output
 
@@ -360,7 +360,7 @@ def test_dead_letters_command_empty(fake_redis_client):
 
 def test_dead_letters_command_lists_tasks(fake_redis_client):
     """_dead_letters_command lists dead-lettered task metadata."""
-    fake_redis_client.xadd("orcest:dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
+    fake_redis_client.xadd("dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
 
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False, width=200)):
@@ -374,7 +374,7 @@ def test_dead_letters_command_lists_tasks(fake_redis_client):
 
 def test_dead_letters_command_replay(fake_redis_client):
     """_dead_letters_command --replay re-enqueues tasks and removes dead-letter entries."""
-    fake_redis_client.xadd("orcest:dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
+    fake_redis_client.xadd("dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
 
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
@@ -396,7 +396,7 @@ def test_dead_letters_command_replay(fake_redis_client):
     assert "delivery_count" not in replayed_fields
 
     # Dead-letter stream should be empty after replay
-    dl_entries = fake_redis_client.xread_after("orcest:dead-letter")
+    dl_entries = fake_redis_client.xread_after("dead-letter")
     assert len(dl_entries) == 0
 
 
@@ -404,7 +404,7 @@ def test_dead_letters_command_replay_missing_tasks_stream(fake_redis_client):
     """_dead_letters_command skips entries without a tasks_stream field."""
     bad_fields = dict(_SAMPLE_DEAD_LETTER_FIELDS)
     del bad_fields["tasks_stream"]
-    fake_redis_client.xadd("orcest:dead-letter", bad_fields)
+    fake_redis_client.xadd("dead-letter", bad_fields)
 
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
@@ -446,7 +446,7 @@ def test_dead_letters_cli_negative_count_exits_error(runner):
 
 def test_dead_letters_cli_lists_tasks(mocker, runner, fake_redis_client):
     """dead-letters command lists entries via the CLI runner."""
-    fake_redis_client.xadd("orcest:dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
+    fake_redis_client.xadd("dead-letter", _SAMPLE_DEAD_LETTER_FIELDS)
     mocker.patch("orcest.shared.redis_client.RedisClient", return_value=fake_redis_client)
 
     result = runner.invoke(main, ["dead-letters", "localhost"])

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 # Redis stream / key name constants
-DEAD_LETTER_STREAM = "orcest:dead-letter"
+DEAD_LETTER_STREAM = "dead-letter"
 
 # Wire-protocol prefix used by workers to signal a transient failure.
 # The orchestrator parses this to decide whether to retry or label for human review.
