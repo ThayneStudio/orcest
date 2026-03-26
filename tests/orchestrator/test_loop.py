@@ -75,15 +75,14 @@ def _make_task_result(
 ) -> TaskResult:
     """Build a TaskResult for result-handling tests.
 
-    If ``resource_id`` is omitted and ``resource_type`` is ``"pr"``, the
-    ``pr_number`` default is used.  For any other ``resource_type`` an explicit
-    ``resource_id`` must be supplied; omitting it raises ``ValueError`` to
-    prevent silently constructing a TaskResult with a mismatched id.
+    If ``resource_id`` is ``None`` (whether omitted or explicitly passed) and
+    ``resource_type`` is ``"pr"``, the ``pr_number`` default is used.  For any
+    other ``resource_type`` an explicit ``resource_id`` must be supplied;
+    passing ``None`` raises ``ValueError`` to prevent silently constructing a
+    TaskResult with a mismatched id.
     """
     if resource_id is None and resource_type != "pr":
-        raise ValueError(
-            f"resource_id must be provided when resource_type={resource_type!r}"
-        )
+        raise ValueError(f"resource_id must be provided when resource_type={resource_type!r}")
     return TaskResult(
         task_id=task_id,
         worker_id=worker_id,
