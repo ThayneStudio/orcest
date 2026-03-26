@@ -22,6 +22,7 @@ from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
     get_attempt_count,
+    get_exhausted_notified,
     get_stale_retrigger_sha,
     get_total_attempt_count,
     has_usage_exhausted_cooldown,
@@ -292,6 +293,62 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "exhausted" in comment_body
     assert str(orchestrator_config.max_attempts) in comment_body
+
+
+def test_poll_cycle_skip_max_attempts_sets_exhausted_notified(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """SKIP_MAX_ATTEMPTS sets the exhausted_notified Redis flag after labeling."""
+    pr_state = _make_pr_state(number=51, action=PRAction.SKIP_MAX_ATTEMPTS)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    # Label was applied successfully
+    gh_mock.add_label.assert_called_once()
+    # exhausted_notified flag must be set in Redis
+    assert get_exhausted_notified(
+        fake_redis_client, orchestrator_config.projects[0].repo, 51
+    )
+
+
+def test_poll_cycle_skip_max_attempts_label_failure_does_not_set_exhausted_notified(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """When add_label fails, exhausted_notified must NOT be set (labeled=False path)."""
+    pr_state = _make_pr_state(number=52, action=PRAction.SKIP_MAX_ATTEMPTS)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    gh_mock.add_label.side_effect = RuntimeError("label API down")
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+
+    # exhausted_notified flag must NOT be set when labeling failed
+    assert not get_exhausted_notified(
+        fake_redis_client, orchestrator_config.projects[0].repo, 52
+    )
 
 
 def test_poll_cycle_skip_backoff_no_label_no_comment(
