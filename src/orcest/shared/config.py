@@ -327,7 +327,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
     # Max total attempts across all SHAs (circuit breaker)
-    max_total_attempts = _safe_int(raw.get("max_total_attempts", 10), "max_total_attempts")
+    max_total_attempts = _safe_int(raw.get("max_total_attempts", 25), "max_total_attempts")
 
     # Whether to delete the head branch after merging
     delete_branch_on_merge = _safe_bool(

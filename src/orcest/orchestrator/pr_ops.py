@@ -403,7 +403,7 @@ def discover_actionable_prs(
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
-    max_total_attempts: int = 10,
+    max_total_attempts: int = 25,
     stale_pending_timeout_seconds: int = 7200,
 ) -> list[PRState]:
     """Discover PRs that need action.
