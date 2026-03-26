@@ -1267,3 +1267,69 @@ class TestFullCycle:
             300,
             mac="02:4F:52:00:01:2C",
         )
+
+
+# ── _next_vm_id upper bound ──────────────────────────────────
+
+
+class TestNextVmIdUpperBound:
+    def test_no_upper_bound_returns_start(self):
+        """Without vm_id_end, allocates start ID when none are taken."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=300, vm_id_end=0),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = []
+
+        assert manager._next_vm_id() == 300
+
+    def test_no_upper_bound_increments_past_existing(self):
+        """Without vm_id_end, increments freely past existing IDs."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=300, vm_id_end=0),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [{"vmid": 300}, {"vmid": 301}, {"vmid": 302}]
+
+        assert manager._next_vm_id() == 303
+
+    def test_upper_bound_allows_valid_id(self):
+        """With vm_id_end set, returns a valid ID within the range."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=300, vm_id_end=305),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [{"vmid": 300}]
+
+        assert manager._next_vm_id() == 301
+
+    def test_upper_bound_raises_when_exhausted(self):
+        """Raises RuntimeError when all IDs in the range are taken."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=300, vm_id_end=302),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [
+            {"vmid": 300},
+            {"vmid": 301},
+            {"vmid": 302},
+        ]
+
+        with pytest.raises(RuntimeError, match="VM ID pool exhausted"):
+            manager._next_vm_id()
+
+    def test_upper_bound_raises_includes_range_in_message(self):
+        """RuntimeError message includes the configured range."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=300, vm_id_end=300),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [{"vmid": 300}]
+
+        with pytest.raises(RuntimeError, match="300-300"):
+            manager._next_vm_id()
