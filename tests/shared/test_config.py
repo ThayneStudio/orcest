@@ -722,8 +722,9 @@ def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
 # -- Null string field guards (_safe_str) -------------------------------------
 
 
-def test_null_github_token_raises(tmp_path: Path):
+def test_null_github_token_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """github.token: null in YAML raises ValueError, not silently producing 'None'."""
+    monkeypatch.delenv("ORCEST_GITHUB_TOKEN", raising=False)
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text("github:\n  token: null\n  repo: acme/widgets\n")
 
@@ -731,8 +732,9 @@ def test_null_github_token_raises(tmp_path: Path):
         load_orchestrator_config(cfg_file)
 
 
-def test_null_redis_key_prefix_raises(tmp_path: Path):
+def test_null_redis_key_prefix_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """redis.key_prefix: null in YAML raises ValueError, not silently producing 'None'."""
+    monkeypatch.delenv("ORCEST_REDIS_KEY_PREFIX", raising=False)
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text("github:\n  repo: acme/widgets\nredis:\n  key_prefix: null\n")
 
