@@ -794,6 +794,7 @@ def discover_actionable_prs(
         elif review_decision == "CHANGES_REQUESTED":
             # CI green but reviewer requested changes — enqueue fix
             # Fetch unresolved review threads for worker prompt context
+            threads: list | None = None
             try:
                 threads = gh.get_unresolved_review_threads(repo, number, token)
             except Exception:
@@ -802,21 +803,71 @@ def discover_actionable_prs(
                     number,
                     exc_info=True,
                 )
-                threads = []
 
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.ENQUEUE_FIX,
-                    ci_failures=[],
-                    review_threads=threads,
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            if threads is not None and not threads:
+                # All review threads resolved but reviewDecision is stale
+                # (GitHub doesn't clear CHANGES_REQUESTED when threads are
+                # resolved — only a new approving review clears it).
+                # Re-trigger claude-review so it can submit a fresh APPROVED
+                # or raise new objections.
+                review_run_id = _get_claude_review_run_id(checks)
+                retrigger_sha = get_review_retrigger_sha(redis, repo, number)
+
+                if review_run_id is not None and retrigger_sha != head_sha:
+                    logger.info(
+                        "PR #%d has CHANGES_REQUESTED but all threads resolved, "
+                        "re-triggering claude-review (run %d)",
+                        number,
+                        review_run_id,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.RETRIGGER_REVIEW,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                            review_run_id=review_run_id,
+                        )
+                    )
+                else:
+                    # Already re-triggered for this SHA or no claude-review
+                    # run found — nothing actionable, skip.
+                    logger.info(
+                        "PR #%d has CHANGES_REQUESTED but all threads resolved, skipping",
+                        number,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_GREEN,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.ENQUEUE_FIX,
+                        ci_failures=[],
+                        review_threads=threads or [],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
                 )
-            )
         elif review_decision == "APPROVED":
             # CI green + approved — check for unresolved threads
             try:
