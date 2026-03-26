@@ -1,5 +1,6 @@
 """Tests for orcest.fleet.proxmox_api."""
 
+import shlex
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -679,6 +680,86 @@ class TestConvertToTemplate:
         mock_api.nodes("pve").tasks.return_value = mock_task
 
         client.convert_to_template(100)
+
+
+class TestWriteSnippetSsh:
+    @patch("subprocess.run")
+    def test_malicious_snippet_name_is_quoted(self, mock_run):
+        """A snippet_name containing shell metacharacters must be shlex-quoted."""
+        client, _ = _make_client()
+
+        # Both subprocess calls succeed
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        malicious_name = "foo; rm -rf /"
+        client._write_snippet_ssh(
+            host="10.20.0.1",
+            snippet_name=malicious_name,
+            userdata="#cloud-config\n",
+            storage="local",
+            vm_id=100,
+        )
+
+        write_call_cmd = mock_run.call_args_list[0][0][0]
+        # The last element is the shell command string sent over SSH
+        shell_cmd = write_call_cmd[-1]
+        quoted = shlex.quote(malicious_name)
+        assert quoted in shell_cmd
+        # The raw injection string must not appear unquoted
+        assert "; rm -rf /" not in shell_cmd.replace(quoted, "")
+
+    @patch("subprocess.run")
+    def test_malicious_storage_and_vm_id_are_quoted(self, mock_run):
+        """storage and vm_id with shell metacharacters must be shlex-quoted in cicustom cmd."""
+        client, _ = _make_client()
+
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        malicious_storage = "local; reboot"
+        client._write_snippet_ssh(
+            host="10.20.0.1",
+            snippet_name="safe-name.yaml",
+            userdata="#cloud-config\n",
+            storage=malicious_storage,
+            vm_id=100,
+        )
+
+        cicustom_call_cmd = mock_run.call_args_list[1][0][0]
+        shell_cmd = cicustom_call_cmd[-1]
+        quoted = shlex.quote(malicious_storage)
+        assert quoted in shell_cmd
+        assert "; reboot" not in shell_cmd.replace(quoted, "")
+
+    @patch("subprocess.run")
+    def test_returns_false_when_ssh_write_fails(self, mock_run):
+        client, _ = _make_client()
+        mock_run.return_value = MagicMock(returncode=1, stderr="connection refused")
+
+        result = client._write_snippet_ssh(
+            host="10.20.0.1",
+            snippet_name="test.yaml",
+            userdata="#cloud-config\n",
+            storage="local",
+            vm_id=100,
+        )
+        assert result is False
+
+    @patch("subprocess.run")
+    def test_raises_on_cicustom_failure(self, mock_run):
+        client, _ = _make_client()
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr=""),
+            MagicMock(returncode=1, stderr="qm error"),
+        ]
+
+        with pytest.raises(RuntimeError, match="qm set --cicustom failed"):
+            client._write_snippet_ssh(
+                host="10.20.0.1",
+                snippet_name="test.yaml",
+                userdata="#cloud-config\n",
+                storage="local",
+                vm_id=100,
+            )
 
 
 class TestWaitForTask:
