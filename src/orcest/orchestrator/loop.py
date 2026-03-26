@@ -1063,6 +1063,17 @@ def _handle_result(
                     f"after USAGE_EXHAUSTED: {e}",
                     exc_info=True,
                 )
+    elif result.status == ResultStatus.USAGE_EXHAUSTED and is_issue:
+        # Issues don't have per-SHA tracking; clear attempts so the issue
+        # is re-enqueued on the next poll cycle after rate limits lift.
+        try:
+            clear_issue_attempts(redis, repo, resource_id)
+        except Exception as e:
+            logger.error(
+                f"Failed to clear issue attempt counter for issue #{resource_id} "
+                f"after USAGE_EXHAUSTED: {e}",
+                exc_info=True,
+            )
 
     # Transient failures (clone timeout, worker restart) should be retried
     # automatically — don't label needs-human or burn attempt slots.
