@@ -717,3 +717,24 @@ def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
     assert config.labels.needs_human == "custom:needs-human"
     assert config.labels.blocked == "custom:blocked"
     assert config.labels.ready == "orcest:ready"
+
+
+# -- Null string field guards (_safe_str) -------------------------------------
+
+
+def test_null_github_token_raises(tmp_path: Path):
+    """github.token: null in YAML raises ValueError, not silently producing 'None'."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  token: null\n  repo: acme/widgets\n")
+
+    with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_null_redis_key_prefix_raises(tmp_path: Path):
+    """redis.key_prefix: null in YAML raises ValueError, not silently producing 'None'."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nredis:\n  key_prefix: null\n")
+
+    with pytest.raises(ValueError, match="explicitly set to null"):
+        load_orchestrator_config(cfg_file)
