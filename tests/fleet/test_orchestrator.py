@@ -350,7 +350,7 @@ class TestCleanPendingTasks:
         def ssh_side_effect(*a, **kw):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:  # KEYS
+            if call_count == 1:  # SCAN
                 return subprocess.CompletedProcess(
                     args=[],
                     returncode=0,

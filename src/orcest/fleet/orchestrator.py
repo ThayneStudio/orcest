@@ -316,7 +316,7 @@ def clean_pending_tasks(ssh_target: str) -> int:
     """Delete all pending task markers from Redis. Returns count deleted."""
     result = _ssh(
         ssh_target,
-        "redis-cli --raw KEYS 'orcest:pending:*'",
+        "redis-cli --scan --pattern 'orcest:pending:*'",
     )
     keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
     if not keys:
