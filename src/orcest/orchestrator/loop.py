@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     clear_total_attempts,
     discover_actionable_prs,
     get_stale_retrigger_sha,
+    set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
@@ -671,6 +672,7 @@ def _poll_project(
                     token,
                 )
                 labeled = True
+                set_exhausted_notified(redis, repo, pr_state.number)
             except Exception as e:
                 logger.error(
                     "Failed to label PR #%d as needs-human: %s",
