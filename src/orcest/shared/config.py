@@ -267,9 +267,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 ProjectConfig(
                     repo=_safe_str(p.get("repo", ""), f"projects[{i}].repo"),
                     # Default to shared token when not set per-project
-                    token=_safe_str(
-                        p.get("token", github_token), f"projects[{i}].token"
-                    ),
+                    token=_safe_str(p.get("token", github_token), f"projects[{i}].token"),
                     claude_token=_safe_str(
                         p.get("claude_token", claude_token),
                         f"projects[{i}].claude_token",
@@ -341,7 +339,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
         extra={
-            _safe_str(k, "runner.extra key"): _safe_str(v, "runner.extra value")
+            _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in _safe_dict(runner_raw, "extra").items()
         },
     )
@@ -467,7 +465,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
         extra={
-            _safe_str(k, "runner.extra key"): _safe_str(v, "runner.extra value")
+            _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in runner_extra_raw.items()
         },
     )
@@ -483,7 +481,9 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     redis_raw_section = _safe_dict(raw, "redis")
     raw_key_prefixes = redis_raw_section.get("key_prefixes")
     if isinstance(raw_key_prefixes, list) and raw_key_prefixes:
-        key_prefixes = [_safe_str(p, "redis.key_prefixes[]") for p in raw_key_prefixes]
+        key_prefixes = [
+            _safe_str(p, f"redis.key_prefixes[{i}]") for i, p in enumerate(raw_key_prefixes)
+        ]
     else:
         key_prefixes = [redis_config.key_prefix]
 
