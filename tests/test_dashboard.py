@@ -105,8 +105,8 @@ def test_dead_letter_count_zero_when_empty(fake_redis_client):
 
 def test_dead_letter_count_in_snapshot(fake_redis_client):
     """Reports dead-letter stream length in snapshot."""
-    fake_redis_client.xadd("orcest:dead-letter", {"id": "t1", "type": "fix_ci"})
-    fake_redis_client.xadd("orcest:dead-letter", {"id": "t2", "type": "fix_ci"})
+    fake_redis_client.xadd("dead-letter", {"id": "t1", "type": "fix_ci"})
+    fake_redis_client.xadd("dead-letter", {"id": "t2", "type": "fix_ci"})
 
     snap = fetch_snapshot(fake_redis_client)
 
@@ -122,7 +122,7 @@ def test_dead_letter_entries_empty_when_no_stream(fake_redis_client):
 def test_dead_letter_entries_populated(fake_redis_client):
     """Fetches last N dead-letter entries with task details."""
     fake_redis_client.xadd(
-        "orcest:dead-letter",
+        "dead-letter",
         {
             "id": "task-abc",
             "type": "fix_ci",
@@ -150,7 +150,7 @@ def test_dead_letter_entries_capped_at_five(fake_redis_client):
     """At most 5 dead-letter entries are returned in the snapshot."""
     for i in range(8):
         fake_redis_client.xadd(
-            "orcest:dead-letter",
+            "dead-letter",
             {"id": f"task-{i}", "type": "fix_ci", "repo": "org/repo"},
         )
 
@@ -164,7 +164,7 @@ def test_dead_letter_entries_most_recent_first(fake_redis_client):
     """Dead-letter entries are returned most recent first."""
     for i in range(3):
         fake_redis_client.xadd(
-            "orcest:dead-letter",
+            "dead-letter",
             {"id": f"task-{i}", "type": "fix_ci", "repo": f"org/repo-{i}"},
         )
 
