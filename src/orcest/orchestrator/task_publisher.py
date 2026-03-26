@@ -10,8 +10,7 @@ import re
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
-from orcest.orchestrator.issue_ops import IssueState
-from orcest.orchestrator.issue_ops import increment_attempts as increment_issue_attempts
+from orcest.orchestrator.issue_ops import IssueState, increment_attempts as increment_issue_attempts
 from orcest.orchestrator.pr_ops import (
     PRState,
     increment_attempts,
