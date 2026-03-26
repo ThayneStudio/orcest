@@ -30,7 +30,6 @@ from orcest.shared.models import (
     ResultStatus,
     Task,
     TaskResult,
-    TaskType,
 )
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
@@ -734,12 +733,8 @@ def _execute_task(
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
-        # Setup workspace. For REBASE_PR tasks, skip auto-rebase — Claude
-        # handles the rebase itself (including conflict resolution).
-        # For REBASE_PR tasks, skip auto-rebase — Claude handles it itself.
-        base_branch = None if task.type == TaskType.REBASE_PR else task.base_branch
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
-        work_dir = workspace.setup(task.repo, task.branch, task.token, base_branch)
+        work_dir = workspace.setup(task.repo, task.branch, task.token)
 
         output_errors = 0
 
