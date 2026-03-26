@@ -214,17 +214,15 @@ def test_set_backoff_cooldown_stores_step(fake_redis_client):
 def test_set_backoff_cooldown_sets_ttl(fake_redis_client):
     """set_backoff_cooldown sets a positive TTL on the Redis key."""
     set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1)
-    key = "backoff:pr:owner/repo:42"
-    ttl = fake_redis_client.ttl(key)
-    assert ttl > 0
+    assert fake_redis_client.ttl("backoff:pr:owner/repo:42") > 0
 
 
 def test_set_backoff_cooldown_ttl_matches_step_duration(fake_redis_client):
     """The TTL is approximately equal to the cooldown for the given step."""
-    step = 2
+    repo, number, step = "owner/repo", 99, 2
     expected_cooldown = get_backoff_cooldown_seconds(step)
-    set_backoff_cooldown(fake_redis_client, "owner/repo", 99, step=step)
-    key = "backoff:pr:owner/repo:99"
+    set_backoff_cooldown(fake_redis_client, repo, number, step=step)
+    key = f"backoff:pr:{repo}:{number}"
     ttl = fake_redis_client.ttl(key)
     # Allow a small margin for processing time.
     assert expected_cooldown - 2 <= ttl <= expected_cooldown
@@ -258,7 +256,7 @@ def test_get_backoff_step_returns_none_after_key_deleted(fake_redis_client):
 def test_get_backoff_step_returns_none_on_corrupt_value(fake_redis_client):
     """get_backoff_step returns None (treating as no backoff) when Redis has a non-integer value."""
     # Write directly using the prefixed key to bypass the int-only set_ex path.
-    prefixed_key = fake_redis_client._prefix + "backoff:pr:owner/repo:77"
+    prefixed_key = fake_redis_client._prefixed("backoff:pr:owner/repo:77")
     fake_redis_client.client.set(prefixed_key, "not-an-int")
     result = get_backoff_step(fake_redis_client, "owner/repo", 77)
     assert result is None
