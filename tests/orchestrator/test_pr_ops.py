@@ -573,6 +573,66 @@ def test_approved_thread_fetch_failure_skips_merge(gh_mock, fake_redis_client, l
     assert results[0].number == 150
 
 
+def test_changes_requested_all_threads_resolved_retriggers_review(
+    gh_mock,
+    fake_redis_client,
+    label_config,
+):
+    """CHANGES_REQUESTED + CI green + all threads resolved + claude-review present -> RETRIGGER_REVIEW."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=155, labels=[], review_decision="CHANGES_REQUESTED", head_sha="abc999"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+        {
+            "name": "claude-review",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/o/r/actions/runs/99999/job/1",
+        },
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_REVIEW
+    assert pr.review_run_id == 99999
+
+
+def test_changes_requested_all_threads_resolved_no_claude_review_skips(
+    gh_mock,
+    fake_redis_client,
+    label_config,
+):
+    """CHANGES_REQUESTED + CI green + all threads resolved + no claude-review -> SKIP_GREEN."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=156, labels=[], review_decision="CHANGES_REQUESTED"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.SKIP_GREEN
+    assert pr.review_threads == []
+
+
 def test_changes_requested_thread_fetch_failure_still_enqueues(
     gh_mock,
     fake_redis_client,
