@@ -55,7 +55,7 @@ def parse_vm_ip(interfaces: list[dict]) -> str | None:
         for addr in iface.get("ip-addresses", []):
             if addr.get("ip-address-type") == "ipv4":
                 ip = addr.get("ip-address")
-                if ip and ip != "127.0.0.1":
+                if ip and ip != "127.0.0.1" and not ip.startswith("169.254."):
                     return ip
     return None
 
