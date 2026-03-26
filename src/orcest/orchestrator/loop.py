@@ -12,8 +12,11 @@ import time
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
-from orcest.orchestrator.issue_ops import IssueAction, discover_actionable_issues
-from orcest.orchestrator.issue_ops import clear_attempts as clear_issue_attempts
+from orcest.orchestrator.issue_ops import (
+    IssueAction,
+    clear_attempts as clear_issue_attempts,
+    discover_actionable_issues,
+)
 from orcest.orchestrator.pr_ops import (
     PRAction,
     clear_attempts,
