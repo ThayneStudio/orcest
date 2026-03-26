@@ -78,7 +78,6 @@ class Workspace:
         repo: str,
         branch: str | None,
         token: str,
-        base_branch: str | None = None,
     ) -> Path:
         """Clone the repo and configure the workspace.
 
@@ -86,7 +85,6 @@ class Workspace:
             repo: "owner/repo" format
             branch: branch to checkout (None = default branch)
             token: GitHub PAT for clone auth and gh CLI
-            base_branch: if set, rebase onto this branch after clone
 
         Returns:
             Path to the cloned repo directory.
