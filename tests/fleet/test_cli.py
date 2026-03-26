@@ -974,7 +974,7 @@ def test_stop_drain_active_destroys_all(runner, cfg_path, mocker):
     )
     mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
 
-    result = runner.invoke(fleet, ["stop", "--drain-active", "--config", cfg_path])
+    result = runner.invoke(fleet, ["stop", "--drain-active", "--yes", "--config", cfg_path])
     assert result.exit_code == 0
     assert mock_px.destroy_vm.call_count == 2
 

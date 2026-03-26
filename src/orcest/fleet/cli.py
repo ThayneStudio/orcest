@@ -1528,13 +1528,24 @@ def set_pool_size(size: int, vm_id_start: int | None, config: str) -> None:
     help="Also destroy active workers (interrupts running tasks).",
 )
 @click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip confirmation prompt.",
+)
+@click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def stop(drain_active: bool, config: str) -> None:
+def stop(drain_active: bool, yes: bool, config: str) -> None:
     """Stop the pool manager and destroy idle worker VMs."""
+    if drain_active and not yes:
+        click.confirm(
+            "This will destroy active workers and interrupt running tasks. Continue?",
+            abort=True,
+        )
+
     from orcest.fleet.config import load_config
     from orcest.fleet.orchestrator import (
         clean_pending_tasks,
@@ -1748,7 +1759,7 @@ def deploy(ctx: click.Context, rebuild_template: bool, drain_active: bool, confi
     # Step 2: Stop fleet
     step += 1
     console.print(f"\n[bold]Step {step}/{total}: Stopping fleet[/bold]\n")
-    ctx.invoke(stop, drain_active=drain_active, config=config)
+    ctx.invoke(stop, drain_active=drain_active, yes=True, config=config)
 
     # Step 3: Update orchestrator
     step += 1
