@@ -723,11 +723,7 @@ def test_runner_hyphenated_yaml_keys_are_accepted_orchestrator(tmp_path: Path):
     """runner.max-retries and runner.retry-backoff should map to RunnerConfig fields."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n"
-        "  repo: acme/widgets\n"
-        "runner:\n"
-        "  max-retries: 5\n"
-        "  retry-backoff: 10\n"
+        "github:\n  repo: acme/widgets\nrunner:\n  max-retries: 5\n  retry-backoff: 10\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -739,11 +735,7 @@ def test_runner_hyphenated_yaml_keys_are_accepted_orchestrator(tmp_path: Path):
 def test_runner_hyphenated_yaml_keys_are_accepted_worker(tmp_path: Path):
     """runner.max-retries and runner.retry-backoff should map to RunnerConfig fields."""
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "runner:\n"
-        "  max-retries: 7\n"
-        "  retry-backoff: 15\n"
-    )
+    cfg_file.write_text("runner:\n  max-retries: 7\n  retry-backoff: 15\n")
 
     config = load_worker_config(cfg_file)
 
