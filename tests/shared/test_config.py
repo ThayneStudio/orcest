@@ -719,6 +719,38 @@ def test_labels_hyphenated_yaml_keys_are_accepted(tmp_path: Path):
     assert config.labels.ready == "orcest:ready"
 
 
+def test_runner_hyphenated_yaml_keys_are_accepted_orchestrator(tmp_path: Path):
+    """runner.max-retries and runner.retry-backoff should map to RunnerConfig fields."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "runner:\n"
+        "  max-retries: 5\n"
+        "  retry-backoff: 10\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.runner.max_retries == 5
+    assert config.runner.retry_backoff == 10
+
+
+def test_runner_hyphenated_yaml_keys_are_accepted_worker(tmp_path: Path):
+    """runner.max-retries and runner.retry-backoff should map to RunnerConfig fields."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "runner:\n"
+        "  max-retries: 7\n"
+        "  retry-backoff: 15\n"
+    )
+
+    config = load_worker_config(cfg_file)
+
+    assert config.runner.max_retries == 7
+    assert config.runner.retry_backoff == 15
+
+
 # -- Null string field guards (_safe_str) -------------------------------------
 
 
