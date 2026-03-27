@@ -374,7 +374,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             "deployment.health_check_url",
         ),
         health_check_timeout=_safe_int(
-            v if (v := deployment_raw.get("health_check_timeout", 30)) is not None else 30,
+            v if (v := deployment_raw.get("health_check_timeout")) is not None else 30,
             "deployment.health_check_timeout",
         ),
         rollback_command=_safe_str(
