@@ -16,10 +16,8 @@ from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import (
     clear_backoff,
-    get_backoff_step,
     make_pending_task_key,
     make_pr_lock_key,
-    set_backoff_cooldown,
 )
 from orcest.shared.redis_client import RedisClient
 
@@ -403,7 +401,7 @@ def discover_actionable_prs(
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
-    max_total_attempts: int = 10,
+    max_total_attempts: int = 50,
     stale_pending_timeout_seconds: int = 7200,
 ) -> list[PRState]:
     """Discover PRs that need action.
@@ -528,56 +526,26 @@ def discover_actionable_prs(
         # above and never reaches this block.
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, repo, number):
-                # exhausted_notified is set and needs-human label is absent (inferred
-                # via SKIP_LABELED invariant above); treat as retry signal and reset.
-                clear_total_attempts(redis, repo, number)
-                clear_attempts(redis, repo, number)
-                clear_exhausted_notified(redis, repo, number)
-                clear_backoff(redis, repo, number)
-                logger.info(
-                    "PR #%d: exhausted_notified set and needs-human label absent"
-                    " (inferred via SKIP_LABELED invariant);"
-                    " resetting total attempt counter, exhausted_notified flag,"
-                    " backoff state, and per-SHA attempt counter for retry",
-                    number,
+            logger.warning(
+                "PR #%d: total attempts (%d) >= limit (%d), stopping",
+                number,
+                total_attempts,
+                max_total_attempts,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
                 )
-                # Fall through to normal processing (all Redis counters now reset).
-            else:
-                # Calculate backoff step: each attempt past the limit increases the step
-                step = total_attempts - max_total_attempts
-                current_step = get_backoff_step(redis, repo, number)
-                if current_step is not None:
-                    # Still in cooldown — skip this PR
-                    results.append(
-                        PRState(
-                            number=number,
-                            title=title,
-                            branch=branch,
-                            head_sha=head_sha,
-                            action=PRAction.SKIP_BACKOFF,
-                            ci_failures=[],
-                            review_threads=[],
-                            labels=pr_labels,
-                            base_branch=base_branch,
-                        )
-                    )
-                    continue
-                else:
-                    # Cooldown expired or first time hitting the limit.
-                    # Set a new cooldown, clear per-SHA attempts so the PR
-                    # can be retried, and fall through to normal routing.
-                    set_backoff_cooldown(redis, repo, number, step)
-                    clear_attempts(redis, repo, number)
-                    logger.info(
-                        "PR #%d: total attempts (%d) >= limit (%d), "
-                        "backoff step %d, clearing per-SHA attempts for retry",
-                        number,
-                        total_attempts,
-                        max_total_attempts,
-                        step,
-                    )
-                    # Fall through to normal processing for one more round.
+            )
+            continue
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).

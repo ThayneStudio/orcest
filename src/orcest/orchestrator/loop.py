@@ -686,8 +686,6 @@ def _poll_project(
                     e,
                     exc_info=True,
                 )
-        elif pr_state.action == PRAction.SKIP_BACKOFF:
-            logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_DRAFT:
             logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:

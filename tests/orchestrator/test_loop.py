@@ -283,32 +283,6 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
     assert str(orchestrator_config.max_attempts) in comment_body
 
 
-def test_poll_cycle_skip_backoff_no_label_no_comment(
-    mocker,
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-):
-    """SKIP_BACKOFF simply logs — no labels added, no comments posted."""
-    pr_state = _make_pr_state(number=51, action=PRAction.SKIP_BACKOFF)
-
-    mocker.patch(
-        "orcest.orchestrator.loop.discover_actionable_prs",
-        return_value=[pr_state],
-    )
-    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
-    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
-
-    # No labels should be added
-    gh_mock.add_label.assert_not_called()
-    # No comments should be posted
-    gh_mock.post_comment.assert_not_called()
-
-
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):
     """When discover_actionable_prs raises, _poll_cycle catches it per-project and continues.
 
