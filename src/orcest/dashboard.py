@@ -111,14 +111,8 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     Separated from fetch_snapshot so the outer function can catch
     connection-level errors that occur after the health check.
     """
-    # Queue depths
+    # Discover task streams
     task_streams = redis.scan_iter(match="tasks:*")
-    queue_depths: dict[str, int] = {}
-    for stream_key in sorted(task_streams):
-        try:
-            queue_depths[stream_key] = redis.xlen(stream_key)
-        except redis_lib.ResponseError:
-            pass  # Key exists but is not a stream
 
     try:
         results_depth: int = redis.xlen("results")
@@ -162,8 +156,9 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         pr_num = key.removeprefix("lock:pr:")
         locks.append(LockInfo(pr=pr_num, owner=owner, ttl=ttl))
 
-    # Consumer groups
+    # Consumer groups + real queue depths (pending + lag, not XLEN)
     consumer_groups = []
+    queue_depths: dict[str, int] = {}
     for stream_key in sorted(task_streams):
         try:
             for g in redis.xinfo_groups(stream_key):
@@ -175,6 +170,9 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
                         pending=g["pending"],
                     )
                 )
+                pending = g.get("pending", 0)
+                lag = max(g.get("lag") or 0, 0)
+                queue_depths[stream_key] = queue_depths.get(stream_key, 0) + pending + lag
         except redis_lib.ResponseError:
             pass  # Stream has no consumer groups
 
