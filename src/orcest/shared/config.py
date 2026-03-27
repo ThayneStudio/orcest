@@ -327,7 +327,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
 
     # Runner config — timeout and max_retries drive the pending-task marker TTL.
     # These should match the values deployed on worker nodes.
-    runner_raw = _safe_dict(raw, "runner")
+    runner_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "runner").items()}
     _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
         type=_safe_str(runner_raw.get("type", _runner_defaults.type), "runner.type"),
@@ -452,7 +452,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     )
 
     # Runner (construct first so backend can default from runner.type)
-    runner_raw = _safe_dict(raw, "runner")
+    runner_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "runner").items()}
     runner_extra_raw = _safe_dict(runner_raw, "extra")
     _runner_defaults = RunnerConfig()
     runner_config = RunnerConfig(
