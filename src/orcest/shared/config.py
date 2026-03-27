@@ -365,15 +365,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     deployment_raw = _safe_dict(raw, "deployment")
     deployment_config = DeploymentConfig(
         enabled=_safe_bool(deployment_raw.get("enabled", False), "deployment.enabled"),
-        command=_safe_str(deployment_raw.get("command", ""), "deployment.command"),
+        command=_safe_str(deployment_raw.get("command") or "", "deployment.command"),
         health_check_url=_safe_str(
-            deployment_raw.get("health_check_url", ""), "deployment.health_check_url"
+            deployment_raw.get("health_check_url") or "", "deployment.health_check_url"
         ),
         health_check_timeout=_safe_int(
-            deployment_raw.get("health_check_timeout", 30), "deployment.health_check_timeout"
+            v if (v := deployment_raw.get("health_check_timeout", 30)) is not None else 30,
+            "deployment.health_check_timeout",
         ),
         rollback_command=_safe_str(
-            deployment_raw.get("rollback_command", ""), "deployment.rollback_command"
+            deployment_raw.get("rollback_command") or "", "deployment.rollback_command"
         ),
     )
     if deployment_config.health_check_url and deployment_config.health_check_timeout <= 0:
