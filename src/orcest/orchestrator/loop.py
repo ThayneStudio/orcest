@@ -117,6 +117,22 @@ def _poll_cycle(
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
+    # Step 1b: Trim processed entries from task streams to prevent unbounded growth.
+    # Uses MINID based on each consumer group's last-delivered-id so only
+    # fully-delivered entries are removed.
+    for project, project_redis in project_clients:
+        for stream in (
+            f"tasks:{config.default_runner}",
+            f"tasks:issue:{config.default_runner}",
+        ):
+            try:
+                for g in project_redis.xinfo_groups(stream):
+                    last_id = g.get("last-delivered-id")
+                    if last_id and last_id != "0-0":
+                        project_redis.xtrim_minid(stream, last_id)
+            except Exception:
+                pass  # Stream may not exist yet
+
     # Step 2: Poll each project
     total_enqueued = 0
     total_merged = 0

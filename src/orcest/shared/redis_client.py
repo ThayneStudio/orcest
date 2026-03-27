@@ -517,6 +517,14 @@ class RedisClient:
         result: int = self._client.xlen(self._prefixed(stream))  # type: ignore[assignment]
         return result
 
+    def xtrim_minid(self, stream: str, minid: str) -> int:
+        """XTRIM stream MINID minid. Removes entries older than minid.
+
+        Returns the number of entries removed.
+        """
+        result: int = self._client.xtrim(self._prefixed(stream), minid=minid)  # type: ignore[assignment]
+        return result
+
     def xinfo_groups(self, stream: str) -> list[dict[str, Any]]:
         """XINFO GROUPS stream."""
         result: list[dict[str, Any]] = self._client.xinfo_groups(self._prefixed(stream))  # type: ignore[assignment]
