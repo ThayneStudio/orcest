@@ -606,6 +606,11 @@ class PoolManager:
                     f"VM ID pool exhausted: all IDs in range "
                     f"{self._pool.vm_id_start}-{self._pool.vm_id_end} are in use"
                 )
+        if self._pool.vm_id_end and candidate > self._pool.vm_id_end:
+            raise RuntimeError(
+                f"VM ID pool exhausted: all IDs in range "
+                f"{self._pool.vm_id_start}-{self._pool.vm_id_end} are in use"
+            )
         return candidate
 
     @staticmethod
