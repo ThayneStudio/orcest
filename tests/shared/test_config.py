@@ -506,10 +506,7 @@ def test_null_deployment_command_treated_as_empty(tmp_path: Path):
     """deployment.command: null in YAML is treated as empty string, not an error."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "deployment:\n"
-        "  enabled: true\n"
-        "  command: null\n"
+        "github:\n  repo: acme/widgets\ndeployment:\n  enabled: true\n  command: null\n"
     )
     cfg = load_orchestrator_config(cfg_file)
     assert cfg.deployment.command == ""
@@ -519,10 +516,7 @@ def test_null_deployment_health_check_url_treated_as_empty(tmp_path: Path):
     """deployment.health_check_url: null in YAML is treated as empty string."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "deployment:\n"
-        "  enabled: true\n"
-        "  health_check_url: null\n"
+        "github:\n  repo: acme/widgets\ndeployment:\n  enabled: true\n  health_check_url: null\n"
     )
     cfg = load_orchestrator_config(cfg_file)
     assert cfg.deployment.health_check_url == ""
@@ -545,10 +539,7 @@ def test_null_deployment_rollback_command_treated_as_empty(tmp_path: Path):
     """deployment.rollback_command: null in YAML is treated as empty string."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "deployment:\n"
-        "  enabled: true\n"
-        "  rollback_command: null\n"
+        "github:\n  repo: acme/widgets\ndeployment:\n  enabled: true\n  rollback_command: null\n"
     )
     cfg = load_orchestrator_config(cfg_file)
     assert cfg.deployment.rollback_command == ""
