@@ -85,7 +85,7 @@ class OrchestratorConfig:
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
-    max_total_attempts: int = 25  # Max total attempts across all SHAs (circuit breaker)
+    max_total_attempts: int = 50  # Max total attempts across all SHAs (hard stop)
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
@@ -317,8 +317,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
-    # Max total attempts across all SHAs (circuit breaker)
-    max_total_attempts = _safe_int(raw.get("max_total_attempts", 10), "max_total_attempts")
+    # Max total attempts across all SHAs (hard stop)
+    max_total_attempts = _safe_int(raw.get("max_total_attempts", 50), "max_total_attempts")
 
     # Whether to delete the head branch after merging
     delete_branch_on_merge = _safe_bool(
