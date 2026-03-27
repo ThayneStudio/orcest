@@ -124,6 +124,7 @@ def _poll_cycle(
         for stream in (
             f"tasks:{config.default_runner}",
             f"tasks:issue:{config.default_runner}",
+            RESULTS_STREAM,
         ):
             try:
                 for g in project_redis.xinfo_groups(stream):

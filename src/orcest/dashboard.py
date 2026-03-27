@@ -535,7 +535,6 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             queues.clear()
             for stream, depth in snapshot.queue_depths.items():
                 queues.add_row(stream, str(depth))
-            queues.add_row("results", str(snapshot.results_depth))
             if not snapshot.queue_depths:
                 queues.add_row("(no task streams)", "0")
             dl_count = snapshot.dead_letter_count
