@@ -89,6 +89,10 @@ class OrchestratorConfig:
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
+    # Redis key prefix for the shared task stream. All per-project orchestrators
+    # publish to this prefix so workers only need to read from one stream.
+    # Defaults to redis.key_prefix for backward compatibility with single-project mode.
+    task_key_prefix: str = ""
 
 
 @dataclass
@@ -347,6 +351,12 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             f"got {stale_pending_timeout_seconds!r}."
         )
 
+    # Shared task stream prefix: all per-project orchestrators publish tasks
+    # to this prefix so workers only need to read from one stream.
+    task_key_prefix = str(
+        os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix", ""))
+    ) or redis_config.key_prefix
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -360,6 +370,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         max_total_attempts=max_total_attempts,
         delete_branch_on_merge=delete_branch_on_merge,
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
+        task_key_prefix=task_key_prefix,
     )
 
     # Validate required fields

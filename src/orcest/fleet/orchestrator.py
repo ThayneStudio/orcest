@@ -499,14 +499,19 @@ def generate_env_file(
     return "\n".join(lines) + "\n"
 
 
-def generate_orchestrator_config(repo: str, key_prefix: str) -> str:
+def generate_orchestrator_config(
+    repo: str, key_prefix: str, task_key_prefix: str = "orcest"
+) -> str:
     """Generate orchestrator.yaml content for a project.
 
     Uses redis host 'redis' (Docker network service name), port 6379,
-    and the project's key prefix for namespace isolation.
+    and the project's key prefix for namespace isolation. The
+    ``task_key_prefix`` is the shared prefix used for the task stream
+    that workers read from.
     """
     config = {
         "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
+        "task_key_prefix": task_key_prefix,
         "github": {"repo": repo},
     }
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

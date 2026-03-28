@@ -56,6 +56,10 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     logger = setup_logging("orchestrator", "main")
     redis = RedisClient(config.redis)
 
+    # Shared task Redis client — all projects publish tasks to this prefix
+    # so workers only need to read from one stream.
+    task_redis = RedisClient.from_client(redis.client, key_prefix=config.task_key_prefix)
+
     # Verify Redis connection
     if not redis.health_check():
         logger.error("Cannot connect to Redis. Exiting.")
@@ -66,7 +70,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         f"tasks:{config.default_runner}",
         f"tasks:issue:{config.default_runner}",
     ):
-        redis.ensure_consumer_group(stream, CONSUMER_GROUP)
+        task_redis.ensure_consumer_group(stream, CONSUMER_GROUP)
 
     # Ensure consumer group for results stream (per-project)
     for project in config.projects:
@@ -95,7 +99,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(config, redis, logger, pending_task_ttl)
+            _poll_cycle(config, redis, task_redis, logger, pending_task_ttl)
         except Exception as e:
             logger.error("Poll cycle failed: %s", e, exc_info=True)
             # Continue after error -- don't crash the loop
@@ -112,6 +116,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 def _poll_cycle(
     config: OrchestratorConfig,
     redis: RedisClient,
+    task_redis: RedisClient,
     logger: logging.Logger,
     pending_task_ttl: int,
 ) -> None:
@@ -136,10 +141,10 @@ def _poll_cycle(
         f"tasks:issue:{config.default_runner}",
     ):
         try:
-            for g in redis.xinfo_groups(stream):
+            for g in task_redis.xinfo_groups(stream):
                 last_id = g.get("last-delivered-id")
                 if last_id and last_id != "0-0":
-                    redis.xtrim_minid(stream, last_id)
+                    task_redis.xtrim_minid(stream, last_id)
         except Exception:
             pass  # Stream may not exist yet
     # Results streams are per-project, trim each one.
@@ -160,7 +165,7 @@ def _poll_cycle(
     for project, project_redis in project_clients:
         try:
             enqueued, merged, prs_checked, issues_checked = _poll_project(
-                project, project_redis, redis, config, logger, pending_task_ttl
+                project, project_redis, task_redis, config, logger, pending_task_ttl
             )
             total_enqueued += enqueued
             total_merged += merged
