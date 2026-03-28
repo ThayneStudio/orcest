@@ -713,7 +713,7 @@ class TestRunWorker:
         }
 
     def _configure_one_iteration(self, mock_redis, task, signal_handlers):
-        """Configure xreadgroup_multi to return one task, then trigger shutdown.
+        """Configure xreadgroup to return one task, then trigger shutdown.
 
         The first call returns the task on the PR stream; subsequent calls
         trigger SIGTERM.
@@ -721,24 +721,21 @@ class TestRunWorker:
         task_fields = task.to_dict()
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            # Drain phase: streams have "0" as entry ID
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             if normal_call_count == 1:
-                # Return task on the first PR stream
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             # On subsequent calls, trigger SIGTERM handler to exit loop
             handler = signal_handlers.get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
     def test_worker_processes_task(self, mocker, worker_config, sample_task):
         """run_worker reads a task from the stream, executes it, and publishes."""
@@ -773,26 +770,25 @@ class TestRunWorker:
         task_fields = sample_task.to_dict()
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             # PR stream is checked first (non-blocking) -- return empty
             if normal_call_count == 1:
                 return []  # PR stream empty
             # Issue stream is checked second (blocking) -- return task
             if normal_call_count == 2:
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             # Trigger shutdown on subsequent calls
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -941,21 +937,20 @@ class TestRunWorker:
         # Return a malformed entry (missing required fields), then trigger shutdown
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             if normal_call_count == 1:
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-bad", {"garbage": "data"})]
+                return [("entry-bad", {"garbage": "data"})]
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -979,20 +974,24 @@ class TestRunWorker:
         def xreadgroup_multi_side_effect(**kwargs):
             nonlocal drain_call_count
             streams = kwargs.get("streams", {})
-            # Drain phase: streams have "0" as entry ID
             if any(v == "0" for v in streams.values()):
                 drain_call_count += 1
                 if drain_call_count == 1:
                     first_stream = next(iter(streams))
                     return [(first_stream, "pending-1", task_fields)]
                 return []
-            # No new tasks — trigger shutdown immediately
+            return []
+
+        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+
+        # Normal reading: trigger shutdown immediately
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -1040,13 +1039,18 @@ class TestRunWorker:
                     first_stream = next(iter(streams))
                     return [(first_stream, "pending-1", task_fields)]
                 return []
-            # No new tasks -- trigger shutdown immediately
+            return []
+
+        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+
+        # Normal reading: trigger shutdown immediately
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -1280,19 +1284,18 @@ class TestRunWorker:
         task_fields = sample_task.to_dict()
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             if normal_call_count == 1:
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             # Should never reach here in ephemeral mode
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -1319,14 +1322,8 @@ class TestRunWorker:
 
         task_fields = sample_task.to_dict()
 
-        def xreadgroup_multi_side_effect(**kwargs):
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
-            first_stream = next(iter(streams))
-            return [(first_stream, "entry-1", task_fields)]
-
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup_multi.return_value = []
+        mock_redis.xreadgroup.return_value = [("entry-1", task_fields)]
 
         run_worker(worker_config)
 
@@ -1346,14 +1343,8 @@ class TestRunWorker:
 
         task_fields = sample_task.to_dict()
 
-        def xreadgroup_multi_side_effect(**kwargs):
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
-            first_stream = next(iter(streams))
-            return [(first_stream, "entry-1", task_fields)]
-
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup_multi.return_value = []
+        mock_redis.xreadgroup.return_value = [("entry-1", task_fields)]
 
         with caplog.at_level(logging.WARNING):
             run_worker(worker_config)
@@ -1383,14 +1374,8 @@ class TestRunWorker:
         task_fields = sample_task.to_dict()
         expected_fq_stream = f"{worker_config.redis.key_prefix}:tasks:{worker_config.backend}"
 
-        def xreadgroup_multi_side_effect(**kwargs):
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
-            first_stream = next(iter(streams))
-            return [(first_stream, "entry-1", task_fields)]
-
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup_multi.return_value = []
+        mock_redis.xreadgroup.return_value = [("entry-1", task_fields)]
 
         run_worker(worker_config)
 
@@ -1413,14 +1398,8 @@ class TestRunWorker:
 
         task_fields = sample_task.to_dict()
 
-        def xreadgroup_multi_side_effect(**kwargs):
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
-            first_stream = next(iter(streams))
-            return [(first_stream, "entry-1", task_fields)]
-
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup_multi.return_value = []
+        mock_redis.xreadgroup.return_value = [("entry-1", task_fields)]
 
         run_worker(worker_config)
 
@@ -1471,19 +1450,18 @@ class TestRunWorker:
         task_fields = sample_task.to_dict()
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             if normal_call_count == 1:
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             # Should never reach here -- ephemeral mode exits after dead-letter
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -1541,21 +1519,18 @@ class TestRunWorker:
         mock_redis.set_ex.side_effect = set_ex_side_effect
 
         task_fields = sample_task.to_dict()
-        fq_stream = f"{worker_config.key_prefixes[0]}:tasks:issue:{worker_config.backend}"
 
         normal_call_count = [0]
 
-        def xreadgroup_multi_side_effect(**kwargs):
-            streams = kwargs.get("streams", {})
-            # Drain phase: streams have "0" as entry ID
-            if any(v == "0" for v in streams.values()):
-                return []
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             normal_call_count[0] += 1
             if normal_call_count[0] == 1:
-                return [(fq_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 
@@ -1581,22 +1556,21 @@ class TestRunWorker:
         task_fields = sample_task.to_dict()
         normal_call_count = 0
 
-        def xreadgroup_multi_side_effect(**kwargs):
+        # Drain phase: no pending tasks
+        mock_redis.xreadgroup_multi.return_value = []
+
+        def xreadgroup_side_effect(group, consumer, stream, count=1, block_ms=5000, pending=False):
             nonlocal normal_call_count
-            streams = kwargs.get("streams", {})
-            if any(v == "0" for v in streams.values()):
-                return []
             normal_call_count += 1
             if normal_call_count == 1:
-                first_stream = next(iter(streams))
-                return [(first_stream, "entry-1", task_fields)]
+                return [("entry-1", task_fields)]
             # After dead-lettering, trigger SIGTERM to exit
             handler = mocks["signal_handlers"].get(signal.SIGTERM)
             if handler:
                 handler(signal.SIGTERM, None)
             return []
 
-        mock_redis.xreadgroup_multi.side_effect = xreadgroup_multi_side_effect
+        mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
         run_worker(worker_config)
 

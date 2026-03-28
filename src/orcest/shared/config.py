@@ -99,11 +99,6 @@ class WorkerConfig:
     backend: str = "claude"
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     ephemeral: bool = False  # When True, process one task and exit
-    key_prefixes: list[str] = field(default_factory=list)  # Multi-project prefixes
-
-    def __post_init__(self) -> None:
-        if not self.key_prefixes:
-            self.key_prefixes = [self.redis.key_prefix]
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -426,14 +421,6 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     ephemeral_raw = raw.get("ephemeral", False)
     ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
 
-    # Multi-project key prefixes: check redis.key_prefixes first, fall back to [redis.key_prefix]
-    redis_raw_section = _safe_dict(raw, "redis")
-    raw_key_prefixes = redis_raw_section.get("key_prefixes")
-    if isinstance(raw_key_prefixes, list) and raw_key_prefixes:
-        key_prefixes = [str(p) for p in raw_key_prefixes]
-    else:
-        key_prefixes = [redis_config.key_prefix]
-
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
@@ -441,7 +428,6 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         backend=backend,
         runner=runner_config,
         ephemeral=ephemeral,
-        key_prefixes=key_prefixes,
     )
 
     # Validate required fields

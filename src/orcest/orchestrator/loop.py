@@ -39,7 +39,12 @@ from orcest.shared.coordination import (
     get_pending_task,
 )
 from orcest.shared.logging import setup_logging
-from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX, ResultStatus, TaskResult
+from orcest.shared.models import (
+    CONSUMER_GROUP,
+    TRANSIENT_SUMMARY_PREFIX,
+    ResultStatus,
+    TaskResult,
+)
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
@@ -55,6 +60,13 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     if not redis.health_check():
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
+
+    # Ensure consumer groups for shared task streams (so workers don't race)
+    for stream in (
+        f"tasks:{config.default_runner}",
+        f"tasks:issue:{config.default_runner}",
+    ):
+        redis.ensure_consumer_group(stream, CONSUMER_GROUP)
 
     # Ensure consumer group for results stream (per-project)
     for project in config.projects:
@@ -104,7 +116,7 @@ def _poll_cycle(
     pending_task_ttl: int,
 ) -> None:
     """Single orchestrator poll cycle across all configured projects."""
-    # Build per-project Redis clients once and reuse across both steps
+    # Build per-project Redis clients once and reuse for results/state
     project_clients = [
         (project, RedisClient.from_client(redis.client, key_prefix=project.key_prefix))
         for project in config.projects
@@ -117,22 +129,28 @@ def _poll_cycle(
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
-    # Step 1b: Trim processed entries from task streams to prevent unbounded growth.
-    # Uses MINID based on each consumer group's last-delivered-id so only
-    # fully-delivered entries are removed.
-    for project, project_redis in project_clients:
-        for stream in (
-            f"tasks:{config.default_runner}",
-            f"tasks:issue:{config.default_runner}",
-            RESULTS_STREAM,
-        ):
-            try:
-                for g in project_redis.xinfo_groups(stream):
-                    last_id = g.get("last-delivered-id")
-                    if last_id and last_id != "0-0":
-                        project_redis.xtrim_minid(stream, last_id)
-            except Exception:
-                pass  # Stream may not exist yet
+    # Step 1b: Trim processed entries from streams to prevent unbounded growth.
+    # Task streams are shared (single namespace), trim once per cycle.
+    for stream in (
+        f"tasks:{config.default_runner}",
+        f"tasks:issue:{config.default_runner}",
+    ):
+        try:
+            for g in redis.xinfo_groups(stream):
+                last_id = g.get("last-delivered-id")
+                if last_id and last_id != "0-0":
+                    redis.xtrim_minid(stream, last_id)
+        except Exception:
+            pass  # Stream may not exist yet
+    # Results streams are per-project, trim each one.
+    for _project, project_redis in project_clients:
+        try:
+            for g in project_redis.xinfo_groups(RESULTS_STREAM):
+                last_id = g.get("last-delivered-id")
+                if last_id and last_id != "0-0":
+                    project_redis.xtrim_minid(RESULTS_STREAM, last_id)
+        except Exception:
+            pass  # Stream may not exist yet
 
     # Step 2: Poll each project
     total_enqueued = 0
@@ -142,7 +160,7 @@ def _poll_cycle(
     for project, project_redis in project_clients:
         try:
             enqueued, merged, prs_checked, issues_checked = _poll_project(
-                project, project_redis, config, logger, pending_task_ttl
+                project, project_redis, redis, config, logger, pending_task_ttl
             )
             total_enqueued += enqueued
             total_merged += merged
@@ -162,12 +180,17 @@ def _poll_cycle(
 
 def _poll_project(
     project: ProjectConfig,
-    redis: RedisClient,
+    project_redis: RedisClient,
+    task_redis: RedisClient,
     config: OrchestratorConfig,
     logger: logging.Logger,
     pending_task_ttl: int,
 ) -> tuple[int, int, int, int]:
     """Poll a single project for actionable PRs and issues.
+
+    Args:
+        project_redis: Per-project Redis client (for pending markers, attempt counters, etc.).
+        task_redis: Shared Redis client (for publishing tasks to the common stream).
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """
@@ -182,7 +205,7 @@ def _poll_project(
     pr_states = discover_actionable_prs(
         repo=repo,
         token=token,
-        redis=redis,
+        redis=project_redis,
         label_config=labels,
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
@@ -202,7 +225,7 @@ def _poll_project(
 
     # Pre-compute issue queue depth for gating issue discovery.
     issue_tasks_stream = f"tasks:issue:{config.default_runner}"
-    issue_queue_depth = redis.stream_queue_depth(issue_tasks_stream, "workers")
+    issue_queue_depth = task_redis.stream_queue_depth(issue_tasks_stream, CONSUMER_GROUP)
 
     enqueued = 0
     merged = 0
@@ -237,13 +260,14 @@ def _poll_project(
                             pr_state=pr_state,
                             repo=repo,
                             token=token,
-                            redis=redis,
+                            redis=project_redis,
                             default_runner=config.default_runner,
                             merge_error=err_msg[:200],
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
                             claude_token=claude_token,
                             key_prefix=key_prefix,
+                            task_redis=task_redis,
                         )
                         enqueued += 1
                     except Exception as rebase_err:
@@ -294,7 +318,7 @@ def _poll_project(
             else:
                 # Clean up state on successful merge
                 try:
-                    clear_review_retrigger(redis, repo, pr_state.number)
+                    clear_review_retrigger(project_redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_review_retrigger for PR #%d",
@@ -302,7 +326,7 @@ def _poll_project(
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
-                    clear_total_attempts(redis, repo, pr_state.number)
+                    clear_total_attempts(project_redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_total_attempts for PR #%d",
@@ -310,7 +334,7 @@ def _poll_project(
                         exc_info=True,
                     )  # Best-effort cleanup; key has TTL anyway
                 try:
-                    clear_backoff(redis, repo, pr_state.number)
+                    clear_backoff(project_redis, repo, pr_state.number)
                 except Exception:
                     logger.debug(
                         "cleanup failed: clear_backoff for PR #%d",
@@ -378,7 +402,7 @@ def _poll_project(
                             pr_state=other_pr,
                             repo=repo,
                             token=token,
-                            redis=redis,
+                            redis=project_redis,
                             default_runner=config.default_runner,
                             merge_error="",
                             pending_task_ttl=pending_task_ttl,
@@ -386,6 +410,7 @@ def _poll_project(
                             claude_token=claude_token,
                             key_prefix=key_prefix,
                             proactive=True,
+                            task_redis=task_redis,
                         )
                     except Exception:
                         logger.warning(
@@ -400,12 +425,13 @@ def _poll_project(
                     pr_state=pr_state,
                     repo=repo,
                     token=token,
-                    redis=redis,
+                    redis=project_redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=claude_token,
                     key_prefix=key_prefix,
+                    task_redis=task_redis,
                 )
                 if result is not None:
                     enqueued += 1
@@ -417,7 +443,7 @@ def _poll_project(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, repo, "pr", pr_state.number)
+                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -432,12 +458,13 @@ def _poll_project(
                     pr_state=pr_state,
                     repo=repo,
                     token=token,
-                    redis=redis,
+                    redis=project_redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=claude_token,
                     key_prefix=key_prefix,
+                    task_redis=task_redis,
                 )
                 enqueued += 1
             except Exception as e:
@@ -448,7 +475,7 @@ def _poll_project(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, repo, "pr", pr_state.number)
+                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -467,12 +494,13 @@ def _poll_project(
                     pr_state=pr_state,
                     repo=repo,
                     token=token,
-                    redis=redis,
+                    redis=project_redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=claude_token,
                     key_prefix=key_prefix,
+                    task_redis=task_redis,
                 )
                 enqueued += 1
             except Exception as e:
@@ -483,7 +511,7 @@ def _poll_project(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, repo, "pr", pr_state.number)
+                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
                 except Exception as clear_err:
                     logger.error(
                         "Failed to clear pending task marker for PR #%d: %s",
@@ -512,7 +540,9 @@ def _poll_project(
                         run_id,
                         token,
                     )
-                    set_review_retrigger_sha(redis, repo, pr_state.number, pr_state.head_sha)
+                    set_review_retrigger_sha(
+                        project_redis, repo, pr_state.number, pr_state.head_sha
+                    )
                 except Exception as e:
                     logger.error(
                         "Failed to re-trigger review for PR #%d: %s",
@@ -523,7 +553,7 @@ def _poll_project(
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
             # Cooldown guard: skip if we already acted on this SHA
-            stale_sha = get_stale_retrigger_sha(redis, repo, pr_state.number)
+            stale_sha = get_stale_retrigger_sha(project_redis, repo, pr_state.number)
             if stale_sha == pr_state.head_sha:
                 logger.debug(
                     "PR #%d: stale checks already handled for SHA %s, skipping",
@@ -570,7 +600,7 @@ def _poll_project(
                         exc_info=True,
                     )
                 set_stale_retrigger_sha(
-                    redis,
+                    project_redis,
                     repo,
                     pr_state.number,
                     pr_state.head_sha,
@@ -635,7 +665,7 @@ def _poll_project(
                 # Always set cooldown after attempting — prevents a busy retry
                 # loop if the run can't be cancelled or immediately rerun.
                 set_stale_retrigger_sha(
-                    redis,
+                    project_redis,
                     repo,
                     pr_state.number,
                     pr_state.head_sha,
@@ -750,7 +780,7 @@ def _poll_project(
             issue_states = discover_actionable_issues(
                 repo=repo,
                 token=token,
-                redis=redis,
+                redis=project_redis,
                 label_config=labels,
                 max_attempts=config.max_attempts,
             )
@@ -768,12 +798,13 @@ def _poll_project(
                     issue_state=issue_state,
                     repo=repo,
                     token=token,
-                    redis=redis,
+                    redis=project_redis,
                     default_runner=config.default_runner,
                     pending_task_ttl=pending_task_ttl,
                     logger=logger,
                     claude_token=claude_token,
                     key_prefix=key_prefix,
+                    task_redis=task_redis,
                 )
                 enqueued += 1
             except Exception as e:
@@ -782,7 +813,7 @@ def _poll_project(
                     exc_info=True,
                 )
                 try:
-                    clear_pending_task(redis, repo, "issue", issue_state.number)
+                    clear_pending_task(project_redis, repo, "issue", issue_state.number)
                 except Exception as clear_err:
                     logger.error(
                         f"Failed to clear pending task marker for issue #{issue_state.number}: "

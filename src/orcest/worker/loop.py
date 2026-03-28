@@ -25,6 +25,7 @@ from orcest.shared.coordination import (
 )
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
+    CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
@@ -38,7 +39,6 @@ from orcest.worker.runner import Runner, RunnerResult, create_runner
 from orcest.worker.workspace import Workspace, WorkspaceError
 
 RESULTS_STREAM = "results"
-CONSUMER_GROUP = "workers"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
@@ -143,29 +143,6 @@ def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
         clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
 
 
-def _build_stream_names(key_prefixes: list[str], backend: str) -> tuple[list[str], list[str]]:
-    """Build fully-qualified stream names for multi-project reading.
-
-    Returns (pr_streams, issue_streams) where each stream name is
-    fully qualified (e.g. ``"myproject:tasks:claude"``).
-    """
-    pr_streams: list[str] = []
-    issue_streams: list[str] = []
-    seen_pr: set[str] = set()
-    seen_issue: set[str] = set()
-    for prefix in key_prefixes:
-        fq_prefix = prefix + ":"
-        pr_name = f"{fq_prefix}tasks:{backend}"
-        issue_name = f"{fq_prefix}tasks:issue:{backend}"
-        if pr_name not in seen_pr:
-            seen_pr.add(pr_name)
-            pr_streams.append(pr_name)
-        if issue_name not in seen_issue:
-            seen_issue.add(issue_name)
-            issue_streams.append(issue_name)
-    return pr_streams, issue_streams
-
-
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -180,22 +157,25 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
 
-    # Build stream names from key_prefixes for multi-project support
-    key_prefixes = config.key_prefixes or [config.redis.key_prefix]
-    pr_fq_streams, issue_fq_streams = _build_stream_names(key_prefixes, config.backend)
+    # Shared task stream names (all projects publish to the same streams)
+    pr_stream = f"tasks:{config.backend}"
+    issue_stream = f"tasks:issue:{config.backend}"
+    # Fully-qualified names for raw Redis operations
+    pr_fq = f"{config.redis.key_prefix}:{pr_stream}"
+    issue_fq = f"{config.redis.key_prefix}:{issue_stream}"
 
     # Verify Redis connection
     if not redis.health_check():
         logger.error("Cannot connect to Redis. Exiting.")
         sys.exit(1)
 
-    # Ensure consumer groups exist on all streams
-    for fq_stream in pr_fq_streams + issue_fq_streams:
-        redis.ensure_consumer_group_raw(fq_stream, CONSUMER_GROUP)
+    # Ensure consumer groups exist on shared streams
+    redis.ensure_consumer_group(pr_stream, CONSUMER_GROUP)
+    redis.ensure_consumer_group(issue_stream, CONSUMER_GROUP)
 
     # Drain pending tasks from previous worker lifecycle.
-    for fq_stream in pr_fq_streams + issue_fq_streams:
-        _drain_pending_tasks_raw(redis, fq_stream, config, logger)
+    _drain_pending_tasks_raw(redis, pr_fq, config, logger)
+    _drain_pending_tasks_raw(redis, issue_fq, config, logger)
 
     # Graceful shutdown
     shutdown = False
@@ -214,39 +194,39 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
     logger.info(
         f"Worker {config.worker_id} started (backend={config.backend}, "
-        f"runner={config.runner.type}, prefixes={key_prefixes}). Waiting for tasks..."
+        f"runner={config.runner.type}, streams={pr_fq},{issue_fq}). Waiting for tasks..."
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
         # PR tasks have priority — non-blocking check first
-        pr_stream_dict = {s: ">" for s in pr_fq_streams}
-        multi_entries = redis.xreadgroup_multi(
-            streams=pr_stream_dict,
+        pr_entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
             consumer=config.worker_id,
+            stream=pr_stream,
             count=1,
-            block=None,
+            block_ms=None,
         )
         current_stream: str | None = None
         entry_id: str | None = None
         fields: dict[str, str] | None = None
 
-        if multi_entries:
-            current_stream, entry_id, fields = multi_entries[0]
+        if pr_entries:
+            entry_id, fields = pr_entries[0]
+            current_stream = pr_fq
         else:
             if shutdown:
                 break
-            # No PR work — block on all issue streams (5s timeout to recheck PRs)
-            issue_stream_dict = {s: ">" for s in issue_fq_streams}
-            multi_entries = redis.xreadgroup_multi(
-                streams=issue_stream_dict,
+            # No PR work — block on issue stream (5s timeout to recheck PRs)
+            issue_entries = redis.xreadgroup(
                 group=CONSUMER_GROUP,
                 consumer=config.worker_id,
+                stream=issue_stream,
                 count=1,
-                block=5000,
+                block_ms=5000,
             )
-            if multi_entries:
-                current_stream, entry_id, fields = multi_entries[0]
+            if issue_entries:
+                entry_id, fields = issue_entries[0]
+                current_stream = issue_fq
 
         if not current_stream or entry_id is None or fields is None:
             continue  # Timeout, loop back to check shutdown
@@ -487,8 +467,8 @@ def _drain_pending_tasks_raw(
 ) -> None:
     """Drain pending tasks from a fully-qualified stream name.
 
-    Same logic as _drain_pending_tasks but uses raw (un-prefixed) Redis
-    operations for multi-project stream support.
+    Uses raw (un-prefixed) Redis operations since the stream name is
+    already fully qualified (e.g. ``orcest:tasks:claude``).
     """
     drained = 0
     while True:

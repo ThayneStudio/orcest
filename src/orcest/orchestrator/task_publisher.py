@@ -170,6 +170,7 @@ def _publish_and_notify(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     proactive: bool = False,
+    task_redis: RedisClient | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility.
 
@@ -220,10 +221,11 @@ def _publish_and_notify(
             _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
             return
 
-    # Publish to backend-specific stream
+    # Publish to backend-specific stream (shared across all projects)
+    stream_redis = task_redis or redis
     try:
         tasks_stream = f"tasks:{default_runner}"
-        redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+        stream_redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
@@ -245,6 +247,7 @@ def publish_fix_task(
     logger: logging.Logger | None = None,
     claude_token: str = "",
     key_prefix: str = "",
+    task_redis: RedisClient | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -406,6 +409,7 @@ def publish_fix_task(
         default_runner=default_runner,
         pending_task_ttl=pending_task_ttl,
         logger=logger,
+        task_redis=task_redis,
     )
 
     return task
@@ -421,6 +425,7 @@ def publish_followup_task(
     logger: logging.Logger | None = None,
     claude_token: str = "",
     key_prefix: str = "",
+    task_redis: RedisClient | None = None,
 ) -> Task:
     """Create and publish a triage-followups task for a PR.
 
@@ -473,6 +478,7 @@ def publish_followup_task(
         default_runner=default_runner,
         pending_task_ttl=pending_task_ttl,
         logger=logger,
+        task_redis=task_redis,
     )
 
     return task
@@ -490,6 +496,7 @@ def publish_rebase_task(
     claude_token: str = "",
     key_prefix: str = "",
     proactive: bool = False,
+    task_redis: RedisClient | None = None,
 ) -> Task:
     """Create and publish a rebase task for a PR.
 
@@ -531,6 +538,7 @@ def publish_rebase_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         proactive=proactive,
+        task_redis=task_redis,
     )
 
     return task
@@ -546,6 +554,7 @@ def publish_issue_task(
     logger: logging.Logger | None = None,
     claude_token: str = "",
     key_prefix: str = "",
+    task_redis: RedisClient | None = None,
 ) -> Task:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -582,6 +591,7 @@ def publish_issue_task(
         default_runner=default_runner,
         pending_task_ttl=pending_task_ttl,
         logger=logger,
+        task_redis=task_redis,
     )
 
     return task
@@ -596,6 +606,7 @@ def _publish_issue_and_notify(
     default_runner: str,
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
+    task_redis: RedisClient | None = None,
 ) -> None:
     """Publish a task to Redis and update GitHub visibility on the issue."""
     task_type = task.type
@@ -622,10 +633,11 @@ def _publish_issue_and_notify(
         _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
         return
 
-    # Publish to issue-specific stream (lower priority than PR tasks)
+    # Publish to issue-specific stream (shared across all projects, lower priority than PR tasks)
+    stream_redis = task_redis or redis
     try:
         tasks_stream = f"tasks:issue:{default_runner}"
-        redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+        stream_redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for issue #{issue_state.number} to Redis",

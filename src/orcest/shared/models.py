@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+# Shared consumer group name used by workers, orchestrator, and pool manager.
+CONSUMER_GROUP = "workers"
+
 # Redis stream / key name constants
 DEAD_LETTER_STREAM = "orcest:dead-letter"
 
