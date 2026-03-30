@@ -36,8 +36,13 @@ class ProjectConfig:
 
     repo: str  # "owner/repo"
     token: str  # GitHub PAT
-    claude_token: str  # Claude Code OAuth token
+    claude_tokens: list[str]  # Claude Code OAuth tokens (round-robin pool)
     key_prefix: str  # Redis key prefix for this project
+
+    @property
+    def claude_token(self) -> str:
+        """First token (backward compat for single-token callers)."""
+        return self.claude_tokens[0] if self.claude_tokens else ""
 
 
 @dataclass
@@ -229,14 +234,22 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     github_token = os.environ.get("GITHUB_TOKEN", github_raw.get("token", ""))
     github_repo = os.environ.get("ORCEST_REPO", github_raw.get("repo", ""))
 
-    claude_token = os.environ.get(
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        github_raw.get("claude_token", ""),
-    )
+    # Claude tokens: prefer comma-separated CLAUDE_CODE_OAUTH_TOKENS env var,
+    # fall back to single CLAUDE_CODE_OAUTH_TOKEN, then YAML.
+    claude_tokens_env = os.environ.get("CLAUDE_CODE_OAUTH_TOKENS", "")
+    if claude_tokens_env:
+        claude_tokens = [t.strip() for t in claude_tokens_env.split(",") if t.strip()]
+    else:
+        single = os.environ.get(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            github_raw.get("claude_token", ""),
+        )
+        claude_tokens = [single] if single else []
+
     github_config = GithubConfig(
         token=str(github_token),
         repo=str(github_repo),
-        claude_token=str(claude_token),
+        claude_token=str(claude_tokens[0]) if claude_tokens else "",
     )
 
     # Multi-project support: load projects list
@@ -248,11 +261,19 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         for i, p in enumerate(projects_raw):
             if not isinstance(p, dict):
                 raise ValueError(f"projects[{i}] must be a YAML mapping, got {type(p).__name__}")
+            # Per-project token list: check claude_tokens (list), claude_token (string), or shared
+            p_tokens_raw = p.get("claude_tokens")
+            if isinstance(p_tokens_raw, list) and p_tokens_raw:
+                p_claude_tokens = [str(t) for t in p_tokens_raw if t]
+            elif p.get("claude_token"):
+                p_claude_tokens = [str(p["claude_token"])]
+            else:
+                p_claude_tokens = list(claude_tokens)  # inherit from shared
             projects.append(
                 ProjectConfig(
                     repo=str(p.get("repo", "")),
-                    token=str(p.get("token", github_token)),  # default to shared token
-                    claude_token=str(p.get("claude_token", claude_token)),  # default to shared
+                    token=str(p.get("token", github_token)),
+                    claude_tokens=p_claude_tokens,
                     key_prefix=str(p.get("key_prefix", redis_config.key_prefix)),
                 )
             )
@@ -273,7 +294,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             ProjectConfig(
                 repo=str(github_repo),
                 token=str(github_token),
-                claude_token=str(claude_token),
+                claude_tokens=list(claude_tokens),
                 key_prefix=str(redis_config.key_prefix),
             )
         ]

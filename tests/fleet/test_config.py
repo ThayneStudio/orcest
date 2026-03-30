@@ -124,7 +124,7 @@ class TestConfigPersistence:
         original = FleetConfig(
             proxmox=ProxmoxConfig(node="mynode", storage="ceph", api_token_id="root@pam!t"),
             orchestrator=OrchestratorConfig(vm_id=200, host="10.0.0.1", disk_size=40),
-            orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_token="sk_def")},
+            orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_tokens=["sk_def"])},
             projects=[
                 ProjectEntry(name="proj", repo="Org/proj"),
             ],

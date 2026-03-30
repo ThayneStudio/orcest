@@ -97,7 +97,7 @@ def orchestrator_config(redis_config, label_config):
             ProjectConfig(
                 repo=github.repo,
                 token=github.token,
-                claude_token=github.claude_token,
+                claude_tokens=[github.claude_token],
                 key_prefix="test",
             ),
         ],

@@ -70,7 +70,12 @@ class OrgEntry:
     """An organisation registered with the fleet."""
 
     github_token: str = ""
-    claude_oauth_token: str = ""
+    claude_oauth_tokens: list[str] = field(default_factory=list)
+
+    @property
+    def claude_oauth_token(self) -> str:
+        """First token in the pool (backward compat for single-token callers)."""
+        return self.claude_oauth_tokens[0] if self.claude_oauth_tokens else ""
 
 
 @dataclass
@@ -182,9 +187,16 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
 
     orgs: dict[str, OrgEntry] = {}
     for name, entry in (data.get("orgs") or {}).items():
+        # Support both list (claude_oauth_tokens) and single string (claude_oauth_token)
+        raw_tokens = entry.get("claude_oauth_tokens")
+        if isinstance(raw_tokens, list):
+            tokens = [str(t) for t in raw_tokens if t]
+        else:
+            single = entry.get("claude_oauth_token", "")
+            tokens = [single] if single else []
         orgs[name] = OrgEntry(
             github_token=entry.get("github_token", ""),
-            claude_oauth_token=entry.get("claude_oauth_token", ""),
+            claude_oauth_tokens=tokens,
         )
 
     projects: list[ProjectEntry] = []
@@ -243,7 +255,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         "orgs": {
             name: {
                 "github_token": org.github_token,
-                "claude_oauth_token": org.claude_oauth_token,
+                "claude_oauth_tokens": org.claude_oauth_tokens,
             }
             for name, org in config.orgs.items()
         },
