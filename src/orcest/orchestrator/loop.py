@@ -319,8 +319,9 @@ def _poll_project(
                                 key_prefix=key_prefix,
                                 task_redis=task_redis,
                             )
-                            _register_task(task.id, ct)
-                            enqueued += 1
+                            if task is not None:
+                                _register_task(task.id, ct)
+                                enqueued += 1
                         except Exception as rebase_err:
                             logger.error(
                                 f"Failed to enqueue rebase task for PR #{pr_state.number}: "
@@ -470,7 +471,8 @@ def _poll_project(
                             proactive=True,
                             task_redis=task_redis,
                         )
-                        _register_task(task.id, ct)
+                        if task is not None:
+                            _register_task(task.id, ct)
                     except Exception:
                         logger.warning(
                             "Failed to enqueue rebase for PR #%d",
@@ -540,8 +542,9 @@ def _poll_project(
                         key_prefix=key_prefix,
                         task_redis=task_redis,
                     )
-                    _register_task(task.id, ct)
-                    enqueued += 1
+                    if task is not None:
+                        _register_task(task.id, ct)
+                        enqueued += 1
                 except Exception as e:
                     logger.error(
                         "Failed to publish followup task for PR #%d: %s",
@@ -584,8 +587,9 @@ def _poll_project(
                         key_prefix=key_prefix,
                         task_redis=task_redis,
                     )
-                    _register_task(task.id, ct)
-                    enqueued += 1
+                    if task is not None:
+                        _register_task(task.id, ct)
+                        enqueued += 1
                 except Exception as e:
                     logger.error(
                         "Failed to publish rebase task for PR #%d: %s",
@@ -896,8 +900,9 @@ def _poll_project(
                         key_prefix=key_prefix,
                         task_redis=task_redis,
                     )
-                    _register_task(task.id, ct)
-                    enqueued += 1
+                    if task is not None:
+                        _register_task(task.id, ct)
+                        enqueued += 1
                 except Exception as e:
                     logger.error(
                         f"Failed to publish issue task for issue #{issue_state.number}: {e}",
