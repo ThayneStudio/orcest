@@ -10,6 +10,7 @@ to a default cooldown when this returns None.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from urllib.error import HTTPError, URLError
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 _USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _TIMEOUT = 10  # seconds
+# Utilization percentage threshold (0-100 scale, as returned by the API).
+_UTILIZATION_THRESHOLD = 95
 
 
 def get_token_reset_time(token: str) -> datetime | None:
@@ -32,8 +35,6 @@ def get_token_reset_time(token: str) -> datetime | None:
     Returns ``None`` on any error (HTTP 429, network failure, unexpected
     response format) so the caller can fall back to a default cooldown.
     """
-    import json
-
     req = Request(
         _USAGE_URL,
         headers={
@@ -49,6 +50,10 @@ def get_token_reset_time(token: str) -> datetime | None:
         logger.warning("Failed to query usage endpoint: %s", exc)
         return None
 
+    if not isinstance(data, dict):
+        logger.warning("Usage endpoint returned non-object JSON: %s", type(data).__name__)
+        return None
+
     try:
         five_hour = data.get("five_hour", {})
         seven_day = data.get("seven_day", {})
@@ -58,7 +63,7 @@ def get_token_reset_time(token: str) -> datetime | None:
         for window in (five_hour, seven_day):
             utilization = float(window.get("utilization", 0))
             resets_at = window.get("resets_at", "")
-            if utilization >= 95 and resets_at:
+            if utilization >= _UTILIZATION_THRESHOLD and resets_at:
                 parsed = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
                 candidates.append(parsed)
 
@@ -68,6 +73,6 @@ def get_token_reset_time(token: str) -> datetime | None:
 
         # Return the soonest reset time
         return min(candidates)
-    except (TypeError, ValueError, KeyError) as exc:
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
         logger.warning("Failed to parse usage response: %s", exc)
         return None
