@@ -1098,6 +1098,8 @@ def _handle_result(
                 result.task_id,
                 current_task_id,
             )
+            if token_pool is not None:
+                token_pool.task_completed(result.task_id)
             return
     except Exception as e:
         logger.error(
@@ -1149,7 +1151,7 @@ def _handle_result(
                     f"Failed to remove ready label from issue #{resource_id}: {e}",
                     exc_info=True,
                 )
-    elif result.status == ResultStatus.USAGE_EXHAUSTED and not is_issue:
+    elif result.status == ResultStatus.USAGE_EXHAUSTED:
         # Mark the exhausted token in the pool so it's skipped in future rounds.
         # Query the usage endpoint for the precise reset time; fall back to 30 min.
         if token_pool is not None:
@@ -1161,29 +1163,27 @@ def _handle_result(
                 except Exception as e:
                     logger.warning("Failed to query token reset time: %s", e)
             token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
-        # Clear the per-SHA attempt counter so the PR can be re-enqueued once
-        # the cooldown expires. The total-attempts counter is intentionally
-        # preserved as a circuit-breaker across rate-limit cycles.
-        cooldown_set = False
-        try:
-            set_usage_exhausted_cooldown(redis, repo, resource_id)
-            cooldown_set = True
-        except Exception as e:
-            logger.error(
-                f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
-                exc_info=True,
-            )
-        # Only clear the per-SHA attempt counter once the cooldown is confirmed;
-        # otherwise the PR would be immediately re-enqueued with no rate-limit protection.
-        if cooldown_set:
+        # PR-specific cooldown: clear per-SHA attempts so PR can be re-enqueued
+        # after the cooldown expires.  Issues don't have per-SHA counters.
+        if not is_issue:
+            cooldown_set = False
             try:
-                clear_attempts(redis, repo, resource_id)
+                set_usage_exhausted_cooldown(redis, repo, resource_id)
+                cooldown_set = True
             except Exception as e:
                 logger.error(
-                    f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
-                    f"after USAGE_EXHAUSTED: {e}",
+                    f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
                     exc_info=True,
                 )
+            if cooldown_set:
+                try:
+                    clear_attempts(redis, repo, resource_id)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
+                        f"after USAGE_EXHAUSTED: {e}",
+                        exc_info=True,
+                    )
 
     # Transient failures (clone timeout, worker restart) should be retried
     # automatically — don't label needs-human or burn attempt slots.
@@ -1239,6 +1239,8 @@ def _handle_result(
         if result.status == ResultStatus.FAILED and is_transient:
             # Transient failures are retried silently — no comment to avoid
             # accumulating noise if infrastructure is degraded across many attempts.
+            if token_pool is not None:
+                token_pool.task_completed(result.task_id)
             return
         elif result.status == ResultStatus.FAILED:
             label_note = (
@@ -1296,6 +1298,7 @@ def _handle_result(
 
         logger.info("Result comment: %s...", body[:100])
 
-    # Clean up token pool tracking for non-exhausted results
-    if token_pool is not None and result.status != ResultStatus.USAGE_EXHAUSTED:
+    # Clean up token pool tracking. mark_exhausted already pops from _task_tokens
+    # for exhausted results, so task_completed is a no-op in that case (safe to call).
+    if token_pool is not None:
         token_pool.task_completed(result.task_id)
