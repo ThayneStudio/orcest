@@ -171,8 +171,11 @@ def _publish_and_notify(
     logger: logging.Logger | None = None,
     proactive: bool = False,
     task_redis: RedisClient | None = None,
-) -> None:
+) -> bool:
     """Publish a task to Redis and update GitHub visibility.
+
+    Returns True if the task was actually published, False if skipped
+    (e.g. because a pending task already exists for this PR).
 
     Shared by publish_fix_task and publish_followup_task to avoid
     duplicating the increment -> publish -> comment -> log sequence.
@@ -194,7 +197,7 @@ def _publish_and_notify(
     # is already pending for this PR, skip publish to avoid duplicates.
     if not set_pending_task(redis, task.repo, "pr", pr_state.number, task.id, ttl=pending_task_ttl):
         _log.info(f"Pending task already exists for PR #{pr_state.number}, skipping publish")
-        return
+        return False
 
     # Increment attempt count BEFORE publishing to Redis to eliminate the
     # check-then-act race: if the orchestrator crashes between xadd and
@@ -219,7 +222,7 @@ def _publish_and_notify(
                 exc_info=True,
             )
             _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
-            return
+            return False
 
     # Publish to backend-specific stream (shared across all projects)
     stream_redis = task_redis or redis
@@ -235,6 +238,7 @@ def _publish_and_notify(
         raise
 
     _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
+    return True
 
 
 def publish_fix_task(
@@ -400,7 +404,7 @@ def publish_fix_task(
         key_prefix=key_prefix,
     )
 
-    _publish_and_notify(
+    published = _publish_and_notify(
         task=task,
         pr_state=pr_state,
         repo=repo,
@@ -412,7 +416,7 @@ def publish_fix_task(
         task_redis=task_redis,
     )
 
-    return task
+    return task if published else None
 
 
 def publish_followup_task(
@@ -426,7 +430,7 @@ def publish_followup_task(
     claude_token: str = "",
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
-) -> Task:
+) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
     This is used when a PR is approved and CI is green, but there are
@@ -469,7 +473,7 @@ def publish_followup_task(
         key_prefix=key_prefix,
     )
 
-    _publish_and_notify(
+    published = _publish_and_notify(
         task=task,
         pr_state=pr_state,
         repo=repo,
@@ -481,7 +485,7 @@ def publish_followup_task(
         task_redis=task_redis,
     )
 
-    return task
+    return task if published else None
 
 
 def publish_rebase_task(
@@ -497,7 +501,7 @@ def publish_rebase_task(
     key_prefix: str = "",
     proactive: bool = False,
     task_redis: RedisClient | None = None,
-) -> Task:
+) -> Task | None:
     """Create and publish a rebase task for a PR.
 
     Enqueued either when ``gh pr merge`` fails due to merge conflicts, or
@@ -528,7 +532,7 @@ def publish_rebase_task(
         key_prefix=key_prefix,
     )
 
-    _publish_and_notify(
+    published = _publish_and_notify(
         task=task,
         pr_state=pr_state,
         repo=repo,
@@ -541,7 +545,7 @@ def publish_rebase_task(
         task_redis=task_redis,
     )
 
-    return task
+    return task if published else None
 
 
 def publish_issue_task(
@@ -555,7 +559,7 @@ def publish_issue_task(
     claude_token: str = "",
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
-) -> Task:
+) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
     Steps:
@@ -582,7 +586,7 @@ def publish_issue_task(
         key_prefix=key_prefix,
     )
 
-    _publish_issue_and_notify(
+    published = _publish_issue_and_notify(
         task=task,
         issue_state=issue_state,
         repo=repo,
@@ -594,7 +598,7 @@ def publish_issue_task(
         task_redis=task_redis,
     )
 
-    return task
+    return task if published else None
 
 
 def _publish_issue_and_notify(
@@ -607,8 +611,11 @@ def _publish_issue_and_notify(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     task_redis: RedisClient | None = None,
-) -> None:
-    """Publish a task to Redis and update GitHub visibility on the issue."""
+) -> bool:
+    """Publish a task to Redis and update GitHub visibility on the issue.
+
+    Returns True if the task was actually published, False if skipped.
+    """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
@@ -617,7 +624,7 @@ def _publish_issue_and_notify(
         redis, task.repo, "issue", issue_state.number, task.id, ttl=pending_task_ttl
     ):
         _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
-        return
+        return False
 
     # Increment attempt count BEFORE publishing to Redis (same rationale as
     # _publish_and_notify: prevents unbounded retries on orchestrator crash).
@@ -631,7 +638,7 @@ def _publish_issue_and_notify(
             exc_info=True,
         )
         _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
-        return
+        return False
 
     # Publish to issue-specific stream (shared across all projects, lower priority than PR tasks)
     stream_redis = task_redis or redis
@@ -647,6 +654,7 @@ def _publish_issue_and_notify(
         raise
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
+    return True
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
