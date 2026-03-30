@@ -31,6 +31,8 @@ from orcest.orchestrator.task_publisher import (
     publish_issue_task,
     publish_rebase_task,
 )
+from orcest.orchestrator.token_pool import TokenPool
+from orcest.orchestrator.usage_check import get_token_reset_time
 from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
     clear_backoff,
@@ -77,6 +79,19 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         project_redis = RedisClient.from_client(redis.client, key_prefix=project.key_prefix)
         project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
+    # Create per-project token pools for round-robin Claude token distribution
+    token_pools: dict[str, TokenPool] = {}
+    for project in config.projects:
+        tokens = project.claude_tokens
+        if tokens:
+            token_pools[project.key_prefix] = TokenPool(tokens)
+            if len(tokens) > 1:
+                logger.info(
+                    "Project %s: token pool with %d Claude tokens",
+                    project.repo,
+                    len(tokens),
+                )
+
     # Graceful shutdown
     shutdown = False
 
@@ -99,7 +114,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(config, redis, task_redis, logger, pending_task_ttl)
+            _poll_cycle(config, redis, task_redis, token_pools, logger, pending_task_ttl)
         except Exception as e:
             logger.error("Poll cycle failed: %s", e, exc_info=True)
             # Continue after error -- don't crash the loop
@@ -117,6 +132,7 @@ def _poll_cycle(
     config: OrchestratorConfig,
     redis: RedisClient,
     task_redis: RedisClient,
+    token_pools: dict[str, TokenPool],
     logger: logging.Logger,
     pending_task_ttl: int,
 ) -> None:
@@ -130,7 +146,10 @@ def _poll_cycle(
     # Step 1: Consume results per project
     for project, project_redis in project_clients:
         try:
-            _consume_results_for_project(project, project_redis, config.labels, logger)
+            pool = token_pools.get(project.key_prefix)
+            _consume_results_for_project(
+                project, project_redis, config.labels, logger, token_pool=pool
+            )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
@@ -164,8 +183,10 @@ def _poll_cycle(
     total_issues = 0
     for project, project_redis in project_clients:
         try:
+            pool = token_pools.get(project.key_prefix)
             enqueued, merged, prs_checked, issues_checked = _poll_project(
-                project, project_redis, task_redis, config, logger, pending_task_ttl
+                project, project_redis, task_redis, config, logger, pending_task_ttl,
+                token_pool=pool,
             )
             total_enqueued += enqueued
             total_merged += merged
@@ -190,20 +211,36 @@ def _poll_project(
     config: OrchestratorConfig,
     logger: logging.Logger,
     pending_task_ttl: int,
+    token_pool: TokenPool | None = None,
 ) -> tuple[int, int, int, int]:
     """Poll a single project for actionable PRs and issues.
 
     Args:
         project_redis: Per-project Redis client (for pending markers, attempt counters, etc.).
         task_redis: Shared Redis client (for publishing tasks to the common stream).
+        token_pool: Optional token pool for round-robin Claude token selection.
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """
     logger = logger.getChild(project.repo)
     repo = project.repo
     token = project.token
-    claude_token = project.claude_token
     key_prefix = project.key_prefix
+
+    def _select_claude_token() -> str | None:
+        """Pick the next Claude token from the pool (round-robin).
+
+        Returns None if all tokens are exhausted (caller should skip enqueue).
+        Falls back to project.claude_token if no pool is configured.
+        """
+        if token_pool is None:
+            return project.claude_token
+        return token_pool.next_token()
+
+    def _register_task(task_id: str, claude_token: str) -> None:
+        """Record which token was used for a task (for exhaustion tracking)."""
+        if token_pool is not None:
+            token_pool.register_task(task_id, claude_token)
     labels = config.labels
 
     # Discover PRs needing action
@@ -260,29 +297,38 @@ def _poll_project(
                     logger.info(
                         f"PR #{pr_state.number}: merge conflict detected, enqueueing rebase task"
                     )
-                    try:
-                        publish_rebase_task(
-                            pr_state=pr_state,
-                            repo=repo,
-                            token=token,
-                            redis=project_redis,
-                            default_runner=config.default_runner,
-                            merge_error=err_msg[:200],
-                            pending_task_ttl=pending_task_ttl,
-                            logger=logger,
-                            claude_token=claude_token,
-                            key_prefix=key_prefix,
-                            task_redis=task_redis,
+                    ct = _select_claude_token()
+                    if ct is None:
+                        logger.warning(
+                            "All Claude tokens exhausted, skipping rebase for PR #%d",
+                            pr_state.number,
                         )
-                        enqueued += 1
-                    except Exception as rebase_err:
-                        logger.error(
-                            f"Failed to enqueue rebase task for PR #{pr_state.number}: "
-                            f"{rebase_err}",
-                            exc_info=True,
-                        )
-                        # Fall through to needs-human labeling
                         is_conflict = False
+                    else:
+                        try:
+                            task = publish_rebase_task(
+                                pr_state=pr_state,
+                                repo=repo,
+                                token=token,
+                                redis=project_redis,
+                                default_runner=config.default_runner,
+                                merge_error=err_msg[:200],
+                                pending_task_ttl=pending_task_ttl,
+                                logger=logger,
+                                claude_token=ct,
+                                key_prefix=key_prefix,
+                                task_redis=task_redis,
+                            )
+                            _register_task(task.id, ct)
+                            enqueued += 1
+                        except Exception as rebase_err:
+                            logger.error(
+                                f"Failed to enqueue rebase task for PR #{pr_state.number}: "
+                                f"{rebase_err}",
+                                exc_info=True,
+                            )
+                            # Fall through to needs-human labeling
+                            is_conflict = False
 
                 if not is_conflict:
                     labeled = False
@@ -402,8 +448,15 @@ def _poll_project(
                         continue  # skip the one we just merged
                     if other_pr.action != PRAction.SKIP_GREEN:
                         continue  # only proactively rebase green PRs
+                    ct = _select_claude_token()
+                    if ct is None:
+                        logger.warning(
+                            "All Claude tokens exhausted, skipping proactive rebase for PR #%d",
+                            other_pr.number,
+                        )
+                        continue
                     try:
-                        publish_rebase_task(
+                        task = publish_rebase_task(
                             pr_state=other_pr,
                             repo=repo,
                             token=token,
@@ -412,11 +465,12 @@ def _poll_project(
                             merge_error="",
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
-                            claude_token=claude_token,
+                            claude_token=ct,
                             key_prefix=key_prefix,
                             proactive=True,
                             task_redis=task_redis,
                         )
+                        _register_task(task.id, ct)
                     except Exception:
                         logger.warning(
                             "Failed to enqueue rebase for PR #%d",
@@ -425,105 +479,129 @@ def _poll_project(
                         )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
-            try:
-                result = publish_fix_task(
-                    pr_state=pr_state,
-                    repo=repo,
-                    token=token,
-                    redis=project_redis,
-                    default_runner=config.default_runner,
-                    pending_task_ttl=pending_task_ttl,
-                    logger=logger,
-                    claude_token=claude_token,
-                    key_prefix=key_prefix,
-                    task_redis=task_redis,
-                )
-                if result is not None:
-                    enqueued += 1
-            except Exception as e:
-                logger.error(
-                    "Failed to publish fix task for PR #%d: %s",
+            ct = _select_claude_token()
+            if ct is None:
+                logger.warning(
+                    "All Claude tokens exhausted, skipping fix task for PR #%d",
                     pr_state.number,
-                    e,
-                    exc_info=True,
                 )
+            else:
                 try:
-                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                except Exception as clear_err:
+                    result = publish_fix_task(
+                        pr_state=pr_state,
+                        repo=repo,
+                        token=token,
+                        redis=project_redis,
+                        default_runner=config.default_runner,
+                        pending_task_ttl=pending_task_ttl,
+                        logger=logger,
+                        claude_token=ct,
+                        key_prefix=key_prefix,
+                        task_redis=task_redis,
+                    )
+                    if result is not None:
+                        _register_task(result.id, ct)
+                        enqueued += 1
+                except Exception as e:
                     logger.error(
-                        "Failed to clear pending task marker for PR #%d: %s",
+                        "Failed to publish fix task for PR #%d: %s",
                         pr_state.number,
-                        clear_err,
+                        e,
                         exc_info=True,
                     )
+                    try:
+                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
+                    except Exception as clear_err:
+                        logger.error(
+                            "Failed to clear pending task marker for PR #%d: %s",
+                            pr_state.number,
+                            clear_err,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
             logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
-            try:
-                publish_followup_task(
-                    pr_state=pr_state,
-                    repo=repo,
-                    token=token,
-                    redis=project_redis,
-                    default_runner=config.default_runner,
-                    pending_task_ttl=pending_task_ttl,
-                    logger=logger,
-                    claude_token=claude_token,
-                    key_prefix=key_prefix,
-                    task_redis=task_redis,
-                )
-                enqueued += 1
-            except Exception as e:
-                logger.error(
-                    "Failed to publish followup task for PR #%d: %s",
+            ct = _select_claude_token()
+            if ct is None:
+                logger.warning(
+                    "All Claude tokens exhausted, skipping followup task for PR #%d",
                     pr_state.number,
-                    e,
-                    exc_info=True,
                 )
+            else:
                 try:
-                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                except Exception as clear_err:
+                    task = publish_followup_task(
+                        pr_state=pr_state,
+                        repo=repo,
+                        token=token,
+                        redis=project_redis,
+                        default_runner=config.default_runner,
+                        pending_task_ttl=pending_task_ttl,
+                        logger=logger,
+                        claude_token=ct,
+                        key_prefix=key_prefix,
+                        task_redis=task_redis,
+                    )
+                    _register_task(task.id, ct)
+                    enqueued += 1
+                except Exception as e:
                     logger.error(
-                        "Failed to clear pending task marker for PR #%d: %s",
+                        "Failed to publish followup task for PR #%d: %s",
                         pr_state.number,
-                        clear_err,
+                        e,
                         exc_info=True,
                     )
+                    try:
+                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
+                    except Exception as clear_err:
+                        logger.error(
+                            "Failed to clear pending task marker for PR #%d: %s",
+                            pr_state.number,
+                            clear_err,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.ENQUEUE_REBASE:
             logger.info(
                 "PR #%d (%s): merge conflicts detected, enqueueing rebase task",
                 pr_state.number,
                 pr_state.title,
             )
-            try:
-                publish_rebase_task(
-                    pr_state=pr_state,
-                    repo=repo,
-                    token=token,
-                    redis=project_redis,
-                    default_runner=config.default_runner,
-                    pending_task_ttl=pending_task_ttl,
-                    logger=logger,
-                    claude_token=claude_token,
-                    key_prefix=key_prefix,
-                    task_redis=task_redis,
-                )
-                enqueued += 1
-            except Exception as e:
-                logger.error(
-                    "Failed to publish rebase task for PR #%d: %s",
+            ct = _select_claude_token()
+            if ct is None:
+                logger.warning(
+                    "All Claude tokens exhausted, skipping rebase task for PR #%d",
                     pr_state.number,
-                    e,
-                    exc_info=True,
                 )
+            else:
                 try:
-                    clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                except Exception as clear_err:
+                    task = publish_rebase_task(
+                        pr_state=pr_state,
+                        repo=repo,
+                        token=token,
+                        redis=project_redis,
+                        default_runner=config.default_runner,
+                        pending_task_ttl=pending_task_ttl,
+                        logger=logger,
+                        claude_token=ct,
+                        key_prefix=key_prefix,
+                        task_redis=task_redis,
+                    )
+                    _register_task(task.id, ct)
+                    enqueued += 1
+                except Exception as e:
                     logger.error(
-                        "Failed to clear pending task marker for PR #%d: %s",
+                        "Failed to publish rebase task for PR #%d: %s",
                         pr_state.number,
-                        clear_err,
+                        e,
                         exc_info=True,
                     )
+                    try:
+                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
+                    except Exception as clear_err:
+                        logger.error(
+                            "Failed to clear pending task marker for PR #%d: %s",
+                            pr_state.number,
+                            clear_err,
+                            exc_info=True,
+                        )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.RETRIGGER_REVIEW:
@@ -798,33 +876,41 @@ def _poll_project(
             logger.info(
                 f"Issue #{issue_state.number} ({issue_state.title}): enqueueing implementation task"
             )
-            try:
-                publish_issue_task(
-                    issue_state=issue_state,
-                    repo=repo,
-                    token=token,
-                    redis=project_redis,
-                    default_runner=config.default_runner,
-                    pending_task_ttl=pending_task_ttl,
-                    logger=logger,
-                    claude_token=claude_token,
-                    key_prefix=key_prefix,
-                    task_redis=task_redis,
+            ct = _select_claude_token()
+            if ct is None:
+                logger.warning(
+                    "All Claude tokens exhausted, skipping issue task for issue #%d",
+                    issue_state.number,
                 )
-                enqueued += 1
-            except Exception as e:
-                logger.error(
-                    f"Failed to publish issue task for issue #{issue_state.number}: {e}",
-                    exc_info=True,
-                )
+            else:
                 try:
-                    clear_pending_task(project_redis, repo, "issue", issue_state.number)
-                except Exception as clear_err:
+                    task = publish_issue_task(
+                        issue_state=issue_state,
+                        repo=repo,
+                        token=token,
+                        redis=project_redis,
+                        default_runner=config.default_runner,
+                        pending_task_ttl=pending_task_ttl,
+                        logger=logger,
+                        claude_token=ct,
+                        key_prefix=key_prefix,
+                        task_redis=task_redis,
+                    )
+                    _register_task(task.id, ct)
+                    enqueued += 1
+                except Exception as e:
                     logger.error(
-                        f"Failed to clear pending task marker for issue #{issue_state.number}: "
-                        f"{clear_err}",
+                        f"Failed to publish issue task for issue #{issue_state.number}: {e}",
                         exc_info=True,
                     )
+                    try:
+                        clear_pending_task(project_redis, repo, "issue", issue_state.number)
+                    except Exception as clear_err:
+                        logger.error(
+                            f"Failed to clear pending task marker for issue #{issue_state.number}: "
+                            f"{clear_err}",
+                            exc_info=True,
+                        )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             logger.warning(
                 f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
@@ -883,6 +969,7 @@ def _consume_results_for_project(
     redis: RedisClient,
     labels: LabelConfig,
     logger: logging.Logger,
+    token_pool: TokenPool | None = None,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -909,7 +996,7 @@ def _consume_results_for_project(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(project, labels, redis, result, logger)
+                _handle_result(project, labels, redis, result, logger, token_pool=token_pool)
                 logger.info(f"Recovered pending result {entry_id}")
             except Exception as e:
                 logger.error(
@@ -940,7 +1027,7 @@ def _consume_results_for_project(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(project, labels, redis, result, logger)
+                _handle_result(project, labels, redis, result, logger, token_pool=token_pool)
             except Exception as e:
                 logger.error(
                     "Failed to process result entry %s: %s",
@@ -967,6 +1054,7 @@ def _handle_result(
     redis: RedisClient,
     result: TaskResult,
     logger: logging.Logger,
+    token_pool: TokenPool | None = None,
 ) -> None:
     """Process a single task result.
 
@@ -1062,6 +1150,17 @@ def _handle_result(
                     exc_info=True,
                 )
     elif result.status == ResultStatus.USAGE_EXHAUSTED and not is_issue:
+        # Mark the exhausted token in the pool so it's skipped in future rounds.
+        # Query the usage endpoint for the precise reset time; fall back to 30 min.
+        if token_pool is not None:
+            exhausted_token = token_pool.get_task_token(result.task_id)
+            cooldown_until = None
+            if exhausted_token:
+                try:
+                    cooldown_until = get_token_reset_time(exhausted_token)
+                except Exception as e:
+                    logger.warning("Failed to query token reset time: %s", e)
+            token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
         # Clear the per-SHA attempt counter so the PR can be re-enqueued once
         # the cooldown expires. The total-attempts counter is intentionally
         # preserved as a circuit-breaker across rate-limit cycles.
@@ -1196,3 +1295,7 @@ def _handle_result(
             )
 
         logger.info("Result comment: %s...", body[:100])
+
+    # Clean up token pool tracking for non-exhausted results
+    if token_pool is not None and result.status != ResultStatus.USAGE_EXHAUSTED:
+        token_pool.task_completed(result.task_id)
