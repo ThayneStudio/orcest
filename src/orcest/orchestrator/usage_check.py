@@ -56,7 +56,7 @@ def get_token_reset_time(token: str) -> datetime | None:
         # Find the window(s) that are near their limit
         candidates: list[datetime] = []
         for window in (five_hour, seven_day):
-            utilization = window.get("utilization", 0)
+            utilization = float(window.get("utilization", 0))
             resets_at = window.get("resets_at", "")
             if utilization >= 95 and resets_at:
                 parsed = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))

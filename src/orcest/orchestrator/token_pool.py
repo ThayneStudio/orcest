@@ -28,6 +28,8 @@ class TokenPool:
     def __init__(self, tokens: list[str]) -> None:
         if not tokens:
             raise ValueError("TokenPool requires at least one token")
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("TokenPool tokens must be unique")
         self._tokens = list(tokens)
         self._counter = 0
         self._cooldowns: dict[int, datetime] = {}  # index -> expiry (UTC)
@@ -71,6 +73,8 @@ class TokenPool:
         idx = self._token_index.get(token)
         if idx is not None:
             self._task_tokens[task_id] = idx
+        else:
+            logger.warning("register_task: token not in pool for task %s", task_id)
 
     def mark_exhausted(
         self,
