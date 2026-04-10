@@ -777,6 +777,7 @@ def _execute_task(
             branch=task.branch,
             summary=runner_result.summary,
             duration_seconds=duration,
+            rate_limit_resets_at=runner_result.rate_limit_resets_at,
         )
 
     except Exception as e:
