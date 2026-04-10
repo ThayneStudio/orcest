@@ -1158,11 +1158,24 @@ def _handle_result(
                 )
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
         # Mark the exhausted token in the pool so it's skipped in future rounds.
-        # Query the usage endpoint for the precise reset time; fall back to 30 min.
+        # Use the resets_at timestamp from the stream-json rate_limit_event if
+        # available; fall back to querying the usage endpoint; final fallback 30 min.
         if token_pool is not None:
             exhausted_token = token_pool.get_task_token(result.task_id)
             cooldown_until = None
-            if exhausted_token:
+            # Prefer the timestamp embedded in the task result (from stream-json)
+            if result.rate_limit_resets_at:
+                from datetime import datetime, timezone
+
+                cooldown_until = datetime.fromtimestamp(
+                    result.rate_limit_resets_at, tz=timezone.utc
+                )
+                logger.info(
+                    "Rate limit resets at %s (from stream-json)",
+                    cooldown_until.isoformat(),
+                )
+            elif exhausted_token:
+                # Fall back to querying the usage endpoint
                 try:
                     cooldown_until = get_token_reset_time(exhausted_token)
                 except Exception as e:
