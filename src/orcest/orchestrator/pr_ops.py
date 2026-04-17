@@ -412,8 +412,9 @@ def discover_actionable_prs(
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs with a pending task already queued
     5. Skip PRs that exceeded total cross-SHA attempt limit
-    6. Skip PRs that have been attempted but haven't changed (attempt count > 0)
-    7. Route PRs with merge conflicts (mergeable == CONFLICTING) to ENQUEUE_REBASE
+    6. Route PRs with merge conflicts to ENQUEUE_REBASE (before SKIP_ACTIVE
+       to avoid deadlock — conflicts can't resolve without a rebase)
+    7. Skip PRs that have been attempted but haven't changed (attempt count > 0)
     8. Fetch CI status; skip if checks are still pending or absent
     9. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
@@ -596,25 +597,10 @@ def discover_actionable_prs(
                 )
             )
             continue
-        if attempt_count > 0:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_ACTIVE,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
-                )
-            )
-            continue
-
-        # Route conflicting PRs to rebase before the expensive CI fetch.
-        # mergeable is fetched as part of list_open_prs (no extra API call).
-        # UNKNOWN means GitHub hasn't computed mergeability yet — ignore it.
+        # Route conflicting PRs to rebase before SKIP_ACTIVE — conflicts
+        # can't resolve without a rebase, so waiting for new commits would
+        # deadlock. SKIP_MAX_ATTEMPTS above still applies to prevent infinite
+        # rebase loops.
         if pr_data.get("mergeable") == "CONFLICTING":
             logger.info(
                 "PR #%d has merge conflicts (mergeable=CONFLICTING), enqueuing rebase",
@@ -627,6 +613,22 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.ENQUEUE_REBASE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        if attempt_count > 0:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_ACTIVE,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,

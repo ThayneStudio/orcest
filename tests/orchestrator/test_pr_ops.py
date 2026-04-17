@@ -1028,8 +1028,11 @@ def test_mergeable_pr_falls_through_to_ci(gh_mock, fake_redis_client, label_conf
     gh_mock.get_ci_status.assert_called_once()
 
 
-def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, label_config):
-    """A conflicting PR with attempt_count > 0 is SKIP_ACTIVE, not re-enqueued."""
+def test_conflicting_pr_enqueues_rebase_despite_attempt_counter(gh_mock, fake_redis_client, label_config):
+    """A conflicting PR with attempt_count > 0 routes to ENQUEUE_REBASE, not SKIP_ACTIVE.
+
+    Conflicts can't resolve without a rebase, so SKIP_ACTIVE would deadlock.
+    """
     pr_number = 403
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], mergeable="CONFLICTING", head_sha="sha1"),
@@ -1044,7 +1047,7 @@ def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, lab
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_ACTIVE
+    assert results[0].action == PRAction.ENQUEUE_REBASE
     gh_mock.get_ci_status.assert_not_called()
 
 
