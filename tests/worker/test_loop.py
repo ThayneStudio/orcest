@@ -210,6 +210,81 @@ class TestExecuteTask:
 
         assert result.status == ResultStatus.USAGE_EXHAUSTED
 
+    def test_runner_timeout_produces_transient_result(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """Runner timeout (success=False) produces a task result with [transient] prefix."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = RunnerResult(
+            success=False, summary="Timed out after 600s"
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.FAILED
+        assert result.summary.startswith("[transient] ")
+        assert "Timed out" in result.summary
+
+    def test_runner_crash_produces_transient_result(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """Runner crash (success=False, all retries exhausted) produces transient result."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = RunnerResult(
+            success=False, summary="Failed after 3 attempts"
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.FAILED
+        assert result.summary.startswith("[transient] ")
+        assert "Failed after 3 attempts" in result.summary
+
+    def test_usage_exhausted_not_marked_transient(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """usage_exhausted=True is NOT marked transient (already separate status)."""
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = RunnerResult(
+            success=False, summary="limit reached", usage_exhausted=True
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.USAGE_EXHAUSTED
+        assert not result.summary.startswith("[transient] ")
+        assert result.summary == "limit reached"
+
     def test_workspace_exception_returns_failed(
         self, local_worker_config, sample_task, mock_workspace
     ):

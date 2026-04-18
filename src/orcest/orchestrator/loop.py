@@ -6,12 +6,14 @@ interruptible sleep (1-second chunks) for responsive termination.
 """
 
 import logging
+import re
 import signal
 import sys
 import time
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
+from orcest.orchestrator.gh import GhRateLimitError
 from orcest.orchestrator.issue_ops import IssueAction, discover_actionable_issues
 from orcest.orchestrator.issue_ops import clear_attempts as clear_issue_attempts
 from orcest.orchestrator.pr_ops import (
@@ -51,6 +53,50 @@ from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
+
+# Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
+# Used to distinguish transient network failures from permanent merge errors.
+_MERGE_NETWORK_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"timed?\s*out",
+        r"ETIMEDOUT",
+        r"connection reset",
+        r"ECONNRESET",
+        r"ECONNREFUSED",
+        r"dial tcp",
+        r"TLS handshake",
+        r"socket hang up",
+        r"no such host",
+        r"i/o timeout",
+        r"network is unreachable",
+    ]
+]
+
+# Maximum number of merge retries for transient network errors before
+# falling through to the needs-human label path.
+_MAX_MERGE_RETRIES = 5
+
+
+def _is_network_error(msg: str) -> bool:
+    """Return True if *msg* matches any known network error pattern."""
+    return any(pat.search(msg) for pat in _MERGE_NETWORK_PATTERNS)
+
+
+def _make_merge_retries_key(repo: str, pr_number: int) -> str:
+    """Redis key for tracking merge retry count due to network errors."""
+    return f"pr:{repo}:{pr_number}:merge_retries"
+
+
+
+def _increment_merge_retries(redis: RedisClient, repo: str, pr_number: int) -> int:
+    """Increment and return the merge retry count. TTL 1 hour."""
+    key = _make_merge_retries_key(repo, pr_number)
+    pipe = redis.pipeline(transaction=True)
+    pipe.incr(key)
+    pipe.expire(key, 3600)  # 1-hour TTL
+    results = pipe.execute()
+    return results[0]
 
 
 def run_orchestrator(config: OrchestratorConfig) -> None:
@@ -332,6 +378,28 @@ def _poll_project(
                             is_conflict = False
 
                 if not is_conflict:
+                    # Check for transient network errors — retry silently
+                    # unless we've exceeded the merge retry budget.
+                    # GhRateLimitError is excluded: _run_gh() already
+                    # exhausted its own retry budget for rate limits.
+                    if (
+                        not isinstance(e, GhRateLimitError)
+                        and _is_network_error(err_msg)
+                    ):
+                        retry_count = _increment_merge_retries(
+                            project_redis, repo, pr_state.number
+                        )
+                        if retry_count <= _MAX_MERGE_RETRIES:
+                            logger.warning(
+                                "PR #%d: transient network error during merge "
+                                "(attempt %d/%d), will retry on next poll cycle: %s",
+                                pr_state.number,
+                                retry_count,
+                                _MAX_MERGE_RETRIES,
+                                err_msg[:200],
+                            )
+                            continue  # skip needs-human label
+
                     labeled = False
                     try:
                         gh.add_label(

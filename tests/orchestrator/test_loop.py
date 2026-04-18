@@ -1441,3 +1441,187 @@ def test_consume_results_multi_project_isolates_streams(fake_redis_client, gh_mo
     # and COMPLETED results are silent -- no comments or labels)
     gh_mock.post_comment.assert_not_called()
     gh_mock.add_label.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Merge network-error retry tests
+# ---------------------------------------------------------------------------
+
+
+def _make_merge_pr_state(number: int = 42) -> PRState:
+    """Build a minimal PRState with MERGE action for merge tests."""
+    return PRState(
+        number=number,
+        title=f"PR #{number}",
+        branch=f"feat/{number}",
+        head_sha="abc123",
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+
+def test_merge_network_error_skips_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A transient network error during merge skips the needs-human label."""
+    pr_state = _make_merge_pr_state(number=300)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("TLS handshake timeout")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should NOT label needs-human for transient network error
+    gh_mock.add_label.assert_not_called()
+    # Should NOT post a comment
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_merge_network_error_retry_exhaustion_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """After exceeding merge retry budget, network error falls through to needs-human."""
+    from orcest.orchestrator.loop import _increment_merge_retries
+
+    pr_state = _make_merge_pr_state(number=301)
+    repo = orchestrator_config.github.repo
+
+    # Pre-populate 5 retries (the max) so the next one should fall through
+    for _ in range(5):
+        _increment_merge_retries(fake_redis_client, repo, 301)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("TLS handshake timeout")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human because retry budget is exhausted
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        301,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    # Should post a comment about the failure
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "failed to merge" in comment_body
+
+
+def test_merge_conflict_not_classified_as_network_error(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A merge conflict is NOT classified as a network error (existing behavior preserved)."""
+    pr_state = _make_merge_pr_state(number=302)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    # Merge conflict error triggers the rebase path, not network retry
+    gh_mock.merge_pr.side_effect = RuntimeError("is not mergeable: the merge commit cannot be cleanly created")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Merge conflict should trigger rebase, not needs-human or network retry
+    # (the conflict handler attempts publish_rebase_task, not add_label)
+    # Verify needs-human was NOT labeled (rebase path was taken)
+    # Note: publish_rebase_task is mocked, so it won't actually enqueue
+    gh_mock.add_label.assert_not_called()
+
+
+def test_merge_gh_rate_limit_error_not_classified_as_network_error(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """GhRateLimitError is NOT classified as a network error -- falls through to needs-human."""
+    from orcest.orchestrator.gh import GhRateLimitError
+
+    pr_state = _make_merge_pr_state(number=303)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = GhRateLimitError("timed out waiting for rate limit reset")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human -- GhRateLimitError bypasses network retry
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        303,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+
+
+def test_non_network_merge_error_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A non-network, non-conflict merge error still labels needs-human."""
+    pr_state = _make_merge_pr_state(number=304)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("branch protection rule violation")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human for non-network error
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        304,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    # Should post a comment about the failure
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "failed to merge" in comment_body
+    assert "branch protection" in comment_body
