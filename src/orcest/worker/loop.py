@@ -755,6 +755,17 @@ def _execute_task(
         else:
             status = ResultStatus.FAILED
 
+        # All runner failures (success=False, not usage_exhausted) are
+        # infrastructure failures (timeout, crash, D-state, lock loss).
+        # Mark them transient so the orchestrator retries instead of
+        # labeling needs-human.  The total_attempts circuit breaker
+        # prevents infinite loops for persistent infra problems.
+        summary = runner_result.summary
+        if status == ResultStatus.FAILED and not summary.startswith(
+            TRANSIENT_SUMMARY_PREFIX
+        ):
+            summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
+
         try:
             redis.xadd_capped(
                 output_stream,
@@ -775,7 +786,7 @@ def _execute_task(
             resource_type=task.resource_type,
             resource_id=task.resource_id,
             branch=task.branch,
-            summary=runner_result.summary,
+            summary=summary,
             duration_seconds=duration,
             rate_limit_resets_at=runner_result.rate_limit_resets_at,
         )
