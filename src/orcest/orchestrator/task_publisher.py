@@ -900,6 +900,15 @@ def _render_fix_prompt(
         sections.append("## Review Feedback")
         sections.append("")
         sections.extend(_render_review_threads(review_threads))
+        sections.append(
+            "Before fixing each thread, identify the *class* of issue, not just "
+            "the cited instance. If a thread points at a specific file or line, "
+            "grep the codebase for the same pattern and fix all occurrences in "
+            "this round. Reviewers will catch missed siblings on the next pass; "
+            "fixing one at a time burns review cycles and risks exhausting the "
+            "retry budget."
+        )
+        sections.append("")
         sections.append("Address the review feedback above. For each thread:")
         sections.append("- If it requests a code change, make the fix and resolve the thread.")
         sections.append(
