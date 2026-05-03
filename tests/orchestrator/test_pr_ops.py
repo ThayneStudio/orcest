@@ -29,10 +29,8 @@ from orcest.orchestrator.pr_ops import (
     set_usage_exhausted_cooldown,
 )
 from orcest.shared.coordination import (
-    get_backoff_step,
     make_pending_task_key,
     make_pr_lock_key,
-    set_backoff_cooldown,
 )
 
 REPO = "test-org/test-repo"
@@ -573,6 +571,68 @@ def test_approved_thread_fetch_failure_skips_merge(gh_mock, fake_redis_client, l
     assert results[0].number == 150
 
 
+def test_changes_requested_all_threads_resolved_retriggers_review(
+    gh_mock,
+    fake_redis_client,
+    label_config,
+):
+    """CHANGES_REQUESTED + CI green + threads resolved + claude-review -> RETRIGGER_REVIEW."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(
+            number=155, labels=[], review_decision="CHANGES_REQUESTED", head_sha="abc999"
+        ),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+        {
+            "name": "claude-review",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+            "detailsUrl": "https://github.com/o/r/actions/runs/99999/job/1",
+        },
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_REVIEW
+    assert pr.review_run_id == 99999
+
+
+def test_changes_requested_all_threads_resolved_no_claude_review_skips(
+    gh_mock,
+    fake_redis_client,
+    label_config,
+):
+    """CHANGES_REQUESTED + CI green + all threads resolved + no claude-review -> SKIP_GREEN."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=156, labels=[], review_decision="CHANGES_REQUESTED"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.SKIP_GREEN
+    assert pr.review_threads == []
+
+
 def test_changes_requested_thread_fetch_failure_still_enqueues(
     gh_mock,
     fake_redis_client,
@@ -970,8 +1030,13 @@ def test_mergeable_pr_falls_through_to_ci(gh_mock, fake_redis_client, label_conf
     gh_mock.get_ci_status.assert_called_once()
 
 
-def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, label_config):
-    """A conflicting PR with attempt_count > 0 is SKIP_ACTIVE, not re-enqueued."""
+def test_conflicting_pr_enqueues_rebase_despite_attempt_counter(
+    gh_mock, fake_redis_client, label_config
+):
+    """A conflicting PR with attempt_count > 0 routes to ENQUEUE_REBASE, not SKIP_ACTIVE.
+
+    Conflicts can't resolve without a rebase, so SKIP_ACTIVE would deadlock.
+    """
     pr_number = 403
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], mergeable="CONFLICTING", head_sha="sha1"),
@@ -986,7 +1051,7 @@ def test_conflicting_pr_respects_attempt_counter(gh_mock, fake_redis_client, lab
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_ACTIVE
+    assert results[0].action == PRAction.ENQUEUE_REBASE
     gh_mock.get_ci_status.assert_not_called()
 
 
@@ -1114,21 +1179,12 @@ def test_no_skip_usage_cooldown_when_not_set(gh_mock, fake_redis_client, label_c
 # ---------------------------------------------------------------------------
 
 
-def test_total_attempts_backoff_first_hit_falls_through(gh_mock, fake_redis_client, label_config):
-    """A PR first exceeding max_total_attempts sets backoff cooldown and falls through.
-
-    On the first poll after hitting the limit, the PR sets a backoff cooldown,
-    clears per-SHA attempts, and falls through to normal CI/review routing
-    (allowing one more retry round).
-    """
+def test_total_attempts_at_limit_hard_stops(gh_mock, fake_redis_client, label_config):
+    """A PR at max_total_attempts is classified as SKIP_MAX_TOTAL_ATTEMPTS."""
     pr_number = 700
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
     ]
-    gh_mock.get_ci_status.return_value = [
-        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
-    ]
-    # Set total attempts to the limit
     for _ in range(10):
         increment_total_attempts(fake_redis_client, REPO, pr_number)
 
@@ -1141,36 +1197,7 @@ def test_total_attempts_backoff_first_hit_falls_through(gh_mock, fake_redis_clie
     )
 
     assert len(results) == 1
-    # Falls through to normal routing — CI failure detected
-    assert results[0].action == PRAction.ENQUEUE_FIX
-    # Backoff cooldown was set
-    assert get_backoff_step(fake_redis_client, REPO, pr_number) is not None
-    # Per-SHA attempts were cleared
-    assert get_attempt_count(fake_redis_client, REPO, pr_number, "") == 0
-
-
-def test_total_attempts_backoff_in_cooldown(gh_mock, fake_redis_client, label_config):
-    """A PR in backoff cooldown is classified as SKIP_BACKOFF."""
-    pr_number = 701
-    gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=pr_number, labels=[]),
-    ]
-    # Set total attempts above the limit
-    for _ in range(10):
-        increment_total_attempts(fake_redis_client, REPO, pr_number)
-    # Set an active backoff cooldown
-    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=0)
-
-    results = discover_actionable_prs(
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-        max_total_attempts=10,
-    )
-
-    assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_BACKOFF
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
     gh_mock.get_ci_status.assert_not_called()
 
 
@@ -1222,20 +1249,14 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
     assert results[0].action == PRAction.ENQUEUE_FIX
 
 
-def test_total_attempts_backoff_no_flag_sets_cooldown(gh_mock, fake_redis_client, label_config):
-    """When total_attempts >= limit and no backoff cooldown active, cooldown is set.
-
-    This is the first-time exhaustion case: the PR sets a backoff cooldown
-    and falls through to normal routing. The total attempt counter is preserved.
-    """
+def test_total_attempts_hard_stop_preserves_counter(gh_mock, fake_redis_client, label_config):
+    """Hard stop at max_total_attempts preserves the counter (no reset)."""
     pr_number = 740
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[]),
     ]
-    gh_mock.get_ci_status.return_value = []
     for _ in range(10):
         increment_total_attempts(fake_redis_client, REPO, pr_number)
-    # No backoff cooldown set
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1246,48 +1267,8 @@ def test_total_attempts_backoff_no_flag_sets_cooldown(gh_mock, fake_redis_client
     )
 
     assert len(results) == 1
-    # Falls through to normal routing (SKIP_NO_CHECKS with empty CI)
-    assert results[0].action == PRAction.SKIP_NO_CHECKS
-    # Counter was NOT reset
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
     assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 10
-    # Backoff cooldown was set
-    assert get_backoff_step(fake_redis_client, REPO, pr_number) is not None
-
-
-def test_total_attempts_skipped_with_exhausted_notified(gh_mock, fake_redis_client, label_config):
-    """When exhausted_notified IS set and needs-human label is absent, counters reset.
-
-    This is the human-approval recovery path: the orchestrator previously added
-    needs-human and set the flag; the human then removed the label. On the next
-    poll the circuit breaker is bypassed, counters are reset, and the PR
-    re-enters normal processing.
-    """
-    pr_number = 750
-    gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=pr_number, labels=[]),
-    ]
-    # PR has no CI checks configured after recovery.
-    gh_mock.get_ci_status.return_value = []
-    for _ in range(10):
-        increment_total_attempts(fake_redis_client, REPO, pr_number)
-    # Simulate: orchestrator previously set the flag when it added the needs-human label;
-    # human then removed the label (so pr_labels contains no needs_human entry).
-    set_exhausted_notified(fake_redis_client, REPO, pr_number)
-
-    results = discover_actionable_prs(
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-        max_total_attempts=10,
-    )
-
-    assert len(results) == 1
-    # Recovery fired — PR re-entered normal processing (SKIP_NO_CHECKS with empty CI).
-    assert results[0].action == PRAction.SKIP_NO_CHECKS
-    # Counter and flag are cleared by the recovery path.
-    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
 
 
 def test_total_attempts_no_recovery_when_needs_human_label_still_present(
@@ -1298,7 +1279,7 @@ def test_total_attempts_no_recovery_when_needs_human_label_still_present(
     SKIP_LABELED fires first (needs_human is in terminal_labels), so the PR
     never reaches the circuit-breaker block.  This test documents that invariant:
     counters are not cleared, and the result is SKIP_LABELED, not
-    SKIP_BACKOFF.
+    SKIP_MAX_TOTAL_ATTEMPTS.
     """
     pr_number = 751
     gh_mock.list_open_prs.return_value = [
@@ -1408,25 +1389,18 @@ def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
     assert ttl_after <= ttl_before
 
 
-def test_recovery_also_clears_per_sha_attempts(gh_mock, fake_redis_client, label_config):
-    """Recovery path clears per-SHA attempt counter as well as total_attempts.
-
-    If the per-SHA counter were left intact, SKIP_ACTIVE would fire immediately
-    after recovery even though the operator removed the needs-human label expecting
-    a retry, silently stalling the PR until new commits are pushed.
-    """
+def test_max_total_attempts_hard_stop_ignores_exhausted_notified(
+    gh_mock, fake_redis_client, label_config
+):
+    """Hard stop at max_total_attempts fires regardless of exhausted_notified flag."""
     pr_number = 763
     head_sha = "abc123"
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], head_sha=head_sha),
     ]
-    gh_mock.get_ci_status.return_value = []
 
-    # Seed both counters to their limits.
     for _ in range(10):
         increment_total_attempts(fake_redis_client, REPO, pr_number)
-    for _ in range(3):
-        increment_attempts(fake_redis_client, REPO, pr_number, head_sha)
     set_exhausted_notified(fake_redis_client, REPO, pr_number)
 
     results = discover_actionable_prs(
@@ -1434,17 +1408,12 @@ def test_recovery_also_clears_per_sha_attempts(gh_mock, fake_redis_client, label
         token="fake-token",
         redis=fake_redis_client,
         label_config=label_config,
-        max_attempts=3,
         max_total_attempts=10,
     )
 
     assert len(results) == 1
-    # Recovery fired and per-SHA counter was cleared, so the PR re-entered
-    # normal processing (SKIP_NO_CHECKS with empty CI) instead of SKIP_ACTIVE.
-    assert results[0].action == PRAction.SKIP_NO_CHECKS
-    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
-    assert not get_exhausted_notified(fake_redis_client, REPO, pr_number)
-    assert get_attempt_count(fake_redis_client, REPO, pr_number, head_sha) == 0
+    assert results[0].action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS
+    gh_mock.get_ci_status.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

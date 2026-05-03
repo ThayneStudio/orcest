@@ -33,7 +33,7 @@ def _cfg(**kwargs) -> FleetConfig:
             ssh_key="ssh-ed25519 AAAA...",
             disk_size=20,
         ),
-        orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_token="sk_def")},
+        orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_tokens=["sk_def"])},
         projects=[],
     )
     defaults.update(kwargs)

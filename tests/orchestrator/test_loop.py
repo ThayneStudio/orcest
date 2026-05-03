@@ -121,7 +121,7 @@ def test_poll_cycle_enqueues_tasks(mocker, fake_redis_client, orchestrator_confi
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_publish.assert_called_once()
     assert mock_publish.call_args.kwargs["pr_state"] is pr_state
@@ -142,7 +142,7 @@ def test_poll_cycle_skips_non_actionable(mocker, fake_redis_client, orchestrator
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_publish.assert_not_called()
 
@@ -169,7 +169,7 @@ def test_poll_cycle_enqueues_followup(mocker, fake_redis_client, orchestrator_co
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_followup.assert_called_once()
     assert mock_followup.call_args.kwargs["pr_state"] is pr_state
@@ -201,7 +201,7 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     assert get_total_attempt_count(fake_redis_client, repo, 40) == 1
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     gh_mock.merge_pr.assert_called_once_with(
         orchestrator_config.github.repo,
@@ -245,7 +245,7 @@ def test_poll_cycle_merge_failure_labels_needs_human(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Should label needs-human after merge failure
     gh_mock.add_label.assert_called_once_with(
@@ -279,7 +279,7 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Should add needs-human label
     gh_mock.add_label.assert_called_once_with(
@@ -313,7 +313,7 @@ def test_poll_cycle_skip_max_attempts_sets_exhausted_notified(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Label was applied successfully
     gh_mock.add_label.assert_called_once()
@@ -341,7 +341,7 @@ def test_poll_cycle_skip_max_attempts_label_failure_does_not_set_exhausted_notif
     gh_mock.add_label.side_effect = RuntimeError("label API down")
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # exhausted_notified flag must NOT be set when labeling failed
     assert not get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 52)
@@ -365,7 +365,7 @@ def test_poll_cycle_skip_backoff_no_label_no_comment(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # No labels should be added
     gh_mock.add_label.assert_not_called()
@@ -389,7 +389,7 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
     logger = logging.getLogger("test")
 
     # Should not raise — per-project error isolation catches and logs
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +825,7 @@ def test_poll_cycle_merge_comment_failure_logged(
 
     logger = logging.getLogger("test")
     # Should not raise -- comment failure is caught and logged
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # merge_pr was still called successfully
     gh_mock.merge_pr.assert_called_once_with(
@@ -869,7 +869,7 @@ def test_poll_cycle_merge_fail_label_fail(
     gh_mock.add_label.side_effect = RuntimeError("label API down")
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Comment should say "Failed to add" since labeling failed
     gh_mock.post_comment.assert_called_once()
@@ -900,7 +900,7 @@ def test_poll_cycle_enqueue_fix_publish_failure(
 
     logger = logging.getLogger("test")
     # Should not raise -- publish failure is caught inside _poll_cycle
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_publish.assert_called_once()
 
@@ -936,7 +936,7 @@ def test_poll_cycle_enqueue_followup_publish_failure(
 
     logger = logging.getLogger("test")
     # Should not raise -- publish failure is caught inside _poll_cycle
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_followup.assert_called_once()
 
@@ -961,7 +961,7 @@ def test_poll_cycle_skip_max_attempts_label_failure(
     gh_mock.add_label.side_effect = RuntimeError("label API down")
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # add_label was attempted
     gh_mock.add_label.assert_called_once()
@@ -992,7 +992,7 @@ def test_poll_cycle_skip_draft_action(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # No task should be published and no merge attempted
     mock_publish.assert_not_called()
@@ -1020,7 +1020,7 @@ def test_poll_cycle_skip_pending_action(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # No task should be published and no merge attempted
     mock_publish.assert_not_called()
@@ -1108,7 +1108,7 @@ def test_poll_cycle_retrigger_review(mocker, fake_redis_client, orchestrator_con
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     gh_mock.rerun_workflow.assert_called_once_with(
         orchestrator_config.github.repo,
@@ -1151,7 +1151,7 @@ def test_poll_cycle_retrigger_review_failure_logged(
 
     logger = logging.getLogger("test")
     # Should not raise
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     gh_mock.rerun_workflow.assert_called_once()
 
@@ -1201,7 +1201,7 @@ def test_poll_cycle_proactive_rebase_skip_green_sibling(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_rebase.assert_called_once()
     assert mock_rebase.call_args.kwargs["pr_state"] is green_pr
@@ -1253,7 +1253,7 @@ def test_poll_cycle_proactive_rebase_skips_non_green_siblings(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_rebase.assert_not_called()
 
@@ -1285,7 +1285,7 @@ def test_poll_cycle_proactive_rebase_skips_merged_pr_itself(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_rebase.assert_not_called()
 
@@ -1329,7 +1329,7 @@ def test_poll_cycle_proactive_rebase_exception_does_not_propagate(
 
     logger = logging.getLogger("test")
     # Must not raise
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -1471,7 +1471,7 @@ def test_poll_cycle_retrigger_stale_checks_cooldown_skips(
     )
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # No GitHub operations — cooldown suppresses all action
     gh_mock.cancel_workflow.assert_not_called()
@@ -1498,7 +1498,7 @@ def test_poll_cycle_retrigger_stale_checks_no_run_ids_escalates(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Should add needs-human label
     gh_mock.add_label.assert_called_once_with(
@@ -1540,7 +1540,7 @@ def test_poll_cycle_retrigger_stale_checks_cancels_and_reruns(
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # cancel_workflow called for each run ID
     assert gh_mock.cancel_workflow.call_count == 2
@@ -1581,7 +1581,7 @@ def test_poll_cycle_retrigger_stale_checks_sets_sha_even_if_cancel_fails(
     gh_mock.cancel_workflow.side_effect = RuntimeError("GitHub error")
 
     logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, logger, 3600)
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Cancel was attempted
     gh_mock.cancel_workflow.assert_called_once()
@@ -1614,13 +1614,13 @@ def _make_multi_project_config(label_config=None):
             ProjectConfig(
                 repo="acme/frontend",
                 token="token-frontend",
-                claude_token="claude-frontend",
+                claude_tokens=["claude-frontend"],
                 key_prefix="frontend",
             ),
             ProjectConfig(
                 repo="acme/backend",
                 token="token-backend",
-                claude_token="claude-backend",
+                claude_tokens=["claude-backend"],
                 key_prefix="backend",
             ),
         ],
@@ -1651,7 +1651,7 @@ def test_poll_cycle_multi_project_polls_each_project(mocker, fake_redis_client, 
         project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     logger = logging.getLogger("test")
-    _poll_cycle(config, fake_redis_client, logger, 3600)
+    _poll_cycle(config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # discover_actionable_prs should be called once per project
     assert mock_discover_prs.call_count == 2
@@ -1698,7 +1698,7 @@ def test_poll_cycle_multi_project_error_isolation(mocker, fake_redis_client, gh_
     logger = logging.getLogger("test")
 
     # Should not raise -- per-project error isolation catches and logs
-    _poll_cycle(config, fake_redis_client, logger, 3600)
+    _poll_cycle(config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Both projects were attempted despite the first one raising
     assert "acme/frontend" in call_repos
@@ -1715,13 +1715,13 @@ def test_consume_results_multi_project_isolates_streams(fake_redis_client, gh_mo
     project_a = ProjectConfig(
         repo="acme/frontend",
         token="token-a",
-        claude_token="claude-a",
+        claude_tokens=["claude-a"],
         key_prefix="proj_a",
     )
     project_b = ProjectConfig(
         repo="acme/backend",
         token="token-b",
-        claude_token="claude-b",
+        claude_tokens=["claude-b"],
         key_prefix="proj_b",
     )
 
@@ -1780,3 +1780,189 @@ def test_consume_results_multi_project_isolates_streams(fake_redis_client, gh_mo
     # and COMPLETED results are silent -- no comments or labels)
     gh_mock.post_comment.assert_not_called()
     gh_mock.add_label.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Merge network-error retry tests
+# ---------------------------------------------------------------------------
+
+
+def _make_merge_pr_state(number: int = 42) -> PRState:
+    """Build a minimal PRState with MERGE action for merge tests."""
+    return PRState(
+        number=number,
+        title=f"PR #{number}",
+        branch=f"feat/{number}",
+        head_sha="abc123",
+        action=PRAction.MERGE,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+
+def test_merge_network_error_skips_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A transient network error during merge skips the needs-human label."""
+    pr_state = _make_merge_pr_state(number=300)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("TLS handshake timeout")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should NOT label needs-human for transient network error
+    gh_mock.add_label.assert_not_called()
+    # Should NOT post a comment
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_merge_network_error_retry_exhaustion_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """After exceeding merge retry budget, network error falls through to needs-human."""
+    from orcest.orchestrator.loop import _increment_merge_retries
+
+    pr_state = _make_merge_pr_state(number=301)
+    repo = orchestrator_config.github.repo
+
+    # Pre-populate 5 retries (the max) so the next one should fall through
+    for _ in range(5):
+        _increment_merge_retries(fake_redis_client, repo, 301)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("TLS handshake timeout")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human because retry budget is exhausted
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        301,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    # Should post a comment about the failure
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "failed to merge" in comment_body
+
+
+def test_merge_conflict_not_classified_as_network_error(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A merge conflict is NOT classified as a network error (existing behavior preserved)."""
+    pr_state = _make_merge_pr_state(number=302)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    # Merge conflict error triggers the rebase path, not network retry
+    gh_mock.merge_pr.side_effect = RuntimeError(
+        "is not mergeable: the merge commit cannot be cleanly created"
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Merge conflict should trigger rebase, not needs-human or network retry
+    # (the conflict handler attempts publish_rebase_task, not add_label)
+    # Verify needs-human was NOT labeled (rebase path was taken)
+    # Note: publish_rebase_task is mocked, so it won't actually enqueue
+    gh_mock.add_label.assert_not_called()
+
+
+def test_merge_gh_rate_limit_error_not_classified_as_network_error(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """GhRateLimitError is NOT classified as a network error -- falls through to needs-human."""
+    from orcest.orchestrator.gh import GhRateLimitError
+
+    pr_state = _make_merge_pr_state(number=303)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = GhRateLimitError("timed out waiting for rate limit reset")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human -- GhRateLimitError bypasses network retry
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        303,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+
+
+def test_non_network_merge_error_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A non-network, non-conflict merge error still labels needs-human."""
+    pr_state = _make_merge_pr_state(number=304)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError("branch protection rule violation")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # Should label needs-human for non-network error
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        304,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    # Should post a comment about the failure
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "failed to merge" in comment_body
+    assert "branch protection" in comment_body

@@ -418,14 +418,19 @@ def fleet() -> None:
     help="GitHub PAT (classic: repo+workflow scopes; "
     "fine-grained: contents, issues, pull-requests, actions R/W).",
 )
-@click.option("--claude-token", required=True, help="Claude OAuth token for this org.")
+@click.option(
+    "--claude-token",
+    required=True,
+    multiple=True,
+    help="Claude OAuth token(s). Repeat for round-robin pool.",
+)
 @click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
-def add_org(org_name: str, github_token: str, claude_token: str, config: str) -> None:
+def add_org(org_name: str, github_token: str, claude_token: tuple[str, ...], config: str) -> None:
     """Register a GitHub organization with its credentials.
 
     ORG_NAME is the GitHub org or user (e.g. 'ThayneStudio').
@@ -468,10 +473,12 @@ def add_org(org_name: str, github_token: str, claude_token: str, config: str) ->
 
     cfg.orgs[org_name] = OrgEntry(
         github_token=github_token,
-        claude_oauth_token=claude_token,
+        claude_oauth_tokens=list(claude_token),
     )
     save_config(cfg, config)
-    console.print(f"\n[bold]Org '{org_name}' registered.[/bold]")
+    token_count = len(claude_token)
+    pool_note = f" ({token_count} Claude tokens)" if token_count > 1 else ""
+    console.print(f"\n[bold]Org '{org_name}' registered{pool_note}.[/bold]")
 
 
 @fleet.command("create-orchestrator")
@@ -711,7 +718,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             github_token=org.github_token,
             key_prefix=project_name,
             project_name=project_name,
-            claude_token=org.claude_oauth_token,
+            claude_tokens=org.claude_oauth_tokens,
         )
         config_yaml = generate_orchestrator_config(
             repo=repo,

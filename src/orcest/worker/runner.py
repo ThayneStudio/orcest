@@ -26,6 +26,7 @@ class RunnerResult:
     success: bool
     summary: str
     usage_exhausted: bool = False
+    rate_limit_resets_at: int = 0  # Unix timestamp when rate limit resets (0 = unknown)
 
 
 class Runner(Protocol):

@@ -67,7 +67,7 @@ def test_onboard_creates_project(runner, cfg_path, mocker):
     """fleet onboard creates a new project entry in the config."""
     cfg = FleetConfig(
         orchestrator=OrchestratorConfig(host="10.20.0.23"),
-        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_token="sk-fake")},
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
@@ -100,7 +100,7 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
     """fleet onboard --name overrides the derived project name."""
     cfg = FleetConfig(
         orchestrator=OrchestratorConfig(host="10.20.0.23"),
-        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_token="sk-fake")},
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
@@ -129,7 +129,7 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
 def test_onboard_requires_orchestrator_host(runner, cfg_path):
     """fleet onboard fails if orchestrator host is not set."""
     cfg = FleetConfig(
-        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_token="sk-fake")},
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
     result = runner.invoke(
@@ -168,7 +168,7 @@ def test_onboard_duplicate_fails(runner, cfg_path):
     """fleet onboard fails if project already exists."""
     cfg = FleetConfig(
         orchestrator=OrchestratorConfig(host="10.20.0.23"),
-        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_token="sk-fake")},
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
         projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
     )
     _save(cfg, cfg_path)

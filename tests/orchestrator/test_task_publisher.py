@@ -19,6 +19,7 @@ from orcest.orchestrator.task_publisher import (
     publish_issue_task,
 )
 from orcest.shared.models import Task, TaskType
+from orcest.shared.redis_client import RedisClient
 
 
 def _make_pr_state(
@@ -1421,3 +1422,70 @@ def test_no_ci_failures_not_transient_path(gh_mock, fake_redis_client):
     # Review-only fix: Claude task created normally
     assert isinstance(result, Task)
     gh_mock.rerun_workflow.assert_not_called()
+
+
+def test_task_redis_receives_xadd(gh_mock, fake_redis_server):
+    """When task_redis is provided, xadd_capped goes to task_redis, not redis."""
+    import fakeredis
+
+    _setup_gh_defaults(gh_mock)
+    pr_state = _make_pr_state(number=99)
+
+    # Two separate RedisClients with different prefixes sharing the same server
+    project_fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+    project_redis = RedisClient.from_client(project_fake, key_prefix="project-a")
+
+    shared_fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+    task_redis = RedisClient.from_client(shared_fake, key_prefix="shared")
+
+    publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=project_redis,
+        default_runner="claude",
+        task_redis=task_redis,
+    )
+
+    # Task should land in shared:tasks:claude, NOT project-a:tasks:claude
+    shared_entries = shared_fake.xrange("shared:tasks:claude")
+    project_entries = project_fake.xrange("project-a:tasks:claude")
+    assert len(shared_entries) == 1
+    assert len(project_entries) == 0
+
+    # Pending marker should be in project-a namespace (per-project state)
+    pending_key = project_fake.get("project-a:pending:pr:test-org/test-repo:99")
+    assert pending_key is not None
+
+
+def test_issue_task_redis_receives_xadd(gh_mock, fake_redis_server):
+    """When task_redis is provided for issue tasks, xadd goes to task_redis."""
+    import fakeredis
+
+    issue_state = IssueState(
+        number=10,
+        title="Add feature",
+        body="Implement the feature",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    project_fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+    project_redis = RedisClient.from_client(project_fake, key_prefix="project-b")
+
+    shared_fake = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+    task_redis = RedisClient.from_client(shared_fake, key_prefix="shared")
+
+    publish_issue_task(
+        issue_state=issue_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=project_redis,
+        default_runner="claude",
+        task_redis=task_redis,
+    )
+
+    shared_entries = shared_fake.xrange("shared:tasks:issue:claude")
+    project_entries = project_fake.xrange("project-b:tasks:issue:claude")
+    assert len(shared_entries) == 1
+    assert len(project_entries) == 0

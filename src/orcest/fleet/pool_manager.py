@@ -19,6 +19,7 @@ import time
 from orcest.fleet.cloud_init import render_clone_userdata
 from orcest.fleet.config import FleetConfig
 from orcest.fleet.proxmox_api import ProxmoxClient, mac_for_vm_id
+from orcest.shared.models import CONSUMER_GROUP
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -30,9 +31,6 @@ _POOL_DONE_PREFIX = "pool:done:"
 
 # VM naming convention
 _VM_NAME_PREFIX = "orcest-worker-"
-
-# Consumer group used by workers (must match worker/loop.py)
-_CONSUMER_GROUP = "workers"
 
 
 class PoolManager:
@@ -58,20 +56,12 @@ class PoolManager:
         proxmox: ProxmoxClient,
         redis: RedisClient,
         key_prefix: str = "orcest",
-        projects: list[str] | None = None,
     ) -> None:
         self._config = config
         self._proxmox = proxmox
         self._redis = redis
         self._pool = config.pool
         self._key_prefix = key_prefix
-        # Derive project names from FleetConfig if not explicitly provided
-        if projects is not None:
-            self._projects = projects
-        elif config.projects:
-            self._projects = [p.name for p in config.projects]
-        else:
-            self._projects = [key_prefix]
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -141,10 +131,10 @@ class PoolManager:
             except Exception:
                 continue
             for group in groups:
-                if group.get("name") != _CONSUMER_GROUP:
+                if group.get("name") != CONSUMER_GROUP:
                     continue
                 try:
-                    consumers = self._redis.xinfo_consumers_raw(stream_name, _CONSUMER_GROUP)
+                    consumers = self._redis.xinfo_consumers_raw(stream_name, CONSUMER_GROUP)
                 except Exception:
                     continue
                 for consumer in consumers:
@@ -314,8 +304,8 @@ class PoolManager:
         try:
             userdata = render_clone_userdata(
                 redis_host=self._config.orchestrator.host,
-                key_prefixes=self._projects,
                 worker_id=name,
+                key_prefix=self._key_prefix,
             )
             self._proxmox.set_cloud_init_userdata(
                 new_id,
@@ -558,16 +548,12 @@ class PoolManager:
     # ── helpers ──────────────────────────────────────────────
 
     def _task_streams(self) -> tuple[str, ...]:
-        """Build fully-qualified task stream names from the projects list."""
-        streams: list[str] = []
-        seen: set[str] = set()
-        for project in self._projects:
-            for suffix in ("tasks:claude", "tasks:issue:claude"):
-                fq = f"{project}:{suffix}"
-                if fq not in seen:
-                    seen.add(fq)
-                    streams.append(fq)
-        return tuple(streams)
+        """Build fully-qualified shared task stream names."""
+        prefix = self._key_prefix
+        return (
+            f"{prefix}:tasks:claude",
+            f"{prefix}:tasks:issue:claude",
+        )
 
     def _next_vm_id(self) -> int:
         """Allocate the next VM ID from the configured pool range.

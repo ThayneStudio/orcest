@@ -29,15 +29,28 @@ def test_empty_redis_returns_valid_snapshot(fake_redis_client):
 
 
 def test_queue_depths(fake_redis_client):
-    """Reports correct queue depths for task streams."""
+    """Reports pending+lag from consumer groups, not XLEN."""
+    # Without consumer groups, queue depths are empty
     fake_redis_client.xadd("tasks:claude", {"id": "1", "repo": "org/repo"})
-    fake_redis_client.xadd("tasks:claude", {"id": "2", "repo": "org/repo"})
-    fake_redis_client.xadd("tasks:noop", {"id": "3", "repo": "org/repo"})
-
     snap = fetch_snapshot(fake_redis_client)
+    assert snap.queue_depths == {}
 
-    assert snap.queue_depths["tasks:claude"] == 2
-    assert snap.queue_depths["tasks:noop"] == 1
+    # Create consumer group and add entries — depth reflects undelivered work
+    fake_redis_client.ensure_consumer_group("tasks:claude", "workers")
+    fake_redis_client.xadd("tasks:claude", {"id": "2", "repo": "org/repo"})
+    snap = fetch_snapshot(fake_redis_client)
+    assert snap.queue_depths["tasks:claude"] > 0
+
+    # Read all entries — they become pending (delivered, not ACKed)
+    entries = fake_redis_client.xreadgroup("workers", "w1", "tasks:claude", count=10, block_ms=0)
+    snap = fetch_snapshot(fake_redis_client)
+    assert snap.queue_depths["tasks:claude"] == len(entries)  # pending = delivered count
+
+    # ACK all entries — depth drops to 0
+    for entry_id, _fields in entries:
+        fake_redis_client.xack("tasks:claude", "workers", entry_id)
+    snap = fetch_snapshot(fake_redis_client)
+    assert snap.queue_depths["tasks:claude"] == 0
 
 
 def test_results_depth(fake_redis_client):
