@@ -7,6 +7,8 @@ and configures the appropriate services.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import yaml
 
 # ── Shared building blocks ──────────────────────────────────
@@ -49,6 +51,35 @@ _PLAYWRIGHT_MAJOR = "1"  # 1.x line — npx resolves latest 1.x at install time
 # Hard-pinned tools (replace dynamic fetches / opaque defaults).
 # Bump when rebaking; verify against https://github.com/supabase/cli/releases
 _SUPABASE_VERSION = "2.95.4"
+
+
+def _template_versions_write_file() -> dict:
+    """Build the cloud-init write_files entry for ``/etc/orcest/template.versions``.
+
+    System-level audit metadata recording which baked-in tool versions
+    were on the template at rebake time. Owner ``root:root`` so it
+    doesn't depend on the orcest user existing — this entry can run in
+    the cc_write_files config stage without ``defer``.
+
+    The ``bumped_at`` timestamp is captured at render time, which for the
+    template-bake flow is when ``orcest fleet rebake`` (or
+    ``create-template``) builds the userdata document. Patch versions
+    floating in NodeSource / npm / Playwright registries are NOT recorded
+    — only the major-version pins under our control.
+    """
+    bumped_at = datetime.now(timezone.utc).isoformat()
+    content = (
+        f"node_major={_NODE_MAJOR}\n"
+        f"playwright_major={_PLAYWRIGHT_MAJOR}\n"
+        f"supabase_version={_SUPABASE_VERSION}\n"
+        f"bumped_at={bumped_at}\n"
+    )
+    return {
+        "path": "/etc/orcest/template.versions",
+        "owner": "root:root",
+        "permissions": "0644",
+        "content": content,
+    }
 
 
 def _orcest_user(ssh_public_key: str = "") -> dict:
@@ -266,11 +297,18 @@ def render_template_userdata(
                 "content": netplan_content,
             },
             {
+                # ``defer: true`` runs this write at the cc_scripts_user
+                # stage (after cc_users_groups), so the ``orcest`` user
+                # exists by the time cloud-init resolves ``orcest:orcest``.
+                # Without defer, cc_write_files runs in the config stage
+                # and logs ``Unknown user or group: "orcest"``.
                 "path": "/home/orcest/.claude.json",
                 "owner": "orcest:orcest",
                 "permissions": "0644",
                 "content": '{"hasCompletedOnboarding": true}',
+                "defer": True,
             },
+            _template_versions_write_file(),
         ],
         runcmd=[
             *_guest_agent_runcmd(),
@@ -323,10 +361,14 @@ def render_clone_userdata(
         "hostname": worker_id,
         "write_files": [
             {
+                # ``defer`` ensures the orcest user exists before the file
+                # is chowned to it (cc_write_files otherwise runs in the
+                # config stage, before cc_users_groups).
                 "path": "/opt/orcest/worker.yaml",
                 "owner": "orcest:orcest",
                 "permissions": "0600",
                 "content": worker_yaml,
+                "defer": True,
             },
             {
                 "path": "/etc/systemd/system/orcest-worker.service",
@@ -338,6 +380,7 @@ def render_clone_userdata(
                 "owner": "orcest:orcest",
                 "permissions": "0644",
                 "content": '{"hasCompletedOnboarding": true}',
+                "defer": True,
             },
         ],
         "runcmd": [
@@ -414,17 +457,22 @@ def render_worker_userdata(
     claude_json = '{"hasCompletedOnboarding": true}'
 
     write_files = [
+        # ``defer: true`` waits for cc_users_groups to create the orcest
+        # user before chown/chmod — the config stage runs cc_write_files
+        # before users exist, which logs ``Unknown user or group: "orcest"``.
         {
             "path": "/opt/orcest/worker.yaml",
             "owner": "orcest:orcest",
             "permissions": "0600",
             "content": worker_yaml,
+            "defer": True,
         },
         {
             "path": "/opt/orcest/.env",
             "owner": "orcest:orcest",
             "permissions": "0600",
             "content": env_content,
+            "defer": True,
         },
         {
             "path": "/etc/systemd/system/orcest-worker.service",
@@ -436,12 +484,14 @@ def render_worker_userdata(
             "owner": "orcest:orcest",
             "permissions": "0644",
             "content": claude_json,
+            "defer": True,
         },
         {
             "path": "/opt/orcest/.gh-token",
             "owner": "orcest:orcest",
             "permissions": "0600",
             "content": f"{github_token}\n",
+            "defer": True,
         },
     ]
 

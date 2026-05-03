@@ -996,6 +996,92 @@ class TestReconcileOrphans:
 
         proxmox.stop_vm.assert_not_called()
 
+    def test_proxmox_template_flag_protects_vm(self):
+        """Bug 1: a VM with Proxmox ``template: 1`` is never destroyed.
+
+        Defence in depth: even if the VMID is outside ``template_vmid_range``
+        and not the active pointer, a Proxmox-marked template (e.g. the
+        result of a partial rebake where the Redis pointer swap failed)
+        must survive orphan reconciliation.
+        """
+        # No range, no pointer; only the Proxmox template flag protects VM 9001.
+        config = _make_config(template_vm_id=9000, vm_id_start=300)
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [
+            {
+                "vmid": 9001,
+                "name": "orcest-worker-template",
+                "status": "stopped",
+                "template": 1,
+            },
+        ]
+        redis._idle_set = set()
+        redis.hgetall.return_value = {}
+
+        manager._reconcile_orphans()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_template_in_range_protected(self):
+        """Bug 1: every VMID in ``template_vmid_range`` is skipped."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(
+                template_vmid_range=[9000, 9009],
+                template_vm_id=9000,
+                vm_id_start=10000,
+            ),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [
+            # Freshly baked, not yet template-converted, no Redis pointer.
+            {"vmid": 9001, "name": "orcest-worker-template", "status": "running"},
+        ]
+        redis._idle_set = set()
+        redis.hgetall.return_value = {}
+
+        manager._reconcile_orphans()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_active_pointer_protected_outside_range(self):
+        """Bug 1: the active Redis pointer is honoured even without a range."""
+        config = _make_config(template_vm_id=9000, vm_id_start=300)
+        manager, proxmox, redis = _make_manager(config=config)
+        # Active pointer was swapped to 9001 (no range configured).
+        redis.get.return_value = "9001"
+        proxmox.list_vms.return_value = [
+            {"vmid": 9001, "name": "orcest-worker-template", "status": "stopped"},
+        ]
+        redis._idle_set = set()
+        redis.hgetall.return_value = {}
+
+        manager._reconcile_orphans()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_proxmox_template_boolean_flag(self):
+        """Bug 1: ``template: True`` (boolean) also protects the VM."""
+        config = _make_config(template_vm_id=9000, vm_id_start=300)
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.list_vms.return_value = [
+            {
+                "vmid": 9001,
+                "name": "orcest-worker-template",
+                "status": "stopped",
+                "template": True,
+            },
+        ]
+        redis._idle_set = set()
+        redis.hgetall.return_value = {}
+
+        manager._reconcile_orphans()
+
+        proxmox.destroy_vm.assert_not_called()
+
 
 # ── _reconcile_stale_redis ──────────────────────────────────
 

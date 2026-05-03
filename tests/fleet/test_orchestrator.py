@@ -340,6 +340,78 @@ class TestCleanPoolRedis:
         ssh.assert_not_called()
 
 
+class TestRedisCliRoutedThroughDockerExec:
+    """Bug 3: redis-cli must run inside the orcest-redis-redis-1 container."""
+
+    def _ok(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def test_set_current_template_vmid_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_vmid
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        set_current_template_vmid("user@host", 9001)
+        cmd = ssh.call_args[0][1]
+        assert "sudo docker exec orcest-redis-redis-1 redis-cli" in cmd
+        assert "SET orcest:pool:current_template_vmid" in cmd
+        assert "9001" in cmd
+
+    def test_get_current_template_vmid_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_current_template_vmid
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="9001\n", stderr=""
+            ),
+        )
+        result = get_current_template_vmid("user@host")
+        assert result == 9001
+        cmd = ssh.call_args[0][1]
+        assert "sudo docker exec orcest-redis-redis-1 redis-cli" in cmd
+        assert "GET orcest:pool:current_template_vmid" in cmd
+
+    def test_get_pool_redis_members_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        get_pool_redis_members("user@host")
+        for call in ssh.call_args_list:
+            assert "sudo docker exec orcest-redis-redis-1 redis-cli" in call[0][1]
+
+    def test_clean_pool_redis_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import clean_pool_redis
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        clean_pool_redis("user@host", ["300"])
+        cmd = ssh.call_args[0][1]
+        assert cmd.count("sudo docker exec orcest-redis-redis-1 redis-cli") == 2
+
+    def test_clean_pending_tasks_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import clean_pending_tasks
+
+        call_count = 0
+
+        def ssh_side_effect(target, command):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="orcest:pending:foo\n",
+                    stderr="",
+                )
+            return self._ok()
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect
+        )
+        clean_pending_tasks("user@host")
+        for call in ssh.call_args_list:
+            assert "sudo docker exec orcest-redis-redis-1 redis-cli" in call[0][1]
+
+
 class TestCleanPendingTasks:
     def _ok(self, *a, **kw):
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")

@@ -285,6 +285,84 @@ class TestPoolConfigTemplateRange:
             PoolConfig(template_vmid_range=[0, 9]).template_range()
 
 
+class TestPoolConfigValidateVmidRanges:
+    """Bug 4: workers and templates must use disjoint VMID ranges."""
+
+    def test_disjoint_above_template_range_ok(self):
+        # Workers above template range: classic deployment.
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=10000)
+        cfg.validate_vmid_ranges()  # no raise
+
+    def test_disjoint_below_template_range_ok(self):
+        cfg = PoolConfig(
+            template_vmid_range=[9000, 9009],
+            vm_id_start=300,
+            vm_id_end=999,
+        )
+        cfg.validate_vmid_ranges()  # no raise
+
+    def test_overlap_at_start_raises(self):
+        # vm_id_start lands inside the template range — this is the live
+        # production misconfiguration that triggered the bug.
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=9001)
+        with pytest.raises(ValueError, match=r"vm_id_start .9001. overlaps"):
+            cfg.validate_vmid_ranges()
+
+    def test_overlap_at_template_start_raises(self):
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=9000)
+        with pytest.raises(ValueError, match="overlaps"):
+            cfg.validate_vmid_ranges()
+
+    def test_overlap_at_template_end_raises(self):
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=9009)
+        with pytest.raises(ValueError, match="overlaps"):
+            cfg.validate_vmid_ranges()
+
+    def test_open_ended_worker_range_below_passes_when_disjoint(self):
+        # Open-ended worker range (vm_id_end=0) is fine if vm_id_start is above
+        # the template range.
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=10000, vm_id_end=0)
+        cfg.validate_vmid_ranges()
+
+    def test_open_ended_worker_range_below_template_range_overlaps(self):
+        # vm_id_start=300 with no upper bound spans across the template range.
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=300, vm_id_end=0)
+        with pytest.raises(ValueError, match="overlaps"):
+            cfg.validate_vmid_ranges()
+
+    def test_no_template_range_passes(self):
+        # Legacy single-VMID mode: no range to overlap with.
+        cfg = PoolConfig(template_vm_id=9000, vm_id_start=9001)
+        cfg.validate_vmid_ranges()
+
+    def test_zero_vm_id_start_passes(self):
+        # Unconfigured worker range: nothing to validate.
+        cfg = PoolConfig(template_vmid_range=[9000, 9009], vm_id_start=0)
+        cfg.validate_vmid_ranges()
+
+    def test_load_config_runs_validation(self, tmp_path):
+        # End-to-end: an overlapping config in YAML refuses to load.
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump(
+                {"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 9001}}
+            )
+        )
+        with pytest.raises(ValueError, match="overlaps"):
+            load_config(path)
+
+    def test_load_config_with_disjoint_ranges_succeeds(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump(
+                {"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 10000}}
+            )
+        )
+        cfg = load_config(path)
+        assert cfg.pool.vm_id_start == 10000
+        assert cfg.pool.template_range() == (9000, 9009)
+
+
 class TestProxmoxConfigIsLocalhost:
     def test_default_is_localhost(self):
         assert ProxmoxConfig().is_localhost() is True

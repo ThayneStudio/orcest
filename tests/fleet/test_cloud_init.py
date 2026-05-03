@@ -268,6 +268,57 @@ class TestTemplateUserdata:
         assert "python3" in data["packages"]
         assert "qemu-guest-agent" in data["packages"]
 
+    def test_orcest_owned_writes_are_deferred(self):
+        """Bug 6: write_files for orcest-owned paths must use ``defer: true``.
+
+        cloud-init's cc_write_files runs in the config stage (before
+        cc_users_groups creates the orcest user). Without defer, chowning
+        to orcest:orcest fails with ``Unknown user or group: "orcest"``.
+        """
+        data = yaml.safe_load(render_template_userdata())
+        for entry in data["write_files"]:
+            owner = entry.get("owner", "")
+            if owner.startswith("orcest"):
+                assert entry.get("defer") is True, (
+                    f"write_files entry for {entry['path']} owned by"
+                    f" {owner!r} must set defer=true"
+                )
+
+    def test_template_versions_audit_file_written(self):
+        """Bug 7: ``/etc/orcest/template.versions`` records baked-in versions."""
+        data = yaml.safe_load(render_template_userdata())
+        entry = next(
+            f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions"
+        )
+        # Owner is root:root — system metadata, not user data; not deferred.
+        assert entry.get("owner") == "root:root"
+        assert entry.get("permissions") == "0644"
+        # No defer — the path doesn't depend on the orcest user.
+        assert "defer" not in entry or entry["defer"] is False
+        # Content lists the major version constants and a bumped_at timestamp.
+        content = entry["content"]
+        assert f"node_major={_NODE_MAJOR}" in content
+        assert f"playwright_major={_PLAYWRIGHT_MAJOR}" in content
+        assert f"supabase_version={_SUPABASE_VERSION}" in content
+        assert "bumped_at=" in content
+
+    def test_template_versions_bumped_at_is_iso_timestamp(self):
+        """Bug 7: bumped_at is a parseable ISO 8601 UTC timestamp."""
+        from datetime import datetime
+
+        data = yaml.safe_load(render_template_userdata())
+        entry = next(
+            f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions"
+        )
+        line = next(
+            line for line in entry["content"].splitlines() if line.startswith("bumped_at=")
+        )
+        ts = line.split("=", 1)[1].strip()
+        # Must round-trip through fromisoformat without raising.
+        parsed = datetime.fromisoformat(ts)
+        # And must be timezone-aware (UTC).
+        assert parsed.tzinfo is not None
+
 
 # ── Clone userdata tests ──────────────────────────────────
 
@@ -342,3 +393,27 @@ class TestCloneUserdata:
         assert "StartLimitIntervalSec=300" in content
         assert "Restart=on-failure" in content
         assert "RestartSec=10" in content
+
+    def test_orcest_owned_writes_are_deferred(self):
+        """Bug 6: clone write_files for orcest-owned paths set ``defer: true``."""
+        data = yaml.safe_load(self._render())
+        for entry in data["write_files"]:
+            owner = entry.get("owner", "")
+            if owner.startswith("orcest"):
+                assert entry.get("defer") is True, (
+                    f"write_files entry for {entry['path']} owned by"
+                    f" {owner!r} must set defer=true"
+                )
+
+
+def test_worker_orcest_owned_writes_are_deferred():
+    """Bug 6: render_worker_userdata also defers orcest-owned write_files."""
+    output = _render()
+    data = yaml.safe_load(output)
+    for entry in data["write_files"]:
+        owner = entry.get("owner", "")
+        if owner.startswith("orcest"):
+            assert entry.get("defer") is True, (
+                f"write_files entry for {entry['path']} owned by"
+                f" {owner!r} must set defer=true"
+            )

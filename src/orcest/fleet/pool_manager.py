@@ -469,6 +469,14 @@ class PoolManager:
                 continue
             vm_id = int(vm_id)
 
+            # Defence in depth: never destroy a Proxmox template, period.
+            # Proxmox marks templates with ``template: 1`` in the API; this
+            # protects freshly-baked templates whose Redis pointer hasn't
+            # been swapped yet (e.g. ``rebake`` interrupted between bake
+            # and pointer SET) and any human-managed template in the range.
+            if self._is_proxmox_template(vm_info):
+                continue
+
             # Skip any template VMID (active or older blue/green generations
             # awaiting GC). Old templates with live linked clones must not be
             # touched here; they get cleaned up by `orcest fleet gc-templates`
@@ -619,6 +627,24 @@ class PoolManager:
             return True
         active = self._resolve_template_vmid()
         return active is not None and vm_id == active
+
+    @staticmethod
+    def _is_proxmox_template(vm_info: dict) -> bool:
+        """Return True if Proxmox itself reports the VM as a template.
+
+        Proxmox sets ``template: 1`` on VMs converted via ``qm template``.
+        We never destroy these regardless of Redis tracking — a template
+        with no live clones is harmless to leave alone (use
+        ``orcest fleet gc-templates`` to remove explicitly).
+
+        Accepts integer (1) or boolean (True) — Proxmox returns either
+        depending on transport. Defaults to False on missing/unknown values.
+        """
+        flag = vm_info.get("template", 0)
+        try:
+            return int(flag) == 1
+        except (TypeError, ValueError):
+            return bool(flag)
 
     def _next_vm_id(self) -> int:
         """Allocate the next VM ID from the configured pool range.

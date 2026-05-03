@@ -128,6 +128,36 @@ class PoolConfig:
             )
         return start, end
 
+    def validate_vmid_ranges(self) -> None:
+        """Verify the template and worker VMID ranges are disjoint.
+
+        Templates and worker clones must use distinct VMID ranges, otherwise
+        the pool manager will allocate worker VMIDs that collide with
+        templates (and either fail the clone or destroy a freshly-baked
+        template). See bug 4 in the blue/green design notes.
+
+        Raises ``ValueError`` if ``template_vmid_range`` is set and
+        ``vm_id_start`` falls within (or below) it. Worker ranges with
+        ``vm_id_end == 0`` (open-ended) are also validated against the
+        template range start.
+        """
+        rng = self.template_range()
+        if rng is None or self.vm_id_start <= 0:
+            return
+        tpl_start, tpl_end = rng
+        worker_start = self.vm_id_start
+        worker_end = self.vm_id_end if self.vm_id_end > 0 else None
+        # Disjoint iff worker_end < tpl_start OR worker_start > tpl_end.
+        worker_above = worker_start > tpl_end
+        worker_below = worker_end is not None and worker_end < tpl_start
+        if not (worker_above or worker_below):
+            raise ValueError(
+                f"pool.vm_id_start ({worker_start}) overlaps"
+                f" pool.template_vmid_range ({tpl_start}, {tpl_end});"
+                " workers must use a disjoint VMID range from templates"
+                f" (e.g. set vm_id_start to {tpl_end + 1} or higher)"
+            )
+
 
 @dataclass
 class FleetConfig:
@@ -256,6 +286,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         max_task_duration=pl.get("max_task_duration", 3600),
         snippet_storage=pl.get("snippet_storage", "local"),
     )
+    # Surface VMID-range overlap at load time rather than at clone time:
+    # an overlap means the pool manager will eventually destroy a
+    # freshly-baked template, which is silent until you watch the live VM
+    # list churn. ``template_range()`` itself raises on a bad range tuple,
+    # so call ``validate_vmid_ranges`` only when we have a usable range.
+    pool.validate_vmid_ranges()
 
     return FleetConfig(
         proxmox=proxmox,
