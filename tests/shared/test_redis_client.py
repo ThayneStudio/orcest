@@ -309,21 +309,69 @@ def test_ensure_consumer_group_other_error_reraises(fake_redis_client, mocker):
 
 
 # ---------------------------------------------------------------------------
-# Tests for stream_queue_depth
+# Tests for stream_unread_count
 # ---------------------------------------------------------------------------
 
 
-def test_stream_queue_depth_warns_on_non_list(fake_redis_client, mocker, caplog):
-    """stream_queue_depth returns 0 and logs a warning when xinfo_groups returns a non-list."""
+def test_stream_unread_count_warns_on_non_list(fake_redis_client, mocker, caplog):
+    """stream_unread_count returns 0 and logs a warning when xinfo_groups returns a non-list."""
     mocker.patch.object(
         fake_redis_client._client,
         "xinfo_groups",
         return_value="unexpected",
     )
     with caplog.at_level(logging.WARNING, logger="orcest.shared.redis_client"):
-        result = fake_redis_client.stream_queue_depth("mystream", "mygroup")
+        result = fake_redis_client.stream_unread_count("mystream", "mygroup")
     assert result == 0
     assert any("unexpected type" in record.message for record in caplog.records)
+
+
+def test_stream_unread_count_excludes_in_flight_entries(fake_redis_client):
+    """Pending (claimed-but-not-ACKed) entries are in flight, not unread."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"k": "v"})
+
+    fake_redis_client.xreadgroup(
+        group=group, consumer="c1", stream=stream, block_ms=None
+    )
+
+    assert fake_redis_client.stream_unread_count(stream, group) == 0
+
+
+def test_stream_unread_count_returns_undelivered_lag(fake_redis_client):
+    """Entries appended but not yet delivered to any consumer count as unread."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    # Prime the group by delivering and ACKing one entry so entries-read is
+    # initialized; otherwise fakeredis reports lag off-by-one.
+    primer_id = fake_redis_client.xadd(stream, {"k": "primer"})
+    fake_redis_client.xreadgroup(
+        group=group, consumer="c0", stream=stream, block_ms=None
+    )
+    fake_redis_client.xack(stream, group, primer_id)
+
+    for _ in range(3):
+        fake_redis_client.xadd(stream, {"k": "v"})
+
+    assert fake_redis_client.stream_unread_count(stream, group) == 3
+
+
+def test_stream_unread_count_with_mix_of_pending_and_lag(fake_redis_client):
+    """When some entries are claimed and others queued, only the queued count."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    for _ in range(5):
+        fake_redis_client.xadd(stream, {"k": "v"})
+
+    fake_redis_client.xreadgroup(
+        group=group, consumer="c1", stream=stream, block_ms=None, count=2
+    )
+
+    assert fake_redis_client.stream_unread_count(stream, group) == 3
 
 
 # ---------------------------------------------------------------------------

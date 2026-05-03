@@ -237,11 +237,13 @@ class RedisClient:
             return []
         return result[0][1]  # type: ignore[index]
 
-    def stream_queue_depth(self, stream: str, group: str) -> int:
-        """Get total unprocessed entries for a consumer group.
+    def stream_unread_count(self, stream: str, group: str) -> int:
+        """Get the number of stream entries not yet delivered to any consumer.
 
-        Returns the sum of pending (delivered but not ACKed) and lag
-        (not yet delivered). Returns 0 if the stream or group doesn't exist.
+        Returns the consumer group's lag — entries appended to the stream that
+        no consumer has claimed yet. Pending entries (claimed but not ACKed)
+        are excluded: they are in flight, not waiting in the queue. Returns 0
+        if the stream or group doesn't exist.
         """
         try:
             groups: list[dict[str, Any]] = self._client.xinfo_groups(self._prefixed(stream))  # type: ignore[assignment]
@@ -261,10 +263,8 @@ class RedisClient:
             return 0
         for g in groups:
             if g.get("name") == group:
-                pending = g.get("pending", 0)
                 # lag can be -1 (unknown) on empty streams; treat as 0.
-                lag = max(g.get("lag") or 0, 0)
-                return pending + lag
+                return max(g.get("lag") or 0, 0)
         return 0
 
     def xpending_count(self, stream: str, group: str, entry_id: str) -> int:
