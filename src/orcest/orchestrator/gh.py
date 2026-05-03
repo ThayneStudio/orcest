@@ -171,7 +171,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
 
     Returns list of dicts with keys: number, title, headRefName,
     headRefOid, isDraft, createdAt, labels, reviewDecision,
-    mergeable.
+    mergeable, mergeStateStatus.
 
     Args:
         repo: Repository in 'owner/repo' format.
@@ -188,7 +188,7 @@ def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
             "--state",
             "open",
             "--json",
-            "number,title,headRefName,baseRefName,headRefOid,isDraft,createdAt,labels,reviewDecision,mergeable",
+            "number,title,headRefName,baseRefName,headRefOid,isDraft,createdAt,labels,reviewDecision,mergeable,mergeStateStatus",
             "--limit",
             str(limit),
         ],
@@ -264,6 +264,30 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
             str(number),
             "--repo",
             repo,
+        ],
+        token,
+    )
+
+
+def update_branch(repo: str, number: int, token: str) -> None:
+    """Update a PR's branch from its base via the GitHub REST API.
+
+    Equivalent to clicking the "Update branch" button in the PR UI: GitHub
+    merges the base branch into the PR branch with a default merge commit.
+    Returns once GitHub accepts the request (the actual merge runs async on
+    GitHub's side; the next poll cycle will see the new head SHA).
+
+    Used when a PR is mergeStateStatus=BEHIND with no conflicts — branch
+    protection that requires up-to-date branches blocks merges otherwise.
+    Conflicting PRs need a worker rebase instead; that path stays separate.
+    """
+    _validate_repo(repo)
+    _run_gh(
+        [
+            "api",
+            f"repos/{repo}/pulls/{number}/update-branch",
+            "-X",
+            "PUT",
         ],
         token,
     )

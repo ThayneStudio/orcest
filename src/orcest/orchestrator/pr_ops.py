@@ -44,6 +44,8 @@ class PRAction(str, Enum):
     ENQUEUE_FIX = "enqueue_fix"  # CI failing or review feedback
     ENQUEUE_FOLLOWUP = "enqueue_followup"  # Approved but unresolved threads — triage into issues
     ENQUEUE_REBASE = "enqueue_rebase"  # PR has merge conflicts; worker should rebase
+    # Out-of-date with base, no conflicts — orchestrator updates via GitHub API
+    UPDATE_BRANCH = "update_branch"
     SKIP_LOCKED = "skip_locked"  # Another worker already on it
     SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
     SKIP_ACTIVE = "skip_active"  # Previously attempted, awaiting external change (new commits)
@@ -600,6 +602,32 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.ENQUEUE_REBASE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        # Out-of-date with base, no conflicts: branch protection that requires
+        # up-to-date branches blocks merges otherwise. Same as clicking the
+        # "Update branch" button — orchestrator handles via REST API; no
+        # worker or Claude token needed. Pre-existing attempt counters don't
+        # gate this: GitHub does the merge, the new head SHA naturally resets
+        # per-SHA counters on the next discovery cycle.
+        if pr_data.get("mergeStateStatus") == "BEHIND":
+            logger.info(
+                "PR #%d is behind base (mergeStateStatus=BEHIND), updating branch",
+                number,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.UPDATE_BRANCH,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
