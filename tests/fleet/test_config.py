@@ -199,6 +199,40 @@ class TestConfigPersistence:
         assert cfg.pool.size == 4
         assert cfg.pool.template_vm_id == 0
         assert cfg.pool.worker_memory == 16384
+        # template_vmid_range defaults to empty list (range mode disabled)
+        assert cfg.pool.template_vmid_range == []
+        assert cfg.pool.template_range() is None
+
+    def test_round_trip_template_vmid_range(self, tmp_path):
+        """template_vmid_range is persisted as a list of two ints."""
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+        )
+        save_config(original, path)
+        loaded = load_config(path)
+        assert loaded.pool.template_vmid_range == [9000, 9009]
+        assert loaded.pool.template_range() == (9000, 9009)
+        # The single-VMID fallback also persists for backward compat.
+        assert loaded.pool.template_vm_id == 9001
+
+    def test_load_template_range_only(self, tmp_path):
+        """A config with range but no template_vm_id parses correctly."""
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump({"pool": {"template_vmid_range": [9000, 9009]}})
+        )
+        cfg = load_config(path)
+        assert cfg.pool.template_range() == (9000, 9009)
+        assert cfg.pool.template_vm_id == 0
+
+    def test_legacy_single_vmid_keeps_working(self, tmp_path):
+        """A legacy config with only template_vm_id (no range) is backward-compat."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"template_vm_id": 9000}}))
+        cfg = load_config(path)
+        assert cfg.pool.template_vm_id == 9000
+        assert cfg.pool.template_range() is None  # range mode disabled
 
     def test_save_creates_parent_dirs(self, tmp_path):
         path = tmp_path / "sub" / "dir" / "config.yaml"
@@ -226,6 +260,29 @@ class TestRequireValidProjectName:
     def test_shell_injection_raises(self):
         with pytest.raises(ValueError):
             require_valid_project_name("; rm -rf /")
+
+
+class TestPoolConfigTemplateRange:
+    def test_empty_returns_none(self):
+        assert PoolConfig().template_range() is None
+
+    def test_valid_pair_returns_tuple(self):
+        assert PoolConfig(template_vmid_range=[9000, 9009]).template_range() == (
+            9000,
+            9009,
+        )
+
+    def test_wrong_length_raises(self):
+        with pytest.raises(ValueError, match=r"\[start, end\]"):
+            PoolConfig(template_vmid_range=[9000]).template_range()
+
+    def test_inverted_range_raises(self):
+        with pytest.raises(ValueError, match="0 < start <= end"):
+            PoolConfig(template_vmid_range=[9009, 9000]).template_range()
+
+    def test_zero_start_raises(self):
+        with pytest.raises(ValueError, match="0 < start <= end"):
+            PoolConfig(template_vmid_range=[0, 9]).template_range()
 
 
 class TestProxmoxConfigIsLocalhost:

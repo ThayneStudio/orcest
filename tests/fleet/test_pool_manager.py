@@ -67,6 +67,9 @@ def _make_redis(idle_set: set[str] | None = None) -> MagicMock:
     mock.xinfo_consumers_raw.return_value = []
     mock.sadd.side_effect = _sadd
     mock.pipeline.return_value = MagicMock()
+    # Template pointer defaults to unset; PoolManager._resolve_template_vmid
+    # then falls back to pool.template_vm_id from config (the legacy path).
+    mock.get.return_value = None
     return mock
 
 
@@ -341,6 +344,58 @@ class TestCloneAndBoot:
 
         assert vm_id is None
         proxmox.clone_vm.assert_not_called()
+
+    def test_redis_pointer_overrides_config_template(self):
+        """When the Redis pointer is set, its VMID is used (not the config one)."""
+        manager, proxmox, redis = _make_manager()
+        # Config says template_vm_id=9000, but the active pointer is 9005.
+        redis.get.return_value = "9005"
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        manager._clone_and_boot()
+
+        _, kwargs = proxmox.clone_vm.call_args
+        assert kwargs["template_id"] == 9005
+
+    def test_falls_back_to_config_when_pointer_unset(self):
+        """When the Redis pointer is unset (None), pool.template_vm_id is used."""
+        manager, proxmox, redis = _make_manager()
+        redis.get.return_value = None
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        manager._clone_and_boot()
+
+        _, kwargs = proxmox.clone_vm.call_args
+        assert kwargs["template_id"] == 9000
+        # And the pointer is initialised so future cycles read from Redis.
+        redis.set_ex.assert_called_once_with(
+            "pool:current_template_vmid", "9000", ttl=86400 * 365
+        )
+
+    def test_invalid_pointer_falls_back_to_config(self):
+        """A non-integer Redis pointer is ignored; config fallback wins."""
+        manager, proxmox, redis = _make_manager()
+        redis.get.return_value = "not-a-number"
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        manager._clone_and_boot()
+
+        _, kwargs = proxmox.clone_vm.call_args
+        assert kwargs["template_id"] == 9000
+
+    def test_pointer_change_picked_up_next_cycle(self):
+        """Subsequent _clone_and_boot calls re-read the pointer (no caching)."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+        redis.get.side_effect = ["9005", "9006"]
+
+        manager._clone_and_boot()
+        first = proxmox.clone_vm.call_args[1]["template_id"]
+        manager._clone_and_boot()
+        second = proxmox.clone_vm.call_args[1]["template_id"]
+
+        assert first == 9005
+        assert second == 9006
 
     def test_vm_no_ip_destroys(self):
         manager, proxmox, redis = _make_manager()

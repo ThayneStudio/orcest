@@ -300,6 +300,38 @@ def get_pool_redis_members(
     return idle, active
 
 
+def get_current_template_vmid(ssh_target: str) -> int | None:
+    """Return the active worker template VMID from Redis, or ``None`` if unset.
+
+    Reads ``orcest:pool:current_template_vmid`` via redis-cli on the
+    orchestrator VM. Returns ``None`` for missing/empty/non-integer values.
+    """
+    result = _ssh(ssh_target, "redis-cli --raw GET orcest:pool:current_template_vmid")
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to read template pointer: {result.stderr.strip()}")
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
+    """Atomically swap the active worker template pointer in Redis.
+
+    Sets ``orcest:pool:current_template_vmid`` to *vm_id*. The pool manager
+    picks this up on its next reconciliation cycle (~10s).
+    """
+    result = _ssh(
+        ssh_target,
+        f"redis-cli SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to set template pointer: {result.stderr.strip()}")
+
+
 def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
     """Remove VM IDs from pool:idle and pool:active in Redis."""
     if not vm_ids:

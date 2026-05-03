@@ -1,32 +1,25 @@
 #!/usr/bin/env bash
-# Orcest worker template rebake — idle-gated.
+# Orcest worker template rebake — non-destructive (blue/green).
 #
 # Invoked weekly by orcest-rebake-template.timer on the Proxmox host.
-# Defers if any worker is currently processing a task; rebakes the template
-# (~10 min) and restarts the warm pool if idle.
+# Builds a NEW template at the next free VMID in pool.template_vmid_range,
+# then atomically swaps the Redis pointer so new clones come from it. The
+# previous template stays alive for any in-flight workers; old templates
+# get garbage-collected once their clones churn out.
+#
+# No idle-gate needed — `orcest fleet rebake` never touches the active
+# template or running workers.
 #
 # Logs to journal under unit orcest-rebake-template.service.
 set -euo pipefail
 
-ORCHESTRATOR_HOST="${ORCHESTRATOR_HOST:-10.20.1.129}"
-ORCHESTRATOR_USER="${ORCHESTRATOR_USER:-orcest}"
-REDIS_CONTAINER="${REDIS_CONTAINER:-orcest-redis-redis-1}"
+echo "Starting non-destructive template rebake."
+orcest fleet rebake
 
-active_count() {
-    ssh -o StrictHostKeyChecking=no \
-        "${ORCHESTRATOR_USER}@${ORCHESTRATOR_HOST}" \
-        "sudo docker exec ${REDIS_CONTAINER} redis-cli HLEN orcest:pool:active" \
-        2>/dev/null | tr -d '[:space:]'
-}
+# Sweep templates with no live clones (skips the active pointer).
+# --dry-run first so the journal records what GC would do, then commit.
+echo "Garbage-collecting orphaned templates."
+orcest fleet gc-templates --dry-run
+orcest fleet gc-templates
 
-active="$(active_count || echo "?")"
-if [[ "${active}" != "0" ]]; then
-    echo "Pool not idle (active=${active}); deferring rebake to next scheduled run."
-    exit 0
-fi
-
-echo "Pool idle. Starting template rebake."
-orcest fleet stop
-orcest fleet create-template
-orcest fleet start
-echo "Template rebake complete. Pool manager will re-clone workers."
+echo "Template rebake complete. Pool manager will pick up the new pointer within ~30s."
