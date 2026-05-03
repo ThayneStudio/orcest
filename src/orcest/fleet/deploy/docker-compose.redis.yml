@@ -2,7 +2,12 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "127.0.0.1:6379:6379"
+      # Bind to 0.0.0.0 so worker VMs (separate hosts on the fleet's private
+      # subnet) can reach Redis on the orchestrator VM. The security-audit
+      # commit b13ccf9 had restricted this to 127.0.0.1, which broke the
+      # multi-VM architecture. Rely on network-level isolation (lab subnet,
+      # firewall) and Redis AUTH for production exposure.
+      - "0.0.0.0:6379:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
