@@ -58,6 +58,12 @@ from orcest.shared.redis_client import RedisClient
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
 
+# Observability counter incremented when _select_claude_token returns None
+# (all tokens in the project's pool are cooling).  TTL keeps it self-cleaning
+# so operators can SCAN the keyspace without finding stale leftovers.
+_TOKEN_EXHAUSTED_SKIP_KEY = "tokens:exhausted_skip"
+_TOKEN_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
+
 # Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
 # Used to distinguish transient network failures from permanent merge errors.
 _MERGE_NETWORK_PATTERNS: list[re.Pattern[str]] = [
@@ -305,10 +311,25 @@ def _poll_project(
 
         Returns None if all tokens are exhausted (caller should skip enqueue).
         Falls back to project.claude_token if no pool is configured.
+
+        On exhaustion, increments a per-project Redis counter so operators can
+        distinguish "quiet because no PRs need work" from "quiet because all
+        Claude tokens are cooling."
         """
         if token_pool is None:
             return project.claude_token
-        return token_pool.next_token()
+        token = token_pool.next_token()
+        if token is None:
+            try:
+                count = project_redis.incr(_TOKEN_EXHAUSTED_SKIP_KEY)
+                if count == 1:
+                    project_redis.expire(
+                        _TOKEN_EXHAUSTED_SKIP_KEY, _TOKEN_EXHAUSTED_SKIP_TTL_SECONDS
+                    )
+            except Exception:
+                # Observability is best-effort; never break the poll cycle.
+                logger.debug("Failed to increment token-exhaustion counter", exc_info=True)
+        return token
 
     def _register_task(task_id: str, claude_token: str) -> None:
         """Record which token was used for a task (for exhaustion tracking)."""
@@ -1337,7 +1358,7 @@ def _handle_result(
     if is_transient:
         # Clear per-SHA attempts so the PR will be re-enqueued on the next
         # poll cycle. Total_attempts is left incremented as a circuit-breaker
-        # against persistent infra failures (fibonacci backoff kicks in).
+        # against persistent infra failures (hard stop at max_total_attempts).
         try:
             if is_issue:
                 clear_issue_attempts(redis, repo, resource_id)

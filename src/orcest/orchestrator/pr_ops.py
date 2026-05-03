@@ -57,7 +57,7 @@ class PRAction(str, Enum):
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
-    SKIP_BACKOFF = "skip_backoff"  # In fibonacci backoff cooldown after total attempts exceeded
+    SKIP_BACKOFF = "skip_backoff"  # Defensive handler; no longer produced by discovery
 
 
 @dataclass
@@ -512,19 +512,6 @@ def discover_actionable_prs(
             )
             continue
 
-        # Fibonacci backoff when total cross-SHA attempt limit is exceeded.
-        # Instead of permanently labeling needs-human, we enter a cooldown
-        # that increases with each cycle past the limit (5m, 5m, 10m, 15m,
-        # 25m, 40m, 65m, 2h cap). This lets stubborn PRs keep retrying
-        # with decreasing frequency.
-        #
-        # Recovery path: if the exhausted_notified flag is set and the
-        # needs-human label is gone, reset the counters and fall through to
-        # normal processing. Any actor (human or automation) that removes the
-        # label is treated as approval.
-        # Note: the label is *not* re-checked here because needs_human is in
-        # terminal_labels — any PR still carrying it is caught by SKIP_LABELED
-        # above and never reaches this block.
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
             logger.warning(

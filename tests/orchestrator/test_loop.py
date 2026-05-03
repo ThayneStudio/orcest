@@ -373,6 +373,51 @@ def test_poll_cycle_skip_backoff_no_label_no_comment(
     gh_mock.post_comment.assert_not_called()
 
 
+def test_poll_cycle_increments_token_exhausted_skip_counter(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """When all tokens in the pool are cooling, _select_claude_token increments
+    a per-project Redis counter so operators can detect the situation."""
+    from datetime import datetime, timedelta, timezone
+
+    from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
+    from orcest.orchestrator.token_pool import TokenPool
+
+    pr_state = _make_pr_state(number=77, action=PRAction.ENQUEUE_FIX)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    publish_mock = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    # Pool with one token, manually marked exhausted so next_token() returns None.
+    pool = TokenPool(["sk-test-token"])
+    pool._cooldowns[0] = datetime.now(timezone.utc) + timedelta(minutes=30)
+    project_key = orchestrator_config.projects[0].key_prefix
+
+    logger = logging.getLogger("test")
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {project_key: pool},
+        logger,
+        3600,
+    )
+
+    # Counter incremented and TTL set, no task published.
+    publish_mock.assert_not_called()
+    raw_count = fake_redis_client.get(_TOKEN_EXHAUSTED_SKIP_KEY)
+    assert raw_count == "1"
+    assert fake_redis_client.ttl(_TOKEN_EXHAUSTED_SKIP_KEY) > 0
+
+
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):
     """When discover_actionable_prs raises, _poll_cycle catches it per-project and continues.
 
