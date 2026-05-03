@@ -4,6 +4,9 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    _NODE_MAJOR,
+    _PLAYWRIGHT_MAJOR,
+    _SUPABASE_VERSION,
     render_clone_userdata,
     render_orchestrator_userdata,
     render_template_userdata,
@@ -85,17 +88,31 @@ def test_claude_json_onboarding_bypass():
 
 
 def test_runcmd_installs_key_tools():
-    """runcmd entries install Node, Docker, Claude CLI, gh, Supabase, Playwright."""
+    """runcmd entries install the full worker tooling stack."""
     output = _render()
     data = yaml.safe_load(output)
     runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
 
-    assert "nodesource" in runcmd
+    assert f"setup_{_NODE_MAJOR}.x" in runcmd
     assert "docker-ce" in runcmd
     assert "claude-code" in runcmd
     assert "gh" in runcmd
-    assert "supabase" in runcmd
-    assert "playwright" in runcmd
+    assert f"v{_SUPABASE_VERSION}" in runcmd
+    assert f"playwright@{_PLAYWRIGHT_MAJOR}" in runcmd
+    assert "deno.land/install.sh" in runcmd
+    assert "npm install -g bun" in runcmd
+    assert "astral.sh/uv/install.sh" in runcmd
+    assert "npm install -g wrangler" in runcmd
+
+
+def test_runcmd_supabase_url_is_static():
+    """Regression guard: Supabase install must NOT use the dynamic GitHub-API
+    fetch — every clone must get the same pinned bytes."""
+    output = _render()
+    data = yaml.safe_load(output)
+    runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+    assert "api.github.com/repos/supabase" not in runcmd
+    assert f"supabase_{_SUPABASE_VERSION}_linux_" in runcmd
 
 
 def test_runcmd_installs_orcest_from_repo():
@@ -194,11 +211,24 @@ class TestTemplateUserdata:
         data = yaml.safe_load(render_template_userdata())
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "claude-code" in runcmd
-        assert "nodesource" in runcmd
+        assert f"setup_{_NODE_MAJOR}.x" in runcmd
         assert "docker-ce" in runcmd
         assert "gh" in runcmd
-        assert "supabase" in runcmd
-        assert "playwright" in runcmd
+        assert f"v{_SUPABASE_VERSION}" in runcmd
+        assert f"playwright@{_PLAYWRIGHT_MAJOR}" in runcmd
+        assert "deno.land/install.sh" in runcmd
+        assert "npm install -g bun" in runcmd
+        assert "astral.sh/uv/install.sh" in runcmd
+        assert "npm install -g wrangler" in runcmd
+
+    def test_template_packages_include_quality_of_life_tools(self):
+        data = yaml.safe_load(render_template_userdata())
+        packages = set(data.get("packages", []))
+        assert "ripgrep" in packages
+        assert "fd-find" in packages
+        assert "jq" in packages
+        assert "redis-tools" in packages
+        assert "postgresql-client" in packages
 
     def test_no_compose_plugin(self):
         data = yaml.safe_load(render_template_userdata())

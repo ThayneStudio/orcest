@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly orcest worker template rebake
+
+[Timer]
+OnCalendar=Sun 04:00:00 UTC
+Persistent=true
+Unit=orcest-rebake-template.service
+
+[Install]
+WantedBy=timers.target
