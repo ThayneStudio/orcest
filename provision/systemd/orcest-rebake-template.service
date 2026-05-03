@@ -1,0 +1,12 @@
+[Unit]
+Description=Orcest worker template rebake (idle-gated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/orcest/rebake-template.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1800

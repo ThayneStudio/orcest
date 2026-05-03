@@ -26,7 +26,29 @@ _WORKER_PACKAGES: list[str] = _BASE_PACKAGES + [
     "python3-venv",
     "golang-go",
     "unzip",
+    # Quality-of-life utilities for shell-driven workflows.
+    # ripgrep + fd-find: Claude's Grep tool uses ripgrep when available, and
+    # fd is much faster than find for the agent's file-scanning passes.
+    "ripgrep",
+    "fd-find",
+    # jq: JSON processing in shell pipelines (gh CLI output, API responses).
+    "jq",
+    # redis-tools: redis-cli for ad-hoc queue inspection from a worker shell.
+    "redis-tools",
+    # postgresql-client: psql for debugging Supabase connections.
+    "postgresql-client",
 ]
+
+
+# Major versions of tools baked into the worker template.
+# Bumping these requires a template rebake (`orcest fleet create-template`).
+# Patch versions float — they're picked up automatically on each rebake.
+_NODE_MAJOR = "22"  # 22.x LTS, supported through April 2027 (replaces EOL 20.x)
+_PLAYWRIGHT_MAJOR = "1"  # 1.x line — npx resolves latest 1.x at install time
+
+# Hard-pinned tools (replace dynamic fetches / opaque defaults).
+# Bump when rebaking; verify against https://github.com/supabase/cli/releases
+_SUPABASE_VERSION = "2.95.4"
 
 
 def _orcest_user(ssh_public_key: str = "") -> dict:
@@ -75,16 +97,20 @@ def _docker_install_runcmd(*, include_compose_plugin: bool = False) -> list[str]
 
 
 def _worker_tooling_runcmd() -> list[str]:
-    """Commands to install worker tooling (Node, Claude CLI, gh, Supabase, Playwright)."""
+    """Commands to install worker tooling.
+
+    Installs (in order): Node, Docker, Claude CLI, gh, Supabase CLI,
+    Playwright + Chromium, Deno, Bun, uv, wrangler.
+    """
     return [
-        # Install Node.js 20.x
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+        # Node.js: NodeSource channel for the configured major version.
+        f"curl -fsSL https://deb.nodesource.com/setup_{_NODE_MAJOR}.x | bash -",
         "apt-get install -y -qq nodejs",
-        # Install Docker Engine (no compose plugin for workers)
+        # Docker Engine (no compose plugin for workers).
         *_docker_install_runcmd(),
-        # Install Claude CLI
+        # Claude CLI: floats to npm-latest; rebakes pull current.
         "npm install -g @anthropic-ai/claude-code",
-        # Install gh CLI
+        # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"
             " | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null"
@@ -97,15 +123,27 @@ def _worker_tooling_runcmd() -> list[str]:
         ),
         "apt-get update -qq",
         "apt-get install -y -qq gh",
-        # Install Supabase CLI
-        "ARCH=$(dpkg --print-architecture)"
-        " && SUPA_VER=$(curl -fsSL https://api.github.com/repos/supabase/cli/releases/latest"
-        ' | grep -oP \'"tag_name":\\s*"v\\K[^"]+\') '
-        '&& curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPA_VER}'
-        '/supabase_${SUPA_VER}_linux_${ARCH}.deb" -o /tmp/supabase.deb'
-        " && dpkg -i /tmp/supabase.deb && rm -f /tmp/supabase.deb",
-        # Install Playwright browsers
-        "npx playwright install --with-deps chromium",
+        # Supabase CLI: hard-pinned. Static URL = reproducible across rebakes.
+        (
+            "ARCH=$(dpkg --print-architecture)"
+            f' && curl -fsSL "https://github.com/supabase/cli/releases/download/v{_SUPABASE_VERSION}'
+            f'/supabase_{_SUPABASE_VERSION}_linux_${{ARCH}}.deb" -o /tmp/supabase.deb'
+            " && dpkg -i /tmp/supabase.deb && rm -f /tmp/supabase.deb"
+        ),
+        # Playwright + Chromium browser binaries.
+        f"npx -y playwright@{_PLAYWRIGHT_MAJOR} install --with-deps chromium",
+        # Deno: Supabase Edge Functions runtime. System-wide install so all
+        # users (including the orcest service) see the binary.
+        "curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y",
+        # Bun: fast Node-compatible runtime + package manager.
+        "npm install -g bun",
+        # uv: Rust-based fast Python package manager (10-50x faster than pip).
+        (
+            "curl -fsSL https://astral.sh/uv/install.sh"
+            ' | env UV_INSTALL_DIR="/usr/local/bin" sh'
+        ),
+        # wrangler: Cloudflare Workers CLI (transit-platform deploys here).
+        "npm install -g wrangler",
     ]
 
 
