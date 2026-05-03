@@ -1794,6 +1794,9 @@ def _upgrade_cli(console: Console) -> None:
 
     console.print("  Installing latest version...", end=" ")
     pip = Path(sys.executable).parent / "pip"
+    # --break-system-packages: the deploy host runs orcest as a system-wide
+    # install (not a venv), so PEP 668's externally-managed-environment guard
+    # blocks the upgrade unless we opt out. Pip ignores the flag in venvs.
     result = subprocess.run(
         [
             str(pip),
@@ -1801,6 +1804,7 @@ def _upgrade_cli(console: Console) -> None:
             "--quiet",
             "--no-cache-dir",
             "--force-reinstall",
+            "--break-system-packages",
             "git+https://github.com/ThayneStudio/orcest.git",
         ],
         capture_output=True,
