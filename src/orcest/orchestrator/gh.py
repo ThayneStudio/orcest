@@ -277,20 +277,32 @@ def update_branch(repo: str, number: int, token: str) -> None:
     Returns once GitHub accepts the request (the actual merge runs async on
     GitHub's side; the next poll cycle will see the new head SHA).
 
-    Used when a PR is mergeStateStatus=BEHIND with no conflicts — branch
-    protection that requires up-to-date branches blocks merges otherwise.
-    Conflicting PRs need a worker rebase instead; that path stays separate.
+    Used for PRs that branch protection holds back because the head is not
+    up to date with base (mergeStateStatus is BEHIND, or BLOCKED when an
+    "up to date" rule is the blocker). When the branch is already current,
+    GitHub returns 422 "no new commits on the base branch" — that's a
+    no-op signal, not a failure, so it's swallowed silently. Conflicting
+    PRs need a worker rebase and go through ENQUEUE_REBASE instead.
     """
     _validate_repo(repo)
-    _run_gh(
-        [
-            "api",
-            f"repos/{repo}/pulls/{number}/update-branch",
-            "-X",
-            "PUT",
-        ],
-        token,
-    )
+    try:
+        _run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{number}/update-branch",
+                "-X",
+                "PUT",
+            ],
+            token,
+        )
+    except GhCliError as exc:
+        if "no new commits on the base branch" in (exc.stderr or "").lower():
+            logger.debug(
+                "update_branch: PR #%d already up to date with base, no-op",
+                number,
+            )
+            return
+        raise
 
 
 def cancel_workflow(repo: str, run_id: int, token: str) -> None:
