@@ -165,6 +165,7 @@ def gh_mock(mocker):
         "get_unresolved_review_threads",
         "resolve_review_thread",
         "merge_pr",
+        "update_branch",
         "rerun_workflow",
         "cancel_workflow",
         "create_issue",

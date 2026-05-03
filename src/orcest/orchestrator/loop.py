@@ -354,6 +354,7 @@ def _poll_project(
     # them last so actionable items are processed first.
     _ACTION_PRIORITY = {
         PRAction.MERGE: 0,
+        PRAction.UPDATE_BRANCH: 0,
         PRAction.ENQUEUE_FIX: 1,
         PRAction.ENQUEUE_FOLLOWUP: 1,
         PRAction.ENQUEUE_REBASE: 1,
@@ -727,6 +728,21 @@ def _poll_project(
                             clear_err,
                             exc_info=True,
                         )
+        elif pr_state.action == PRAction.UPDATE_BRANCH:
+            logger.info(
+                "PR #%d (%s): out-of-date with base, calling update-branch",
+                pr_state.number,
+                pr_state.title,
+            )
+            try:
+                gh.update_branch(repo, pr_state.number, token)
+            except Exception as e:
+                logger.warning(
+                    "PR #%d: update-branch failed: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
         elif pr_state.action == PRAction.SKIP_GREEN:
             logger.debug("PR #%d: CI green, skipping", pr_state.number)
         elif pr_state.action == PRAction.RETRIGGER_REVIEW:

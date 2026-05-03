@@ -33,6 +33,7 @@ from orcest.orchestrator.gh import (
     post_comment,
     remove_label,
     resolve_review_thread,
+    update_branch,
 )
 
 REPO = "acme/widgets"
@@ -796,6 +797,28 @@ def test_merge_pr_no_delete_branch(mocker):
     args_passed = mock_run.call_args[0][0]
     assert "--delete-branch" not in args_passed
     assert "--squash" in args_passed
+
+
+# ---------------------------------------------------------------------------
+# update_branch — calls the GitHub update-branch REST endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_update_branch_calls_correct_api(mocker):
+    """update_branch issues PUT /repos/{repo}/pulls/{number}/update-branch via gh api."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="",
+    )
+
+    update_branch(REPO, 99, TOKEN)
+
+    mock_run.assert_called_once()
+    args_passed = mock_run.call_args[0][0]
+    assert args_passed[0] == "api"
+    assert args_passed[1] == f"repos/{REPO}/pulls/99/update-branch"
+    assert "PUT" in args_passed
+    assert mock_run.call_args[0][1] == TOKEN
 
 
 # ---------------------------------------------------------------------------

@@ -175,6 +175,44 @@ def test_poll_cycle_enqueues_followup(mocker, fake_redis_client, orchestrator_co
     assert mock_followup.call_args.kwargs["pr_state"] is pr_state
 
 
+def test_poll_cycle_calls_update_branch_for_behind_pr(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """_poll_cycle calls gh.update_branch for PRs with UPDATE_BRANCH action — no
+    worker, no Claude token; the orchestrator handles it directly."""
+    pr_state = PRState(
+        number=70,
+        title="PR #70",
+        branch="feat/70",
+        head_sha="abc123",
+        action=PRAction.UPDATE_BRANCH,
+        ci_failures=[],
+        review_threads=[],
+        labels=[],
+    )
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mock_publish_rebase = mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    gh_mock.update_branch.assert_called_once_with(
+        orchestrator_config.github.repo,
+        70,
+        orchestrator_config.github.token,
+    )
+    # No worker task should be published — update-branch is orchestrator-side.
+    mock_publish_rebase.assert_not_called()
+    gh_mock.merge_pr.assert_not_called()
+
+
 def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh_mock):
     """_poll_cycle calls gh.merge_pr for PRs with MERGE action."""
     pr_state = PRState(
