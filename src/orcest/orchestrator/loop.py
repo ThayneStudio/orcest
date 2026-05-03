@@ -959,25 +959,14 @@ def _poll_project(
                 "PR #%d: unhandled action %r, skipping", pr_state.number, pr_state.action
             )
 
-    # Discover issues needing implementation
-    # Prioritize existing PRs over new issue work. PRs with terminal
-    # labels (needs-human/blocked) are parked and don't block issue work.
-    pr_work_pending = any(
-        pr_state.action
-        in (
-            PRAction.ENQUEUE_FIX,
-            PRAction.ENQUEUE_FOLLOWUP,
-            PRAction.ENQUEUE_REBASE,
-            PRAction.SKIP_LOCKED,
-            PRAction.SKIP_QUEUED,
-        )
-        for pr_state in pr_states
-    )
-
+    # Discover issues needing implementation. The only backpressure here is
+    # issue-stream depth — PR-fix tasks already published this cycle (and PRs
+    # locked or queued from prior cycles) represent already-resourced work
+    # that doesn't compete with new issue discovery. Worker pool capacity
+    # naturally throttles by leaving published tasks in the streams when
+    # workers are busy.
     issue_states: list = []
-    if pr_work_pending:
-        logger.info("PRs need attention, deferring issue discovery until PR backlog clears")
-    elif issue_queue_depth > 0:
+    if issue_queue_depth > 0:
         logger.info(
             f"Issue task queue has {issue_queue_depth} pending entries, "
             f"deferring issue discovery until queue drains"
