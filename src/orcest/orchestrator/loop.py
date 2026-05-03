@@ -360,9 +360,13 @@ def _poll_project(
     }
     pr_states.sort(key=lambda ps: (_ACTION_PRIORITY.get(ps.action, 9), ps.number))
 
-    # Pre-compute issue queue depth for gating issue discovery.
+    # Pre-compute unclaimed issue tasks for gating issue discovery. Tasks that
+    # are claimed and in flight don't block — they're consuming worker capacity,
+    # not buffer space. Only undelivered (lag) entries justify deferral.
     issue_tasks_stream = f"tasks:issue:{config.default_runner}"
-    issue_queue_depth = task_redis.stream_queue_depth(issue_tasks_stream, CONSUMER_GROUP)
+    unclaimed_issue_tasks = task_redis.stream_unread_count(
+        issue_tasks_stream, CONSUMER_GROUP
+    )
 
     enqueued = 0
     merged = 0
@@ -960,15 +964,15 @@ def _poll_project(
             )
 
     # Discover issues needing implementation. The only backpressure here is
-    # issue-stream depth — PR-fix tasks already published this cycle (and PRs
-    # locked or queued from prior cycles) represent already-resourced work
-    # that doesn't compete with new issue discovery. Worker pool capacity
-    # naturally throttles by leaving published tasks in the streams when
-    # workers are busy.
+    # the count of unclaimed issue tasks already on the stream — adding more
+    # while a backlog of undelivered tasks exists just bloats the queue.
+    # Tasks that workers have already claimed don't block: they're consuming
+    # capacity, freeing other idle workers to take new work. PR-fix tasks
+    # ride a separate stream and share worker capacity organically.
     issue_states: list = []
-    if issue_queue_depth > 0:
+    if unclaimed_issue_tasks > 0:
         logger.info(
-            f"Issue task queue has {issue_queue_depth} pending entries, "
+            f"Issue task queue has {unclaimed_issue_tasks} unclaimed entries, "
             f"deferring issue discovery until queue drains"
         )
     else:
