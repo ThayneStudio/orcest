@@ -966,11 +966,14 @@ class TestRunWorker:
         assert "merge conflict" in parsed.summary.lower()
 
     def test_worker_health_check_failure_exits(self, mocker, worker_config):
-        """When redis.health_check() returns False, run_worker calls sys.exit(1)."""
+        """When redis.health_check() always returns False, run_worker exhausts
+        the startup retry budget and calls sys.exit(1)."""
         mock_redis = self._build_mock_redis()
-        # Override health_check to return False
+        # Override health_check to return False on every attempt
         mock_redis.health_check.return_value = False
         self._setup_run_worker(mocker, worker_config, mock_redis)
+        # Patch sleep so the test doesn't wait ~65s for the retry budget.
+        sleep_patch = mocker.patch("orcest.worker.loop.time.sleep")
 
         with pytest.raises(SystemExit) as exc_info:
             run_worker(worker_config)
@@ -978,6 +981,32 @@ class TestRunWorker:
         assert exc_info.value.code == 1
         # Should never attempt to read from the stream
         mock_redis.xreadgroup.assert_not_called()
+        # Confirm the retry loop actually ran (10 attempts, 9 sleeps in between).
+        from orcest.worker.loop import _STARTUP_PING_BACKOFF, _STARTUP_PING_RETRIES
+
+        assert mock_redis.health_check.call_count == _STARTUP_PING_RETRIES
+        assert sleep_patch.call_count == _STARTUP_PING_RETRIES - 1
+        # Backoff sequence is what the helper documents.
+        assert [c.args[0] for c in sleep_patch.call_args_list] == list(_STARTUP_PING_BACKOFF)
+
+    def test_worker_health_check_recovers_after_transient_failure(
+        self, mocker, worker_config, sample_task
+    ):
+        """If health_check fails a few times then succeeds, the worker proceeds
+        normally instead of exiting — this is the brief-Redis-restart scenario."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        # Fail 3 times then succeed.
+        mock_redis.health_check.side_effect = [False, False, False, True]
+        mocker.patch("orcest.worker.loop.time.sleep")  # avoid real sleeps
+        # Ensure the loop exits after one iteration so the test terminates.
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        # Should NOT raise SystemExit
+        run_worker(worker_config)
+
+        assert mock_redis.health_check.call_count == 4
 
     def test_worker_result_publish_failure_does_not_ack(self, mocker, worker_config, sample_task):
         """When all result-stream publish retries raise, xack_raw must NOT be called.
