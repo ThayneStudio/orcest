@@ -821,6 +821,34 @@ def test_update_branch_calls_correct_api(mocker):
     assert mock_run.call_args[0][1] == TOKEN
 
 
+def test_update_branch_swallows_already_up_to_date(mocker):
+    """422 'no new commits on the base branch' means the branch is already
+    up to date — return cleanly, not as an error. Other failures still raise."""
+    mock_run = mocker.patch("orcest.orchestrator.gh._run_gh")
+    mock_run.side_effect = GhCliError(
+        "gh failed",
+        stderr=(
+            "gh: There are no new commits on the base branch. (HTTP 422)\n"
+            '{"message":"There are no new commits on the base branch.",'
+            '"status":"422"}'
+        ),
+    )
+
+    update_branch(REPO, 100, TOKEN)
+
+
+def test_update_branch_propagates_other_errors(mocker):
+    """Errors that aren't the 'already up to date' 422 must still raise."""
+    mock_run = mocker.patch("orcest.orchestrator.gh._run_gh")
+    mock_run.side_effect = GhCliError(
+        "gh failed",
+        stderr="gh: HTTP 403: Forbidden",
+    )
+
+    with pytest.raises(GhCliError):
+        update_branch(REPO, 100, TOKEN)
+
+
 # ---------------------------------------------------------------------------
 # resolve_review_thread — non-string thread_id
 # ---------------------------------------------------------------------------

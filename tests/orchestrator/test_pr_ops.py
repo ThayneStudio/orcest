@@ -1014,6 +1014,34 @@ def test_behind_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_con
     gh_mock.get_ci_status.assert_not_called()
 
 
+def test_blocked_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_config):
+    """A PR with mergeStateStatus=BLOCKED is also routed to UPDATE_BRANCH.
+
+    Branch protection requiring 'up to date with base' reports BLOCKED (not
+    BEHIND) when the branch is out of date. update-branch handles both: when
+    the branch is genuinely behind, it updates; when it is already up to date,
+    GitHub returns 422 and the call is a no-op.
+    """
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(
+            number=413,
+            labels=[],
+            mergeable="MERGEABLE",
+            merge_state_status="BLOCKED",
+        ),
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.UPDATE_BRANCH
+
+
 def test_conflicting_pr_takes_priority_over_behind(gh_mock, fake_redis_client, label_config):
     """If a PR is both CONFLICTING and BEHIND, conflict resolution wins —
     a worker rebase is needed; orchestrator-side update-branch would fail."""
@@ -1045,6 +1073,32 @@ def test_clean_pr_does_not_trigger_update_branch(gh_mock, fake_redis_client, lab
             labels=[],
             mergeable="MERGEABLE",
             merge_state_status="CLEAN",
+        ),
+    ]
+    gh_mock.get_ci_status.return_value = [{"name": "tests", "conclusion": "success"}]
+    gh_mock.get_unresolved_review_threads.return_value = []
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action != PRAction.UPDATE_BRANCH
+
+
+def test_unstable_pr_does_not_trigger_update_branch(gh_mock, fake_redis_client, label_config):
+    """mergeStateStatus=UNSTABLE means non-required CI is failing but the PR is
+    otherwise mergeable. Don't fire UPDATE_BRANCH — being merely UNSTABLE doesn't
+    indicate behind-base; the normal flow handles it."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(
+            number=414,
+            labels=[],
+            mergeable="MERGEABLE",
+            merge_state_status="UNSTABLE",
         ),
     ]
     gh_mock.get_ci_status.return_value = [{"name": "tests", "conclusion": "success"}]
