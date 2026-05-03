@@ -437,11 +437,16 @@ def _systemd_unit(worker_id: str = "%H") -> str:
             their VM-based ID (e.g. ``orcest-worker-9001``); the default
             ``%H`` (hostname) is kept for legacy non-pool workers.
     """
+    # StartLimitBurst=10 / StartLimitIntervalSec=300 lets systemd retry the
+    # worker up to 10 times over 5 minutes before giving up.  Combined with
+    # the in-process ~60 s Redis-connect retry in worker/loop.py, a brief
+    # Redis container restart during ``orcest fleet update`` is well within
+    # the recovery window without manual ``systemctl reset-failed`` per VM.
     return f"""\
 [Unit]
 Description=Orcest Worker
 After=network.target
-StartLimitBurst=5
+StartLimitBurst=10
 StartLimitIntervalSec=300
 
 [Service]

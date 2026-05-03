@@ -298,3 +298,17 @@ class TestCloneUserdata:
         svc_path = "/etc/systemd/system/orcest-worker.service"
         unit_file = next(f for f in data["write_files"] if f["path"] == svc_path)
         assert "EnvironmentFile=-/opt/orcest/.env" in unit_file["content"]
+
+    def test_systemd_start_limit_hardened(self):
+        """StartLimitBurst/IntervalSec let systemd retry through a brief Redis
+        outage during ``orcest fleet update``.  10 restarts over 5 minutes
+        combined with the in-process ~60s Redis-connect retry covers a normal
+        deploy without manual ``systemctl reset-failed`` per VM."""
+        data = yaml.safe_load(self._render())
+        svc_path = "/etc/systemd/system/orcest-worker.service"
+        unit_file = next(f for f in data["write_files"] if f["path"] == svc_path)
+        content = unit_file["content"]
+        assert "StartLimitBurst=10" in content
+        assert "StartLimitIntervalSec=300" in content
+        assert "Restart=on-failure" in content
+        assert "RestartSec=10" in content

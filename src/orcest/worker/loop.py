@@ -49,6 +49,17 @@ if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
         "_RESULT_PUBLISH_BACKOFF must have exactly _RESULT_PUBLISH_RETRIES - 1 entries"
     )
 
+# Startup Redis-connect retry budget.  Tuned so a brief Redis container restart
+# during ``orcest fleet update`` doesn't kill the worker process (which would
+# trip systemd's StartLimit and require manual reset-failed).  The
+# (1, 2, 4, 8, 10, 10, 10, 10, 10) backoff sums to ~65 s across 10 attempts.
+_STARTUP_PING_RETRIES = 10
+_STARTUP_PING_BACKOFF = (1, 2, 4, 8, 10, 10, 10, 10, 10)
+if len(_STARTUP_PING_BACKOFF) != _STARTUP_PING_RETRIES - 1:
+    raise ValueError(
+        "_STARTUP_PING_BACKOFF must have exactly _STARTUP_PING_RETRIES - 1 entries"
+    )
+
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
     """Warn if gh is configured with an OAuth token that may attempt refresh writes.
@@ -99,6 +110,40 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
                 host,
                 token[:4],
             )
+
+
+def _wait_for_redis(redis: RedisClient, logger: logging.Logger) -> bool:
+    """Ping Redis with exponential backoff so a brief outage doesn't kill the worker.
+
+    During ``orcest fleet update`` the Redis container restarts briefly.  Without
+    this loop a single failed ``health_check()`` makes the worker exit(1), and
+    after ~5 quick failures systemd's StartLimit trips and the unit must be
+    reset manually on every worker VM.  Retrying for ~60 s in-process keeps
+    the worker patient enough to ride out a normal deploy, while still falling
+    through to exit(1) for a genuinely down Redis (so systemd's outer retry
+    logic, hardened in cloud_init.py, can take over).
+
+    Returns True if Redis became reachable, False if all attempts failed.
+    Logs each attempt at INFO so operators can tell the worker is patient,
+    not stuck.
+    """
+    for attempt in range(_STARTUP_PING_RETRIES):
+        if redis.health_check():
+            if attempt > 0:
+                logger.info(
+                    "Redis reachable after %d attempt(s)", attempt + 1
+                )
+            return True
+        if attempt < _STARTUP_PING_RETRIES - 1:
+            sleep_s = _STARTUP_PING_BACKOFF[attempt]
+            logger.info(
+                "Redis ping failed (attempt %d/%d); retrying in %ds",
+                attempt + 1,
+                _STARTUP_PING_RETRIES,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+    return False
 
 
 def _make_abort_event(*events: threading.Event) -> threading.Event:
@@ -163,9 +208,14 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     pr_fq = f"{config.redis.key_prefix}:{pr_stream}"
     issue_fq = f"{config.redis.key_prefix}:{issue_stream}"
 
-    # Verify Redis connection
-    if not redis.health_check():
-        logger.error("Cannot connect to Redis. Exiting.")
+    # Verify Redis connection with retry budget so a brief Redis restart
+    # (e.g. during ``orcest fleet update``) doesn't kill the worker.
+    if not _wait_for_redis(redis, logger):
+        logger.error(
+            "Redis unreachable after %d retries (~%ds); exiting for systemd to handle",
+            _STARTUP_PING_RETRIES,
+            sum(_STARTUP_PING_BACKOFF),
+        )
         sys.exit(1)
 
     # Ensure consumer groups exist on shared streams
