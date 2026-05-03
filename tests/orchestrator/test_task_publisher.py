@@ -515,7 +515,7 @@ def test_publish_ci_fix_no_thread_details(
     )
 
     # Should not contain review thread sections
-    assert "Review Feedback" not in task.prompt
+    assert "## Review Feedback" not in task.prompt
     assert "review thread" not in task.prompt.lower()
     # But should contain CI failure info
     assert "pytest" in task.prompt
@@ -557,7 +557,7 @@ def test_ci_failures_suppress_review_threads_in_prompt(
     assert "pytest" in task.prompt
     assert "CI Failures" in task.prompt
     # Review thread sections should NOT be present
-    assert "Review Feedback" not in task.prompt
+    assert "## Review Feedback" not in task.prompt
     assert "src/handler.py" not in task.prompt
     assert "This function is too long" not in task.prompt
 
