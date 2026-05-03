@@ -34,6 +34,13 @@ _SSH_OPTS = [
     "LogLevel=ERROR",
 ]
 
+# The orchestrator VM does not have ``redis-cli`` installed natively —
+# Redis runs inside the ``orcest-redis-redis-1`` container started by the
+# ``docker-compose.redis.yml`` stack. All redis-cli invocations from the
+# fleet CLI must be routed through ``docker exec`` against that container.
+_REDIS_CONTAINER = "orcest-redis-redis-1"
+_REDIS_CLI_PREFIX = f"sudo docker exec {_REDIS_CONTAINER} redis-cli"
+
 
 def _ssh(ssh_target: str, cmd: str) -> subprocess.CompletedProcess[str]:
     """Run a command on the orchestrator VM via SSH."""
@@ -281,7 +288,7 @@ def get_pool_redis_members(
     Uses ``redis-cli --raw`` for predictable line-per-value output.
     """
     # Read idle set
-    result = _ssh(ssh_target, "redis-cli --raw SMEMBERS orcest:pool:idle")
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:idle")
     idle: set[str] = set()
     if result.returncode == 0:
         for line in result.stdout.strip().splitlines():
@@ -290,7 +297,7 @@ def get_pool_redis_members(
                 idle.add(stripped)
 
     # Read active hash (returns alternating key, value lines)
-    result = _ssh(ssh_target, "redis-cli --raw HGETALL orcest:pool:active")
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw HGETALL orcest:pool:active")
     active: dict[str, str] = {}
     if result.returncode == 0:
         lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
@@ -306,7 +313,9 @@ def get_current_template_vmid(ssh_target: str) -> int | None:
     Reads ``orcest:pool:current_template_vmid`` via redis-cli on the
     orchestrator VM. Returns ``None`` for missing/empty/non-integer values.
     """
-    result = _ssh(ssh_target, "redis-cli --raw GET orcest:pool:current_template_vmid")
+    result = _ssh(
+        ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_vmid"
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to read template pointer: {result.stderr.strip()}")
     raw = result.stdout.strip()
@@ -326,7 +335,8 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
     """
     result = _ssh(
         ssh_target,
-        f"redis-cli SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
+        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid"
+        f" {shlex.quote(str(vm_id))}",
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to set template pointer: {result.stderr.strip()}")
@@ -339,8 +349,8 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
     cmds: list[str] = []
     for vm_id in vm_ids:
         quoted = shlex.quote(vm_id)
-        cmds.append(f"redis-cli SREM orcest:pool:idle {quoted}")
-        cmds.append(f"redis-cli HDEL orcest:pool:active {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:idle {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} HDEL orcest:pool:active {quoted}")
     _ssh(ssh_target, " && ".join(cmds))
 
 
@@ -348,13 +358,13 @@ def clean_pending_tasks(ssh_target: str) -> int:
     """Delete all pending task markers from Redis. Returns count deleted."""
     result = _ssh(
         ssh_target,
-        "redis-cli --scan --pattern 'orcest:pending:*'",
+        f"{_REDIS_CLI_PREFIX} --scan --pattern 'orcest:pending:*'",
     )
     keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
     if not keys:
         return 0
     quoted = " ".join(shlex.quote(k) for k in keys)
-    _ssh(ssh_target, f"redis-cli DEL {quoted}")
+    _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
     return len(keys)
 
 

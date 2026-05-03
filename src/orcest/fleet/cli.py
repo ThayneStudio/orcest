@@ -64,17 +64,22 @@ def _prompt_storage(
     console: Console,
     default: str | None = None,
 ) -> str:
-    """Interactively select a Proxmox storage pool.
+    """Interactively select a Proxmox storage pool, honouring *default*.
 
-    Queries available storage filtered by *content_type* (e.g. ``"images"``),
-    displays a Rich table, and prompts the user to pick one.
+    Queries available storage filtered by *content_type* (e.g. ``"images"``).
+    When *default* is supplied and matches an available storage, returns it
+    without prompting — this is the non-interactive path used by systemd
+    timers (``orcest-rebake-template.timer``) where there is no TTY.
+
+    Falls back to a Rich table + prompt only when *default* is unset or no
+    longer matches available storage; useful for first-time setup.
 
     Args:
         px: Proxmox API client.
         content_type: Required content type (``"images"``, ``"snippets"``, etc.).
         purpose: Human description shown in the prompt (e.g. ``"template VM disk"``).
         console: Rich console for output.
-        default: Pre-selected storage name (highlighted as default).
+        default: Pre-selected storage name. Skips the prompt when present and valid.
 
     Returns:
         The chosen storage name.
@@ -88,6 +93,13 @@ def _prompt_storage(
         name = storages[0]["storage"]
         console.print(f"  Storage for {purpose}: [green]{name}[/green] (only option)")
         return name
+
+    # Non-interactive shortcut: use the configured default when it matches
+    # one of the actually-available storages. Skipping the prompt is what
+    # lets the rebake timer run without a TTY.
+    if default and any(s["storage"] == default for s in storages):
+        console.print(f"  Storage for {purpose}: [green]{default}[/green] (from config)")
+        return default
 
     # Build table
     table = Table(title=f"Available storage ({purpose})")
@@ -265,25 +277,59 @@ def _wait_for_cloud_init(
     console: Console,
     timeout: int = 600,
 ) -> bool:
-    """Wait for cloud-init to finish on a remote host. Returns True on success."""
+    """Wait for cloud-init to truly finish on a remote host.
+
+    Cloud-init writes ``/var/lib/cloud/instance/boot-finished`` only when
+    ``cloud-final.service`` exits — that's the real "done" signal. Polling
+    for the file is robust to ``cloud-init status --wait`` returning early
+    on recoverable errors (e.g. a single ``write_files`` OSError) while
+    cloud-final is still running tooling installs.
+
+    Returns True if boot-finished appears within *timeout*, False otherwise.
+    """
     ssh_target = f"{user}@{host}"
     console.print(f"  Waiting for cloud-init to finish on {host}...", end=" ")
-    try:
-        result = subprocess.run(
-            ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status --wait"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    *_SSH_OPTS,
+                    ssh_target,
+                    "test -f /var/lib/cloud/instance/boot-finished",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            time.sleep(5)
+            continue
         if result.returncode == 0:
-            console.print("[green]ok[/green]")
+            # Cloud-final exited. If status reports an error we still proceed
+            # (recoverable issues like the write_files one are not blocking),
+            # but surface a warning so the operator can investigate.
+            try:
+                status = subprocess.run(
+                    ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                output = (status.stdout or "").strip()
+            except subprocess.TimeoutExpired:
+                output = ""
+            if "status: done" in output:
+                console.print("[green]ok[/green]")
+            else:
+                console.print("[yellow]warning[/yellow]")
+                if output:
+                    console.print(f"    cloud-init: {output}")
             return True
-        console.print("[yellow]warning[/yellow]")
-        console.print(f"    cloud-init may have errors: {result.stderr.strip()}")
-        return True  # cloud-init finished, possibly with errors
-    except subprocess.TimeoutExpired:
-        console.print("[red]timed out[/red]")
-        return False
+        time.sleep(5)
+    console.print("[red]timed out[/red]")
+    return False
 
 
 def _ssh_run(host: str, user: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -1662,8 +1708,8 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
             "  [yellow]New template VM "
             f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
             "  Set it manually with:"
-            f" ssh {cfg.ssh_target()} 'redis-cli SET orcest:pool:current_template_vmid"
-            f" {new_vmid}'"
+            f" ssh {cfg.ssh_target()} 'sudo docker exec orcest-redis-redis-1 redis-cli"
+            f" SET orcest:pool:current_template_vmid {new_vmid}'"
         )
         sys.exit(1)
 

@@ -1409,3 +1409,184 @@ def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
     # Start step should have uploaded config and started pool manager
     mock_upload_cfg.assert_called()
     mock_ensure_pool.assert_called()
+
+
+# ── _prompt_storage non-interactive tests (bug 8) ───────────
+
+
+class TestPromptStorageNonInteractive:
+    """Bug 8: when default matches an available storage, skip the prompt.
+
+    ``orcest-rebake-template.timer`` invokes the CLI without a TTY; an
+    interactive ``click.prompt`` would block forever, so ``_prompt_storage``
+    must return the configured value directly when it is valid.
+    """
+
+    def _px(self, mocker, storages):
+        from orcest.fleet.cli import _prompt_storage
+
+        px = mocker.MagicMock()
+        px.list_storage.return_value = storages
+        return _prompt_storage, px
+
+    def test_returns_default_without_prompt_when_match(self, mocker):
+        from rich.console import Console
+
+        mock_prompt = mocker.patch("orcest.fleet.cli.click.prompt")
+        _prompt_storage, px = self._px(
+            mocker,
+            [
+                {"storage": "ssd-pool", "type": "lvmthin", "avail": 1e12},
+                {"storage": "hdd-pool", "type": "lvmthin", "avail": 1e12},
+            ],
+        )
+        result = _prompt_storage(
+            px, "images", "template VM disk", Console(), default="ssd-pool"
+        )
+        assert result == "ssd-pool"
+        mock_prompt.assert_not_called()
+
+    def test_prompts_when_default_not_in_storages(self, mocker):
+        """If the configured default is not available, fall back to the prompt."""
+        from rich.console import Console
+
+        mock_prompt = mocker.patch("orcest.fleet.cli.click.prompt", return_value=2)
+        _prompt_storage, px = self._px(
+            mocker,
+            [
+                {"storage": "ssd-pool", "type": "lvmthin", "avail": 1e12},
+                {"storage": "hdd-pool", "type": "lvmthin", "avail": 1e12},
+            ],
+        )
+        result = _prompt_storage(
+            px, "images", "template VM disk", Console(), default="missing"
+        )
+        assert result == "hdd-pool"
+        mock_prompt.assert_called_once()
+
+    def test_prompts_when_default_is_none(self, mocker):
+        from rich.console import Console
+
+        mock_prompt = mocker.patch("orcest.fleet.cli.click.prompt", return_value=1)
+        _prompt_storage, px = self._px(
+            mocker,
+            [
+                {"storage": "ssd-pool", "type": "lvmthin", "avail": 1e12},
+                {"storage": "hdd-pool", "type": "lvmthin", "avail": 1e12},
+            ],
+        )
+        result = _prompt_storage(px, "images", "template VM disk", Console())
+        assert result == "ssd-pool"
+        mock_prompt.assert_called_once()
+
+    def test_single_option_short_circuits(self, mocker):
+        """Single-option path ignores ``default`` and returns the only choice."""
+        from rich.console import Console
+
+        mock_prompt = mocker.patch("orcest.fleet.cli.click.prompt")
+        _prompt_storage, px = self._px(
+            mocker, [{"storage": "only-one", "type": "lvmthin", "avail": 1e12}]
+        )
+        assert (
+            _prompt_storage(px, "images", "x", Console(), default="missing") == "only-one"
+        )
+        mock_prompt.assert_not_called()
+
+
+# ── _wait_for_cloud_init polling (bug 5) ────────────────────
+
+
+class TestWaitForCloudInit:
+    """Bug 5: poll for ``/var/lib/cloud/instance/boot-finished`` to confirm
+    cloud-final has actually exited; ``cloud-init status --wait`` returns
+    early on recoverable errors while installs are still running."""
+
+    def test_returns_true_when_boot_finished_appears(self, mocker):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        completed_test = mocker.MagicMock(returncode=0)
+        completed_status = mocker.MagicMock(returncode=0, stdout="status: done", stderr="")
+        run = mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[completed_test, completed_status],
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        result = _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60)
+        assert result is True
+        # The first invocation must check the boot-finished marker file.
+        first_cmd = run.call_args_list[0][0][0]
+        assert "test -f /var/lib/cloud/instance/boot-finished" in " ".join(first_cmd)
+
+    def test_polls_until_boot_finished(self, mocker):
+        """Bug 5: keep polling while boot-finished is missing."""
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        # First two checks fail (file missing); third succeeds; then status check.
+        results = [
+            mocker.MagicMock(returncode=1),
+            mocker.MagicMock(returncode=1),
+            mocker.MagicMock(returncode=0),
+            mocker.MagicMock(returncode=0, stdout="status: done", stderr=""),
+        ]
+        run = mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=results)
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert (
+            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is True
+        )
+        # Should have polled at least three times.
+        assert run.call_count >= 3
+
+    def test_timeout_returns_false(self, mocker):
+        """Bug 5: timeout returns False, never proceeds with a half-done bake."""
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        # Always returns "file not found".
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            return_value=mocker.MagicMock(returncode=1),
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        # Make monotonic jump past the deadline immediately.
+        base = [0.0]
+
+        def fake_monotonic():
+            base[0] += 30.0
+            return base[0]
+
+        mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
+        assert (
+            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
+        )
+
+    def test_does_not_complete_on_status_error_alone(self, mocker):
+        """Bug 5 regression: ``status: error`` without boot-finished must NOT
+        be treated as completion. Old code returned True on any non-zero exit
+        from ``cloud-init status --wait``; the verification agent saw this
+        proceed to ``cloud-init clean`` while installs were still running.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        # boot-finished never shows up; we should time out, not complete.
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            return_value=mocker.MagicMock(returncode=1),
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        base = [0.0]
+
+        def fake_monotonic():
+            base[0] += 100.0
+            return base[0]
+
+        mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
+        assert (
+            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
+        )
