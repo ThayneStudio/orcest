@@ -945,7 +945,10 @@ def _render_fix_prompt(
             "## Instructions",
             "",
             "1. Read the CI failure details and/or review feedback carefully.",
-            "2. Make the minimal changes needed to fix the issues.",
+            "2. Make focused changes -- generalize per the Review Feedback "
+            "guidance above (fix all sibling instances of each cited issue), "
+            "but don't refactor unrelated code or expand scope beyond the "
+            "failures and feedback.",
             "3. Run the project's linter/tests to verify your fix.",
             "4. Commit your changes with a descriptive message.",
             "5. Push to the branch.",
