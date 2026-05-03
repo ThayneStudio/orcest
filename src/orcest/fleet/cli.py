@@ -1136,7 +1136,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     Downloads a cloud image, creates a VM, installs worker tools
     via cloud-init, then converts to a template for fast linked cloning.
     """
-    from orcest.fleet.cloud_init import render_template_userdata
     from orcest.fleet.config import load_config, save_config
 
     console = Console()
@@ -1188,6 +1187,54 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         px.destroy_vm(vm_id)
         console.print("[green]ok[/green]")
 
+    _create_template_at_vmid(
+        px,
+        cfg,
+        vm_id,
+        image_url=image_url,
+        storage=storage,
+        snippet_storage=snippet_storage,
+        console=console,
+    )
+
+    # Save template_vm_id and prompt for worker VM ID range
+    cfg.pool.template_vm_id = vm_id
+    default_start = vm_id + 1
+    vm_id_start = click.prompt(
+        "  Worker VM ID range starts at",
+        default=default_start,
+        type=int,
+    )
+    cfg.pool.vm_id_start = vm_id_start
+    save_config(cfg, config)
+
+    console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
+    console.print(f"  Saved template_vm_id={vm_id}, vm_id_start={vm_id_start} to fleet config.")
+
+
+def _create_template_at_vmid(
+    px: ProxmoxClient,
+    cfg: FleetConfig,
+    vm_id: int,
+    *,
+    image_url: str,
+    storage: str,
+    snippet_storage: str,
+    console: Console,
+) -> None:
+    """Bake a worker template at *vm_id*: download image, provision, convert.
+
+    Shared by the original ``create-template`` command (which manages the
+    single-VMID config) and the new ``rebake`` command (which allocates a
+    fresh VMID from the template range and atomically swaps the Redis
+    pointer on success).
+
+    Calls :func:`sys.exit(1)` on any failure after best-effort cleanup of
+    the half-built VM.  Caller is responsible for any post-success bookkeeping
+    (config save, Redis pointer swap).
+    """
+    from orcest.fleet.cloud_init import render_template_userdata
+
     console.print(f"\n[bold]Creating worker template (VM {vm_id})[/bold]\n")
 
     # Step 1: Create VM from cloud image
@@ -1210,7 +1257,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
             pass
         sys.exit(1)
 
-    # Steps 2-8 can all fail; on any failure we destroy the VM
+    # Steps 2-9 can all fail; on any failure we destroy the VM
     # to avoid leaving orphaned resources.
     def _cleanup_vm() -> None:
         console.print("  Cleaning up: destroying VM...")
@@ -1291,7 +1338,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
 
     # Step 7b: Prepare template for unique clone identities.
     # Clear machine-id so each linked clone gets a unique one on first boot.
-    # (The netplan DHCP fix is handled via cloud-init write_files in cloud_init.py.)
     console.print("  Preparing template for cloning...", end=" ")
     try:
         result = _ssh_run(
@@ -1310,9 +1356,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     console.print("[green]ok[/green]")
 
     # Step 8: Flush filesystem and gracefully shut down the VM.
-    # A hard stop (qm stop) can lose up to 30 seconds of unflushed ext4
-    # writes (commit=30 in the Ubuntu cloud image fstab), which corrupts
-    # the venv and other recently-written files on ZFS-backed storage.
     console.print("  Syncing filesystem...", end=" ")
     try:
         result = _ssh_run(vm_ip, cfg.orchestrator.user, "sudo sync", timeout=120)
@@ -1348,20 +1391,6 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         console.print(f"[red]failed[/red]: {exc}")
         _cleanup_vm()
         sys.exit(1)
-
-    # Step 10: Save template_vm_id and prompt for worker VM ID range
-    cfg.pool.template_vm_id = vm_id
-    default_start = vm_id + 1
-    vm_id_start = click.prompt(
-        "  Worker VM ID range starts at",
-        default=default_start,
-        type=int,
-    )
-    cfg.pool.vm_id_start = vm_id_start
-    save_config(cfg, config)
-
-    console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
-    console.print(f"  Saved template_vm_id={vm_id}, vm_id_start={vm_id_start} to fleet config.")
 
 
 def _set_vm_cloud_init(
@@ -1496,6 +1525,337 @@ def pool_status(config: str) -> None:
     console.print(vm_table)
     console.print(f"\n  Total: {len(worker_vms)} VMs ({running} running, {stopped} stopped)")
     console.print(f"  Target pool size: {cfg.pool.size}")
+
+
+def _allocate_template_vmid(
+    px: ProxmoxClient,
+    cfg: FleetConfig,
+    *,
+    skip: int | None = None,
+) -> int:
+    """Pick the next free VMID in ``pool.template_vmid_range``.
+
+    Scans Proxmox for VMIDs already in use within the range and returns the
+    lowest free one. *skip* is excluded from candidates (used to avoid the
+    currently-active template even if it has been destroyed but still
+    appears in Proxmox).
+
+    Raises :class:`SystemExit(1)` if no range is configured or the range
+    is exhausted.
+    """
+    console = Console()
+    rng = cfg.pool.template_range()
+    if rng is None:
+        console.print(
+            "[red]pool.template_vmid_range is not configured.[/red]\n"
+            "  Add e.g. 'template_vmid_range: [9000, 9009]' to /etc/orcest/config.yaml,"
+            " or use 'orcest fleet create-template' for the legacy single-VMID flow."
+        )
+        sys.exit(1)
+    start, end = rng
+
+    in_use: set[int] = set()
+    try:
+        for vm in px.list_vms():
+            vmid = vm.get("vmid")
+            if vmid is not None:
+                in_use.add(int(vmid))
+    except Exception as exc:
+        console.print(f"[red]Failed to list VMs from Proxmox:[/red] {exc}")
+        sys.exit(1)
+
+    for candidate in range(start, end + 1):
+        if candidate in in_use or candidate == skip:
+            continue
+        return candidate
+
+    console.print(
+        f"[red]Template VMID range exhausted: all of {start}-{end} are in use.[/red]\n"
+        "  Run 'orcest fleet gc-templates' to garbage-collect old templates,"
+        " then retry."
+    )
+    sys.exit(1)
+
+
+@fleet.command("rebake")
+@click.option(
+    "--image-url",
+    default=_DEFAULT_CLOUD_IMAGE_URL,
+    help="Cloud image URL to download.",
+    show_default=True,
+)
+@click.option(
+    "--storage",
+    default=None,
+    help="Proxmox storage for VM disk (default: pool.storage from config).",
+)
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def rebake(image_url: str, storage: str | None, config: str) -> None:
+    """Bake a new worker template and atomically swap the active pointer.
+
+    Allocates the next free VMID from ``pool.template_vmid_range``, builds
+    a fresh template there, then sets the Redis pointer
+    ``orcest:pool:current_template_vmid`` so the pool manager picks it up
+    on its next reconciliation cycle (~10s).
+
+    Never touches the previous template. Old templates with live linked
+    clones stay alive until their clones churn out, then can be cleaned
+    up with ``orcest fleet gc-templates``.
+
+    On any failure the half-built VM is destroyed and the pointer is left
+    untouched, so the active template is unchanged.
+    """
+    from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import set_current_template_vmid
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Proxmox API credentials not configured.[/red]")
+        sys.exit(1)
+
+    if not cfg.orchestrator.host:
+        console.print(
+            "[red]Orchestrator host not set — cannot reach Redis to swap pointer.[/red]"
+        )
+        sys.exit(1)
+
+    px = _create_proxmox_client(cfg)
+
+    if storage is None:
+        storage = cfg.pool.storage or _prompt_storage(
+            px, "images", "template VM disk", console, default=cfg.pool.storage
+        )
+    snippet_storage = cfg.pool.snippet_storage or _find_snippet_storage(px, console)
+
+    new_vmid = _allocate_template_vmid(px, cfg, skip=cfg.pool.template_vm_id or None)
+    rng = cfg.pool.template_range()
+    assert rng is not None  # _allocate_template_vmid would have exited
+    console.print(
+        f"\n[bold]Rebaking template at VM {new_vmid}[/bold] (range {rng[0]}-{rng[1]})\n"
+    )
+
+    _create_template_at_vmid(
+        px,
+        cfg,
+        new_vmid,
+        image_url=image_url,
+        storage=storage,
+        snippet_storage=snippet_storage,
+        console=console,
+    )
+
+    # Atomic swap: pool manager picks up the new VMID on its next cycle.
+    console.print("\n  Swapping active template pointer...", end=" ")
+    try:
+        set_current_template_vmid(cfg.ssh_target(), new_vmid)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        console.print(
+            "  [yellow]New template VM "
+            f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
+            "  Set it manually with:"
+            f" ssh {cfg.ssh_target()} 'redis-cli SET orcest:pool:current_template_vmid"
+            f" {new_vmid}'"
+        )
+        sys.exit(1)
+
+    console.print(
+        f"\n[bold]Rebake complete.[/bold] Active template is now VM {new_vmid}.\n"
+        "  Pool manager will clone from the new template within ~30s."
+    )
+
+
+@fleet.command("destroy-template")
+@click.argument("vm_id", type=int)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip confirmation prompt.",
+)
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def destroy_template(vm_id: int, yes: bool, config: str) -> None:
+    """Destroy a worker template VM.
+
+    Refuses if VM_ID is the currently-active template (would leave the pool
+    without one) or if any linked clones still reference it (Proxmox would
+    reject the destroy anyway, but a clear pre-flight error is friendlier).
+    """
+    from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import get_current_template_vmid
+
+    console = Console()
+    cfg = load_config(config)
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Proxmox API credentials not configured.[/red]")
+        sys.exit(1)
+
+    px = _create_proxmox_client(cfg)
+
+    # Refuse to destroy the active template (Redis pointer or single-VMID config).
+    active: int | None = None
+    if cfg.orchestrator.host:
+        try:
+            active = get_current_template_vmid(cfg.ssh_target())
+        except Exception as exc:
+            console.print(f"[yellow]Warning: could not read active pointer:[/yellow] {exc}")
+    if active is None and cfg.pool.template_vm_id:
+        active = cfg.pool.template_vm_id
+    if active == vm_id:
+        console.print(
+            f"[red]Refusing to destroy VM {vm_id}: it is the currently-active template.[/red]\n"
+            "  Run 'orcest fleet rebake' first to swap to a new template, then retry."
+        )
+        sys.exit(1)
+
+    # Pre-flight: check for linked clones referencing this template.
+    try:
+        all_vms = px.list_vms()
+    except Exception as exc:
+        console.print(f"[red]Failed to list VMs:[/red] {exc}")
+        sys.exit(1)
+    clones = [
+        int(v.get("vmid", 0))
+        for v in all_vms
+        if v.get("name", "").startswith("orcest-worker-")
+        and not v.get("template", False)
+        and int(v.get("vmid", 0)) != vm_id
+    ]
+    if clones:
+        sample = sorted(clones)[:5]
+        more = "..." if len(clones) > 5 else ""
+        console.print(
+            f"[red]Refusing to destroy VM {vm_id}: {len(clones)} linked clone(s) still"
+            f" reference it (vmids: {sample}{more}).[/red]\n"
+            "  Wait for the clones to churn out, or run 'orcest fleet stop --drain-active'"
+            " to drain them."
+        )
+        sys.exit(1)
+
+    if not yes:
+        click.confirm(f"Destroy template VM {vm_id}?", abort=True)
+
+    console.print(f"  Destroying template VM {vm_id}...", end=" ")
+    try:
+        try:
+            px.stop_vm(vm_id)
+        except Exception:
+            pass  # templates are usually already stopped
+        px.destroy_vm(vm_id)
+        console.print("[green]ok[/green]")
+    except Exception as exc:
+        console.print(f"[red]failed[/red]: {exc}")
+        sys.exit(1)
+
+
+@fleet.command("gc-templates")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show which templates would be destroyed without destroying them.",
+)
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+def gc_templates(dry_run: bool, config: str) -> None:
+    """Destroy old templates in the range that have no live linked clones.
+
+    Iterates VMIDs in ``pool.template_vmid_range``, skips the currently-active
+    template, and attempts to destroy each one. Templates with live linked
+    clones will fail to destroy (Proxmox enforces this) and are left in place.
+    """
+    from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import get_current_template_vmid
+
+    console = Console()
+    cfg = load_config(config)
+
+    rng = cfg.pool.template_range()
+    if rng is None:
+        console.print(
+            "[red]pool.template_vmid_range is not configured — nothing to GC.[/red]"
+        )
+        sys.exit(1)
+    start, end = rng
+
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        console.print("[red]Proxmox API credentials not configured.[/red]")
+        sys.exit(1)
+
+    px = _create_proxmox_client(cfg)
+
+    active: int | None = None
+    if cfg.orchestrator.host:
+        try:
+            active = get_current_template_vmid(cfg.ssh_target())
+        except Exception:
+            pass
+    if active is None and cfg.pool.template_vm_id:
+        active = cfg.pool.template_vm_id
+
+    try:
+        all_vms = px.list_vms()
+    except Exception as exc:
+        console.print(f"[red]Failed to list VMs:[/red] {exc}")
+        sys.exit(1)
+    in_range_vmids = sorted(
+        int(v["vmid"]) for v in all_vms if "vmid" in v and start <= int(v["vmid"]) <= end
+    )
+
+    candidates = [vmid for vmid in in_range_vmids if vmid != active]
+    if not candidates:
+        console.print(
+            f"  No GC candidates in range {start}-{end}"
+            + (f" (active template is VM {active})" if active else "")
+            + "."
+        )
+        return
+
+    console.print(
+        f"  Found {len(candidates)} GC candidate(s) in range {start}-{end}: {candidates}"
+    )
+    destroyed: list[int] = []
+    skipped: list[int] = []
+    for vmid in candidates:
+        if dry_run:
+            console.print(f"  [dry-run] would destroy VM {vmid}")
+            continue
+        console.print(f"  Destroying VM {vmid}...", end=" ")
+        try:
+            try:
+                px.stop_vm(vmid)
+            except Exception:
+                pass
+            px.destroy_vm(vmid)
+            console.print("[green]ok[/green]")
+            destroyed.append(vmid)
+        except Exception as exc:
+            # Most common reason: linked clones still reference this template.
+            console.print(f"[yellow]skipped[/yellow]: {exc}")
+            skipped.append(vmid)
+
+    if not dry_run:
+        console.print(
+            f"\n  Destroyed {len(destroyed)} template(s)"
+            + (f", skipped {len(skipped)} (live clones)" if skipped else "")
+            + "."
+        )
 
 
 @fleet.command("set-pool-size")

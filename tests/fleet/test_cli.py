@@ -754,6 +754,249 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     mock_px.destroy_vm.assert_called_once_with(200)
 
 
+# ── rebake / destroy-template / gc-templates tests ──────────
+
+
+def _patch_template_bake(mocker):
+    """Stub out the slow steps inside ``_create_template_at_vmid``.
+
+    Used by rebake/create-template tests to avoid needing a real Proxmox
+    or a full successful bake path.
+    """
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch(
+        "orcest.fleet.cli._ssh_run",
+        return_value=mocker.MagicMock(returncode=0),
+    )
+
+
+def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, mocker):
+    """rebake picks the lowest free VMID in the range and SETs the Redis pointer."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(
+            host="10.20.0.1", user="orcest", ssh_key="ssh-ed25519 AAA"
+        ),
+        pool=PoolConfig(
+            template_vmid_range=[9000, 9009],
+            template_vm_id=9000,  # current active
+            storage="ssd-pool",
+            snippet_storage="local",
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    # 9000 is the current active template; rebake should skip it and pick 9001.
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+    ]
+    _patch_template_bake(mocker)
+    mock_set = mocker.patch("orcest.fleet.orchestrator.set_current_template_vmid")
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "Rebake complete" in result.output
+    mock_px.convert_to_template.assert_called_once_with(9001)
+    mock_set.assert_called_once_with("orcest@10.20.0.1", 9001)
+
+
+def test_rebake_no_range_configured_fails(runner, cfg_path, mocker):
+    """rebake refuses without pool.template_vmid_range."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),  # legacy single-VMID, no range
+    )
+    _save(cfg, cfg_path)
+    _mock_proxmox_client(mocker)
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "template_vmid_range" in result.output
+
+
+def test_rebake_range_exhausted_fails(runner, cfg_path, mocker):
+    """rebake fails if every VMID in the range is already in use."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9001], template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "template": True},
+        {"vmid": 9001, "template": True},
+    ]
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "exhausted" in result.output
+
+
+def test_rebake_bake_failure_does_not_swap_pointer(runner, cfg_path, mocker):
+    """If bake fails, rebake never SETs the Redis pointer (active stays unchanged)."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(
+            template_vmid_range=[9000, 9009],
+            template_vm_id=9000,
+            storage="ssd-pool",
+            snippet_storage="local",
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [{"vmid": 9000, "template": True}]
+    mocker.patch(
+        "orcest.fleet.cli._create_vm_from_cloud_image",
+        side_effect=RuntimeError("download failed"),
+    )
+    mock_set = mocker.patch("orcest.fleet.orchestrator.set_current_template_vmid")
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    mock_set.assert_not_called()
+    # Best-effort cleanup of the half-built VM
+    mock_px.destroy_vm.assert_called_once_with(9001)
+
+
+def test_destroy_template_refuses_active_pointer(runner, cfg_path, mocker):
+    """destroy-template refuses to destroy the currently-active template."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    _mock_proxmox_client(mocker)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(
+        fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path]
+    )
+
+    assert result.exit_code != 0
+    assert "currently-active template" in result.output
+
+
+def test_destroy_template_refuses_with_live_clones(runner, cfg_path, mocker):
+    """destroy-template refuses if any worker VMs (linked clones) still exist."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+        {"vmid": 300, "name": "orcest-worker-300", "template": False},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(
+        fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path]
+    )
+
+    assert result.exit_code != 0
+    assert "linked clone" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_destroy_template_succeeds_when_safe(runner, cfg_path, mocker):
+    """destroy-template destroys the template when no clones reference it."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(
+        fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path]
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_px.destroy_vm.assert_called_once_with(9000)
+
+
+def test_gc_templates_destroys_inactive_only(runner, cfg_path, mocker):
+    """gc-templates destroys old templates in range but skips the active one."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9002, "name": "orcest-worker-template", "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    # 9000 and 9002 destroyed; 9001 (active) preserved
+    destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
+    assert destroyed == {9000, 9002}
+
+
+def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
+    """gc-templates --dry-run reports candidates but does not destroy them."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "template": True},
+        {"vmid": 9001, "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--dry-run", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "would destroy VM 9000" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
 # ── pool-status tests ───────────────────────────────────────
 
 

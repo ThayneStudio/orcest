@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 _POOL_IDLE_KEY = "pool:idle"
 _POOL_ACTIVE_KEY = "pool:active"
 _POOL_DONE_PREFIX = "pool:done:"
+# Pointer naming the active worker template VMID. Set by `orcest fleet rebake`
+# (or initialised from `pool.template_vm_id` on first run for backward compat).
+_POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
 
 # VM naming convention
 _VM_NAME_PREFIX = "orcest-worker-"
@@ -249,6 +252,45 @@ class PoolManager:
                 exc_info=True,
             )
 
+    def _resolve_template_vmid(self) -> int | None:
+        """Return the VMID of the currently-active worker template.
+
+        Read order each cycle:
+          1. Redis pointer ``pool:current_template_vmid`` (set by ``rebake``).
+          2. Single-VMID fallback ``pool.template_vm_id`` (legacy/zero-config).
+             When used, the pointer is also initialised so subsequent reads
+             come from Redis without restart.
+
+        Returns ``None`` if neither is configured.
+        """
+        try:
+            raw = self._redis.get(_POOL_CURRENT_TEMPLATE_KEY)
+        except Exception:
+            logger.warning(
+                "Failed to read template pointer from Redis; falling back to config",
+                exc_info=True,
+            )
+            raw = None
+
+        if raw:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid template pointer %r in Redis; falling back to config", raw
+                )
+
+        fallback = self._pool.template_vm_id
+        if not fallback:
+            return None
+        # Initialise pointer from config so future reads come from Redis.
+        # Best-effort: if Redis is down we still return the fallback ID.
+        try:
+            self._redis.set_ex(_POOL_CURRENT_TEMPLATE_KEY, str(fallback), ttl=86400 * 365)
+        except Exception:
+            logger.warning("Failed to initialise template pointer in Redis", exc_info=True)
+        return fallback
+
     def _clone_and_boot(self) -> int | None:
         """Clone a new VM from template, start it, add to idle set.
 
@@ -258,9 +300,12 @@ class PoolManager:
         as long as only one pool manager instance is running. See module
         docstring.
         """
-        template_id = self._pool.template_vm_id
+        template_id = self._resolve_template_vmid()
         if not template_id:
-            logger.error("No template VM ID configured (pool.template_vm_id)")
+            logger.error(
+                "No template VM ID configured "
+                "(pool.template_vm_id or Redis pointer pool:current_template_vmid)"
+            )
             return None
 
         if not self._pool.vm_id_start:
@@ -424,8 +469,11 @@ class PoolManager:
                 continue
             vm_id = int(vm_id)
 
-            # Skip the template itself
-            if vm_id == self._pool.template_vm_id:
+            # Skip any template VMID (active or older blue/green generations
+            # awaiting GC). Old templates with live linked clones must not be
+            # touched here; they get cleaned up by `orcest fleet gc-templates`
+            # once their clones churn out.
+            if self._is_template_vmid(vm_id):
                 continue
 
             if vm_id not in tracked_vm_ids:
@@ -480,7 +528,7 @@ class PoolManager:
                 vm_id = int(member)
             except (ValueError, TypeError):
                 continue
-            if vm_id not in proxmox_vm_ids and vm_id != self._pool.template_vm_id:
+            if vm_id not in proxmox_vm_ids and not self._is_template_vmid(vm_id):
                 logger.warning(
                     "Stale idle entry VM %d not found in Proxmox, removing from Redis",
                     vm_id,
@@ -501,7 +549,7 @@ class PoolManager:
                 vm_id = int(vm_id_str)
             except (ValueError, TypeError):
                 continue
-            if vm_id not in proxmox_vm_ids and vm_id != self._pool.template_vm_id:
+            if vm_id not in proxmox_vm_ids and not self._is_template_vmid(vm_id):
                 logger.warning(
                     "Stale active entry VM %d not found in Proxmox, removing from Redis",
                     vm_id,
@@ -554,6 +602,23 @@ class PoolManager:
             f"{prefix}:tasks:claude",
             f"{prefix}:tasks:issue:claude",
         )
+
+    def _is_template_vmid(self, vm_id: int) -> bool:
+        """Return True if *vm_id* names a template (active or pending GC).
+
+        Includes the active template (Redis pointer or single-VMID config)
+        and every VMID in the configured ``template_vmid_range``.
+        """
+        try:
+            rng = self._pool.template_range()
+        except ValueError:
+            rng = None
+        if rng is not None and rng[0] <= vm_id <= rng[1]:
+            return True
+        if vm_id == self._pool.template_vm_id and self._pool.template_vm_id != 0:
+            return True
+        active = self._resolve_template_vmid()
+        return active is not None and vm_id == active
 
     def _next_vm_id(self) -> int:
         """Allocate the next VM ID from the configured pool range.

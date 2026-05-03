@@ -91,7 +91,12 @@ class PoolConfig:
     """Ephemeral worker VM pool settings."""
 
     size: int = 4  # Target warm pool size
-    template_vm_id: int = 0  # Template to clone from (0 = not configured)
+    template_vm_id: int = 0  # Single-VMID fallback (used only if template_vmid_range is empty)
+    # Inclusive [start, end] range of VMIDs reserved for worker templates.
+    # The "currently active" template within this range is named by the
+    # Redis pointer ``orcest:pool:current_template_vmid`` (set by ``rebake``).
+    # Empty list means range mode is disabled — fall back to ``template_vm_id``.
+    template_vmid_range: list[int] = field(default_factory=list)
     vm_id_start: int = 0  # First VM ID for worker clones (0 = not configured)
     vm_id_end: int = 0  # Last VM ID for worker clones (0 = no upper bound)
     storage: str = "ssd-pool"  # ZFS pool for linked clones
@@ -100,6 +105,28 @@ class PoolConfig:
     worker_disk_size: int = 30  # GB
     max_task_duration: int = 3600  # seconds before force-kill
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
+
+    def template_range(self) -> tuple[int, int] | None:
+        """Return ``(start, end)`` template VMID range, or ``None`` if not configured.
+
+        The range field is the source of truth for blue/green template
+        rotation; ``template_vm_id`` is only consulted as a single-VMID
+        fallback when the range is empty.
+        """
+        r = self.template_vmid_range
+        if not r:
+            return None
+        if len(r) != 2:
+            raise ValueError(
+                f"pool.template_vmid_range must be [start, end], got {r!r}"
+            )
+        start, end = int(r[0]), int(r[1])
+        if start <= 0 or end < start:
+            raise ValueError(
+                f"pool.template_vmid_range must be [start, end] with 0 < start <= end,"
+                f" got [{start}, {end}]"
+            )
+        return start, end
 
 
 @dataclass
@@ -210,9 +237,16 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         )
 
     pl = data.get("pool") or {}
+    raw_range = pl.get("template_vmid_range") or []
+    if raw_range and not isinstance(raw_range, list):
+        raise ValueError(
+            f"pool.template_vmid_range must be a list, got {type(raw_range).__name__}"
+        )
+    template_range_list = [int(v) for v in raw_range] if raw_range else []
     pool = PoolConfig(
         size=pl.get("size", 4),
         template_vm_id=pl.get("template_vm_id", 0),
+        template_vmid_range=template_range_list,
         vm_id_start=pl.get("vm_id_start", 0),
         vm_id_end=pl.get("vm_id_end", 0),
         storage=pl.get("storage", "ssd-pool"),
@@ -271,6 +305,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         "pool": {
             "size": config.pool.size,
             "template_vm_id": config.pool.template_vm_id,
+            "template_vmid_range": list(config.pool.template_vmid_range),
             "vm_id_start": config.pool.vm_id_start,
             "vm_id_end": config.pool.vm_id_end,
             "storage": config.pool.storage,
