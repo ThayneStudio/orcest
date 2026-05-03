@@ -16,10 +16,8 @@ from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import (
     clear_backoff,
-    get_backoff_step,
     make_pending_task_key,
     make_pr_lock_key,
-    set_backoff_cooldown,
 )
 from orcest.shared.redis_client import RedisClient
 
@@ -403,7 +401,7 @@ def discover_actionable_prs(
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
-    max_total_attempts: int = 25,
+    max_total_attempts: int = 50,
     stale_pending_timeout_seconds: int = 7200,
 ) -> list[PRState]:
     """Discover PRs that need action.
@@ -414,8 +412,9 @@ def discover_actionable_prs(
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs with a pending task already queued
     5. Skip PRs that exceeded total cross-SHA attempt limit
-    6. Skip PRs that have been attempted but haven't changed (attempt count > 0)
-    7. Route PRs with merge conflicts (mergeable == CONFLICTING) to ENQUEUE_REBASE
+    6. Route PRs with merge conflicts to ENQUEUE_REBASE (before SKIP_ACTIVE
+       to avoid deadlock — conflicts can't resolve without a rebase)
+    7. Skip PRs that have been attempted but haven't changed (attempt count > 0)
     8. Fetch CI status; skip if checks are still pending or absent
     9. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
@@ -528,56 +527,26 @@ def discover_actionable_prs(
         # above and never reaches this block.
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
-            if get_exhausted_notified(redis, repo, number):
-                # exhausted_notified is set and needs-human label is absent (inferred
-                # via SKIP_LABELED invariant above); treat as retry signal and reset.
-                clear_total_attempts(redis, repo, number)
-                clear_attempts(redis, repo, number)
-                clear_exhausted_notified(redis, repo, number)
-                clear_backoff(redis, repo, number)
-                logger.info(
-                    "PR #%d: exhausted_notified set and needs-human label absent"
-                    " (inferred via SKIP_LABELED invariant);"
-                    " resetting total attempt counter, exhausted_notified flag,"
-                    " backoff state, and per-SHA attempt counter for retry",
-                    number,
+            logger.warning(
+                "PR #%d: total attempts (%d) >= limit (%d), stopping",
+                number,
+                total_attempts,
+                max_total_attempts,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
                 )
-                # Fall through to normal processing (all Redis counters now reset).
-            else:
-                # Calculate backoff step: each attempt past the limit increases the step
-                step = total_attempts - max_total_attempts
-                current_step = get_backoff_step(redis, repo, number)
-                if current_step is not None:
-                    # Still in cooldown — skip this PR
-                    results.append(
-                        PRState(
-                            number=number,
-                            title=title,
-                            branch=branch,
-                            head_sha=head_sha,
-                            action=PRAction.SKIP_BACKOFF,
-                            ci_failures=[],
-                            review_threads=[],
-                            labels=pr_labels,
-                            base_branch=base_branch,
-                        )
-                    )
-                    continue
-                else:
-                    # Cooldown expired or first time hitting the limit.
-                    # Set a new cooldown, clear per-SHA attempts so the PR
-                    # can be retried, and fall through to normal routing.
-                    set_backoff_cooldown(redis, repo, number, step)
-                    clear_attempts(redis, repo, number)
-                    logger.info(
-                        "PR #%d: total attempts (%d) >= limit (%d), "
-                        "backoff step %d, clearing per-SHA attempts for retry",
-                        number,
-                        total_attempts,
-                        max_total_attempts,
-                        step,
-                    )
-                    # Fall through to normal processing for one more round.
+            )
+            continue
 
         # Skip if a USAGE_EXHAUSTED cooldown is still active (waiting for
         # API capacity to recover before re-enqueuing).
@@ -628,25 +597,10 @@ def discover_actionable_prs(
                 )
             )
             continue
-        if attempt_count > 0:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_ACTIVE,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
-                )
-            )
-            continue
-
-        # Route conflicting PRs to rebase before the expensive CI fetch.
-        # mergeable is fetched as part of list_open_prs (no extra API call).
-        # UNKNOWN means GitHub hasn't computed mergeability yet — ignore it.
+        # Route conflicting PRs to rebase before SKIP_ACTIVE — conflicts
+        # can't resolve without a rebase, so waiting for new commits would
+        # deadlock. SKIP_MAX_ATTEMPTS above still applies to prevent infinite
+        # rebase loops.
         if pr_data.get("mergeable") == "CONFLICTING":
             logger.info(
                 "PR #%d has merge conflicts (mergeable=CONFLICTING), enqueuing rebase",
@@ -659,6 +613,22 @@ def discover_actionable_prs(
                     branch=branch,
                     head_sha=head_sha,
                     action=PRAction.ENQUEUE_REBASE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
+        if attempt_count > 0:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_ACTIVE,
                     ci_failures=[],
                     review_threads=[],
                     labels=pr_labels,
@@ -794,6 +764,7 @@ def discover_actionable_prs(
         elif review_decision == "CHANGES_REQUESTED":
             # CI green but reviewer requested changes — enqueue fix
             # Fetch unresolved review threads for worker prompt context
+            threads: list | None = None
             try:
                 threads = gh.get_unresolved_review_threads(repo, number, token)
             except Exception:
@@ -802,21 +773,71 @@ def discover_actionable_prs(
                     number,
                     exc_info=True,
                 )
-                threads = []
 
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.ENQUEUE_FIX,
-                    ci_failures=[],
-                    review_threads=threads,
-                    labels=pr_labels,
-                    base_branch=base_branch,
+            if threads is not None and not threads:
+                # All review threads resolved but reviewDecision is stale
+                # (GitHub doesn't clear CHANGES_REQUESTED when threads are
+                # resolved — only a new approving review clears it).
+                # Re-trigger claude-review so it can submit a fresh APPROVED
+                # or raise new objections.
+                review_run_id = _get_claude_review_run_id(checks)
+                retrigger_sha = get_review_retrigger_sha(redis, repo, number)
+
+                if review_run_id is not None and retrigger_sha != head_sha:
+                    logger.info(
+                        "PR #%d has CHANGES_REQUESTED but all threads resolved, "
+                        "re-triggering claude-review (run %d)",
+                        number,
+                        review_run_id,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.RETRIGGER_REVIEW,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                            review_run_id=review_run_id,
+                        )
+                    )
+                else:
+                    # Already re-triggered for this SHA or no claude-review
+                    # run found — nothing actionable, skip.
+                    logger.info(
+                        "PR #%d has CHANGES_REQUESTED but all threads resolved, skipping",
+                        number,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_GREEN,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.ENQUEUE_FIX,
+                        ci_failures=[],
+                        review_threads=threads or [],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
                 )
-            )
         elif review_decision == "APPROVED":
             # CI green + approved — check for unresolved threads
             try:

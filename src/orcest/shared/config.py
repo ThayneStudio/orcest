@@ -36,8 +36,13 @@ class ProjectConfig:
 
     repo: str  # "owner/repo"
     token: str  # GitHub PAT
-    claude_token: str  # Claude Code OAuth token
+    claude_tokens: list[str]  # Claude Code OAuth tokens (round-robin pool)
     key_prefix: str  # Redis key prefix for this project
+
+    @property
+    def claude_token(self) -> str:
+        """First token (backward compat for single-token callers)."""
+        return self.claude_tokens[0] if self.claude_tokens else ""
 
 
 @dataclass
@@ -85,10 +90,14 @@ class OrchestratorConfig:
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
-    max_total_attempts: int = 25  # Max total attempts across all SHAs (circuit breaker)
+    max_total_attempts: int = 50  # Max total attempts across all SHAs (hard stop)
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
+    # Redis key prefix for the shared task stream. All per-project orchestrators
+    # publish to this prefix so workers only need to read from one stream.
+    # Defaults to redis.key_prefix for backward compatibility with single-project mode.
+    task_key_prefix: str = ""
 
 
 @dataclass
@@ -99,11 +108,6 @@ class WorkerConfig:
     backend: str = "claude"
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     ephemeral: bool = False  # When True, process one task and exit
-    key_prefixes: list[str] = field(default_factory=list)  # Multi-project prefixes
-
-    def __post_init__(self) -> None:
-        if not self.key_prefixes:
-            self.key_prefixes = [self.redis.key_prefix]
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -244,14 +248,22 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     github_token = os.environ.get("GITHUB_TOKEN", github_raw.get("token", ""))
     github_repo = os.environ.get("ORCEST_REPO", github_raw.get("repo", ""))
 
-    claude_token = os.environ.get(
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        github_raw.get("claude_token", ""),
-    )
+    # Claude tokens: prefer comma-separated CLAUDE_CODE_OAUTH_TOKENS env var,
+    # fall back to single CLAUDE_CODE_OAUTH_TOKEN, then YAML.
+    claude_tokens_env = os.environ.get("CLAUDE_CODE_OAUTH_TOKENS", "")
+    if claude_tokens_env:
+        claude_tokens = [t.strip() for t in claude_tokens_env.split(",") if t.strip()]
+    else:
+        single = os.environ.get(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            github_raw.get("claude_token", ""),
+        )
+        claude_tokens = [single] if single else []
+
     github_config = GithubConfig(
         token=_safe_str(github_token, "github.token"),
         repo=_safe_str(github_repo, "github.repo"),
-        claude_token=_safe_str(claude_token, "github.claude_token"),
+        claude_token=_safe_str(claude_tokens[0], "github.claude_token") if claude_tokens else "",
     )
 
     # Multi-project support: load projects list
@@ -263,15 +275,26 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         for i, p in enumerate(projects_raw):
             if not isinstance(p, dict):
                 raise ValueError(f"projects[{i}] must be a YAML mapping, got {type(p).__name__}")
+            # Per-project token list: check claude_tokens (list), claude_token (string), or shared
+            p_tokens_raw = p.get("claude_tokens")
+            if isinstance(p_tokens_raw, list) and p_tokens_raw:
+                p_claude_tokens = [
+                    _safe_str(t, f"projects[{i}].claude_tokens[{j}]")
+                    for j, t in enumerate(p_tokens_raw)
+                    if t
+                ]
+            elif p.get("claude_token"):
+                p_claude_tokens = [
+                    _safe_str(p["claude_token"], f"projects[{i}].claude_token")
+                ]
+            else:
+                p_claude_tokens = list(claude_tokens)  # inherit from shared
             projects.append(
                 ProjectConfig(
                     repo=_safe_str(p.get("repo", ""), f"projects[{i}].repo"),
                     # Default to shared token when not set per-project
                     token=_safe_str(p.get("token", github_token), f"projects[{i}].token"),
-                    claude_token=_safe_str(
-                        p.get("claude_token", claude_token),
-                        f"projects[{i}].claude_token",
-                    ),
+                    claude_tokens=p_claude_tokens,
                     key_prefix=_safe_str(
                         p.get("key_prefix", redis_config.key_prefix),
                         f"projects[{i}].key_prefix",
@@ -304,7 +327,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             ProjectConfig(
                 repo=_safe_str(github_repo, "github.repo"),
                 token=_safe_str(github_token, "github.token"),
-                claude_token=_safe_str(claude_token, "github.claude_token"),
+                claude_tokens=list(claude_tokens),
                 key_prefix=_safe_str(redis_config.key_prefix, "redis.key_prefix"),
             )
         ]
@@ -353,8 +376,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
 
-    # Max total attempts across all SHAs (circuit breaker)
-    max_total_attempts = _safe_int(raw.get("max_total_attempts", 25), "max_total_attempts")
+    # Max total attempts across all SHAs (hard stop)
+    max_total_attempts = _safe_int(raw.get("max_total_attempts", 50), "max_total_attempts")
 
     # Whether to delete the head branch after merging
     delete_branch_on_merge = _safe_bool(
@@ -398,6 +421,12 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             f"got {stale_pending_timeout_seconds!r}."
         )
 
+    # Shared task stream prefix: all per-project orchestrators publish tasks
+    # to this prefix so workers only need to read from one stream.
+    task_key_prefix = str(
+        os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix", ""))
+    ) or redis_config.key_prefix
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -411,6 +440,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         max_total_attempts=max_total_attempts,
         delete_branch_on_merge=delete_branch_on_merge,
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
+        task_key_prefix=task_key_prefix,
     )
 
     # Validate required fields
@@ -483,16 +513,6 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     ephemeral_raw = raw.get("ephemeral", False)
     ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
 
-    # Multi-project key prefixes: check redis.key_prefixes first, fall back to [redis.key_prefix]
-    redis_raw_section = _safe_dict(raw, "redis")
-    raw_key_prefixes = redis_raw_section.get("key_prefixes")
-    if isinstance(raw_key_prefixes, list) and raw_key_prefixes:
-        key_prefixes = [
-            _safe_str(p, f"redis.key_prefixes[{i}]") for i, p in enumerate(raw_key_prefixes)
-        ]
-    else:
-        key_prefixes = [redis_config.key_prefix]
-
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
@@ -500,7 +520,6 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         backend=backend,
         runner=runner_config,
         ephemeral=ephemeral,
-        key_prefixes=key_prefixes,
     )
 
     # Validate required fields

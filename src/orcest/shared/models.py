@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+# Shared consumer group name used by workers, orchestrator, and pool manager.
+CONSUMER_GROUP = "workers"
+
 # Redis stream / key name constants
 DEAD_LETTER_STREAM = "dead-letter"
 
@@ -132,10 +135,11 @@ class TaskResult:
     duration_seconds: int
     resource_type: str  # "pr" or "issue" -- needed so orchestrator can post comments
     resource_id: int  # PR/issue number
+    rate_limit_resets_at: int = 0  # Unix timestamp when rate limit resets (0 = unknown)
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
-        return {
+        d = {
             "task_id": self.task_id,
             "worker_id": self.worker_id,
             "status": self.status.value,
@@ -145,6 +149,9 @@ class TaskResult:
             "resource_type": self.resource_type,
             "resource_id": str(self.resource_id),
         }
+        if self.rate_limit_resets_at:
+            d["rate_limit_resets_at"] = str(self.rate_limit_resets_at)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, str]) -> "TaskResult":
@@ -158,4 +165,5 @@ class TaskResult:
             duration_seconds=int(data["duration_seconds"]),
             resource_type=data["resource_type"],
             resource_id=int(data["resource_id"]),
+            rate_limit_resets_at=int(data.get("rate_limit_resets_at", "0")),
         )

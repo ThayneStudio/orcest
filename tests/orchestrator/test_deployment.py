@@ -243,7 +243,8 @@ def test_poll_cycle_runs_deployment_after_merge(
     mock_deploy = mocker.patch("orcest.orchestrator.loop.run_deployment")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"), 3600)
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     mock_deploy.assert_called_once_with(orchestrator_config.deployment, 200, mocker.ANY)
 
@@ -281,7 +282,8 @@ def test_poll_cycle_deployment_failure_creates_issue(
     gh_mock.create_issue.return_value = 999
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"), 3600)
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     gh_mock.create_issue.assert_called_once()
     title, body = (
@@ -318,7 +320,8 @@ def test_poll_cycle_deployment_skipped_when_disabled(
     mock_deploy = mocker.patch("orcest.orchestrator.loop.run_deployment")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    _poll_cycle(orchestrator_config, fake_redis_client, logging.getLogger("test"), 3600)
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     # Merge happened; run_deployment is called unconditionally but is a no-op when disabled
     gh_mock.merge_pr.assert_called_once()

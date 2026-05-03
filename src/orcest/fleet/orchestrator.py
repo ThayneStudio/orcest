@@ -480,12 +480,16 @@ def generate_env_file(
     github_token: str,
     key_prefix: str,
     project_name: str,
+    claude_tokens: list[str] | None = None,
     claude_token: str = "",
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
     Values are single-quoted to prevent Docker Compose from performing
     variable interpolation (``$`` references) or word splitting.
+
+    Accepts either ``claude_tokens`` (list, preferred) or ``claude_token``
+    (single string, backward compat).
     """
     _validate_project_name(project_name)
     _validate_env_value(github_token, "github_token")
@@ -498,20 +502,31 @@ def generate_env_file(
         "ORCEST_IMAGE='orcest:latest'",
         f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'",
     ]
-    if claude_token:
-        _validate_env_value(claude_token, "claude_token")
-        lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{claude_token}'")
+    # Resolve token list: prefer explicit list, fall back to single string
+    tokens = claude_tokens if claude_tokens else ([claude_token] if claude_token else [])
+    if tokens:
+        for i, t in enumerate(tokens):
+            _validate_env_value(t, f"claude_tokens[{i}]")
+        # First token as CLAUDE_CODE_OAUTH_TOKEN (worker env fallback)
+        lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{tokens[0]}'")
+        # All tokens as comma-separated list for orchestrator round-robin
+        lines.append(f"CLAUDE_CODE_OAUTH_TOKENS='{','.join(tokens)}'")
     return "\n".join(lines) + "\n"
 
 
-def generate_orchestrator_config(repo: str, key_prefix: str) -> str:
+def generate_orchestrator_config(
+    repo: str, key_prefix: str, task_key_prefix: str = "orcest"
+) -> str:
     """Generate orchestrator.yaml content for a project.
 
     Uses redis host 'redis' (Docker network service name), port 6379,
-    and the project's key prefix for namespace isolation.
+    and the project's key prefix for namespace isolation. The
+    ``task_key_prefix`` is the shared prefix used for the task stream
+    that workers read from.
     """
     config = {
         "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
+        "task_key_prefix": task_key_prefix,
         "github": {"repo": repo},
     }
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

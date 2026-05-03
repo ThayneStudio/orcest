@@ -91,6 +91,7 @@ class ClaudeResult:
     duration_seconds: int
     raw_output: str
     usage_exhausted: bool = False
+    rate_limit_resets_at: int = 0  # Unix timestamp from rate_limit_event, 0 = not set
 
 
 def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
@@ -131,6 +132,35 @@ def _is_usage_exhausted(stderr: str) -> bool:
         if primary in text and (not secondary or secondary in text):
             return True
     return False
+
+
+def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
+    """Check stream-json stdout for a rate_limit_event with blocked status.
+
+    Claude Code emits ``rate_limit_event`` objects in stream-json output
+    when usage limits are approached or hit.  The ``status`` field is
+    ``"allowed"`` normally and ``"blocked"`` when the limit is reached.
+
+    Returns (is_blocked, resets_at_unix) where resets_at_unix is the
+    Unix timestamp from the event (0 if not available).
+    """
+    import json
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or "rate_limit_event" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("type") != "rate_limit_event":
+            continue
+        info = obj.get("rate_limit_info", {})
+        if info.get("status") == "blocked":
+            resets_at = info.get("resetsAt", 0)
+            return True, int(resets_at) if resets_at else 0
+    return False, 0
 
 
 def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
@@ -606,14 +636,19 @@ def run_claude(
                     duration_seconds=duration,
                     raw_output=stderr or stdout,
                 )
-            # Check for usage exhaustion -- do NOT retry
-            if _is_usage_exhausted(stderr):
+            # Check for usage exhaustion -- do NOT retry.
+            # Two detection paths:
+            # 1. stderr patterns (rate limit / usage limit error messages)
+            # 2. stdout rate_limit_event with status=blocked (stream-json)
+            rate_blocked, resets_at = _check_rate_limit_event(stdout)
+            if _is_usage_exhausted(stderr) or rate_blocked:
                 return ClaudeResult(
                     success=False,
                     summary="Claude usage limit reached",
                     duration_seconds=duration,
-                    raw_output=stderr,
+                    raw_output=stderr or stdout,
                     usage_exhausted=True,
+                    rate_limit_resets_at=resets_at,
                 )
 
         # Retry with backoff on non-zero exit (crash)
@@ -676,6 +711,7 @@ class ClaudeRunner:
             success=result.success,
             summary=result.summary,
             usage_exhausted=result.usage_exhausted,
+            rate_limit_resets_at=result.rate_limit_resets_at,
         )
 
 
