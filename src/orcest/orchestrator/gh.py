@@ -269,20 +269,20 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
     )
 
 
-def update_branch(repo: str, number: int, token: str) -> None:
+def update_branch(repo: str, number: int, token: str) -> bool:
     """Update a PR's branch from its base via the GitHub REST API.
 
     Equivalent to clicking the "Update branch" button in the PR UI: GitHub
     merges the base branch into the PR branch with a default merge commit.
-    Returns once GitHub accepts the request (the actual merge runs async on
-    GitHub's side; the next poll cycle will see the new head SHA).
+    Returns True once GitHub accepts the request (the actual merge runs async
+    on GitHub's side; the next poll cycle will see the new head SHA).
 
     Used for PRs that branch protection holds back because the head is not
     up to date with base (mergeStateStatus is BEHIND, or BLOCKED when an
     "up to date" rule is the blocker). When the branch is already current,
     GitHub returns 422 "no new commits on the base branch" — that's a
-    no-op signal, not a failure, so it's swallowed silently. Conflicting
-    PRs need a worker rebase and go through ENQUEUE_REBASE instead.
+    no-op signal, not a failure, so False is returned. Conflicting PRs need
+    a worker rebase and go through ENQUEUE_REBASE instead.
     """
     _validate_repo(repo)
     try:
@@ -295,13 +295,14 @@ def update_branch(repo: str, number: int, token: str) -> None:
             ],
             token,
         )
+        return True
     except GhCliError as exc:
         if "no new commits on the base branch" in (exc.stderr or "").lower():
             logger.debug(
                 "update_branch: PR #%d already up to date with base, no-op",
                 number,
             )
-            return
+            return False
         raise
 
 

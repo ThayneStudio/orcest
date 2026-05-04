@@ -16,6 +16,7 @@ from orcest.orchestrator.loop import (
     RESULTS_GROUP,
     RESULTS_STREAM,
     _consume_results_for_project,
+    _is_required_checks_expected_error,
     _poll_cycle,
 )
 from orcest.orchestrator.pr_ops import (
@@ -2083,6 +2084,51 @@ def test_required_checks_expected_merge_error_updates_branch(
     gh_mock.post_comment.assert_not_called()
 
 
+def test_required_status_check_expected_singular_matches_recovery_predicate():
+    """GitHub may use singular 'required status check' for one required check."""
+    assert _is_required_checks_expected_error(
+        'Repository rule violations found: Required status check "test" is expected.'
+    )
+
+
+def test_required_checks_expected_update_branch_noop_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """If update-branch is a no-op, the terminal needs-human path still runs."""
+    pr_state = _make_merge_pr_state(number=306)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError(
+        "Repository rule violations found: required status check is expected"
+    )
+    gh_mock.update_branch.return_value = False
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    gh_mock.update_branch.assert_called_once_with(
+        orchestrator_config.github.repo,
+        306,
+        orchestrator_config.github.token,
+    )
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        306,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    gh_mock.post_comment.assert_called_once()
+
+
 def test_required_checks_expected_update_branch_failure_labels_needs_human(
     mocker,
     fake_redis_client,
@@ -2090,7 +2136,7 @@ def test_required_checks_expected_update_branch_failure_labels_needs_human(
     gh_mock,
 ):
     """If the recovery update-branch call fails, the existing terminal path still runs."""
-    pr_state = _make_merge_pr_state(number=306)
+    pr_state = _make_merge_pr_state(number=307)
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -2110,7 +2156,7 @@ def test_required_checks_expected_update_branch_failure_labels_needs_human(
     gh_mock.update_branch.assert_called_once()
     gh_mock.add_label.assert_called_once_with(
         orchestrator_config.github.repo,
-        306,
+        307,
         orchestrator_config.labels.needs_human,
         orchestrator_config.github.token,
     )

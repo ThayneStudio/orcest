@@ -97,7 +97,7 @@ def _is_required_checks_expected_error(msg: str) -> bool:
     """Return True when branch protection says required checks need rerunning."""
     lower = msg.lower()
     return (
-        "required status checks" in lower
+        "required status check" in lower
         and "expected" in lower
         and (
             "repository rule violations" in lower
@@ -453,8 +453,8 @@ def _poll_project(
                             pr_state.number,
                         )
                         try:
-                            gh.update_branch(repo, pr_state.number, token)
-                            continue
+                            if gh.update_branch(repo, pr_state.number, token):
+                                continue
                         except Exception as update_err:
                             logger.warning(
                                 "PR #%d: update-branch after merge rejection failed: %s",
