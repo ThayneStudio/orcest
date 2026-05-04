@@ -2049,3 +2049,68 @@ def test_non_network_merge_error_labels_needs_human(
     comment_body = gh_mock.post_comment.call_args[0][2]
     assert "failed to merge" in comment_body
     assert "branch protection" in comment_body
+
+
+def test_required_checks_expected_merge_error_updates_branch(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """Branch protection saying checks are expected updates the branch instead of escalating."""
+    pr_state = _make_merge_pr_state(number=305)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError(
+        "Repository rule violations found: 11 of 11 required status checks are expected"
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    gh_mock.update_branch.assert_called_once_with(
+        orchestrator_config.github.repo,
+        305,
+        orchestrator_config.github.token,
+    )
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_required_checks_expected_update_branch_failure_labels_needs_human(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """If the recovery update-branch call fails, the existing terminal path still runs."""
+    pr_state = _make_merge_pr_state(number=306)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.merge_pr.side_effect = RuntimeError(
+        "Repository rule violations found: 11 of 11 required status checks are expected"
+    )
+    gh_mock.update_branch.side_effect = RuntimeError("update branch failed")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    gh_mock.update_branch.assert_called_once()
+    gh_mock.add_label.assert_called_once_with(
+        orchestrator_config.github.repo,
+        306,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
