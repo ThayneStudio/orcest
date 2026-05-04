@@ -29,6 +29,7 @@ class IssueAction(str, Enum):
     SKIP_QUEUED = "skip_queued"  # Task already pending in queue
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
+    SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"
 
 
 @dataclass
@@ -78,6 +79,23 @@ def clear_attempts(redis: RedisClient, repo: str, issue_number: int) -> None:
     redis.delete(_make_attempts_key(repo, issue_number))
 
 
+def _make_usage_cooldown_key(repo: str, issue_number: int) -> str:
+    """Redis key for the USAGE_EXHAUSTED cooldown marker."""
+    return f"issue:{repo}:{issue_number}:usage_cooldown"
+
+
+def set_usage_exhausted_cooldown(
+    redis: RedisClient, repo: str, issue_number: int, ttl_seconds: int = 1800
+) -> None:
+    """Set a cooldown marker so the issue is not immediately re-enqueued."""
+    redis.set_ex(_make_usage_cooldown_key(repo, issue_number), "1", ttl_seconds)
+
+
+def has_usage_exhausted_cooldown(redis: RedisClient, repo: str, issue_number: int) -> bool:
+    """Return True if a USAGE_EXHAUSTED cooldown is still active for this issue."""
+    return bool(redis.exists(_make_usage_cooldown_key(repo, issue_number)))
+
+
 def discover_actionable_issues(
     repo: str,
     token: str,
@@ -91,11 +109,12 @@ def discover_actionable_issues(
     1. Fetch issues with the `orcest:ready` label
     2. Skip if terminal orcest label present (blocked/needs-human)
     3. Skip if Redis lock exists (worker in progress)
-    4. Skip if max attempts reached
-    5. Skip if task already in flight (attempts > 0 with a pending marker)
-    6. Clear orphaned attempts (attempts > 0 without a pending marker)
-    7. Skip if task already pending in the queue
-    8. Everything else -> ENQUEUE_IMPLEMENT
+    4. Skip if usage-exhausted cooldown is active
+    5. Skip if max attempts reached
+    6. Skip if task already in flight (attempts > 0 with a pending marker)
+    7. Clear orphaned attempts (attempts > 0 without a pending marker)
+    8. Skip if task already pending in the queue
+    9. Everything else -> ENQUEUE_IMPLEMENT
     """
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
@@ -141,6 +160,18 @@ def discover_actionable_issues(
             continue
 
         pending_key = make_pending_task_key(repo, "issue", number)
+
+        if has_usage_exhausted_cooldown(redis, repo, number):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_USAGE_COOLDOWN,
+                    labels=issue_labels,
+                )
+            )
+            continue
 
         # Skip if task already in flight or max attempts reached
         attempt_count = get_attempt_count(redis, repo, number)

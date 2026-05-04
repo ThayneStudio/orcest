@@ -13,6 +13,7 @@ from orcest.orchestrator.issue_ops import (
     discover_actionable_issues,
     get_attempt_count,
     increment_attempts,
+    set_usage_exhausted_cooldown,
 )
 from orcest.shared.coordination import make_issue_lock_key, make_pending_task_key
 
@@ -77,6 +78,25 @@ def test_empty_issue_list(issue_gh_mock, fake_redis_client, label_config):
     )
 
     assert results == []
+
+
+def test_skip_usage_cooldown_when_active(issue_gh_mock, fake_redis_client, label_config):
+    """An issue with an active USAGE_EXHAUSTED cooldown is not re-enqueued."""
+    issue_number = 2
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=issue_number, labels=[{"name": label_config.ready}]),
+    ]
+    set_usage_exhausted_cooldown(fake_redis_client, REPO, issue_number, ttl_seconds=300)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_USAGE_COOLDOWN
 
 
 def test_multiple_actionable_issues(issue_gh_mock, fake_redis_client, label_config):
@@ -200,9 +220,7 @@ def test_skip_issue_with_pending_task(issue_gh_mock, fake_redis_client, label_co
 # ---------------------------------------------------------------------------
 
 
-def test_skip_active_issue_with_live_pending_task(
-    issue_gh_mock, fake_redis_client, label_config
-):
+def test_skip_active_issue_with_live_pending_task(issue_gh_mock, fake_redis_client, label_config):
     """An issue with attempts > 0 and a live pending task is SKIP_ACTIVE."""
     issue_gh_mock.return_value = [
         _make_issue_data(number=7, labels=[]),

@@ -148,6 +148,14 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
     """
     import json
 
+    def _parse_resets_at(value: object) -> int:
+        if value is None or value == "" or isinstance(value, bool):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
     resets_at = 0
     for line in stdout.splitlines():
         line = line.strip()
@@ -164,7 +172,7 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
         if obj.get("type") == "rate_limit_event":
             info = obj.get("rate_limit_info", {})
             if info.get("resetsAt"):
-                resets_at = int(info["resetsAt"])
+                resets_at = _parse_resets_at(info["resetsAt"])
             if info.get("status") in {"blocked", "rejected"}:
                 return True, resets_at
         if obj.get("api_error_status") == 429 or obj.get("error") == "rate_limit":
