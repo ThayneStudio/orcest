@@ -64,6 +64,8 @@ RESULTS_GROUP = "orchestrator"
 # so operators can SCAN the keyspace without finding stale leftovers.
 _TOKEN_EXHAUSTED_SKIP_KEY = "tokens:exhausted_skip"
 _TOKEN_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
+_USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
+_USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 
 # Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
 # Used to distinguish transient network failures from permanent merge errors.
@@ -380,9 +382,7 @@ def _poll_project(
     # are claimed and in flight don't block — they're consuming worker capacity,
     # not buffer space. Only undelivered (lag) entries justify deferral.
     issue_tasks_stream = f"tasks:issue:{config.default_runner}"
-    unclaimed_issue_tasks = task_redis.stream_unread_count(
-        issue_tasks_stream, CONSUMER_GROUP
-    )
+    unclaimed_issue_tasks = task_redis.stream_unread_count(issue_tasks_stream, CONSUMER_GROUP)
 
     enqueued = 0
     merged = 0
@@ -468,13 +468,8 @@ def _poll_project(
                     # unless we've exceeded the merge retry budget.
                     # GhRateLimitError is excluded: _run_gh() already
                     # exhausted its own retry budget for rate limits.
-                    if (
-                        not isinstance(e, GhRateLimitError)
-                        and _is_network_error(err_msg)
-                    ):
-                        retry_count = _increment_merge_retries(
-                            project_redis, repo, pr_state.number
-                        )
+                    if not isinstance(e, GhRateLimitError) and _is_network_error(err_msg):
+                        retry_count = _increment_merge_retries(project_redis, repo, pr_state.number)
                         if retry_count <= _MAX_MERGE_RETRIES:
                             logger.warning(
                                 "PR #%d: transient network error during merge "
@@ -1333,6 +1328,16 @@ def _handle_result(
                     exc_info=True,
                 )
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
+        try:
+            count = redis.incr(_USAGE_EXHAUSTED_RESULT_KEY)
+            if count == 1:
+                redis.expire(
+                    _USAGE_EXHAUSTED_RESULT_KEY,
+                    _USAGE_EXHAUSTED_RESULT_TTL_SECONDS,
+                )
+        except Exception:
+            logger.debug("Failed to increment usage-exhausted result counter", exc_info=True)
+
         # Mark the exhausted token in the pool so it's skipped in future rounds.
         # Use the resets_at timestamp from the stream-json rate_limit_event if
         # available; fall back to querying the usage endpoint; final fallback 30 min.
@@ -1372,6 +1377,10 @@ def _handle_result(
             if cooldown_set:
                 try:
                     clear_attempts(redis, repo, resource_id)
+                    logger.info(
+                        "PR #%d: cleared per-SHA attempt counter after USAGE_EXHAUSTED",
+                        resource_id,
+                    )
                 except Exception as e:
                     logger.error(
                         f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
@@ -1380,6 +1389,10 @@ def _handle_result(
                     )
                 try:
                     decrement_total_attempts(redis, repo, resource_id)
+                    logger.info(
+                        "PR #%d: decremented total-attempt counter after USAGE_EXHAUSTED",
+                        resource_id,
+                    )
                 except Exception as e:
                     logger.error(
                         f"Failed to undo total-attempt increment for PR #{resource_id} "
@@ -1391,6 +1404,10 @@ def _handle_result(
             # the issue is re-enqueued on the next poll cycle unconditionally.
             try:
                 clear_issue_attempts(redis, repo, resource_id)
+                logger.info(
+                    "Issue #%d: cleared attempt counter after USAGE_EXHAUSTED",
+                    resource_id,
+                )
             except Exception as e:
                 logger.error(
                     f"Failed to clear issue attempt counter for issue #{resource_id} "

@@ -13,6 +13,7 @@ from orcest.orchestrator.issue_ops import (
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.loop import (
+    _USAGE_EXHAUSTED_RESULT_KEY,
     RESULTS_GROUP,
     RESULTS_STREAM,
     _consume_results_for_project,
@@ -710,6 +711,8 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     # Rate limits should not consume the cross-SHA retry budget.
     assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
 
+    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
+
     # Cooldown marker must be set
     assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
 
@@ -765,6 +768,7 @@ def test_consume_results_usage_exhausted_issue_clears_attempts(
 
     # Attempt counter must be cleared so the issue is re-discoverable
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
 
     # A "paused" comment must be posted to the issue
     gh_mock.post_issue_comment.assert_called_once()
