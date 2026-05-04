@@ -135,31 +135,40 @@ def _is_usage_exhausted(stderr: str) -> bool:
 
 
 def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
-    """Check stream-json stdout for a rate_limit_event with blocked status.
+    """Check stream-json stdout for Claude usage/rate-limit exhaustion.
 
     Claude Code emits ``rate_limit_event`` objects in stream-json output
     when usage limits are approached or hit.  The ``status`` field is
-    ``"allowed"`` normally and ``"blocked"`` when the limit is reached.
+    ``"allowed"`` normally; exhausted tokens have been observed as either
+    ``"blocked"`` or ``"rejected"``.  Some CLI versions also emit a final
+    ``result`` object with ``api_error_status=429`` and no useful stderr.
 
-    Returns (is_blocked, resets_at_unix) where resets_at_unix is the
+    Returns (is_exhausted, resets_at_unix) where resets_at_unix is the
     Unix timestamp from the event (0 if not available).
     """
     import json
 
+    resets_at = 0
     for line in stdout.splitlines():
         line = line.strip()
-        if not line or "rate_limit_event" not in line:
+        if not line or (
+            "rate_limit_event" not in line
+            and "api_error_status" not in line
+            and '"error":"rate_limit"' not in line
+        ):
             continue
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if obj.get("type") != "rate_limit_event":
-            continue
-        info = obj.get("rate_limit_info", {})
-        if info.get("status") == "blocked":
-            resets_at = info.get("resetsAt", 0)
-            return True, int(resets_at) if resets_at else 0
+        if obj.get("type") == "rate_limit_event":
+            info = obj.get("rate_limit_info", {})
+            if info.get("resetsAt"):
+                resets_at = int(info["resetsAt"])
+            if info.get("status") in {"blocked", "rejected"}:
+                return True, resets_at
+        if obj.get("api_error_status") == 429 or obj.get("error") == "rate_limit":
+            return True, resets_at
     return False, 0
 
 
@@ -611,6 +620,20 @@ def run_claude(
         stderr = "".join(stderr_lines)
         duration = int(time.monotonic() - start_time)
 
+        # Check for usage exhaustion before normal returncode handling. Claude
+        # Code can emit a stream-json rate_limit_event/result and still exit
+        # through paths that do not give us a useful stderr signal.
+        rate_blocked, resets_at = _check_rate_limit_event(stdout)
+        if _is_usage_exhausted(stderr) or rate_blocked:
+            return ClaudeResult(
+                success=False,
+                summary="Claude usage limit reached",
+                duration_seconds=duration,
+                raw_output=stderr or stdout,
+                usage_exhausted=True,
+                rate_limit_resets_at=resets_at,
+            )
+
         if proc.returncode == 0:
             summary = _extract_summary(stdout)
             return ClaudeResult(
@@ -635,20 +658,6 @@ def run_claude(
                     summary="Process did not exit (stuck in D-state)",
                     duration_seconds=duration,
                     raw_output=stderr or stdout,
-                )
-            # Check for usage exhaustion -- do NOT retry.
-            # Two detection paths:
-            # 1. stderr patterns (rate limit / usage limit error messages)
-            # 2. stdout rate_limit_event with status=blocked (stream-json)
-            rate_blocked, resets_at = _check_rate_limit_event(stdout)
-            if _is_usage_exhausted(stderr) or rate_blocked:
-                return ClaudeResult(
-                    success=False,
-                    summary="Claude usage limit reached",
-                    duration_seconds=duration,
-                    raw_output=stderr or stdout,
-                    usage_exhausted=True,
-                    rate_limit_resets_at=resets_at,
                 )
 
         # Retry with backoff on non-zero exit (crash)

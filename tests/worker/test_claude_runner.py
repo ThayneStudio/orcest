@@ -494,6 +494,69 @@ def test_stderr_captured_via_thread(mock_popen, mocker, tmp_path):
     assert result.usage_exhausted is True
 
 
+@pytest.mark.unit
+def test_stream_json_rejected_rate_limit_is_usage_exhausted(mock_popen, mocker, tmp_path):
+    """stream-json rate_limit_event status=rejected is usage exhaustion, not retryable."""
+    mock_cls, mock_proc = mock_popen
+
+    rate_limit_event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": 1778302800,
+            "rateLimitType": "seven_day",
+        },
+    }
+    result_event = {
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": "You're out of extra usage",
+    }
+    mock_proc.stdout = iter([json.dumps(rate_limit_event) + "\n", json.dumps(result_event) + "\n"])
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 1
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=3, retry_backoff=0)
+
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert result.rate_limit_resets_at == 1778302800
+    assert mock_cls.call_count == 1
+
+
+@pytest.mark.unit
+def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, tmp_path):
+    """A 429 stream-json result is not success even if the process exits 0."""
+    mock_cls, mock_proc = mock_popen
+
+    result_event = {
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": "You're out of extra usage",
+    }
+    mock_proc.stdout = iter([json.dumps(result_event) + "\n"])
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=3, retry_backoff=0)
+
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert mock_cls.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Popen OSError (binary not found)
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from orcest.orchestrator.pr_ops import (
     clear_exhausted_notified,
     clear_review_retrigger,
     clear_total_attempts,
+    decrement_total_attempts,
     discover_actionable_prs,
     get_attempt_count,
     get_exhausted_notified,
@@ -1349,6 +1350,22 @@ def test_clear_total_attempts(fake_redis_client):
     assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 2
 
     clear_total_attempts(fake_redis_client, REPO, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
+
+
+def test_decrement_total_attempts(fake_redis_client):
+    """decrement_total_attempts removes one count without going below zero."""
+    pr_number = 725
+    increment_total_attempts(fake_redis_client, REPO, pr_number)
+    increment_total_attempts(fake_redis_client, REPO, pr_number)
+
+    decrement_total_attempts(fake_redis_client, REPO, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 1
+
+    decrement_total_attempts(fake_redis_client, REPO, pr_number)
+    assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
+
+    decrement_total_attempts(fake_redis_client, REPO, pr_number)
     assert get_total_attempt_count(fake_redis_client, REPO, pr_number) == 0
 
 

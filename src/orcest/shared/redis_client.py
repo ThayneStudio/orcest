@@ -592,6 +592,10 @@ class PrefixedPipeline:
         self._pipe.incr(self._prefixed(key))
         return self
 
+    def decr(self, key: str) -> "PrefixedPipeline":
+        self._pipe.decr(self._prefixed(key))
+        return self
+
     def delete(self, *keys: str) -> "PrefixedPipeline":
         """DEL key [key ...] (queued in pipeline). No-op if no keys given."""
         if keys:
