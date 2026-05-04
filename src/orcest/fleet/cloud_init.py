@@ -545,7 +545,7 @@ ExecStart=/opt/orcest/venv/bin/orcest work --id {worker_id} --config /opt/orcest
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
-MemoryMax=4G
+MemoryMax=8G
 Environment=PYTHONUNBUFFERED=1
 PrivateTmp=yes
 NoNewPrivileges=yes
