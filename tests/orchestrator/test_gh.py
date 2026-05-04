@@ -811,7 +811,7 @@ def test_update_branch_calls_correct_api(mocker):
         return_value="",
     )
 
-    update_branch(REPO, 99, TOKEN)
+    assert update_branch(REPO, 99, TOKEN) is True
 
     mock_run.assert_called_once()
     args_passed = mock_run.call_args[0][0]
@@ -821,9 +821,9 @@ def test_update_branch_calls_correct_api(mocker):
     assert mock_run.call_args[0][1] == TOKEN
 
 
-def test_update_branch_swallows_already_up_to_date(mocker):
+def test_update_branch_returns_false_when_already_up_to_date(mocker):
     """422 'no new commits on the base branch' means the branch is already
-    up to date — return cleanly, not as an error. Other failures still raise."""
+    up to date — return False, not an error. Other failures still raise."""
     mock_run = mocker.patch("orcest.orchestrator.gh._run_gh")
     mock_run.side_effect = GhCliError(
         "gh failed",
@@ -834,7 +834,7 @@ def test_update_branch_swallows_already_up_to_date(mocker):
         ),
     )
 
-    update_branch(REPO, 100, TOKEN)
+    assert update_branch(REPO, 100, TOKEN) is False
 
 
 def test_update_branch_propagates_other_errors(mocker):
