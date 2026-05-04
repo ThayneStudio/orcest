@@ -200,12 +200,16 @@ def test_skip_issue_with_pending_task(issue_gh_mock, fake_redis_client, label_co
 # ---------------------------------------------------------------------------
 
 
-def test_skip_active_issue(issue_gh_mock, fake_redis_client, label_config):
-    """An issue with attempts > 0 (but below max) is SKIP_ACTIVE."""
+def test_skip_active_issue_with_live_pending_task(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """An issue with attempts > 0 and a live pending task is SKIP_ACTIVE."""
     issue_gh_mock.return_value = [
         _make_issue_data(number=7, labels=[]),
     ]
     increment_attempts(fake_redis_client, REPO, 7)  # count = 1
+    pending_key = make_pending_task_key(REPO, "issue", 7)
+    fake_redis_client.set_ex(pending_key, "task-active", 86400)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -218,6 +222,51 @@ def test_skip_active_issue(issue_gh_mock, fake_redis_client, label_config):
     assert len(results) == 1
     assert results[0].action == IssueAction.SKIP_ACTIVE
     assert results[0].number == 7
+
+
+def test_orphaned_active_issue_clears_attempts_and_enqueues(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """An issue with attempts > 0 but no pending task is retried normally."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=14, labels=[]),
+    ]
+    increment_attempts(fake_redis_client, REPO, 14)  # count = 1
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert results[0].number == 14
+    assert get_attempt_count(fake_redis_client, REPO, 14) == 0
+
+
+def test_issue_without_attempts_or_pending_task_still_enqueues(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """An issue with attempts == 0 and no pending task keeps the normal path."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=15, labels=[]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert results[0].number == 15
+    assert get_attempt_count(fake_redis_client, REPO, 15) == 0
 
 
 def test_skip_max_attempts_reached(issue_gh_mock, fake_redis_client, label_config):
@@ -306,8 +355,8 @@ def test_lock_checked_before_pending(issue_gh_mock, fake_redis_client, label_con
     assert results[0].action == IssueAction.SKIP_LOCKED
 
 
-def test_pending_checked_before_attempts(issue_gh_mock, fake_redis_client, label_config):
-    """Pending-task check happens before attempt check (SKIP_QUEUED, not SKIP_ACTIVE)."""
+def test_attempts_checked_before_pending(issue_gh_mock, fake_redis_client, label_config):
+    """An active attempt with a live pending task is SKIP_ACTIVE, not SKIP_QUEUED."""
     issue_gh_mock.return_value = [
         _make_issue_data(number=13, labels=[]),
     ]
@@ -323,7 +372,7 @@ def test_pending_checked_before_attempts(issue_gh_mock, fake_redis_client, label
         max_attempts=3,
     )
 
-    assert results[0].action == IssueAction.SKIP_QUEUED
+    assert results[0].action == IssueAction.SKIP_ACTIVE
 
 
 # ---------------------------------------------------------------------------
