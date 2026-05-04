@@ -5,11 +5,13 @@ and fake_redis_client for result stream operations.
 """
 
 import logging
+import time
 
 import pytest
 
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
+    has_usage_exhausted_cooldown as has_issue_usage_exhausted_cooldown,
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.loop import (
@@ -73,6 +75,7 @@ def _make_task_result(
     duration: int = 120,
     resource_type: str = "pr",
     resource_id: int | None = None,
+    rate_limit_resets_at: int = 0,
 ) -> TaskResult:
     """Build a TaskResult for result-handling tests.
 
@@ -93,6 +96,7 @@ def _make_task_result(
         duration_seconds=duration,
         resource_type=resource_type,
         resource_id=resource_id if resource_id is not None else pr_number,
+        rate_limit_resets_at=rate_limit_resets_at,
     )
 
 
@@ -715,6 +719,59 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
 
     # Cooldown marker must be set
     assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
+    assert 1700 <= fake_redis_client.ttl(f"pr:{repo}:{pr_number}:usage_cooldown") <= 1800
+
+
+def test_consume_results_duplicate_usage_exhausted_refunds_once(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """Duplicate USAGE_EXHAUSTED delivery must not double-refund attempts or metrics."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 63
+    repo = orchestrator_config.github.repo
+
+    increment_total_attempts(fake_redis_client, repo, pr_number)
+    increment_total_attempts(fake_redis_client, repo, pr_number)
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 2
+
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=pr_number,
+        task_id="task-pr-usage-duplicate",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 1
+    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
+
+
+def test_consume_results_usage_exhausted_pr_cooldown_ttl_uses_reset_time(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """PR usage cooldown TTL is derived from rate_limit_resets_at when present."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 64
+    repo = orchestrator_config.github.repo
+    resets_at = int(time.time()) + 120
+
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=pr_number,
+        rate_limit_resets_at=resets_at,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    ttl = fake_redis_client.ttl(f"pr:{repo}:{pr_number}:usage_cooldown")
+    assert 1 <= ttl <= 120
 
 
 def test_consume_results_usage_exhausted_no_branch(
@@ -744,7 +801,7 @@ def test_consume_results_usage_exhausted_no_branch(
 def test_consume_results_usage_exhausted_issue_clears_attempts(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A USAGE_EXHAUSTED result for an issue clears the attempt counter so it can be re-enqueued."""
+    """An issue USAGE_EXHAUSTED result clears attempts and sets a cooldown."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     issue_number = 62
@@ -766,8 +823,10 @@ def test_consume_results_usage_exhausted_issue_clears_attempts(
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # Attempt counter must be cleared so the issue is re-discoverable
+    # Attempt counter is cleared, but cooldown prevents immediate rediscovery.
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert has_issue_usage_exhausted_cooldown(fake_redis_client, repo, issue_number)
+    assert 1700 <= fake_redis_client.ttl(f"issue:{repo}:{issue_number}:usage_cooldown") <= 1800
     assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
 
     # A "paused" comment must be posted to the issue
@@ -778,6 +837,35 @@ def test_consume_results_usage_exhausted_issue_clears_attempts(
     # No label operations for USAGE_EXHAUSTED on issues
     gh_mock.add_issue_label.assert_not_called()
     gh_mock.remove_issue_label.assert_not_called()
+
+
+def test_consume_results_usage_exhausted_issue_sets_cooldown_from_reset_time(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """Issue USAGE_EXHAUSTED persists a cooldown using rate_limit_resets_at."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    issue_number = 65
+    repo = orchestrator_config.github.repo
+    resets_at = int(time.time()) + 120
+
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="task-issue-ue-cooldown",
+        rate_limit_resets_at=resets_at,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert has_issue_usage_exhausted_cooldown(fake_redis_client, repo, issue_number)
+    ttl = fake_redis_client.ttl(f"issue:{repo}:{issue_number}:usage_cooldown")
+    assert 1 <= ttl <= 120
 
 
 def test_consume_results_malformed_entry_is_acked(fake_redis_client, orchestrator_config, gh_mock):

@@ -559,6 +559,38 @@ def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, t
 
 
 @pytest.mark.unit
+def test_stream_json_rejected_rate_limit_with_malformed_reset_is_usage_exhausted(
+    mock_popen, mocker, tmp_path
+):
+    """Malformed resetsAt must not make an exhausted event retryable."""
+    mock_cls, mock_proc = mock_popen
+
+    rate_limit_event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": "tomorrow",
+            "rateLimitType": "seven_day",
+        },
+    }
+    mock_proc.stdout = iter([json.dumps(rate_limit_event) + "\n"])
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 1
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=3, retry_backoff=0)
+
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert result.rate_limit_resets_at == 0
+    assert mock_cls.call_count == 1
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("event", "expected_reset"),
     [
@@ -583,6 +615,20 @@ def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, t
 def test_check_rate_limit_event_exhaustion_shapes(event, expected_reset):
     """Observed stream-json rate-limit shapes are classified as usage exhaustion."""
     assert _check_rate_limit_event(json.dumps(event)) == (True, expected_reset)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "resets_at",
+    ["tomorrow", {"epoch": 1778302800}, ["1778302800"], True],
+)
+def test_check_rate_limit_event_malformed_reset_still_exhausted(resets_at):
+    """Unparseable truthy resetsAt values classify exhausted with reset 0."""
+    event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {"status": "blocked", "resetsAt": resets_at},
+    }
+    assert _check_rate_limit_event(json.dumps(event)) == (True, 0)
 
 
 @pytest.mark.unit

@@ -6,6 +6,7 @@ interruptible sleep (1-second chunks) for responsive termination.
 """
 
 import logging
+import math
 import re
 import signal
 import sys
@@ -18,6 +19,7 @@ from orcest.orchestrator.issue_ops import (
     IssueAction,
     clear_attempts as clear_issue_attempts,
     discover_actionable_issues,
+    set_usage_exhausted_cooldown as set_issue_usage_exhausted_cooldown,
 )
 from orcest.orchestrator.pr_ops import (
     PRAction,
@@ -66,6 +68,8 @@ _TOKEN_EXHAUSTED_SKIP_KEY = "tokens:exhausted_skip"
 _TOKEN_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
+_USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
+_USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS = 24 * 3600
 
 # Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
 # Used to distinguish transient network failures from permanent merge errors.
@@ -85,6 +89,21 @@ _MERGE_NETWORK_PATTERNS: list[re.Pattern[str]] = [
         r"network is unreachable",
     ]
 ]
+
+
+def _make_usage_exhausted_processed_key(task_id: str) -> str:
+    """Redis key tracking USAGE_EXHAUSTED accounting already done for a task."""
+    return f"result:{task_id}:usage_exhausted_processed"
+
+
+def _usage_exhausted_cooldown_ttl_seconds(result: TaskResult) -> int:
+    """Return persisted usage cooldown TTL, preferring result reset timestamp."""
+    if result.rate_limit_resets_at:
+        ttl = math.ceil(result.rate_limit_resets_at - time.time())
+        if ttl > 0:
+            return ttl
+    return _USAGE_EXHAUSTED_COOLDOWN_SECONDS
+
 
 # Maximum number of merge retries for transient network errors before
 # falling through to the needs-human label path.
@@ -1115,6 +1134,11 @@ def _poll_project(
             logger.debug(f"Issue #{issue_state.number}: locked, skipping")
         elif issue_state.action == IssueAction.SKIP_ACTIVE:
             logger.debug(f"Issue #{issue_state.number}: task in flight, skipping")
+        elif issue_state.action == IssueAction.SKIP_USAGE_COOLDOWN:
+            logger.debug(
+                "Issue #%d: usage-exhausted cooldown active, skipping",
+                issue_state.number,
+            )
         elif issue_state.action == IssueAction.SKIP_LABELED:
             logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
         else:
@@ -1224,7 +1248,7 @@ def _handle_result(
     - completed: clears attempt counter
     - failed: adds needs-human label
     - blocked: adds blocked label
-    - usage_exhausted: no label changes (task stays parked as SKIP_ACTIVE)
+    - usage_exhausted: no label changes; resource resumes after cooldown
     """
     logger.info(
         "Result for task %s: %s (worker: %s, %ss)",
@@ -1328,13 +1352,20 @@ def _handle_result(
                     exc_info=True,
                 )
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
+        usage_accounting_processed = False
         try:
-            count = redis.incr(_USAGE_EXHAUSTED_RESULT_KEY)
-            if count == 1:
-                redis.expire(
-                    _USAGE_EXHAUSTED_RESULT_KEY,
-                    _USAGE_EXHAUSTED_RESULT_TTL_SECONDS,
-                )
+            usage_accounting_processed = redis.set_nx_ex(
+                _make_usage_exhausted_processed_key(result.task_id),
+                "1",
+                _USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS,
+            )
+            if usage_accounting_processed:
+                count = redis.incr(_USAGE_EXHAUSTED_RESULT_KEY)
+                if count == 1:
+                    redis.expire(
+                        _USAGE_EXHAUSTED_RESULT_KEY,
+                        _USAGE_EXHAUSTED_RESULT_TTL_SECONDS,
+                    )
         except Exception:
             logger.debug("Failed to increment usage-exhausted result counter", exc_info=True)
 
@@ -1362,12 +1393,18 @@ def _handle_result(
                 except Exception as e:
                     logger.warning("Failed to query token reset time: %s", e)
             token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
+        usage_cooldown_ttl = _usage_exhausted_cooldown_ttl_seconds(result)
         # PR-specific cooldown: clear per-SHA attempts so PR can be re-enqueued
         # after the cooldown expires.  Issues don't have per-SHA counters.
         if not is_issue:
             cooldown_set = False
             try:
-                set_usage_exhausted_cooldown(redis, repo, resource_id)
+                set_usage_exhausted_cooldown(
+                    redis,
+                    repo,
+                    resource_id,
+                    ttl_seconds=usage_cooldown_ttl,
+                )
                 cooldown_set = True
             except Exception as e:
                 logger.error(
@@ -1387,21 +1424,32 @@ def _handle_result(
                         f"after USAGE_EXHAUSTED: {e}",
                         exc_info=True,
                     )
-                try:
-                    decrement_total_attempts(redis, repo, resource_id)
-                    logger.info(
-                        "PR #%d: decremented total-attempt counter after USAGE_EXHAUSTED",
-                        resource_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to undo total-attempt increment for PR #{resource_id} "
-                        f"after USAGE_EXHAUSTED: {e}",
-                        exc_info=True,
-                    )
+                if usage_accounting_processed:
+                    try:
+                        decrement_total_attempts(redis, repo, resource_id)
+                        logger.info(
+                            "PR #%d: decremented total-attempt counter after USAGE_EXHAUSTED",
+                            resource_id,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to undo total-attempt increment for PR #{resource_id} "
+                            f"after USAGE_EXHAUSTED: {e}",
+                            exc_info=True,
+                        )
         else:
-            # Issues don't have per-SHA tracking or a cooldown; clear attempts so
-            # the issue is re-enqueued on the next poll cycle unconditionally.
+            try:
+                set_issue_usage_exhausted_cooldown(
+                    redis,
+                    repo,
+                    resource_id,
+                    ttl_seconds=usage_cooldown_ttl,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to set usage-exhausted cooldown for issue #{resource_id}: {e}",
+                    exc_info=True,
+                )
             try:
                 clear_issue_attempts(redis, repo, resource_id)
                 logger.info(
