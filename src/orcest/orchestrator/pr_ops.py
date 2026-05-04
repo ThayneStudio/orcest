@@ -636,18 +636,14 @@ def discover_actionable_prs(
         # gate this: GitHub does the merge, the new head SHA naturally resets
         # per-SHA counters on the next discovery cycle.
         #
-        # Both BEHIND and BLOCKED can mean "behind base":
-        #   - BEHIND fires when being out-of-date is the *only* blocker.
-        #   - BLOCKED fires when branch protection rules (incl. "up to date")
-        #     plus other conditions (failing required checks, etc.) all block.
-        # update_branch is a no-op when the branch is already current (GitHub
-        # returns 422 "no new commits"), so calling it on BLOCKED PRs that
-        # aren't actually behind is harmless.
+        # Only explicit BEHIND is safe to route through update-branch here.
+        # GitHub also reports BLOCKED for ordinary failed required checks and
+        # requested changes; treating all BLOCKED PRs as "maybe behind" prevents
+        # those failures from ever reaching the worker queue.
         merge_state = pr_data.get("mergeStateStatus")
-        if merge_state in ("BEHIND", "BLOCKED"):
+        if merge_state == "BEHIND":
             logger.info(
-                "PR #%d may be out of date with base (mergeStateStatus=%s), "
-                "calling update-branch",
+                "PR #%d is out of date with base (mergeStateStatus=%s), calling update-branch",
                 number,
                 merge_state,
             )

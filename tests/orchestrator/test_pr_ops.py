@@ -1015,13 +1015,10 @@ def test_behind_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_con
     gh_mock.get_ci_status.assert_not_called()
 
 
-def test_blocked_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_config):
-    """A PR with mergeStateStatus=BLOCKED is also routed to UPDATE_BRANCH.
+def test_blocked_pr_with_failing_ci_routes_to_fix(gh_mock, fake_redis_client, label_config):
+    """BLOCKED usually means branch protection is blocked by checks/reviews.
 
-    Branch protection requiring 'up to date with base' reports BLOCKED (not
-    BEHIND) when the branch is out of date. update-branch handles both: when
-    the branch is genuinely behind, it updates; when it is already up to date,
-    GitHub returns 422 and the call is a no-op.
+    It must not short-circuit to UPDATE_BRANCH before failed CI can be queued.
     """
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(
@@ -1030,6 +1027,9 @@ def test_blocked_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_co
             mergeable="MERGEABLE",
             merge_state_status="BLOCKED",
         ),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "Node Quality", "conclusion": "failure"},
     ]
 
     results = discover_actionable_prs(
@@ -1040,7 +1040,8 @@ def test_blocked_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_co
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.UPDATE_BRANCH
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert results[0].ci_failures == [{"name": "Node Quality", "conclusion": "failure"}]
 
 
 def test_conflicting_pr_takes_priority_over_behind(gh_mock, fake_redis_client, label_config):
