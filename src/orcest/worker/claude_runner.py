@@ -154,7 +154,7 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
         if not line or (
             "rate_limit_event" not in line
             and "api_error_status" not in line
-            and '"error":"rate_limit"' not in line
+            and '"error"' not in line
         ):
             continue
         try:

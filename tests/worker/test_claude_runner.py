@@ -18,6 +18,7 @@ from orcest.worker.claude_runner import (
     ClaudeResult,
     ClaudeRunner,
     _build_env,
+    _check_rate_limit_event,
     _extract_summary,
     _is_usage_exhausted,
     run_claude,
@@ -555,6 +556,43 @@ def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, t
     assert result.success is False
     assert result.usage_exhausted is True
     assert mock_cls.call_count == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("event", "expected_reset"),
+    [
+        (
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "blocked", "resetsAt": 1778302800},
+            },
+            1778302800,
+        ),
+        (
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "rejected", "resetsAt": 1778302801},
+            },
+            1778302801,
+        ),
+        ({"type": "result", "api_error_status": 429}, 0),
+        ({"type": "result", "error": "rate_limit"}, 0),
+    ],
+)
+def test_check_rate_limit_event_exhaustion_shapes(event, expected_reset):
+    """Observed stream-json rate-limit shapes are classified as usage exhaustion."""
+    assert _check_rate_limit_event(json.dumps(event)) == (True, expected_reset)
+
+
+@pytest.mark.unit
+def test_check_rate_limit_event_allowed_not_exhausted():
+    """An allowed rate-limit event records no usage exhaustion."""
+    event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {"status": "allowed", "resetsAt": 1778302800},
+    }
+    assert _check_rate_limit_event(json.dumps(event)) == (False, 0)
 
 
 # ---------------------------------------------------------------------------
