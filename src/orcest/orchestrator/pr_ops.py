@@ -177,6 +177,25 @@ def increment_total_attempts(redis: RedisClient, repo: str, pr_number: int) -> i
     return results[0]
 
 
+def decrement_total_attempts(redis: RedisClient, repo: str, pr_number: int) -> None:
+    """Undo one total-attempt increment for a PR.
+
+    Task publication increments total_attempts before the worker runs. If the
+    worker only hits Claude usage exhaustion, no real retry was consumed, so
+    the pre-publish increment should be removed without driving the counter
+    below zero.
+    """
+    key = _make_total_attempts_key(repo, pr_number)
+    current = get_total_attempt_count(redis, repo, pr_number)
+    if current <= 1:
+        redis.delete(key)
+        return
+    pipe = redis.pipeline(transaction=True)
+    pipe.decr(key)
+    pipe.expire(key, 30 * 24 * 3600)
+    pipe.execute()
+
+
 def clear_total_attempts(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the total attempt counter for a PR (on successful completion)."""
     redis.delete(_make_total_attempts_key(repo, pr_number))

@@ -24,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
     clear_attempts,
     clear_review_retrigger,
     clear_total_attempts,
+    decrement_total_attempts,
     discover_actionable_prs,
     get_stale_retrigger_sha,
     set_exhausted_notified,
@@ -1374,6 +1375,14 @@ def _handle_result(
                 except Exception as e:
                     logger.error(
                         f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
+                        f"after USAGE_EXHAUSTED: {e}",
+                        exc_info=True,
+                    )
+                try:
+                    decrement_total_attempts(redis, repo, resource_id)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to undo total-attempt increment for PR #{resource_id} "
                         f"after USAGE_EXHAUSTED: {e}",
                         exc_info=True,
                     )

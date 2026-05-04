@@ -672,16 +672,18 @@ def test_consume_results_permanent_failure_still_labels(
 
 
 def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config, gh_mock):
-    """A USAGE_EXHAUSTED result posts a comment, clears per-SHA attempts, and sets cooldown."""
+    """USAGE_EXHAUSTED clears per-SHA attempts, undoes total count, and sets cooldown."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     pr_number = 60
     head_sha = "deadbeef"
 
-    # Simulate a prior attempt so the counter is non-zero
+    # Simulate the pre-publish attempt increments for this task.
     repo = orchestrator_config.github.repo
     increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    increment_total_attempts(fake_redis_client, repo, pr_number)
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 1
 
     result = _make_task_result(
         status=ResultStatus.USAGE_EXHAUSTED,
@@ -705,6 +707,8 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
 
     # Per-SHA attempt counter must be cleared so PR can be re-enqueued after cooldown
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+    # Rate limits should not consume the cross-SHA retry budget.
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
 
     # Cooldown marker must be set
     assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
