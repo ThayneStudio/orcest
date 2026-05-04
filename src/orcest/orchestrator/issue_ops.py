@@ -92,8 +92,10 @@ def discover_actionable_issues(
     2. Skip if terminal orcest label present (blocked/needs-human)
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if max attempts reached
-    5. Skip if task already in flight (attempts > 0)
-    6. Everything else -> ENQUEUE_IMPLEMENT
+    5. Skip if task already in flight (attempts > 0 with a pending marker)
+    6. Clear orphaned attempts (attempts > 0 without a pending marker)
+    7. Skip if task already pending in the queue
+    8. Everything else -> ENQUEUE_IMPLEMENT
     """
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
@@ -138,19 +140,7 @@ def discover_actionable_issues(
             )
             continue
 
-        # Skip if a task for this issue is already pending in the queue
         pending_key = make_pending_task_key(repo, "issue", number)
-        if redis.exists(pending_key):
-            results.append(
-                IssueState(
-                    number=number,
-                    title=title,
-                    body=body,
-                    action=IssueAction.SKIP_QUEUED,
-                    labels=issue_labels,
-                )
-            )
-            continue
 
         # Skip if task already in flight or max attempts reached
         attempt_count = get_attempt_count(redis, repo, number)
@@ -172,12 +162,34 @@ def discover_actionable_issues(
             )
             continue
         if attempt_count > 0:
+            if redis.exists(pending_key):
+                results.append(
+                    IssueState(
+                        number=number,
+                        title=title,
+                        body=body,
+                        action=IssueAction.SKIP_ACTIVE,
+                        labels=issue_labels,
+                    )
+                )
+                continue
+
+            logger.info(
+                "Issue #%d has %d attempt(s) but no pending task marker; "
+                "clearing orphaned attempts",
+                number,
+                attempt_count,
+            )
+            clear_attempts(redis, repo, number)
+
+        # Skip if a task for this issue is already pending in the queue
+        if redis.exists(pending_key):
             results.append(
                 IssueState(
                     number=number,
                     title=title,
                     body=body,
-                    action=IssueAction.SKIP_ACTIVE,
+                    action=IssueAction.SKIP_QUEUED,
                     labels=issue_labels,
                 )
             )
