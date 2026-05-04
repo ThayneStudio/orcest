@@ -93,6 +93,20 @@ def _is_network_error(msg: str) -> bool:
     return any(pat.search(msg) for pat in _MERGE_NETWORK_PATTERNS)
 
 
+def _is_required_checks_expected_error(msg: str) -> bool:
+    """Return True when branch protection says required checks need rerunning."""
+    lower = msg.lower()
+    return (
+        "required status checks" in lower
+        and "expected" in lower
+        and (
+            "repository rule violations" in lower
+            or "branch protection" in lower
+            or "rule violations" in lower
+        )
+    )
+
+
 def _make_merge_retries_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking merge retry count due to network errors."""
     return f"pr:{repo}:{pr_number}:merge_retries"
@@ -432,6 +446,23 @@ def _poll_project(
                             is_conflict = False
 
                 if not is_conflict:
+                    if _is_required_checks_expected_error(err_msg):
+                        logger.info(
+                            "PR #%d: merge blocked because required status checks are "
+                            "expected; updating branch so checks can rerun",
+                            pr_state.number,
+                        )
+                        try:
+                            gh.update_branch(repo, pr_state.number, token)
+                            continue
+                        except Exception as update_err:
+                            logger.warning(
+                                "PR #%d: update-branch after merge rejection failed: %s",
+                                pr_state.number,
+                                update_err,
+                                exc_info=True,
+                            )
+
                     # Check for transient network errors — retry silently
                     # unless we've exceeded the merge retry budget.
                     # GhRateLimitError is excluded: _run_gh() already
