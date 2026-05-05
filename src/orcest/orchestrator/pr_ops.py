@@ -629,38 +629,10 @@ def discover_actionable_prs(
             )
             continue
 
-        # Out-of-date with base: branch protection that requires up-to-date
-        # branches holds the merge until the head catches up. Same as clicking
-        # "Update branch" in the UI — orchestrator handles via REST API; no
-        # worker or Claude token needed. Pre-existing attempt counters don't
-        # gate this: GitHub does the merge, the new head SHA naturally resets
-        # per-SHA counters on the next discovery cycle.
-        #
-        # Only explicit BEHIND is safe to route through update-branch here.
-        # GitHub also reports BLOCKED for ordinary failed required checks and
-        # requested changes; treating all BLOCKED PRs as "maybe behind" prevents
-        # those failures from ever reaching the worker queue.
-        merge_state = pr_data.get("mergeStateStatus")
-        if merge_state == "BEHIND":
-            logger.info(
-                "PR #%d is out of date with base (mergeStateStatus=%s), calling update-branch",
-                number,
-                merge_state,
-            )
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.UPDATE_BRANCH,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
-                )
-            )
-            continue
+        # Do not update a PR branch just because GitHub reports BEHIND. A
+        # BEHIND PR can still be mergeable, and updating it creates a base
+        # merge commit that retriggers CI. If branch protection truly requires
+        # an up-to-date branch, the merge path handles GitHub's rejection.
 
         if attempt_count > 0:
             results.append(

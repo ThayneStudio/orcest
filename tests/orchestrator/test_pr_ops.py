@@ -990,8 +990,10 @@ def test_base_branch_propagated_to_pr_state(gh_mock, fake_redis_client, label_co
     assert results[0].base_branch == "develop"
 
 
-def test_behind_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_config):
-    """A PR with mergeStateStatus=BEHIND (out-of-date) is routed to UPDATE_BRANCH."""
+def test_behind_pr_falls_through_to_ci_without_update_branch(
+    gh_mock, fake_redis_client, label_config
+):
+    """BEHIND alone must not update the PR branch and churn CI."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(
             number=410,
@@ -1000,6 +1002,10 @@ def test_behind_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_con
             merge_state_status="BEHIND",
         ),
     ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = []
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1009,10 +1015,9 @@ def test_behind_pr_routes_to_update_branch(gh_mock, fake_redis_client, label_con
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.UPDATE_BRANCH
+    assert results[0].action == PRAction.SKIP_GREEN
     assert results[0].number == 410
-    # CI should not be fetched — branch-update path doesn't depend on CI status.
-    gh_mock.get_ci_status.assert_not_called()
+    gh_mock.get_ci_status.assert_called_once()
 
 
 def test_blocked_pr_with_failing_ci_routes_to_fix(gh_mock, fake_redis_client, label_config):
