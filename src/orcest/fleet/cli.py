@@ -2196,16 +2196,16 @@ def deploy(ctx: click.Context, rebuild_template: bool, drain_active: bool, confi
 def _upgrade_cli(console: Console) -> None:
     """Upgrade the orcest CLI from GitHub."""
     import subprocess
-    from pathlib import Path
 
     console.print("  Installing latest version...", end=" ")
-    pip = Path(sys.executable).parent / "pip"
     # --break-system-packages: the deploy host runs orcest as a system-wide
     # install (not a venv), so PEP 668's externally-managed-environment guard
     # blocks the upgrade unless we opt out. Pip ignores the flag in venvs.
     result = subprocess.run(
         [
-            str(pip),
+            sys.executable,
+            "-m",
+            "pip",
             "install",
             "--quiet",
             "--no-cache-dir",
