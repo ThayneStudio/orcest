@@ -364,7 +364,12 @@ def get_pr_diff(repo: str, number: int, token: str) -> str:
     )
 
 
-def update_branch(repo: str, number: int, token: str) -> bool:
+def update_branch(
+    repo: str,
+    number: int,
+    token: str,
+    expected_head_sha: str | None = None,
+) -> bool:
     """Update a PR's branch from its base via the GitHub REST API.
 
     Equivalent to clicking the "Update branch" button in the PR UI: GitHub
@@ -380,16 +385,16 @@ def update_branch(repo: str, number: int, token: str) -> bool:
     a worker rebase and go through ENQUEUE_REBASE instead.
     """
     _validate_repo(repo)
+    args = [
+        "api",
+        f"repos/{repo}/pulls/{number}/update-branch",
+        "-X",
+        "PUT",
+    ]
+    if expected_head_sha:
+        args.extend(["-f", f"expected_head_sha={expected_head_sha}"])
     try:
-        _run_gh(
-            [
-                "api",
-                f"repos/{repo}/pulls/{number}/update-branch",
-                "-X",
-                "PUT",
-            ],
-            token,
-        )
+        _run_gh(args, token)
         return True
     except GhCliError as exc:
         if "no new commits on the base branch" in (exc.stderr or "").lower():
@@ -539,6 +544,7 @@ def merge_pr(
     token: str,
     method: str = "squash",
     delete_branch: bool = True,
+    head_sha: str | None = None,
 ) -> None:
     """Merge a PR. Raises GhCliError on failure.
 
@@ -550,6 +556,8 @@ def merge_pr(
         delete_branch: Whether to delete the head branch after merging.
             Defaults to True. Set to False if branch protection rules
             prevent deletion or if you prefer to keep branches post-merge.
+        head_sha: Expected PR head SHA. When provided, GitHub rejects the
+            merge if the branch head changed after discovery.
     """
     if method not in _VALID_MERGE_METHODS:
         raise ValueError(
@@ -566,6 +574,8 @@ def merge_pr(
     ]
     if delete_branch:
         args.append("--delete-branch")
+    if head_sha:
+        args.extend(["--match-head-commit", head_sha])
     _run_gh(args, token)
 
 
