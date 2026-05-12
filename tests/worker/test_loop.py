@@ -186,6 +186,7 @@ class TestExecuteTask:
         assert result.status == ResultStatus.FAILED
         assert result.task_id == sample_task.id
         assert "merge conflict" in result.summary.lower()
+        assert not result.summary.startswith("[transient] ")
 
     def test_worker_handles_usage_exhaustion(
         self, local_worker_config, sample_task, mock_workspace
@@ -216,7 +217,7 @@ class TestExecuteTask:
         """Runner timeout (success=False) produces a task result with [transient] prefix."""
         mock_runner = MagicMock()
         mock_runner.run.return_value = RunnerResult(
-            success=False, summary="Timed out after 600s"
+            success=False, summary="Timed out after 600s", transient=True
         )
 
         mock_redis = MagicMock()
@@ -241,7 +242,7 @@ class TestExecuteTask:
         """Runner crash (success=False, all retries exhausted) produces transient result."""
         mock_runner = MagicMock()
         mock_runner.run.return_value = RunnerResult(
-            success=False, summary="Failed after 3 attempts"
+            success=False, summary="Failed after 3 attempts", transient=True
         )
 
         mock_redis = MagicMock()

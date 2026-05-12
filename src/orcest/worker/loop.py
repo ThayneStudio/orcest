@@ -807,14 +807,14 @@ def _execute_task(
         else:
             status = ResultStatus.FAILED
 
-        # All runner failures (success=False, not usage_exhausted) are
-        # infrastructure failures (timeout, crash, D-state, lock loss).
-        # Mark them transient so the orchestrator retries instead of
-        # labeling needs-human.  The total_attempts circuit breaker
-        # prevents infinite loops for persistent infra problems.
+        # Only failures explicitly classified as transient should be retried
+        # silently. Normal task failures need human-visible handling instead
+        # of being recycled until the retry budget is exhausted.
         summary = runner_result.summary
-        if status == ResultStatus.FAILED and not summary.startswith(
-            TRANSIENT_SUMMARY_PREFIX
+        if (
+            status == ResultStatus.FAILED
+            and runner_result.transient
+            and not summary.startswith(TRANSIENT_SUMMARY_PREFIX)
         ):
             summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
 

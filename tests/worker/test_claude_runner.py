@@ -18,6 +18,7 @@ from orcest.worker.claude_runner import (
     ClaudeResult,
     ClaudeRunner,
     _build_env,
+    _check_overloaded_event,
     _check_rate_limit_event,
     _extract_summary,
     _is_usage_exhausted,
@@ -559,6 +560,38 @@ def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, t
 
 
 @pytest.mark.unit
+def test_stream_json_529_overloaded_is_transient_not_usage_exhausted(
+    mock_popen, mocker, tmp_path
+):
+    """A 529 provider overload is retryable infrastructure, not usage exhaustion."""
+    mock_cls, mock_proc = mock_popen
+
+    result_event = {
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 529,
+        "error": "server_error",
+        "result": "API Error: 529 Overloaded",
+    }
+    mock_proc.stdout = iter([json.dumps(result_event) + "\n"])
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=3, retry_backoff=0)
+
+    assert result.success is False
+    assert result.usage_exhausted is False
+    assert result.transient is True
+    assert result.summary == "Claude overloaded (529)"
+    assert mock_cls.call_count == 1
+
+
+@pytest.mark.unit
 def test_stream_json_rejected_rate_limit_with_malformed_reset_is_usage_exhausted(
     mock_popen, mocker, tmp_path
 ):
@@ -639,6 +672,17 @@ def test_check_rate_limit_event_allowed_not_exhausted():
         "rate_limit_info": {"status": "allowed", "resetsAt": 1778302800},
     }
     assert _check_rate_limit_event(json.dumps(event)) == (False, 0)
+
+
+@pytest.mark.unit
+def test_check_overloaded_event_detects_529_server_error():
+    event = {
+        "type": "result",
+        "api_error_status": 529,
+        "error": "server_error",
+        "result": "API Error: 529 Overloaded",
+    }
+    assert _check_overloaded_event(json.dumps(event)) is True
 
 
 # ---------------------------------------------------------------------------
