@@ -92,6 +92,7 @@ class ClaudeResult:
     raw_output: str
     usage_exhausted: bool = False
     rate_limit_resets_at: int = 0  # Unix timestamp from rate_limit_event, 0 = not set
+    transient: bool = False
 
 
 def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
@@ -178,6 +179,34 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
         if obj.get("api_error_status") == 429 or obj.get("error") == "rate_limit":
             return True, resets_at
     return False, 0
+
+
+def _check_overloaded_event(stdout: str) -> bool:
+    """Check stream-json stdout for Claude server overload errors."""
+    import json
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or (
+            "api_error_status" not in line
+            and '"error"' not in line
+            and "Overloaded" not in line
+        ):
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("api_error_status") == 529:
+            return True
+        message = str(obj.get("message") or obj.get("result") or "")
+        if obj.get("error") == "server_error" and (
+            "529" in message or "overloaded" in message.lower()
+        ):
+            return True
+        if "529" in message and "overloaded" in message.lower():
+            return True
+    return False
 
 
 def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
@@ -517,6 +546,7 @@ def run_claude(
                         summary="Aborted: lock lost",
                         duration_seconds=duration,
                         raw_output="".join(stdout_lines),
+                        transient=True,
                     )
                 if time.monotonic() - attempt_start >= timeout:
                     timed_out = True
@@ -552,6 +582,7 @@ def run_claude(
                     summary=f"Timed out after {timeout}s",
                     duration_seconds=duration,
                     raw_output="".join(stdout_lines),
+                    transient=True,
                 )
 
             if logger:
@@ -606,6 +637,7 @@ def run_claude(
                 summary=f"Timed out after {timeout}s",
                 duration_seconds=duration,
                 raw_output="".join(stdout_lines),
+                transient=True,
             )
 
         try:
@@ -641,6 +673,16 @@ def run_claude(
                 usage_exhausted=True,
                 rate_limit_resets_at=resets_at,
             )
+        overloaded = _check_overloaded_event(stdout)
+
+        if overloaded:
+            return ClaudeResult(
+                success=False,
+                summary="Claude overloaded (529)",
+                duration_seconds=duration,
+                raw_output=stderr or stdout,
+                transient=True,
+            )
 
         if proc.returncode == 0:
             summary = _extract_summary(stdout)
@@ -666,6 +708,7 @@ def run_claude(
                     summary="Process did not exit (stuck in D-state)",
                     duration_seconds=duration,
                     raw_output=stderr or stdout,
+                    transient=True,
                 )
 
         # Retry with backoff on non-zero exit (crash)
@@ -729,6 +772,7 @@ class ClaudeRunner:
             summary=result.summary,
             usage_exhausted=result.usage_exhausted,
             rate_limit_resets_at=result.rate_limit_resets_at,
+            transient=result.transient,
         )
 
 
