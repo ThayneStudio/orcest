@@ -1463,6 +1463,24 @@ class TestNextVmIdUpperBound:
         with pytest.raises(RuntimeError, match="VM ID pool exhausted"):
             manager._next_vm_id()
 
+    def test_upper_bound_raises_when_start_is_after_end(self):
+        """Raises a configuration error when the configured range is invalid."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=303, vm_id_end=302),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Invalid VM ID pool range: vm_id_start \(303\) is greater than "
+                r"vm_id_end \(302\)"
+            ),
+        ):
+            manager._next_vm_id()
+        proxmox.list_vms.assert_not_called()
+
     def test_upper_bound_raises_includes_range_in_message(self):
         """RuntimeError message includes the configured range."""
         config = FleetConfig(
