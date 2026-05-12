@@ -171,6 +171,49 @@ def test_run_claude_failure_retries(mock_popen, mocker, tmp_path):
     assert mock_cls.call_count == 2
 
 
+@pytest.mark.unit
+def test_run_claude_exhausted_retries_is_transient(mock_popen, mocker, tmp_path):
+    """All retries fail with non-zero exit -> transient=True so the orchestrator
+    retries silently instead of escalating to needs-human.
+
+    Repeated naked crashes (no timeout, no 529, no usage-exhausted signal) are
+    almost always infrastructure (network, auth, claude-cli crash, OOM) — not a
+    code-level failure a human can fix.
+    """
+    mock_cls, mock_proc = mock_popen
+
+    attempts = [
+        {"stdout": iter([]), "stderr": iter(["segfault\n"]), "rc": 1},
+        {"stdout": iter([]), "stderr": iter(["segfault\n"]), "rc": 1},
+    ]
+    call_idx = {"n": 0}
+
+    def popen_side_effect(*args, **kwargs):
+        i = call_idx["n"]
+        call_idx["n"] += 1
+        attempt = attempts[i]
+        mock_proc.stdout = attempt["stdout"]
+        mock_proc.stderr = attempt["stderr"]
+        mock_proc.returncode = attempt["rc"]
+        return mock_proc
+
+    mock_cls.side_effect = popen_side_effect
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(
+            100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0
+        ),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
+
+    assert result.success is False
+    assert result.transient is True
+    assert "Failed after 2 attempts" in result.summary
+    assert mock_cls.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Timeout -- detected during streaming
 # ---------------------------------------------------------------------------
@@ -375,6 +418,56 @@ def test_on_output_called_per_line(mock_popen, mocker, tmp_path):
     assert captured[0] == lines[0]
     assert captured[1] == lines[1]
     assert captured[2] == lines[2]
+
+
+@pytest.mark.unit
+def test_on_stderr_called_per_line(mock_popen, mocker, tmp_path):
+    """on_stderr callback receives every stderr line so workers can stream
+    stderr to Redis alongside stdout (needed for postmortems of crashes that
+    leave no trace in stream-json output).
+    """
+    mock_cls, mock_proc = mock_popen
+
+    mock_proc.stdout = iter(_make_stdout_lines("ok"))
+    mock_proc.stderr = iter(["claude: oops\n", "stack trace line 2\n"])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    stderr_captured: list[str] = []
+    result = run_claude(
+        PROMPT, tmp_path, TOKEN, max_retries=1, on_stderr=stderr_captured.append
+    )
+
+    assert result.success is True
+    assert stderr_captured == ["claude: oops\n", "stack trace line 2\n"]
+
+
+@pytest.mark.unit
+def test_on_stderr_callback_failure_does_not_break_collection(
+    mock_popen, mocker, tmp_path
+):
+    """A flaky on_stderr (e.g. Redis blip) must not break local stderr collection,
+    which usage-exhaustion detection relies on."""
+    _, mock_proc = mock_popen
+
+    mock_proc.stdout = iter(_make_stdout_lines("ok"))
+    mock_proc.stderr = iter(["a\n", "b\n"])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    def flaky(line: str) -> None:
+        raise RuntimeError("redis is down")
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, on_stderr=flaky)
+    assert result.success is True
 
 
 @pytest.mark.unit

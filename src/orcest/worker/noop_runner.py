@@ -32,6 +32,7 @@ class NoopRunner:
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
         claude_token: str = "",
     ) -> RunnerResult:

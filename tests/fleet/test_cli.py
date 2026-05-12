@@ -1101,6 +1101,52 @@ def test_pool_status_no_worker_vms(runner, cfg_path, mocker):
     assert "No worker VMs found" in result.output
 
 
+def test_pool_status_uses_redis_pointer(runner, cfg_path, mocker):
+    """pool-status reads the active template from Redis when orchestrator host is set."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=200),
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9003,
+    )
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.get_vm_status.return_value = "stopped"
+    mock_px.list_vms.return_value = []
+
+    result = runner.invoke(fleet, ["pool-status", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    assert "9003" in result.output
+    assert "Redis pointer" in result.output
+    # The Proxmox status check should use the Redis-derived VMID, not the config one.
+    mock_px.get_vm_status.assert_called_with(9003)
+
+
+def test_pool_status_falls_back_to_config_when_redis_unset(runner, cfg_path, mocker):
+    """pool-status falls back to cfg.pool.template_vm_id when Redis pointer is unset."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=200),
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=None,
+    )
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.get_vm_status.return_value = "stopped"
+    mock_px.list_vms.return_value = []
+
+    result = runner.invoke(fleet, ["pool-status", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    assert "200" in result.output
+    mock_px.get_vm_status.assert_called_with(200)
+
+
 # ── set-pool-size tests ─────────────────────────────────────
 
 
@@ -1222,8 +1268,22 @@ def test_stop_drain_active_destroys_all(runner, cfg_path, mocker):
     assert mock_px.destroy_vm.call_count == 2
 
 
-def test_stop_drain_active_prompt_abort(runner, cfg_path, mocker):
-    """stop --drain-active aborts when user answers 'n' at the confirmation prompt."""
+@pytest.mark.parametrize(
+    ("prompt_input", "should_proceed", "expected_destroy_count"),
+    [
+        pytest.param("n\n", False, 0, id="abort"),
+        pytest.param("y\n", True, 2, id="confirm"),
+    ],
+)
+def test_stop_drain_active_prompt(
+    runner,
+    cfg_path,
+    mocker,
+    prompt_input,
+    should_proceed,
+    expected_destroy_count,
+):
+    """stop --drain-active follows the user's confirmation prompt answer."""
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
         pool=PoolConfig(template_vm_id=9000),
@@ -1242,34 +1302,16 @@ def test_stop_drain_active_prompt_abort(runner, cfg_path, mocker):
     )
     mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
 
-    result = runner.invoke(fleet, ["stop", "--drain-active", "--config", cfg_path], input="n\n")
-    assert result.exit_code != 0
-    mock_px.destroy_vm.assert_not_called()
-
-
-def test_stop_drain_active_prompt_confirm(runner, cfg_path, mocker):
-    """stop --drain-active proceeds when user answers 'y' at the confirmation prompt."""
-    cfg = _proxmox_cfg(
-        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+    result = runner.invoke(
+        fleet,
+        ["stop", "--drain-active", "--config", cfg_path],
+        input=prompt_input,
     )
-    _save(cfg, cfg_path)
-
-    mock_px = _mock_proxmox_client(mocker)
-    mock_px.list_vms.return_value = [
-        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
-        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
-    ]
-    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
-    mocker.patch(
-        "orcest.fleet.orchestrator.get_pool_redis_members",
-        return_value=({"300"}, {"301": "1000.0"}),
-    )
-    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
-
-    result = runner.invoke(fleet, ["stop", "--drain-active", "--config", cfg_path], input="y\n")
-    assert result.exit_code == 0
-    assert mock_px.destroy_vm.call_count == 2
+    if should_proceed:
+        assert result.exit_code == 0
+    else:
+        assert result.exit_code != 0
+    assert mock_px.destroy_vm.call_count == expected_destroy_count
 
 
 def test_stop_requires_orchestrator_host(runner, cfg_path):
