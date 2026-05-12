@@ -167,39 +167,133 @@ def _run_gh(args: list[str], token: str) -> str:
 
 
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
-    """List all open PRs, sorted oldest first.
+    """List open PRs, sorted oldest first.
 
     Returns list of dicts with keys: number, title, headRefName,
-    headRefOid, isDraft, createdAt, labels, reviewDecision,
+    baseRefName, headRefOid, isDraft, createdAt, labels, reviewDecision,
     mergeable, mergeStateStatus.
 
     Args:
         repo: Repository in 'owner/repo' format.
         token: GitHub token.
-        limit: Maximum number of PRs to fetch. Defaults to 100.
+        limit: Maximum number of PRs to fetch. Defaults to 100. Values above
+            100 are fetched with GraphQL cursor pagination.
     """
     _validate_repo(repo)
-    output = _run_gh(
-        [
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,headRefName,baseRefName,headRefOid,isDraft,createdAt,labels,reviewDecision,mergeable,mergeStateStatus",
-            "--limit",
-            str(limit),
-        ],
-        token,
-    )
-    if not output:
+    if limit < 1:
         return []
-    try:
-        return json.loads(output)
-    except json.JSONDecodeError as e:
-        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+
+    owner, name = repo.split("/", 1)
+    query = """
+query($owner: String!, $repo: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(
+      states: OPEN
+      first: $first
+      after: $after
+      orderBy: {field: CREATED_AT, direction: ASC}
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        headRefName
+        baseRefName
+        headRefOid
+        isDraft
+        createdAt
+        labels(first: 100) {
+          nodes {
+            id
+            name
+            description
+            color
+          }
+        }
+        reviewDecision
+        mergeable
+        mergeStateStatus
+      }
+    }
+  }
+}
+"""
+
+    prs: list[dict] = []
+    cursor: str | None = None
+    page_count = 0
+    pull_requests: dict[str, Any] = {}
+
+    while len(prs) < limit and page_count < _MAX_PAGES:
+        page_count += 1
+        page_size = min(100, limit - len(prs))
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={name}",
+            "-F",
+            f"first={page_size}",
+            "-f",
+            f"query={query}",
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"after={cursor}"])
+
+        output = _run_gh(args, token)
+        if not output:
+            return prs
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+        if isinstance(data, list):
+            return data
+
+        if "errors" in data:
+            msgs = [e.get("message", str(e)) for e in data["errors"]]
+            raise GhCliError(f"GraphQL errors fetching open PRs: {'; '.join(msgs)}")
+
+        repo_data = (data.get("data") or {}).get("repository")
+        if not repo_data:
+            raise GhCliError(
+                f"GraphQL returned null repository for {repo!r} — "
+                "check that the repo exists and the token has access"
+            )
+        pull_requests = repo_data.get("pullRequests") or {}
+        for pr in pull_requests.get("nodes") or []:
+            labels = (pr.get("labels") or {}).get("nodes") or []
+            normalized = dict(pr)
+            normalized["labels"] = labels
+            prs.append(normalized)
+
+        page_info = pull_requests.get("pageInfo") or {}
+        if page_info.get("hasNextPage") and len(prs) < limit:
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                logger.warning(
+                    "Open PR pagination for %s had hasNextPage=True but no endCursor; "
+                    "stopping with %d PRs fetched",
+                    repo,
+                    len(prs),
+                )
+                break
+        else:
+            break
+    else:
+        page_info = pull_requests.get("pageInfo") or {}
+        if page_info.get("hasNextPage") and len(prs) < limit:
+            logger.warning(
+                "Open PR listing for %s reached MAX_PAGES (%d); "
+                "some PRs may have been truncated (%d fetched so far)",
+                repo,
+                _MAX_PAGES,
+                len(prs),
+            )
+
+    return prs
 
 
 def get_pr(repo: str, number: int, token: str) -> dict:
@@ -215,7 +309,8 @@ def get_pr(repo: str, number: int, token: str) -> dict:
             "--json",
             "number,title,body,headRefName,baseRefName,state,"
             "labels,reviewDecision,reviews,"
-            "statusCheckRollup,commits,additions,deletions",
+            "statusCheckRollup,commits,additions,deletions,"
+            "mergeable,mergeStateStatus",
         ],
         token,
     )
@@ -497,8 +592,8 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           path
           line
           isResolved
-          comments(first: 10) {
-            pageInfo { hasNextPage }
+          comments(last: 100) {
+            pageInfo { hasPreviousPage }
             nodes {
               author { login }
               body
@@ -602,10 +697,10 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             continue
         comments_data = thread.get("comments") or {}
         comment_page = comments_data.get("pageInfo") or {}
-        if comment_page.get("hasNextPage"):
+        if comment_page.get("hasPreviousPage"):
             thread_id = thread.get("id", "<unknown>")
             logger.warning(
-                "Review thread %s has more than 10 comments; later comments were not fetched",
+                "Review thread %s has more than 100 comments; oldest comments were not fetched",
                 thread_id,
             )
         comments = []
