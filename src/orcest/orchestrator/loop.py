@@ -29,6 +29,7 @@ from orcest.orchestrator.pr_ops import (
     discover_actionable_prs,
     get_stale_retrigger_sha,
     increment_total_attempts,
+    record_self_cancelled_stale_runs,
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
@@ -39,6 +40,7 @@ from orcest.orchestrator.task_publisher import (
     publish_followup_task,
     publish_issue_task,
     publish_rebase_task,
+    rerun_all_transient_ci,
 )
 from orcest.orchestrator.token_pool import TokenPool
 from orcest.orchestrator.usage_check import get_token_reset_time
@@ -46,8 +48,11 @@ from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
     clear_backoff,
     clear_pending_task,
+    clear_transient_failure_count,
     compute_pending_task_ttl,
     get_pending_task,
+    increment_transient_failure_count,
+    set_backoff_cooldown,
 )
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
@@ -70,6 +75,10 @@ _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
 _USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS = 24 * 3600
+_TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS = 24 * 3600
+_REVIEW_RERUN_FAILURE_COOLDOWN_SECONDS = 15 * 60
+_REVIEW_RERUN_FAILURE_TTL_SECONDS = 7 * 24 * 3600
+_MAX_REVIEW_RERUN_FAILURES = 3
 
 # Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
 # Used to distinguish transient network failures from permanent merge errors.
@@ -87,6 +96,7 @@ _MERGE_NETWORK_PATTERNS: list[re.Pattern[str]] = [
         r"no such host",
         r"i/o timeout",
         r"network is unreachable",
+        r"HTTP 50[234]",
     ]
 ]
 
@@ -94,6 +104,11 @@ _MERGE_NETWORK_PATTERNS: list[re.Pattern[str]] = [
 def _make_usage_exhausted_processed_key(task_id: str) -> str:
     """Redis key tracking USAGE_EXHAUSTED accounting already done for a task."""
     return f"result:{task_id}:usage_exhausted_processed"
+
+
+def _make_transient_failure_processed_key(task_id: str) -> str:
+    """Redis key tracking transient-failure accounting already done for a task."""
+    return f"result:{task_id}:transient_failure_processed"
 
 
 def _usage_exhausted_cooldown_ttl_seconds(result: TaskResult) -> int:
@@ -129,6 +144,91 @@ def _is_required_checks_expected_error(msg: str) -> bool:
     )
 
 
+def _is_merge_conflict_error(msg: str) -> bool:
+    """Fallback classifier for gh errors when PR merge status cannot be refreshed."""
+    lower = msg.lower()
+    return (
+        "merge conflict" in lower
+        or "merge conflicts" in lower
+        or "is not mergeable" in lower
+        or "cannot be cleanly created" in lower
+        or "cannot automatically merge" in lower
+    )
+
+
+def _merge_status_indicates_conflict(pr_data: dict) -> bool | None:
+    """Return GitHub's conflict decision, or None when the status is inconclusive."""
+    mergeable = pr_data.get("mergeable")
+    merge_state_status = pr_data.get("mergeStateStatus")
+    if mergeable == "CONFLICTING" or merge_state_status == "DIRTY":
+        return True
+    if mergeable == "MERGEABLE" and merge_state_status in {
+        "BEHIND",
+        "BLOCKED",
+        "CLEAN",
+        "DRAFT",
+        "HAS_HOOKS",
+        "UNSTABLE",
+    }:
+        return False
+    return None
+
+
+def _merge_status_summary(pr_data: dict) -> str:
+    """Render the GitHub merge status fields for logs."""
+    return (
+        f"mergeable={pr_data.get('mergeable')!r} "
+        f"mergeStateStatus={pr_data.get('mergeStateStatus')!r}"
+    )
+
+
+def _merge_failure_indicates_conflict(
+    *, repo: str, pr_number: int, token: str, err_msg: str, logger: logging.Logger
+) -> bool:
+    """Prefer GitHub merge status; fall back to gh error text if status is unknown."""
+    try:
+        refreshed_pr = gh.get_pr(repo, pr_number, token)
+        status_conflict = _merge_status_indicates_conflict(refreshed_pr)
+        if status_conflict is not None:
+            return status_conflict
+        logger.warning(
+            "PR #%d: GitHub merge status was inconclusive after merge failure "
+            "(%s), falling back to gh error text",
+            pr_number,
+            _merge_status_summary(refreshed_pr),
+        )
+    except Exception as status_err:
+        logger.warning(
+            "PR #%d: failed to refresh GitHub merge status after merge failure, "
+            "falling back to gh error text: %s",
+            pr_number,
+            status_err,
+            exc_info=True,
+        )
+    return _is_merge_conflict_error(err_msg)
+
+
+def _is_stale_head_error(msg: str) -> bool:
+    """Return True when GitHub rejected an action because the PR head changed."""
+    lower = msg.lower()
+    return (
+        ("match-head-commit" in lower)
+        or ("expected_head_sha" in lower)
+        or ("expected head sha" in lower)
+        or ("head sha" in lower and ("mismatch" in lower or "modified" in lower))
+        or ("head commit" in lower and ("changed" in lower or "mismatch" in lower))
+        or ("head branch was modified" in lower)
+    )
+
+
+def _exception_message_with_stderr(exc: Exception) -> str:
+    """Return exception text plus gh stderr when available."""
+    stderr = getattr(exc, "stderr", "")
+    if stderr:
+        return f"{exc}\n{stderr}"
+    return str(exc)
+
+
 def _make_merge_retries_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking merge retry count due to network errors."""
     return f"pr:{repo}:{pr_number}:merge_retries"
@@ -142,6 +242,147 @@ def _increment_merge_retries(redis: RedisClient, repo: str, pr_number: int) -> i
     pipe.expire(key, 3600)  # 1-hour TTL
     results = pipe.execute()
     return results[0]
+
+
+def _make_review_rerun_failure_key(repo: str, pr_number: int, head_sha: str) -> str:
+    """Redis key for failed claude-review rerun attempts on a PR SHA."""
+    return f"pr:{repo}:{pr_number}:review_rerun_failures:{head_sha}"
+
+
+def _make_review_rerun_failure_cooldown_key(
+    repo: str, pr_number: int, head_sha: str
+) -> str:
+    """Redis key suppressing claude-review reruns after a failed rerun call."""
+    return f"pr:{repo}:{pr_number}:review_rerun_failure_cooldown:{head_sha}"
+
+
+def _record_review_rerun_failure(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> int:
+    """Increment failed rerun attempts for this PR SHA and set a cooldown."""
+    key = _make_review_rerun_failure_key(repo, pr_number, head_sha)
+    count = redis.incr(key)
+    redis.expire(key, _REVIEW_RERUN_FAILURE_TTL_SECONDS)
+    redis.set_ex(
+        _make_review_rerun_failure_cooldown_key(repo, pr_number, head_sha),
+        "1",
+        _REVIEW_RERUN_FAILURE_COOLDOWN_SECONDS,
+    )
+    return count
+
+
+def _clear_review_rerun_failures(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> None:
+    """Clear loop-side failed rerun state after a successful rerun."""
+    redis.delete(
+        _make_review_rerun_failure_key(repo, pr_number, head_sha),
+        _make_review_rerun_failure_cooldown_key(repo, pr_number, head_sha),
+    )
+
+
+def _review_rerun_failure_cooldown_active(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> bool:
+    """Return True when a failed claude-review rerun is still cooling down."""
+    return redis.exists(_make_review_rerun_failure_cooldown_key(repo, pr_number, head_sha))
+
+
+def _label_pr_retry_budget_exhausted(
+    *,
+    repo: str,
+    pr_state,
+    labels: LabelConfig,
+    token: str,
+    logger: logging.Logger,
+    redis: RedisClient,
+    attempts_text: str,
+    retry_text: str,
+) -> None:
+    """Label and comment on a PR whose orchestrator retry budget is exhausted."""
+    logger.warning(
+        "PR #%d: retry budget exhausted, adding needs-human label", pr_state.number
+    )
+    labeled = False
+    try:
+        gh.add_label(
+            repo,
+            pr_state.number,
+            labels.needs_human,
+            token,
+        )
+        labeled = True
+        set_exhausted_notified(redis, repo, pr_state.number)
+    except Exception as e:
+        logger.error(
+            "Failed to label PR #%d as needs-human: %s",
+            pr_state.number,
+            e,
+            exc_info=True,
+        )
+    try:
+        label_note = (
+            f"Labeling as `{labels.needs_human}` for manual review."
+            if labeled
+            else f"Failed to add `{labels.needs_human}` label — please triage manually."
+        )
+        gh.post_comment(
+            repo,
+            pr_state.number,
+            f"**orcest** has exhausted its retry budget "
+            f"({attempts_text}) for this PR. {label_note}\n\n{retry_text}",
+            token,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to comment on PR #%d about max attempts: %s",
+            pr_state.number,
+            e,
+            exc_info=True,
+        )
+
+
+def _label_review_rerun_failures_exhausted(
+    *,
+    repo: str,
+    pr_state,
+    labels: LabelConfig,
+    token: str,
+    logger: logging.Logger,
+    failure_count: int,
+) -> None:
+    """Escalate repeated failures to call gh.rerun_workflow for claude-review."""
+    labeled = False
+    try:
+        gh.add_label(repo, pr_state.number, labels.needs_human, token)
+        labeled = True
+    except Exception as e:
+        logger.error(
+            "Failed to label PR #%d after claude-review rerun failures: %s",
+            pr_state.number,
+            e,
+            exc_info=True,
+        )
+    try:
+        label_note = (
+            f"Labeling as `{labels.needs_human}` for manual review."
+            if labeled
+            else f"Failed to add `{labels.needs_human}` label — please triage manually."
+        )
+        gh.post_comment(
+            repo,
+            pr_state.number,
+            f"**orcest** failed to re-trigger `claude-review` {failure_count} times. "
+            f"{label_note}",
+            token,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to comment on PR #%d about claude-review rerun failures: %s",
+            pr_state.number,
+            e,
+            exc_info=True,
+        )
 
 
 def run_orchestrator(config: OrchestratorConfig) -> None:
@@ -414,18 +655,23 @@ def _poll_project(
                     pr_state.number,
                     token,
                     delete_branch=config.delete_branch_on_merge,
+                    head_sha=pr_state.head_sha,
                 )
                 merged += 1
             except Exception as e:
-                err_msg = str(e)
+                err_msg = _exception_message_with_stderr(e)
                 logger.error(
                     f"Failed to merge PR #{pr_state.number}: {err_msg}",
                     exc_info=True,
                 )
                 # If the error looks like a merge conflict, enqueue a
                 # rebase task so a worker can resolve it automatically.
-                is_conflict = (
-                    "is not mergeable" in err_msg or "cannot be cleanly created" in err_msg
+                is_conflict = _merge_failure_indicates_conflict(
+                    repo=repo,
+                    pr_number=pr_state.number,
+                    token=token,
+                    err_msg=err_msg,
+                    logger=logger,
                 )
                 if is_conflict:
                     logger.info(
@@ -437,7 +683,7 @@ def _poll_project(
                             "All Claude tokens exhausted, skipping rebase for PR #%d",
                             pr_state.number,
                         )
-                        is_conflict = False
+                        continue
                     else:
                         try:
                             task = publish_rebase_task(
@@ -473,15 +719,39 @@ def _poll_project(
                             pr_state.number,
                         )
                         try:
-                            if gh.update_branch(repo, pr_state.number, token):
+                            if gh.update_branch(
+                                repo,
+                                pr_state.number,
+                                token,
+                                expected_head_sha=pr_state.head_sha,
+                            ):
                                 continue
                         except Exception as update_err:
+                            if _is_stale_head_error(
+                                _exception_message_with_stderr(update_err)
+                            ):
+                                logger.info(
+                                    "PR #%d: update-branch rejected stale discovered "
+                                    "head SHA %s after merge rejection; retrying next poll",
+                                    pr_state.number,
+                                    pr_state.head_sha,
+                                )
+                                continue
                             logger.warning(
                                 "PR #%d: update-branch after merge rejection failed: %s",
                                 pr_state.number,
                                 update_err,
                                 exc_info=True,
                             )
+
+                    if _is_stale_head_error(err_msg):
+                        logger.info(
+                            "PR #%d: merge rejected stale discovered head SHA %s; "
+                            "retrying next poll",
+                            pr_state.number,
+                            pr_state.head_sha,
+                        )
+                        continue
 
                     # Check for transient network errors — retry silently
                     # unless we've exceeded the merge retry budget.
@@ -649,6 +919,23 @@ def _poll_project(
                         )
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
+            try:
+                if rerun_all_transient_ci(
+                    pr_state=pr_state,
+                    repo=repo,
+                    token=token,
+                    redis=project_redis,
+                    logger=logger,
+                ):
+                    continue
+            except Exception as e:
+                logger.warning(
+                    "Failed to classify/re-trigger transient CI for PR #%d before "
+                    "token selection: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
             ct = _select_claude_token()
             if ct is None:
                 logger.warning(
@@ -668,6 +955,7 @@ def _poll_project(
                         claude_token=ct,
                         key_prefix=key_prefix,
                         task_redis=task_redis,
+                        skip_transient_rerun=True,
                     )
                     if result is not None:
                         _register_task(result.id, ct)
@@ -781,8 +1069,21 @@ def _poll_project(
                 pr_state.title,
             )
             try:
-                gh.update_branch(repo, pr_state.number, token)
+                gh.update_branch(
+                    repo,
+                    pr_state.number,
+                    token,
+                    expected_head_sha=pr_state.head_sha,
+                )
             except Exception as e:
+                if _is_stale_head_error(_exception_message_with_stderr(e)):
+                    logger.info(
+                        "PR #%d: update-branch rejected stale discovered head SHA %s; "
+                        "retrying next poll",
+                        pr_state.number,
+                        pr_state.head_sha,
+                    )
+                    continue
                 logger.warning(
                     "PR #%d: update-branch failed: %s",
                     pr_state.number,
@@ -795,6 +1096,13 @@ def _poll_project(
             if pr_state.review_run_id is None:
                 logger.error(
                     "PR #%d: RETRIGGER_REVIEW action but review_run_id is None, skipping",
+                    pr_state.number,
+                )
+            elif _review_rerun_failure_cooldown_active(
+                project_redis, repo, pr_state.number, pr_state.head_sha
+            ):
+                logger.info(
+                    "PR #%d: claude-review rerun failure cooldown active, skipping",
                     pr_state.number,
                 )
             else:
@@ -813,13 +1121,32 @@ def _poll_project(
                     set_review_retrigger_sha(
                         project_redis, repo, pr_state.number, pr_state.head_sha
                     )
+                    _clear_review_rerun_failures(
+                        project_redis, repo, pr_state.number, pr_state.head_sha
+                    )
                 except Exception as e:
+                    failure_count = _record_review_rerun_failure(
+                        project_redis, repo, pr_state.number, pr_state.head_sha
+                    )
                     logger.error(
-                        "Failed to re-trigger review for PR #%d: %s",
+                        "Failed to re-trigger review for PR #%d "
+                        "(failure %d/%d; cooldown %ds): %s",
                         pr_state.number,
+                        failure_count,
+                        _MAX_REVIEW_RERUN_FAILURES,
+                        _REVIEW_RERUN_FAILURE_COOLDOWN_SECONDS,
                         e,
                         exc_info=True,
                     )
+                    if failure_count >= _MAX_REVIEW_RERUN_FAILURES:
+                        _label_review_rerun_failures_exhausted(
+                            repo=repo,
+                            pr_state=pr_state,
+                            labels=labels,
+                            token=token,
+                            logger=logger,
+                            failure_count=failure_count,
+                        )
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
             # Cooldown guard: skip if we already acted on this SHA
@@ -886,6 +1213,7 @@ def _poll_project(
                 )
                 any_cancel_succeeded = False
                 cancelled_count = 0
+                cancelled_run_ids: list[int] = []
                 for run_id in run_ids:
                     try:
                         gh.cancel_workflow(
@@ -895,6 +1223,7 @@ def _poll_project(
                         )
                         any_cancel_succeeded = True
                         cancelled_count += 1
+                        cancelled_run_ids.append(run_id)
                         logger.info(
                             "PR #%d: cancelled stale workflow run %d",
                             pr_state.number,
@@ -942,6 +1271,14 @@ def _poll_project(
                     ex=config.stale_pending_timeout_seconds,
                 )
                 if any_cancel_succeeded:
+                    record_self_cancelled_stale_runs(
+                        project_redis,
+                        repo,
+                        pr_state.number,
+                        pr_state.head_sha,
+                        cancelled_run_ids,
+                        ttl_seconds=max(config.stale_pending_timeout_seconds * 2, 24 * 3600),
+                    )
                     try:
                         gh.post_comment(
                             repo,
@@ -962,48 +1299,32 @@ def _poll_project(
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:
-            logger.warning(
-                "PR #%d: max attempts reached, adding needs-human label", pr_state.number
+            _label_pr_retry_budget_exhausted(
+                repo=repo,
+                pr_state=pr_state,
+                labels=labels,
+                token=token,
+                logger=logger,
+                redis=project_redis,
+                attempts_text=f"{config.max_attempts} attempts",
+                retry_text=(
+                    "Push a new commit to reset the counter and allow orcest to try again."
+                ),
             )
-            labeled = False
-            try:
-                gh.add_label(
-                    repo,
-                    pr_state.number,
-                    labels.needs_human,
-                    token,
-                )
-                labeled = True
-                set_exhausted_notified(project_redis, repo, pr_state.number)
-            except Exception as e:
-                logger.error(
-                    "Failed to label PR #%d as needs-human: %s",
-                    pr_state.number,
-                    e,
-                    exc_info=True,
-                )
-            try:
-                label_note = (
-                    f"Labeling as `{labels.needs_human}` for manual review."
-                    if labeled
-                    else f"Failed to add `{labels.needs_human}` label — please triage manually."
-                )
-                gh.post_comment(
-                    repo,
-                    pr_state.number,
-                    f"**orcest** has exhausted its retry budget "
-                    f"({config.max_attempts} attempts) for this PR. "
-                    f"{label_note}\n\nPush a new commit to reset "
-                    f"the counter and allow orcest to try again.",
-                    token,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to comment on PR #%d about max attempts: %s",
-                    pr_state.number,
-                    e,
-                    exc_info=True,
-                )
+        elif pr_state.action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS:
+            _label_pr_retry_budget_exhausted(
+                repo=repo,
+                pr_state=pr_state,
+                labels=labels,
+                token=token,
+                logger=logger,
+                redis=project_redis,
+                attempts_text=f"{config.max_total_attempts} failed attempts across commits",
+                retry_text=(
+                    "A human should inspect the repeated failures before clearing "
+                    "the label and retrying."
+                ),
+            )
         elif pr_state.action == PRAction.SKIP_BACKOFF:
             logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_DRAFT:
@@ -1245,7 +1566,7 @@ def _handle_result(
 
     Posts a comment on the resource (PR or issue) with the result summary
     and manages labels:
-    - completed: clears attempt counter
+    - completed: clears issue attempt counter; PR attempts remain until the SHA changes
     - failed: adds needs-human label
     - blocked: adds blocked label
     - usage_exhausted: no label changes; resource resumes after cooldown
@@ -1325,21 +1646,32 @@ def _handle_result(
             exc_info=True,
         )
 
-    # Clear per-SHA attempt counter on success so future failures on a new
-    # SHA start fresh. Do NOT clear total_attempts here — that cross-SHA
-    # circuit breaker should only be reset when the PR is truly resolved
-    # (merged), not on intermediate task successes.
+    # Completed issue tasks are resolved by removing the ready label below, so
+    # their attempt counter can be cleared. Completed PR tasks are intentionally
+    # different: a worker can report success without changing PR head or resolving
+    # the failing condition. Leaving the per-SHA guard in place prevents unlimited
+    # same-SHA retries; a real pushed commit resets the guard during discovery.
+    # Do NOT clear total_attempts here — that cross-SHA circuit breaker should
+    # only be reset when the PR is truly resolved (merged), not on intermediate
+    # task successes.
     if result.status == ResultStatus.COMPLETED:
-        try:
-            if is_issue:
+        if is_issue:
+            try:
                 clear_issue_attempts(redis, repo, resource_id)
-            else:
-                clear_attempts(redis, repo, resource_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
+            except Exception as e:
+                logger.error(
+                    f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
+                    exc_info=True,
+                )
+        else:
+            try:
+                clear_backoff(redis, repo, resource_id)
+                clear_transient_failure_count(redis, repo, resource_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to clear transient backoff state for PR #{resource_id}: {e}",
+                    exc_info=True,
+                )
 
         # Remove orcest:ready label from completed issues so they are not
         # re-discovered on the next poll cycle.
@@ -1450,21 +1782,33 @@ def _handle_result(
                     exc_info=True,
                 )
 
-    # Transient failures (clone timeout, worker restart) should be retried
-    # automatically — don't label needs-human or burn attempt slots.
+    # Transient failures (clone timeout, provider overload, worker restart)
+    # should be retried automatically after backoff without burning the
+    # cross-SHA PR attempt budget.
     is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
         TRANSIENT_SUMMARY_PREFIX
     )
 
     if is_transient:
-        # Clear per-SHA attempts so the PR will be re-enqueued on the next
-        # poll cycle. Total_attempts is not touched: transient failures never
-        # bump it (see _handle_result terminal-failure branch), so there is
-        # nothing to refund.
+        transient_accounting_processed = False
+        try:
+            transient_accounting_processed = redis.set_nx_ex(
+                _make_transient_failure_processed_key(result.task_id),
+                "1",
+                _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS,
+            )
+        except Exception:
+            logger.debug("Failed to mark transient failure as processed", exc_info=True)
+
         try:
             if is_issue:
                 clear_issue_attempts(redis, repo, resource_id)
             else:
+                if transient_accounting_processed:
+                    transient_count = increment_transient_failure_count(
+                        redis, repo, resource_id
+                    )
+                    set_backoff_cooldown(redis, repo, resource_id, transient_count - 1)
                 clear_attempts(redis, repo, resource_id)
         except Exception as e:
             logger.error(
@@ -1479,11 +1823,6 @@ def _handle_result(
     # Transient failures skip labeling — they will be retried automatically.
     labeled = False
     if result.status == ResultStatus.FAILED and not is_transient:
-        # Terminal failures are the only events that bump the cross-SHA budget.
-        # Healthy review-fix cycles (COMPLETED), rate limits (USAGE_EXHAUSTED),
-        # and transient infra failures must not consume it — otherwise a PR
-        # going through many legitimate cycles trips the cap and gets
-        # mislabeled needs-human.
         if not is_issue:
             try:
                 increment_total_attempts(redis, repo, resource_id)
