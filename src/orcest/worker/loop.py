@@ -786,6 +786,20 @@ def _execute_task(
                         exc_info=True,
                     )
 
+        def on_stderr(line: str) -> None:
+            # Stderr is published to the same output stream tagged ``stream=stderr``
+            # so postmortems can reconstruct what the runner emitted before a crash.
+            # Failures here are silent: streaming visibility is non-critical and we
+            # never want a flaky Redis to break task execution.
+            try:
+                redis.xadd_capped(
+                    output_stream,
+                    {"line": line, "stream": "stderr"},
+                    maxlen=_STREAM_MAXLEN,
+                )
+            except Exception:
+                pass
+
         # Run the configured backend
         runner_result: RunnerResult = runner.run(
             prompt=task.prompt,
@@ -794,6 +808,7 @@ def _execute_task(
             timeout=config.runner.timeout,
             logger=logger,
             on_output=on_output,
+            on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=task.claude_token,
         )

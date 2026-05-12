@@ -261,11 +261,18 @@ def _close_pipes(proc: subprocess.Popen[str]) -> None:
 
 def _drain_stderr(
     proc: subprocess.Popen[str],
+    on_stderr: Callable[[str], None] | None = None,
 ) -> tuple[list[str], threading.Thread]:
     """Read stderr in a background thread to avoid pipe deadlock.
 
     Returns a (lines, thread) tuple.  The caller should
     ``thread.join(timeout=...)`` before reading the list.
+
+    If ``on_stderr`` is provided, each stderr line is also forwarded to it
+    so the worker can stream stderr to Redis alongside stdout. The callback
+    must not raise; the reader silently ignores callback failures so a
+    flaky consumer cannot break stderr collection (which the local code
+    still relies on for usage-exhaustion detection).
 
     Thread safety note: if ``join()`` times out while the thread is
     still appending, reading ``lines`` is safe on CPython (the GIL
@@ -280,6 +287,11 @@ def _drain_stderr(
         try:
             for line in proc.stderr:
                 lines.append(line)
+                if on_stderr is not None:
+                    try:
+                        on_stderr(line)
+                    except Exception:
+                        pass
         except (OSError, ValueError):
             # Pipe closed or invalid -- nothing more to read.
             pass
@@ -298,6 +310,7 @@ def run_claude(
     retry_backoff: int = 10,
     logger: logging.Logger | None = None,
     on_output: Callable[[str], None] | None = None,
+    on_stderr: Callable[[str], None] | None = None,
     abort_event: threading.Event | None = None,
     claude_token: str = "",
 ) -> ClaudeResult:
@@ -307,7 +320,11 @@ def run_claude(
 
     Stdout is read line-by-line so that on_output can stream each line
     to external consumers (e.g. Redis) as it arrives.  Stderr is drained
-    in a background thread to prevent pipe deadlock.
+    in a background thread to prevent pipe deadlock, and each line is
+    forwarded to on_stderr when provided — workers stream stderr alongside
+    stdout so postmortem investigations of failed tasks (e.g. claude-cli
+    crashes that exit non-zero without an explicit error envelope) have a
+    surviving record after the worker VM is destroyed.
 
     The prompt is passed as a subprocess argument (list form), so it is
     never interpreted by a shell.  No prompt-injection risk exists at the
@@ -323,6 +340,7 @@ def run_claude(
         retry_backoff: Seconds between retries.
         logger: Optional logger for status messages.
         on_output: Optional callback invoked with each stdout line.
+        on_stderr: Optional callback invoked with each stderr line.
         abort_event: Optional event that, when set, interrupts retry backoff
             and aborts the running subprocess so the worker can respond to a
             lost lock without waiting the full delay.
@@ -403,7 +421,7 @@ def run_claude(
 
         # Drain stderr in background to avoid pipe deadlock
         try:
-            stderr_lines, stderr_thread = _drain_stderr(proc)
+            stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=on_stderr)
         except RuntimeError:
             # Thread creation failed (e.g. system resource limit).
             # Kill the process and treat as a retryable crash.
@@ -721,6 +739,13 @@ def run_claude(
 
     # All retries exhausted -- include stderr from the most recent
     # attempt that successfully started a drain thread.
+    #
+    # Repeated non-zero exits without any of the explicit transient signals
+    # above (timeout, 529, usage exhaustion, D-state, lock loss) are almost
+    # always infrastructure: network blip, auth/token hiccup, claude-cli
+    # stream-json crash, OOM. There is nothing a human can fix; mark
+    # transient so the orchestrator retries with exponential backoff
+    # instead of escalating the PR to needs-human.
     duration = int(time.monotonic() - start_time)
     last_stderr = "".join(stderr_lines) if stderr_lines else ""
     last_stdout = "".join(stdout_lines) if stdout_lines else ""
@@ -729,6 +754,7 @@ def run_claude(
         summary=f"Failed after {max_retries} attempts",
         duration_seconds=duration,
         raw_output=last_stderr or last_stdout,
+        transient=True,
     )
 
 
@@ -751,6 +777,7 @@ class ClaudeRunner:
         timeout: int,
         logger: logging.Logger | None = None,
         on_output: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
         claude_token: str = "",
     ) -> RunnerResult:
@@ -764,6 +791,7 @@ class ClaudeRunner:
             retry_backoff=self.retry_backoff,
             logger=logger,
             on_output=on_output,
+            on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=claude_token,
         )

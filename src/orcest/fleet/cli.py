@@ -1479,9 +1479,31 @@ def _set_vm_cloud_init(
 def pool_status(config: str) -> None:
     """Show worker pool status: template info, idle/active VMs."""
     from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import get_current_template_vmid
 
     console = Console()
     cfg = load_config(config)
+
+    active_template: int | None = None
+    template_source = "config"
+    if cfg.orchestrator.host:
+        try:
+            redis_vmid = get_current_template_vmid(cfg.ssh_target())
+        except Exception as exc:
+            console.print(
+                f"[yellow]Warning: could not read Redis template pointer:[/yellow] {exc}"
+            )
+            redis_vmid = None
+        if redis_vmid is not None:
+            active_template = redis_vmid
+            template_source = "Redis pointer"
+    if active_template is None and cfg.pool.template_vm_id:
+        active_template = cfg.pool.template_vm_id
+
+    if active_template:
+        tmpl_display = f"{active_template} [dim]({template_source})[/dim]"
+    else:
+        tmpl_display = "[dim]not set[/dim]"
 
     # Pool configuration table
     pool_table = Table(title="Worker Pool Configuration")
@@ -1489,10 +1511,7 @@ def pool_status(config: str) -> None:
     pool_table.add_column("Value", style="white")
 
     pool_table.add_row("Target Size", str(cfg.pool.size))
-    pool_table.add_row(
-        "Template VM ID",
-        str(cfg.pool.template_vm_id) if cfg.pool.template_vm_id else "[dim]not set[/dim]",
-    )
+    pool_table.add_row("Template VM ID", tmpl_display)
     pool_table.add_row("Storage", cfg.pool.storage)
     pool_table.add_row("Worker Memory", f"{cfg.pool.worker_memory} MB")
     pool_table.add_row("Worker Cores", str(cfg.pool.worker_cores))
@@ -1500,7 +1519,7 @@ def pool_status(config: str) -> None:
     pool_table.add_row("Max Task Duration", f"{cfg.pool.max_task_duration}s")
     console.print(pool_table)
 
-    if not cfg.pool.template_vm_id:
+    if not active_template:
         console.print(
             "\n[yellow]No template configured.[/yellow]\n"
             "  Run 'orcest fleet create-template' first."
@@ -1517,9 +1536,9 @@ def pool_status(config: str) -> None:
     px = _create_proxmox_client(cfg)
 
     # Check if template exists
-    console.print(f"\n  Checking template VM {cfg.pool.template_vm_id}...", end=" ")
+    console.print(f"\n  Checking template VM {active_template}...", end=" ")
     try:
-        tpl_status = px.get_vm_status(cfg.pool.template_vm_id)
+        tpl_status = px.get_vm_status(active_template)
         console.print(f"[green]{tpl_status}[/green]")
     except Exception as exc:
         console.print(f"[red]not found[/red]: {exc}")
