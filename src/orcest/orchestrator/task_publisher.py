@@ -104,6 +104,53 @@ def _clear_pending_safe(
         )
 
 
+def _rollback_pr_attempt_increment(
+    redis: RedisClient,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    logger: logging.Logger,
+) -> None:
+    """Undo one pre-publish per-SHA attempt reservation for a PR."""
+    key = f"pr:{repo}:{pr_number}:attempts"
+    try:
+        data: dict[str, str] = redis.hgetall(key)
+        if not data or data.get("head_sha", "") != head_sha:
+            return
+        try:
+            current = int(data.get("count", 0))
+        except (TypeError, ValueError):
+            redis.delete(key)
+            return
+        if current <= 1:
+            redis.delete(key)
+            return
+        pipe = redis.pipeline(transaction=True)
+        pipe.hincrby(key, "count", -1)
+        pipe.hset(key, "head_sha", head_sha)
+        pipe.expire(key, 7 * 24 * 3600)
+        pipe.execute()
+    except Exception:
+        logger.warning(
+            "Failed to roll back attempt counter for PR #%d after publish abort",
+            pr_number,
+            exc_info=True,
+        )
+
+
+def _rollback_pr_attempt_reservation(
+    redis: RedisClient,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    rollback_attempt: bool,
+    logger: logging.Logger,
+) -> None:
+    """Best-effort rollback for counters reserved before stream publish."""
+    if rollback_attempt:
+        _rollback_pr_attempt_increment(redis, repo, pr_number, head_sha, logger)
+
+
 def _extract_relevant_log_sections(log_text: str, max_len: int) -> str:
     """Extract the most relevant sections from a CI log.
 
@@ -158,6 +205,131 @@ def _extract_run_id(details_url: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _collect_ci_failure_context(
+    pr_state: PRState,
+    repo: str,
+    token: str,
+) -> tuple[list[dict], dict[str, str], TaskType]:
+    """Fetch CI logs once and classify each failed check."""
+    failure_summaries: list[dict] = []
+    ci_logs: dict[str, str] = {}  # check_name -> log_text
+    run_logs_cache: dict[int, str] = {}  # run_id -> log_text (dedup)
+    task_type = TaskType.FIX_PR
+
+    for check in pr_state.ci_failures:
+        details_url = check.get("detailsUrl", "")
+        check_name = check.get("name", "unknown")
+        log_text = ""
+
+        # Try to fetch logs from GitHub Actions run
+        run_id = _extract_run_id(details_url)
+        if run_id is not None:
+            if run_id not in run_logs_cache:
+                try:
+                    run_logs_cache[run_id] = gh.get_failed_run_logs(repo, run_id, token)
+                except Exception:
+                    # Never let log fetching break task creation
+                    run_logs_cache[run_id] = ""
+            log_text = run_logs_cache[run_id]
+
+        ci_logs[check_name] = log_text
+
+        classification = classify_ci_failure(check_name, log_text)
+        failure_summaries.append(
+            {
+                "name": check_name,
+                "classification": classification.value,
+                "details_url": details_url,
+            }
+        )
+
+        if classification == CIFailureType.CODE:
+            task_type = TaskType.FIX_CI
+
+    return failure_summaries, ci_logs, task_type
+
+
+def _rerun_all_transient_ci_from_summaries(
+    pr_state: PRState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    failure_summaries: list[dict],
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Return True when all CI failures were transient and were rerun."""
+    _log = logger or logging.getLogger(__name__)
+    if not failure_summaries or not all(
+        s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
+    ):
+        return False
+
+    transient_count = increment_transient_attempts(
+        redis, repo, pr_state.number, pr_state.head_sha
+    )
+    if transient_count > _MAX_TRANSIENT_RETRIES:
+        _log.warning(
+            "PR #%d: transient retry budget exhausted (%d/%d), falling back to fix task",
+            pr_state.number,
+            transient_count,
+            _MAX_TRANSIENT_RETRIES,
+        )
+        return False
+
+    _log.info(
+        "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",
+        pr_state.number,
+        transient_count,
+        _MAX_TRANSIENT_RETRIES,
+    )
+    retriggered: set[int] = set()
+    for check in pr_state.ci_failures:
+        run_id = _extract_run_id(check.get("detailsUrl", ""))
+        if run_id is not None and run_id not in retriggered:
+            try:
+                gh.rerun_workflow(repo, run_id, token, failed_only=True)
+                retriggered.add(run_id)
+            except Exception:
+                _log.warning(
+                    "PR #%d: failed to re-trigger run %d",
+                    pr_state.number,
+                    run_id,
+                    exc_info=True,
+                )
+    if not retriggered:
+        _log.warning(
+            "PR #%d: transient path triggered but no runs were re-triggered (retry %d/%d); "
+            "falling back to fix task",
+            pr_state.number,
+            transient_count,
+            _MAX_TRANSIENT_RETRIES,
+        )
+        return False
+
+    return True
+
+
+def rerun_all_transient_ci(
+    pr_state: PRState,
+    repo: str,
+    token: str,
+    redis: RedisClient,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Re-trigger all-transient CI failures without publishing a worker task."""
+    failure_summaries, _ci_logs, _task_type = _collect_ci_failure_context(
+        pr_state, repo, token
+    )
+    return _rerun_all_transient_ci_from_summaries(
+        pr_state=pr_state,
+        repo=repo,
+        token=token,
+        redis=redis,
+        failure_summaries=failure_summaries,
+        logger=logger,
+    )
+
+
 def _publish_and_notify(
     task: Task,
     pr_state: PRState,
@@ -208,15 +380,25 @@ def _publish_and_notify(
     # resetting the per-SHA counter on the next poll cycle anyway.
     # If a proactive rebase fails (genuine conflicts), the worker is expected
     # to transition the PR away from SKIP_GREEN, preventing unbounded retries.
+    attempt_incremented = False
     if not proactive:
         try:
             increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
+            attempt_incremented = True
         except Exception:
             _log.error(
                 f"Failed to increment attempt counter for PR #{pr_state.number} "
                 f"before publishing task {task.id} to Redis; skipping publish to "
                 f"avoid an un-counted attempt — will retry next poll cycle",
                 exc_info=True,
+            )
+            _rollback_pr_attempt_reservation(
+                redis,
+                repo,
+                pr_state.number,
+                pr_state.head_sha,
+                attempt_incremented,
+                _log,
             )
             _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
             return False
@@ -230,6 +412,14 @@ def _publish_and_notify(
         _log.error(
             f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
             exc_info=True,
+        )
+        _rollback_pr_attempt_reservation(
+            redis,
+            repo,
+            pr_state.number,
+            pr_state.head_sha,
+            attempt_incremented,
+            _log,
         )
         _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
         raise
@@ -249,6 +439,7 @@ def publish_fix_task(
     claude_token: str = "",
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
+    skip_transient_rerun: bool = False,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -264,44 +455,11 @@ def publish_fix_task(
         transient and CI was re-triggered directly (no Claude task enqueued,
         main attempt budget not consumed).
     """
-    # Gather context
-    diff = gh.get_pr_diff(repo, pr_state.number, token)
-
     # Fetch CI logs and classify failures
-    failure_summaries: list[dict] = []
-    ci_logs: dict[str, str] = {}  # check_name -> log_text
-    run_logs_cache: dict[int, str] = {}  # run_id -> log_text (dedup)
-    task_type = TaskType.FIX_PR
-
-    for check in pr_state.ci_failures:
-        details_url = check.get("detailsUrl", "")
-        check_name = check.get("name", "unknown")
-        log_text = ""
-
-        # Try to fetch logs from GitHub Actions run
-        run_id = _extract_run_id(details_url)
-        if run_id is not None:
-            if run_id not in run_logs_cache:
-                try:
-                    run_logs_cache[run_id] = gh.get_failed_run_logs(repo, run_id, token)
-                except Exception:
-                    # Never let log fetching break task creation
-                    run_logs_cache[run_id] = ""
-            log_text = run_logs_cache[run_id]
-
-        ci_logs[check_name] = log_text
-
-        classification = classify_ci_failure(check_name, log_text)
-        failure_summaries.append(
-            {
-                "name": check_name,
-                "classification": classification.value,
-                "details_url": details_url,
-            }
-        )
-
-        if classification == CIFailureType.CODE:
-            task_type = TaskType.FIX_CI
+    _log = logger or logging.getLogger(__name__)
+    failure_summaries, ci_logs, task_type = _collect_ci_failure_context(
+        pr_state, repo, token
+    )
 
     # If every CI failure is transient, re-trigger the runs directly instead of
     # asking Claude to "fix" something that isn't a code problem.  A separate
@@ -310,54 +468,20 @@ def publish_fix_task(
     # normal fix-task path.  If no runs could be re-triggered (all rerun calls
     # raised), we fall through to Claude immediately — both a transient slot and
     # a main-attempt slot are consumed for that cycle.
-    _log = logger or logging.getLogger(__name__)
-    if failure_summaries and all(
-        s["classification"] == CIFailureType.TRANSIENT.value for s in failure_summaries
+    if not skip_transient_rerun and _rerun_all_transient_ci_from_summaries(
+        pr_state=pr_state,
+        repo=repo,
+        token=token,
+        redis=redis,
+        failure_summaries=failure_summaries,
+        logger=logger,
     ):
-        transient_count = increment_transient_attempts(
-            redis, repo, pr_state.number, pr_state.head_sha
-        )
-        if transient_count <= _MAX_TRANSIENT_RETRIES:
-            _log.info(
-                "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",
-                pr_state.number,
-                transient_count,
-                _MAX_TRANSIENT_RETRIES,
-            )
-            retriggered: set[int] = set()
-            for check in pr_state.ci_failures:
-                run_id = _extract_run_id(check.get("detailsUrl", ""))
-                if run_id is not None and run_id not in retriggered:
-                    try:
-                        gh.rerun_workflow(repo, run_id, token, failed_only=True)
-                        retriggered.add(run_id)
-                    except Exception:
-                        _log.warning(
-                            "PR #%d: failed to re-trigger run %d",
-                            pr_state.number,
-                            run_id,
-                            exc_info=True,
-                        )
-            if not retriggered:
-                _log.warning(
-                    "PR #%d: transient path triggered but no runs were re-triggered (retry %d/%d); "
-                    "falling back to fix task",
-                    pr_state.number,
-                    transient_count,
-                    _MAX_TRANSIENT_RETRIES,
-                )
-                # Fall through to enqueue a Claude fix task since we couldn't retrigger anything.
-            else:
-                # No Claude task needed — return without consuming the main attempt budget.
-                return None
-        else:
-            _log.warning(
-                "PR #%d: transient retry budget exhausted (%d/%d), falling back to fix task",
-                pr_state.number,
-                transient_count,
-                _MAX_TRANSIENT_RETRIES,
-            )
-            # Fall through to enqueue a Claude fix task below.
+        # No Claude task needed — return without consuming the main attempt budget.
+        return None
+
+    # Gather context for the worker task only after direct transient reruns
+    # have had a chance to avoid publication.
+    diff = gh.get_pr_diff(repo, pr_state.number, token)
 
     # Use review threads from pr_state (populated by discover_actionable_prs for
     # CHANGES_REQUESTED). For CI failures, fetch unresolved threads via GraphQL
