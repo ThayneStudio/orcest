@@ -551,12 +551,12 @@ def test_get_unresolved_review_threads_graphql_error(mocker):
 
 
 def test_merge_pr_calls_correct_args(mocker):
-    """merge_pr passes --squash and --delete-branch by default."""
+    """merge_pr passes --squash, --delete-branch, and the head guard by default."""
     mock_run = mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value="",
     )
-    merge_pr(REPO, 42, TOKEN)
+    merge_pr(REPO, 42, TOKEN, head_sha="abc123")
 
     mock_run.assert_called_once()
     args_passed = mock_run.call_args[0][0]
@@ -567,6 +567,8 @@ def test_merge_pr_calls_correct_args(mocker):
     assert REPO in args_passed
     assert "--squash" in args_passed
     assert "--delete-branch" in args_passed
+    assert "--match-head-commit" in args_passed
+    assert "abc123" in args_passed
     assert mock_run.call_args[0][1] == TOKEN
 
 
@@ -881,6 +883,18 @@ def test_merge_pr_no_delete_branch(mocker):
     assert "--squash" in args_passed
 
 
+def test_merge_pr_without_head_sha_omits_match_head_commit(mocker):
+    """merge_pr keeps the head guard optional for callers without a discovered SHA."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value="",
+    )
+    merge_pr(REPO, 10, TOKEN)
+
+    args_passed = mock_run.call_args[0][0]
+    assert "--match-head-commit" not in args_passed
+
+
 # ---------------------------------------------------------------------------
 # update_branch — calls the GitHub update-branch REST endpoint
 # ---------------------------------------------------------------------------
@@ -893,13 +907,14 @@ def test_update_branch_calls_correct_api(mocker):
         return_value="",
     )
 
-    assert update_branch(REPO, 99, TOKEN) is True
+    assert update_branch(REPO, 99, TOKEN, expected_head_sha="def456") is True
 
     mock_run.assert_called_once()
     args_passed = mock_run.call_args[0][0]
     assert args_passed[0] == "api"
     assert args_passed[1] == f"repos/{REPO}/pulls/99/update-branch"
     assert "PUT" in args_passed
+    assert "expected_head_sha=def456" in args_passed
     assert mock_run.call_args[0][1] == TOKEN
 
 
