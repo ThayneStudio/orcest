@@ -26,9 +26,9 @@ from orcest.orchestrator.pr_ops import (
     clear_attempts,
     clear_review_retrigger,
     clear_total_attempts,
-    decrement_total_attempts,
     discover_actionable_prs,
     get_stale_retrigger_sha,
+    increment_total_attempts,
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
@@ -1424,19 +1424,6 @@ def _handle_result(
                         f"after USAGE_EXHAUSTED: {e}",
                         exc_info=True,
                     )
-                if usage_accounting_processed:
-                    try:
-                        decrement_total_attempts(redis, repo, resource_id)
-                        logger.info(
-                            "PR #%d: decremented total-attempt counter after USAGE_EXHAUSTED",
-                            resource_id,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to undo total-attempt increment for PR #{resource_id} "
-                            f"after USAGE_EXHAUSTED: {e}",
-                            exc_info=True,
-                        )
         else:
             try:
                 set_issue_usage_exhausted_cooldown(
@@ -1471,8 +1458,9 @@ def _handle_result(
 
     if is_transient:
         # Clear per-SHA attempts so the PR will be re-enqueued on the next
-        # poll cycle. Total_attempts is left incremented as a circuit-breaker
-        # against persistent infra failures (hard stop at max_total_attempts).
+        # poll cycle. Total_attempts is not touched: transient failures never
+        # bump it (see _handle_result terminal-failure branch), so there is
+        # nothing to refund.
         try:
             if is_issue:
                 clear_issue_attempts(redis, repo, resource_id)
@@ -1491,6 +1479,19 @@ def _handle_result(
     # Transient failures skip labeling — they will be retried automatically.
     labeled = False
     if result.status == ResultStatus.FAILED and not is_transient:
+        # Terminal failures are the only events that bump the cross-SHA budget.
+        # Healthy review-fix cycles (COMPLETED), rate limits (USAGE_EXHAUSTED),
+        # and transient infra failures must not consume it — otherwise a PR
+        # going through many legitimate cycles trips the cap and gets
+        # mislabeled needs-human.
+        if not is_issue:
+            try:
+                increment_total_attempts(redis, repo, resource_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
+                    exc_info=True,
+                )
         try:
             _add_label(repo, resource_id, labels.needs_human, token)
             labeled = True

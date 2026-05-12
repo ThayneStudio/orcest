@@ -14,7 +14,6 @@ from orcest.orchestrator.issue_ops import IssueState, increment_attempts as incr
 from orcest.orchestrator.pr_ops import (
     PRState,
     increment_attempts,
-    increment_total_attempts,
     increment_transient_attempts,
 )
 from orcest.shared.config import RunnerConfig
@@ -212,7 +211,6 @@ def _publish_and_notify(
     if not proactive:
         try:
             increment_attempts(redis, repo, pr_state.number, pr_state.head_sha)
-            increment_total_attempts(redis, repo, pr_state.number)
         except Exception:
             _log.error(
                 f"Failed to increment attempt counter for PR #{pr_state.number} "
