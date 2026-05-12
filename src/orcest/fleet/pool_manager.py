@@ -654,6 +654,13 @@ class PoolManager:
         already in use.
         """
         start = self._pool.vm_id_start
+        end = self._pool.vm_id_end
+        if end and start > end:
+            raise RuntimeError(
+                f"Invalid VM ID pool range: vm_id_start ({start}) is greater than "
+                f"vm_id_end ({end})"
+            )
+
         existing: set[int] = set()
         try:
             for vm in self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX):
@@ -678,15 +685,14 @@ class PoolManager:
         candidate = start
         while candidate in existing:
             candidate += 1
-            if self._pool.vm_id_end and candidate > self._pool.vm_id_end:
+            if end and candidate > end:
                 raise RuntimeError(
                     f"VM ID pool exhausted: all IDs in range "
-                    f"{self._pool.vm_id_start}-{self._pool.vm_id_end} are in use"
+                    f"{start}-{end} are in use"
                 )
-        if self._pool.vm_id_end and candidate > self._pool.vm_id_end:
+        if end and candidate > end:
             raise RuntimeError(
-                f"VM ID pool exhausted: all IDs in range "
-                f"{self._pool.vm_id_start}-{self._pool.vm_id_end} are in use"
+                f"VM ID pool exhausted: all IDs in range {start}-{end} are in use"
             )
         return candidate
 
