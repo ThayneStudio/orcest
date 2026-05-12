@@ -11,6 +11,7 @@ from orcest.orchestrator.pr_ops import (
     PRAction,
     _check_stale_pending,
     _get_claude_review_run_id,
+    _make_pending_check_first_seen_key,
     clear_attempts,
     clear_exhausted_notified,
     clear_review_retrigger,
@@ -24,6 +25,7 @@ from orcest.orchestrator.pr_ops import (
     increment_attempts,
     increment_total_attempts,
     increment_transient_attempts,
+    record_self_cancelled_stale_runs,
     set_exhausted_notified,
     set_review_retrigger_sha,
     set_usage_exhausted_cooldown,
@@ -31,6 +33,7 @@ from orcest.orchestrator.pr_ops import (
 from orcest.shared.coordination import (
     make_pending_task_key,
     make_pr_lock_key,
+    set_backoff_cooldown,
 )
 
 REPO = "test-org/test-repo"
@@ -500,6 +503,81 @@ def test_cancelled_conclusion_counted_as_failure(gh_mock, fake_redis_client, lab
     assert pr.ci_failures[0]["name"] == "deploy"
 
 
+def test_self_cancelled_stale_run_is_suppressed(
+    gh_mock, fake_redis_client, label_config
+):
+    """A CANCELLED check from stale self-healing does not enqueue a Claude fix."""
+    pr_number = 143
+    head_sha = "sha-self-cancelled"
+    run_id = 12345
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha=head_sha),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            "conclusion": "cancelled",
+            "detailsUrl": f"https://github.com/org/repo/actions/runs/{run_id}/job/1",
+        },
+    ]
+    record_self_cancelled_stale_runs(
+        fake_redis_client,
+        REPO,
+        pr_number,
+        head_sha,
+        [run_id],
+        ttl_seconds=86400,
+    )
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+    assert results[0].ci_failures == []
+
+
+def test_unrelated_cancelled_run_still_enqueues_fix(
+    gh_mock, fake_redis_client, label_config
+):
+    """Only the run IDs cancelled by stale self-healing are suppressed."""
+    pr_number = 144
+    head_sha = "sha-other-cancelled"
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha=head_sha),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {
+            "name": "build",
+            "conclusion": "cancelled",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/99999/job/1",
+        },
+    ]
+    record_self_cancelled_stale_runs(
+        fake_redis_client,
+        REPO,
+        pr_number,
+        head_sha,
+        [12345],
+        ttl_seconds=86400,
+    )
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert results[0].ci_failures == gh_mock.get_ci_status.return_value
+
+
 def test_timed_out_conclusion_counted_as_failure(gh_mock, fake_redis_client, label_config):
     """A CheckRun with conclusion='timed_out' should be treated as a CI failure."""
     gh_mock.list_open_prs.return_value = [
@@ -635,12 +713,12 @@ def test_changes_requested_all_threads_resolved_no_claude_review_skips(
     assert pr.review_threads == []
 
 
-def test_changes_requested_thread_fetch_failure_still_enqueues(
+def test_changes_requested_thread_fetch_failure_skips_retryably(
     gh_mock,
     fake_redis_client,
     label_config,
 ):
-    """CHANGES_REQUESTED + CI green + thread fetch raises -> ENQUEUE_FIX with empty threads."""
+    """CHANGES_REQUESTED + CI green + thread fetch raises -> retryable skip."""
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=160, labels=[], review_decision="CHANGES_REQUESTED"),
     ]
@@ -658,7 +736,7 @@ def test_changes_requested_thread_fetch_failure_still_enqueues(
 
     assert len(results) == 1
     pr = results[0]
-    assert pr.action == PRAction.ENQUEUE_FIX
+    assert pr.action == PRAction.SKIP_PENDING
     assert pr.review_threads == []
 
 
@@ -1121,10 +1199,12 @@ def test_unstable_pr_does_not_trigger_update_branch(gh_mock, fake_redis_client, 
     assert results[0].action != PRAction.UPDATE_BRANCH
 
 
-def test_unknown_mergeable_falls_through_to_ci(gh_mock, fake_redis_client, label_config):
+def test_unknown_mergeable_falls_through_to_ci_and_blocks_merge(
+    gh_mock, fake_redis_client, label_config
+):
     """A PR with mergeable=UNKNOWN continues normally to the CI check."""
     gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=401, labels=[], mergeable="UNKNOWN"),
+        _make_pr_data(number=401, labels=[], mergeable="UNKNOWN", review_decision="APPROVED"),
     ]
     gh_mock.get_ci_status.return_value = [
         {"name": "tests", "conclusion": "success"},
@@ -1139,8 +1219,61 @@ def test_unknown_mergeable_falls_through_to_ci(gh_mock, fake_redis_client, label
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_GREEN
+    assert results[0].action == PRAction.SKIP_PENDING
     gh_mock.get_ci_status.assert_called_once()
+
+
+def test_unknown_mergeable_ci_failure_still_enqueues_fix(gh_mock, fake_redis_client, label_config):
+    """mergeable=UNKNOWN does not mask CI failure classification."""
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=403, labels=[], mergeable="UNKNOWN", review_decision="APPROVED"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "https://ci/1"},
+    ]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    gh_mock.get_unresolved_review_threads.assert_not_called()
+
+
+def test_unknown_mergeable_unresolved_threads_still_enqueue_fix(
+    gh_mock, fake_redis_client, label_config
+):
+    """mergeable=UNKNOWN does not mask review-thread fix classification."""
+    threads = [
+        {
+            "id": "PRRT_401",
+            "path": "src/foo.py",
+            "line": 12,
+            "comments": [{"author": "reviewer", "body": "Please adjust this"}],
+        },
+    ]
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=404, labels=[], mergeable="UNKNOWN", review_decision=""),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "success"},
+    ]
+    gh_mock.get_unresolved_review_threads.return_value = threads
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert results[0].review_threads == threads
 
 
 def test_mergeable_pr_falls_through_to_ci(gh_mock, fake_redis_client, label_config):
@@ -1381,6 +1514,26 @@ def test_total_attempts_below_limit_proceeds(gh_mock, fake_redis_client, label_c
 
     assert len(results) == 1
     assert results[0].action == PRAction.ENQUEUE_FIX
+
+
+def test_backoff_cooldown_skips_before_enqueue(gh_mock, fake_redis_client, label_config):
+    """A PR in transient-failure backoff is not enqueued until cooldown expires."""
+    pr_number = 735
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=2)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_BACKOFF
+    gh_mock.get_ci_status.assert_not_called()
 
 
 def test_total_attempts_hard_stop_preserves_counter(gh_mock, fake_redis_client, label_config):
@@ -1985,17 +2138,18 @@ def test_skip_pending_when_checks_are_fresh(gh_mock, fake_redis_client, label_co
     assert results[0].action == PRAction.SKIP_PENDING
 
 
-def test_skip_pending_when_no_timestamp(gh_mock, fake_redis_client, label_config):
-    """Pending check with no timestamp → SKIP_PENDING (conservative, not re-triggered)."""
+def test_skip_pending_when_no_timestamp_first_seen_is_fresh(
+    gh_mock, fake_redis_client, label_config
+):
+    """Timestamp-less pending check is first observed as fresh."""
+    check = {
+        "name": "build",
+        # No startedAt or createdAt
+    }
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=1002, labels=[]),
     ]
-    gh_mock.get_ci_status.return_value = [
-        {
-            "name": "build",
-            # No startedAt or createdAt
-        },
-    ]
+    gh_mock.get_ci_status.return_value = [check]
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -2007,6 +2161,94 @@ def test_skip_pending_when_no_timestamp(gh_mock, fake_redis_client, label_config
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_PENDING
+    key = _make_pending_check_first_seen_key(REPO, 1002, "", check)
+    assert fake_redis_client.get(key) is not None
+
+
+def test_retrigger_stale_checks_when_no_timestamp_first_seen_is_stale(
+    gh_mock, fake_redis_client, label_config
+):
+    """Timestamp-less pending check uses Redis first-seen time to become stale."""
+    check = {
+        "name": "build",
+        "detailsUrl": "https://github.com/org/repo/actions/runs/12345/job/1",
+        # No startedAt or createdAt
+    }
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1005, labels=[], head_sha="abc123"),
+    ]
+    gh_mock.get_ci_status.return_value = [check]
+    key = _make_pending_check_first_seen_key(REPO, 1005, "abc123", check)
+    fake_redis_client.set_ex(key, _stale_ts(3), 86400)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_STALE_CHECKS
+    assert pr.stale_run_ids == [12345]
+
+
+def test_expected_pending_check_without_timestamp_first_seen_is_fresh(
+    gh_mock, fake_redis_client, label_config
+):
+    """EXPECTED StatusContext without timestamp starts as SKIP_PENDING."""
+    check = {
+        "name": "ci/external",
+        "state": "EXPECTED",
+        # No startedAt or createdAt
+    }
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1006, labels=[], head_sha="def456"),
+    ]
+    gh_mock.get_ci_status.return_value = [check]
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_PENDING
+
+
+def test_expected_pending_check_without_timestamp_first_seen_is_stale(
+    gh_mock, fake_redis_client, label_config
+):
+    """EXPECTED StatusContext without timestamp eventually leaves SKIP_PENDING."""
+    check = {
+        "name": "ci/external",
+        "state": "EXPECTED",
+        # No startedAt or createdAt
+    }
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=1007, labels=[], head_sha="ghi789"),
+    ]
+    gh_mock.get_ci_status.return_value = [check]
+    key = _make_pending_check_first_seen_key(REPO, 1007, "ghi789", check)
+    fake_redis_client.set_ex(key, _stale_ts(3), 86400)
+
+    results = discover_actionable_prs(
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        stale_pending_timeout_seconds=7200,
+    )
+
+    assert len(results) == 1
+    pr = results[0]
+    assert pr.action == PRAction.RETRIGGER_STALE_CHECKS
+    assert pr.stale_run_ids == []
 
 
 def test_retrigger_stale_checks_no_run_ids(gh_mock, fake_redis_client, label_config):

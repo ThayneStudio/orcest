@@ -6,6 +6,7 @@ and returns a list of PRState objects with recommended actions. The orchestrator
 main loop acts on these recommendations.
 """
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import (
     clear_backoff,
+    get_backoff_step,
     make_pending_task_key,
     make_pr_lock_key,
 )
@@ -247,6 +249,97 @@ def set_stale_retrigger_sha(
     redis.set_ex(_make_stale_retrigger_key(repo, pr_number), head_sha, ex)
 
 
+def _make_self_cancelled_stale_runs_key(repo: str, pr_number: int, head_sha: str) -> str:
+    """Redis set of GitHub Actions run IDs cancelled by stale-check self-healing."""
+    return f"pr:{repo}:{pr_number}:{head_sha}:self_cancelled_stale_runs"
+
+
+def record_self_cancelled_stale_runs(
+    redis: RedisClient,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    run_ids: list[int],
+    ttl_seconds: int,
+) -> None:
+    """Record stale workflow runs cancelled by orcest so their CANCELLED checks are ignored."""
+    if not run_ids:
+        return
+    key = _make_self_cancelled_stale_runs_key(repo, pr_number, head_sha)
+    redis.sadd(key, *(str(run_id) for run_id in run_ids))
+    redis.expire(key, ttl_seconds)
+
+
+def _extract_actions_run_id(check: dict) -> int | None:
+    """Extract a GitHub Actions run ID from a check details URL."""
+    details_url = check.get("detailsUrl") or ""
+    match = re.search(r"/actions/runs/(\d+)", details_url)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _is_self_cancelled_stale_failure(
+    redis: RedisClient,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    check: dict,
+) -> bool:
+    """Return True when this CANCELLED check was created by stale-check self-healing."""
+    if (check.get("conclusion") or "").upper() != "CANCELLED":
+        return False
+    run_id = _extract_actions_run_id(check)
+    if run_id is None:
+        return False
+    key = _make_self_cancelled_stale_runs_key(repo, pr_number, head_sha)
+    return str(run_id) in redis.smembers(key)
+
+
+def _make_pending_check_first_seen_key(
+    repo: str, pr_number: int, head_sha: str, check: dict
+) -> str:
+    """Redis key for timestamp-less pending check first-observed time."""
+    # State (EXPECTED vs PENDING) is intentionally excluded from the identity:
+    # the same check transitioning EXPECTED→PENDING must keep its first-seen
+    # timestamp, otherwise stale-pending escalation never fires.
+    identity = "\0".join(
+        str(check.get(field) or "") for field in ("name", "detailsUrl", "targetUrl")
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return f"pr:{repo}:{pr_number}:{head_sha}:pending_check_first_seen:{digest}"
+
+
+def _fill_pending_first_seen_timestamps(
+    redis: RedisClient,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    ci_pending: list[dict],
+    ttl_seconds: int,
+) -> list[dict]:
+    """Attach first-seen timestamps to pending checks that GitHub reports without one."""
+    now = datetime.now(timezone.utc).isoformat()
+    enriched: list[dict] = []
+
+    for check in ci_pending:
+        if check.get("startedAt") or check.get("createdAt"):
+            enriched.append(check)
+            continue
+
+        key = _make_pending_check_first_seen_key(repo, pr_number, head_sha, check)
+        first_seen = redis.get(key)
+        if first_seen is None:
+            first_seen = now
+            redis.set_ex(key, first_seen, ttl_seconds)
+
+        enriched_check = dict(check)
+        enriched_check["createdAt"] = first_seen
+        enriched.append(enriched_check)
+
+    return enriched
+
+
 def _make_usage_cooldown_key(repo: str, pr_number: int) -> str:
     """Redis key for the USAGE_EXHAUSTED cooldown marker."""
     return f"pr:{repo}:{pr_number}:usage_cooldown"
@@ -364,12 +457,9 @@ def _check_stale_pending(ci_pending: list[dict], timeout_seconds: int) -> tuple[
     # All pending checks have exceeded the timeout — collect their run IDs
     run_ids: list[int] = []
     for check in ci_pending:
-        details_url = check.get("detailsUrl") or ""
-        match = re.search(r"/actions/runs/(\d+)", details_url)
-        if match:
-            run_id = int(match.group(1))
-            if run_id not in run_ids:
-                run_ids.append(run_id)
+        run_id = _extract_actions_run_id(check)
+        if run_id is not None and run_id not in run_ids:
+            run_ids.append(run_id)
     return True, run_ids
 
 
@@ -517,6 +607,30 @@ def discover_actionable_prs(
             )
             continue
 
+        # Clear backoff state when a new SHA is pushed, since new context
+        # makes the previous backoff cycle irrelevant. We detect this by
+        # checking the stored SHA in the per-SHA attempt counter before
+        # get_attempt_count resets it.
+        stored_sha_data = redis.hgetall(_make_attempts_key(repo, number))
+        if stored_sha_data and stored_sha_data.get("head_sha", "") != head_sha:
+            clear_backoff(redis, repo, number)
+
+        if get_backoff_step(redis, repo, number) is not None:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_BACKOFF,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
             logger.warning(
@@ -562,14 +676,6 @@ def discover_actionable_prs(
                 )
             )
             continue
-
-        # Clear backoff state when a new SHA is pushed, since new context
-        # makes the previous backoff cycle irrelevant. We detect this by
-        # checking the stored SHA in the per-SHA attempt counter before
-        # get_attempt_count resets it.
-        stored_sha_data = redis.hgetall(_make_attempts_key(repo, number))
-        if stored_sha_data and stored_sha_data.get("head_sha", "") != head_sha:
-            clear_backoff(redis, repo, number)
 
         # Skip if previously attempted on this SHA (awaiting new commits)
         # or max attempts reached.
@@ -673,6 +779,22 @@ def discover_actionable_prs(
             if (c.get("conclusion") or "").upper() in _FAILURE_CONCLUSIONS
             or (not c.get("conclusion") and (c.get("state") or "").upper() in ("FAILURE", "ERROR"))
         ]
+        suppressed_self_cancelled_failures = [
+            c
+            for c in ci_failures
+            if _is_self_cancelled_stale_failure(redis, repo, number, head_sha, c)
+        ]
+        if suppressed_self_cancelled_failures:
+            ci_failures = [
+                c
+                for c in ci_failures
+                if not _is_self_cancelled_stale_failure(redis, repo, number, head_sha, c)
+            ]
+            logger.info(
+                "PR #%d: suppressing %d CANCELLED check(s) from stale-check self-cancellation",
+                number,
+                len(suppressed_self_cancelled_failures),
+            )
         # A check is pending if it hasn't reached a terminal state.
         # statusCheckRollup can include both CheckRun objects (which have
         # "conclusion") and StatusContext objects (which have "state").
@@ -686,10 +808,34 @@ def discover_actionable_prs(
             and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
         ]
 
+        if suppressed_self_cancelled_failures and not ci_failures and not ci_pending:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_PENDING,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
         if ci_pending and not ci_failures:
             # Only skip as pending if no checks have failed yet.
             # If there are already failures, enqueue a fix immediately
             # rather than waiting for other checks to finish.
+            ci_pending = _fill_pending_first_seen_timestamps(
+                redis,
+                repo,
+                number,
+                head_sha,
+                ci_pending,
+                ttl_seconds=max(stale_pending_timeout_seconds * 2, 24 * 3600),
+            )
             all_stale, stale_run_ids = _check_stale_pending(
                 ci_pending, stale_pending_timeout_seconds
             )
@@ -766,10 +912,25 @@ def discover_actionable_prs(
                 threads = gh.get_unresolved_review_threads(repo, number, token)
             except Exception:
                 logger.warning(
-                    "Failed to fetch review threads for PR #%d, enqueuing without thread details",
+                    "Failed to fetch review threads for PR #%d with CHANGES_REQUESTED, "
+                    "skipping until review context can be fetched",
                     number,
                     exc_info=True,
                 )
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_PENDING,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+                continue
 
             if threads is not None and not threads:
                 # All review threads resolved but reviewDecision is stale
@@ -885,6 +1046,26 @@ def discover_actionable_prs(
                     )
                 )
             else:
+                if pr_data.get("mergeable") == "UNKNOWN":
+                    logger.debug(
+                        "PR #%d is approved and green but mergeability is UNKNOWN, skipping merge",
+                        number,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+
                 # All clear — merge
                 results.append(
                     PRState(
