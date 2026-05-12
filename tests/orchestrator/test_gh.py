@@ -49,6 +49,29 @@ def assert_uses_status_check_rollup_json(mock_run: MagicMock) -> None:
     assert cmd[json_idx + 1] == "statusCheckRollup"
 
 
+def _open_prs_graphql_response(
+    nodes: list[dict] | None = None,
+    *,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {
+                            "hasNextPage": has_next_page,
+                            "endCursor": end_cursor,
+                        },
+                        "nodes": nodes or [],
+                    }
+                }
+            }
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # list_open_prs
 # ---------------------------------------------------------------------------
@@ -586,31 +609,90 @@ def test_get_pr_malformed_json_raises(mocker):
 
 
 def test_list_open_prs_custom_limit(mocker):
-    """list_open_prs passes the custom limit value to the gh CLI."""
+    """list_open_prs caps each GraphQL page at 100 even when the caller asks for more."""
     mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
-        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+        return_value=subprocess.CompletedProcess(
+            args=["gh"],
+            returncode=0,
+            stdout=_open_prs_graphql_response(),
+            stderr="",
+        ),
     )
     list_open_prs(REPO, TOKEN, limit=250)
 
     args_passed = mock_run.call_args[0][0]
-    assert "--limit" in args_passed
-    limit_idx = args_passed.index("--limit")
-    assert args_passed[limit_idx + 1] == "250"
+    assert "-F" in args_passed
+    assert "first=100" in args_passed
 
 
 def test_list_open_prs_default_limit(mocker):
-    """list_open_prs defaults to limit 100 when not specified."""
+    """list_open_prs defaults to a first page size of 100."""
     mock_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
-        return_value=subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="[]", stderr=""),
+        return_value=subprocess.CompletedProcess(
+            args=["gh"],
+            returncode=0,
+            stdout=_open_prs_graphql_response(),
+            stderr="",
+        ),
     )
     list_open_prs(REPO, TOKEN)
 
     args_passed = mock_run.call_args[0][0]
-    assert "--limit" in args_passed
-    limit_idx = args_passed.index("--limit")
-    assert args_passed[limit_idx + 1] == "100"
+    assert "api" in args_passed
+    assert "graphql" in args_passed
+    assert "first=100" in args_passed
+    query_arg = next(arg for arg in args_passed if arg.startswith("query="))
+    assert "orderBy: {field: CREATED_AT, direction: ASC}" in query_arg
+
+
+def test_list_open_prs_paginates_past_100_and_preserves_shape(mocker):
+    """list_open_prs fetches additional GraphQL pages and normalizes labels."""
+    page1_nodes = [
+        {
+            "number": 1,
+            "title": "oldest",
+            "headRefName": "one",
+            "baseRefName": "main",
+            "headRefOid": "abc",
+            "isDraft": False,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "labels": {"nodes": [{"name": "ready", "color": "00ff00"}]},
+            "reviewDecision": None,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+    ]
+    page2_nodes = [
+        {
+            "number": 2,
+            "title": "newer",
+            "headRefName": "two",
+            "baseRefName": "main",
+            "headRefOid": "def",
+            "isDraft": False,
+            "createdAt": "2026-01-02T00:00:00Z",
+            "labels": {"nodes": []},
+            "reviewDecision": "APPROVED",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+    ]
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[
+            _open_prs_graphql_response(page1_nodes, has_next_page=True, end_cursor="cursor1"),
+            _open_prs_graphql_response(page2_nodes),
+        ],
+    )
+
+    result = list_open_prs(REPO, TOKEN, limit=150)
+
+    assert [pr["number"] for pr in result] == [1, 2]
+    assert result[0]["labels"] == [{"name": "ready", "color": "00ff00"}]
+    second_args = mock_run.call_args_list[1][0][0]
+    assert "after=cursor1" in second_args
 
 
 def test_list_open_prs_malformed_json(mocker):
@@ -935,8 +1017,12 @@ def test_get_unresolved_threads_null_comment_author(mocker):
     assert result[0]["comments"][0]["body"] == "Ghost comment"
 
 
-def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
-    """Logs a warning when a review thread has more than 10 comments."""
+def test_get_unresolved_threads_long_thread_uses_newest_comments(mocker, caplog):
+    """Uses the newest comment page for long review threads and warns about omitted old comments."""
+    newest_comments = [
+        {"body": f"Comment {i}", "author": {"login": "u"}}
+        for i in range(11, 111)
+    ]
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
@@ -953,11 +1039,8 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
                                         "line": 1,
                                         "isResolved": False,
                                         "comments": {
-                                            "pageInfo": {"hasNextPage": True},
-                                            "nodes": [
-                                                {"body": f"Comment {i}", "author": {"login": "u"}}
-                                                for i in range(10)
-                                            ],
+                                            "pageInfo": {"hasPreviousPage": True},
+                                            "nodes": newest_comments,
                                         },
                                     },
                                 ],
@@ -972,12 +1055,40 @@ def test_get_unresolved_threads_comment_pagination_warns(mocker, caplog):
     with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
         result = get_unresolved_review_threads(REPO, 5, TOKEN)
 
-    # Should still return the thread (with the 10 comments it got)
     assert len(result) == 1
     assert result[0]["id"] == "PRRT_many_comments"
-    assert len(result[0]["comments"]) == 10
-    # Should have logged a warning about truncated comments
-    assert any("more than 10 comments" in msg for msg in caplog.messages)
+    assert len(result[0]["comments"]) == 100
+    assert result[0]["comments"][0]["body"] == "Comment 11"
+    assert result[0]["comments"][-1]["body"] == "Comment 110"
+    assert any("more than 100 comments" in msg for msg in caplog.messages)
+
+
+def test_get_unresolved_threads_queries_last_100_comments(mocker):
+    """The review-thread query asks GitHub for the newest 100 comments per thread."""
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [],
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+    )
+
+    get_unresolved_review_threads(REPO, 5, TOKEN)
+
+    args_passed = mock_run.call_args[0][0]
+    query_arg = next(arg for arg in args_passed if arg.startswith("query="))
+    assert "comments(last: 100)" in query_arg
+    assert "hasPreviousPage" in query_arg
 
 
 def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
