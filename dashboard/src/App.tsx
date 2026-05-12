@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSnapshot } from "./hooks/useSnapshot";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { StuckAlerts } from "./components/StuckAlerts";
@@ -18,9 +18,44 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "dead-letters", label: "Dead Letters" },
 ];
 
+function isTab(value: string | null): value is Tab {
+  return TABS.some((tab) => tab.id === value);
+}
+
+function getTabFromUrl(): Tab {
+  if (typeof window === "undefined") return "overview";
+
+  const tab = new URLSearchParams(window.location.search).get("tab");
+  return isTab(tab) ? tab : "overview";
+}
+
+function setTabInUrl(tab: Tab) {
+  const url = new URL(window.location.href);
+
+  if (tab === "overview") {
+    url.searchParams.delete("tab");
+  } else {
+    url.searchParams.set("tab", tab);
+  }
+
+  window.history.replaceState(null, "", url);
+}
+
 export default function App() {
   const { snapshot, stuckTasks, workers, connected, lastUpdate } = useSnapshot();
-  const [activeTab, setActiveTab] = useState<Tab>("overview");
+  const [activeTab, setActiveTab] = useState<Tab>(getTabFromUrl);
+
+  useEffect(() => {
+    const handleNavigation = () => setActiveTab(getTabFromUrl());
+
+    window.addEventListener("popstate", handleNavigation);
+    return () => window.removeEventListener("popstate", handleNavigation);
+  }, []);
+
+  const selectTab = (tab: Tab) => {
+    setActiveTab(tab);
+    setTabInUrl(tab);
+  };
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col">
@@ -45,7 +80,7 @@ export default function App() {
                   ? "bg-zinc-800 text-zinc-100"
                   : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"
               }`}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => selectTab(tab.id)}
             >
               {tab.label}
               {tab.id === "dead-letters" && snapshot && snapshot.dead_letter_count > 0 && (

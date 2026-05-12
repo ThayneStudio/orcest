@@ -113,11 +113,14 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
 
   // Active locks — keys are prefixed: orcest:lock:pr:*, orcest:lock:issue:*
   const locks: LockInfo[] = [];
-  const allLockKeys: string[] = [];
+  const allLockKeySet = new Set<string>();
   for (const pattern of ["*:lock:pr:*", "*:lock:issue:*"]) {
     const lockKeys = await scanKeys(pattern);
-    allLockKeys.push(...lockKeys);
+    for (const key of lockKeys) {
+      allLockKeySet.add(key);
+    }
   }
+  const allLockKeys = [...allLockKeySet].sort();
   if (allLockKeys.length > 0) {
     // Batch all GET + TTL calls into a single pipeline to avoid N round-trips
     const lockPipeline = redis.pipeline();
