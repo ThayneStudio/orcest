@@ -234,7 +234,15 @@ def _collect_ci_failure_context(
 
         ci_logs[check_name] = log_text
 
-        classification = classify_ci_failure(check_name, log_text)
+        # A CANCELLED check that survived pr_ops self-cancellation suppression
+        # was cancelled by something external (human click, branch protection,
+        # workflow policy, a previous job timeout). Cancellation carries no
+        # code-level signal, so treat it as transient and let the rerun budget
+        # handle it instead of spending a Claude token.
+        if (check.get("conclusion") or "").upper() == "CANCELLED":
+            classification = CIFailureType.TRANSIENT
+        else:
+            classification = classify_ci_failure(check_name, log_text)
         failure_summaries.append(
             {
                 "name": check_name,

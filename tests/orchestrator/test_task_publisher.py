@@ -1276,6 +1276,38 @@ def test_publish_fix_task_skip_transient_rerun_publishes_worker_task(
     assert len(entries) == 1
 
 
+def test_cancelled_check_classified_as_transient_and_rerun(gh_mock, fake_redis_client):
+    """A CANCELLED check (not self-cancelled by orcest) is rerun, not handed to Claude."""
+    _setup_gh_defaults(gh_mock)
+    # Log content that would otherwise classify as UNKNOWN — confirms the
+    # CANCELLED conclusion bypasses ci_triage entirely.
+    gh_mock.get_failed_run_logs.return_value = "##[error] The operation was canceled."
+
+    ci_failures = [
+        {
+            "name": "Node Quality",
+            "conclusion": "CANCELLED",
+            "detailsUrl": "https://github.com/org/repo/actions/runs/42999/job/9001",
+        }
+    ]
+    pr_state = _make_pr_state(number=2799, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    assert result is None
+    gh_mock.rerun_workflow.assert_called_once_with(
+        "test-org/test-repo", 42999, "fake-token", failed_only=True
+    )
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
+    assert len(entries) == 0
+
+
 def test_all_transient_failures_does_not_increment_main_attempts(gh_mock, fake_redis_client):
     """All-transient path does not increment the main per-SHA attempt counter."""
     from orcest.orchestrator.pr_ops import get_attempt_count
