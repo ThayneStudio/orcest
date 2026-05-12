@@ -588,7 +588,7 @@ def test_consume_results_transient_failure_no_needs_human(
 def test_consume_results_transient_failure_clears_attempts(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A transient FAILED result clears per-SHA attempt counter for retry."""
+    """A transient FAILED result clears per-SHA attempts and never bumps total_attempts."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     pr_number = 56
@@ -611,6 +611,8 @@ def test_consume_results_transient_failure_clears_attempts(
 
     # Per-SHA attempts should be cleared
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+    # Transient failures must never bump total_attempts.
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
 
 
 def test_consume_results_transient_failure_clears_issue_attempts(
@@ -652,8 +654,11 @@ def test_consume_results_transient_failure_clears_issue_attempts(
 def test_consume_results_permanent_failure_still_labels(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A non-transient FAILED result still adds needs-human label (regression test)."""
+    """A non-transient FAILED result adds needs-human and bumps total_attempts."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    assert get_total_attempt_count(fake_redis_client, repo, 57) == 0
 
     result = _make_task_result(
         status=ResultStatus.FAILED,
@@ -669,26 +674,52 @@ def test_consume_results_permanent_failure_still_labels(
 
     # Should add needs-human label
     gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
+        repo,
         57,
         labels.needs_human,
         orchestrator_config.github.token,
     )
+    # Terminal failures are the only events that bump the cross-SHA counter.
+    assert get_total_attempt_count(fake_redis_client, repo, 57) == 1
+
+
+def test_consume_results_completed_does_not_bump_total_attempts(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """Healthy fix-cycles must not bump total_attempts.
+
+    Each review-fix cycle that completes successfully (worker pushed a commit,
+    review bot may still ask for changes) must keep the cross-SHA failure
+    counter at zero. Otherwise a PR going through many healthy cycles would
+    trip the 50-attempt circuit breaker even though nothing is wrong.
+    """
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    pr_number = 58
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
+
+    for _ in range(3):
+        result = _make_task_result(status=ResultStatus.COMPLETED, pr_number=pr_number)
+        fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
 
 
 def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config, gh_mock):
-    """USAGE_EXHAUSTED clears per-SHA attempts, undoes total count, and sets cooldown."""
+    """USAGE_EXHAUSTED clears per-SHA attempts and sets cooldown."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     pr_number = 60
     head_sha = "deadbeef"
 
-    # Simulate the pre-publish attempt increments for this task.
+    # Simulate the pre-publish per-SHA increment for this task.
     repo = orchestrator_config.github.repo
     increment_attempts(fake_redis_client, repo, pr_number, head_sha)
-    increment_total_attempts(fake_redis_client, repo, pr_number)
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
-    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 1
 
     result = _make_task_result(
         status=ResultStatus.USAGE_EXHAUSTED,
@@ -712,7 +743,8 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
 
     # Per-SHA attempt counter must be cleared so PR can be re-enqueued after cooldown
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
-    # Rate limits should not consume the cross-SHA retry budget.
+    # Rate limits never bump the cross-SHA failure counter (USAGE_EXHAUSTED
+    # isn't a terminal failure), so it stays at 0.
     assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
 
     assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
@@ -720,34 +752,6 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     # Cooldown marker must be set
     assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
     assert 1700 <= fake_redis_client.ttl(f"pr:{repo}:{pr_number}:usage_cooldown") <= 1800
-
-
-def test_consume_results_duplicate_usage_exhausted_refunds_once(
-    fake_redis_client, orchestrator_config, gh_mock
-):
-    """Duplicate USAGE_EXHAUSTED delivery must not double-refund attempts or metrics."""
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    pr_number = 63
-    repo = orchestrator_config.github.repo
-
-    increment_total_attempts(fake_redis_client, repo, pr_number)
-    increment_total_attempts(fake_redis_client, repo, pr_number)
-    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 2
-
-    result = _make_task_result(
-        status=ResultStatus.USAGE_EXHAUSTED,
-        pr_number=pr_number,
-        task_id="task-pr-usage-duplicate",
-    )
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-
-    logger = logging.getLogger("test")
-    _consume_results(orchestrator_config, fake_redis_client, logger)
-
-    assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 1
-    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
 
 
 def test_consume_results_usage_exhausted_pr_cooldown_ttl_uses_reset_time(
