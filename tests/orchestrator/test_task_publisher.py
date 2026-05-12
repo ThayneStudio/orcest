@@ -11,12 +11,18 @@ import pytest
 
 from orcest.orchestrator.gh import GhCliError
 from orcest.orchestrator.issue_ops import IssueAction, IssueState
-from orcest.orchestrator.pr_ops import PRAction, PRState
+from orcest.orchestrator.pr_ops import (
+    PRAction,
+    PRState,
+    get_attempt_count,
+    get_total_attempt_count,
+)
 from orcest.orchestrator.task_publisher import (
     _render_rebase_prompt,
     publish_fix_task,
     publish_followup_task,
     publish_issue_task,
+    rerun_all_transient_ci,
 )
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
@@ -870,6 +876,9 @@ def test_publish_and_notify_xadd_failure(
     finally:
         fake_redis_client.xadd_capped = original_xadd_capped
 
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 604, "abc123") == 0
+    assert get_total_attempt_count(fake_redis_client, "test-org/test-repo", 604) == 0
+
 
 def test_render_review_threads_missing_body():
     """A review thread comment with body=None should use empty string."""
@@ -1213,6 +1222,58 @@ def test_all_transient_failures_retrigger_ci_not_enqueue(gh_mock, fake_redis_cli
     # Nothing should be in the tasks stream
     entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
     assert len(entries) == 0
+
+
+def test_rerun_all_transient_ci_does_not_publish_or_fetch_diff(
+    gh_mock, fake_redis_client
+):
+    """The pre-token transient path re-triggers CI without creating worker context."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "connection reset by peer"
+
+    ci_failures = _make_transient_ci_failures([42005])
+    pr_state = _make_pr_state(number=908, ci_failures=ci_failures)
+
+    result = rerun_all_transient_ci(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+    )
+
+    assert result is True
+    gh_mock.rerun_workflow.assert_called_once_with(
+        "test-org/test-repo", 42005, "fake-token", failed_only=True
+    )
+    gh_mock.get_pr_diff.assert_not_called()
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
+    assert len(entries) == 0
+
+
+def test_publish_fix_task_skip_transient_rerun_publishes_worker_task(
+    gh_mock, fake_redis_client
+):
+    """Loop preflight can defer all-transient fallback publication until it has a token."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "timeout"
+
+    ci_failures = _make_transient_ci_failures([42006])
+    pr_state = _make_pr_state(number=909, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+        claude_token="claude-token",
+        skip_transient_rerun=True,
+    )
+
+    assert isinstance(result, Task)
+    gh_mock.rerun_workflow.assert_not_called()
+    entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
+    assert len(entries) == 1
 
 
 def test_all_transient_failures_does_not_increment_main_attempts(gh_mock, fake_redis_client):
