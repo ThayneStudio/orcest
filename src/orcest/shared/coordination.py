@@ -4,9 +4,13 @@ Uses Lua scripts for atomic release and refresh to prevent race conditions
 where a lock could be released by a non-owner.
 """
 
+import json
 import logging
 import types
 import uuid
+from dataclasses import dataclass
+
+import redis
 
 from orcest.shared.config import RunnerConfig
 from orcest.shared.redis_client import RedisClient
@@ -153,6 +157,48 @@ def compute_pending_task_ttl(runner_config: RunnerConfig) -> int:
 _PENDING_TASK_TTL = compute_pending_task_ttl(RunnerConfig())
 
 
+@dataclass(frozen=True)
+class PendingTaskMetadata:
+    task_id: str
+    snapshot_head_sha: str = ""
+    decision_reason: str = ""
+    created_at: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "task_id": self.task_id,
+                "snapshot_head_sha": self.snapshot_head_sha,
+                "decision_reason": self.decision_reason,
+                "created_at": self.created_at,
+            },
+            sort_keys=True,
+        )
+
+
+def parse_pending_task_metadata(value: str | None) -> PendingTaskMetadata | None:
+    """Parse a pending-task marker, accepting legacy plain task-id values."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return PendingTaskMetadata(task_id=value)
+    if not isinstance(data, dict):
+        return PendingTaskMetadata(task_id=value)
+    task_id = data.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return PendingTaskMetadata(task_id=value)
+    return PendingTaskMetadata(
+        task_id=task_id,
+        snapshot_head_sha=str(data.get("snapshot_head_sha", "")),
+        decision_reason=str(data.get("decision_reason", "")),
+        created_at=str(data.get("created_at", "")),
+    )
+
+
 def set_pending_task(
     redis_client: RedisClient,
     repo: str,
@@ -160,13 +206,22 @@ def set_pending_task(
     resource_id: int,
     task_id: str,
     ttl: int = _PENDING_TASK_TTL,
+    snapshot_head_sha: str = "",
+    decision_reason: str = "",
+    created_at: str = "",
 ) -> bool:
     """Mark a task as pending for a resource. Returns True if set (no existing pending task).
 
     Uses SET NX EX for atomic check-and-set with a TTL safety net.
     """
     key = make_pending_task_key(repo, resource_type, resource_id)
-    return redis_client.set_nx_ex(key, task_id, ttl)
+    value = PendingTaskMetadata(
+        task_id=task_id,
+        snapshot_head_sha=snapshot_head_sha,
+        decision_reason=decision_reason,
+        created_at=created_at,
+    ).to_json()
+    return redis_client.set_nx_ex(key, value, ttl)
 
 
 def get_pending_task(
@@ -176,8 +231,19 @@ def get_pending_task(
     resource_id: int,
 ) -> str | None:
     """Return the active pending task ID for a resource, or None if absent."""
+    metadata = get_pending_task_metadata(redis_client, repo, resource_type, resource_id)
+    return metadata.task_id if metadata is not None else None
+
+
+def get_pending_task_metadata(
+    redis_client: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+) -> PendingTaskMetadata | None:
+    """Return parsed pending task metadata for a resource, if present."""
     key = make_pending_task_key(repo, resource_type, resource_id)
-    return redis_client.get(key)
+    return parse_pending_task_metadata(redis_client.get(key))
 
 
 def clear_pending_task(
@@ -189,6 +255,36 @@ def clear_pending_task(
     """Clear the pending task marker for a resource."""
     key = make_pending_task_key(repo, resource_type, resource_id)
     redis_client.delete(key)
+
+
+def clear_pending_task_if_matches(
+    redis_client: RedisClient,
+    repo: str,
+    resource_type: str,
+    resource_id: int,
+    task_id: str,
+) -> bool:
+    """Clear pending marker only when it still points at ``task_id``."""
+    key = make_pending_task_key(repo, resource_type, resource_id)
+    fq_key = redis_client._prefixed(key)
+    while True:
+        pipe = redis_client.client.pipeline()
+        try:
+            pipe.watch(fq_key)
+            raw = pipe.get(fq_key)
+            raw_str = str(raw) if raw is not None else None
+            metadata = parse_pending_task_metadata(raw_str)
+            if metadata is None or metadata.task_id != task_id:
+                pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.delete(fq_key)
+            pipe.execute()
+            return True
+        except redis.WatchError:
+            continue
+        finally:
+            pipe.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +302,22 @@ def get_backoff_cooldown_seconds(step: int) -> int:
     return _BACKOFF_COOLDOWNS_SECONDS[clamped]
 
 
-def set_backoff_cooldown(redis_client: RedisClient, repo: str, number: int, step: int) -> None:
+def _make_backoff_key(repo: str, number: int) -> str:
+    return f"backoff:pr:{repo}:{number}"
+
+
+def _make_backoff_head_sha_key(repo: str, number: int) -> str:
+    return f"{_make_backoff_key(repo, number)}:head_sha"
+
+
+def set_backoff_cooldown(
+    redis_client: RedisClient, repo: str, number: int, step: int, head_sha: str = ""
+) -> None:
     """Set a backoff cooldown for a PR. The key expires after the cooldown duration."""
     cooldown = get_backoff_cooldown_seconds(step)
-    key = f"backoff:pr:{repo}:{number}"
-    redis_client.set_ex(key, str(step), ttl=cooldown)
+    redis_client.set_ex(_make_backoff_key(repo, number), str(step), ttl=cooldown)
+    if head_sha:
+        redis_client.set_ex(_make_backoff_head_sha_key(repo, number), head_sha, ttl=cooldown)
 
 
 def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int | None:
@@ -218,7 +325,7 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
 
     Returns None if not in backoff (cooldown expired or never set).
     """
-    key = f"backoff:pr:{repo}:{number}"
+    key = _make_backoff_key(repo, number)
     val = redis_client.get(key)
     if val is None:
         return None
@@ -240,8 +347,13 @@ def get_backoff_step(redis_client: RedisClient, repo: str, number: int) -> int |
 
 def clear_backoff(redis_client: RedisClient, repo: str, number: int) -> None:
     """Clear backoff state (e.g. when a new commit is pushed)."""
-    key = f"backoff:pr:{repo}:{number}"
-    redis_client.delete(key)
+    redis_client.delete(_make_backoff_key(repo, number))
+    redis_client.delete(_make_backoff_head_sha_key(repo, number))
+
+
+def get_backoff_head_sha(redis_client: RedisClient, repo: str, number: int) -> str | None:
+    """Return the PR head SHA that created the current backoff, if recorded."""
+    return redis_client.get(_make_backoff_head_sha_key(repo, number))
 
 
 _TRANSIENT_FAILURE_COUNT_TTL_SECONDS = 7 * 24 * 3600
@@ -257,6 +369,17 @@ def increment_transient_failure_count(
     pipe.expire(key, _TRANSIENT_FAILURE_COUNT_TTL_SECONDS)
     results = pipe.execute()
     return int(results[0])
+
+
+def get_transient_failure_count(redis_client: RedisClient, repo: str, number: int) -> int:
+    """Get the transient failure streak for a PR."""
+    val = redis_client.get(f"transient_failures:pr:{repo}:{number}")
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
 
 
 def clear_transient_failure_count(

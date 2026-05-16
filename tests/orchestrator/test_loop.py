@@ -4,6 +4,7 @@ Uses mocker (pytest-mock) to patch high-level functions called by the loop,
 and fake_redis_client for result stream operations.
 """
 
+import json
 import logging
 import time
 
@@ -41,8 +42,12 @@ from orcest.orchestrator.pr_ops import (
 )
 from orcest.shared.config import OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
+    clear_backoff,
+    get_backoff_head_sha,
     get_backoff_step,
     get_pending_task,
+    get_transient_failure_count,
+    increment_transient_failure_count,
     set_pending_task,
 )
 from orcest.shared.models import ResultStatus, TaskResult
@@ -51,7 +56,13 @@ from orcest.shared.models import ResultStatus, TaskResult
 def _consume_results(config: OrchestratorConfig, redis, logger):
     """Compat wrapper: calls _consume_results_for_project with the first project."""
     project = config.projects[0]
-    _consume_results_for_project(project, redis, config.labels, logger)
+    _consume_results_for_project(
+        project,
+        redis,
+        config.labels,
+        logger,
+        max_transient_failures=config.max_transient_failures,
+    )
 
 
 def _make_pr_state(
@@ -85,6 +96,7 @@ def _make_task_result(
     resource_type: str = "pr",
     resource_id: int | None = None,
     rate_limit_resets_at: int = 0,
+    snapshot_head_sha: str | None = None,
 ) -> TaskResult:
     """Build a TaskResult for result-handling tests.
 
@@ -106,6 +118,11 @@ def _make_task_result(
         resource_type=resource_type,
         resource_id=resource_id if resource_id is not None else pr_number,
         rate_limit_resets_at=rate_limit_resets_at,
+        snapshot_head_sha=(
+            snapshot_head_sha
+            if snapshot_head_sha is not None
+            else ("abc123" if resource_type == "pr" else "")
+        ),
     )
 
 
@@ -840,10 +857,10 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 # ---------------------------------------------------------------------------
 
 
-def test_consume_results_completed_pr_preserves_same_sha_attempt_guard(
+def test_consume_results_completed_pr_attempt_guard_is_retry_budget_not_active_work(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A COMPLETED PR result stays guarded until a new commit changes the SHA."""
+    """A COMPLETED PR result leaves attempt budget but does not imply active work."""
     from orcest.orchestrator import pr_ops
 
     # Set up consumer group and add a result to the stream
@@ -896,8 +913,7 @@ def test_consume_results_completed_pr_preserves_same_sha_attempt_guard(
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_ACTIVE
-    gh_mock.get_ci_status.assert_not_called()
+    assert results[0].action == PRAction.ENQUEUE_FIX
 
 
 def test_consume_results_completed_issue_clears_attempts(
@@ -1034,6 +1050,76 @@ def test_consume_results_transient_failure_clears_attempts(
     # Transient infrastructure/provider failures must never bump total_attempts.
     assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
     assert get_backoff_step(fake_redis_client, repo, pr_number) == 0
+
+
+def test_consume_results_transient_failure_at_budget_still_retries(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """The configured transient budget is inclusive: count 5 still retries silently."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    orchestrator_config.max_transient_failures = 5
+
+    pr_number = 58
+    head_sha = "abc123"
+    repo = orchestrator_config.github.repo
+    for _ in range(4):
+        increment_transient_failure_count(fake_redis_client, repo, pr_number)
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=pr_number,
+        summary="[transient] Timed out after 1800s",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 5
+    assert get_backoff_step(fake_redis_client, repo, pr_number) == 4
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_consume_results_transient_failure_over_budget_escalates(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """The sixth transient PR failure labels needs-human instead of silent retry."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    orchestrator_config.max_transient_failures = 5
+
+    pr_number = 59
+    head_sha = "abc123"
+    repo = orchestrator_config.github.repo
+
+    for _ in range(5):
+        increment_transient_failure_count(fake_redis_client, repo, pr_number)
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    clear_backoff(fake_redis_client, repo, pr_number)
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=pr_number,
+        summary="[transient] Timed out after 1800s",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 6
+    assert get_backoff_step(fake_redis_client, repo, pr_number) is None
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
+    gh_mock.add_label.assert_called_once_with(
+        repo,
+        pr_number,
+        orchestrator_config.labels.needs_human,
+        orchestrator_config.github.token,
+    )
+    gh_mock.post_comment.assert_called_once()
+    assert "transient" in gh_mock.post_comment.call_args[0][2].lower()
 
 
 def test_consume_results_transient_failure_clears_issue_attempts(
@@ -2093,10 +2179,11 @@ def test_handle_result_none_pending_applies_side_effects(
         status=ResultStatus.FAILED,
         branch="fix/none-window",
         summary="Something went wrong",
-        duration_seconds=15,
-        resource_type="pr",
-        resource_id=pr_number,
-    )
+            duration_seconds=15,
+            resource_type="pr",
+            resource_id=pr_number,
+            snapshot_head_sha="abc123",
+        )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     logger = logging.getLogger("test")
@@ -2105,6 +2192,379 @@ def test_handle_result_none_pending_applies_side_effects(
     # Side-effects must apply: needs-human label and a comment should be posted
     gh_mock.add_label.assert_called_once()
     gh_mock.post_comment.assert_called_once()
+
+
+def test_handle_result_stale_pr_snapshot_skips_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 202
+    result = TaskResult(
+        task_id="task-old-sha",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/stale-sha",
+        summary="Something went wrong",
+        duration_seconds=15,
+        resource_type="pr",
+        resource_id=pr_number,
+        snapshot_head_sha="sha-old",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    gh_mock.get_pr.return_value = {
+        "headRefOid": "sha-new",
+        "statusCheckRollup": [{"name": "tests", "conclusion": "FAILURE"}],
+    }
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_stale_pr_snapshot_clears_attempt_reservation(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    pr_number = 203
+    increment_attempts(fake_redis_client, repo, pr_number, "sha-old")
+    result = TaskResult(
+        task_id="task-stale-attempt",
+        worker_id="worker-1",
+        status=ResultStatus.STALE,
+        branch="fix/stale",
+        summary="stale",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=pr_number,
+        snapshot_head_sha="sha-old",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_attempt_count(fake_redis_client, repo, pr_number, "sha-old") == 0
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_stale_pr_snapshot_does_not_clear_new_sha_attempts(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    pr_number = 204
+    increment_attempts(fake_redis_client, repo, pr_number, "sha-new")
+    result = TaskResult(
+        task_id="task-stale-old-attempt",
+        worker_id="worker-1",
+        status=ResultStatus.STALE,
+        branch="fix/stale",
+        summary="stale",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=pr_number,
+        snapshot_head_sha="sha-old",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_attempt_count(fake_redis_client, repo, pr_number, "sha-new") == 1
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_uses_ci_status_fallback_for_snapshot_validation(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 205
+    result = TaskResult(
+        task_id="task-current",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/current",
+        summary="failed",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=pr_number,
+        snapshot_head_sha="sha-current",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    gh_mock.get_pr.return_value = {"headRefOid": "sha-current"}
+    gh_mock.get_ci_status.return_value = [{"name": "tests", "conclusion": "failure"}]
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_called_once()
+    gh_mock.post_comment.assert_called_once()
+
+
+def test_handle_result_validation_failure_drops_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    result = TaskResult(
+        task_id="task-unvalidated",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/unvalidated",
+        summary="failed",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=206,
+        snapshot_head_sha="sha-current",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    gh_mock.get_pr.side_effect = RuntimeError("github unavailable")
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_snapshotless_pr_result_drops_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    result = TaskResult(
+        task_id="legacy-task",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/legacy",
+        summary="failed",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=207,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_review_thread_body_change_drops_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    old_fingerprint = (
+        '{"comments":[{"author":"alice","body":"old feedback","created_at":"","id":"","updated_at":""}],'
+        '"id":"thread-1","line":"10","path":"app.py"}'
+    )
+    result = TaskResult(
+        task_id="task-review-stale",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/review",
+        summary="failed",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=208,
+        snapshot_head_sha="sha-current",
+        decision_reason="changes_requested",
+        snapshot_review_thread_ids=["thread-1"],
+        snapshot_review_thread_fingerprints=[old_fingerprint],
+    )
+    gh_mock.get_pr.return_value = {"headRefOid": "sha-current"}
+    gh_mock.get_unresolved_review_threads.return_value = [
+        {
+            "id": "thread-1",
+            "path": "app.py",
+            "line": 10,
+            "comments": [{"author": "alice", "body": "new feedback"}],
+        }
+    ]
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_handle_result_rebase_conflict_resolved_drops_side_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    result = TaskResult(
+        task_id="task-rebase-stale",
+        worker_id="worker-1",
+        status=ResultStatus.FAILED,
+        branch="fix/rebase",
+        summary="failed",
+        duration_seconds=1,
+        resource_type="pr",
+        resource_id=209,
+        snapshot_head_sha="sha-current",
+        decision_reason="merge_conflict_rebase",
+    )
+    gh_mock.get_pr.return_value = {
+        "headRefOid": "sha-current",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+    }
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_transient_result_backoff_records_result_snapshot_sha_without_attempt_hash(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    pr_number = 210
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=pr_number,
+        summary="[transient] worker restarted",
+        snapshot_head_sha="sha-current",
+    )
+    gh_mock.get_pr.return_value = {"headRefOid": "sha-current"}
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_backoff_step(fake_redis_client, repo, pr_number) == 0
+    assert get_backoff_head_sha(fake_redis_client, repo, pr_number) == "sha-current"
+
+
+def test_stale_pending_usage_exhausted_marks_token_before_return(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+    mocker,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    project = orchestrator_config.projects[0]
+    pr_number = 211
+    set_pending_task(
+        fake_redis_client,
+        project.repo,
+        "pr",
+        pr_number,
+        "new-task",
+        snapshot_head_sha="sha-current",
+        decision_reason="ci_failure",
+    )
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=pr_number,
+        task_id="old-task",
+        snapshot_head_sha="sha-current",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    token_pool = mocker.MagicMock()
+    token_pool.get_task_token.return_value = "exhausted-token"
+
+    _consume_results_for_project(
+        project,
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        token_pool=token_pool,
+    )
+
+    token_pool.mark_exhausted.assert_called_once()
+    token_pool.task_completed.assert_called_once_with("old-task")
+    gh_mock.post_comment.assert_not_called()
+
+
+def test_structured_ci_result_stales_when_target_url_changes(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    snapshot = json.dumps(
+        {
+            "context": "build",
+            "details_url": "",
+            "name": "",
+            "target_url": "https://ci.example/build/old",
+            "workflow_name": "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=212,
+        snapshot_head_sha="sha-current",
+    )
+    result.decision_reason = "ci_failure"
+    result.snapshot_failed_checks = [snapshot]
+    gh_mock.get_pr.return_value = {
+        "headRefOid": "sha-current",
+        "statusCheckRollup": [
+            {
+                "context": "build",
+                "state": "FAILURE",
+                "targetUrl": "https://ci.example/build/new",
+            }
+        ],
+    }
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

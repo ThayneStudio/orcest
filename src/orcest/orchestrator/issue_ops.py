@@ -173,8 +173,21 @@ def discover_actionable_issues(
             )
             continue
 
-        # Skip if task already in flight or max attempts reached
+        # Attempts are retry budget, not proof of active work. If Redis has
+        # attempts but no pending marker, clear the orphaned budget before
+        # enforcing max attempts so GitHub-source-of-truth work cannot get stuck.
         attempt_count = get_attempt_count(redis, repo, number)
+        if attempt_count > 0 and not redis.exists(pending_key):
+            logger.info(
+                "Issue #%d has %d attempt(s) but no pending task marker; "
+                "clearing orphaned attempts",
+                number,
+                attempt_count,
+            )
+            clear_attempts(redis, repo, number)
+            attempt_count = 0
+
+        # Skip if task already in flight or max attempts reached
         if attempt_count >= max_attempts:
             logger.warning(
                 "Issue #%d has reached %d attempts (max %d), skipping",
@@ -192,26 +205,17 @@ def discover_actionable_issues(
                 )
             )
             continue
-        if attempt_count > 0:
-            if redis.exists(pending_key):
-                results.append(
-                    IssueState(
-                        number=number,
-                        title=title,
-                        body=body,
-                        action=IssueAction.SKIP_ACTIVE,
-                        labels=issue_labels,
-                    )
+        if attempt_count > 0 and redis.exists(pending_key):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_ACTIVE,
+                    labels=issue_labels,
                 )
-                continue
-
-            logger.info(
-                "Issue #%d has %d attempt(s) but no pending task marker; "
-                "clearing orphaned attempts",
-                number,
-                attempt_count,
             )
-            clear_attempts(redis, repo, number)
+            continue
 
         # Skip if a task for this issue is already pending in the queue
         if redis.exists(pending_key):

@@ -24,6 +24,7 @@ _ENV_VARS_TO_CLEAR = [
     "GITHUB_TOKEN",
     "ORCEST_REPO",
     "ORCEST_DEFAULT_RUNNER",
+    "ORCEST_MAX_TRANSIENT_FAILURES",
     "ORCEST_WORKER_ID",
     "ORCEST_WORKSPACE_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -69,6 +70,7 @@ def test_load_orchestrator_config_from_yaml(tmp_path: Path):
     assert config.labels.blocked == "custom:blocked"
     # Non-overridden label keeps its default
     assert config.labels.needs_human == "orcest:needs-human"
+    assert config.max_transient_failures == 5
 
 
 def test_load_orchestrator_config_env_overrides(
@@ -89,6 +91,38 @@ def test_load_orchestrator_config_env_overrides(
     assert config.redis.host == "env-host"
     assert config.github.repo == "env/repo"
     assert config.github.token == "ghp_env_token"
+
+
+def test_load_orchestrator_config_max_transient_failures_from_yaml(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nmax_transient_failures: 7\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.max_transient_failures == 7
+
+
+def test_load_orchestrator_config_max_transient_failures_env_override(
+    tmp_path: Path, monkeypatch
+):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nmax_transient_failures: 7\n")
+    monkeypatch.setenv("ORCEST_MAX_TRANSIENT_FAILURES", "3")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.max_transient_failures == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-int"])
+def test_load_orchestrator_config_invalid_max_transient_failures(
+    tmp_path: Path, value: str
+):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(f"github:\n  repo: acme/widgets\nmax_transient_failures: {value}\n")
+
+    with pytest.raises(ValueError, match="max_transient_failures"):
+        load_orchestrator_config(cfg_file)
 
 
 def test_load_worker_config_from_yaml(tmp_path: Path):

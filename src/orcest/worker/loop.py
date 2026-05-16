@@ -6,6 +6,7 @@ per resource, runs Claude, and publishes results back to a results stream
 for the orchestrator.
 """
 
+import json
 import logging
 import os
 import signal
@@ -14,14 +15,17 @@ import threading
 import time
 from pathlib import Path
 
+import redis as redis_py
 import yaml
 
+from orcest.orchestrator import gh
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
-    clear_pending_task,
+    clear_pending_task_if_matches,
     make_issue_lock_key,
     make_pr_lock_key,
+    parse_pending_task_metadata,
 )
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
@@ -59,6 +63,12 @@ if len(_STARTUP_PING_BACKOFF) != _STARTUP_PING_RETRIES - 1:
     raise ValueError(
         "_STARTUP_PING_BACKOFF must have exactly _STARTUP_PING_RETRIES - 1 entries"
     )
+
+_FAILURE_CONCLUSIONS = frozenset(
+    {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
+)
+_CI_DECISIONS = frozenset({"ci_failure"})
+_REVIEW_DECISIONS = frozenset({"changes_requested", "followup_threads"})
 
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
@@ -182,9 +192,45 @@ def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
     if task.key_prefix:
         # Build the fully-qualified pending key directly
         fq_key = f"{task.key_prefix}:pending:{task.resource_type}:{task.repo}:{task.resource_id}"
-        redis.delete_raw(fq_key)
+        _clear_raw_pending_task_if_matches(redis, fq_key, task.id)
     else:
-        clear_pending_task(redis, task.repo, task.resource_type, task.resource_id)
+        clear_pending_task_if_matches(
+            redis, task.repo, task.resource_type, task.resource_id, task.id
+        )
+
+
+def _clear_raw_pending_task_if_matches(redis: RedisClient, fq_key: str, task_id: str) -> bool:
+    while True:
+        pipe = redis.client.pipeline()
+        try:
+            pipe.watch(fq_key)
+            raw = pipe.get(fq_key)
+            raw_str = str(raw) if raw is not None else None
+            metadata = parse_pending_task_metadata(raw_str)
+            if metadata is None or metadata.task_id != task_id:
+                pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.delete(fq_key)
+            pipe.execute()
+            return True
+        except redis_py.WatchError:
+            continue
+        finally:
+            pipe.reset()
+
+
+def _clear_task_attempt_reservation(redis: RedisClient, task: Task) -> None:
+    """Clear the attempt reservation when no result can reach the orchestrator."""
+    if task.resource_type == "issue":
+        key = f"issue:{task.repo}:{task.resource_id}:attempts"
+    else:
+        key = f"pr:{task.repo}:{task.resource_id}:attempts"
+
+    if task.key_prefix:
+        redis.delete_raw(f"{task.key_prefix}:{key}")
+    else:
+        redis.delete(key)
 
 
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
@@ -205,8 +251,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     pr_stream = f"tasks:{config.backend}"
     issue_stream = f"tasks:issue:{config.backend}"
     # Fully-qualified names for raw Redis operations
-    pr_fq = f"{config.redis.key_prefix}:{pr_stream}"
-    issue_fq = f"{config.redis.key_prefix}:{issue_stream}"
+    if config.redis.key_prefix:
+        pr_fq = f"{config.redis.key_prefix}:{pr_stream}"
+        issue_fq = f"{config.redis.key_prefix}:{issue_stream}"
+    else:
+        pr_fq = pr_stream
+        issue_fq = issue_stream
 
     # Verify Redis connection with retry budget so a brief Redis restart
     # (e.g. during ``orcest fleet update``) doesn't kill the worker.
@@ -346,8 +396,18 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         if not lock.acquire():
             logger.warning(f"Lock {lock.key} already held, skipping task {task.id}")
-            # ACK the message so it's not redelivered to us
-            # (another worker has the lock and presumably the same task)
+            # The stream entry is being discarded, so clear only this task's
+            # coordination markers. Otherwise a matching pending marker can
+            # strand the PR/issue until TTL even though the task was ACKed.
+            try:
+                _clear_pending_task_for_task(redis, task)
+                _clear_task_attempt_reservation(redis, task)
+            except Exception:
+                logger.warning(
+                    "Failed to clear skipped task coordination state for "
+                    f"{task.resource_type} #{task.resource_id}",
+                    exc_info=True,
+                )
             try:
                 redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
             except Exception:
@@ -419,6 +479,15 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             lock.release()
             if lock_lost.is_set():
                 logger.warning(f"Lock {lock.key} was lost during task execution; task aborted")
+                result = _task_result(
+                    task,
+                    config,
+                    ResultStatus.STALE,
+                    task.branch,
+                    "Worker lost the Redis lock before publishing; dropping task result.",
+                    result.duration_seconds,
+                    rate_limit_resets_at=result.rate_limit_resets_at,
+                )
             else:
                 logger.info(f"Released lock {lock.key}")
         finally:
@@ -435,7 +504,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             logger,
             current_stream,
             entry_id,
-            abort_event=abort_event,
+            abort_event=shutdown_event,
         )
 
         if published:
@@ -446,18 +515,6 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             except Exception:
                 logger.error(
                     f"Failed to ACK task {task.id} (will be redelivered)",
-                    exc_info=True,
-                )
-
-            # Clear pending-task marker promptly so the orchestrator can
-            # re-enqueue if needed (belt-and-suspenders with the orchestrator's
-            # clear in _handle_result).
-            try:
-                _clear_pending_task_for_task(redis, task)
-            except Exception:
-                logger.warning(
-                    "Failed to clear pending task marker for "
-                    f"{task.resource_type} #{task.resource_id}",
                     exc_info=True,
                 )
 
@@ -482,6 +539,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 # (~95 min) since the VM is about to be destroyed.
                 try:
                     _clear_pending_task_for_task(redis, task)
+                    _clear_task_attempt_reservation(redis, task)
                 except Exception:
                     logger.warning(
                         "Failed to clear pending task marker for "
@@ -498,6 +556,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         elif not published:
             try:
                 _clear_pending_task_for_task(redis, task)
+                _clear_task_attempt_reservation(redis, task)
             except Exception:
                 logger.warning(
                     "Failed to clear pending task marker for "
@@ -534,6 +593,7 @@ def _drain_pending_tasks_raw(
         for stream_name, entry_id, fields in result:
             drained += 1
             task: Task | None = None
+            recovery_result_published = False
             try:
                 task = Task.from_dict(fields)
                 logger.warning(
@@ -541,18 +601,16 @@ def _drain_pending_tasks_raw(
                     f"for {task.resource_type} #{task.resource_id}) — "
                     f"publishing FAILED result"
                 )
-                task_result = TaskResult(
-                    task_id=task.id,
-                    worker_id=config.worker_id,
-                    status=ResultStatus.FAILED,
-                    resource_type=task.resource_type,
-                    resource_id=task.resource_id,
-                    branch=task.branch,
-                    summary=(
+                task_result = _task_result(
+                    task,
+                    config,
+                    ResultStatus.FAILED,
+                    task.branch,
+                    (
                         f"{TRANSIENT_SUMMARY_PREFIX}"
                         "Worker restarted mid-execution; task was not completed."
                     ),
-                    duration_seconds=0,
+                    0,
                 )
                 try:
                     # Publish result to the correct project's results stream
@@ -565,6 +623,7 @@ def _drain_pending_tasks_raw(
                         redis.xadd_capped(
                             RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
                         )
+                    recovery_result_published = True
                 except Exception:
                     logger.error(
                         f"Failed to publish recovery result for task {task.id}",
@@ -585,6 +644,8 @@ def _drain_pending_tasks_raw(
             if task is not None:
                 try:
                     _clear_pending_task_for_task(redis, task)
+                    if not recovery_result_published:
+                        _clear_task_attempt_reservation(redis, task)
                 except Exception:
                     logger.warning(
                         "Failed to clear pending task marker for "
@@ -653,6 +714,7 @@ def _dead_letter_task(
     # this the marker lingers until TTL expiry (~95 min with defaults).
     try:
         _clear_pending_task_for_task(redis, task)
+        _clear_task_attempt_reservation(redis, task)
     except Exception:
         logger.warning(
             "Failed to clear pending task marker for "
@@ -735,6 +797,170 @@ def _publish_result_with_retry(
     return False
 
 
+def _task_result(
+    task: Task,
+    config: WorkerConfig,
+    status: ResultStatus,
+    branch: str | None,
+    summary: str,
+    duration_seconds: int,
+    rate_limit_resets_at: int = 0,
+) -> TaskResult:
+    return TaskResult(
+        task_id=task.id,
+        worker_id=config.worker_id,
+        status=status,
+        resource_type=task.resource_type,
+        resource_id=task.resource_id,
+        branch=branch,
+        summary=summary,
+        duration_seconds=duration_seconds,
+        rate_limit_resets_at=rate_limit_resets_at,
+        snapshot_head_sha=task.snapshot_head_sha,
+        decision_reason=task.decision_reason,
+        snapshot_failed_checks=task.snapshot_failed_checks,
+        snapshot_review_thread_ids=task.snapshot_review_thread_ids,
+        snapshot_review_thread_fingerprints=task.snapshot_review_thread_fingerprints,
+    )
+
+
+def _failed_check_names(checks: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or "").upper()
+        failed = conclusion in _FAILURE_CONCLUSIONS or (
+            not conclusion and state in ("FAILURE", "ERROR")
+        )
+        if failed:
+            name = (
+                check.get("detailsUrl")
+                or check.get("details_url")
+                or check.get("name")
+                or check.get("context")
+                or check.get("workflowName")
+            )
+            if name:
+                names.add(str(name))
+    return names
+
+
+def _failed_check_fingerprints(checks: list[dict]) -> set[str]:
+    fingerprints: set[str] = set()
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or "").upper()
+        failed = conclusion in _FAILURE_CONCLUSIONS or (
+            not conclusion and state in ("FAILURE", "ERROR")
+        )
+        if not failed:
+            continue
+        payload = {
+            "name": str(check.get("name") or ""),
+            "context": str(check.get("context") or ""),
+            "workflow_name": str(check.get("workflowName") or ""),
+            "details_url": str(check.get("detailsUrl") or check.get("details_url") or ""),
+            "target_url": str(check.get("targetUrl") or check.get("target_url") or ""),
+        }
+        if any(payload.values()):
+            fingerprints.add(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return fingerprints
+
+
+def _snapshot_failed_checks_still_failing(checks: list[dict], snapshot: list[str]) -> bool:
+    snapshot_set = set(snapshot)
+    if not snapshot_set:
+        return True
+    current_fingerprints = _failed_check_fingerprints(checks)
+    if current_fingerprints & snapshot_set:
+        return True
+    return bool(_failed_check_names(checks) & snapshot_set)
+
+
+def _review_thread_ids(threads: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for thread in threads:
+        thread_id = thread.get("id") or thread.get("node_id")
+        if thread_id:
+            ids.add(str(thread_id))
+    return ids
+
+
+def _review_thread_fingerprints(threads: list[dict]) -> set[str]:
+    fingerprints: set[str] = set()
+    for thread in threads:
+        comments = []
+        for comment in thread.get("comments") or []:
+            comments.append(
+                {
+                    "id": str(comment.get("id") or comment.get("node_id") or ""),
+                    "author": str(comment.get("author") or ""),
+                    "body": str(comment.get("body") or ""),
+                    "created_at": str(comment.get("createdAt") or comment.get("created_at") or ""),
+                    "updated_at": str(comment.get("updatedAt") or comment.get("updated_at") or ""),
+                }
+            )
+        payload = {
+            "id": str(thread.get("id") or thread.get("node_id") or ""),
+            "path": str(thread.get("path") or ""),
+            "line": str(thread.get("line") or ""),
+            "comments": comments,
+        }
+        fingerprints.add(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return fingerprints
+
+
+def _validate_pr_task_snapshot(task: Task, logger: logging.Logger) -> tuple[bool, str]:
+    """Return (is_stale, reason) for cheap PR snapshot checks."""
+    if task.resource_type != "pr":
+        return False, ""
+    if not task.snapshot_head_sha:
+        return True, "PR task has no snapshot head SHA; dropping stale legacy task."
+
+    pr_data = gh.get_pr(task.repo, task.resource_id, task.token)
+    current_sha = str(pr_data.get("headRefOid") or "")
+    if not current_sha:
+        return True, "GitHub PR response did not include headRefOid; dropping stale task."
+    if current_sha and current_sha != task.snapshot_head_sha:
+        return True, (
+            f"PR head changed from {task.snapshot_head_sha} to {current_sha}; "
+            "dropping stale task."
+        )
+
+    if task.decision_reason in _CI_DECISIONS and task.snapshot_failed_checks:
+        checks = pr_data.get("statusCheckRollup") or gh.get_ci_status(
+            task.repo, task.resource_id, task.token
+        )
+        if not _snapshot_failed_checks_still_failing(checks, task.snapshot_failed_checks):
+            return True, "Captured CI failures are no longer failing; dropping stale task."
+
+    if task.decision_reason in _REVIEW_DECISIONS and task.snapshot_review_thread_ids:
+        threads = gh.get_unresolved_review_threads(task.repo, task.resource_id, task.token)
+        if task.snapshot_review_thread_fingerprints:
+            if not set(task.snapshot_review_thread_fingerprints).issubset(
+                _review_thread_fingerprints(threads)
+            ):
+                return True, "Captured review thread content changed; dropping stale task."
+        elif not set(task.snapshot_review_thread_ids).issubset(_review_thread_ids(threads)):
+            return True, "Captured review threads are no longer unresolved; dropping stale task."
+
+    if task.decision_reason == "merge_conflict_rebase":
+        mergeable = str(pr_data.get("mergeable") or "").upper()
+        merge_state = str(pr_data.get("mergeStateStatus") or "").upper()
+        if mergeable == "UNKNOWN" and merge_state == "UNKNOWN":
+            raise RuntimeError("GitHub mergeability is UNKNOWN; retry snapshot validation later.")
+        if mergeable != "CONFLICTING" and merge_state != "DIRTY":
+            return True, "PR no longer has merge conflicts; dropping stale rebase task."
+
+    if task.decision_reason == "proactive_rebase":
+        mergeable = str(pr_data.get("mergeable") or "").upper()
+        if mergeable == "CONFLICTING":
+            return True, "PR became conflicting; dropping stale proactive rebase task."
+
+    logger.debug("PR snapshot validation passed for task %s", task.id)
+    return False, ""
+
+
 def _execute_task(
     task: Task,
     config: WorkerConfig,
@@ -747,6 +973,20 @@ def _execute_task(
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
     output_stream = f"output:{config.worker_id}"
+
+    def publish_task_end(status: ResultStatus) -> None:
+        try:
+            redis.xadd_capped(
+                output_stream,
+                {
+                    "type": "task_end",
+                    "task_id": task.id,
+                    "status": status.value,
+                },
+                maxlen=_STREAM_MAXLEN,
+            )
+        except Exception:
+            logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 
     try:
         # Publish task start marker (non-critical; don't fail the task)
@@ -763,8 +1003,49 @@ def _execute_task(
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
+        try:
+            is_stale, stale_reason = _validate_pr_task_snapshot(task, logger)
+        except Exception as exc:
+            duration = int(time.monotonic() - start)
+            publish_task_end(ResultStatus.FAILED)
+            return _task_result(
+                task,
+                config,
+                ResultStatus.FAILED,
+                task.branch,
+                f"{TRANSIENT_SUMMARY_PREFIX}GitHub snapshot validation failed: {exc}",
+                duration,
+            )
+        if is_stale:
+            duration = int(time.monotonic() - start)
+            publish_task_end(ResultStatus.STALE)
+            return _task_result(
+                task,
+                config,
+                ResultStatus.STALE,
+                task.branch,
+                stale_reason,
+                duration,
+            )
+
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
         work_dir = workspace.setup(task.repo, task.branch, task.token)
+        if task.resource_type == "pr" and task.snapshot_head_sha:
+            workspace_head_sha = workspace.current_head_sha()
+            if workspace_head_sha != task.snapshot_head_sha:
+                duration = int(time.monotonic() - start)
+                publish_task_end(ResultStatus.STALE)
+                return _task_result(
+                    task,
+                    config,
+                    ResultStatus.STALE,
+                    task.branch,
+                    (
+                        f"Workspace HEAD {workspace_head_sha} did not match task snapshot "
+                        f"{task.snapshot_head_sha}; dropping stale task."
+                    ),
+                    duration,
+                )
 
         output_errors = 0
 
@@ -833,28 +1114,15 @@ def _execute_task(
         ):
             summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
 
-        try:
-            redis.xadd_capped(
-                output_stream,
-                {
-                    "type": "task_end",
-                    "task_id": task.id,
-                    "status": status.value,
-                },
-                maxlen=_STREAM_MAXLEN,
-            )
-        except Exception:
-            logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
+        publish_task_end(status)
 
-        return TaskResult(
-            task_id=task.id,
-            worker_id=config.worker_id,
-            status=status,
-            resource_type=task.resource_type,
-            resource_id=task.resource_id,
-            branch=task.branch,
-            summary=summary,
-            duration_seconds=duration,
+        return _task_result(
+            task,
+            config,
+            status,
+            task.branch,
+            summary,
+            duration,
             rate_limit_resets_at=runner_result.rate_limit_resets_at,
         )
 
@@ -862,33 +1130,20 @@ def _execute_task(
         duration = int(time.monotonic() - start)
         logger.error(f"Task execution failed: {e}", exc_info=True)
 
-        try:
-            redis.xadd_capped(
-                output_stream,
-                {
-                    "type": "task_end",
-                    "task_id": task.id,
-                    "status": ResultStatus.FAILED.value,
-                },
-                maxlen=_STREAM_MAXLEN,
-            )
-        except Exception:
-            logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
+        publish_task_end(ResultStatus.FAILED)
 
         # Infrastructure failures (clone timeout, network) are transient —
         # the orchestrator will retry without burning an attempt slot.
         is_transient = isinstance(e, WorkspaceError) and e.transient
         prefix = TRANSIENT_SUMMARY_PREFIX if is_transient else ""
 
-        return TaskResult(
-            task_id=task.id,
-            worker_id=config.worker_id,
-            status=ResultStatus.FAILED,
-            resource_type=task.resource_type,
-            resource_id=task.resource_id,
-            branch=task.branch,
-            summary=f"{prefix}Worker exception: {e}",
-            duration_seconds=duration,
+        return _task_result(
+            task,
+            config,
+            ResultStatus.FAILED,
+            task.branch,
+            f"{prefix}Worker exception: {e}",
+            duration,
         )
 
     finally:

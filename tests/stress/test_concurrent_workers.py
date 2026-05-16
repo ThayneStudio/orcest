@@ -292,8 +292,14 @@ class TestConcurrentWorkers:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             pending = redis.client.xpending("tasks", "workers")
-            # When pending reaches 0, all tasks have been acked.
-            if pending.get("pending", 0) == 0:  # type: ignore[union-attr]
+            unread = redis.stream_unread_count("tasks", "workers")
+            # When unread and pending are both 0 after at least one task was
+            # processed, all stream entries have been acked or intentionally skipped.
+            if (
+                tasks_processed
+                and pending.get("pending", 0) == 0  # type: ignore[union-attr]
+                and unread == 0
+            ):
                 break
             time.sleep(0.1)
 

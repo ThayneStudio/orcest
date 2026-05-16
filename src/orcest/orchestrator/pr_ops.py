@@ -17,7 +17,11 @@ from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import (
     clear_backoff,
+    clear_pending_task_if_matches,
+    clear_transient_failure_count,
+    get_backoff_head_sha,
     get_backoff_step,
+    get_pending_task_metadata,
     make_pending_task_key,
     make_pr_lock_key,
 )
@@ -50,7 +54,7 @@ class PRAction(str, Enum):
     UPDATE_BRANCH = "update_branch"
     SKIP_LOCKED = "skip_locked"  # Another worker already on it
     SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
-    SKIP_ACTIVE = "skip_active"  # Previously attempted, awaiting external change (new commits)
+    SKIP_ACTIVE = "skip_active"  # Historical value; attempts alone no longer suppress work
     SKIP_GREEN = "skip_green"  # CI passing, nothing to do
     SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
     SKIP_PENDING = "skip_pending"  # CI checks still running
@@ -61,7 +65,7 @@ class PRAction(str, Enum):
     RETRIGGER_REVIEW = "retrigger_review"  # claude-review passed but no formal review submitted
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
-    SKIP_BACKOFF = "skip_backoff"  # Defensive handler; no longer produced by discovery
+    SKIP_BACKOFF = "skip_backoff"  # Transient failure backoff is active
 
 
 @dataclass
@@ -148,6 +152,20 @@ def increment_attempts(redis: RedisClient, repo: str, pr_number: int, head_sha: 
 def clear_attempts(redis: RedisClient, repo: str, pr_number: int) -> None:
     """Clear the attempt counter for a PR (e.g. on successful completion)."""
     redis.delete(_make_attempts_key(repo, pr_number))
+
+
+def clear_attempts_if_head_sha(
+    redis: RedisClient, repo: str, pr_number: int, head_sha: str
+) -> bool:
+    """Clear PR attempt counter only when it still belongs to ``head_sha``."""
+    if not head_sha:
+        return False
+    key = _make_attempts_key(repo, pr_number)
+    data: dict[str, str] = redis.hgetall(key)
+    if data.get("head_sha") != head_sha:
+        return False
+    redis.delete(key)
+    return True
 
 
 def _make_total_attempts_key(repo: str, pr_number: int) -> str:
@@ -507,10 +525,9 @@ def discover_actionable_prs(
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs with a pending task already queued
     5. Skip PRs that exceeded total cross-SHA attempt limit
-    6. Route PRs with merge conflicts to ENQUEUE_REBASE (before SKIP_ACTIVE
-       to avoid deadlock — conflicts can't resolve without a rebase)
-    7. Skip PRs that have been attempted but haven't changed (attempt count > 0)
-    8. Fetch CI status; skip if checks are still pending or absent
+    6. Route PRs with merge conflicts to ENQUEUE_REBASE.
+    7. Skip PRs whose retry budget is exhausted for the current SHA.
+    8. Fetch CI status; skip if checks are still pending or absent.
     9. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
     """
@@ -589,9 +606,31 @@ def discover_actionable_prs(
             )
             continue
 
-        # Skip if a task for this PR is already pending in the queue
+        # Skip if a task for this PR is already pending in the queue and
+        # still belongs to the current GitHub snapshot. Pending markers from
+        # older SHAs are disposable coordination state.
         pending_key = make_pending_task_key(repo, "pr", number)
-        if redis.exists(pending_key):
+        pending_metadata = get_pending_task_metadata(redis, repo, "pr", number)
+        if pending_metadata is not None and not pending_metadata.snapshot_head_sha:
+            logger.info(
+                "PR #%d: clearing legacy pending task %s without snapshot metadata",
+                number,
+                pending_metadata.task_id,
+            )
+            clear_pending_task_if_matches(redis, repo, "pr", number, pending_metadata.task_id)
+        elif (
+            pending_metadata is not None
+            and pending_metadata.snapshot_head_sha != head_sha
+        ):
+            logger.info(
+                "PR #%d: clearing pending task %s from old SHA %s (current %s)",
+                number,
+                pending_metadata.task_id,
+                pending_metadata.snapshot_head_sha,
+                head_sha,
+            )
+            clear_pending_task_if_matches(redis, repo, "pr", number, pending_metadata.task_id)
+        elif pending_metadata is not None or redis.exists(pending_key):
             results.append(
                 PRState(
                     number=number,
@@ -607,29 +646,40 @@ def discover_actionable_prs(
             )
             continue
 
-        # Clear backoff state when a new SHA is pushed, since new context
-        # makes the previous backoff cycle irrelevant. We detect this by
-        # checking the stored SHA in the per-SHA attempt counter before
-        # get_attempt_count resets it.
+        # Clear legacy attempt-derived backoff state when a new SHA is pushed.
+        # SHA-aware backoff below handles transient failures whose attempts
+        # hash was intentionally cleared.
         stored_sha_data = redis.hgetall(_make_attempts_key(repo, number))
         if stored_sha_data and stored_sha_data.get("head_sha", "") != head_sha:
             clear_backoff(redis, repo, number)
 
-        if get_backoff_step(redis, repo, number) is not None:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_BACKOFF,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
+        backoff_step = get_backoff_step(redis, repo, number)
+        if backoff_step is not None:
+            backoff_head_sha = get_backoff_head_sha(redis, repo, number)
+            if backoff_head_sha and backoff_head_sha != head_sha:
+                logger.info(
+                    "PR #%d: clearing transient backoff from old SHA %s (current %s)",
+                    number,
+                    backoff_head_sha,
+                    head_sha,
                 )
-            )
-            continue
+                clear_backoff(redis, repo, number)
+                clear_transient_failure_count(redis, repo, number)
+            else:
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_BACKOFF,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+                continue
 
         total_attempts = get_total_attempt_count(redis, repo, number)
         if total_attempts >= max_total_attempts:
@@ -677,8 +727,8 @@ def discover_actionable_prs(
             )
             continue
 
-        # Skip if previously attempted on this SHA (awaiting new commits)
-        # or max attempts reached.
+        # Attempts are retry budget, not proof of active work. Active work is
+        # represented by the pending marker or lock above.
         attempt_count = get_attempt_count(redis, repo, number, head_sha)
         if attempt_count >= max_attempts:
             results.append(
@@ -695,14 +745,16 @@ def discover_actionable_prs(
                 )
             )
             continue
-        # Route conflicting PRs to rebase before SKIP_ACTIVE — conflicts
-        # can't resolve without a rebase, so waiting for new commits would
-        # deadlock. SKIP_MAX_ATTEMPTS above still applies to prevent infinite
-        # rebase loops.
-        if pr_data.get("mergeable") == "CONFLICTING":
+        # Route conflicting PRs to rebase. SKIP_MAX_ATTEMPTS above still
+        # applies to prevent infinite rebase loops.
+        mergeable = str(pr_data.get("mergeable") or "").upper()
+        merge_state = str(pr_data.get("mergeStateStatus") or "").upper()
+        if mergeable == "CONFLICTING" or merge_state == "DIRTY":
             logger.info(
-                "PR #%d has merge conflicts (mergeable=CONFLICTING), enqueuing rebase",
+                "PR #%d has merge conflicts (mergeable=%s, mergeStateStatus=%s), enqueuing rebase",
                 number,
+                mergeable,
+                merge_state,
             )
             results.append(
                 PRState(
@@ -723,22 +775,6 @@ def discover_actionable_prs(
         # BEHIND PR can still be mergeable, and updating it creates a base
         # merge commit that retriggers CI. If branch protection truly requires
         # an up-to-date branch, the merge path handles GitHub's rejection.
-
-        if attempt_count > 0:
-            results.append(
-                PRState(
-                    number=number,
-                    title=title,
-                    branch=branch,
-                    head_sha=head_sha,
-                    action=PRAction.SKIP_ACTIVE,
-                    ci_failures=[],
-                    review_threads=[],
-                    labels=pr_labels,
-                    base_branch=base_branch,
-                )
-            )
-            continue
 
         # Check CI status -- wrapped in try/except so a single PR's
         # failure does not crash discovery for all other PRs.
@@ -1092,7 +1128,20 @@ def discover_actionable_prs(
                     number,
                     exc_info=True,
                 )
-                threads = []
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_PENDING,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+                continue
 
             if threads:
                 logger.info(

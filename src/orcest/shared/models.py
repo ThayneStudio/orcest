@@ -4,6 +4,7 @@ All to_dict values are strings (Redis streams require flat {str: str} entries).
 Empty string is used as the None sentinel for optional fields.
 """
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ class ResultStatus(str, Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     USAGE_EXHAUSTED = "usage_exhausted"
+    STALE = "stale"
 
 
 @dataclass
@@ -58,6 +60,11 @@ class Task:
     base_branch: str | None  # Base branch to rebase onto (e.g. "main", "master")
     key_prefix: str  # Redis key prefix for multi-project routing
     created_at: datetime
+    snapshot_head_sha: str = ""  # PR head SHA this task was derived from
+    decision_reason: str = ""  # Why this task was enqueued (ci_failure, changes_requested, etc.)
+    snapshot_failed_checks: list[str] | None = None
+    snapshot_review_thread_ids: list[str] | None = None
+    snapshot_review_thread_fingerprints: list[str] | None = None
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -74,6 +81,13 @@ class Task:
             "base_branch": self.base_branch or "",
             "key_prefix": self.key_prefix,
             "created_at": self.created_at.isoformat(),
+            "snapshot_head_sha": self.snapshot_head_sha,
+            "decision_reason": self.decision_reason,
+            "snapshot_failed_checks": json.dumps(self.snapshot_failed_checks or []),
+            "snapshot_review_thread_ids": json.dumps(self.snapshot_review_thread_ids or []),
+            "snapshot_review_thread_fingerprints": json.dumps(
+                self.snapshot_review_thread_fingerprints or []
+            ),
         }
 
     @classmethod
@@ -92,6 +106,13 @@ class Task:
             base_branch=data.get("base_branch") or None,
             key_prefix=data.get("key_prefix", ""),
             created_at=datetime.fromisoformat(data["created_at"]),
+            snapshot_head_sha=data.get("snapshot_head_sha", ""),
+            decision_reason=data.get("decision_reason", ""),
+            snapshot_failed_checks=_json_list(data.get("snapshot_failed_checks", "")),
+            snapshot_review_thread_ids=_json_list(data.get("snapshot_review_thread_ids", "")),
+            snapshot_review_thread_fingerprints=_json_list(
+                data.get("snapshot_review_thread_fingerprints", "")
+            ),
         )
 
     @classmethod
@@ -107,6 +128,11 @@ class Task:
         base_branch: str | None = None,
         claude_token: str = "",
         key_prefix: str = "",
+        snapshot_head_sha: str = "",
+        decision_reason: str = "",
+        snapshot_failed_checks: list[str] | None = None,
+        snapshot_review_thread_ids: list[str] | None = None,
+        snapshot_review_thread_fingerprints: list[str] | None = None,
     ) -> "Task":
         """Factory with auto-generated ID and timestamp."""
         return cls(
@@ -122,6 +148,11 @@ class Task:
             base_branch=base_branch,
             key_prefix=key_prefix,
             created_at=datetime.now(timezone.utc),
+            snapshot_head_sha=snapshot_head_sha,
+            decision_reason=decision_reason,
+            snapshot_failed_checks=snapshot_failed_checks,
+            snapshot_review_thread_ids=snapshot_review_thread_ids,
+            snapshot_review_thread_fingerprints=snapshot_review_thread_fingerprints,
         )
 
 
@@ -136,6 +167,11 @@ class TaskResult:
     resource_type: str  # "pr" or "issue" -- needed so orchestrator can post comments
     resource_id: int  # PR/issue number
     rate_limit_resets_at: int = 0  # Unix timestamp when rate limit resets (0 = unknown)
+    snapshot_head_sha: str = ""
+    decision_reason: str = ""
+    snapshot_failed_checks: list[str] | None = None
+    snapshot_review_thread_ids: list[str] | None = None
+    snapshot_review_thread_fingerprints: list[str] | None = None
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -148,6 +184,13 @@ class TaskResult:
             "duration_seconds": str(self.duration_seconds),
             "resource_type": self.resource_type,
             "resource_id": str(self.resource_id),
+            "snapshot_head_sha": self.snapshot_head_sha,
+            "decision_reason": self.decision_reason,
+            "snapshot_failed_checks": json.dumps(self.snapshot_failed_checks or []),
+            "snapshot_review_thread_ids": json.dumps(self.snapshot_review_thread_ids or []),
+            "snapshot_review_thread_fingerprints": json.dumps(
+                self.snapshot_review_thread_fingerprints or []
+            ),
         }
         if self.rate_limit_resets_at:
             d["rate_limit_resets_at"] = str(self.rate_limit_resets_at)
@@ -166,4 +209,23 @@ class TaskResult:
             resource_type=data["resource_type"],
             resource_id=int(data["resource_id"]),
             rate_limit_resets_at=int(data.get("rate_limit_resets_at", "0")),
+            snapshot_head_sha=data.get("snapshot_head_sha", ""),
+            decision_reason=data.get("decision_reason", ""),
+            snapshot_failed_checks=_json_list(data.get("snapshot_failed_checks", "")),
+            snapshot_review_thread_ids=_json_list(data.get("snapshot_review_thread_ids", "")),
+            snapshot_review_thread_fingerprints=_json_list(
+                data.get("snapshot_review_thread_fingerprints", "")
+            ),
         )
+
+
+def _json_list(raw: str) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]

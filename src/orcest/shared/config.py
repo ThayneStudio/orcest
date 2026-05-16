@@ -91,6 +91,7 @@ class OrchestratorConfig:
     default_runner: str = "claude"
     max_attempts: int = 3  # Max task attempts per SHA before needs-human
     max_total_attempts: int = 50  # Max total attempts across all SHAs (hard stop)
+    max_transient_failures: int = 5  # Max transient PR failures before needs-human
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
@@ -379,6 +380,20 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     # Max total attempts across all SHAs (hard stop)
     max_total_attempts = _safe_int(raw.get("max_total_attempts", 50), "max_total_attempts")
 
+    # Max transient worker failures before labeling needs-human.
+    max_transient_failures = _safe_int(
+        os.environ.get(
+            "ORCEST_MAX_TRANSIENT_FAILURES",
+            raw.get("max_transient_failures", 5),
+        ),
+        "max_transient_failures",
+    )
+    if max_transient_failures <= 0:
+        raise ValueError(
+            "Config field 'max_transient_failures' must be a positive integer, "
+            f"got {max_transient_failures!r}."
+        )
+
     # Whether to delete the head branch after merging
     delete_branch_on_merge = _safe_bool(
         raw.get("delete_branch_on_merge", True), "delete_branch_on_merge"
@@ -438,6 +453,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         default_runner=default_runner,
         max_attempts=max_attempts,
         max_total_attempts=max_total_attempts,
+        max_transient_failures=max_transient_failures,
         delete_branch_on_merge=delete_branch_on_merge,
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
         task_key_prefix=task_key_prefix,

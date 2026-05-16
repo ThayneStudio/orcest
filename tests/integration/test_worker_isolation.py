@@ -29,6 +29,15 @@ from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.workspace import Workspace
 
 
+@pytest.fixture(autouse=True)
+def _mock_worker_pr_snapshot_lookup(monkeypatch):
+    """Keep integration isolation tests focused on locks, not live GitHub state."""
+    monkeypatch.setattr(
+        "orcest.worker.loop.gh.get_pr",
+        lambda repo, pr_number, token: {"headRefOid": "abc123", "statusCheckRollup": []},
+    )
+
+
 @pytest.mark.integration
 class TestWorkerIsolation:
     """Prove workers using the real loop can't overlap on the same PR."""
@@ -58,7 +67,17 @@ class TestWorkerIsolation:
         runner = NoopRunner(duration=noop_duration)
         original_run = runner.run
 
-        def instrumented_run(prompt, work_dir, token, timeout, logger=None, on_output=None):
+        def instrumented_run(
+            prompt,
+            work_dir,
+            token,
+            timeout,
+            logger=None,
+            on_output=None,
+            on_stderr=None,
+            abort_event=None,
+            claude_token="",
+        ):
             """Wrap NoopRunner.run to track concurrent executions."""
             with count_lock:
                 active_count["value"] += 1
@@ -71,6 +90,9 @@ class TestWorkerIsolation:
                     timeout=timeout,
                     logger=logger,
                     on_output=on_output,
+                    on_stderr=on_stderr,
+                    abort_event=abort_event,
+                    claude_token=claude_token,
                 )
             finally:
                 with count_lock:
@@ -98,6 +120,7 @@ class TestWorkerIsolation:
                 resource_id=pr_number,
                 prompt=f"Task {i}",
                 branch="fix-branch",
+                snapshot_head_sha="abc123",
             )
             for i in range(num_tasks)
         ]
@@ -113,6 +136,7 @@ class TestWorkerIsolation:
             # thread-safe).
             mock_workspace = unittest.mock.MagicMock(spec=Workspace)
             mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
+            mock_workspace.current_head_sha.return_value = "abc123"
 
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
             lock = RedisLock(redis, lock_key, ttl=30, owner=worker_id)
@@ -195,7 +219,17 @@ class TestWorkerIsolation:
         runner = NoopRunner(duration=noop_duration)
         original_run = runner.run
 
-        def instrumented_run(prompt, work_dir, token, timeout, logger=None, on_output=None):
+        def instrumented_run(
+            prompt,
+            work_dir,
+            token,
+            timeout,
+            logger=None,
+            on_output=None,
+            on_stderr=None,
+            abort_event=None,
+            claude_token="",
+        ):
             with count_lock:
                 active_count["value"] += 1
                 active_count["max"] = max(active_count["max"], active_count["value"])
@@ -207,6 +241,9 @@ class TestWorkerIsolation:
                     timeout=timeout,
                     logger=logger,
                     on_output=on_output,
+                    on_stderr=on_stderr,
+                    abort_event=abort_event,
+                    claude_token=claude_token,
                 )
             finally:
                 with count_lock:
@@ -231,6 +268,7 @@ class TestWorkerIsolation:
             # thread-safe).
             mock_workspace = unittest.mock.MagicMock(spec=Workspace)
             mock_workspace.setup.return_value = Path("/tmp/fake-workspace")
+            mock_workspace.current_head_sha.return_value = "abc123"
 
             task = Task.create(
                 task_type=TaskType.FIX_CI,
@@ -240,6 +278,7 @@ class TestWorkerIsolation:
                 resource_id=pr_number,  # Different PR per worker!
                 prompt=f"Task for PR {pr_number}",
                 branch=f"fix-pr-{pr_number}",
+                snapshot_head_sha="abc123",
             )
             lock_key = make_pr_lock_key(task.repo, task.resource_id)
             lock = RedisLock(redis, lock_key, ttl=30, owner=worker_id)
@@ -309,21 +348,23 @@ class TestWorkerIsolation:
                 resource_id=1,  # Same PR!
                 prompt=f"Task {i}",
                 branch="fix-branch",
+                snapshot_head_sha="abc123",
             )
             redis.xadd(tasks_stream, task.to_dict())
 
-        # Track concurrency via instrumented sleep in noop_runner
+        # Track concurrent NoopRunner executions.
         active_count = {"value": 0, "max": 0}
         count_lock = threading.Lock()
         original_sleep = time.sleep
 
-        def instrumented_sleep(duration):
-            """Track concurrent executions during noop sleep."""
+        original_noop_run = NoopRunner.run
+
+        def instrumented_noop_run(self, *args, **kwargs):
             with count_lock:
                 active_count["value"] += 1
                 active_count["max"] = max(active_count["max"], active_count["value"])
             try:
-                original_sleep(duration)
+                return original_noop_run(self, *args, **kwargs)
             finally:
                 with count_lock:
                     active_count["value"] -= 1
@@ -346,6 +387,7 @@ class TestWorkerIsolation:
                     port=parsed["port"],
                     db=parsed["db"],
                     password=parsed["password"],
+                    key_prefix="",
                 ),
                 worker_id=f"test-worker-{i}",
                 workspace_dir="/tmp/orcest-test-isolation",
@@ -368,6 +410,7 @@ class TestWorkerIsolation:
         def _make_mock_ws(*args, **kwargs):
             ws = unittest.mock.MagicMock(spec=Workspace)
             ws.setup.return_value = Path("/tmp/fake-workspace")
+            ws.current_head_sha.return_value = "abc123"
             return ws
 
         mock_ws_cls.side_effect = _make_mock_ws
@@ -379,11 +422,11 @@ class TestWorkerIsolation:
         signal_patcher = unittest.mock.patch("orcest.worker.loop.signal.signal")
         signal_patcher.start()
 
-        noop_sleep_patcher = unittest.mock.patch(
-            "orcest.worker.noop_runner.time.sleep",
-            side_effect=instrumented_sleep,
+        noop_run_patcher = unittest.mock.patch(
+            "orcest.worker.noop_runner.NoopRunner.run",
+            new=instrumented_noop_run,
         )
-        noop_sleep_patcher.start()
+        noop_run_patcher.start()
 
         stop_event = threading.Event()
 
@@ -419,10 +462,6 @@ class TestWorkerIsolation:
             # time for all 5 tasks to be read and either processed or skipped.
             # With 0.1s noop sleep, this is very fast.
             #
-            # IMPORTANT: use original_sleep for the test's own waits.
-            # The noop_sleep_patcher patches time.sleep as imported in the
-            # noop_runner module; using original_sleep here avoids any
-            # ambiguity about which sleep is being called.
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 results_count = redis.client.xlen(results_stream)
@@ -444,7 +483,7 @@ class TestWorkerIsolation:
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
-            noop_sleep_patcher.stop()
+            noop_run_patcher.stop()
             if hung_threads:
                 raise RuntimeError(f"Worker thread(s) {hung_threads!r} did not stop within 10 s")
 
@@ -494,6 +533,7 @@ class TestWorkerIsolation:
             resource_id=pr_number,
             prompt="This should be skipped",
             branch="fix-branch",
+            snapshot_head_sha="abc123",
         )
         redis.xadd(tasks_stream, task.to_dict())
 
@@ -506,6 +546,7 @@ class TestWorkerIsolation:
             resource_id=pr_number + 1,  # Different PR
             prompt="This should succeed",
             branch="fix-branch-2",
+            snapshot_head_sha="abc123",
         )
         redis.xadd(tasks_stream, task2.to_dict())
 
@@ -524,6 +565,7 @@ class TestWorkerIsolation:
                 port=parsed["port"],
                 db=parsed["db"],
                 password=parsed["password"],
+                key_prefix="",
             ),
             worker_id="skip-test-worker",
             workspace_dir="/tmp/orcest-test-isolation",
@@ -541,6 +583,7 @@ class TestWorkerIsolation:
         def _make_mock_ws(*args, **kwargs):
             ws = unittest.mock.MagicMock(spec=Workspace)
             ws.setup.return_value = Path("/tmp/fake-workspace")
+            ws.current_head_sha.return_value = "abc123"
             return ws
 
         mock_ws_cls.side_effect = _make_mock_ws

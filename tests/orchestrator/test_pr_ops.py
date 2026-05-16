@@ -31,9 +31,14 @@ from orcest.orchestrator.pr_ops import (
     set_usage_exhausted_cooldown,
 )
 from orcest.shared.coordination import (
+    get_backoff_step,
+    get_pending_task,
+    get_transient_failure_count,
+    increment_transient_failure_count,
     make_pending_task_key,
     make_pr_lock_key,
     set_backoff_cooldown,
+    set_pending_task,
 )
 
 REPO = "test-org/test-repo"
@@ -945,8 +950,10 @@ def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config
     gh_mock.get_ci_status.assert_not_called()
 
 
-def test_discover_skip_active_via_attempt_counter(gh_mock, fake_redis_client, label_config):
-    """A PR with attempts > 0 (task in flight) is classified as SKIP_ACTIVE."""
+def test_discover_attempt_counter_without_active_work_does_not_skip(
+    gh_mock, fake_redis_client, label_config
+):
+    """Attempts are retry budget, not active-work proof."""
     pr_number = 304
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(number=pr_number, labels=[], head_sha="sha1"),
@@ -954,6 +961,9 @@ def test_discover_skip_active_via_attempt_counter(gh_mock, fake_redis_client, la
 
     # Seed attempt counter so it's > 0
     increment_attempts(fake_redis_client, REPO, pr_number, head_sha="sha1")
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure"},
+    ]
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -963,10 +973,8 @@ def test_discover_skip_active_via_attempt_counter(gh_mock, fake_redis_client, la
     )
 
     assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_ACTIVE
+    assert results[0].action == PRAction.ENQUEUE_FIX
     assert results[0].number == pr_number
-    # CI should not be fetched for an active task
-    gh_mock.get_ci_status.assert_not_called()
 
 
 def test_discover_multiple_prs(gh_mock, fake_redis_client, label_config):
@@ -1355,11 +1363,18 @@ def test_skip_queued_when_pending_task_exists(gh_mock, fake_redis_client, label_
     """A PR with a pending task marker is classified as SKIP_QUEUED."""
     pr_number = 600
     gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=pr_number, labels=[]),
+        _make_pr_data(number=pr_number, labels=[], head_sha="abc123"),
     ]
-    # Set a pending task marker
-    pending_key = make_pending_task_key("test-org/test-repo", "pr", pr_number)
-    fake_redis_client.set_ex(pending_key, "task-xyz", 86400)
+    set_pending_task(
+        fake_redis_client,
+        "test-org/test-repo",
+        "pr",
+        pr_number,
+        "task-xyz",
+        snapshot_head_sha="abc123",
+        decision_reason="ci_failure",
+        ttl=86400,
+    )
 
     results = discover_actionable_prs(
         repo="test-org/test-repo",
@@ -1370,8 +1385,68 @@ def test_skip_queued_when_pending_task_exists(gh_mock, fake_redis_client, label_
 
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_QUEUED
-    # CI should not be fetched
-    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_pending_task_old_sha_is_cleared_and_current_snapshot_enqueues(
+    gh_mock, fake_redis_client, label_config
+):
+    pr_number = 601
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha="sha-new"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "FAILURE", "status": "COMPLETED"}
+    ]
+
+    set_pending_task(
+        fake_redis_client,
+        REPO,
+        "pr",
+        pr_number,
+        "task-old",
+        snapshot_head_sha="sha-old",
+        decision_reason="ci_failure",
+        ttl=3600,
+    )
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert get_pending_task(fake_redis_client, REPO, "pr", pr_number) is None
+
+
+def test_legacy_pending_task_without_snapshot_is_cleared_and_requeued(
+    gh_mock, fake_redis_client, label_config
+):
+    pr_number = 602
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha="sha-current"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "FAILURE", "status": "COMPLETED"}
+    ]
+    fake_redis_client.set_ex(
+        make_pending_task_key(REPO, "pr", pr_number),
+        "legacy-task",
+        ttl=3600,
+    )
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert get_pending_task(fake_redis_client, REPO, "pr", pr_number) is None
 
 
 def test_no_skip_queued_without_pending_marker(gh_mock, fake_redis_client, label_config):
@@ -1534,6 +1609,56 @@ def test_backoff_cooldown_skips_before_enqueue(gh_mock, fake_redis_client, label
     assert len(results) == 1
     assert results[0].action == PRAction.SKIP_BACKOFF
     gh_mock.get_ci_status.assert_not_called()
+
+
+def test_backoff_cooldown_same_sha_skips_before_enqueue(
+    gh_mock, fake_redis_client, label_config
+):
+    """A SHA-aware transient backoff still skips for the same head SHA."""
+    pr_number = 736
+    head_sha = "sha-a"
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha=head_sha),
+    ]
+    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=2, head_sha=head_sha)
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.SKIP_BACKOFF
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_backoff_cooldown_new_sha_clears_backoff_and_transient_count(
+    gh_mock, fake_redis_client, label_config
+):
+    """A new commit bypasses stale transient backoff even after attempts were cleared."""
+    pr_number = 737
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[], head_sha="sha-b"),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
+    ]
+    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=2, head_sha="sha-a")
+    increment_transient_failure_count(fake_redis_client, REPO, pr_number)
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    assert get_backoff_step(fake_redis_client, REPO, pr_number) is None
+    assert get_transient_failure_count(fake_redis_client, REPO, pr_number) == 0
 
 
 def test_total_attempts_hard_stop_preserves_counter(gh_mock, fake_redis_client, label_config):
