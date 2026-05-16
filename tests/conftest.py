@@ -175,6 +175,7 @@ def gh_mock(mocker):
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
+    ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
     return ns
 
 
@@ -219,6 +220,7 @@ def real_redis_client(_check_redis):
         port=parsed["port"],
         db=parsed["db"],
         password=parsed["password"],
+        key_prefix="",
     )
     client = RedisClient(config)
     client.client.flushdb()
@@ -240,6 +242,7 @@ def make_real_redis_client(_check_redis):
             port=parsed["port"],
             db=parsed["db"],
             password=parsed["password"],
+            key_prefix="",
         )
         c = RedisClient(config)
         clients.append(c)

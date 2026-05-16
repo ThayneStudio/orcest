@@ -181,6 +181,21 @@ class Workspace:
         self._work_dir = repo_dir
         return self._work_dir
 
+    def current_head_sha(self) -> str:
+        """Return the checked-out HEAD SHA for the current workspace."""
+        repo_dir = self.path
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise WorkspaceError("failed to read workspace HEAD SHA") from exc
+        return result.stdout.strip()
+
     def cleanup(self) -> None:
         """Remove the workspace directory.
 

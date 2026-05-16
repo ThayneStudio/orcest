@@ -9,10 +9,14 @@ from orcest.shared.coordination import (
     clear_backoff,
     compute_pending_task_ttl,
     get_backoff_cooldown_seconds,
+    get_backoff_head_sha,
     get_backoff_step,
+    get_pending_task,
+    get_pending_task_metadata,
     make_issue_lock_key,
     make_pr_lock_key,
     set_backoff_cooldown,
+    set_pending_task,
 )
 
 
@@ -171,6 +175,33 @@ def test_compute_pending_task_ttl_reflects_non_default_values():
     assert ttl > compute_pending_task_ttl(RunnerConfig())
 
 
+def test_pending_task_metadata_round_trip(fake_redis_client):
+    assert set_pending_task(
+        fake_redis_client,
+        "owner/repo",
+        "pr",
+        42,
+        "task-123",
+        snapshot_head_sha="abc123",
+        decision_reason="ci_failure",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    assert get_pending_task(fake_redis_client, "owner/repo", "pr", 42) == "task-123"
+    metadata = get_pending_task_metadata(fake_redis_client, "owner/repo", "pr", 42)
+    assert metadata is not None
+    assert metadata.task_id == "task-123"
+    assert metadata.snapshot_head_sha == "abc123"
+    assert metadata.decision_reason == "ci_failure"
+
+
+def test_pending_task_metadata_accepts_legacy_plain_task_id(fake_redis_client):
+    fake_redis_client.set_ex("pending:pr:owner/repo:42", "legacy-task", ttl=300)
+    metadata = get_pending_task_metadata(fake_redis_client, "owner/repo", "pr", 42)
+    assert metadata is not None
+    assert metadata.task_id == "legacy-task"
+    assert metadata.snapshot_head_sha == ""
+
+
 # ---------------------------------------------------------------------------
 # Backoff functions
 # ---------------------------------------------------------------------------
@@ -213,8 +244,15 @@ def test_set_backoff_cooldown_stores_step(fake_redis_client):
 
 def test_set_backoff_cooldown_sets_ttl(fake_redis_client):
     """set_backoff_cooldown sets a positive TTL on the Redis key."""
-    set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1)
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1, head_sha="abc123")
     assert fake_redis_client.ttl("backoff:pr:owner/repo:42") > 0
+    assert fake_redis_client.ttl("backoff:pr:owner/repo:42:head_sha") > 0
+
+
+def test_set_backoff_cooldown_stores_head_sha(fake_redis_client):
+    """set_backoff_cooldown stores the SHA that created the cooldown."""
+    set_backoff_cooldown(fake_redis_client, "owner/repo", 42, step=1, head_sha="abc123")
+    assert get_backoff_head_sha(fake_redis_client, "owner/repo", 42) == "abc123"
 
 
 def test_set_backoff_cooldown_ttl_matches_step_duration(fake_redis_client):
@@ -267,6 +305,7 @@ def test_clear_backoff_removes_key(fake_redis_client):
     set_backoff_cooldown(fake_redis_client, "owner/repo", 3, step=1)
     clear_backoff(fake_redis_client, "owner/repo", 3)
     assert get_backoff_step(fake_redis_client, "owner/repo", 3) is None
+    assert get_backoff_head_sha(fake_redis_client, "owner/repo", 3) is None
 
 
 def test_clear_backoff_is_idempotent(fake_redis_client):

@@ -5,6 +5,7 @@ side effects, prompt diff truncation, CI log fetching/rendering, and
 review thread prompt rendering for both fix and followup tasks.
 """
 
+import json
 import logging
 
 import pytest
@@ -73,6 +74,8 @@ def test_publish_creates_task(gh_mock, fake_redis_client):
     assert task.resource_id == 42
     assert task.resource_type == "pr"
     assert task.branch == "fix/widget"
+    assert task.snapshot_head_sha == "abc123"
+    assert task.decision_reason == "changes_requested"
     # No CI failures -> FIX_PR (review-driven path)
     assert task.type == TaskType.FIX_PR
 
@@ -101,6 +104,34 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client):
     assert fields["id"] == task.id
     assert fields["repo"] == "test-org/test-repo"
     assert fields["resource_id"] == "7"
+
+
+def test_publish_ci_snapshot_includes_target_url_identity(gh_mock, fake_redis_client):
+    _setup_gh_defaults(gh_mock)
+    pr_state = _make_pr_state(
+        number=43,
+        ci_failures=[
+            {
+                "context": "build",
+                "conclusion": "FAILURE",
+                "targetUrl": "https://ci.example/build/123",
+            }
+        ],
+    )
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    assert task is not None
+    assert task.snapshot_failed_checks
+    payload = json.loads(task.snapshot_failed_checks[0])
+    assert payload["context"] == "build"
+    assert payload["target_url"] == "https://ci.example/build/123"
 
 
 def test_publish_does_not_add_label(gh_mock, fake_redis_client):
@@ -848,21 +879,17 @@ def test_publish_and_notify_xadd_failure(
     gh_mock,
     fake_redis_client,
 ):
-    """When redis.xadd_capped raises (Redis down after task construction), the
+    """When redis.xadd raises (Redis down after task construction), the
     exception should propagate."""
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=604)
 
-    # Patch xadd_capped (not xadd): task_publisher calls redis.xadd_capped()
-    # directly, and xadd_capped calls self._client.xadd internally, bypassing
-    # the RedisClient.xadd wrapper. Patching the lower-level xadd would have
-    # no effect on the publisher's code path.
-    original_xadd_capped = fake_redis_client.xadd_capped
+    original_xadd = fake_redis_client.xadd
 
-    def broken_xadd_capped(stream, fields, **kwargs):
+    def broken_xadd(stream, fields):
         raise ConnectionError("Redis connection lost")
 
-    fake_redis_client.xadd_capped = broken_xadd_capped
+    fake_redis_client.xadd = broken_xadd
 
     try:
         with pytest.raises(ConnectionError, match="Redis connection lost"):
@@ -874,7 +901,7 @@ def test_publish_and_notify_xadd_failure(
                 default_runner="claude",
             )
     finally:
-        fake_redis_client.xadd_capped = original_xadd_capped
+        fake_redis_client.xadd = original_xadd
 
     assert get_attempt_count(fake_redis_client, "test-org/test-repo", 604, "abc123") == 0
     assert get_total_attempt_count(fake_redis_client, "test-org/test-repo", 604) == 0
@@ -1517,8 +1544,34 @@ def test_no_ci_failures_not_transient_path(gh_mock, fake_redis_client):
     gh_mock.rerun_workflow.assert_not_called()
 
 
+def test_review_snapshot_fingerprint_changes_with_comment_body(gh_mock, fake_redis_client):
+    _setup_gh_defaults(gh_mock)
+    threads = [
+        {
+            "id": "thread-1",
+            "path": "app.py",
+            "line": 10,
+            "comments": [{"author": "alice", "body": "old feedback"}],
+        }
+    ]
+    pr_state = _make_pr_state(number=908, ci_failures=[], review_threads=threads)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    assert task is not None
+    assert task.snapshot_review_thread_ids == ["thread-1"]
+    assert task.snapshot_review_thread_fingerprints
+    assert "old feedback" in task.snapshot_review_thread_fingerprints[0]
+
+
 def test_task_redis_receives_xadd(gh_mock, fake_redis_server):
-    """When task_redis is provided, xadd_capped goes to task_redis, not redis."""
+    """When task_redis is provided, xadd goes to task_redis, not redis."""
     import fakeredis
 
     _setup_gh_defaults(gh_mock)

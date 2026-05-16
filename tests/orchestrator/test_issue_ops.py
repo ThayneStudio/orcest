@@ -294,6 +294,7 @@ def test_skip_max_attempts_reached(issue_gh_mock, fake_redis_client, label_confi
     ]
     for _ in range(3):
         increment_attempts(fake_redis_client, REPO, 8)  # count = 3 (== max_attempts)
+    fake_redis_client.set_ex(make_pending_task_key(REPO, "issue", 8), "task-8", 3600)
 
     results = discover_actionable_issues(
         repo=REPO,
@@ -315,6 +316,7 @@ def test_skip_max_attempts_exceeded(issue_gh_mock, fake_redis_client, label_conf
     ]
     for _ in range(5):
         increment_attempts(fake_redis_client, REPO, 9)
+    fake_redis_client.set_ex(make_pending_task_key(REPO, "issue", 9), "task-9", 3600)
 
     results = discover_actionable_issues(
         repo=REPO,

@@ -5,12 +5,17 @@ publishes tasks to the Redis stream. Also handles GitHub visibility by
 posting comments when tasks are queued.
 """
 
+import json
 import logging
 import re
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
-from orcest.orchestrator.issue_ops import IssueState, increment_attempts as increment_issue_attempts
+from orcest.orchestrator.issue_ops import (
+    IssueState,
+    clear_attempts as clear_issue_attempts,
+    increment_attempts as increment_issue_attempts,
+)
 from orcest.orchestrator.pr_ops import (
     PRState,
     increment_attempts,
@@ -19,6 +24,7 @@ from orcest.orchestrator.pr_ops import (
 from orcest.shared.config import RunnerConfig
 from orcest.shared.coordination import (
     clear_pending_task,
+    clear_pending_task_if_matches,
     compute_pending_task_ttl,
     set_pending_task,
 )
@@ -32,39 +38,15 @@ _PER_CHECK_LOG_LIMIT = 20000
 # Total log budget across all checks in a single prompt
 _TOTAL_LOG_BUDGET = 50000
 
-# Tasks stream cap: 10 000 entries.
-#
-# SEMANTIC NOTE: tasks:* streams are work queues consumed via XREADGROUP,
-# unlike output/log streams which are append-only observation channels.
-# This distinction matters for trimming:
-#
-#   - Output/log streams: trimming old entries is safe because consumers only
-#     need recent data for display; losing old log lines is acceptable.
-#   - Task streams: trimming *undelivered* entries causes silent task loss —
-#     the entry is removed from Redis before any worker reads it, so the work
-#     is silently dropped.
-#
-# With approximate MAXLEN, Redis may trim the oldest entries as soon as the
-# stream exceeds ~maxlen entries.  If the backlog of undelivered tasks grows
-# beyond that threshold (i.e. workers are seriously behind), the oldest tasks
-# can be lost before a worker ever reads them.
-#
-# SAFETY NET: the orchestrator's GitHub re-poll loop is the mitigation.
-# On the next poll cycle the orchestrator will re-discover actionable
-# PRs/issues and re-enqueue any tasks that were trimmed, so work is not
-# permanently lost — only delayed by one poll interval.
-# CAVEAT: each trimmed (and therefore un-executed) task still consumes an
-# attempt counter slot.  If trimming happens on every cycle until
-# max_attempts is exhausted, the item will be permanently silenced.
-# At 10 000 MAXLEN this is extraordinarily unlikely, but not impossible.
-#
-# MAXLEN RATIONALE: 10 000 was chosen to make silent loss practically
-# impossible under realistic conditions.  At typical throughput the queue
-# depth stays well below 100.  A backlog of 10 000 undelivered tasks would
-# require workers to be catastrophically behind; at that point the system is
-# already degraded for other reasons.  10 000 entries add only ~5-10 MB of
-# Redis memory (stream entries are compact), which is negligible.
-_TASKS_STREAM_MAXLEN = 10_000
+# Task streams are work queues consumed via XREADGROUP. They are intentionally
+# not capped at publish time because trimming undelivered entries silently drops
+# work while leaving retry reservations behind.
+
+DECISION_CI_FAILURE = "ci_failure"
+DECISION_CHANGES_REQUESTED = "changes_requested"
+DECISION_FOLLOWUP_THREADS = "followup_threads"
+DECISION_MERGE_CONFLICT_REBASE = "merge_conflict_rebase"
+DECISION_PROACTIVE_REBASE = "proactive_rebase"
 
 # Regex matching lines that signal the start of an important log section
 # (stack traces, test failures, assertion errors, etc.)
@@ -91,10 +73,14 @@ def _clear_pending_safe(
     resource_type: str,
     resource_id: int,
     logger: logging.Logger,
+    task_id: str = "",
 ) -> None:
     """Best-effort clear of pending task marker on publish failure."""
     try:
-        clear_pending_task(redis, repo, resource_type, resource_id)
+        if task_id:
+            clear_pending_task_if_matches(redis, repo, resource_type, resource_id, task_id)
+        else:
+            clear_pending_task(redis, repo, resource_type, resource_id)
     except Exception:
         logger.warning(
             "Failed to clear pending marker for %s #%d",
@@ -102,6 +88,54 @@ def _clear_pending_safe(
             resource_id,
             exc_info=True,
         )
+
+
+def _check_fingerprints(checks: list[dict]) -> list[str]:
+    fingerprints: list[str] = []
+    for check in checks:
+        payload = {
+            "name": str(check.get("name") or ""),
+            "context": str(check.get("context") or ""),
+            "workflow_name": str(check.get("workflowName") or ""),
+            "details_url": str(check.get("detailsUrl") or check.get("details_url") or ""),
+            "target_url": str(check.get("targetUrl") or check.get("target_url") or ""),
+        }
+        if any(payload.values()):
+            fingerprints.append(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return sorted(set(fingerprints))
+
+
+def _review_thread_ids(threads: list[dict]) -> list[str]:
+    ids: list[str] = []
+    for thread in threads:
+        thread_id = thread.get("id") or thread.get("node_id")
+        if thread_id:
+            ids.append(str(thread_id))
+    return sorted(set(ids))
+
+
+def _review_thread_fingerprints(threads: list[dict]) -> list[str]:
+    fingerprints: list[str] = []
+    for thread in threads:
+        comments = []
+        for comment in thread.get("comments") or []:
+            comments.append(
+                {
+                    "id": str(comment.get("id") or comment.get("node_id") or ""),
+                    "author": str(comment.get("author") or ""),
+                    "body": str(comment.get("body") or ""),
+                    "created_at": str(comment.get("createdAt") or comment.get("created_at") or ""),
+                    "updated_at": str(comment.get("updatedAt") or comment.get("updated_at") or ""),
+                }
+            )
+        payload = {
+            "id": str(thread.get("id") or thread.get("node_id") or ""),
+            "path": str(thread.get("path") or ""),
+            "line": str(thread.get("line") or ""),
+            "comments": comments,
+        }
+        fingerprints.append(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return sorted(set(fingerprints))
 
 
 def _rollback_pr_attempt_increment(
@@ -373,7 +407,17 @@ def _publish_and_notify(
 
     # Claim the pending-task slot atomically (SET NX EX). If another task
     # is already pending for this PR, skip publish to avoid duplicates.
-    if not set_pending_task(redis, task.repo, "pr", pr_state.number, task.id, ttl=pending_task_ttl):
+    if not set_pending_task(
+        redis,
+        task.repo,
+        "pr",
+        pr_state.number,
+        task.id,
+        ttl=pending_task_ttl,
+        snapshot_head_sha=task.snapshot_head_sha,
+        decision_reason=task.decision_reason,
+        created_at=task.created_at.isoformat(),
+    ):
         _log.info(f"Pending task already exists for PR #{pr_state.number}, skipping publish")
         return False
 
@@ -408,14 +452,14 @@ def _publish_and_notify(
                 attempt_incremented,
                 _log,
             )
-            _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
+            _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log, task.id)
             return False
 
     # Publish to backend-specific stream (shared across all projects)
     stream_redis = task_redis or redis
     try:
         tasks_stream = f"tasks:{default_runner}"
-        stream_redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+        stream_redis.xadd(tasks_stream, task.to_dict())
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for PR #{pr_state.number} to Redis",
@@ -429,7 +473,7 @@ def _publish_and_notify(
             attempt_incremented,
             _log,
         )
-        _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log)
+        _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log, task.id)
         raise
 
     _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
@@ -531,6 +575,13 @@ def publish_fix_task(
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
         key_prefix=key_prefix,
+        snapshot_head_sha=pr_state.head_sha,
+        decision_reason=(
+            DECISION_CI_FAILURE if pr_state.ci_failures else DECISION_CHANGES_REQUESTED
+        ),
+        snapshot_failed_checks=_check_fingerprints(pr_state.ci_failures),
+        snapshot_review_thread_ids=_review_thread_ids(review_threads),
+        snapshot_review_thread_fingerprints=_review_thread_fingerprints(review_threads),
     )
 
     published = _publish_and_notify(
@@ -600,6 +651,10 @@ def publish_followup_task(
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
         key_prefix=key_prefix,
+        snapshot_head_sha=pr_state.head_sha,
+        decision_reason=DECISION_FOLLOWUP_THREADS,
+        snapshot_review_thread_ids=_review_thread_ids(pr_state.review_threads),
+        snapshot_review_thread_fingerprints=_review_thread_fingerprints(pr_state.review_threads),
     )
 
     published = _publish_and_notify(
@@ -659,6 +714,10 @@ def publish_rebase_task(
         base_branch=pr_state.base_branch,
         claude_token=claude_token,
         key_prefix=key_prefix,
+        snapshot_head_sha=pr_state.head_sha,
+        decision_reason=(
+            DECISION_PROACTIVE_REBASE if proactive else DECISION_MERGE_CONFLICT_REBASE
+        ),
     )
 
     published = _publish_and_notify(
@@ -766,20 +825,21 @@ def _publish_issue_and_notify(
             f"avoid an un-counted attempt — will retry next poll cycle",
             exc_info=True,
         )
-        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
+        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
         return False
 
     # Publish to issue-specific stream (shared across all projects, lower priority than PR tasks)
     stream_redis = task_redis or redis
     try:
         tasks_stream = f"tasks:issue:{default_runner}"
-        stream_redis.xadd_capped(tasks_stream, task.to_dict(), maxlen=_TASKS_STREAM_MAXLEN)
+        stream_redis.xadd(tasks_stream, task.to_dict())
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for issue #{issue_state.number} to Redis",
             exc_info=True,
         )
-        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log)
+        clear_issue_attempts(redis, repo, issue_state.number)
+        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
         raise
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")

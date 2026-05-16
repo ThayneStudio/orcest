@@ -31,7 +31,7 @@ class RedisClient:
             socket_connect_timeout=config.socket_connect_timeout,
         )
         self._client: redis.Redis = redis.Redis(connection_pool=self._pool)
-        self._prefix = config.key_prefix + ":"
+        self._prefix = f"{config.key_prefix}:" if config.key_prefix else ""
 
     @classmethod
     def from_client(cls, client: redis.Redis, key_prefix: str = "test") -> "RedisClient":
@@ -45,7 +45,7 @@ class RedisClient:
         instance: RedisClient = object.__new__(cls)
         instance._client = client
         instance._pool = client.connection_pool
-        instance._prefix = key_prefix + ":"
+        instance._prefix = f"{key_prefix}:" if key_prefix else ""
         return instance
 
     @property

@@ -5,6 +5,7 @@ results from workers. Uses graceful shutdown on SIGTERM/SIGINT with
 interruptible sleep (1-second chunks) for responsive termination.
 """
 
+import json
 import logging
 import math
 import re
@@ -24,6 +25,7 @@ from orcest.orchestrator.issue_ops import (
 from orcest.orchestrator.pr_ops import (
     PRAction,
     clear_attempts,
+    clear_attempts_if_head_sha,
     clear_review_retrigger,
     clear_total_attempts,
     discover_actionable_prs,
@@ -47,7 +49,7 @@ from orcest.orchestrator.usage_check import get_token_reset_time
 from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
     clear_backoff,
-    clear_pending_task,
+    clear_pending_task_if_matches,
     clear_transient_failure_count,
     compute_pending_task_ttl,
     get_pending_task,
@@ -79,6 +81,9 @@ _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS = 24 * 3600
 _REVIEW_RERUN_FAILURE_COOLDOWN_SECONDS = 15 * 60
 _REVIEW_RERUN_FAILURE_TTL_SECONDS = 7 * 24 * 3600
 _MAX_REVIEW_RERUN_FAILURES = 3
+_FAILURE_CONCLUSIONS = frozenset(
+    {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
+)
 
 # Patterns matching Go HTTP / network errors surfaced by the `gh` CLI.
 # Used to distinguish transient network failures from permanent merge errors.
@@ -118,6 +123,213 @@ def _usage_exhausted_cooldown_ttl_seconds(result: TaskResult) -> int:
         if ttl > 0:
             return ttl
     return _USAGE_EXHAUSTED_COOLDOWN_SECONDS
+
+
+def _failed_check_names(checks: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or "").upper()
+        failed = conclusion in _FAILURE_CONCLUSIONS or (
+            not conclusion and state in ("FAILURE", "ERROR")
+        )
+        if failed:
+            name = (
+                check.get("detailsUrl")
+                or check.get("details_url")
+                or check.get("name")
+                or check.get("context")
+                or check.get("workflowName")
+            )
+            if name:
+                names.add(str(name))
+    return names
+
+
+def _failed_check_fingerprints(checks: list[dict]) -> set[str]:
+    fingerprints: set[str] = set()
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or "").upper()
+        failed = conclusion in _FAILURE_CONCLUSIONS or (
+            not conclusion and state in ("FAILURE", "ERROR")
+        )
+        if not failed:
+            continue
+        payload = {
+            "name": str(check.get("name") or ""),
+            "context": str(check.get("context") or ""),
+            "workflow_name": str(check.get("workflowName") or ""),
+            "details_url": str(check.get("detailsUrl") or check.get("details_url") or ""),
+            "target_url": str(check.get("targetUrl") or check.get("target_url") or ""),
+        }
+        if any(payload.values()):
+            fingerprints.add(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return fingerprints
+
+
+def _snapshot_failed_checks_still_failing(checks: list[dict], snapshot: list[str]) -> bool:
+    snapshot_set = set(snapshot)
+    if not snapshot_set:
+        return True
+    current_fingerprints = _failed_check_fingerprints(checks)
+    if current_fingerprints & snapshot_set:
+        return True
+    return bool(_failed_check_names(checks) & snapshot_set)
+
+
+def _review_thread_ids(threads: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for thread in threads:
+        thread_id = thread.get("id") or thread.get("node_id")
+        if thread_id:
+            ids.add(str(thread_id))
+    return ids
+
+
+def _review_thread_fingerprints(threads: list[dict]) -> set[str]:
+    fingerprints: set[str] = set()
+    for thread in threads:
+        comments = []
+        for comment in thread.get("comments") or []:
+            comments.append(
+                {
+                    "id": str(comment.get("id") or comment.get("node_id") or ""),
+                    "author": str(comment.get("author") or ""),
+                    "body": str(comment.get("body") or ""),
+                    "created_at": str(comment.get("createdAt") or comment.get("created_at") or ""),
+                    "updated_at": str(comment.get("updatedAt") or comment.get("updated_at") or ""),
+                }
+            )
+        payload = {
+            "id": str(thread.get("id") or thread.get("node_id") or ""),
+            "path": str(thread.get("path") or ""),
+            "line": str(thread.get("line") or ""),
+            "comments": comments,
+        }
+        fingerprints.add(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return fingerprints
+
+
+def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logging.Logger) -> bool:
+    """Cheaply reject PR results that no longer match the current GitHub snapshot."""
+    if result.resource_type != "pr":
+        return False
+    if not result.snapshot_head_sha:
+        logger.info(
+            "Dropping snapshot-less legacy PR result for PR #%d",
+            result.resource_id,
+        )
+        return True
+
+    try:
+        pr_data = gh.get_pr(project.repo, result.resource_id, project.token)
+    except Exception:
+        logger.warning(
+            "Failed to validate result snapshot for PR #%d; dropping result side-effects",
+            result.resource_id,
+            exc_info=True,
+        )
+        return True
+
+    current_sha = str(pr_data.get("headRefOid") or "")
+    if not current_sha:
+        logger.info(
+            "Dropping result for PR #%d: GitHub response did not include headRefOid",
+            result.resource_id,
+        )
+        return True
+    if current_sha and current_sha != result.snapshot_head_sha:
+        logger.info(
+            "Dropping stale result for PR #%d: result SHA %s, current SHA %s",
+            result.resource_id,
+            result.snapshot_head_sha,
+            current_sha,
+        )
+        return True
+
+    if result.decision_reason == "ci_failure" and result.snapshot_failed_checks:
+        checks = pr_data.get("statusCheckRollup") or gh.get_ci_status(
+            project.repo, result.resource_id, project.token
+        )
+        if not _snapshot_failed_checks_still_failing(checks, result.snapshot_failed_checks):
+            logger.info(
+                "Dropping stale CI result for PR #%d: captured failed checks are no longer failing",
+                result.resource_id,
+            )
+            return True
+
+    if result.decision_reason in ("changes_requested", "followup_threads") and (
+        result.snapshot_review_thread_ids
+    ):
+        try:
+            threads = gh.get_unresolved_review_threads(
+                project.repo, result.resource_id, project.token
+            )
+        except Exception:
+            logger.warning(
+                "Failed to validate review-thread snapshot for PR #%d; "
+                "dropping result side-effects",
+                result.resource_id,
+                exc_info=True,
+            )
+            return True
+        if result.snapshot_review_thread_fingerprints:
+            if not set(result.snapshot_review_thread_fingerprints).issubset(
+                _review_thread_fingerprints(threads)
+            ):
+                logger.info(
+                    "Dropping stale review result for PR #%d: captured thread content changed",
+                    result.resource_id,
+                )
+                return True
+        elif not set(result.snapshot_review_thread_ids).issubset(_review_thread_ids(threads)):
+            logger.info(
+                "Dropping stale review result for PR #%d: captured threads are resolved",
+                result.resource_id,
+            )
+            return True
+
+    if result.decision_reason == "merge_conflict_rebase":
+        mergeable = str(pr_data.get("mergeable") or "").upper()
+        merge_state = str(pr_data.get("mergeStateStatus") or "").upper()
+        if mergeable != "CONFLICTING" and merge_state != "DIRTY":
+            logger.info(
+                "Dropping stale rebase result for PR #%d: conflict no longer applies",
+                result.resource_id,
+            )
+            return True
+
+    if result.decision_reason == "proactive_rebase":
+        mergeable = str(pr_data.get("mergeable") or "").upper()
+        if mergeable == "CONFLICTING":
+            logger.info(
+                "Dropping stale proactive rebase result for PR #%d: PR is now conflicting",
+                result.resource_id,
+            )
+            return True
+
+    return False
+
+
+def _mark_usage_exhausted_token(
+    result: TaskResult, token_pool: TokenPool | None, logger: logging.Logger
+) -> None:
+    if token_pool is None:
+        return
+    exhausted_token = token_pool.get_task_token(result.task_id)
+    cooldown_until = None
+    if result.rate_limit_resets_at:
+        from datetime import datetime, timezone
+
+        cooldown_until = datetime.fromtimestamp(result.rate_limit_resets_at, tz=timezone.utc)
+        logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
+    elif exhausted_token:
+        try:
+            cooldown_until = get_token_reset_time(exhausted_token)
+        except Exception as e:
+            logger.warning("Failed to query token reset time: %s", e)
+    token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
 
 
 # Maximum number of merge retries for transient network errors before
@@ -499,33 +711,20 @@ def _poll_cycle(
         try:
             pool = token_pools.get(project.key_prefix)
             _consume_results_for_project(
-                project, project_redis, config.labels, logger, token_pool=pool
+                project,
+                project_redis,
+                config.labels,
+                logger,
+                token_pool=pool,
+                max_transient_failures=config.max_transient_failures,
             )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
-    # Step 1b: Trim processed entries from streams to prevent unbounded growth.
-    # Task streams are shared (single namespace), trim once per cycle.
-    for stream in (
-        f"tasks:{config.default_runner}",
-        f"tasks:issue:{config.default_runner}",
-    ):
-        try:
-            for g in task_redis.xinfo_groups(stream):
-                last_id = g.get("last-delivered-id")
-                if last_id and last_id != "0-0":
-                    task_redis.xtrim_minid(stream, last_id)
-        except Exception:
-            pass  # Stream may not exist yet
-    # Results streams are per-project, trim each one.
-    for _project, project_redis in project_clients:
-        try:
-            for g in project_redis.xinfo_groups(RESULTS_STREAM):
-                last_id = g.get("last-delivered-id")
-                if last_id and last_id != "0-0":
-                    project_redis.xtrim_minid(RESULTS_STREAM, last_id)
-        except Exception:
-            pass  # Stream may not exist yet
+    # Do not trim task/result streams by consumer-group last-delivered-id.
+    # That ID can include delivered but unACKed PEL entries; trimming them would
+    # erase the only recoverable task/result body and leave Redis coordination
+    # state as the only memory of work.
 
     # Step 2: Poll each project
     total_enqueued = 0
@@ -967,15 +1166,6 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
-                    try:
-                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                    except Exception as clear_err:
-                        logger.error(
-                            "Failed to clear pending task marker for PR #%d: %s",
-                            pr_state.number,
-                            clear_err,
-                            exc_info=True,
-                        )
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
             logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
             ct = _select_claude_token()
@@ -1008,15 +1198,6 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
-                    try:
-                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                    except Exception as clear_err:
-                        logger.error(
-                            "Failed to clear pending task marker for PR #%d: %s",
-                            pr_state.number,
-                            clear_err,
-                            exc_info=True,
-                        )
         elif pr_state.action == PRAction.ENQUEUE_REBASE:
             logger.info(
                 "PR #%d (%s): merge conflicts detected, enqueueing rebase task",
@@ -1053,15 +1234,6 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
-                    try:
-                        clear_pending_task(project_redis, repo, "pr", pr_state.number)
-                    except Exception as clear_err:
-                        logger.error(
-                            "Failed to clear pending task marker for PR #%d: %s",
-                            pr_state.number,
-                            clear_err,
-                            exc_info=True,
-                        )
         elif pr_state.action == PRAction.UPDATE_BRANCH:
             logger.info(
                 "PR #%d (%s): out-of-date with base, calling update-branch",
@@ -1404,14 +1576,6 @@ def _poll_project(
                         f"Failed to publish issue task for issue #{issue_state.number}: {e}",
                         exc_info=True,
                     )
-                    try:
-                        clear_pending_task(project_redis, repo, "issue", issue_state.number)
-                    except Exception as clear_err:
-                        logger.error(
-                            f"Failed to clear pending task marker for issue #{issue_state.number}: "
-                            f"{clear_err}",
-                            exc_info=True,
-                        )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             logger.warning(
                 f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
@@ -1476,6 +1640,7 @@ def _consume_results_for_project(
     labels: LabelConfig,
     logger: logging.Logger,
     token_pool: TokenPool | None = None,
+    max_transient_failures: int = 5,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -1502,7 +1667,15 @@ def _consume_results_for_project(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(project, labels, redis, result, logger, token_pool=token_pool)
+                _handle_result(
+                    project,
+                    labels,
+                    redis,
+                    result,
+                    logger,
+                    token_pool=token_pool,
+                    max_transient_failures=max_transient_failures,
+                )
                 logger.info(f"Recovered pending result {entry_id}")
             except Exception as e:
                 logger.error(
@@ -1533,7 +1706,15 @@ def _consume_results_for_project(
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
-                _handle_result(project, labels, redis, result, logger, token_pool=token_pool)
+                _handle_result(
+                    project,
+                    labels,
+                    redis,
+                    result,
+                    logger,
+                    token_pool=token_pool,
+                    max_transient_failures=max_transient_failures,
+                )
             except Exception as e:
                 logger.error(
                     "Failed to process result entry %s: %s",
@@ -1561,6 +1742,7 @@ def _handle_result(
     result: TaskResult,
     logger: logging.Logger,
     token_pool: TokenPool | None = None,
+    max_transient_failures: int = 5,
 ) -> None:
     """Process a single task result.
 
@@ -1586,28 +1768,10 @@ def _handle_result(
     resource_label = "issue" if is_issue else "PR"
     resource_type = result.resource_type or ("issue" if is_issue else "pr")
 
-    # Guard against stale task IDs.
-    # When result publishing fails in a worker, the pending-task marker is cleared
-    # so the orchestrator can re-enqueue. If the old task entry stays unACKed in the
-    # Redis PEL and a drain later publishes a FAILED result for it, the orchestrator
-    # may have already enqueued a newer task. In that case the pending-task marker
-    # holds the *new* task's ID, and applying label/comment side-effects for the old
-    # task would be incorrect. Skip processing entirely for stale results.
-    #
-    # When current_task_id is None, the pending marker was cleared for
-    # re-enqueueing but no new task has been set yet. Proceeding with
-    # side-effects is correct — there is no active replacement task, so
-    # the result (e.g. needs-human label) should apply.
-    #
-    # Note: true duplicate delivery (same task_id re-delivered by Redis) is NOT
-    # guarded here. When a duplicate arrives, current_task_id will either be None
-    # (marker already cleared on the first pass) or equal to result.task_id —
-    # neither path skips processing. In practice this is acceptable: the worker
-    # ACKs the stream entry immediately after publishing the result, making true
-    # re-delivery extremely rare. GitHub label operations are idempotent, so the
-    # main risk is a duplicate comment. If full idempotency is required in the
-    # future, a Redis SET of processed task IDs with a short TTL would be the
-    # approach.
+    # Guard against stale task IDs. GitHub snapshot validation below is the
+    # authoritative staleness check for PR tasks; the pending marker is only
+    # coordination state that prevents an old result from affecting a newer
+    # in-flight task.
     try:
         current_task_id = get_pending_task(redis, repo, resource_type, resource_id)
         if current_task_id is not None and current_task_id != result.task_id:
@@ -1619,6 +1783,8 @@ def _handle_result(
                 result.task_id,
                 current_task_id,
             )
+            if result.status == ResultStatus.USAGE_EXHAUSTED:
+                _mark_usage_exhausted_token(result, token_pool, logger)
             if token_pool is not None:
                 token_pool.task_completed(result.task_id)
             return
@@ -1631,6 +1797,31 @@ def _handle_result(
             exc_info=True,
         )
 
+    if result.status == ResultStatus.STALE or _is_pr_result_stale(project, result, logger):
+        try:
+            clear_pending_task_if_matches(redis, repo, resource_type, resource_id, result.task_id)
+        except Exception:
+            logger.warning(
+                "Failed to clear stale pending task marker for %s #%d",
+                resource_label,
+                resource_id,
+                exc_info=True,
+            )
+        if not is_issue:
+            try:
+                clear_attempts_if_head_sha(redis, repo, resource_id, result.snapshot_head_sha)
+            except Exception:
+                logger.warning(
+                    "Failed to clear attempt reservation for stale PR result #%d",
+                    resource_id,
+                    exc_info=True,
+                )
+        if result.status == ResultStatus.USAGE_EXHAUSTED:
+            _mark_usage_exhausted_token(result, token_pool, logger)
+        if token_pool is not None:
+            token_pool.task_completed(result.task_id)
+        return
+
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
@@ -1639,7 +1830,7 @@ def _handle_result(
     # if needed. This applies to ALL result statuses — the task is no longer
     # pending regardless of whether it succeeded or failed.
     try:
-        clear_pending_task(redis, repo, resource_type, resource_id)
+        clear_pending_task_if_matches(redis, repo, resource_type, resource_id, result.task_id)
     except Exception as e:
         logger.error(
             f"Failed to clear pending task marker for {resource_label} #{resource_id}: {e}",
@@ -1704,27 +1895,7 @@ def _handle_result(
         # Mark the exhausted token in the pool so it's skipped in future rounds.
         # Use the resets_at timestamp from the stream-json rate_limit_event if
         # available; fall back to querying the usage endpoint; final fallback 30 min.
-        if token_pool is not None:
-            exhausted_token = token_pool.get_task_token(result.task_id)
-            cooldown_until = None
-            # Prefer the timestamp embedded in the task result (from stream-json)
-            if result.rate_limit_resets_at:
-                from datetime import datetime, timezone
-
-                cooldown_until = datetime.fromtimestamp(
-                    result.rate_limit_resets_at, tz=timezone.utc
-                )
-                logger.info(
-                    "Rate limit resets at %s (from stream-json)",
-                    cooldown_until.isoformat(),
-                )
-            elif exhausted_token:
-                # Fall back to querying the usage endpoint
-                try:
-                    cooldown_until = get_token_reset_time(exhausted_token)
-                except Exception as e:
-                    logger.warning("Failed to query token reset time: %s", e)
-            token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
+        _mark_usage_exhausted_token(result, token_pool, logger)
         usage_cooldown_ttl = _usage_exhausted_cooldown_ttl_seconds(result)
         # PR-specific cooldown: clear per-SHA attempts so PR can be re-enqueued
         # after the cooldown expires.  Issues don't have per-SHA counters.
@@ -1788,6 +1959,7 @@ def _handle_result(
     is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
         TRANSIENT_SUMMARY_PREFIX
     )
+    transient_exhausted = False
 
     if is_transient:
         transient_accounting_processed = False
@@ -1804,12 +1976,38 @@ def _handle_result(
             if is_issue:
                 clear_issue_attempts(redis, repo, resource_id)
             else:
+                head_sha = result.snapshot_head_sha
+                try:
+                    attempt_data: dict[str, str] = redis.hgetall(
+                        f"pr:{repo}:{resource_id}:attempts"
+                    )
+                    attempt_head_sha = attempt_data.get("head_sha", "")
+                    if attempt_head_sha:
+                        head_sha = attempt_head_sha
+                except Exception:
+                    logger.debug(
+                        "Failed to read attempt SHA before transient cleanup for PR #%d",
+                        resource_id,
+                        exc_info=True,
+                    )
                 if transient_accounting_processed:
                     transient_count = increment_transient_failure_count(
                         redis, repo, resource_id
                     )
-                    set_backoff_cooldown(redis, repo, resource_id, transient_count - 1)
-                clear_attempts(redis, repo, resource_id)
+                    if transient_count > max_transient_failures:
+                        transient_exhausted = True
+                        clear_backoff(redis, repo, resource_id)
+                    else:
+                        set_backoff_cooldown(
+                            redis,
+                            repo,
+                            resource_id,
+                            transient_count - 1,
+                            head_sha=head_sha,
+                        )
+                        clear_attempts(redis, repo, resource_id)
+                else:
+                    clear_attempts(redis, repo, resource_id)
         except Exception as e:
             logger.error(
                 f"Failed to clear attempts for transient failure on "
@@ -1820,17 +2018,18 @@ def _handle_result(
     # Manage labels based on result status.
     # Only terminal statuses (FAILED, BLOCKED) add labels.
     # USAGE_EXHAUSTED adds no labels — the PR will resume via the cooldown mechanism.
-    # Transient failures skip labeling — they will be retried automatically.
+    # Transient failures skip labeling until their retry budget is exhausted.
     labeled = False
-    if result.status == ResultStatus.FAILED and not is_transient:
+    if result.status == ResultStatus.FAILED and (not is_transient or transient_exhausted):
         if not is_issue:
-            try:
-                increment_total_attempts(redis, repo, resource_id)
-            except Exception as e:
-                logger.error(
-                    f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
-                    exc_info=True,
-                )
+            if not is_transient:
+                try:
+                    increment_total_attempts(redis, repo, resource_id)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
+                        exc_info=True,
+                    )
         try:
             _add_label(repo, resource_id, labels.needs_human, token)
             labeled = True
@@ -1854,7 +2053,7 @@ def _handle_result(
     if result.status != ResultStatus.COMPLETED:
         safe_summary = result.summary[:500] if result.summary else ""
 
-        if result.status == ResultStatus.FAILED and is_transient:
+        if result.status == ResultStatus.FAILED and is_transient and not transient_exhausted:
             # Transient failures are retried silently — no comment to avoid
             # accumulating noise if infrastructure is degraded across many attempts.
             if token_pool is not None:

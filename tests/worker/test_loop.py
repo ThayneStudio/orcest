@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import signal
 import threading
 from pathlib import Path
@@ -24,7 +25,9 @@ from orcest.worker.loop import (
     RESULTS_STREAM,
     _check_gh_credentials,
     _clear_pending_task_for_task,
+    _clear_task_attempt_reservation,
     _dead_letter_task,
+    _drain_pending_tasks_raw,
     _execute_task,
     _make_abort_event,
     _publish_result_with_retry,
@@ -60,6 +63,7 @@ def sample_task():
         resource_id=42,
         prompt="Fix the failing CI checks",
         branch="fix-ci",
+        snapshot_head_sha="abc123",
     )
 
 
@@ -68,8 +72,18 @@ def mock_workspace():
     """A mock Workspace whose setup() returns a tmp path without cloning."""
     ws = MagicMock()
     ws.setup.return_value = Path("/tmp/fake-workspace/repo")
+    ws.current_head_sha.return_value = "abc123"
     ws.cleanup.return_value = None
     return ws
+
+
+@pytest.fixture(autouse=True)
+def _mock_worker_pr_snapshot(mocker):
+    """Default PR snapshot lookup for tests that exercise normal PR execution."""
+    return mocker.patch(
+        "orcest.worker.loop.gh.get_pr",
+        return_value={"headRefOid": "abc123", "statusCheckRollup": []},
+    )
 
 
 def _success_runner_result() -> RunnerResult:
@@ -187,6 +201,333 @@ class TestExecuteTask:
         assert result.task_id == sample_task.id
         assert "merge conflict" in result.summary.lower()
         assert not result.summary.startswith("[transient] ")
+
+    def test_pr_task_stale_when_head_sha_changed(self, local_worker_config, mock_workspace, mocker):
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+            snapshot_head_sha="sha-old",
+            decision_reason="ci_failure",
+            snapshot_failed_checks=["tests"],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={"headRefOid": "sha-new", "statusCheckRollup": []},
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        assert result.snapshot_head_sha == "sha-old"
+        mock_runner.run.assert_not_called()
+        mock_workspace.setup.assert_not_called()
+
+    def test_snapshotless_pr_task_is_stale(self, local_worker_config, mock_workspace):
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+        mock_workspace.setup.assert_not_called()
+
+    def test_pr_ci_task_stale_when_failed_check_now_green(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+            snapshot_head_sha="sha-same",
+            decision_reason="ci_failure",
+            snapshot_failed_checks=["tests"],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={
+                "headRefOid": "sha-same",
+                "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}],
+            },
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+
+    def test_pr_ci_task_stale_when_same_check_name_has_different_run(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+            snapshot_head_sha="sha-same",
+            decision_reason="ci_failure",
+            snapshot_failed_checks=["https://github.com/o/r/actions/runs/1"],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={
+                "headRefOid": "sha-same",
+                "statusCheckRollup": [
+                    {
+                        "name": "tests",
+                        "conclusion": "FAILURE",
+                        "detailsUrl": "https://github.com/o/r/actions/runs/2",
+                    }
+                ],
+            },
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+
+    def test_pr_ci_task_stale_when_same_context_has_different_target_url(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        snapshot = json.dumps(
+            {
+                "context": "build",
+                "details_url": "",
+                "name": "",
+                "target_url": "https://ci.example/build/old",
+                "workflow_name": "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+            snapshot_head_sha="sha-same",
+            decision_reason="ci_failure",
+            snapshot_failed_checks=[snapshot],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={
+                "headRefOid": "sha-same",
+                "statusCheckRollup": [
+                    {
+                        "context": "build",
+                        "state": "FAILURE",
+                        "targetUrl": "https://ci.example/build/new",
+                    }
+                ],
+            },
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+
+    def test_review_task_stale_when_thread_body_changes(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        old_fingerprint = (
+            '{"comments":[{"author":"alice","body":"old feedback","created_at":"","id":"","updated_at":""}],'
+            '"id":"thread-1","line":"10","path":"app.py"}'
+        )
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix review",
+            branch="fix-review",
+            snapshot_head_sha="sha-same",
+            decision_reason="changes_requested",
+            snapshot_review_thread_ids=["thread-1"],
+            snapshot_review_thread_fingerprints=[old_fingerprint],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={"headRefOid": "sha-same"},
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_unresolved_review_threads",
+            return_value=[
+                {
+                    "id": "thread-1",
+                    "path": "app.py",
+                    "line": 10,
+                    "comments": [{"author": "alice", "body": "new feedback"}],
+                }
+            ],
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+
+    def test_merge_conflict_rebase_task_stale_when_conflict_resolved(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        task = Task.create(
+            task_type=TaskType.REBASE_PR,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Rebase",
+            branch="fix-conflict",
+            snapshot_head_sha="sha-same",
+            decision_reason="merge_conflict_rebase",
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={
+                "headRefOid": "sha-same",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+        )
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
+
+    def test_pr_task_stale_when_cloned_head_differs(
+        self, local_worker_config, mock_workspace, mocker
+    ):
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix CI",
+            branch="fix-ci",
+            snapshot_head_sha="sha-expected",
+            decision_reason="ci_failure",
+            snapshot_failed_checks=["tests"],
+        )
+        mocker.patch(
+            "orcest.worker.loop.gh.get_pr",
+            return_value={
+                "headRefOid": "sha-expected",
+                "statusCheckRollup": [{"name": "tests", "conclusion": "FAILURE"}],
+            },
+        )
+        mock_workspace.current_head_sha.return_value = "sha-other"
+        mock_runner = MagicMock()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.STALE
+        mock_runner.run.assert_not_called()
 
     def test_worker_handles_usage_exhaustion(
         self, local_worker_config, sample_task, mock_workspace
@@ -665,6 +1006,7 @@ class TestExecuteTask:
             prompt="rebase",
             branch="feature",
             base_branch="main",
+            snapshot_head_sha="abc123",
         )
         mock_runner = MagicMock()
         mock_runner.run.return_value = _success_runner_result()
@@ -759,6 +1101,7 @@ class TestRunWorker:
         # Patch Workspace to avoid real filesystem
         mock_ws = MagicMock()
         mock_ws.setup.return_value = Path("/tmp/fake-workspace/repo")
+        mock_ws.current_head_sha.return_value = "abc123"
         mock_ws.cleanup.return_value = None
         mocker.patch("orcest.worker.loop.Workspace", return_value=mock_ws)
 
@@ -892,10 +1235,12 @@ class TestRunWorker:
 
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
-        task is ACKed so it is not redelivered.
+        task is ACKed only after matching coordination state is cleared.
         """
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
+        mock_attempts = mocker.patch("orcest.worker.loop._clear_task_attempt_reservation")
 
         # Simulate lock already held: set returns None (NX fails)
         mock_redis.client.set.return_value = None
@@ -909,6 +1254,8 @@ class TestRunWorker:
         # The task must still be ACKed (to avoid redelivery)
         expected_fq_stream = f"{worker_config.redis.key_prefix}:tasks:{worker_config.backend}"
         mock_redis.xack_raw.assert_called_once_with(expected_fq_stream, CONSUMER_GROUP, "entry-1")
+        mock_clear.assert_called_once()
+        mock_attempts.assert_called_once()
         # No result should be published
         mock_redis.xadd.assert_not_called()
 
@@ -935,9 +1282,8 @@ class TestRunWorker:
         assert parsed.worker_id == worker_config.worker_id
         assert parsed.resource_id == sample_task.resource_id
 
-    def test_worker_clears_pending_marker_after_success(self, mocker, worker_config, sample_task):
-        """After a successful task, the pending-task marker is cleared so the
-        orchestrator can re-enqueue if needed."""
+    def test_worker_leaves_pending_marker_after_success(self, mocker, worker_config, sample_task):
+        """After a successful result publish, orchestrator result handling owns pending cleanup."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
@@ -946,7 +1292,7 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        mock_clear.assert_called_once()
+        mock_clear.assert_not_called()
 
     def test_worker_handles_runner_failure(self, mocker, worker_config, sample_task):
         """When the runner returns success=False, the result has FAILED status."""
@@ -1127,6 +1473,7 @@ class TestRunWorker:
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
+        mock_attempts = mocker.patch("orcest.worker.loop._clear_task_attempt_reservation")
 
         # Make the results-stream publish fail during drain
         mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
@@ -1162,6 +1509,7 @@ class TestRunWorker:
         mocks["runner"].run.assert_not_called()
         # The pending-task marker must still be cleared despite publish failure
         mock_clear.assert_called()
+        mock_attempts.assert_called()
 
     def test_abort_event_fires_on_sigterm(self, mocker, worker_config, sample_task):
         """The abort_event passed to _execute_task is set when SIGTERM fires,
@@ -1747,7 +2095,10 @@ class TestDeadLetterTask:
         mock_redis.xadd_capped.return_value = "1-0"
         mock_redis.xack_raw.return_value = 1
 
-        with patch("orcest.worker.loop._clear_pending_task_for_task") as mock_clear:
+        with (
+            patch("orcest.worker.loop._clear_pending_task_for_task") as mock_clear,
+            patch("orcest.worker.loop._clear_task_attempt_reservation") as mock_attempts,
+        ):
             _dead_letter_task(
                 mock_redis,
                 "tasks:claude",
@@ -1758,6 +2109,7 @@ class TestDeadLetterTask:
             )
 
             mock_clear.assert_called_once()
+            mock_attempts.assert_called_once()
 
     def test_clears_pending_marker_even_when_publish_and_ack_fail(
         self, local_worker_config, sample_task
@@ -2129,12 +2481,45 @@ class TestCheckGhCredentials:
 # ---------------------------------------------------------------------------
 
 
+def test_drain_pending_tasks_preserves_snapshot_metadata(local_worker_config):
+    task = Task.create(
+        task_type=TaskType.FIX_CI,
+        repo="owner/repo",
+        token="tok",
+        resource_type="pr",
+        resource_id=42,
+        prompt="fix it",
+        branch="feature",
+        snapshot_head_sha="sha-old",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+    )
+    mock_redis = MagicMock()
+    mock_redis.xreadgroup_multi.side_effect = [
+        [("tasks", "1-0", task.to_dict())],
+        [],
+    ]
+
+    _drain_pending_tasks_raw(
+        mock_redis,
+        "tasks",
+        local_worker_config,
+        logging.getLogger("test"),
+    )
+
+    fields = mock_redis.xadd_capped.call_args.args[1]
+    result = TaskResult.from_dict(fields)
+    assert result.snapshot_head_sha == "sha-old"
+    assert result.decision_reason == "ci_failure"
+    assert result.snapshot_failed_checks == ["tests"]
+
+
 @pytest.mark.unit
 class TestMultiProjectRouting:
     """Tests for multi-project key_prefix routing in pending-task clearing
     and result publishing."""
 
-    def test_clear_pending_task_for_task_uses_task_key_prefix(self):
+    def test_clear_pending_task_for_task_uses_task_key_prefix(self, fake_redis_client):
         """When a Task carries a key_prefix, _clear_pending_task_for_task must
         call redis.delete_raw with the fully-qualified pending key that includes
         the project prefix, NOT the worker's default prefix."""
@@ -2148,16 +2533,34 @@ class TestMultiProjectRouting:
             branch="feature",
             key_prefix="projectA",
         )
-        mock_redis = MagicMock()
-
-        _clear_pending_task_for_task(mock_redis, task)
-
         expected_key = "projectA:pending:pr:owner/repo:42"
-        mock_redis.delete_raw.assert_called_once_with(expected_key)
-        # Must NOT fall back to the prefixed delete (clear_pending_task path)
-        mock_redis.delete.assert_not_called()
+        fake_redis_client.set_nx_ex_raw(expected_key, task.id, ttl=300)
 
-    def test_clear_pending_task_for_task_falls_back_to_default(self):
+        _clear_pending_task_for_task(fake_redis_client, task)
+
+        assert fake_redis_client.get_raw(expected_key) is None
+
+    def test_clear_pending_task_for_task_does_not_delete_different_raw_task(
+        self, fake_redis_client
+    ):
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="projectA",
+        )
+        expected_key = "projectA:pending:pr:owner/repo:42"
+        fake_redis_client.set_nx_ex_raw(expected_key, '{"task_id": "newer-task"}', ttl=300)
+
+        _clear_pending_task_for_task(fake_redis_client, task)
+
+        assert fake_redis_client.get_raw(expected_key) == '{"task_id": "newer-task"}'
+
+    def test_clear_pending_task_for_task_falls_back_to_default(self, fake_redis_client):
         """When a Task has an empty key_prefix, _clear_pending_task_for_task
         must fall back to clear_pending_task which uses the worker's default
         Redis key prefix (via redis.delete, not delete_raw)."""
@@ -2171,13 +2574,47 @@ class TestMultiProjectRouting:
             branch="feature",
             key_prefix="",
         )
+        fake_redis_client.set_nx_ex("pending:pr:owner/repo:42", task.id, ttl=300)
+
+        _clear_pending_task_for_task(fake_redis_client, task)
+
+        assert fake_redis_client.get("pending:pr:owner/repo:42") is None
+
+    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(self):
+        """No-result worker paths must clear PR attempts in the project namespace."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            key_prefix="projectA",
+        )
         mock_redis = MagicMock()
 
-        _clear_pending_task_for_task(mock_redis, task)
+        _clear_task_attempt_reservation(mock_redis, task)
 
-        # Should call the prefixed delete path (clear_pending_task -> redis.delete)
-        mock_redis.delete.assert_called_once_with("pending:pr:owner/repo:42")
-        # Must NOT call the raw delete
+        mock_redis.delete_raw.assert_called_once_with("projectA:pr:owner/repo:42:attempts")
+        mock_redis.delete.assert_not_called()
+
+    def test_clear_task_attempt_reservation_falls_back_to_default_for_issue(self):
+        """No-result issue cleanup uses the normal prefixed delete path."""
+        task = Task.create(
+            task_type=TaskType.IMPLEMENT_ISSUE,
+            repo="owner/repo",
+            token="tok",
+            resource_type="issue",
+            resource_id=7,
+            prompt="fix it",
+            key_prefix="",
+        )
+        mock_redis = MagicMock()
+
+        _clear_task_attempt_reservation(mock_redis, task)
+
+        mock_redis.delete.assert_called_once_with("issue:owner/repo:7:attempts")
         mock_redis.delete_raw.assert_not_called()
 
     def test_result_published_to_correct_project_stream(self, monkeypatch):

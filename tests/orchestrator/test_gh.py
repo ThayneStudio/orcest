@@ -346,8 +346,12 @@ def test_get_unresolved_review_threads(mocker):
     assert thread["path"] == "src/foo.py"
     assert thread["line"] == 42
     assert len(thread["comments"]) == 2
-    assert thread["comments"][0] == {"author": "reviewer1", "body": "Fix this"}
-    assert thread["comments"][1] == {"author": "reviewer2", "body": "Agreed"}
+    assert thread["comments"][0]["author"] == "reviewer1"
+    assert thread["comments"][0]["body"] == "Fix this"
+    assert {"id", "createdAt", "updatedAt"} <= set(thread["comments"][0])
+    assert thread["comments"][1]["author"] == "reviewer2"
+    assert thread["comments"][1]["body"] == "Agreed"
+    assert {"id", "createdAt", "updatedAt"} <= set(thread["comments"][1])
 
 
 def test_get_unresolved_review_threads_author_login_extracted(mocker):
@@ -390,7 +394,9 @@ def test_get_unresolved_review_threads_author_login_extracted(mocker):
     result = get_unresolved_review_threads(REPO, 1, TOKEN)
 
     assert len(result) == 1
-    assert result[0]["comments"] == [{"author": "octocat", "body": "Please fix this"}]
+    assert result[0]["comments"][0]["author"] == "octocat"
+    assert result[0]["comments"][0]["body"] == "Please fix this"
+    assert {"id", "createdAt", "updatedAt"} <= set(result[0]["comments"][0])
 
 
 def test_get_unresolved_threads_all_resolved(mocker):

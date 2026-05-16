@@ -307,7 +307,7 @@ def get_pr(repo: str, number: int, token: str) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,headRefName,baseRefName,state,"
+            "number,title,body,headRefName,headRefOid,baseRefName,state,"
             "labels,reviewDecision,reviews,"
             "statusCheckRollup,commits,additions,deletions,"
             "mergeable,mergeStateStatus",
@@ -586,7 +586,7 @@ def get_unresolved_review_threads(repo: str, number: int, token: str) -> list[di
     to only those that are not yet resolved.
 
     Returns list of dicts with keys: id, path, line, comments.
-    Each comment dict has keys: author, body.
+    Each comment dict has keys: id, author, body, createdAt, updatedAt.
     """
     _validate_repo(repo)
     owner, name = repo.split("/", 1)
@@ -605,8 +605,11 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           comments(last: 100) {
             pageInfo { hasPreviousPage }
             nodes {
+              id
               author { login }
               body
+              createdAt
+              updatedAt
             }
           }
         }
@@ -718,8 +721,11 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             author_info = comment.get("author") or {}
             comments.append(
                 {
+                    "id": comment.get("id", ""),
                     "author": author_info.get("login", ""),
                     "body": comment.get("body", ""),
+                    "createdAt": comment.get("createdAt", ""),
+                    "updatedAt": comment.get("updatedAt", ""),
                 }
             )
         results.append(

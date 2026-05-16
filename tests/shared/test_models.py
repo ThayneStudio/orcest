@@ -55,7 +55,13 @@ def test_task_to_dict_values_are_strings():
 
 
 def test_task_to_dict_from_dict_round_trip():
-    original = _make_task()
+    original = _make_task(
+        snapshot_head_sha="abc123",
+        decision_reason="ci_failure",
+        snapshot_failed_checks=["tests"],
+        snapshot_review_thread_ids=["thread-1"],
+        snapshot_review_thread_fingerprints=["thread-1:fingerprint"],
+    )
     rebuilt = Task.from_dict(original.to_dict())
 
     assert rebuilt.id == original.id
@@ -66,6 +72,11 @@ def test_task_to_dict_from_dict_round_trip():
     assert rebuilt.resource_id == original.resource_id
     assert rebuilt.prompt == original.prompt
     assert rebuilt.branch == original.branch
+    assert rebuilt.snapshot_head_sha == "abc123"
+    assert rebuilt.decision_reason == "ci_failure"
+    assert rebuilt.snapshot_failed_checks == ["tests"]
+    assert rebuilt.snapshot_review_thread_ids == ["thread-1"]
+    assert rebuilt.snapshot_review_thread_fingerprints == ["thread-1:fingerprint"]
     # Datetime round-trip through isoformat loses sub-microsecond
     # precision but should be equal within a second.
     assert abs((rebuilt.created_at - original.created_at).total_seconds()) < 1
@@ -87,7 +98,12 @@ def test_task_type_enum_round_trip():
 
 
 def test_task_result_to_dict_from_dict_round_trip():
-    original = _make_task_result()
+    original = _make_task_result(
+        snapshot_head_sha="abc123",
+        decision_reason="changes_requested",
+        snapshot_review_thread_ids=["thread-1"],
+        snapshot_review_thread_fingerprints=["thread-1:fingerprint"],
+    )
     rebuilt = TaskResult.from_dict(original.to_dict())
 
     assert rebuilt.task_id == original.task_id
@@ -98,6 +114,10 @@ def test_task_result_to_dict_from_dict_round_trip():
     assert rebuilt.duration_seconds == original.duration_seconds
     assert rebuilt.resource_type == original.resource_type
     assert rebuilt.resource_id == original.resource_id
+    assert rebuilt.snapshot_head_sha == "abc123"
+    assert rebuilt.decision_reason == "changes_requested"
+    assert rebuilt.snapshot_review_thread_ids == ["thread-1"]
+    assert rebuilt.snapshot_review_thread_fingerprints == ["thread-1:fingerprint"]
 
 
 def test_result_status_enum_round_trip():
