@@ -68,6 +68,47 @@ def test_empty_logs():
     assert result is CIFailureType.UNKNOWN
 
 
+# -- Definitive code signal beats incidental transient keyword ---------------
+
+
+def test_assertion_error_beats_incidental_timeout_keyword():
+    """A real test failure must not be misread as transient because the long
+    CI log happens to contain the word "timeout" somewhere unrelated."""
+    logs = (
+        "Running edge function tests...\n"
+        "request timeout is configured to 30s\n"  # incidental transient keyword
+        "error: AssertionError: Values are not equal.\n"
+        "    -   200\n    +   400\n"
+        "FAILED | 59 passed | 3 failed (63ms)\n"
+        "##[error]Process completed with exit code 1.\n"
+    )
+    assert (
+        classify_ci_failure("Deno tests (edge functions)", logs)
+        is CIFailureType.CODE
+    )
+
+
+def test_test_summary_counts_beat_incidental_transient_keyword():
+    """A test-summary line with passed+failed counts is a definitive code
+    failure even when a transient keyword appears elsewhere."""
+    logs = "connection reset noted in one flaky step\nTests: 3 failed, 10 passed\n"
+    assert classify_ci_failure("jest", logs) is CIFailureType.CODE
+
+
+def test_genuine_transient_without_code_signal_stays_transient():
+    """No definitive code signal -> a transient keyword still wins."""
+    logs = "##[error]The operation was canceled.\nECONNREFUSED 10.0.0.1:443\n"
+    assert classify_ci_failure("build", logs) is CIFailureType.TRANSIENT
+
+
+def test_step_number_failed_is_not_a_test_summary():
+    """'Step 3 failed' must not be mistaken for a '3 failed' test summary."""
+    assert (
+        classify_ci_failure("build", logs="Step 3 failed: timeout")
+        is CIFailureType.TRANSIENT
+    )
+
+
 # -- Case insensitivity ------------------------------------------------------
 
 

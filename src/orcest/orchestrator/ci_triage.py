@@ -1,9 +1,17 @@
 """CI failure classification using heuristic pattern matching.
 
 Classifies CI failures without Claude by matching check run names and log
-snippets against known patterns. Pattern matching order: transient first
-(cheapest to handle), then dependency, then code (most common). Unknown
+snippets against known patterns.
+
+Matching order: definitive code-failure signals first (a build/test tool
+actually ran and reported a real defect — never produced by flaky infra),
+then transient, then dependency, then the broader code patterns. Unknown
 is the fallback for cases needing Claude classification in Phase 2.
+
+The definitive-code precedence exists because transient patterns are matched
+against the whole log: a bare keyword like "timeout" appearing incidentally
+in a long log would otherwise mask a genuine ``AssertionError`` and send a
+deterministically-failing PR into an endless transient-rerun loop.
 """
 
 import re
@@ -30,6 +38,22 @@ TRANSIENT_PATTERNS: list[str] = [
     r"rate limit",
     r"socket hang up",
     r"ECONNREFUSED",
+]
+
+# Definitive code-failure signals. When any of these is present the build or
+# test tooling ran and reported a real defect (a parse error, a failed
+# assertion, a test-summary line with a non-zero failed count). Flaky infra
+# — network timeouts, runner crashes, 5xx — never produces these, so they win
+# over an incidental transient keyword elsewhere in the log.
+DEFINITIVE_CODE_PATTERNS: list[str] = [
+    r"\bAssertionError\b",
+    r"\bSyntaxError\b",
+    r"\bIndentationError\b",
+    # Test-summary lines: a failed count next to a passed count, either order
+    # ("59 passed | 3 failed", "Tests: 3 failed, 10 passed"). Requiring both
+    # counts on one line avoids matching a step number like "Step 3 failed".
+    r"\d+\s+passed\b.{0,40}\b\d+\s+failed\b",
+    r"\d+\s+failed\b.{0,40}\b\d+\s+passed\b",
 ]
 
 CODE_PATTERNS: list[str] = [
@@ -75,6 +99,13 @@ def classify_ci_failure(
         CIFailureType classification.
     """
     text = f"{check_name}\n{logs}"
+
+    # Definitive code-failure signals win over an incidental transient
+    # keyword: flaky infra never produces an assertion error or a test
+    # summary with failure counts.
+    for pattern in DEFINITIVE_CODE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return CIFailureType.CODE
 
     for pattern in TRANSIENT_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
