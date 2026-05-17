@@ -32,7 +32,6 @@ from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
     get_attempt_count,
-    get_exhausted_notified,
     get_stale_retrigger_sha,
     get_total_attempt_count,
     has_usage_exhausted_cooldown,
@@ -97,6 +96,8 @@ def _make_task_result(
     resource_id: int | None = None,
     rate_limit_resets_at: int = 0,
     snapshot_head_sha: str | None = None,
+    needs_human: bool = False,
+    needs_human_reason: str = "",
 ) -> TaskResult:
     """Build a TaskResult for result-handling tests.
 
@@ -123,6 +124,8 @@ def _make_task_result(
             if snapshot_head_sha is not None
             else ("abc123" if resource_type == "pr" else "")
         ),
+        needs_human=needs_human,
+        needs_human_reason=needs_human_reason,
     )
 
 
@@ -147,19 +150,13 @@ def test_merge_status_indicates_conflict_for_github_states():
     assert _merge_status_indicates_conflict(
         {"mergeable": "CONFLICTING", "mergeStateStatus": "BLOCKED"}
     )
-    assert _merge_status_indicates_conflict(
-        {"mergeable": "MERGEABLE", "mergeStateStatus": "DIRTY"}
-    )
+    assert _merge_status_indicates_conflict({"mergeable": "MERGEABLE", "mergeStateStatus": "DIRTY"})
     assert (
-        _merge_status_indicates_conflict(
-            {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"}
-        )
+        _merge_status_indicates_conflict({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"})
         is False
     )
     assert (
-        _merge_status_indicates_conflict(
-            {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}
-        )
+        _merge_status_indicates_conflict({"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"})
         is None
     )
 
@@ -398,13 +395,14 @@ def test_poll_cycle_merge_conflict_enqueues_rebase(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_poll_cycle_non_conflict_merge_failure_labels_needs_human(
+def test_poll_cycle_non_conflict_merge_failure_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """Non-conflict merge failures still get escalated for manual review."""
+    """A non-conflict merge failure backs off and retries -- it is never
+    escalated to needs-human."""
     pr_state = PRState(
         number=41,
         title="PR #41",
@@ -429,16 +427,10 @@ def test_poll_cycle_non_conflict_merge_failure_labels_needs_human(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        41,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed to merge" in comment_body
-    assert "repository rule violation" in comment_body
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    # A backoff cooldown was set so the merge is retried later.
+    assert get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 41) is not None
 
 
 def test_poll_cycle_merge_stale_head_skips_needs_human(
@@ -535,13 +527,13 @@ def test_poll_cycle_merge_conflict_token_exhausted_skips_needs_human(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_poll_cycle_skip_max_attempts_labels_and_comments(
+def test_poll_cycle_skip_max_attempts_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """SKIP_MAX_ATTEMPTS adds needs-human label and posts an explanatory comment."""
+    """SKIP_MAX_ATTEMPTS backs off and retries -- it never labels needs-human."""
     pr_state = _make_pr_state(number=50, action=PRAction.SKIP_MAX_ATTEMPTS)
 
     mocker.patch(
@@ -555,28 +547,23 @@ def test_poll_cycle_skip_max_attempts_labels_and_comments(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Should add needs-human label
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        50,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    # Should post a comment about exhausted retry budget
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "exhausted" in comment_body
-    assert str(orchestrator_config.max_attempts) in comment_body
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 50) is not None
 
 
-def test_poll_cycle_skip_max_total_attempts_labels_and_comments(
+def test_poll_cycle_skip_max_total_attempts_backs_off_and_resets(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """SKIP_MAX_TOTAL_ATTEMPTS adds needs-human label and explains the hard stop."""
+    """SKIP_MAX_TOTAL_ATTEMPTS backs off, resets the total counter so work
+    resumes, and never labels needs-human."""
+    repo = orchestrator_config.projects[0].repo
     pr_state = _make_pr_state(number=53, action=PRAction.SKIP_MAX_TOTAL_ATTEMPTS)
+    for _ in range(orchestrator_config.max_total_attempts):
+        increment_total_attempts(fake_redis_client, repo, 53)
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -589,70 +576,11 @@ def test_poll_cycle_skip_max_total_attempts_labels_and_comments(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        53,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "exhausted" in comment_body
-    assert str(orchestrator_config.max_total_attempts) in comment_body
-    assert "failed attempts across commits" in comment_body
-    assert get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 53)
-
-
-def test_poll_cycle_skip_max_attempts_sets_exhausted_notified(
-    mocker,
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-):
-    """SKIP_MAX_ATTEMPTS sets the exhausted_notified Redis flag after labeling."""
-    pr_state = _make_pr_state(number=51, action=PRAction.SKIP_MAX_ATTEMPTS)
-
-    mocker.patch(
-        "orcest.orchestrator.loop.discover_actionable_prs",
-        return_value=[pr_state],
-    )
-    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
-    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
-
-    # Label was applied successfully
-    gh_mock.add_label.assert_called_once()
-    # exhausted_notified flag must be set in Redis
-    assert get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 51)
-
-
-def test_poll_cycle_skip_max_attempts_label_failure_does_not_set_exhausted_notified(
-    mocker,
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-):
-    """When add_label fails, exhausted_notified must NOT be set (labeled=False path)."""
-    pr_state = _make_pr_state(number=52, action=PRAction.SKIP_MAX_ATTEMPTS)
-
-    mocker.patch(
-        "orcest.orchestrator.loop.discover_actionable_prs",
-        return_value=[pr_state],
-    )
-    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
-    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    gh_mock.add_label.side_effect = RuntimeError("label API down")
-
-    logger = logging.getLogger("test")
-    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
-
-    # exhausted_notified flag must NOT be set when labeling failed
-    assert not get_exhausted_notified(fake_redis_client, orchestrator_config.projects[0].repo, 52)
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert get_backoff_step(fake_redis_client, repo, 53) is not None
+    # The total-attempt counter is reset so the PR resumes after the cooldown.
+    assert get_total_attempt_count(fake_redis_client, repo, 53) == 0
 
 
 def test_poll_cycle_skip_backoff_no_label_no_comment(
@@ -745,9 +673,7 @@ def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
             "detailsUrl": "https://github.com/org/repo/actions/runs/42007/job/1",
         }
     ]
-    pr_state = _make_pr_state(
-        number=78, action=PRAction.ENQUEUE_FIX, ci_failures=ci_failures
-    )
+    pr_state = _make_pr_state(number=78, action=PRAction.ENQUEUE_FIX, ci_failures=ci_failures)
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -801,9 +727,7 @@ def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
             "detailsUrl": "https://github.com/org/repo/actions/runs/42008/job/1",
         }
     ]
-    pr_state = _make_pr_state(
-        number=79, action=PRAction.ENQUEUE_FIX, ci_failures=ci_failures
-    )
+    pr_state = _make_pr_state(number=79, action=PRAction.ENQUEUE_FIX, ci_failures=ci_failures)
 
     mocker.patch(
         "orcest.orchestrator.loop.discover_actionable_prs",
@@ -969,7 +893,7 @@ def test_consume_results_completed_does_not_clear_total_attempts(
 
 
 def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock):
-    """A FAILED result adds needs-human label."""
+    """An ordinary FAILED result is retried silently -- no label, no comment."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(status=ResultStatus.FAILED, pr_number=55)
@@ -978,24 +902,41 @@ def test_consume_results_failed(fake_redis_client, orchestrator_config, gh_mock)
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    labels = orchestrator_config.labels
-
-    # Should post a comment mentioning failure
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed" in comment_body
-    assert labels.needs_human in comment_body
-
-    # No label removals
+    # An ordinary fix-attempt failure is never escalated and never commented on.
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
     gh_mock.remove_label.assert_not_called()
 
-    # Should add needs-human
+
+def test_consume_results_failed_with_needs_human_signal(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A FAILED result carrying the worker's NEEDS_HUMAN signal -- and only
+    that -- applies the needs-human label and comments the worker's reason."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=55,
+        summary="Investigated; a product decision is required.",
+        needs_human=True,
+        needs_human_reason="product owner must choose the canonical role value",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    labels = orchestrator_config.labels
     gh_mock.add_label.assert_called_once_with(
         orchestrator_config.github.repo,
         55,
         labels.needs_human,
         orchestrator_config.github.token,
     )
+    gh_mock.post_comment.assert_called_once()
+    comment_body = gh_mock.post_comment.call_args[0][2]
+    assert "product owner must choose the canonical role value" in comment_body
 
 
 def test_consume_results_transient_failure_no_needs_human(
@@ -1083,10 +1024,11 @@ def test_consume_results_transient_failure_at_budget_still_retries(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_consume_results_transient_failure_over_budget_escalates(
+def test_consume_results_transient_failure_over_budget_keeps_retrying(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """The sixth transient PR failure labels needs-human instead of silent retry."""
+    """Past the transient budget, orcest keeps retrying at the capped backoff
+    cadence -- it never escalates a transient failure to needs-human."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     orchestrator_config.max_transient_failures = 5
 
@@ -1102,7 +1044,7 @@ def test_consume_results_transient_failure_over_budget_escalates(
     result = _make_task_result(
         status=ResultStatus.FAILED,
         pr_number=pr_number,
-        summary="[transient] Timed out after 1800s",
+        summary="[transient] Timed out after 5400s",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
@@ -1110,16 +1052,12 @@ def test_consume_results_transient_failure_over_budget_escalates(
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
     assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 6
-    assert get_backoff_step(fake_redis_client, repo, pr_number) is None
-    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
-    gh_mock.add_label.assert_called_once_with(
-        repo,
-        pr_number,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    gh_mock.post_comment.assert_called_once()
-    assert "transient" in gh_mock.post_comment.call_args[0][2].lower()
+    # A backoff is still set (the step clamps rather than escalating).
+    assert get_backoff_step(fake_redis_client, repo, pr_number) is not None
+    # Per-SHA attempts are cleared so the PR retries after the cooldown.
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_consume_results_transient_failure_clears_issue_attempts(
@@ -1158,10 +1096,11 @@ def test_consume_results_transient_failure_clears_issue_attempts(
     gh_mock.post_issue_comment.assert_not_called()
 
 
-def test_consume_results_permanent_failure_still_labels(
+def test_consume_results_permanent_failure_bumps_total_but_does_not_label(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A non-transient FAILED result adds needs-human and bumps total_attempts."""
+    """A non-transient FAILED result bumps total_attempts (which only paces the
+    retry cadence) but never adds needs-human."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     repo = orchestrator_config.github.repo
@@ -1177,16 +1116,10 @@ def test_consume_results_permanent_failure_still_labels(
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    labels = orchestrator_config.labels
-
-    # Should add needs-human label
-    gh_mock.add_label.assert_called_once_with(
-        repo,
-        57,
-        labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    # Terminal failures are the only events that bump the cross-SHA counter.
+    # No escalation -- the failure is just retried.
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    # Non-transient failures still bump the cross-SHA counter (paces backoff).
     assert get_total_attempt_count(fake_redis_client, repo, 57) == 1
 
 
@@ -1530,13 +1463,13 @@ def test_poll_cycle_merge_comment_failure_logged(
     gh_mock.post_comment.assert_called_once()
 
 
-def test_poll_cycle_merge_fail_label_fail(
+def test_poll_cycle_merge_fail_does_not_label(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """Merge fails AND add_label('orcest:needs-human') raises -- labeled=False in comment."""
+    """A non-conflict merge failure never labels or comments -- it backs off."""
     pr_state = PRState(
         number=81,
         title="PR #81",
@@ -1556,18 +1489,14 @@ def test_poll_cycle_merge_fail_label_fail(
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    # merge fails for a non-conflict reason, then add_label also fails
     gh_mock.merge_pr.side_effect = RuntimeError("repository rule violation")
-    gh_mock.add_label.side_effect = RuntimeError("label API down")
 
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Comment should say "Failed to add" since labeling failed
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "Failed to add" in comment_body
-    assert "please triage manually" in comment_body
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 81) is not None
 
 
 def test_poll_cycle_enqueue_fix_publish_failure(
@@ -1633,13 +1562,13 @@ def test_poll_cycle_enqueue_followup_publish_failure(
     mock_followup.assert_called_once()
 
 
-def test_poll_cycle_skip_max_attempts_label_failure(
+def test_poll_cycle_skip_max_attempts_does_not_touch_github(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """add_label raises during SKIP_MAX_ATTEMPTS -- labeled=False variant of the comment."""
+    """SKIP_MAX_ATTEMPTS makes no GitHub calls -- it only sets a local backoff."""
     pr_state = _make_pr_state(number=84, action=PRAction.SKIP_MAX_ATTEMPTS)
 
     mocker.patch(
@@ -1650,20 +1579,12 @@ def test_poll_cycle_skip_max_attempts_label_failure(
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    gh_mock.add_label.side_effect = RuntimeError("label API down")
-
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # add_label was attempted
-    gh_mock.add_label.assert_called_once()
-
-    # Comment should have the "Failed to add" variant
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "Failed to add" in comment_body
-    assert "please triage manually" in comment_body
-    assert "exhausted" in comment_body
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 84) is not None
 
 
 def test_poll_cycle_skip_draft_action(
@@ -1727,15 +1648,21 @@ def test_poll_cycle_skip_pending_action(
 # ---------------------------------------------------------------------------
 
 
-def test_handle_result_failed_label_failure(
+def test_handle_result_needs_human_label_failure(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """FAILED result where add_label raises -- comment says 'Failed to add'."""
+    """A needs-human result where add_label raises -- comment falls back to the
+    'add it manually' variant; no crash."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    result = _make_task_result(status=ResultStatus.FAILED, pr_number=90)
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=90,
+        needs_human=True,
+        needs_human_reason="ambiguous requirement",
+    )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     gh_mock.add_label.side_effect = RuntimeError("label API down")
@@ -1743,12 +1670,9 @@ def test_handle_result_failed_label_failure(
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # Should post a comment with the "Failed to add ... label" variant
     gh_mock.post_comment.assert_called_once()
     comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed" in comment_body
-    assert "Failed to add" in comment_body
-    assert "please triage manually" in comment_body
+    assert "add it manually" in comment_body
 
 
 def test_handle_result_post_comment_failure(
@@ -1756,10 +1680,15 @@ def test_handle_result_post_comment_failure(
     orchestrator_config,
     gh_mock,
 ):
-    """When post_comment raises in _handle_result, it should be logged (no crash)."""
+    """When post_comment raises for a needs-human result, it is logged (no crash)."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    result = _make_task_result(status=ResultStatus.FAILED, pr_number=91)
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=91,
+        needs_human=True,
+        needs_human_reason="needs a product decision",
+    )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     gh_mock.post_comment.side_effect = RuntimeError("GitHub API down")
@@ -1768,7 +1697,6 @@ def test_handle_result_post_comment_failure(
     # Should not raise -- post_comment failure is caught and logged
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    # post_comment was attempted (failures still get comments)
     gh_mock.post_comment.assert_called_once()
 
 
@@ -1887,10 +1815,11 @@ def test_poll_cycle_retrigger_review_failure_cooldown_skips_next_poll(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_poll_cycle_retrigger_review_failures_escalate_after_limit(
+def test_poll_cycle_retrigger_review_failures_back_off_after_limit(
     mocker, fake_redis_client, orchestrator_config, gh_mock
 ):
-    """Repeated failed claude-review reruns eventually add needs-human and comment."""
+    """Repeated failed claude-review reruns back off and retry -- they never
+    add needs-human."""
     pr_state = PRState(
         number=503,
         title="PR #503",
@@ -1913,25 +1842,15 @@ def test_poll_cycle_retrigger_review_failures_escalate_after_limit(
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
     repo = orchestrator_config.github.repo
-    cooldown_key = _make_review_rerun_failure_cooldown_key(
-        repo, pr_state.number, pr_state.head_sha
-    )
+    cooldown_key = _make_review_rerun_failure_cooldown_key(repo, pr_state.number, pr_state.head_sha)
     logger = logging.getLogger("test")
     for _ in range(_MAX_REVIEW_RERUN_FAILURES):
         fake_redis_client.delete(cooldown_key)
         _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     assert gh_mock.rerun_workflow.call_count == _MAX_REVIEW_RERUN_FAILURES
-    gh_mock.add_label.assert_called_once_with(
-        repo,
-        503,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed to re-trigger `claude-review`" in comment_body
-    assert str(_MAX_REVIEW_RERUN_FAILURES) in comment_body
+    gh_mock.add_label.assert_not_called()
+    assert get_backoff_step(fake_redis_client, repo, 503) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2172,18 +2091,21 @@ def test_handle_result_none_pending_applies_side_effects(
     pr_number = 201
     task_id = "task-no-pending"
 
-    # No pending-task marker is set — get_pending_task will return None
+    # No pending-task marker is set — get_pending_task will return None.
+    # Use a needs-human result so there is an observable side-effect.
     result = TaskResult(
         task_id=task_id,
         worker_id="worker-1",
         status=ResultStatus.FAILED,
         branch="fix/none-window",
         summary="Something went wrong",
-            duration_seconds=15,
-            resource_type="pr",
-            resource_id=pr_number,
-            snapshot_head_sha="abc123",
-        )
+        duration_seconds=15,
+        resource_type="pr",
+        resource_id=pr_number,
+        snapshot_head_sha="abc123",
+        needs_human=True,
+        needs_human_reason="a human decision is required",
+    )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     logger = logging.getLogger("test")
@@ -2314,6 +2236,8 @@ def test_handle_result_uses_ci_status_fallback_for_snapshot_validation(
         snapshot_head_sha="sha-current",
         decision_reason="ci_failure",
         snapshot_failed_checks=["tests"],
+        needs_human=True,
+        needs_human_reason="a human decision is required",
     )
     gh_mock.get_pr.return_value = {"headRefOid": "sha-current"}
     gh_mock.get_ci_status.return_value = [{"name": "tests", "conclusion": "failure"}]
@@ -2388,7 +2312,8 @@ def test_handle_result_review_thread_body_change_drops_side_effects(
 ):
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     old_fingerprint = (
-        '{"comments":[{"author":"alice","body":"old feedback","created_at":"","id":"","updated_at":""}],'
+        '{"comments":[{"author":"alice","body":"old feedback",'
+        '"created_at":"","id":"","updated_at":""}],'
         '"id":"thread-1","line":"10","path":"app.py"}'
     )
     result = TaskResult(
@@ -2627,13 +2552,14 @@ def test_poll_cycle_retrigger_stale_checks_cooldown_skips(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_poll_cycle_retrigger_stale_checks_no_run_ids_escalates(
+def test_poll_cycle_retrigger_stale_checks_no_run_ids_does_not_label(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """With no re-triggerable run IDs, adds needs-human label and posts a comment."""
+    """With no re-triggerable run IDs, orcest logs and moves on -- it never
+    labels needs-human."""
     pr_state = _make_stale_pr_state(number=100, head_sha="stale222", stale_run_ids=[])
 
     mocker.patch(
@@ -2647,24 +2573,14 @@ def test_poll_cycle_retrigger_stale_checks_no_run_ids_escalates(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Should add needs-human label
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        100,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-
-    # Should post a comment about the stuck checks
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "stale" in comment_body.lower() or "pending" in comment_body.lower()
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
     # No cancel/rerun operations
     gh_mock.cancel_workflow.assert_not_called()
     gh_mock.rerun_workflow.assert_not_called()
 
-    # Cooldown SHA must be recorded to prevent repeated escalations
+    # Cooldown SHA must still be recorded to prevent re-handling every cycle
     recorded_sha = get_stale_retrigger_sha(fake_redis_client, orchestrator_config.github.repo, 100)
     assert recorded_sha == "stale222"
 
@@ -3061,7 +2977,7 @@ def test_merge_github_gateway_timeout_skips_needs_human(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_merge_network_error_retry_exhaustion_labels_needs_human(
+def test_merge_network_error_retry_exhaustion_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
@@ -3089,17 +3005,10 @@ def test_merge_network_error_retry_exhaustion_labels_needs_human(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Should label needs-human because retry budget is exhausted
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        301,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    # Should post a comment about the failure
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed to merge" in comment_body
+    # Past the merge retry budget orcest backs off and retries -- never labels.
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert get_backoff_step(fake_redis_client, repo, 301) is not None
 
 
 def test_merge_conflict_not_classified_as_network_error(
@@ -3140,7 +3049,8 @@ def test_merge_gh_rate_limit_error_not_classified_as_network_error(
     orchestrator_config,
     gh_mock,
 ):
-    """GhRateLimitError is NOT classified as a network error -- falls through to needs-human."""
+    """GhRateLimitError bypasses the network-retry path and backs off -- it is
+    never escalated to needs-human."""
     from orcest.orchestrator.gh import GhRateLimitError
 
     pr_state = _make_merge_pr_state(number=303)
@@ -3157,22 +3067,20 @@ def test_merge_gh_rate_limit_error_not_classified_as_network_error(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Should label needs-human -- GhRateLimitError bypasses network retry
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        303,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
+    gh_mock.add_label.assert_not_called()
+    assert (
+        get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 303) is not None
     )
 
 
-def test_non_network_merge_error_labels_needs_human(
+def test_non_network_merge_error_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """A non-network, non-conflict merge error still labels needs-human."""
+    """A non-network, non-conflict merge error backs off and retries -- it is
+    never escalated to needs-human."""
     pr_state = _make_merge_pr_state(number=304)
 
     mocker.patch(
@@ -3187,18 +3095,11 @@ def test_non_network_merge_error_labels_needs_human(
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
-    # Should label needs-human for non-network error
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        304,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert (
+        get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 304) is not None
     )
-    # Should post a comment about the failure
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "failed to merge" in comment_body
-    assert "branch protection" in comment_body
 
 
 def test_required_checks_expected_merge_error_updates_branch(
@@ -3241,13 +3142,14 @@ def test_required_status_check_expected_singular_matches_recovery_predicate():
     )
 
 
-def test_required_checks_expected_update_branch_noop_labels_needs_human(
+def test_required_checks_expected_update_branch_noop_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """If update-branch is a no-op, the terminal needs-human path still runs."""
+    """If update-branch is a no-op, the merge failure backs off -- it never
+    labels needs-human."""
     pr_state = _make_merge_pr_state(number=306)
 
     mocker.patch(
@@ -3271,22 +3173,18 @@ def test_required_checks_expected_update_branch_noop_labels_needs_human(
         orchestrator_config.github.token,
         expected_head_sha=pr_state.head_sha,
     )
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        306,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
-    )
-    gh_mock.post_comment.assert_called_once()
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
 
-def test_required_checks_expected_update_branch_failure_labels_needs_human(
+def test_required_checks_expected_update_branch_failure_backs_off(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """If the recovery update-branch call fails, the existing terminal path still runs."""
+    """If the recovery update-branch call fails, the merge failure backs off --
+    it never labels needs-human."""
     pr_state = _make_merge_pr_state(number=307)
 
     mocker.patch(
@@ -3305,11 +3203,9 @@ def test_required_checks_expected_update_branch_failure_labels_needs_human(
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
 
     gh_mock.update_branch.assert_called_once()
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        307,
-        orchestrator_config.labels.needs_human,
-        orchestrator_config.github.token,
+    gh_mock.add_label.assert_not_called()
+    assert (
+        get_backoff_step(fake_redis_client, orchestrator_config.projects[0].repo, 307) is not None
     )
 
 

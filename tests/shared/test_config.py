@@ -102,9 +102,7 @@ def test_load_orchestrator_config_max_transient_failures_from_yaml(tmp_path: Pat
     assert config.max_transient_failures == 7
 
 
-def test_load_orchestrator_config_max_transient_failures_env_override(
-    tmp_path: Path, monkeypatch
-):
+def test_load_orchestrator_config_max_transient_failures_env_override(tmp_path: Path, monkeypatch):
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text("github:\n  repo: acme/widgets\nmax_transient_failures: 7\n")
     monkeypatch.setenv("ORCEST_MAX_TRANSIENT_FAILURES", "3")
@@ -115,9 +113,7 @@ def test_load_orchestrator_config_max_transient_failures_env_override(
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-int"])
-def test_load_orchestrator_config_invalid_max_transient_failures(
-    tmp_path: Path, value: str
-):
+def test_load_orchestrator_config_invalid_max_transient_failures(tmp_path: Path, value: str):
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(f"github:\n  repo: acme/widgets\nmax_transient_failures: {value}\n")
 
@@ -846,3 +842,10 @@ def test_null_redis_key_prefix_raises(tmp_path: Path, monkeypatch: pytest.Monkey
 
     with pytest.raises(ValueError, match="explicitly set to null"):
         load_orchestrator_config(cfg_file)
+
+
+def test_runner_config_defaults_90min_opus():
+    """Fix tasks default to a 90-minute wall clock on Opus."""
+    defaults = RunnerConfig()
+    assert defaults.timeout == 5400
+    assert defaults.model == "claude-opus-4-7"

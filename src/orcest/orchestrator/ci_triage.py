@@ -54,6 +54,18 @@ DEFINITIVE_CODE_PATTERNS: list[str] = [
     # counts on one line avoids matching a step number like "Step 3 failed".
     r"\d+\s+passed\b.{0,40}\b\d+\s+failed\b",
     r"\d+\s+failed\b.{0,40}\b\d+\s+passed\b",
+    # SQL / pgTAP / TAP failures. Database tooling produces these only when a
+    # migration or test actually ran and reported a real defect; flaky infra
+    # never emits them. Without these, a pgTAP failure in a log that also
+    # mentions "timeout" elsewhere is misclassified TRANSIENT and loops.
+    r"(?m)^not ok \d+",  # TAP failed-test line
+    r"# Bad plan\b",  # pgTAP plan mismatch
+    r"Looks like you (planned|failed)",  # pgTAP/Test::More summary
+    r"Failed \d+ of \d+\b",  # pg_prove run summary
+    r"ERROR:\s+syntax error at or near",  # Postgres parse error
+    r"duplicate key value violates unique constraint",
+    r"violates (foreign key|not-null|check) constraint",
+    r"(?m)^psql:.*\bERROR:",  # psql-reported SQL error
 ]
 
 CODE_PATTERNS: list[str] = [

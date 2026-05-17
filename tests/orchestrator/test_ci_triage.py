@@ -82,10 +82,7 @@ def test_assertion_error_beats_incidental_timeout_keyword():
         "FAILED | 59 passed | 3 failed (63ms)\n"
         "##[error]Process completed with exit code 1.\n"
     )
-    assert (
-        classify_ci_failure("Deno tests (edge functions)", logs)
-        is CIFailureType.CODE
-    )
+    assert classify_ci_failure("Deno tests (edge functions)", logs) is CIFailureType.CODE
 
 
 def test_test_summary_counts_beat_incidental_transient_keyword():
@@ -103,10 +100,7 @@ def test_genuine_transient_without_code_signal_stays_transient():
 
 def test_step_number_failed_is_not_a_test_summary():
     """'Step 3 failed' must not be mistaken for a '3 failed' test summary."""
-    assert (
-        classify_ci_failure("build", logs="Step 3 failed: timeout")
-        is CIFailureType.TRANSIENT
-    )
+    assert classify_ci_failure("build", logs="Step 3 failed: timeout") is CIFailureType.TRANSIENT
 
 
 # -- Case insensitivity ------------------------------------------------------
@@ -123,3 +117,41 @@ def test_case_insensitive():
         classify_ci_failure("install", logs="NO MATCHING DISTRIBUTION FOUND for pkg")
         is CIFailureType.DEPENDENCY
     )
+
+
+# -- SQL / pgTAP / TAP definitive code failures ------------------------------
+
+
+def test_pgtap_bad_plan_beats_incidental_timeout():
+    """A pgTAP 'Bad plan' failure is a real defect even when the log also
+    mentions 'timeout' elsewhere (a common false transient trigger)."""
+    logs = (
+        "Waiting for database (timeout 60s)... ready\n"
+        "not ok 9 - prospect tags insert\n"
+        "# Bad plan: 19 tests planned but only 9 ran\n"
+    )
+    assert classify_ci_failure("pgTAP tests", logs) is CIFailureType.CODE
+
+
+def test_postgres_duplicate_key_is_code():
+    logs = (
+        "connection pool idle timeout configured\n"
+        "ERROR:  duplicate key value violates unique constraint "
+        '"prospect_companies_pkey"\n'
+    )
+    assert classify_ci_failure("db migration", logs) is CIFailureType.CODE
+
+
+def test_postgres_syntax_error_beats_incidental_timeout():
+    """A real SQL syntax error must not be misread as transient just because
+    the word 'timeout' appears somewhere in the log."""
+    logs = (
+        "statement_timeout set to 30s\n"
+        "psql:migration.sql:135: ERROR:  syntax error at or near \"'personnel'\"\n"
+    )
+    assert classify_ci_failure("Apply migrations", logs) is CIFailureType.CODE
+
+
+def test_pg_prove_failed_summary_is_code():
+    logs = "timeout helper loaded\nFailed 3 of 19 subtests\n"
+    assert classify_ci_failure("pg_prove", logs) is CIFailureType.CODE
