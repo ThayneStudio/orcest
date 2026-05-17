@@ -358,10 +358,10 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         # Replaying them would inject literal "[REDACTED]" as credentials,
         # causing auth failures. Detect and refuse with guidance; the original
         # secrets are intentionally never stored in the dead-letter stream.
-        redacted_secrets = [
-            f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"
-        ]
-        if redacted_secrets:
+        if any(task_fields.get(f) == "[REDACTED]" for f in REDACTED_FIELDS):
+            redacted_secrets = [
+                f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"
+            ]
             console.print(
                 f"[red]Cannot replay entry {entry_id}: contains redacted values for "
                 f"{redacted_secrets}. Original credentials are not persisted in "

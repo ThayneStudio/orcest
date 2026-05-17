@@ -45,8 +45,9 @@ def _sync_claude_for_provider(
 
     Non-claude providers pass through unchanged.
 
-    This eliminates the previous duplication of the sync across create(),
-    from_dict(), and to_dict().
+    This eliminates the previous duplication of the sync across create()
+    and to_dict(); from_dict() uses separate one-directional deserialization
+    logic (to correctly handle explicit empty `credential`).
     """
     if provider != "claude":
         return credential, claude_token
@@ -112,7 +113,8 @@ class Task:
         """
         # Keep claude_token populated from credential for claude provider during rollout.
         # Delegated to the shared helper (removes duplication of sync logic
-        # that previously lived in to_dict / from_dict / create).
+        # that previously lived in to_dict and create; from_dict has separate
+        # one-directional handling for explicit credential values).
         _ignored_cred, claude_token_out = _sync_claude_for_provider(
             self.provider, self.credential, self.claude_token
         )
