@@ -37,6 +37,7 @@ from orcest.orchestrator.pr_ops import (
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
 )
+from orcest.orchestrator.provider_pool import ProviderPool
 from orcest.orchestrator.task_publisher import (
     publish_fix_task,
     publish_followup_task,
@@ -44,7 +45,6 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
     rerun_all_transient_ci,
 )
-from orcest.orchestrator.provider_pool import ProviderPool
 from orcest.orchestrator.usage_check import get_token_reset_time
 from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
@@ -713,8 +713,9 @@ def _poll_project(
     Args:
         project_redis: Per-project Redis client (for pending markers, attempt counters, etc.).
         task_redis: Shared Redis client (for publishing tasks to the common stream).
-        token_pool: Optional provider pool (generalized; still called token_pool in this
-            transitional function for minimal diff). Uses lean ProviderEntry surface only.
+        token_pool: Optional ProviderPool (parameter retains the name `token_pool`
+            during the claude_tokens migration to keep the diff minimal; only the
+            lean provider/credential/model/identity() surface is ever used).
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """

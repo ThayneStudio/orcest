@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from orcest.shared.providers import ProviderEntry
 
@@ -30,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 class ProviderPool:
     """Round-robin pool of ProviderEntry objects with per-identity exhaustion cooldowns.
+
+    TOCTOU / NO-RESERVATION CONTRACT:
+    next_entry() returns a *snapshot* of an available entry at the instant of
+    the call. It performs no reservation or atomic claim. A concurrent caller
+    may receive the same entry (or the entry may be marked exhausted by a
+    racing mark_exhausted) before the original caller registers or publishes.
+    Callers MUST tolerate None returns and MUST use the register-before-publish
+    + task_completed rollback pattern to avoid leaking in-flight mappings on
+    publish failure. See next_entry and the usage example below.
 
     Usage (new path)::
 
@@ -96,16 +104,28 @@ class ProviderPool:
             active = sum(1 for exp in self._cooldowns.values() if exp > now)
             return self.size - active
 
+    def _prune_cooldowns(self) -> None:
+        """Remove expired cooldown entries. Must be called while holding self._lock."""
+        now = datetime.now(timezone.utc)
+        self._cooldowns = {i: exp for i, exp in self._cooldowns.items() if exp > now}
+
     def next_entry(self) -> ProviderEntry | None:
         """Return next available entry (round-robin, skipping exhausted).
 
-        Call register_task after (or before) publishing to associate the task_id.
+        CRITICAL CONTRACT — TOCTOU, no reservation:
+        The returned entry (if any) is only guaranteed available *at the moment
+        of return*. There is no lock held across the call, no reservation made,
+        and no prevention of the same identity being handed to another caller
+        (or being benched) before the caller acts on it. This is intentional
+        for lock-free concurrent use; the design relies on best-effort + the
+        register/task_completed safety net.
+
+        Call register_task (before or after publish) to associate the task_id
+        for later mark_exhausted. Always handle the None case (all exhausted).
         Returns None if every entry is currently cooled down.
         """
         with self._lock:
-            now = datetime.now(timezone.utc)
-            # Drop expired cooldowns
-            self._cooldowns = {i: exp for i, exp in self._cooldowns.items() if exp > now}
+            self._prune_cooldowns()
 
             n = len(self._entries)
             for _ in range(n):
@@ -182,7 +202,6 @@ class ProviderPool:
             self._cooldowns[ident] = expiry
 
             entry = self._identity_to_entry.get(ident)
-            masked = (entry.credential[:10] + "...") if entry else ident[:16]
             prov = entry.provider if entry else "?"
             logger.info(
                 "Provider %s (id=%s) benched until %s",
