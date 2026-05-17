@@ -485,7 +485,8 @@ def test_poll_cycle_merge_conflict_token_exhausted_skips_needs_human(
     """Merge conflicts skipped for Claude capacity do not get generic needs-human handling."""
     from datetime import datetime, timedelta, timezone
 
-    from orcest.orchestrator.token_pool import TokenPool
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
 
     pr_state = PRState(
         number=42,
@@ -508,8 +509,11 @@ def test_poll_cycle_merge_conflict_token_exhausted_skips_needs_human(
     gh_mock.merge_pr.side_effect = RuntimeError("Pull request is not mergeable")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    pool = TokenPool(["sk-test-token"])
-    pool._cooldowns[0] = datetime.now(timezone.utc) + timedelta(minutes=30)
+    # Use ProviderPool + public API (register+mark) for hardened exhaustion simulation.
+    entry = ProviderEntry(provider="claude", credential="sk-test-token")
+    pool = ProviderPool([entry])
+    pool.register_task("t-exh", entry)
+    pool.mark_exhausted("t-exh", resets_at=datetime.now(timezone.utc) + timedelta(minutes=30))
     project_key = orchestrator_config.projects[0].key_prefix
 
     logger = logging.getLogger("test")
@@ -615,12 +619,13 @@ def test_poll_cycle_increments_token_exhausted_skip_counter(
     orchestrator_config,
     gh_mock,
 ):
-    """When all tokens in the pool are cooling, _select_claude_token increments
-    a per-project Redis counter so operators can detect the situation."""
+    """When all entries in the ProviderPool are cooling, _select_provider_entry increments
+    the per-project Redis counter (legacy key name) so operators can detect the situation."""
     from datetime import datetime, timedelta, timezone
 
     from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
-    from orcest.orchestrator.token_pool import TokenPool
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
 
     pr_state = _make_pr_state(number=77, action=PRAction.ENQUEUE_FIX)
 
@@ -632,9 +637,11 @@ def test_poll_cycle_increments_token_exhausted_skip_counter(
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    # Pool with one token, manually marked exhausted so next_token() returns None.
-    pool = TokenPool(["sk-test-token"])
-    pool._cooldowns[0] = datetime.now(timezone.utc) + timedelta(minutes=30)
+    # Pool with one entry, marked exhausted via public API so next_entry() returns None.
+    entry = ProviderEntry(provider="claude", credential="sk-test-token")
+    pool = ProviderPool([entry])
+    pool.register_task("t-exh", entry)
+    pool.mark_exhausted("t-exh", resets_at=datetime.now(timezone.utc) + timedelta(minutes=30))
     project_key = orchestrator_config.projects[0].key_prefix
 
     logger = logging.getLogger("test")
@@ -664,7 +671,8 @@ def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
     from datetime import datetime, timedelta, timezone
 
     from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
-    from orcest.orchestrator.token_pool import TokenPool
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
 
     ci_failures = [
         {
@@ -684,8 +692,11 @@ def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
     gh_mock.get_failed_run_logs.return_value = "connection reset by peer"
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    pool = TokenPool(["sk-test-token"])
-    pool._cooldowns[0] = datetime.now(timezone.utc) + timedelta(minutes=30)
+    # ProviderPool via public API
+    entry = ProviderEntry(provider="claude", credential="sk-test-token")
+    pool = ProviderPool([entry])
+    pool.register_task("t-exh", entry)
+    pool.mark_exhausted("t-exh", resets_at=datetime.now(timezone.utc) + timedelta(minutes=30))
     project_key = orchestrator_config.projects[0].key_prefix
 
     logger = logging.getLogger("test")
@@ -714,11 +725,12 @@ def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
     orchestrator_config,
     gh_mock,
 ):
-    """Code CI failures do not publish worker tasks when all Claude tokens are exhausted."""
+    """Code CI failures do not publish worker tasks when all providers are exhausted."""
     from datetime import datetime, timedelta, timezone
 
     from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
-    from orcest.orchestrator.token_pool import TokenPool
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
 
     ci_failures = [
         {
@@ -738,8 +750,11 @@ def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
     gh_mock.get_failed_run_logs.return_value = "FAILED test_widget.py::test_case"
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    pool = TokenPool(["sk-test-token"])
-    pool._cooldowns[0] = datetime.now(timezone.utc) + timedelta(minutes=30)
+    # ProviderPool via public API
+    entry = ProviderEntry(provider="claude", credential="sk-test-token")
+    pool = ProviderPool([entry])
+    pool.register_task("t-exh", entry)
+    pool.mark_exhausted("t-exh", resets_at=datetime.now(timezone.utc) + timedelta(minutes=30))
     project_key = orchestrator_config.projects[0].key_prefix
 
     logger = logging.getLogger("test")

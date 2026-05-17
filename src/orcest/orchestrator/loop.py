@@ -63,14 +63,17 @@ from orcest.shared.models import (
     ResultStatus,
     TaskResult,
 )
+from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient
 
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
 
-# Observability counter incremented when _select_claude_token returns None
-# (all tokens in the project's pool are cooling).  TTL keeps it self-cleaning
+# Observability counter incremented when _select_provider_entry returns None
+# (all entries in the project's ProviderPool are cooling).  TTL keeps it self-cleaning
 # so operators can SCAN the keyspace without finding stale leftovers.
+# (Key name retains "tokens" during transition; per-provider variants use masked
+# identities in logs and will be further split in Task 8.)
 _TOKEN_EXHAUSTED_SKIP_KEY = "tokens:exhausted_skip"
 _TOKEN_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
@@ -315,18 +318,40 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
 def _mark_usage_exhausted_token(
     result: TaskResult, token_pool: ProviderPool | None, logger: logging.Logger
 ) -> None:
+    """Generalized for ProviderPool: mark the entry for the task exhausted.
+
+    Uses get_task_entry (lean ProviderEntry) when available for provider-aware
+    fallback query (only claude uses the anthropic usage endpoint; others rely on
+    rate_limit_resets_at from worker result). Falls back to legacy get_task_token
+    for mocks / old shims. All logging uses only masked identity().
+    """
     if token_pool is None:
         return
-    exhausted_token = token_pool.get_task_token(result.task_id)
+    entry = token_pool.get_task_entry(result.task_id)
+    # Support legacy MagicMock tests and old registration paths that only
+    # implement the token shim: if get_task_entry gave a non-real object or None,
+    # fall back.
+    if entry is None or not hasattr(entry, "provider") or not hasattr(entry, "identity"):
+        cred = token_pool.get_task_token(result.task_id)
+        if cred:
+            entry = ProviderEntry(provider="claude", credential=cred, model=None)
+    ident = entry.identity() if entry and hasattr(entry, "identity") else "?"
+    prov = entry.provider if entry and hasattr(entry, "provider") else "?"
+    logger.info(
+        "USAGE_EXHAUSTED observed for provider %s (id=%s, task=%s) — will mark exhausted",
+        prov,
+        ident,
+        result.task_id,
+    )
     cooldown_until = None
     if result.rate_limit_resets_at:
         from datetime import datetime, timezone
 
         cooldown_until = datetime.fromtimestamp(result.rate_limit_resets_at, tz=timezone.utc)
         logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
-    elif exhausted_token:
+    elif entry and prov == "claude" and hasattr(entry, "credential") and entry.credential:
         try:
-            cooldown_until = get_token_reset_time(exhausted_token)
+            cooldown_until = get_token_reset_time(entry.credential)
         except Exception as e:
             logger.warning("Failed to query token reset time: %s", e)
     token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
@@ -564,19 +589,34 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     # Create per-project provider pools (generalized from legacy TokenPool).
-    # For the claude_tokens migration path we synthesize lean ProviderEntry objects
-    # (rich execution fields left None) via from_claude_tokens per Task 3 / boundary rule.
+    # Prefer the rich-but-lean ProjectConfig.providers (populated by config load with
+    # legacy claude synth + any new providers from YAML, deduped). Fall back to
+    # claude_tokens synthesis only for direct test ProjectConfig() constructions that
+    # omit .providers. Only lean surface (provider/credential/model) is used.
     token_pools: dict[str, ProviderPool] = {}
     for project in config.projects:
-        tokens = project.claude_tokens
-        if tokens:
-            token_pools[project.key_prefix] = ProviderPool.from_claude_tokens(tokens)
-            if len(tokens) > 1:
-                logger.info(
-                    "Project %s: provider pool with %d Claude entries (via legacy claude_tokens)",
-                    project.repo,
-                    len(tokens),
-                )
+        entries = list(project.providers) if project.providers else []
+        if not entries and project.claude_tokens:
+            entries = [
+                ProviderEntry(provider="claude", credential=t, model=None)
+                for t in project.claude_tokens
+            ]
+        if entries:
+            # Defensive dedup by identity (config load already does this, but tests may not)
+            seen: dict[str, ProviderEntry] = {}
+            unique = []
+            for e in entries:
+                ident = e.identity()
+                if ident not in seen:
+                    seen[ident] = e
+                    unique.append(e)
+            token_pools[project.key_prefix] = ProviderPool(unique)
+            logger.info(
+                "Project %s: provider pool with %d entries (providers=%s)",
+                project.repo,
+                len(unique),
+                [e.provider for e in unique],
+            )
 
     # Graceful shutdown
     shutdown = False
@@ -715,7 +755,8 @@ def _poll_project(
         task_redis: Shared Redis client (for publishing tasks to the common stream).
         token_pool: Optional ProviderPool (parameter retains the name `token_pool`
             during the claude_tokens migration to keep the diff minimal; only the
-            lean provider/credential/model/identity() surface is ever used).
+            lean provider/credential/model/identity() surface is ever used via
+            the internal _select_provider_entry / _register_task).
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """
@@ -724,20 +765,30 @@ def _poll_project(
     token = project.token
     key_prefix = project.key_prefix
 
-    def _select_claude_token() -> str | None:
-        """Pick the next Claude token from the pool (round-robin).
+    def _select_provider_entry() -> ProviderEntry | None:
+        """Pick the next ProviderEntry from the pool using the lean surface only
+        (provider/credential/model/identity()).
 
-        Returns None if all tokens are exhausted (caller should skip enqueue).
-        Falls back to project.claude_token if no pool is configured.
+        Returns None if all entries are exhausted/cooling (caller should skip enqueue
+        and the skip counter is incremented for observability).
 
-        On exhaustion, increments a per-project Redis counter so operators can
-        distinguish "quiet because no PRs need work" from "quiet because all
-        Claude tokens are cooling."
+        Falls back to synthesizing a lean claude entry from project.claude_token when
+        no pool was configured for the project (single-token legacy or test paths).
+        Never reads or forwards cli_binary/env_var/extras.
+
+        On exhaustion, increments the (transition) per-project Redis skip counter.
         """
         if token_pool is None:
-            return project.claude_token
-        token = token_pool.next_token()
-        if token is None:
+            # Preserve legacy behavior for test fixtures (which use empty claude_token
+            # in GithubConfig and pass {} for token_pools): always return a (possibly
+            # empty-cred) lean entry so publish_* is still invoked as before.
+            # Real configs with providers or claude_tokens get pools, so this path
+            # is mainly for direct-test compat.
+            ct = project.claude_token or ""
+            return ProviderEntry(provider="claude", credential=ct, model=None)
+
+        entry = token_pool.next_entry()
+        if entry is None:
             try:
                 count = project_redis.incr(_TOKEN_EXHAUSTED_SKIP_KEY)
                 if count == 1:
@@ -746,13 +797,18 @@ def _poll_project(
                     )
             except Exception:
                 # Observability is best-effort; never break the poll cycle.
-                logger.debug("Failed to increment token-exhaustion counter", exc_info=True)
-        return token
+                logger.debug("Failed to increment provider-exhaustion counter", exc_info=True)
+            # Debug log includes masked identities only (from pool __repr__)
+            logger.debug("Provider pool exhausted during selection: %r", token_pool)
+        return entry
 
-    def _register_task(task_id: str, claude_token: str) -> None:
-        """Record which token was used for a task (for exhaustion tracking)."""
+    def _register_task(task_id: str, entry: ProviderEntry | str) -> None:
+        """Record which provider entry (lean surface) was used for a task id
+        (for later exhaustion tracking via mark_exhausted / task_completed).
+        Accepts entry object (preferred) or str for legacy shim paths.
+        """
         if token_pool is not None:
-            token_pool.register_task(task_id, claude_token)
+            token_pool.register_task(task_id, entry)
 
     labels = config.labels
 
@@ -818,10 +874,10 @@ def _poll_project(
                     logger.info(
                         f"PR #{pr_state.number}: merge conflict detected, enqueueing rebase task"
                     )
-                    ct = _select_claude_token()
-                    if ct is None:
+                    entry = _select_provider_entry()
+                    if entry is None:
                         logger.warning(
-                            "All Claude tokens exhausted, skipping rebase for PR #%d",
+                            "All providers exhausted, skipping rebase task for PR #%d",
                             pr_state.number,
                         )
                         continue
@@ -836,12 +892,15 @@ def _poll_project(
                                 merge_error=err_msg[:200],
                                 pending_task_ttl=pending_task_ttl,
                                 logger=logger,
-                                claude_token=ct,
+                                claude_token=entry.credential if entry.provider == "claude" else "",
                                 key_prefix=key_prefix,
                                 task_redis=task_redis,
+                                provider=entry.provider,
+                                credential=entry.credential,
+                                model=entry.model,
                             )
                             if task is not None:
-                                _register_task(task.id, ct)
+                                _register_task(task.id, entry)
                                 enqueued += 1
                         except Exception as rebase_err:
                             logger.error(
@@ -1009,10 +1068,10 @@ def _poll_project(
                         continue  # skip the one we just merged
                     if other_pr.action != PRAction.SKIP_GREEN:
                         continue  # only proactively rebase green PRs
-                    ct = _select_claude_token()
-                    if ct is None:
+                    entry = _select_provider_entry()
+                    if entry is None:
                         logger.warning(
-                            "All Claude tokens exhausted, skipping proactive rebase for PR #%d",
+                            "All providers exhausted, skipping proactive rebase for PR #%d",
                             other_pr.number,
                         )
                         continue
@@ -1026,13 +1085,16 @@ def _poll_project(
                             merge_error="",
                             pending_task_ttl=pending_task_ttl,
                             logger=logger,
-                            claude_token=ct,
+                            claude_token=entry.credential if entry.provider == "claude" else "",
                             key_prefix=key_prefix,
                             proactive=True,
                             task_redis=task_redis,
+                            provider=entry.provider,
+                            credential=entry.credential,
+                            model=entry.model,
                         )
                         if task is not None:
-                            _register_task(task.id, ct)
+                            _register_task(task.id, entry)
                     except Exception:
                         logger.warning(
                             "Failed to enqueue rebase for PR #%d",
@@ -1058,10 +1120,10 @@ def _poll_project(
                     e,
                     exc_info=True,
                 )
-            ct = _select_claude_token()
-            if ct is None:
+            entry = _select_provider_entry()
+            if entry is None:
                 logger.warning(
-                    "All Claude tokens exhausted, skipping fix task for PR #%d",
+                    "All providers exhausted, skipping fix task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -1074,13 +1136,16 @@ def _poll_project(
                         default_runner=config.default_runner,
                         pending_task_ttl=pending_task_ttl,
                         logger=logger,
-                        claude_token=ct,
+                        claude_token=entry.credential if entry.provider == "claude" else "",
                         key_prefix=key_prefix,
                         task_redis=task_redis,
                         skip_transient_rerun=True,
+                        provider=entry.provider,
+                        credential=entry.credential,
+                        model=entry.model,
                     )
                     if result is not None:
-                        _register_task(result.id, ct)
+                        _register_task(result.id, entry)
                         enqueued += 1
                 except Exception as e:
                     logger.error(
@@ -1091,10 +1156,10 @@ def _poll_project(
                     )
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
             logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
-            ct = _select_claude_token()
-            if ct is None:
+            entry = _select_provider_entry()
+            if entry is None:
                 logger.warning(
-                    "All Claude tokens exhausted, skipping followup task for PR #%d",
+                    "All providers exhausted, skipping followup task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -1107,12 +1172,15 @@ def _poll_project(
                         default_runner=config.default_runner,
                         pending_task_ttl=pending_task_ttl,
                         logger=logger,
-                        claude_token=ct,
+                        claude_token=entry.credential if entry.provider == "claude" else "",
                         key_prefix=key_prefix,
                         task_redis=task_redis,
+                        provider=entry.provider,
+                        credential=entry.credential,
+                        model=entry.model,
                     )
                     if task is not None:
-                        _register_task(task.id, ct)
+                        _register_task(task.id, entry)
                         enqueued += 1
                 except Exception as e:
                     logger.error(
@@ -1127,10 +1195,10 @@ def _poll_project(
                 pr_state.number,
                 pr_state.title,
             )
-            ct = _select_claude_token()
-            if ct is None:
+            entry = _select_provider_entry()
+            if entry is None:
                 logger.warning(
-                    "All Claude tokens exhausted, skipping rebase task for PR #%d",
+                    "All providers exhausted, skipping rebase task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -1143,12 +1211,15 @@ def _poll_project(
                         default_runner=config.default_runner,
                         pending_task_ttl=pending_task_ttl,
                         logger=logger,
-                        claude_token=ct,
+                        claude_token=entry.credential if entry.provider == "claude" else "",
                         key_prefix=key_prefix,
                         task_redis=task_redis,
+                        provider=entry.provider,
+                        credential=entry.credential,
+                        model=entry.model,
                     )
                     if task is not None:
-                        _register_task(task.id, ct)
+                        _register_task(task.id, entry)
                         enqueued += 1
                 except Exception as e:
                     logger.error(
@@ -1453,10 +1524,10 @@ def _poll_project(
             logger.info(
                 f"Issue #{issue_state.number} ({issue_state.title}): enqueueing implementation task"
             )
-            ct = _select_claude_token()
-            if ct is None:
+            entry = _select_provider_entry()
+            if entry is None:
                 logger.warning(
-                    "All Claude tokens exhausted, skipping issue task for issue #%d",
+                    "All providers exhausted, skipping issue task for issue #%d",
                     issue_state.number,
                 )
             else:
@@ -1469,12 +1540,15 @@ def _poll_project(
                         default_runner=config.default_runner,
                         pending_task_ttl=pending_task_ttl,
                         logger=logger,
-                        claude_token=ct,
+                        claude_token=entry.credential if entry.provider == "claude" else "",
                         key_prefix=key_prefix,
                         task_redis=task_redis,
+                        provider=entry.provider,
+                        credential=entry.credential,
+                        model=entry.model,
                     )
                     if task is not None:
-                        _register_task(task.id, ct)
+                        _register_task(task.id, entry)
                         enqueued += 1
                 except Exception as e:
                     logger.error(
