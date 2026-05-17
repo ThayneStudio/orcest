@@ -79,6 +79,8 @@ def _make_proxmox() -> MagicMock:
     mock.get_vm_ip.return_value = "10.20.0.50"
     mock.get_vm_status.return_value = "stopped"
     mock.list_vms.return_value = []
+    # Default: the configured template exists (validated before cloning).
+    mock.vm_exists.return_value = True
     return mock
 
 
@@ -508,6 +510,102 @@ class TestCloneAndBoot:
         # _destroy_vm should have been called to clean up
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
+
+
+def _make_range_config(template_vmid_range: list[int] | None = None) -> FleetConfig:
+    """Build a config with a template VMID range (blue/green template mode)."""
+    return FleetConfig(
+        proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+        pool=PoolConfig(
+            size=4,
+            template_vm_id=0,
+            template_vmid_range=template_vmid_range or [9000, 9009],
+            vm_id_start=300,
+            storage="ssd-pool",
+        ),
+    )
+
+
+class TestResolveTemplateValidation:
+    """A dangling template pointer must not drive an endless clone storm."""
+
+    def test_existing_template_used_without_repoint(self):
+        """When the pointer names a live template it is used as-is."""
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = "9005"
+        proxmox.vm_exists.return_value = True
+
+        manager._clone_and_boot()
+
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args[1]["template_id"] == 9005
+        # No recovery needed → the template pointer is not rewritten.
+        redis.set_ex.assert_not_called()
+
+    def test_missing_template_recovers_and_repoints(self):
+        """A dangling pointer falls back to a live in-range template and repoints."""
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = "9002"  # pointer names a destroyed template
+        proxmox.vm_exists.return_value = False
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        manager._clone_and_boot()
+
+        # Cloned from the newest live template (9001), not the missing 9002.
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args[1]["template_id"] == 9001
+        # Pointer repointed so the recovery survives a restart.
+        redis.set_ex.assert_called_once_with(
+            "pool:current_template_vmid", "9001", ttl=86400 * 365
+        )
+
+    def test_missing_template_no_replacement_returns_none(self):
+        """With no live template anywhere, no clone is attempted."""
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = "9002"
+        proxmox.vm_exists.return_value = False
+        proxmox.list_vms.return_value = [
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        vm_id = manager._clone_and_boot()
+
+        assert vm_id is None
+        proxmox.clone_vm.assert_not_called()
+
+    def test_transient_existence_error_uses_candidate(self):
+        """A transient Proxmox error must not be mistaken for a missing template."""
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = "9005"
+        proxmox.vm_exists.side_effect = RuntimeError("API timeout")
+
+        manager._clone_and_boot()
+
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args[1]["template_id"] == 9005
+
+    def test_replacement_ignores_non_template_and_out_of_range(self):
+        """Recovery only picks Proxmox templates inside the configured range."""
+        manager, proxmox, redis = _make_manager(
+            config=_make_range_config(template_vmid_range=[9000, 9003])
+        )
+        redis.get.return_value = "9002"
+        proxmox.vm_exists.return_value = False
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9500, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9001, "name": "orcest-worker-template", "template": False},
+        ]
+
+        manager._clone_and_boot()
+
+        proxmox.clone_vm.assert_called_once()
+        # 9500 is out of range, 9001 is not a template → only 9000 qualifies.
+        assert proxmox.clone_vm.call_args[1]["template_id"] == 9000
 
 
 # ── _detect_active_workers ───────────────────────────────────

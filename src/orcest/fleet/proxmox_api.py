@@ -13,8 +13,18 @@ import shlex
 import time
 
 from proxmoxer import ProxmoxAPI
+from proxmoxer.core import ResourceException
 
 logger = logging.getLogger(__name__)
+
+# Substrings Proxmox uses when a VMID has no configuration file (the VM does
+# not exist). Matched case-insensitively to tell a genuinely-missing VM apart
+# from a transient API error.
+_VM_NOT_FOUND_MARKERS = (
+    "does not exist",
+    "find configuration file",
+    "no such",
+)
 
 
 def mac_for_vm_id(vm_id: int) -> str:
@@ -233,6 +243,26 @@ class ProxmoxClient:
         upid = self._api.nodes(self._node).qemu(vm_id).delete(**params)
         if upid:
             self.wait_for_task(upid)
+
+    def vm_exists(self, vm_id: int) -> bool:
+        """Return True if a VM with *vm_id* exists on the node.
+
+        Used to validate a worker-template VMID before cloning: a dangling
+        template pointer (e.g. the template was garbage-collected while the
+        pointer still named it) would otherwise drive an endless clone-retry
+        storm.
+
+        Re-raises on any error that is not a clear "VM not found" so a
+        transient API failure is not mistaken for a missing VM.
+        """
+        try:
+            self._api.nodes(self._node).qemu(vm_id).status.current.get()
+            return True
+        except ResourceException as exc:
+            msg = str(exc).lower()
+            if any(marker in msg for marker in _VM_NOT_FOUND_MARKERS):
+                return False
+            raise
 
     def get_vm_status(self, vm_id: int) -> str:
         """Get the current status of a VM.
