@@ -279,9 +279,7 @@ class PoolManager:
             try:
                 return int(raw)
             except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid template pointer %r in Redis; falling back to config", raw
-                )
+                logger.warning("Invalid template pointer %r in Redis; falling back to config", raw)
 
         fallback = self._pool.template_vm_id
         if not fallback:
@@ -378,7 +376,10 @@ class PoolManager:
         candidates: list[int] = []
         for vm in all_vms:
             try:
-                vmid = int(vm.get("vmid"))
+                raw_vmid = vm.get("vmid")
+                if raw_vmid is None:
+                    continue
+                vmid = int(raw_vmid)
             except (TypeError, ValueError):
                 continue
             if vmid == exclude or not self._is_proxmox_template(vm):
@@ -768,8 +769,7 @@ class PoolManager:
         end = self._pool.vm_id_end
         if end and start > end:
             raise RuntimeError(
-                f"Invalid VM ID pool range: vm_id_start ({start}) is greater than "
-                f"vm_id_end ({end})"
+                f"Invalid VM ID pool range: vm_id_start ({start}) is greater than vm_id_end ({end})"
             )
 
         existing: set[int] = set()
@@ -798,13 +798,10 @@ class PoolManager:
             candidate += 1
             if end and candidate > end:
                 raise RuntimeError(
-                    f"VM ID pool exhausted: all IDs in range "
-                    f"{start}-{end} are in use"
+                    f"VM ID pool exhausted: all IDs in range {start}-{end} are in use"
                 )
         if end and candidate > end:
-            raise RuntimeError(
-                f"VM ID pool exhausted: all IDs in range {start}-{end} are in use"
-            )
+            raise RuntimeError(f"VM ID pool exhausted: all IDs in range {start}-{end} are in use")
         return candidate
 
     @staticmethod

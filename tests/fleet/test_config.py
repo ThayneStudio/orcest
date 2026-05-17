@@ -219,9 +219,7 @@ class TestConfigPersistence:
     def test_load_template_range_only(self, tmp_path):
         """A config with range but no template_vm_id parses correctly."""
         path = tmp_path / "config.yaml"
-        path.write_text(
-            yaml.dump({"pool": {"template_vmid_range": [9000, 9009]}})
-        )
+        path.write_text(yaml.dump({"pool": {"template_vmid_range": [9000, 9009]}}))
         cfg = load_config(path)
         assert cfg.pool.template_range() == (9000, 9009)
         assert cfg.pool.template_vm_id == 0
@@ -344,9 +342,7 @@ class TestPoolConfigValidateVmidRanges:
         # End-to-end: an overlapping config in YAML refuses to load.
         path = tmp_path / "config.yaml"
         path.write_text(
-            yaml.dump(
-                {"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 9001}}
-            )
+            yaml.dump({"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 9001}})
         )
         with pytest.raises(ValueError, match="overlaps"):
             load_config(path)
@@ -354,9 +350,7 @@ class TestPoolConfigValidateVmidRanges:
     def test_load_config_with_disjoint_ranges_succeeds(self, tmp_path):
         path = tmp_path / "config.yaml"
         path.write_text(
-            yaml.dump(
-                {"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 10000}}
-            )
+            yaml.dump({"pool": {"template_vmid_range": [9000, 9009], "vm_id_start": 10000}})
         )
         cfg = load_config(path)
         assert cfg.pool.vm_id_start == 10000

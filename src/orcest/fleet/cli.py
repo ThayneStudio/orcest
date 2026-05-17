@@ -1490,9 +1490,7 @@ def pool_status(config: str) -> None:
         try:
             redis_vmid = get_current_template_vmid(cfg.ssh_target())
         except Exception as exc:
-            console.print(
-                f"[yellow]Warning: could not read Redis template pointer:[/yellow] {exc}"
-            )
+            console.print(f"[yellow]Warning: could not read Redis template pointer:[/yellow] {exc}")
             redis_vmid = None
         if redis_vmid is not None:
             active_template = redis_vmid
@@ -1686,9 +1684,7 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
         sys.exit(1)
 
     if not cfg.orchestrator.host:
-        console.print(
-            "[red]Orchestrator host not set — cannot reach Redis to swap pointer.[/red]"
-        )
+        console.print("[red]Orchestrator host not set — cannot reach Redis to swap pointer.[/red]")
         sys.exit(1)
 
     px = _create_proxmox_client(cfg)
@@ -1702,9 +1698,7 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     new_vmid = _allocate_template_vmid(px, cfg, skip=cfg.pool.template_vm_id or None)
     rng = cfg.pool.template_range()
     assert rng is not None  # _allocate_template_vmid would have exited
-    console.print(
-        f"\n[bold]Rebaking template at VM {new_vmid}[/bold] (range {rng[0]}-{rng[1]})\n"
-    )
+    console.print(f"\n[bold]Rebaking template at VM {new_vmid}[/bold] (range {rng[0]}-{rng[1]})\n")
 
     _create_template_at_vmid(
         px,
@@ -1861,9 +1855,7 @@ def gc_templates(dry_run: bool, config: str) -> None:
 
     rng = cfg.pool.template_range()
     if rng is None:
-        console.print(
-            "[red]pool.template_vmid_range is not configured — nothing to GC.[/red]"
-        )
+        console.print("[red]pool.template_vmid_range is not configured — nothing to GC.[/red]")
         sys.exit(1)
     start, end = rng
 
@@ -1912,9 +1904,7 @@ def gc_templates(dry_run: bool, config: str) -> None:
         )
         return
 
-    console.print(
-        f"  Found {len(candidates)} GC candidate(s) in range {start}-{end}: {candidates}"
-    )
+    console.print(f"  Found {len(candidates)} GC candidate(s) in range {start}-{end}: {candidates}")
     destroyed: list[int] = []
     skipped: list[int] = []
     for vmid in candidates:

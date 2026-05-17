@@ -370,9 +370,7 @@ class TestCloneAndBoot:
         _, kwargs = proxmox.clone_vm.call_args
         assert kwargs["template_id"] == 9000
         # And the pointer is initialised so future cycles read from Redis.
-        redis.set_ex.assert_called_once_with(
-            "pool:current_template_vmid", "9000", ttl=86400 * 365
-        )
+        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9000", ttl=86400 * 365)
 
     def test_invalid_pointer_falls_back_to_config(self):
         """A non-integer Redis pointer is ignored; config fallback wins."""
@@ -559,9 +557,7 @@ class TestResolveTemplateValidation:
         proxmox.clone_vm.assert_called_once()
         assert proxmox.clone_vm.call_args[1]["template_id"] == 9001
         # Pointer repointed so the recovery survives a restart.
-        redis.set_ex.assert_called_once_with(
-            "pool:current_template_vmid", "9001", ttl=86400 * 365
-        )
+        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9001", ttl=86400 * 365)
 
     def test_missing_template_no_replacement_returns_none(self):
         """With no live template anywhere, no clone is attempted."""

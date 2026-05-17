@@ -280,16 +280,13 @@ class TestTemplateUserdata:
             owner = entry.get("owner", "")
             if owner.startswith("orcest"):
                 assert entry.get("defer") is True, (
-                    f"write_files entry for {entry['path']} owned by"
-                    f" {owner!r} must set defer=true"
+                    f"write_files entry for {entry['path']} owned by {owner!r} must set defer=true"
                 )
 
     def test_template_versions_audit_file_written(self):
         """Bug 7: ``/etc/orcest/template.versions`` records baked-in versions."""
         data = yaml.safe_load(render_template_userdata())
-        entry = next(
-            f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions"
-        )
+        entry = next(f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions")
         # Owner is root:root — system metadata, not user data; not deferred.
         assert entry.get("owner") == "root:root"
         assert entry.get("permissions") == "0644"
@@ -307,12 +304,8 @@ class TestTemplateUserdata:
         from datetime import datetime
 
         data = yaml.safe_load(render_template_userdata())
-        entry = next(
-            f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions"
-        )
-        line = next(
-            line for line in entry["content"].splitlines() if line.startswith("bumped_at=")
-        )
+        entry = next(f for f in data["write_files"] if f["path"] == "/etc/orcest/template.versions")
+        line = next(line for line in entry["content"].splitlines() if line.startswith("bumped_at="))
         ts = line.split("=", 1)[1].strip()
         # Must round-trip through fromisoformat without raising.
         parsed = datetime.fromisoformat(ts)
@@ -401,8 +394,7 @@ class TestCloneUserdata:
             owner = entry.get("owner", "")
             if owner.startswith("orcest"):
                 assert entry.get("defer") is True, (
-                    f"write_files entry for {entry['path']} owned by"
-                    f" {owner!r} must set defer=true"
+                    f"write_files entry for {entry['path']} owned by {owner!r} must set defer=true"
                 )
 
 
@@ -414,6 +406,5 @@ def test_worker_orcest_owned_writes_are_deferred():
         owner = entry.get("owner", "")
         if owner.startswith("orcest"):
             assert entry.get("defer") is True, (
-                f"write_files entry for {entry['path']} owned by"
-                f" {owner!r} must set defer=true"
+                f"write_files entry for {entry['path']} owned by {owner!r} must set defer=true"
             )

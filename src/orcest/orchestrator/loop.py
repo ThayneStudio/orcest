@@ -24,6 +24,7 @@ from orcest.orchestrator.issue_ops import (
 )
 from orcest.orchestrator.pr_ops import (
     PRAction,
+    PRState,
     clear_attempts,
     clear_attempts_if_head_sha,
     clear_review_retrigger,
@@ -500,7 +501,7 @@ def _review_rerun_failure_cooldown_active(
 def _back_off_pr_retries(
     *,
     repo: str,
-    pr_state,
+    pr_state: PRState,
     logger: logging.Logger,
     redis: RedisClient,
     reason: str,

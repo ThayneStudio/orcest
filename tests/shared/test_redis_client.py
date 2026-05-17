@@ -333,9 +333,7 @@ def test_stream_unread_count_excludes_in_flight_entries(fake_redis_client):
     fake_redis_client.ensure_consumer_group(stream, group)
     fake_redis_client.xadd(stream, {"k": "v"})
 
-    fake_redis_client.xreadgroup(
-        group=group, consumer="c1", stream=stream, block_ms=None
-    )
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None)
 
     assert fake_redis_client.stream_unread_count(stream, group) == 0
 
@@ -348,9 +346,7 @@ def test_stream_unread_count_returns_undelivered_lag(fake_redis_client):
     # Prime the group by delivering and ACKing one entry so entries-read is
     # initialized; otherwise fakeredis reports lag off-by-one.
     primer_id = fake_redis_client.xadd(stream, {"k": "primer"})
-    fake_redis_client.xreadgroup(
-        group=group, consumer="c0", stream=stream, block_ms=None
-    )
+    fake_redis_client.xreadgroup(group=group, consumer="c0", stream=stream, block_ms=None)
     fake_redis_client.xack(stream, group, primer_id)
 
     for _ in range(3):
@@ -367,9 +363,7 @@ def test_stream_unread_count_with_mix_of_pending_and_lag(fake_redis_client):
     for _ in range(5):
         fake_redis_client.xadd(stream, {"k": "v"})
 
-    fake_redis_client.xreadgroup(
-        group=group, consumer="c1", stream=stream, block_ms=None, count=2
-    )
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, block_ms=None, count=2)
 
     assert fake_redis_client.stream_unread_count(stream, group) == 3
 

@@ -508,9 +508,7 @@ def test_cancelled_conclusion_counted_as_failure(gh_mock, fake_redis_client, lab
     assert pr.ci_failures[0]["name"] == "deploy"
 
 
-def test_self_cancelled_stale_run_is_suppressed(
-    gh_mock, fake_redis_client, label_config
-):
+def test_self_cancelled_stale_run_is_suppressed(gh_mock, fake_redis_client, label_config):
     """A CANCELLED check from stale self-healing does not enqueue a Claude fix."""
     pr_number = 143
     head_sha = "sha-self-cancelled"
@@ -546,9 +544,7 @@ def test_self_cancelled_stale_run_is_suppressed(
     assert results[0].ci_failures == []
 
 
-def test_unrelated_cancelled_run_still_enqueues_fix(
-    gh_mock, fake_redis_client, label_config
-):
+def test_unrelated_cancelled_run_still_enqueues_fix(gh_mock, fake_redis_client, label_config):
     """Only the run IDs cancelled by stale self-healing are suppressed."""
     pr_number = 144
     head_sha = "sha-other-cancelled"
@@ -1611,9 +1607,7 @@ def test_backoff_cooldown_skips_before_enqueue(gh_mock, fake_redis_client, label
     gh_mock.get_ci_status.assert_not_called()
 
 
-def test_backoff_cooldown_same_sha_skips_before_enqueue(
-    gh_mock, fake_redis_client, label_config
-):
+def test_backoff_cooldown_same_sha_skips_before_enqueue(gh_mock, fake_redis_client, label_config):
     """A SHA-aware transient backoff still skips for the same head SHA."""
     pr_number = 736
     head_sha = "sha-a"

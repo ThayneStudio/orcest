@@ -10,13 +10,13 @@ test: redis-up
 
 # Start Redis in Docker for integration/stress tests
 redis-up:
-	docker compose up -d redis
+	docker compose -f docker-compose.redis.yml up -d redis
 	@echo "Waiting for Redis..."
-	@timeout 30 bash -c 'until docker compose exec redis redis-cli ping 2>/dev/null | grep -q PONG; do sleep 0.2; done'
+	@timeout 30 bash -c 'until docker compose -f docker-compose.redis.yml exec redis redis-cli ping 2>/dev/null | grep -q PONG; do sleep 0.2; done'
 
 redis-down:
-	docker compose stop redis
-	docker compose rm -f redis
+	docker compose -f docker-compose.redis.yml stop redis
+	docker compose -f docker-compose.redis.yml rm -f redis
 
 lint:
 	ruff check src/ tests/

@@ -359,9 +359,7 @@ def get_backoff_head_sha(redis_client: RedisClient, repo: str, number: int) -> s
 _TRANSIENT_FAILURE_COUNT_TTL_SECONDS = 7 * 24 * 3600
 
 
-def increment_transient_failure_count(
-    redis_client: RedisClient, repo: str, number: int
-) -> int:
+def increment_transient_failure_count(redis_client: RedisClient, repo: str, number: int) -> int:
     """Increment the transient failure streak for a PR and return the count."""
     key = f"transient_failures:pr:{repo}:{number}"
     pipe = redis_client.pipeline(transaction=True)
@@ -382,9 +380,7 @@ def get_transient_failure_count(redis_client: RedisClient, repo: str, number: in
         return 0
 
 
-def clear_transient_failure_count(
-    redis_client: RedisClient, repo: str, number: int
-) -> None:
+def clear_transient_failure_count(redis_client: RedisClient, repo: str, number: int) -> None:
     """Clear the transient failure streak for a PR."""
     key = f"transient_failures:pr:{repo}:{number}"
     redis_client.delete(key)

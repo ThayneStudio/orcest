@@ -385,12 +385,10 @@ class TestVmExists:
         from proxmoxer.core import ResourceException
 
         client, mock_api = _make_client()
-        mock_api.nodes("pve").qemu(9002).status.current.get.side_effect = (
-            ResourceException(
-                500,
-                "Internal Server Error",
-                "unable to find configuration file for VM 9002 on node 'pve'",
-            )
+        mock_api.nodes("pve").qemu(9002).status.current.get.side_effect = ResourceException(
+            500,
+            "Internal Server Error",
+            "unable to find configuration file for VM 9002 on node 'pve'",
         )
         assert client.vm_exists(9002) is False
 
@@ -398,8 +396,8 @@ class TestVmExists:
         from proxmoxer.core import ResourceException
 
         client, mock_api = _make_client()
-        mock_api.nodes("pve").qemu(9000).status.current.get.side_effect = (
-            ResourceException(596, "Connection timed out", "")
+        mock_api.nodes("pve").qemu(9000).status.current.get.side_effect = ResourceException(
+            596, "Connection timed out", ""
         )
         with pytest.raises(ResourceException):
             client.vm_exists(9000)
