@@ -14,7 +14,11 @@ from rich.table import Table
 
 from orcest.dashboard import fetch_snapshot, truncate
 from orcest.fleet.cli import fleet
-from orcest.shared.models import DEAD_LETTER_METADATA_FIELDS, DEAD_LETTER_STREAM
+from orcest.shared.models import (
+    DEAD_LETTER_METADATA_FIELDS,
+    DEAD_LETTER_STREAM,
+    REDACTED_FIELDS,
+)
 
 if TYPE_CHECKING:
     from orcest.shared.config import RedisConfig
@@ -348,6 +352,26 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
         # Strip dead-letter metadata; keep only original task fields.
         task_fields = {k: v for k, v in fields.items() if k not in DEAD_LETTER_METADATA_FIELDS}
+
+        # Critical safety for post-Task-2 redaction: DL entries now contain
+        # "[REDACTED]" for secrets (via to_safe_dict in the write sites).
+        # Replaying them would inject literal "[REDACTED]" as credentials,
+        # causing auth failures. Detect and refuse with guidance; the original
+        # secrets are intentionally never stored in the dead-letter stream.
+        redacted_secrets = [
+            f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"
+        ]
+        if redacted_secrets:
+            console.print(
+                f"[red]Cannot replay entry {entry_id}: contains redacted values for "
+                f"{redacted_secrets}. Original credentials are not persisted in "
+                "dead-letters (security requirement). Re-trigger the task from the "
+                "orchestrator (normal triage/issue flow) or supply the credential "
+                "when manually re-enqueuing.[/red]"
+            )
+            errors += 1
+            continue
+
         try:
             # Not atomic: if xdel fails after xadd the entry stays in the dead-letter stream
             # and will be replayed again on the next --replay run (at-least-once delivery).

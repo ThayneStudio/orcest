@@ -34,6 +34,29 @@ DEAD_LETTER_METADATA_FIELDS = frozenset(
 REDACTED_FIELDS = frozenset({"token", "claude_token", "credential"})
 
 
+def _sync_claude_for_provider(
+    provider: str, credential: str, claude_token: str
+) -> tuple[str, str]:
+    """Centralize the transition-era 'Claude provider sync' logic.
+
+    For provider=="claude", ensure both credential and claude_token carry the
+    (same) secret so that legacy code paths (still reading .claude_token) and
+    new paths (reading .credential) both work during the rollout.
+
+    Non-claude providers pass through unchanged.
+
+    This eliminates the previous duplication of the sync across create(),
+    from_dict(), and to_dict().
+    """
+    if provider != "claude":
+        return credential, claude_token
+    # Prefer whichever is truthy; if both supplied and different we keep the
+    # respective values (rare during transition).
+    eff_cred = credential or claude_token
+    eff_ct = claude_token or credential
+    return eff_cred, eff_ct
+
+
 class TaskType(str, Enum):
     FIX_PR = "fix_pr"
     FIX_CI = "fix_ci"
@@ -88,9 +111,11 @@ class Task:
         interoperate without losing the per-task credential.
         """
         # Keep claude_token populated from credential for claude provider during rollout.
-        claude_token_out = self.claude_token
-        if not claude_token_out and self.provider == "claude":
-            claude_token_out = self.credential
+        # Delegated to the shared helper (removes duplication of sync logic
+        # that previously lived in to_dict / from_dict / create).
+        _ignored_cred, claude_token_out = _sync_claude_for_provider(
+            self.provider, self.credential, self.claude_token
+        )
         return {
             "id": self.id,
             "type": self.type.value,
@@ -128,11 +153,17 @@ class Task:
         # Legacy tolerance + new field synthesis (Step 2.1 / 2.4 requirement)
         claude_token_in = data.get("claude_token", "")
         provider_in = data.get("provider") or "claude"
-        credential_in = data.get("credential") or claude_token_in or ""
+        # Proper presence check (not "or") so that explicit empty-string "credential"
+        # (valid per wire protocol) is respected and does not fall back to claude_token.
+        # Absent key -> None; explicit "" -> ""; only fallback on absent.
+        raw_credential = data.get("credential")
+        credential_in = raw_credential if raw_credential is not None else (claude_token_in or "")
         model_in = data.get("model") or None
 
         # For claude provider during transition, ensure claude_token is populated
         # so that code paths still reading task.claude_token continue to work.
+        # This one-directional fill (cred -> claude) respects explicit credential
+        # values (including empty) taking precedence per the new-field contract.
         if provider_in == "claude" and not claude_token_in and credential_in:
             claude_token_in = credential_in
 
@@ -192,11 +223,10 @@ class Task:
         Callers may also pass provider/credential/model explicitly (future path).
         """
         # Derive for transition compatibility (keep claude_token populated too)
-        effective_credential = credential or claude_token
-        if provider == "claude":
-            effective_claude_token = claude_token or credential
-        else:
-            effective_claude_token = claude_token
+        # Uses shared helper to eliminate duplication of Claude sync logic.
+        effective_credential, effective_claude_token = _sync_claude_for_provider(
+            provider, credential, claude_token
+        )
 
         return cls(
             id=str(uuid.uuid4()),

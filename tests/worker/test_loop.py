@@ -1653,6 +1653,10 @@ class TestRunWorker:
         assert "dead_letter_reason" in dl_fields
         assert "original_entry_id" in dl_fields
 
+        # Explicit redaction assertion at DL write site for worker integration test
+        assert dl_fields.get("token") == "[REDACTED]"
+        assert "test-token-loop" not in str(dl_fields)
+
         # The original entry must be ACKed so the main stream doesn't stall
         expected_fq_stream = f"{worker_config.redis.key_prefix}:tasks:{worker_config.backend}"
         mock_redis.xack_raw.assert_any_call(expected_fq_stream, CONSUMER_GROUP, "entry-1")
@@ -2068,6 +2072,13 @@ class TestDeadLetterTask:
         assert fields["tasks_stream"] == "tasks:claude"
         assert fields["delivery_count"] == "5"
 
+        # Explicit redaction assertion at the DL write site (code quality review)
+        assert fields.get("token") == "[REDACTED]", "secret token must be redacted in DL"
+        assert fields.get("credential") == "[REDACTED]"
+        assert fields.get("claude_token") == "[REDACTED]"
+        # sample secret must not appear
+        assert "test-token-loop" not in str(fields)
+
         mock_redis.xack_raw.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-42")
 
     def test_acks_even_when_dead_letter_publish_fails(self, local_worker_config, sample_task):
@@ -2273,6 +2284,10 @@ class TestPublishResultWithRetry:
         assert "dead_letter_reason" in dl_fields
         assert dl_fields["tasks_stream"] == "tasks:claude"
         assert dl_fields["original_entry_id"] == "entry-42"
+
+        # Explicit redaction assertion at the result-DL write site (code quality review)
+        assert dl_fields.get("token") == "[REDACTED]", "github token must be redacted even in result DL path"
+        assert "test-token-loop" not in str(dl_fields)
 
     def test_all_retries_fail_dead_letter_also_fails_returns_false(self, sample_task, caplog):
         """Returns False even when the dead-letter write itself raises."""

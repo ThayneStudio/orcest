@@ -299,6 +299,39 @@ def test_task_from_dict_tolerates_legacy_claude_token_payload():
     assert d2["model"] == ""
 
 
+def test_task_from_dict_explicit_empty_credential_takes_precedence():
+    """from_dict must treat explicit 'credential': '' as present (not fallback to claude_token).
+
+    This was the precedence bug: `get("credential") or claude...` treated "" as absent.
+    """
+    payload = {
+        "id": "p1",
+        "type": "fix_ci",
+        "repo": "a/b",
+        "token": "ghp_x",
+        "claude_token": "sk-claude-present",
+        "credential": "",  # explicit empty for new field (precedence)
+        "provider": "claude",
+        "resource_type": "pr",
+        "resource_id": "1",
+        "prompt": "p",
+        "branch": "",
+        "base_branch": "",
+        "key_prefix": "",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "snapshot_head_sha": "",
+        "decision_reason": "",
+        "snapshot_failed_checks": "[]",
+        "snapshot_review_thread_ids": "[]",
+        "snapshot_review_thread_fingerprints": "[]",
+        "model": "",
+    }
+    task = Task.from_dict(payload)
+    assert task.credential == "", "explicit empty credential must be kept (not replaced by claude_token)"
+    assert task.claude_token == "sk-claude-present", "claude_token from input preserved when cred explicit empty"
+    assert task.provider == "claude"
+
+
 def test_task_repr_redacts_sensitive_fields():
     """__repr__ must never contain raw secrets (security requirement from subagent review)."""
     secret_ct = "sk-ant-repr-secret-00112233"
