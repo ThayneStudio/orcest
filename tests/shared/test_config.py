@@ -11,6 +11,7 @@ from orcest.shared.config import (
     load_orchestrator_config,
     load_worker_config,
 )
+from orcest.shared.providers import ProviderEntry
 
 # ---------------------------------------------------------------------------
 # Env vars that config.py reads -- we must ensure they are unset in every
@@ -30,6 +31,9 @@ _ENV_VARS_TO_CLEAR = [
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKENS",
     "ORCEST_TASK_KEY_PREFIX",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "ANTHROPIC_API_KEY",
 ]
 
 
@@ -849,3 +853,143 @@ def test_runner_config_defaults_90min_opus():
     defaults = RunnerConfig()
     assert defaults.timeout == 5400
     assert defaults.model == "claude-opus-4-7"
+
+
+# -- providers: list + backward compat with claude_tokens (Task 4) ----------------
+
+
+def test_load_orchestrator_config_legacy_claude_synthesizes_provider_entries(tmp_path: Path):
+    """Legacy path synthesizes ProviderEntry('claude', ...) with rich fields=None (boundary)."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  token: ghp_tok\n"
+        "  repo: acme/widgets\n"
+        "  claude_token: claude_tok\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 1
+    proj = config.projects[0]
+    assert len(proj.providers) == 1
+    e = proj.providers[0]
+    assert isinstance(e, ProviderEntry)
+    assert e.provider == "claude"
+    assert e.credential == "claude_tok"
+    assert e.model is None
+    assert e.cli_binary is None
+    assert e.env_var is None
+    assert e.extras == {}
+
+
+def test_load_orchestrator_config_providers_list_from_yaml(tmp_path: Path):
+    """providers: list populates .providers; supports model + rich fields from YAML."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: claude\n"
+        "    credential: claude-in-providers\n"
+        "    model: claude-3-5-sonnet\n"
+        "  - provider: grok\n"
+        "    credential: xai-secret\n"
+        "    model: grok-3-latest\n"
+        "    extras:\n"
+        "      temperature: \"0.2\"\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    proj = config.projects[0]
+    assert len(proj.providers) >= 2
+    # Find by provider (order: top providers first, then any synth claude if not duped)
+    grok_e = next((e for e in proj.providers if e.provider == "grok"), None)
+    assert grok_e is not None
+    assert grok_e.credential == "xai-secret"
+    assert grok_e.model == "grok-3-latest"
+    assert grok_e.cli_binary is None
+    assert grok_e.env_var is None
+    assert grok_e.extras == {"temperature": "0.2"}
+
+    claude_e = next((e for e in proj.providers if e.provider == "claude"), None)
+    assert claude_e is not None
+    assert claude_e.model == "claude-3-5-sonnet"
+
+
+def test_load_orchestrator_config_providers_mixed_with_env_claude(tmp_path: Path, monkeypatch):
+    """Mixed env (claude) + YAML providers (grok + env fallback for its cred)."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKENS", "env-claude-1,env-claude-2")
+    monkeypatch.setenv("XAI_API_KEY", "grok-from-env")
+
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: acme\n"
+        "    providers:\n"
+        "      - provider: grok\n"
+        "        model: grok-3\n"
+        "        # credential omitted -> falls back to XAI_API_KEY from env\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert len(config.projects) == 1
+    proj = config.projects[0]
+    assert proj.claude_tokens == ["env-claude-1", "env-claude-2"]  # legacy still works
+    # providers should contain synth claude (2) + grok from yaml (with cred from env)
+    assert len(proj.providers) == 3
+    claude_entries = [e for e in proj.providers if e.provider == "claude"]
+    assert len(claude_entries) == 2
+    assert all(e.cli_binary is None for e in claude_entries)  # legacy synth path
+    grok_e = next(e for e in proj.providers if e.provider == "grok")
+    assert grok_e.credential == "grok-from-env"
+    assert grok_e.model == "grok-3"
+    assert grok_e.cli_binary is None  # not specified, per design
+
+
+def test_load_orchestrator_config_providers_rich_fields_explicit(tmp_path: Path):
+    """providers entry can carry cli_binary, env_var, extras (orchestrator ignores rich fields)."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: grok\n"
+        "    credential: k\n"
+        "    cli_binary: custom-grok-bin\n"
+        "    env_var: CUSTOM_GROK_KEY\n"
+        "    extras:\n      foo: bar\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+    e = config.projects[0].providers[0]
+    assert e.cli_binary == "custom-grok-bin"
+    assert e.env_var == "CUSTOM_GROK_KEY"
+    assert e.extras == {"foo": "bar"}
+
+
+def test_load_orchestrator_config_providers_bad_entry_raises(tmp_path: Path):
+    """Bad providers entry (missing provider or credential, non-dict) raises clear ValueError."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nproviders:\n  - foo: bar\n")
+    with pytest.raises(ValueError, match="providers\\[0\\]"):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_worker_config_with_providers_list(tmp_path: Path):
+    """WorkerConfig also carries providers list (parsed from its YAML)."""
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text(
+        "worker_id: test-worker\n"
+        "providers:\n"
+        "  - provider: claude\n"
+        "    credential: dummy-for-worker\n"
+    )
+
+    config = load_worker_config(cfg_file)
+
+    assert len(config.providers) == 1
+    assert config.providers[0].provider == "claude"
+    assert isinstance(config.providers[0], ProviderEntry)

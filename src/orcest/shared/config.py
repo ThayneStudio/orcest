@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from orcest.shared.providers import ProviderEntry
+
 
 @dataclass
 class RedisConfig:
@@ -38,6 +40,9 @@ class ProjectConfig:
     token: str  # GitHub PAT
     claude_tokens: list[str]  # Claude Code OAuth tokens (round-robin pool)
     key_prefix: str  # Redis key prefix for this project
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # New: multi-provider support. Legacy claude_tokens path synthesizes
+    # ProviderEntry objects with rich fields (cli_binary/env_var/extras) left None.
 
     @property
     def claude_token(self) -> str:
@@ -106,6 +111,8 @@ class OrchestratorConfig:
     # publish to this prefix so workers only need to read from one stream.
     # Defaults to redis.key_prefix for backward compatibility with single-project mode.
     task_key_prefix: str = ""
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # Top-level providers parsed from YAML (shared or single-project mode)
 
 
 @dataclass
@@ -116,6 +123,8 @@ class WorkerConfig:
     backend: str = "claude"
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     ephemeral: bool = False  # When True, process one task and exit
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # Optional provider declarations (for future multi-provider worker support)
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -168,6 +177,79 @@ def _safe_bool(value: Any, field_name: str) -> bool:
             "Use an unquoted YAML boolean (true or false)."
         )
     return value
+
+
+def _parse_provider_entry(raw: dict[str, Any], context: str) -> ProviderEntry:
+    """Parse a single provider dict from YAML into a ProviderEntry.
+
+    Supports all ProviderEntry fields (provider, credential, model, cli_binary,
+    env_var, extras). Credentials may come from the YAML value or fall back to
+    conventional environment variables for mixed YAML+env sources.
+
+    For the legacy claude_tokens path, callers synthesize entries directly with
+    rich fields (cli_binary, env_var, extras) explicitly left as None/defaults.
+    """
+    provider = _safe_str(raw.get("provider", ""), f"{context}.provider").strip()
+    if not provider:
+        raise ValueError(f"{context} must have a non-empty 'provider' field")
+
+    cred_raw = raw.get("credential")
+    if cred_raw is not None and str(cred_raw).strip():
+        credential = _safe_str(cred_raw, f"{context}.credential").strip()
+    else:
+        # Support mixed YAML + env var sources for new providers (e.g. grok via XAI_API_KEY)
+        candidates: list[str] = [
+            f"{provider.upper()}_TOKEN",
+            f"{provider.upper()}_API_KEY",
+            f"{provider.upper()}_KEY",
+        ]
+        if provider == "grok":
+            candidates = ["XAI_API_KEY", "GROK_API_KEY", "XAI_API_TOKEN"] + candidates
+        elif provider == "claude":
+            candidates = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] + candidates
+
+        credential = ""
+        for cand in candidates:
+            v = os.environ.get(cand)
+            if v and str(v).strip():
+                credential = str(v).strip()
+                break
+
+        if not credential:
+            raise ValueError(
+                f"Provider entry at {context} for '{provider}' is missing 'credential' "
+                f"(not present in YAML and no matching env var among {candidates[:3]}... was set)"
+            )
+
+    model = raw.get("model")
+    if model is not None:
+        model = _safe_str(model, f"{context}.model").strip() or None
+
+    cli_binary = raw.get("cli_binary")
+    if cli_binary is not None:
+        cli_binary = _safe_str(cli_binary, f"{context}.cli_binary").strip() or None
+
+    env_var = raw.get("env_var")
+    if env_var is not None:
+        env_var = _safe_str(env_var, f"{context}.env_var").strip() or None
+
+    extras_raw = raw.get("extras", {}) or {}
+    if not isinstance(extras_raw, dict):
+        raise ValueError(
+            f"{context}.extras must be a YAML mapping, got {type(extras_raw).__name__}"
+        )
+    extras: dict[str, str] = {}
+    for k, v in extras_raw.items():
+        extras[_safe_str(k, f"{context}.extras key")] = _safe_str(v, f"{context}.extras value")
+
+    return ProviderEntry(
+        provider=provider,
+        credential=credential,
+        model=model,
+        cli_binary=cli_binary,
+        env_var=env_var,
+        extras=extras,
+    )
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -274,6 +356,17 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         claude_token=_safe_str(claude_tokens[0], "github.claude_token") if claude_tokens else "",
     )
 
+    # Top-level providers list (new style; rich fields from YAML, creds via env fallback)
+    top_providers_raw = raw.get("providers")
+    top_providers: list[ProviderEntry] = []
+    if isinstance(top_providers_raw, list):
+        for j, e_raw in enumerate(top_providers_raw):
+            if not isinstance(e_raw, dict):
+                raise ValueError(
+                    f"providers[{j}] must be a YAML mapping, got {type(e_raw).__name__}"
+                )
+            top_providers.append(_parse_provider_entry(e_raw, f"providers[{j}]"))
+
     # Multi-project support: load projects list
     projects_raw = raw.get("projects")
     if projects_raw is not None and not isinstance(projects_raw, list):
@@ -295,6 +388,30 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 p_claude_tokens = [_safe_str(p["claude_token"], f"projects[{i}].claude_token")]
             else:
                 p_claude_tokens = list(claude_tokens)  # inherit from shared
+
+            # New providers support (per-project) + legacy claude_tokens synthesis
+            # (claude entries synthesized with rich fields left as None per boundary)
+            p_providers: list[ProviderEntry] = list(top_providers)
+            p_providers_raw = p.get("providers")
+            if isinstance(p_providers_raw, list) and p_providers_raw:
+                for j, e_raw in enumerate(p_providers_raw):
+                    if not isinstance(e_raw, dict):
+                        raise ValueError(
+                        f"projects[{i}].providers[{j}] must be a YAML mapping, "
+                        f"got {type(e_raw).__name__}"
+                    )
+                    p_providers.append(
+                        _parse_provider_entry(e_raw, f"projects[{i}].providers[{j}]")
+                    )
+
+            # Synthesize from legacy claude_tokens (rich=None) + merge, dedup by identity()
+            existing_idents = {e.identity() for e in p_providers}
+            for t in p_claude_tokens:
+                e = ProviderEntry(provider="claude", credential=t, model=None)
+                if e.identity() not in existing_idents:
+                    p_providers.append(e)
+                    existing_idents.add(e.identity())
+
             projects.append(
                 ProjectConfig(
                     repo=_safe_str(p.get("repo", ""), f"projects[{i}].repo"),
@@ -305,6 +422,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                         p.get("key_prefix", redis_config.key_prefix),
                         f"projects[{i}].key_prefix",
                     ),
+                    providers=p_providers,
                 )
             )
         if len(projects) > 1:
@@ -329,12 +447,22 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 )
     else:
         # Backward compatibility: single-project mode
+        # Synthesize claude entries (rich=None) + any top-level providers, deduped
+        single_providers: list[ProviderEntry] = list(top_providers)
+        existing_idents = {e.identity() for e in single_providers}
+        for t in claude_tokens:
+            e = ProviderEntry(provider="claude", credential=t, model=None)
+            if e.identity() not in existing_idents:
+                single_providers.append(e)
+                existing_idents.add(e.identity())
+
         projects = [
             ProjectConfig(
                 repo=_safe_str(github_repo, "github.repo"),
                 token=_safe_str(github_token, "github.token"),
                 claude_tokens=list(claude_tokens),
                 key_prefix=_safe_str(redis_config.key_prefix, "redis.key_prefix"),
+                providers=single_providers,
             )
         ]
 
@@ -463,6 +591,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         delete_branch_on_merge=delete_branch_on_merge,
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
         task_key_prefix=task_key_prefix,
+        providers=top_providers,
     )
 
     # Validate required fields
@@ -535,6 +664,17 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     ephemeral_raw = raw.get("ephemeral", False)
     ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
 
+    # providers list (new multi-provider support; parsed for completeness)
+    worker_providers_raw = raw.get("providers")
+    worker_providers: list[ProviderEntry] = []
+    if isinstance(worker_providers_raw, list) and worker_providers_raw:
+        for j, e_raw in enumerate(worker_providers_raw):
+            if not isinstance(e_raw, dict):
+                raise ValueError(
+                    f"providers[{j}] must be a YAML mapping, got {type(e_raw).__name__}"
+                )
+            worker_providers.append(_parse_provider_entry(e_raw, f"providers[{j}]"))
+
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
@@ -542,6 +682,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         backend=backend,
         runner=runner_config,
         ephemeral=ephemeral,
+        providers=worker_providers,
     )
 
     # Validate required fields
