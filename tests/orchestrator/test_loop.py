@@ -623,7 +623,7 @@ def test_poll_cycle_increments_token_exhausted_skip_counter(
     the per-project Redis counter (legacy key name) so operators can detect the situation."""
     from datetime import datetime, timedelta, timezone
 
-    from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
+    from orcest.orchestrator.loop import _PROVIDER_EXHAUSTED_SKIP_KEY
     from orcest.orchestrator.provider_pool import ProviderPool
     from orcest.shared.providers import ProviderEntry
 
@@ -656,9 +656,9 @@ def test_poll_cycle_increments_token_exhausted_skip_counter(
 
     # Counter incremented and TTL set, no task published.
     publish_mock.assert_not_called()
-    raw_count = fake_redis_client.get(_TOKEN_EXHAUSTED_SKIP_KEY)
+    raw_count = fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY)
     assert raw_count == "1"
-    assert fake_redis_client.ttl(_TOKEN_EXHAUSTED_SKIP_KEY) > 0
+    assert fake_redis_client.ttl(_PROVIDER_EXHAUSTED_SKIP_KEY) > 0
 
 
 def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
@@ -670,7 +670,7 @@ def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
     """All-transient CI reruns happen before Claude token selection."""
     from datetime import datetime, timedelta, timezone
 
-    from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
+    from orcest.orchestrator.loop import _PROVIDER_EXHAUSTED_SKIP_KEY
     from orcest.orchestrator.provider_pool import ProviderPool
     from orcest.shared.providers import ProviderEntry
 
@@ -716,7 +716,7 @@ def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
         failed_only=True,
     )
     publish_mock.assert_not_called()
-    assert fake_redis_client.get(_TOKEN_EXHAUSTED_SKIP_KEY) is None
+    assert fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY) is None
 
 
 def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
@@ -728,7 +728,7 @@ def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
     """Code CI failures do not publish worker tasks when all providers are exhausted."""
     from datetime import datetime, timedelta, timezone
 
-    from orcest.orchestrator.loop import _TOKEN_EXHAUSTED_SKIP_KEY
+    from orcest.orchestrator.loop import _PROVIDER_EXHAUSTED_SKIP_KEY
     from orcest.orchestrator.provider_pool import ProviderPool
     from orcest.shared.providers import ProviderEntry
 
@@ -769,7 +769,7 @@ def test_poll_cycle_token_exhausted_code_fix_still_requires_claude_token(
 
     gh_mock.rerun_workflow.assert_not_called()
     publish_mock.assert_not_called()
-    assert fake_redis_client.get(_TOKEN_EXHAUSTED_SKIP_KEY) == "1"
+    assert fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY) == "1"
 
 
 def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_config, gh_mock):

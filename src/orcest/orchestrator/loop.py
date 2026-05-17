@@ -12,6 +12,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
@@ -72,10 +73,10 @@ RESULTS_GROUP = "orchestrator"
 # Observability counter incremented when _select_provider_entry returns None
 # (all entries in the project's ProviderPool are cooling).  TTL keeps it self-cleaning
 # so operators can SCAN the keyspace without finding stale leftovers.
-# (Key name retains "tokens" during transition; per-provider variants use masked
-# identities in logs and will be further split in Task 8.)
-_TOKEN_EXHAUSTED_SKIP_KEY = "tokens:exhausted_skip"
-_TOKEN_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
+# Per-provider exhausted-skip counters (using masked identities() as keys) and
+# further splitting are planned for Task 8; this provides the base providers: key.
+_PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"
+_PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
@@ -784,16 +785,16 @@ def _poll_project(
             # empty-cred) lean entry so publish_* is still invoked as before.
             # Real configs with providers or claude_tokens get pools, so this path
             # is mainly for direct-test compat.
-            ct = project.claude_token or ""
-            return ProviderEntry(provider="claude", credential=ct, model=None)
+            cred = project.claude_token or ""
+            return ProviderEntry(provider="claude", credential=cred, model=None)
 
         entry = token_pool.next_entry()
         if entry is None:
             try:
-                count = project_redis.incr(_TOKEN_EXHAUSTED_SKIP_KEY)
+                count = project_redis.incr(_PROVIDER_EXHAUSTED_SKIP_KEY)
                 if count == 1:
                     project_redis.expire(
-                        _TOKEN_EXHAUSTED_SKIP_KEY, _TOKEN_EXHAUSTED_SKIP_TTL_SECONDS
+                        _PROVIDER_EXHAUSTED_SKIP_KEY, _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS
                     )
             except Exception:
                 # Observability is best-effort; never break the poll cycle.
@@ -882,6 +883,8 @@ def _poll_project(
                         )
                         continue
                     else:
+                        task_id = str(uuid.uuid4())
+                        _register_task(task_id, entry)
                         try:
                             task = publish_rebase_task(
                                 pr_state=pr_state,
@@ -898,16 +901,23 @@ def _poll_project(
                                 provider=entry.provider,
                                 credential=entry.credential,
                                 model=entry.model,
+                                task_id=task_id,
                             )
                             if task is not None:
-                                _register_task(task.id, entry)
+                                # registered before publish per contract; id will match
                                 enqueued += 1
+                            else:
+                                # publish returned without enqueue (e.g. dedup); release mapping
+                                if token_pool is not None:
+                                    token_pool.task_completed(task_id)
                         except Exception as rebase_err:
                             logger.error(
                                 f"Failed to enqueue rebase task for PR #{pr_state.number}: "
                                 f"{rebase_err}",
                                 exc_info=True,
                             )
+                            if token_pool is not None:
+                                token_pool.task_completed(task_id)
                             # Fall through to the backoff-and-retry path
                             is_conflict = False
 
@@ -1075,6 +1085,8 @@ def _poll_project(
                             other_pr.number,
                         )
                         continue
+                    task_id = str(uuid.uuid4())
+                    _register_task(task_id, entry)
                     try:
                         task = publish_rebase_task(
                             pr_state=other_pr,
@@ -1092,15 +1104,22 @@ def _poll_project(
                             provider=entry.provider,
                             credential=entry.credential,
                             model=entry.model,
+                            task_id=task_id,
                         )
                         if task is not None:
-                            _register_task(task.id, entry)
+                            # pre-registered; success
+                            pass
+                        else:
+                            if token_pool is not None:
+                                token_pool.task_completed(task_id)
                     except Exception:
                         logger.warning(
                             "Failed to enqueue rebase for PR #%d",
                             other_pr.number,
                             exc_info=True,
                         )
+                        if token_pool is not None:
+                            token_pool.task_completed(task_id)
         elif pr_state.action == PRAction.ENQUEUE_FIX:
             logger.info("PR #%d (%s): enqueueing fix task", pr_state.number, pr_state.title)
             try:
@@ -1127,6 +1146,8 @@ def _poll_project(
                     pr_state.number,
                 )
             else:
+                task_id = str(uuid.uuid4())
+                _register_task(task_id, entry)
                 try:
                     result = publish_fix_task(
                         pr_state=pr_state,
@@ -1143,10 +1164,14 @@ def _poll_project(
                         provider=entry.provider,
                         credential=entry.credential,
                         model=entry.model,
+                        task_id=task_id,
                     )
                     if result is not None:
-                        _register_task(result.id, entry)
+                        # pre-registered before publish per hardened contract
                         enqueued += 1
+                    else:
+                        if token_pool is not None:
+                            token_pool.task_completed(task_id)
                 except Exception as e:
                     logger.error(
                         "Failed to publish fix task for PR #%d: %s",
@@ -1154,6 +1179,8 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
+                    if token_pool is not None:
+                        token_pool.task_completed(task_id)
         elif pr_state.action == PRAction.ENQUEUE_FOLLOWUP:
             logger.info("PR #%d (%s): enqueueing followup triage", pr_state.number, pr_state.title)
             entry = _select_provider_entry()
@@ -1163,6 +1190,8 @@ def _poll_project(
                     pr_state.number,
                 )
             else:
+                task_id = str(uuid.uuid4())
+                _register_task(task_id, entry)
                 try:
                     task = publish_followup_task(
                         pr_state=pr_state,
@@ -1178,10 +1207,14 @@ def _poll_project(
                         provider=entry.provider,
                         credential=entry.credential,
                         model=entry.model,
+                        task_id=task_id,
                     )
                     if task is not None:
-                        _register_task(task.id, entry)
+                        # pre-registered
                         enqueued += 1
+                    else:
+                        if token_pool is not None:
+                            token_pool.task_completed(task_id)
                 except Exception as e:
                     logger.error(
                         "Failed to publish followup task for PR #%d: %s",
@@ -1189,6 +1222,8 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
+                    if token_pool is not None:
+                        token_pool.task_completed(task_id)
         elif pr_state.action == PRAction.ENQUEUE_REBASE:
             logger.info(
                 "PR #%d (%s): merge conflicts detected, enqueueing rebase task",
@@ -1202,6 +1237,8 @@ def _poll_project(
                     pr_state.number,
                 )
             else:
+                task_id = str(uuid.uuid4())
+                _register_task(task_id, entry)
                 try:
                     task = publish_rebase_task(
                         pr_state=pr_state,
@@ -1217,10 +1254,14 @@ def _poll_project(
                         provider=entry.provider,
                         credential=entry.credential,
                         model=entry.model,
+                        task_id=task_id,
                     )
                     if task is not None:
-                        _register_task(task.id, entry)
+                        # pre-registered per contract
                         enqueued += 1
+                    else:
+                        if token_pool is not None:
+                            token_pool.task_completed(task_id)
                 except Exception as e:
                     logger.error(
                         "Failed to publish rebase task for PR #%d: %s",
@@ -1228,6 +1269,8 @@ def _poll_project(
                         e,
                         exc_info=True,
                     )
+                    if token_pool is not None:
+                        token_pool.task_completed(task_id)
         elif pr_state.action == PRAction.UPDATE_BRANCH:
             logger.info(
                 "PR #%d (%s): out-of-date with base, calling update-branch",
@@ -1531,6 +1574,8 @@ def _poll_project(
                     issue_state.number,
                 )
             else:
+                task_id = str(uuid.uuid4())
+                _register_task(task_id, entry)
                 try:
                     task = publish_issue_task(
                         issue_state=issue_state,
@@ -1546,15 +1591,21 @@ def _poll_project(
                         provider=entry.provider,
                         credential=entry.credential,
                         model=entry.model,
+                        task_id=task_id,
                     )
                     if task is not None:
-                        _register_task(task.id, entry)
+                        # pre-registered per hardened contract
                         enqueued += 1
+                    else:
+                        if token_pool is not None:
+                            token_pool.task_completed(task_id)
                 except Exception as e:
                     logger.error(
                         f"Failed to publish issue task for issue #{issue_state.number}: {e}",
                         exc_info=True,
                     )
+                    if token_pool is not None:
+                        token_pool.task_completed(task_id)
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
             # Budget exhaustion is not a human-decision blocker. Orcest does
             # not label the issue needs-human; it simply stops actively

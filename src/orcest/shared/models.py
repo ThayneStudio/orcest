@@ -217,12 +217,18 @@ class Task:
         provider: str = "claude",
         credential: str = "",
         model: str | None = None,
+        # task_id allows register-before-publish + failure cleanup contract (Task 5):
+        # pre-generate id, register_task(id, entry), pass here so create uses it;
+        # on publish failure/None paths, caller calls task_completed to rollback.
+        task_id: str | None = None,
     ) -> "Task":
         """Factory with auto-generated ID and timestamp.
 
         During transition, if only claude_token is supplied we derive credential +
         provider so that the embedded secret is available under the new name too.
         Callers may also pass provider/credential/model explicitly (future path).
+        Optional task_id supports the hardened register-before-xadd contract in
+        orchestrator without changing id generation for legacy callers.
         """
         # Derive for transition compatibility (keep claude_token populated too)
         # Uses shared helper to eliminate duplication of Claude sync logic.
@@ -231,7 +237,7 @@ class Task:
         )
 
         return cls(
-            id=str(uuid.uuid4()),
+            id=task_id if task_id is not None else str(uuid.uuid4()),
             type=task_type,
             repo=repo,
             token=token,
