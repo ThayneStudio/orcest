@@ -862,10 +862,7 @@ def test_load_orchestrator_config_legacy_claude_synthesizes_provider_entries(tmp
     """Legacy path synthesizes ProviderEntry('claude', ...) with rich fields=None (boundary)."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n"
-        "  token: ghp_tok\n"
-        "  repo: acme/widgets\n"
-        "  claude_token: claude_tok\n"
+        "github:\n  token: ghp_tok\n  repo: acme/widgets\n  claude_token: claude_tok\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -896,7 +893,7 @@ def test_load_orchestrator_config_providers_list_from_yaml(tmp_path: Path):
         "    credential: xai-secret\n"
         "    model: grok-3-latest\n"
         "    extras:\n"
-        "      temperature: \"0.2\"\n"
+        '      temperature: "0.2"\n'
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -993,3 +990,76 @@ def test_load_worker_config_with_providers_list(tmp_path: Path):
     assert len(config.providers) == 1
     assert config.providers[0].provider == "claude"
     assert isinstance(config.providers[0], ProviderEntry)
+
+
+# -- regression tests for Task 4 code quality nits (dedup) ----------------------
+
+
+def test_providers_dedup_between_top_level_and_per_project(tmp_path: Path):
+    """Same provider identity in top-level providers: and per-project providers:
+    is deduplicated (top-level occurrence wins; no duplicate in final list).
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: grok\n"
+        "    credential: shared-grok-creds\n"
+        "    model: grok-base\n"
+        "projects:\n"
+        "  - repo: acme/widgets\n"
+        "    key_prefix: acme\n"
+        "    providers:\n"
+        "      - provider: grok\n"
+        "        credential: shared-grok-creds\n"
+        "        model: grok-base\n"
+        "        # same identity as top; should not cause duplicate\n"
+        "      - provider: claude\n"
+        "        credential: per-proj-claude\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+    proj = config.projects[0]
+    # grok appears only once (from top), plus the per-proj claude
+    grok_entries = [e for e in proj.providers if e.provider == "grok"]
+    assert len(grok_entries) == 1
+    assert grok_entries[0].model == "grok-base"
+    claude_entries = [e for e in proj.providers if e.provider == "claude"]
+    assert len(claude_entries) == 1
+    # total: 1 grok + 1 claude (no legacy synth since no claude_tokens in this yaml)
+    assert len(proj.providers) == 2
+
+
+def test_providers_dedup_within_single_list_first_wins(tmp_path: Path):
+    """Duplicate entries inside one providers: list are deduplicated; first wins
+    (per documented behavior in _parse_providers_list).
+    Non-identity fields (e.g. cli_binary) from the first occurrence are retained.
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: grok\n"
+        "    credential: dup-creds\n"
+        "    model: m\n"
+        "    cli_binary: first-bin\n"
+        "  - provider: grok\n"
+        "    credential: dup-creds\n"
+        "    model: m\n"
+        "    cli_binary: second-bin\n"
+        "  - provider: grok\n"
+        "    credential: other-creds\n"
+        "    model: m\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+    proj = config.projects[0]
+    grok_entries = [e for e in proj.providers if e.provider == "grok"]
+    # two unique identities (dup-creds and other-creds); the dup was dropped
+    assert len(grok_entries) == 2
+    # first-wins: the one with dup-creds kept the first cli_binary
+    first = next(e for e in grok_entries if e.credential == "dup-creds")
+    assert first.cli_binary == "first-bin"
+    # the other one is present
+    other = next(e for e in grok_entries if e.credential == "other-creds")
+    assert other.cli_binary is None
