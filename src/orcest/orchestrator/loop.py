@@ -44,7 +44,7 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
     rerun_all_transient_ci,
 )
-from orcest.orchestrator.token_pool import TokenPool
+from orcest.orchestrator.provider_pool import ProviderPool
 from orcest.orchestrator.usage_check import get_token_reset_time
 from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
@@ -313,7 +313,7 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
 
 
 def _mark_usage_exhausted_token(
-    result: TaskResult, token_pool: TokenPool | None, logger: logging.Logger
+    result: TaskResult, token_pool: ProviderPool | None, logger: logging.Logger
 ) -> None:
     if token_pool is None:
         return
@@ -563,15 +563,17 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     for _, project_redis in project_clients:
         project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
-    # Create per-project token pools for round-robin Claude token distribution
-    token_pools: dict[str, TokenPool] = {}
+    # Create per-project provider pools (generalized from legacy TokenPool).
+    # For the claude_tokens migration path we synthesize lean ProviderEntry objects
+    # (rich execution fields left None) via from_claude_tokens per Task 3 / boundary rule.
+    token_pools: dict[str, ProviderPool] = {}
     for project in config.projects:
         tokens = project.claude_tokens
         if tokens:
-            token_pools[project.key_prefix] = TokenPool(tokens)
+            token_pools[project.key_prefix] = ProviderPool.from_claude_tokens(tokens)
             if len(tokens) > 1:
                 logger.info(
-                    "Project %s: token pool with %d Claude tokens",
+                    "Project %s: provider pool with %d Claude entries (via legacy claude_tokens)",
                     project.repo,
                     len(tokens),
                 )
@@ -635,7 +637,7 @@ def _poll_cycle(
     config: OrchestratorConfig,
     redis: RedisClient,
     task_redis: RedisClient,
-    token_pools: dict[str, TokenPool],
+    token_pools: dict[str, ProviderPool],
     logger: logging.Logger,
     pending_task_ttl: int,
     project_clients: list[tuple[ProjectConfig, RedisClient]] | None = None,
@@ -704,14 +706,15 @@ def _poll_project(
     config: OrchestratorConfig,
     logger: logging.Logger,
     pending_task_ttl: int,
-    token_pool: TokenPool | None = None,
+    token_pool: ProviderPool | None = None,
 ) -> tuple[int, int, int, int]:
     """Poll a single project for actionable PRs and issues.
 
     Args:
         project_redis: Per-project Redis client (for pending markers, attempt counters, etc.).
         task_redis: Shared Redis client (for publishing tasks to the common stream).
-        token_pool: Optional token pool for round-robin Claude token selection.
+        token_pool: Optional provider pool (generalized; still called token_pool in this
+            transitional function for minimal diff). Uses lean ProviderEntry surface only.
 
     Returns (enqueued, merged, prs_checked, issues_checked).
     """
@@ -1515,7 +1518,7 @@ def _consume_results_for_project(
     redis: RedisClient,
     labels: LabelConfig,
     logger: logging.Logger,
-    token_pool: TokenPool | None = None,
+    token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
 ) -> None:
     """Consume any pending results from workers for a single project.
@@ -1617,7 +1620,7 @@ def _handle_result(
     redis: RedisClient,
     result: TaskResult,
     logger: logging.Logger,
-    token_pool: TokenPool | None = None,
+    token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
 ) -> None:
     """Process a single task result.
