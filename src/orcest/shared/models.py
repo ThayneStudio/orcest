@@ -172,6 +172,11 @@ class TaskResult:
     snapshot_failed_checks: list[str] | None = None
     snapshot_review_thread_ids: list[str] | None = None
     snapshot_review_thread_fingerprints: list[str] | None = None
+    # Set only when the worker's agent explicitly reported a genuine
+    # human-decision blocker. This is the sole trigger for the needs-human
+    # label; orcest never infers it from failure counts.
+    needs_human: bool = False
+    needs_human_reason: str = ""
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -194,6 +199,9 @@ class TaskResult:
         }
         if self.rate_limit_resets_at:
             d["rate_limit_resets_at"] = str(self.rate_limit_resets_at)
+        if self.needs_human:
+            d["needs_human"] = "1"
+            d["needs_human_reason"] = self.needs_human_reason
         return d
 
     @classmethod
@@ -216,6 +224,8 @@ class TaskResult:
             snapshot_review_thread_fingerprints=_json_list(
                 data.get("snapshot_review_thread_fingerprints", "")
             ),
+            needs_human=data.get("needs_human", "") == "1",
+            needs_human_reason=data.get("needs_human_reason", ""),
         )
 
 

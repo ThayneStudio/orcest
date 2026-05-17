@@ -201,9 +201,7 @@ def test_run_claude_exhausted_retries_is_transient(mock_popen, mocker, tmp_path)
 
     mocker.patch(
         "orcest.worker.claude_runner.time.monotonic",
-        side_effect=_monotonic_seq(
-            100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0
-        ),
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 105.0, 105.0, 105.0, 110.0, 110.0),
     )
 
     result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=2, retry_backoff=0)
@@ -438,18 +436,14 @@ def test_on_stderr_called_per_line(mock_popen, mocker, tmp_path):
     )
 
     stderr_captured: list[str] = []
-    result = run_claude(
-        PROMPT, tmp_path, TOKEN, max_retries=1, on_stderr=stderr_captured.append
-    )
+    result = run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, on_stderr=stderr_captured.append)
 
     assert result.success is True
     assert stderr_captured == ["claude: oops\n", "stack trace line 2\n"]
 
 
 @pytest.mark.unit
-def test_on_stderr_callback_failure_does_not_break_collection(
-    mock_popen, mocker, tmp_path
-):
+def test_on_stderr_callback_failure_does_not_break_collection(mock_popen, mocker, tmp_path):
     """A flaky on_stderr (e.g. Redis blip) must not break local stderr collection,
     which usage-exhaustion detection relies on."""
     _, mock_proc = mock_popen
@@ -653,9 +647,7 @@ def test_stream_json_429_with_zero_exit_is_usage_exhausted(mock_popen, mocker, t
 
 
 @pytest.mark.unit
-def test_stream_json_529_overloaded_is_transient_not_usage_exhausted(
-    mock_popen, mocker, tmp_path
-):
+def test_stream_json_529_overloaded_is_transient_not_usage_exhausted(mock_popen, mocker, tmp_path):
     """A 529 provider overload is retryable infrastructure, not usage exhaustion."""
     mock_cls, mock_proc = mock_popen
 
@@ -1188,3 +1180,198 @@ def test_claude_runner_class_run(mock_popen, mocker, tmp_path):
     assert result.success is True
     assert "Runner class result" in result.summary
     assert result.usage_exhausted is False
+
+
+# ---------------------------------------------------------------------------
+# --model flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_run_claude_passes_model_flag(mock_popen, mocker, tmp_path):
+    """When model is given, --model <model> is inserted before -p."""
+    mock_cls, mock_proc = mock_popen
+    mock_proc.stdout = iter(_make_stdout_lines("ok"))
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, model="claude-opus-4-7")
+
+    cmd = mock_cls.call_args[0][0]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-7"
+    # -p still carries the prompt
+    assert cmd[-2:] == ["-p", PROMPT]
+
+
+@pytest.mark.unit
+def test_run_claude_omits_model_flag_when_empty(mock_popen, mocker, tmp_path):
+    """No --model flag is added when model is empty (CLI default applies)."""
+    mock_cls, mock_proc = mock_popen
+    mock_proc.stdout = iter(_make_stdout_lines("ok"))
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
+    )
+
+    run_claude(PROMPT, tmp_path, TOKEN, max_retries=1)
+
+    assert "--model" not in mock_cls.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Timeout that is actually a usage-cap stall
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_timeout_with_usage_signal_reports_usage_exhausted(mock_popen, mocker, tmp_path):
+    """A watchdog timeout whose partial stderr carries a usage-limit signal is
+    reported as usage_exhausted (not a plain transient timeout) so the
+    orchestrator waits for the reset instead of retrying into the same wall."""
+    mock_cls, mock_proc = mock_popen
+
+    mock_proc.stdout = iter(_make_stdout_lines("line 1", "line 2", "line 3"))
+    mock_proc.stderr = iter(["Error: usage limit reached for this billing period\n"])
+
+    mocker.patch("orcest.worker.claude_runner._kill_process_tree")
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 120.0, 200.0, 200.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, timeout=60, max_retries=3)
+
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert result.transient is False
+    assert mock_cls.call_count == 1
+
+
+@pytest.mark.unit
+def test_timeout_without_usage_signal_stays_transient(mock_popen, mocker, tmp_path):
+    """A genuine timeout (no usage signal) stays a retryable transient
+    failure, not usage_exhausted."""
+    mock_cls, mock_proc = mock_popen
+
+    mock_proc.stdout = iter(_make_stdout_lines("line 1", "line 2", "line 3"))
+    mock_proc.stderr = iter([])
+
+    mocker.patch("orcest.worker.claude_runner._kill_process_tree")
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 120.0, 200.0, 200.0),
+    )
+
+    result = run_claude(PROMPT, tmp_path, TOKEN, timeout=60, max_retries=3)
+
+    assert result.success is False
+    assert result.usage_exhausted is False
+    assert result.transient is True
+    assert "Timed out" in result.summary
+
+
+# ---------------------------------------------------------------------------
+# _parse_needs_human
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_parse_needs_human_detects_signal():
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    flag, reason = _parse_needs_human(
+        "I investigated but cannot proceed.\nNEEDS_HUMAN: product owner must decide the role name\n"
+    )
+    assert flag is True
+    assert reason == "product owner must decide the role name"
+
+
+@pytest.mark.unit
+def test_parse_needs_human_absent():
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    flag, reason = _parse_needs_human("Fixed the failing test and pushed.")
+    assert flag is False
+    assert reason == ""
+
+
+@pytest.mark.unit
+def test_parse_needs_human_handles_stream_json_escaped_text():
+    """The signal is still found when embedded in stream-json escaped text."""
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    flag, reason = _parse_needs_human(
+        '{"type":"result","result":"done.\\nNEEDS_HUMAN: missing API credentials\\n"}'
+    )
+    assert flag is True
+    assert reason == "missing API credentials"
+
+
+@pytest.mark.unit
+def test_parse_needs_human_ignores_echoed_prompt_in_user_message():
+    """The fix prompt contains a literal 'NEEDS_HUMAN:' instruction. Claude
+    Code echoes the prompt back in a stream-json 'user' message -- that echo
+    must NOT be read as the agent emitting the signal."""
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    stream = "\n".join(
+        [
+            '{"type":"user","message":{"role":"user","content":['
+            '{"type":"text","text":"## Escalation\\n\\n    NEEDS_HUMAN: '
+            '<one-line reason a human must decide>\\n"}]}}',
+            '{"type":"assistant","message":{"role":"assistant","content":['
+            '{"type":"text","text":"Fixed the failing test and pushed."}]}}',
+            '{"type":"result","result":"Fixed the failing test and pushed."}',
+        ]
+    )
+    flag, reason = _parse_needs_human(stream)
+    assert flag is False
+    assert reason == ""
+
+
+@pytest.mark.unit
+def test_parse_needs_human_ignores_mid_sentence_mention():
+    """A discussion mention of the token (not a standalone line) is not the
+    signal."""
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    flag, _ = _parse_needs_human(
+        "I considered emitting NEEDS_HUMAN: but decided I can fix this myself."
+    )
+    assert flag is False
+
+
+@pytest.mark.unit
+def test_parse_needs_human_ignores_placeholder_form():
+    """An echoed-back <placeholder> is not a real reason."""
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    flag, _ = _parse_needs_human(
+        "Done analysing.\nNEEDS_HUMAN: <one-line reason a human must decide>"
+    )
+    assert flag is False
+
+
+@pytest.mark.unit
+def test_parse_needs_human_detects_signal_in_assistant_message():
+    """A genuine standalone NEEDS_HUMAN line in the assistant message IS the
+    signal."""
+    from orcest.worker.claude_runner import _parse_needs_human
+
+    stream = (
+        '{"type":"assistant","message":{"role":"assistant","content":['
+        '{"type":"text","text":"I cannot proceed.\\n'
+        'NEEDS_HUMAN: the role rename needs a product decision"}]}}'
+    )
+    flag, reason = _parse_needs_human(stream)
+    assert flag is True
+    assert reason == "the role rename needs a product decision"

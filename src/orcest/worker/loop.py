@@ -60,9 +60,7 @@ if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
 _STARTUP_PING_RETRIES = 10
 _STARTUP_PING_BACKOFF = (1, 2, 4, 8, 10, 10, 10, 10, 10)
 if len(_STARTUP_PING_BACKOFF) != _STARTUP_PING_RETRIES - 1:
-    raise ValueError(
-        "_STARTUP_PING_BACKOFF must have exactly _STARTUP_PING_RETRIES - 1 entries"
-    )
+    raise ValueError("_STARTUP_PING_BACKOFF must have exactly _STARTUP_PING_RETRIES - 1 entries")
 
 _FAILURE_CONCLUSIONS = frozenset(
     {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
@@ -140,9 +138,7 @@ def _wait_for_redis(redis: RedisClient, logger: logging.Logger) -> bool:
     for attempt in range(_STARTUP_PING_RETRIES):
         if redis.health_check():
             if attempt > 0:
-                logger.info(
-                    "Redis reachable after %d attempt(s)", attempt + 1
-                )
+                logger.info("Redis reachable after %d attempt(s)", attempt + 1)
             return True
         if attempt < _STARTUP_PING_RETRIES - 1:
             sleep_s = _STARTUP_PING_BACKOFF[attempt]
@@ -805,6 +801,8 @@ def _task_result(
     summary: str,
     duration_seconds: int,
     rate_limit_resets_at: int = 0,
+    needs_human: bool = False,
+    needs_human_reason: str = "",
 ) -> TaskResult:
     return TaskResult(
         task_id=task.id,
@@ -821,6 +819,8 @@ def _task_result(
         snapshot_failed_checks=task.snapshot_failed_checks,
         snapshot_review_thread_ids=task.snapshot_review_thread_ids,
         snapshot_review_thread_fingerprints=task.snapshot_review_thread_fingerprints,
+        needs_human=needs_human,
+        needs_human_reason=needs_human_reason,
     )
 
 
@@ -923,8 +923,7 @@ def _validate_pr_task_snapshot(task: Task, logger: logging.Logger) -> tuple[bool
         return True, "GitHub PR response did not include headRefOid; dropping stale task."
     if current_sha and current_sha != task.snapshot_head_sha:
         return True, (
-            f"PR head changed from {task.snapshot_head_sha} to {current_sha}; "
-            "dropping stale task."
+            f"PR head changed from {task.snapshot_head_sha} to {current_sha}; dropping stale task."
         )
 
     if task.decision_reason in _CI_DECISIONS and task.snapshot_failed_checks:
@@ -1096,7 +1095,13 @@ def _execute_task(
 
         duration = int(time.monotonic() - start)
 
-        if runner_result.success:
+        if runner_result.needs_human:
+            # A worker-reported human-decision blocker is never a success: the
+            # PR was not resolved. Force FAILED (even if the CLI exited 0) so
+            # the orchestrator surfaces the signal instead of silently
+            # treating the task as completed.
+            status = ResultStatus.FAILED
+        elif runner_result.success:
             status = ResultStatus.COMPLETED
         elif runner_result.usage_exhausted:
             status = ResultStatus.USAGE_EXHAUSTED
@@ -1124,6 +1129,8 @@ def _execute_task(
             summary,
             duration,
             rate_limit_resets_at=runner_result.rate_limit_resets_at,
+            needs_human=runner_result.needs_human,
+            needs_human_reason=runner_result.needs_human_reason,
         )
 
     except Exception as e:
