@@ -28,6 +28,11 @@ class RunnerResult:
     usage_exhausted: bool = False
     rate_limit_resets_at: int = 0  # Unix timestamp when rate limit resets (0 = unknown)
     transient: bool = False
+    # Set when the worker's agent explicitly reported a genuine human-decision
+    # blocker (a `NEEDS_HUMAN:` line). This is the only signal that warrants the
+    # orcest:needs-human label -- orcest never infers it from failure counts.
+    needs_human: bool = False
+    needs_human_reason: str = ""
 
 
 class Runner(Protocol):
@@ -52,7 +57,7 @@ def create_runner(config: RunnerConfig) -> Runner:
     if config.type == "claude":
         from orcest.worker.claude_runner import ClaudeRunner
 
-        return ClaudeRunner(config.max_retries, config.retry_backoff)
+        return ClaudeRunner(config.max_retries, config.retry_backoff, config.model)
     elif config.type == "noop":
         from orcest.worker.noop_runner import NoopRunner
 

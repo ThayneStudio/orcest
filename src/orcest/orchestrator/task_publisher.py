@@ -18,6 +18,7 @@ from orcest.orchestrator.issue_ops import (
 )
 from orcest.orchestrator.pr_ops import (
     PRState,
+    get_transient_attempt_count,
     increment_attempts,
     increment_transient_attempts,
 )
@@ -306,18 +307,20 @@ def _rerun_all_transient_ci_from_summaries(
     ):
         return False
 
-    transient_count = increment_transient_attempts(
-        redis, repo, pr_state.number, pr_state.head_sha
-    )
-    if transient_count > _MAX_TRANSIENT_RETRIES:
+    # Check the budget BEFORE incrementing. Incrementing first lets the counter
+    # run away (observed: 53/3) when a misclassified failure keeps re-entering
+    # this path every poll cycle; reading first caps it at _MAX_TRANSIENT_RETRIES.
+    already_spent = get_transient_attempt_count(redis, repo, pr_state.number, pr_state.head_sha)
+    if already_spent >= _MAX_TRANSIENT_RETRIES:
         _log.warning(
-            "PR #%d: transient retry budget exhausted (%d/%d), falling back to fix task",
+            "PR #%d: transient CI retry budget spent (%d/%d), dispatching a fix task",
             pr_state.number,
-            transient_count,
+            already_spent,
             _MAX_TRANSIENT_RETRIES,
         )
         return False
 
+    transient_count = increment_transient_attempts(redis, repo, pr_state.number, pr_state.head_sha)
     _log.info(
         "PR #%d: all CI failures are transient (retry %d/%d), re-triggering CI",
         pr_state.number,
@@ -359,9 +362,7 @@ def rerun_all_transient_ci(
     logger: logging.Logger | None = None,
 ) -> bool:
     """Re-trigger all-transient CI failures without publishing a worker task."""
-    failure_summaries, _ci_logs, _task_type = _collect_ci_failure_context(
-        pr_state, repo, token
-    )
+    failure_summaries, _ci_logs, _task_type = _collect_ci_failure_context(pr_state, repo, token)
     return _rerun_all_transient_ci_from_summaries(
         pr_state=pr_state,
         repo=repo,
@@ -509,9 +510,7 @@ def publish_fix_task(
     """
     # Fetch CI logs and classify failures
     _log = logger or logging.getLogger(__name__)
-    failure_summaries, ci_logs, task_type = _collect_ci_failure_context(
-        pr_state, repo, token
-    )
+    failure_summaries, ci_logs, task_type = _collect_ci_failure_context(pr_state, repo, token)
 
     # If every CI failure is transient, re-trigger the runs directly instead of
     # asking Claude to "fix" something that isn't a code problem.  A separate
@@ -1057,7 +1056,13 @@ def _render_fix_prompt(
         sections.append("")
         log_budget = _TOTAL_LOG_BUDGET
         for failure in ci_failures:
-            sections.append(f"- **{failure['name']}** ({failure['classification']})")
+            # A fix task is only dispatched once the transient-rerun budget is
+            # spent, so a "transient" tag here would mislead the worker into
+            # dismissing a real failure. Present it as a code failure to fix.
+            shown_class = failure["classification"]
+            if shown_class == CIFailureType.TRANSIENT.value:
+                shown_class = CIFailureType.CODE.value
+            sections.append(f"- **{failure['name']}** ({shown_class})")
             if failure.get("details_url"):
                 sections.append(f"  Details: {failure['details_url']}")
             # Include log excerpt if available
@@ -1146,6 +1151,20 @@ def _render_fix_prompt(
             "-- you are not authorized to change review status.",
             "",
             "Push to the existing branch. Do not create new PRs.",
+            "",
+            "## Escalation (use only as a genuine last resort)",
+            "",
+            "You have full repo access and tools -- investigate, reproduce, and "
+            "fix the problem yourself. Only if this PR genuinely cannot proceed "
+            "without a human decision -- a contradictory or ambiguous product "
+            "requirement, or credentials/access you cannot obtain -- end your "
+            "final message with a single line in exactly this form:",
+            "",
+            "    NEEDS_HUMAN: <one-line reason a human must decide>",
+            "",
+            "Never emit that line for anything you can investigate, reproduce, "
+            "or fix yourself. A hard bug, a flaky test, or a confusing failure "
+            "is not a reason -- those are your job.",
         ]
     )
 
