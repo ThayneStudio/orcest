@@ -404,9 +404,7 @@ class TestRedisCliRoutedThroughDockerExec:
                 )
             return self._ok()
 
-        ssh = mocker.patch(
-            "orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect
-        )
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         clean_pending_tasks("user@host")
         for call in ssh.call_args_list:
             assert "sudo docker exec orcest-redis-redis-1 redis-cli" in call[0][1]

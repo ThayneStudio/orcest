@@ -313,9 +313,7 @@ def get_current_template_vmid(ssh_target: str) -> int | None:
     Reads ``orcest:pool:current_template_vmid`` via redis-cli on the
     orchestrator VM. Returns ``None`` for missing/empty/non-integer values.
     """
-    result = _ssh(
-        ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_vmid"
-    )
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_vmid")
     if result.returncode != 0:
         raise RuntimeError(f"Failed to read template pointer: {result.stderr.strip()}")
     raw = result.stdout.strip()
@@ -335,8 +333,7 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
     """
     result = _ssh(
         ssh_target,
-        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid"
-        f" {shlex.quote(str(vm_id))}",
+        f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to set template pointer: {result.stderr.strip()}")

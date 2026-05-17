@@ -170,10 +170,7 @@ def _worker_tooling_runcmd() -> list[str]:
         # Bun: fast Node-compatible runtime + package manager.
         "npm install -g bun",
         # uv: Rust-based fast Python package manager (10-50x faster than pip).
-        (
-            "curl -fsSL https://astral.sh/uv/install.sh"
-            ' | env UV_INSTALL_DIR="/usr/local/bin" sh'
-        ),
+        ('curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh'),
         # wrangler: Cloudflare Workers CLI (transit-platform deploys here).
         "npm install -g wrangler",
     ]

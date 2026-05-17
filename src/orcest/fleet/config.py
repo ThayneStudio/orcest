@@ -117,9 +117,7 @@ class PoolConfig:
         if not r:
             return None
         if len(r) != 2:
-            raise ValueError(
-                f"pool.template_vmid_range must be [start, end], got {r!r}"
-            )
+            raise ValueError(f"pool.template_vmid_range must be [start, end], got {r!r}")
         start, end = int(r[0]), int(r[1])
         if start <= 0 or end < start:
             raise ValueError(
@@ -269,9 +267,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     pl = data.get("pool") or {}
     raw_range = pl.get("template_vmid_range") or []
     if raw_range and not isinstance(raw_range, list):
-        raise ValueError(
-            f"pool.template_vmid_range must be a list, got {type(raw_range).__name__}"
-        )
+        raise ValueError(f"pool.template_vmid_range must be a list, got {type(raw_range).__name__}")
     template_range_list = [int(v) for v in raw_range] if raw_range else []
     pool = PoolConfig(
         size=pl.get("size", 4),
