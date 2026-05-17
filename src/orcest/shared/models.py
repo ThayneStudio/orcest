@@ -27,6 +27,12 @@ DEAD_LETTER_METADATA_FIELDS = frozenset(
     {"dead_letter_reason", "tasks_stream", "original_entry_id", "delivery_count"}
 )
 
+# Sensitive fields whose values must be redacted in to_safe_dict(), __repr__(),
+# logs, exceptions, and dead-letter displays. This is the core of the
+# systematic redaction layer required by the security review before generalizing
+# beyond claude_token.
+REDACTED_FIELDS = frozenset({"token", "claude_token", "credential"})
+
 
 class TaskType(str, Enum):
     FIX_PR = "fix_pr"
@@ -60,6 +66,13 @@ class Task:
     base_branch: str | None  # Base branch to rebase onto (e.g. "main", "master")
     key_prefix: str  # Redis key prefix for multi-project routing
     created_at: datetime
+    # New fields for multi-provider support (Task 2). Defaults ensure
+    # backward compatibility with existing Task.create() call sites and
+    # legacy serialized payloads. claude_token is retained (and kept populated)
+    # during the transition so old workers continue to function.
+    provider: str = "claude"
+    credential: str = ""
+    model: str | None = None
     snapshot_head_sha: str = ""  # PR head SHA this task was derived from
     decision_reason: str = ""  # Why this task was enqueued (ci_failure, changes_requested, etc.)
     snapshot_failed_checks: list[str] | None = None
@@ -67,13 +80,23 @@ class Task:
     snapshot_review_thread_fingerprints: list[str] | None = None
 
     def to_dict(self) -> dict[str, str]:
-        """Serialize to flat string dict for Redis stream XADD."""
+        """Serialize to flat string dict for Redis stream XADD.
+
+        For the transition period we always emit both the legacy ``claude_token``
+        (populated when provider=="claude") and the new ``provider``/``credential``/
+        ``model`` fields so that mixed old/new orchestrators and workers can
+        interoperate without losing the per-task credential.
+        """
+        # Keep claude_token populated from credential for claude provider during rollout.
+        claude_token_out = self.claude_token
+        if not claude_token_out and self.provider == "claude":
+            claude_token_out = self.credential
         return {
             "id": self.id,
             "type": self.type.value,
             "repo": self.repo,
             "token": self.token,
-            "claude_token": self.claude_token,
+            "claude_token": claude_token_out,
             "resource_type": self.resource_type,
             "resource_id": str(self.resource_id),
             "prompt": self.prompt,
@@ -88,17 +111,37 @@ class Task:
             "snapshot_review_thread_fingerprints": json.dumps(
                 self.snapshot_review_thread_fingerprints or []
             ),
+            # New multi-provider fields (always present for new consumers)
+            "provider": self.provider,
+            "credential": self.credential,
+            "model": self.model or "",
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, str]) -> "Task":
-        """Deserialize from Redis stream entry fields."""
+        """Deserialize from Redis stream entry fields.
+
+        Tolerates legacy payloads that only contain ``claude_token`` (pre-Task-2
+        orchestrators) by synthesizing ``provider="claude"`` + ``credential`` from it.
+        New payloads with explicit provider/credential take precedence.
+        """
+        # Legacy tolerance + new field synthesis (Step 2.1 / 2.4 requirement)
+        claude_token_in = data.get("claude_token", "")
+        provider_in = data.get("provider") or "claude"
+        credential_in = data.get("credential") or claude_token_in or ""
+        model_in = data.get("model") or None
+
+        # For claude provider during transition, ensure claude_token is populated
+        # so that code paths still reading task.claude_token continue to work.
+        if provider_in == "claude" and not claude_token_in and credential_in:
+            claude_token_in = credential_in
+
         return cls(
             id=data["id"],
             type=TaskType(data["type"]),
             repo=data["repo"],
             token=data["token"],
-            claude_token=data.get("claude_token", ""),
+            claude_token=claude_token_in,
             resource_type=data["resource_type"],
             resource_id=int(data["resource_id"]),
             prompt=data["prompt"],
@@ -113,6 +156,10 @@ class Task:
             snapshot_review_thread_fingerprints=_json_list(
                 data.get("snapshot_review_thread_fingerprints", "")
             ),
+            # New fields (with legacy-derived defaults)
+            provider=provider_in,
+            credential=credential_in,
+            model=model_in,
         )
 
     @classmethod
@@ -133,14 +180,30 @@ class Task:
         snapshot_failed_checks: list[str] | None = None,
         snapshot_review_thread_ids: list[str] | None = None,
         snapshot_review_thread_fingerprints: list[str] | None = None,
+        # New params for multi-provider (defaults keep all existing call sites working)
+        provider: str = "claude",
+        credential: str = "",
+        model: str | None = None,
     ) -> "Task":
-        """Factory with auto-generated ID and timestamp."""
+        """Factory with auto-generated ID and timestamp.
+
+        During transition, if only claude_token is supplied we derive credential +
+        provider so that the embedded secret is available under the new name too.
+        Callers may also pass provider/credential/model explicitly (future path).
+        """
+        # Derive for transition compatibility (keep claude_token populated too)
+        effective_credential = credential or claude_token
+        if provider == "claude":
+            effective_claude_token = claude_token or credential
+        else:
+            effective_claude_token = claude_token
+
         return cls(
             id=str(uuid.uuid4()),
             type=task_type,
             repo=repo,
             token=token,
-            claude_token=claude_token,
+            claude_token=effective_claude_token,
             resource_type=resource_type,
             resource_id=resource_id,
             prompt=prompt,
@@ -153,6 +216,42 @@ class Task:
             snapshot_failed_checks=snapshot_failed_checks,
             snapshot_review_thread_ids=snapshot_review_thread_ids,
             snapshot_review_thread_fingerprints=snapshot_review_thread_fingerprints,
+            provider=provider,
+            credential=effective_credential,
+            model=model,
+        )
+
+    def to_safe_dict(self) -> dict[str, str]:
+        """Return a redacted copy of to_dict() suitable for logs, exceptions,
+        dead-letter metadata, and any human-visible or persisted diagnostic path.
+
+        All fields listed in REDACTED_FIELDS have their values replaced by
+        "[REDACTED]" so that secrets never appear in plaintext outside the
+        minimal hot paths (Redis streams consumed only by trusted workers that
+        need the real credential at runtime).
+        """
+        d = self.to_dict()
+        for field in REDACTED_FIELDS:
+            if field in d:
+                d[field] = "[REDACTED]"
+        return d
+
+    def __repr__(self) -> str:
+        """Safe repr that never leaks raw credentials (addresses security review finding).
+
+        Uses short prefix mask (like ProviderEntry) for the secret fields so
+        operators can still correlate "which token was involved" in logs without
+        exposing the full secret.
+        """
+        def _mask(val: str) -> str:
+            return (val[:4] + "...") if val else ""
+
+        return (
+            f"Task(id={self.id!r}, type={self.type.value!r}, repo={self.repo!r}, "
+            f"token={_mask(self.token)!r}, claude_token={_mask(self.claude_token)!r}, "
+            f"provider={self.provider!r}, credential={_mask(self.credential)!r}, "
+            f"model={self.model!r}, resource_type={self.resource_type!r}, "
+            f"resource_id={self.resource_id}, ...)"
         )
 
 

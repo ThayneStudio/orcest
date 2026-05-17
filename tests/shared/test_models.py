@@ -3,6 +3,7 @@
 import pytest
 
 from orcest.shared.models import (
+    REDACTED_FIELDS,
     ResultStatus,
     Task,
     TaskResult,
@@ -191,3 +192,147 @@ def test_task_result_needs_human_defaults_false():
     rebuilt = TaskResult.from_dict(_make_task_result().to_dict())
     assert rebuilt.needs_human is False
     assert rebuilt.needs_human_reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Task 2: new fields, to_safe_dict redaction, legacy from_dict, __repr__, DL paths
+# These are the TDD failing tests added in Step 2.1 before implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_task_new_provider_credential_model_fields_with_defaults():
+    """Task exposes provider/credential/model (for multi-provider) with compat defaults."""
+    # No claude_token passed -> credential empty, provider defaults to claude
+    task = _make_task()
+    assert task.provider == "claude"
+    assert task.credential == ""
+    assert task.model is None
+    assert hasattr(task, "claude_token")  # kept for transition
+
+    # When claude_token passed via create (current call sites), it populates credential too
+    task_ct = _make_task(claude_token="sk-ant-oat01-test123")
+    assert task_ct.provider == "claude"
+    assert task_ct.credential == "sk-ant-oat01-test123"
+    assert task_ct.claude_token == "sk-ant-oat01-test123"
+    assert task_ct.model is None
+
+    # Explicit new-style creation (for future providers)
+    task_grok = _make_task(
+        provider="grok", credential="xai-secret-abc987", model="grok-3-latest"
+    )
+    assert task_grok.provider == "grok"
+    assert task_grok.credential == "xai-secret-abc987"
+    assert task_grok.model == "grok-3-latest"
+    # claude_token remains empty for non-claude (or could be populated; current design keeps separate)
+    assert task_grok.claude_token == ""
+
+
+def test_task_to_safe_dict_redacts_secrets():
+    """to_safe_dict returns flat dict with REDACTED_FIELDS masked; used by DL, logs, repr."""
+    secret = "sk-ant-oat01-verysecretvalue"
+    task = _make_task(claude_token=secret, token="ghp_ghsecret456")
+    safe = task.to_safe_dict()
+
+    # Must be dict[str,str] like to_dict
+    assert isinstance(safe, dict)
+    for k, v in safe.items():
+        assert isinstance(k, str) and isinstance(v, str)
+
+    # Secrets must be redacted; marker must not leak the value
+    for f in ("token", "claude_token", "credential"):
+        assert f in safe, f"REDACTED field {f} must be present in safe dict"
+        assert secret not in safe[f]
+        assert "ghsecret" not in safe[f]
+        assert safe[f] == "[REDACTED]"
+
+    # Non-secrets preserved
+    assert safe["id"] == task.id
+    assert safe["repo"] == task.repo
+    assert safe["type"] == task.type.value
+    assert safe["provider"] == "claude"
+    assert safe["model"] == ""
+
+    # REDACTED_FIELDS is the canonical set
+    assert "token" in REDACTED_FIELDS
+    assert "claude_token" in REDACTED_FIELDS
+    assert "credential" in REDACTED_FIELDS
+    # model is not secret
+    assert "model" not in REDACTED_FIELDS
+
+
+def test_task_from_dict_tolerates_legacy_claude_token_payload():
+    """from_dict must accept old payloads (only claude_token, no provider/credential/model)."""
+    legacy_d = {
+        "id": "legacy-task-001",
+        "type": "fix_ci",
+        "repo": "acme/legacy",
+        "token": "ghp_legacy_pat",
+        "claude_token": "sk-legacy-claude-999999",
+        "resource_type": "pr",
+        "resource_id": "99",
+        "prompt": "legacy prompt",
+        "branch": "fix/legacy",
+        "base_branch": "main",
+        "key_prefix": "proj:",
+        "created_at": "2026-05-01T12:00:00+00:00",
+        # deliberately no 'provider', 'credential', 'model' keys (old orchestrator)
+        "snapshot_head_sha": "",
+        "decision_reason": "",
+        "snapshot_failed_checks": "[]",
+        "snapshot_review_thread_ids": "[]",
+        "snapshot_review_thread_fingerprints": "[]",
+    }
+    task = Task.from_dict(legacy_d)
+
+    assert task.id == "legacy-task-001"
+    assert task.claude_token == "sk-legacy-claude-999999"
+    # Must synthesize for new fields from legacy claude_token
+    assert task.provider == "claude"
+    assert task.credential == "sk-legacy-claude-999999"
+    assert task.model is None
+
+    # Round-trip via to_dict should now emit the new fields + keep claude_token for workers
+    d2 = task.to_dict()
+    assert d2["provider"] == "claude"
+    assert d2["credential"] == "sk-legacy-claude-999999"
+    assert d2["claude_token"] == "sk-legacy-claude-999999"
+    assert d2["model"] == ""
+
+
+def test_task_repr_redacts_sensitive_fields():
+    """__repr__ must never contain raw secrets (security requirement from subagent review)."""
+    secret_ct = "sk-ant-repr-secret-00112233"
+    secret_gh = "ghp_reprgh_445566"
+    task = _make_task(claude_token=secret_ct, token=secret_gh)
+
+    r = repr(task)
+    assert secret_ct not in r, "raw claude credential leaked in Task.__repr__"
+    assert secret_gh not in r, "raw github token leaked in Task.__repr__"
+    # Should contain redaction marker or masked form
+    assert "[REDACTED]" in r or "..." in r
+
+
+def test_safe_dict_supports_dead_letter_redaction_paths():
+    """to_safe_dict is the projection used (or to be used) by dead-letter writers to avoid
+    leaking credentials into DL stream, logs, and exception contexts.
+    """
+    secret = "sk-dl-redact-me-778899"
+    task = _make_task(claude_token=secret)
+
+    # This is the shape used in DL writes: {**task.to_xxx(), "dead_letter_reason": ..., ...}
+    dl_fields = {
+        **task.to_safe_dict(),
+        "dead_letter_reason": "Exceeded max delivery count (5)",
+        "tasks_stream": "tasks:claude",
+        "original_entry_id": "1234-0",
+        "delivery_count": "6",
+    }
+    # No secret value anywhere in the DL payload
+    dl_str = str(dl_fields)
+    assert secret not in dl_str
+    assert dl_fields["credential"] == "[REDACTED]"
+    assert dl_fields["claude_token"] == "[REDACTED]"
+    assert dl_fields["token"] == "[REDACTED]"
+    # Metadata and non-secrets still present for recovery/display
+    assert dl_fields["dead_letter_reason"].startswith("Exceeded")
+    assert dl_fields["id"] == task.id

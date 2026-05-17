@@ -679,8 +679,10 @@ def _dead_letter_task(
     de-duplicate on ``original_entry_id``.
     """
     try:
+        # Use safe projection so credentials never land in the dead-letter stream
+        # (systematic redaction layer, Task 2 / security review).
         dl_fields = {
-            **task.to_dict(),
+            **task.to_safe_dict(),
             "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
             "tasks_stream": tasks_stream,
             "original_entry_id": entry_id,
@@ -770,8 +772,11 @@ def _publish_result_with_retry(
         exc_info=last_exc,
     )
     try:
+        # Use safe projection so credentials never land in the dead-letter stream
+        # (systematic redaction layer, Task 2 / security review). Result dicts
+        # contain no secrets, only the task part is redacted.
         dl_fields = {
-            **task.to_dict(),
+            **task.to_safe_dict(),
             **result.to_dict(),
             "dead_letter_reason": (
                 f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
