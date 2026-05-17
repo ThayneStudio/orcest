@@ -65,6 +65,9 @@ class PoolManager:
         self._redis = redis
         self._pool = config.pool
         self._key_prefix = key_prefix
+        # De-spam flag: True once the "no valid template" error has been
+        # logged, cleared again as soon as a valid template is resolved.
+        self._template_recovery_failed = False
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -252,8 +255,8 @@ class PoolManager:
                 exc_info=True,
             )
 
-    def _resolve_template_vmid(self) -> int | None:
-        """Return the VMID of the currently-active worker template.
+    def _read_template_pointer(self) -> int | None:
+        """Return the configured template VMID without checking it exists.
 
         Read order each cycle:
           1. Redis pointer ``pool:current_template_vmid`` (set by ``rebake``).
@@ -290,6 +293,114 @@ class PoolManager:
         except Exception:
             logger.warning("Failed to initialise template pointer in Redis", exc_info=True)
         return fallback
+
+    def _resolve_template_vmid(self) -> int | None:
+        """Return the VMID of a worker template that actually exists in Proxmox.
+
+        Reads the configured template VMID (Redis pointer, then config) and
+        validates it exists. A dangling pointer — e.g. the template was
+        garbage-collected while the pointer still named it — would otherwise
+        make every clone fail with ``unable to find configuration file`` and
+        drive an endless clone-retry storm.
+
+        When the configured template is missing, search
+        ``template_vmid_range`` for a live template and repoint the Redis
+        pointer so the recovery is permanent (survives restarts and stops
+        the storm after a single cycle).
+
+        Returns ``None`` if no valid template can be found.
+        """
+        candidate = self._read_template_pointer()
+        if candidate is None:
+            return None
+
+        try:
+            exists = self._proxmox.vm_exists(candidate)
+        except Exception:
+            # Transient Proxmox error — do not mistake it for a missing
+            # template. Use the candidate; the clone will surface any real
+            # failure and be retried next cycle.
+            logger.warning(
+                "Could not verify template VM %d exists; using it anyway",
+                candidate,
+                exc_info=True,
+            )
+            return candidate
+
+        if exists:
+            self._template_recovery_failed = False
+            return candidate
+
+        replacement = self._find_replacement_template(exclude=candidate)
+        if replacement is None:
+            if not self._template_recovery_failed:
+                logger.error(
+                    "Active template VM %d does not exist in Proxmox and no "
+                    "replacement template was found — the pool cannot grow "
+                    "until a template is baked (run 'orcest fleet rebake')",
+                    candidate,
+                )
+                self._template_recovery_failed = True
+            return None
+
+        logger.error(
+            "Active template VM %d does not exist in Proxmox; recovering by "
+            "repointing the active template to live template VM %d",
+            candidate,
+            replacement,
+        )
+        self._repoint_template_pointer(replacement)
+        self._template_recovery_failed = False
+        return replacement
+
+    def _find_replacement_template(self, exclude: int) -> int | None:
+        """Find a live worker template to recover a dangling template pointer.
+
+        Searches Proxmox for template VMs inside ``template_vmid_range`` (or
+        matching the single-VMID config fallback). Prefers the highest VMID,
+        which is the most recently baked template.
+        """
+        try:
+            rng = self._pool.template_range()
+        except ValueError:
+            rng = None
+        cfg_id = self._pool.template_vm_id
+
+        try:
+            all_vms = self._proxmox.list_vms()
+        except Exception:
+            logger.warning(
+                "Failed to list VMs while searching for a replacement template",
+                exc_info=True,
+            )
+            return None
+
+        candidates: list[int] = []
+        for vm in all_vms:
+            try:
+                vmid = int(vm.get("vmid"))
+            except (TypeError, ValueError):
+                continue
+            if vmid == exclude or not self._is_proxmox_template(vm):
+                continue
+            in_range = rng is not None and rng[0] <= vmid <= rng[1]
+            if in_range or (cfg_id and vmid == cfg_id):
+                candidates.append(vmid)
+
+        if not candidates:
+            return None
+        return max(candidates)
+
+    def _repoint_template_pointer(self, vm_id: int) -> None:
+        """Repoint the Redis template pointer so a recovery survives restarts."""
+        try:
+            self._redis.set_ex(_POOL_CURRENT_TEMPLATE_KEY, str(vm_id), ttl=86400 * 365)
+        except Exception:
+            logger.warning(
+                "Failed to repoint template pointer to VM %d in Redis",
+                vm_id,
+                exc_info=True,
+            )
 
     def _clone_and_boot(self) -> int | None:
         """Clone a new VM from template, start it, add to idle set.

@@ -997,6 +997,50 @@ def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
     mock_px.destroy_vm.assert_not_called()
 
 
+def test_gc_templates_aborts_when_active_undeterminable(runner, cfg_path, mocker):
+    """gc-templates fails closed when the active template cannot be determined."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009]),  # no template_vm_id fallback
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        side_effect=RuntimeError("redis unreachable"),
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+
+    assert result.exit_code == 1
+    assert "Could not determine the active template" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_destroy_template_aborts_when_active_undeterminable(runner, cfg_path, mocker):
+    """destroy-template fails closed when the active template cannot be determined."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009]),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        side_effect=RuntimeError("redis unreachable"),
+    )
+
+    result = runner.invoke(
+        fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path]
+    )
+
+    assert result.exit_code == 1
+    assert "Could not determine the active template" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
 # ── pool-status tests ───────────────────────────────────────
 
 

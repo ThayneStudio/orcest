@@ -1779,6 +1779,14 @@ def destroy_template(vm_id: int, yes: bool, config: str) -> None:
             console.print(f"[yellow]Warning: could not read active pointer:[/yellow] {exc}")
     if active is None and cfg.pool.template_vm_id:
         active = cfg.pool.template_vm_id
+    if active is None:
+        console.print(
+            "[red]Could not determine the active template VMID[/red] "
+            "(Redis pointer unreadable and no pool.template_vm_id fallback).\n"
+            f"  Refusing to destroy VM {vm_id} in case it is the live template.\n"
+            "  Verify the pointer or set pool.template_vm_id, then retry."
+        )
+        sys.exit(1)
     if active == vm_id:
         console.print(
             f"[red]Refusing to destroy VM {vm_id}: it is the currently-active template.[/red]\n"
@@ -1873,6 +1881,18 @@ def gc_templates(dry_run: bool, config: str) -> None:
             pass
     if active is None and cfg.pool.template_vm_id:
         active = cfg.pool.template_vm_id
+
+    if active is None:
+        console.print(
+            "[red]Could not determine the active template VMID[/red] "
+            "(Redis pointer unreadable and no pool.template_vm_id fallback).\n"
+            "  Refusing to garbage-collect — every in-range template would be a "
+            "candidate, including the live one.\n"
+            "  Verify the pointer first:"
+            f" ssh {cfg.ssh_target()} 'sudo docker exec orcest-redis-redis-1"
+            " redis-cli GET orcest:pool:current_template_vmid'"
+        )
+        sys.exit(1)
 
     try:
         all_vms = px.list_vms()

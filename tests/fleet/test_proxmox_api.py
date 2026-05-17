@@ -373,6 +373,38 @@ class TestGetVmStatus:
         assert client.get_vm_status(200) == "running"
 
 
+class TestVmExists:
+    def test_returns_true_when_status_query_succeeds(self):
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(9000).status.current.get.return_value = {
+            "status": "stopped",
+        }
+        assert client.vm_exists(9000) is True
+
+    def test_returns_false_when_config_file_missing(self):
+        from proxmoxer.core import ResourceException
+
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(9002).status.current.get.side_effect = (
+            ResourceException(
+                500,
+                "Internal Server Error",
+                "unable to find configuration file for VM 9002 on node 'pve'",
+            )
+        )
+        assert client.vm_exists(9002) is False
+
+    def test_reraises_on_transient_error(self):
+        from proxmoxer.core import ResourceException
+
+        client, mock_api = _make_client()
+        mock_api.nodes("pve").qemu(9000).status.current.get.side_effect = (
+            ResourceException(596, "Connection timed out", "")
+        )
+        with pytest.raises(ResourceException):
+            client.vm_exists(9000)
+
+
 class TestGetVmIp:
     @patch("orcest.fleet.proxmox_api.time")
     def test_returns_ip_on_first_poll(self, mock_time):
