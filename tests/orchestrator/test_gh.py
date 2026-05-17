@@ -1040,10 +1040,7 @@ def test_get_unresolved_threads_null_comment_author(mocker):
 
 def test_get_unresolved_threads_long_thread_uses_newest_comments(mocker, caplog):
     """Uses the newest comment page for long review threads and warns about omitted old comments."""
-    newest_comments = [
-        {"body": f"Comment {i}", "author": {"login": "u"}}
-        for i in range(11, 111)
-    ]
+    newest_comments = [{"body": f"Comment {i}", "author": {"login": "u"}} for i in range(11, 111)]
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(

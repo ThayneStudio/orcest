@@ -219,7 +219,7 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
         if value is None or value == "" or isinstance(value, bool):
             return 0
         try:
-            return int(value)
+            return int(value)  # type: ignore[call-overload]
         except (TypeError, ValueError, OverflowError):
             return 0
 

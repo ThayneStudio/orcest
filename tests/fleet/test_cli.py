@@ -777,9 +777,7 @@ def _patch_template_bake(mocker):
 def test_rebake_allocates_next_free_vmid_and_swaps_pointer(runner, cfg_path, mocker):
     """rebake picks the lowest free VMID in the range and SETs the Redis pointer."""
     cfg = _proxmox_cfg(
-        orchestrator=OrchestratorConfig(
-            host="10.20.0.1", user="orcest", ssh_key="ssh-ed25519 AAA"
-        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest", ssh_key="ssh-ed25519 AAA"),
         pool=PoolConfig(
             template_vmid_range=[9000, 9009],
             template_vm_id=9000,  # current active
@@ -883,9 +881,7 @@ def test_destroy_template_refuses_active_pointer(runner, cfg_path, mocker):
         return_value=9001,
     )
 
-    result = runner.invoke(
-        fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path]
-    )
+    result = runner.invoke(fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path])
 
     assert result.exit_code != 0
     assert "currently-active template" in result.output
@@ -910,9 +906,7 @@ def test_destroy_template_refuses_with_live_clones(runner, cfg_path, mocker):
         return_value=9001,
     )
 
-    result = runner.invoke(
-        fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path]
-    )
+    result = runner.invoke(fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path])
 
     assert result.exit_code != 0
     assert "linked clone" in result.output
@@ -937,9 +931,7 @@ def test_destroy_template_succeeds_when_safe(runner, cfg_path, mocker):
         return_value=9001,
     )
 
-    result = runner.invoke(
-        fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path]
-    )
+    result = runner.invoke(fleet, ["destroy-template", "9000", "--yes", "--config", cfg_path])
 
     assert result.exit_code == 0, result.output
     mock_px.destroy_vm.assert_called_once_with(9000)
@@ -1032,9 +1024,7 @@ def test_destroy_template_aborts_when_active_undeterminable(runner, cfg_path, mo
         side_effect=RuntimeError("redis unreachable"),
     )
 
-    result = runner.invoke(
-        fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path]
-    )
+    result = runner.invoke(fleet, ["destroy-template", "9001", "--yes", "--config", cfg_path])
 
     assert result.exit_code == 1
     assert "Could not determine the active template" in result.output
@@ -1526,9 +1516,7 @@ class TestPromptStorageNonInteractive:
                 {"storage": "hdd-pool", "type": "lvmthin", "avail": 1e12},
             ],
         )
-        result = _prompt_storage(
-            px, "images", "template VM disk", Console(), default="ssd-pool"
-        )
+        result = _prompt_storage(px, "images", "template VM disk", Console(), default="ssd-pool")
         assert result == "ssd-pool"
         mock_prompt.assert_not_called()
 
@@ -1544,9 +1532,7 @@ class TestPromptStorageNonInteractive:
                 {"storage": "hdd-pool", "type": "lvmthin", "avail": 1e12},
             ],
         )
-        result = _prompt_storage(
-            px, "images", "template VM disk", Console(), default="missing"
-        )
+        result = _prompt_storage(px, "images", "template VM disk", Console(), default="missing")
         assert result == "hdd-pool"
         mock_prompt.assert_called_once()
 
@@ -1573,9 +1559,7 @@ class TestPromptStorageNonInteractive:
         _prompt_storage, px = self._px(
             mocker, [{"storage": "only-one", "type": "lvmthin", "avail": 1e12}]
         )
-        assert (
-            _prompt_storage(px, "images", "x", Console(), default="missing") == "only-one"
-        )
+        assert _prompt_storage(px, "images", "x", Console(), default="missing") == "only-one"
         mock_prompt.assert_not_called()
 
 
@@ -1620,9 +1604,7 @@ class TestWaitForCloudInit:
         ]
         run = mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=results)
         mocker.patch("orcest.fleet.cli.time.sleep")
-        assert (
-            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is True
-        )
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is True
         # Should have polled at least three times.
         assert run.call_count >= 3
 
@@ -1646,9 +1628,7 @@ class TestWaitForCloudInit:
             return base[0]
 
         mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
-        assert (
-            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
-        )
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
 
     def test_does_not_complete_on_status_error_alone(self, mocker):
         """Bug 5 regression: ``status: error`` without boot-finished must NOT
@@ -1673,6 +1653,4 @@ class TestWaitForCloudInit:
             return base[0]
 
         mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
-        assert (
-            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
-        )
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
