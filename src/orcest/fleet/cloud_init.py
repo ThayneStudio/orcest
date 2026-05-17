@@ -8,6 +8,7 @@ and configures the appropriate services.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 import yaml
 
@@ -456,7 +457,7 @@ def render_worker_userdata(
 
     claude_json = '{"hasCompletedOnboarding": true}'
 
-    write_files = [
+    write_files: list[dict[str, Any]] = [
         # ``defer: true`` waits for cc_users_groups to create the orcest
         # user before chown/chmod — the config stage runs cc_write_files
         # before users exist, which logs ``Unknown user or group: "orcest"``.

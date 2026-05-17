@@ -378,7 +378,10 @@ class PoolManager:
         candidates: list[int] = []
         for vm in all_vms:
             try:
-                vmid = int(vm.get("vmid"))
+                raw_vmid = vm.get("vmid")
+                if raw_vmid is None:
+                    continue
+                vmid = int(raw_vmid)
             except (TypeError, ValueError):
                 continue
             if vmid == exclude or not self._is_proxmox_template(vm):
