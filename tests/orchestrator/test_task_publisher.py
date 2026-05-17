@@ -1251,9 +1251,7 @@ def test_all_transient_failures_retrigger_ci_not_enqueue(gh_mock, fake_redis_cli
     assert len(entries) == 0
 
 
-def test_rerun_all_transient_ci_does_not_publish_or_fetch_diff(
-    gh_mock, fake_redis_client
-):
+def test_rerun_all_transient_ci_does_not_publish_or_fetch_diff(gh_mock, fake_redis_client):
     """The pre-token transient path re-triggers CI without creating worker context."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = "connection reset by peer"
@@ -1277,9 +1275,7 @@ def test_rerun_all_transient_ci_does_not_publish_or_fetch_diff(
     assert len(entries) == 0
 
 
-def test_publish_fix_task_skip_transient_rerun_publishes_worker_task(
-    gh_mock, fake_redis_client
-):
+def test_publish_fix_task_skip_transient_rerun_publishes_worker_task(gh_mock, fake_redis_client):
     """Loop preflight can defer all-transient fallback publication until it has a token."""
     _setup_gh_defaults(gh_mock)
     gh_mock.get_failed_run_logs.return_value = "timeout"
@@ -1635,3 +1631,53 @@ def test_issue_task_redis_receives_xadd(gh_mock, fake_redis_server):
     project_entries = project_fake.xrange("project-b:tasks:issue:claude")
     assert len(shared_entries) == 1
     assert len(project_entries) == 0
+
+
+def test_transient_attempt_counter_never_exceeds_budget(gh_mock, fake_redis_client):
+    """The transient counter is capped at _MAX_TRANSIENT_RETRIES even when the
+    same all-transient PR re-enters the rerun path many times -- it must not
+    run away (the observed-in-prod 53/3 bug)."""
+    from orcest.orchestrator.pr_ops import get_transient_attempt_count
+    from orcest.orchestrator.task_publisher import _MAX_TRANSIENT_RETRIES
+
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "ETIMEDOUT"
+
+    ci_failures = _make_transient_ci_failures([42010])
+    pr_state = _make_pr_state(number=910, ci_failures=ci_failures)
+
+    for _ in range(_MAX_TRANSIENT_RETRIES + 8):
+        rerun_all_transient_ci(
+            pr_state=pr_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+        )
+
+    count = get_transient_attempt_count(fake_redis_client, "test-org/test-repo", 910, "abc123")
+    assert count == _MAX_TRANSIENT_RETRIES
+
+
+def test_fallback_fix_prompt_presents_transient_failure_as_code(gh_mock, fake_redis_client):
+    """Once the transient rerun budget is spent and a fix task is dispatched,
+    the prompt must not tag the failure '(transient)' -- that would tell the
+    worker to dismiss a real failure."""
+    _setup_gh_defaults(gh_mock)
+    gh_mock.get_failed_run_logs.return_value = "ETIMEDOUT"
+
+    ci_failures = _make_transient_ci_failures([42011])
+    pr_state = _make_pr_state(number=911, ci_failures=ci_failures)
+
+    result = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+        claude_token="claude-token",
+        skip_transient_rerun=True,
+    )
+
+    assert isinstance(result, Task)
+    assert "(transient)" not in result.prompt
+    assert "(code)" in result.prompt

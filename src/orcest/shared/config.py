@@ -60,9 +60,13 @@ class LabelConfig:
 @dataclass
 class RunnerConfig:
     type: str = "claude"
-    timeout: int = 1800  # 30 minutes
+    timeout: int = 5400  # 90 minutes
     max_retries: int = 3
     retry_backoff: int = 10  # seconds between retries
+    # Model the worker passes to the Claude CLI. Fix tasks (DB migrations,
+    # multi-file refactors) benefit from the most capable model; without an
+    # explicit flag the CLI silently uses the token's default.
+    model: str = "claude-opus-4-7"
     extra: dict[str, str] = field(default_factory=dict)
 
 
@@ -89,9 +93,12 @@ class OrchestratorConfig:
     # runner duration.
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     default_runner: str = "claude"
-    max_attempts: int = 3  # Max task attempts per SHA before needs-human
-    max_total_attempts: int = 50  # Max total attempts across all SHAs (hard stop)
-    max_transient_failures: int = 5  # Max transient PR failures before needs-human
+    # Per-SHA task attempts before the retry cadence backs off. Orcest does not
+    # abandon the PR or escalate to a human at this threshold -- it only slows
+    # down; a new commit resets the counter.
+    max_attempts: int = 3
+    max_total_attempts: int = 50  # Total attempts across all SHAs before backing off
+    max_transient_failures: int = 5  # Transient PR failures before the cadence backs off
     delete_branch_on_merge: bool = True  # Whether to delete the head branch after merging
     # Seconds a pending CI check may be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds: int = 7200
@@ -285,9 +292,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                     if t
                 ]
             elif p.get("claude_token"):
-                p_claude_tokens = [
-                    _safe_str(p["claude_token"], f"projects[{i}].claude_token")
-                ]
+                p_claude_tokens = [_safe_str(p["claude_token"], f"projects[{i}].claude_token")]
             else:
                 p_claude_tokens = list(claude_tokens)  # inherit from shared
             projects.append(
@@ -438,9 +443,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
 
     # Shared task stream prefix: all per-project orchestrators publish tasks
     # to this prefix so workers only need to read from one stream.
-    task_key_prefix = str(
-        os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix", ""))
-    ) or redis_config.key_prefix
+    task_key_prefix = (
+        str(os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix", "")))
+        or redis_config.key_prefix
+    )
 
     config = OrchestratorConfig(
         redis=redis_config,

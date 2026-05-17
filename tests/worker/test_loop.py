@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import signal
 import threading
 from pathlib import Path
@@ -405,7 +405,8 @@ class TestExecuteTask:
         self, local_worker_config, mock_workspace, mocker
     ):
         old_fingerprint = (
-            '{"comments":[{"author":"alice","body":"old feedback","created_at":"","id":"","updated_at":""}],'
+            '{"comments":[{"author":"alice","body":"old feedback",'
+            '"created_at":"","id":"","updated_at":""}],'
             '"id":"thread-1","line":"10","path":"app.py"}'
         )
         task = Task.create(

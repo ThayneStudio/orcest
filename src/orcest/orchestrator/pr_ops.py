@@ -618,10 +618,7 @@ def discover_actionable_prs(
                 pending_metadata.task_id,
             )
             clear_pending_task_if_matches(redis, repo, "pr", number, pending_metadata.task_id)
-        elif (
-            pending_metadata is not None
-            and pending_metadata.snapshot_head_sha != head_sha
-        ):
+        elif pending_metadata is not None and pending_metadata.snapshot_head_sha != head_sha:
             logger.info(
                 "PR #%d: clearing pending task %s from old SHA %s (current %s)",
                 number,
@@ -878,7 +875,7 @@ def discover_actionable_prs(
             if all_stale:
                 # All pending checks have exceeded the staleness timeout.
                 # Re-trigger what we can; if no run IDs are extractable
-                # (e.g. StatusContext checks), the loop will add needs-human.
+                # (e.g. StatusContext checks), the loop just logs and moves on.
                 logger.warning(
                     "PR #%d has %d stale pending check(s) (>%ds), "
                     "escalating for re-trigger (run_ids=%s)",
@@ -1191,9 +1188,11 @@ def discover_actionable_prs(
                         )
                     )
                 elif review_run_id is not None and retrigger_sha == head_sha:
-                    # Already re-triggered for this SHA, still no review — escalate
+                    # Already re-triggered for this SHA, still no review. Route
+                    # to SKIP_MAX_ATTEMPTS, which backs off and retries later
+                    # (it no longer escalates to a human).
                     logger.warning(
-                        "PR #%d: claude-review re-trigger exhausted (SHA %s), escalating",
+                        "PR #%d: claude-review re-trigger exhausted (SHA %s), backing off",
                         number,
                         head_sha[:8],
                     )

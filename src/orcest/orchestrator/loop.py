@@ -32,7 +32,6 @@ from orcest.orchestrator.pr_ops import (
     get_stale_retrigger_sha,
     increment_total_attempts,
     record_self_cancelled_stale_runs,
-    set_exhausted_notified,
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
@@ -333,7 +332,7 @@ def _mark_usage_exhausted_token(
 
 
 # Maximum number of merge retries for transient network errors before
-# falling through to the needs-human label path.
+# falling through to the backoff-and-retry path.
 _MAX_MERGE_RETRIES = 5
 
 
@@ -461,9 +460,7 @@ def _make_review_rerun_failure_key(repo: str, pr_number: int, head_sha: str) -> 
     return f"pr:{repo}:{pr_number}:review_rerun_failures:{head_sha}"
 
 
-def _make_review_rerun_failure_cooldown_key(
-    repo: str, pr_number: int, head_sha: str
-) -> str:
+def _make_review_rerun_failure_cooldown_key(repo: str, pr_number: int, head_sha: str) -> str:
     """Redis key suppressing claude-review reruns after a failed rerun call."""
     return f"pr:{repo}:{pr_number}:review_rerun_failure_cooldown:{head_sha}"
 
@@ -500,101 +497,41 @@ def _review_rerun_failure_cooldown_active(
     return redis.exists(_make_review_rerun_failure_cooldown_key(repo, pr_number, head_sha))
 
 
-def _label_pr_retry_budget_exhausted(
+def _back_off_pr_retries(
     *,
     repo: str,
     pr_state,
-    labels: LabelConfig,
-    token: str,
     logger: logging.Logger,
     redis: RedisClient,
-    attempts_text: str,
-    retry_text: str,
+    reason: str,
+    step: int,
 ) -> None:
-    """Label and comment on a PR whose orchestrator retry budget is exhausted."""
-    logger.warning(
-        "PR #%d: retry budget exhausted, adding needs-human label", pr_state.number
+    """Lengthen a PR's retry cadence instead of escalating it to a human.
+
+    Orcest never abandons a PR or applies the needs-human label on budget
+    exhaustion -- a "hard" PR is the worker's job, not a human's. The per-SHA
+    attempt counter is cleared and a backoff cooldown is set so the PR is
+    retried automatically once the cooldown expires. ``step`` selects the
+    cooldown length (see coordination.get_backoff_cooldown_seconds); a larger
+    step is used the deeper into the budget we are, so a repeatedly failing PR
+    is retried less often -- never zero.
+    """
+    try:
+        set_backoff_cooldown(redis, repo, pr_state.number, step, head_sha=pr_state.head_sha)
+        clear_attempts(redis, repo, pr_state.number)
+    except Exception as e:
+        logger.error(
+            "PR #%d: failed to set retry backoff: %s",
+            pr_state.number,
+            e,
+            exc_info=True,
+        )
+    logger.info(
+        "PR #%d: %s -- backing off retries (step %d), not escalating to a human",
+        pr_state.number,
+        reason,
+        step,
     )
-    labeled = False
-    try:
-        gh.add_label(
-            repo,
-            pr_state.number,
-            labels.needs_human,
-            token,
-        )
-        labeled = True
-        set_exhausted_notified(redis, repo, pr_state.number)
-    except Exception as e:
-        logger.error(
-            "Failed to label PR #%d as needs-human: %s",
-            pr_state.number,
-            e,
-            exc_info=True,
-        )
-    try:
-        label_note = (
-            f"Labeling as `{labels.needs_human}` for manual review."
-            if labeled
-            else f"Failed to add `{labels.needs_human}` label — please triage manually."
-        )
-        gh.post_comment(
-            repo,
-            pr_state.number,
-            f"**orcest** has exhausted its retry budget "
-            f"({attempts_text}) for this PR. {label_note}\n\n{retry_text}",
-            token,
-        )
-    except Exception as e:
-        logger.error(
-            "Failed to comment on PR #%d about max attempts: %s",
-            pr_state.number,
-            e,
-            exc_info=True,
-        )
-
-
-def _label_review_rerun_failures_exhausted(
-    *,
-    repo: str,
-    pr_state,
-    labels: LabelConfig,
-    token: str,
-    logger: logging.Logger,
-    failure_count: int,
-) -> None:
-    """Escalate repeated failures to call gh.rerun_workflow for claude-review."""
-    labeled = False
-    try:
-        gh.add_label(repo, pr_state.number, labels.needs_human, token)
-        labeled = True
-    except Exception as e:
-        logger.error(
-            "Failed to label PR #%d after claude-review rerun failures: %s",
-            pr_state.number,
-            e,
-            exc_info=True,
-        )
-    try:
-        label_note = (
-            f"Labeling as `{labels.needs_human}` for manual review."
-            if labeled
-            else f"Failed to add `{labels.needs_human}` label — please triage manually."
-        )
-        gh.post_comment(
-            repo,
-            pr_state.number,
-            f"**orcest** failed to re-trigger `claude-review` {failure_count} times. "
-            f"{label_note}",
-            token,
-        )
-    except Exception as e:
-        logger.error(
-            "Failed to comment on PR #%d about claude-review rerun failures: %s",
-            pr_state.number,
-            e,
-            exc_info=True,
-        )
 
 
 def run_orchestrator(config: OrchestratorConfig) -> None:
@@ -907,7 +844,7 @@ def _poll_project(
                                 f"{rebase_err}",
                                 exc_info=True,
                             )
-                            # Fall through to needs-human labeling
+                            # Fall through to the backoff-and-retry path
                             is_conflict = False
 
                 if not is_conflict:
@@ -926,9 +863,7 @@ def _poll_project(
                             ):
                                 continue
                         except Exception as update_err:
-                            if _is_stale_head_error(
-                                _exception_message_with_stderr(update_err)
-                            ):
+                            if _is_stale_head_error(_exception_message_with_stderr(update_err)):
                                 logger.info(
                                     "PR #%d: update-branch rejected stale discovered "
                                     "head SHA %s after merge rejection; retrying next poll",
@@ -969,41 +904,24 @@ def _poll_project(
                             )
                             continue  # skip needs-human label
 
-                    labeled = False
-                    try:
-                        gh.add_label(
-                            repo,
-                            pr_state.number,
-                            labels.needs_human,
-                            token,
-                        )
-                        labeled = True
-                    except Exception as label_err:
-                        logger.error(
-                            f"Failed to label PR #{pr_state.number} after merge failure: "
-                            f"{label_err}",
-                            exc_info=True,
-                        )
-                    try:
-                        safe_err = err_msg[:200]
-                        label_note = (
-                            f"Labeling as `{labels.needs_human}` for manual review."
-                            if labeled
-                            else f"Failed to add `{labels.needs_human}` "
-                            f"label — please triage manually."
-                        )
-                        gh.post_comment(
-                            repo,
-                            pr_state.number,
-                            f"**orcest** failed to merge this PR: {safe_err}\n\n{label_note}",
-                            token,
-                        )
-                    except Exception as comment_err:
-                        logger.error(
-                            f"Failed to comment on PR #{pr_state.number} "
-                            f"after merge failure: {comment_err}",
-                            exc_info=True,
-                        )
+                    # A non-conflict, non-stale, non-network merge failure
+                    # (branch protection, a missing required check, etc.) is
+                    # not a human-decision blocker -- it usually clears on its
+                    # own once CI/branch state settles. Back off and let the
+                    # next poll re-evaluate; never escalate to needs-human.
+                    logger.warning(
+                        "PR #%d: merge failed (%s) -- backing off, will retry",
+                        pr_state.number,
+                        err_msg[:200],
+                    )
+                    _back_off_pr_retries(
+                        repo=repo,
+                        pr_state=pr_state,
+                        logger=logger,
+                        redis=project_redis,
+                        reason="merge failed",
+                        step=1,
+                    )
             else:
                 # Clean up state on successful merge
                 try:
@@ -1301,8 +1219,7 @@ def _poll_project(
                         project_redis, repo, pr_state.number, pr_state.head_sha
                     )
                     logger.error(
-                        "Failed to re-trigger review for PR #%d "
-                        "(failure %d/%d; cooldown %ds): %s",
+                        "Failed to re-trigger review for PR #%d (failure %d/%d; cooldown %ds): %s",
                         pr_state.number,
                         failure_count,
                         _MAX_REVIEW_RERUN_FAILURES,
@@ -1311,13 +1228,22 @@ def _poll_project(
                         exc_info=True,
                     )
                     if failure_count >= _MAX_REVIEW_RERUN_FAILURES:
-                        _label_review_rerun_failures_exhausted(
+                        # Repeated failures to re-trigger claude-review are not
+                        # a human-decision blocker. Back off and keep retrying;
+                        # never escalate to needs-human.
+                        logger.warning(
+                            "PR #%d: claude-review re-trigger failed %d times -- "
+                            "backing off, will retry",
+                            pr_state.number,
+                            failure_count,
+                        )
+                        _back_off_pr_retries(
                             repo=repo,
                             pr_state=pr_state,
-                            labels=labels,
-                            token=token,
                             logger=logger,
-                            failure_count=failure_count,
+                            redis=project_redis,
+                            reason="claude-review re-trigger repeatedly failed",
+                            step=2,
                         )
         elif pr_state.action == PRAction.RETRIGGER_STALE_CHECKS:
             run_ids = pr_state.stale_run_ids
@@ -1331,43 +1257,14 @@ def _poll_project(
                 )
             elif not run_ids:
                 # Stale pending checks found but no re-triggerable run IDs
-                # (e.g. StatusContext checks). Escalate to needs-human.
+                # (e.g. StatusContext checks). Nothing orcest can act on and no
+                # human decision is required -- the checks may still settle.
+                # Log and move on; never escalate to needs-human.
                 logger.warning(
                     "PR #%d: stale pending checks with no re-triggerable run IDs; "
-                    "adding needs-human label",
+                    "leaving for the check provider to settle",
                     pr_state.number,
                 )
-                try:
-                    gh.add_label(
-                        repo,
-                        pr_state.number,
-                        labels.needs_human,
-                        token,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Failed to add needs-human label to PR #%d: %s",
-                        pr_state.number,
-                        e,
-                        exc_info=True,
-                    )
-                try:
-                    gh.post_comment(
-                        repo,
-                        pr_state.number,
-                        f"**orcest** detected stale CI checks that have been pending for "
-                        f"more than {config.stale_pending_timeout_seconds // 60}m but "
-                        f"could not re-trigger them automatically. "
-                        f"Please investigate the stuck checks manually.",
-                        token,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Failed to comment on PR #%d about stale checks: %s",
-                        pr_state.number,
-                        e,
-                        exc_info=True,
-                    )
                 set_stale_retrigger_sha(
                     project_redis,
                     repo,
@@ -1471,32 +1368,35 @@ def _poll_project(
         elif pr_state.action == PRAction.SKIP_LOCKED:
             logger.debug("PR #%d: locked, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_MAX_ATTEMPTS:
-            _label_pr_retry_budget_exhausted(
+            _back_off_pr_retries(
                 repo=repo,
                 pr_state=pr_state,
-                labels=labels,
-                token=token,
                 logger=logger,
                 redis=project_redis,
-                attempts_text=f"{config.max_attempts} attempts",
-                retry_text=(
-                    "Push a new commit to reset the counter and allow orcest to try again."
-                ),
+                reason=f"per-SHA retry budget reached ({config.max_attempts} attempts)",
+                step=1,
             )
         elif pr_state.action == PRAction.SKIP_MAX_TOTAL_ATTEMPTS:
-            _label_pr_retry_budget_exhausted(
+            _back_off_pr_retries(
                 repo=repo,
                 pr_state=pr_state,
-                labels=labels,
-                token=token,
                 logger=logger,
                 redis=project_redis,
-                attempts_text=f"{config.max_total_attempts} failed attempts across commits",
-                retry_text=(
-                    "A human should inspect the repeated failures before clearing "
-                    "the label and retrying."
-                ),
+                reason=(f"total retry budget reached ({config.max_total_attempts} attempts)"),
+                step=7,
             )
+            # The total-attempt counter only paces the retry cadence. Reset it
+            # now so that, once the long backoff cooldown expires, discovery no
+            # longer returns SKIP_MAX_TOTAL_ATTEMPTS and work resumes.
+            try:
+                clear_total_attempts(project_redis, repo, pr_state.number)
+            except Exception as e:
+                logger.error(
+                    "PR #%d: failed to reset total-attempt counter: %s",
+                    pr_state.number,
+                    e,
+                    exc_info=True,
+                )
         elif pr_state.action == PRAction.SKIP_BACKOFF:
             logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_DRAFT:
@@ -1577,42 +1477,17 @@ def _poll_project(
                         exc_info=True,
                     )
         elif issue_state.action == IssueAction.SKIP_MAX_ATTEMPTS:
-            logger.warning(
-                f"Issue #{issue_state.number}: max attempts reached, adding needs-human label"
+            # Budget exhaustion is not a human-decision blocker. Orcest does
+            # not label the issue needs-human; it simply stops actively
+            # retrying until the issue changes (a new comment/edit resets the
+            # counter). A human can still pick it up, but orcest is not
+            # asserting that one is required.
+            logger.info(
+                "Issue #%d: per-issue retry budget reached (%d attempts), "
+                "pausing retries -- not escalating to a human",
+                issue_state.number,
+                config.max_attempts,
             )
-            labeled = False
-            try:
-                gh.add_issue_label(
-                    repo,
-                    issue_state.number,
-                    labels.needs_human,
-                    token,
-                )
-                labeled = True
-            except Exception as e:
-                logger.error(
-                    f"Failed to label issue #{issue_state.number} as needs-human: {e}",
-                    exc_info=True,
-                )
-            try:
-                label_note = (
-                    f"Labeling as `{labels.needs_human}` for manual review."
-                    if labeled
-                    else f"Failed to add `{labels.needs_human}` label — please triage manually."
-                )
-                gh.post_issue_comment(
-                    repo,
-                    issue_state.number,
-                    f"**orcest** has exhausted its retry budget "
-                    f"({config.max_attempts} attempts) for this issue. "
-                    f"{label_note}",
-                    token,
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to comment on issue #{issue_state.number} about max attempts: {e}",
-                    exc_info=True,
-                )
         elif issue_state.action == IssueAction.SKIP_QUEUED:
             logger.debug(f"Issue #{issue_state.number}: task already queued, skipping")
         elif issue_state.action == IssueAction.SKIP_LOCKED:
@@ -1749,7 +1624,8 @@ def _handle_result(
     Posts a comment on the resource (PR or issue) with the result summary
     and manages labels:
     - completed: clears issue attempt counter; PR attempts remain until the SHA changes
-    - failed: adds needs-human label
+    - failed: retried automatically; needs-human is added ONLY when the worker
+      explicitly reported a human-decision blocker (result.needs_human)
     - blocked: adds blocked label
     - usage_exhausted: no label changes; resource resumes after cooldown
     """
@@ -1959,7 +1835,6 @@ def _handle_result(
     is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
         TRANSIENT_SUMMARY_PREFIX
     )
-    transient_exhausted = False
 
     if is_transient:
         transient_accounting_processed = False
@@ -1991,21 +1866,20 @@ def _handle_result(
                         exc_info=True,
                     )
                 if transient_accounting_processed:
-                    transient_count = increment_transient_failure_count(
-                        redis, repo, resource_id
+                    # Each transient failure lengthens the backoff cooldown
+                    # (get_backoff_cooldown_seconds clamps the step, so it
+                    # plateaus rather than growing without bound). Orcest never
+                    # escalates a transient failure to a human -- it just keeps
+                    # retrying at the capped cadence.
+                    transient_count = increment_transient_failure_count(redis, repo, resource_id)
+                    set_backoff_cooldown(
+                        redis,
+                        repo,
+                        resource_id,
+                        transient_count - 1,
+                        head_sha=head_sha,
                     )
-                    if transient_count > max_transient_failures:
-                        transient_exhausted = True
-                        clear_backoff(redis, repo, resource_id)
-                    else:
-                        set_backoff_cooldown(
-                            redis,
-                            repo,
-                            resource_id,
-                            transient_count - 1,
-                            head_sha=head_sha,
-                        )
-                        clear_attempts(redis, repo, resource_id)
+                    clear_attempts(redis, repo, resource_id)
                 else:
                     clear_attempts(redis, repo, resource_id)
         except Exception as e:
@@ -2016,20 +1890,24 @@ def _handle_result(
             )
 
     # Manage labels based on result status.
-    # Only terminal statuses (FAILED, BLOCKED) add labels.
-    # USAGE_EXHAUSTED adds no labels — the PR will resume via the cooldown mechanism.
-    # Transient failures skip labeling until their retry budget is exhausted.
+    #
+    # needs-human is applied for exactly one reason: the worker's agent
+    # explicitly reported a genuine human-decision blocker (result.needs_human).
+    # Orcest never infers needs-human from a failure or a budget count -- an
+    # ordinary fix-attempt failure is just retried on the next eligible cycle.
     labeled = False
-    if result.status == ResultStatus.FAILED and (not is_transient or transient_exhausted):
-        if not is_issue:
-            if not is_transient:
-                try:
-                    increment_total_attempts(redis, repo, resource_id)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
-                        exc_info=True,
-                    )
+    needs_human = result.status == ResultStatus.FAILED and result.needs_human
+    if result.status == ResultStatus.FAILED and not is_transient and not is_issue:
+        # The total-attempt counter only paces the retry cadence (see the
+        # SKIP_MAX_TOTAL_ATTEMPTS handler); it never escalates.
+        try:
+            increment_total_attempts(redis, repo, resource_id)
+        except Exception as e:
+            logger.error(
+                f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
+                exc_info=True,
+            )
+    if needs_human:
         try:
             _add_label(repo, resource_id, labels.needs_human, token)
             labeled = True
@@ -2053,23 +1931,25 @@ def _handle_result(
     if result.status != ResultStatus.COMPLETED:
         safe_summary = result.summary[:500] if result.summary else ""
 
-        if result.status == ResultStatus.FAILED and is_transient and not transient_exhausted:
-            # Transient failures are retried silently — no comment to avoid
-            # accumulating noise if infrastructure is degraded across many attempts.
+        if result.status == ResultStatus.FAILED and not needs_human:
+            # An ordinary (transient or otherwise) fix-attempt failure is
+            # retried automatically -- stay silent to avoid accumulating
+            # comment noise across attempts.
             if token_pool is not None:
                 token_pool.task_completed(result.task_id)
             return
         elif result.status == ResultStatus.FAILED:
+            # needs_human is True: the worker's agent explicitly asked for a
+            # human decision. Surface its reason so the human knows what to do.
+            reason = result.needs_human_reason or "(no reason given)"
             label_note = (
-                f"Labeling as `{labels.needs_human}` for manual review."
+                f"Labeled `{labels.needs_human}`."
                 if labeled
-                else f"Failed to add `{labels.needs_human}` label — please triage manually."
+                else f"Failed to add `{labels.needs_human}` label — please add it manually."
             )
             body = (
-                f"**orcest** task `{result.task_id}` failed "
-                f"({result.duration_seconds}s, "
-                f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary}\n\n"
+                f"**orcest** needs a human decision on this PR.\n\n"
+                f"The worker reported: {reason}\n\n"
                 f"{label_note}"
             )
         elif result.status == ResultStatus.BLOCKED:

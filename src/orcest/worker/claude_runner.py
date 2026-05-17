@@ -95,6 +95,72 @@ class ClaudeResult:
     transient: bool = False
 
 
+# A worker reports a genuine human-decision blocker by ending its final
+# message with a standalone `NEEDS_HUMAN: <reason>` line. The pattern is
+# anchored to the start of a line (after optional indent / markdown quote) so
+# that a mid-sentence mention ("I considered NEEDS_HUMAN: ...") does not trip
+# it. It is matched only against agent-authored text -- never the echoed
+# prompt -- see _agent_text_from_stream_json.
+_NEEDS_HUMAN_RE = re.compile(r"(?m)^[ \t>]*NEEDS_HUMAN:[ \t]*([^\n]{1,300})")
+
+
+def _agent_text_from_stream_json(output: str) -> str:
+    """Return only the agent-authored text from Claude stream-json output.
+
+    Concatenates assistant message text blocks and any top-level ``result``
+    string, JSON-decoded so newlines are real (anchored matching needs them).
+    Critically, ``user`` message lines -- which echo the prompt we sent, and
+    therefore the prompt's own ``NEEDS_HUMAN:`` instruction -- are excluded, so
+    the instruction can never be mistaken for the agent emitting the signal.
+    If the input is not stream-json (e.g. plain stderr), it is returned
+    unchanged so it is still scannable.
+    """
+    if not output or not output.strip():
+        return ""
+    parts: list[str] = []
+    saw_json = False
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        saw_json = True
+        if "result" in obj and isinstance(obj["result"], str) and "role" not in obj:
+            parts.append(obj["result"])
+        msg = obj.get("message", obj)
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+    if not saw_json:
+        return output
+    return "\n".join(parts)
+
+
+def _parse_needs_human(output: str) -> tuple[bool, str]:
+    """Detect a worker-reported human-decision blocker in Claude's output.
+
+    The fix prompt instructs Claude to end its final message with a standalone
+    ``NEEDS_HUMAN: <reason>`` line, only for a genuine human-decision blocker.
+    Returns (flag, reason); reason is empty when the signal is absent.
+    """
+    text = _agent_text_from_stream_json(output)
+    if not text:
+        return False, ""
+    m = _NEEDS_HUMAN_RE.search(text)
+    if not m:
+        return False, ""
+    reason = m.group(1).strip()
+    # The prompt's example uses a <placeholder>; an echoed-back placeholder is
+    # not a real reason.
+    if reason.startswith("<"):
+        return False, ""
+    return True, reason
+
+
 def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
     """Build a minimal environment for the Claude subprocess.
 
@@ -188,9 +254,7 @@ def _check_overloaded_event(stdout: str) -> bool:
     for line in stdout.splitlines():
         line = line.strip()
         if not line or (
-            "api_error_status" not in line
-            and '"error"' not in line
-            and "Overloaded" not in line
+            "api_error_status" not in line and '"error"' not in line and "Overloaded" not in line
         ):
             continue
         try:
@@ -207,6 +271,40 @@ def _check_overloaded_event(stdout: str) -> bool:
         if "529" in message and "overloaded" in message.lower():
             return True
     return False
+
+
+def _timeout_claude_result(
+    timeout: int,
+    duration: int,
+    stdout: str,
+    stderr: str,
+) -> ClaudeResult:
+    """Build the ClaudeResult for a run the watchdog killed at the wall clock.
+
+    A watchdog kill is usually a genuine timeout, but Claude can also stall at
+    the limit because it hit a usage / rate limit and the CLI never exited on
+    its own. Inspect the partial output for that signal first: if present,
+    report usage exhaustion so the orchestrator waits for the reset instead of
+    retrying straight into the same wall. Otherwise it is a real timeout —
+    transient (retryable with backoff), not a code defect.
+    """
+    rate_blocked, resets_at = _check_rate_limit_event(stdout)
+    if _is_usage_exhausted(stderr) or rate_blocked:
+        return ClaudeResult(
+            success=False,
+            summary="Claude usage limit reached",
+            duration_seconds=duration,
+            raw_output=stderr or stdout,
+            usage_exhausted=True,
+            rate_limit_resets_at=resets_at,
+        )
+    return ClaudeResult(
+        success=False,
+        summary=f"Timed out after {timeout}s",
+        duration_seconds=duration,
+        raw_output=stdout,
+        transient=True,
+    )
 
 
 def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
@@ -313,10 +411,11 @@ def run_claude(
     on_stderr: Callable[[str], None] | None = None,
     abort_event: threading.Event | None = None,
     claude_token: str = "",
+    model: str = "",
 ) -> ClaudeResult:
     """Execute Claude CLI and return parsed result.
 
-    Runs: claude --print --output-format stream-json -p <prompt>
+    Runs: claude --print --output-format stream-json [--model M] -p <prompt>
 
     Stdout is read line-by-line so that on_output can stream each line
     to external consumers (e.g. Redis) as it arrives.  Stderr is drained
@@ -344,6 +443,9 @@ def run_claude(
         abort_event: Optional event that, when set, interrupts retry backoff
             and aborts the running subprocess so the worker can respond to a
             lost lock without waiting the full delay.
+        claude_token: Optional Claude OAuth token.
+        model: Optional model identifier passed to the CLI as --model. When
+            empty the CLI uses the token's default model.
 
     Returns:
         ClaudeResult with success flag, summary, and timing.
@@ -365,9 +467,10 @@ def run_claude(
         "--output-format",
         "stream-json",
         "--dangerously-skip-permissions",
-        "-p",
-        prompt,
     ]
+    if model:
+        cmd += ["--model", model]
+    cmd += ["-p", prompt]
 
     if logger:
         env_keys = sorted(env.keys())
@@ -595,12 +698,8 @@ def run_claude(
                         len(stdout_lines),
                         stderr_text[:1000] if stderr_text else "(empty)",
                     )
-                return ClaudeResult(
-                    success=False,
-                    summary=f"Timed out after {timeout}s",
-                    duration_seconds=duration,
-                    raw_output="".join(stdout_lines),
-                    transient=True,
+                return _timeout_claude_result(
+                    timeout, duration, "".join(stdout_lines), "".join(stderr_lines)
                 )
 
             if logger:
@@ -650,12 +749,8 @@ def run_claude(
                     len(stdout_lines),
                     stderr_text[:1000] if stderr_text else "(empty)",
                 )
-            return ClaudeResult(
-                success=False,
-                summary=f"Timed out after {timeout}s",
-                duration_seconds=duration,
-                raw_output="".join(stdout_lines),
-                transient=True,
+            return _timeout_claude_result(
+                timeout, duration, "".join(stdout_lines), "".join(stderr_lines)
             )
 
         try:
@@ -765,9 +860,11 @@ class ClaudeRunner:
         self,
         max_retries: int = 3,
         retry_backoff: int = 10,
+        model: str = "",
     ):
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.model = model
 
     def run(
         self,
@@ -794,13 +891,17 @@ class ClaudeRunner:
             on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=claude_token,
+            model=self.model,
         )
+        needs_human, needs_human_reason = _parse_needs_human(result.raw_output)
         return RunnerResult(
             success=result.success,
             summary=result.summary,
             usage_exhausted=result.usage_exhausted,
             rate_limit_resets_at=result.rate_limit_resets_at,
             transient=result.transient,
+            needs_human=needs_human,
+            needs_human_reason=needs_human_reason,
         )
 
 

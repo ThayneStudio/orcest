@@ -172,3 +172,22 @@ def test_task_result_branch_none_roundtrip():
 
     rebuilt = TaskResult.from_dict(d)
     assert rebuilt.branch is None
+
+
+def test_task_result_needs_human_round_trip():
+    """needs_human / needs_human_reason survive to_dict -> from_dict."""
+    original = _make_task_result(
+        status=ResultStatus.FAILED,
+        needs_human=True,
+        needs_human_reason="product owner must pick the canonical role name",
+    )
+    rebuilt = TaskResult.from_dict(original.to_dict())
+    assert rebuilt.needs_human is True
+    assert rebuilt.needs_human_reason == ("product owner must pick the canonical role name")
+
+
+def test_task_result_needs_human_defaults_false():
+    """A result without the needs_human signal deserializes to False."""
+    rebuilt = TaskResult.from_dict(_make_task_result().to_dict())
+    assert rebuilt.needs_human is False
+    assert rebuilt.needs_human_reason == ""
