@@ -17,7 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from orcest.worker.runner import RunnerResult
+from orcest.worker.runner import (
+    ProviderRecipe,
+    RunnerResult,
+    get_provider_recipe,
+)
 
 # Patterns that indicate Claude usage/rate limit exhaustion.
 # Checked against stderr only (case-insensitive).
@@ -161,12 +165,16 @@ def _parse_needs_human(output: str) -> tuple[bool, str]:
     return True, reason
 
 
-def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
-    """Build a minimal environment for the Claude subprocess.
+def _build_env(
+    token: str, credential: str = "", env_var_name: str = "CLAUDE_CODE_OAUTH_TOKEN"
+) -> dict[str, str]:
+    """Build a minimal environment for the provider subprocess.
 
     Uses an allowlist of safe variables from the parent process, then
     injects GITHUB_TOKEN (also as GH_TOKEN for gh CLI compatibility)
-    and CLAUDE_CODE_OAUTH_TOKEN if provided (per-task credential).
+    and the provider-specific credential env var (looked up from the
+    worker-local PROVIDER_REGISTRY) if provided.
+    Never injects via argv.
     """
     env: dict[str, str] = {}
     for key in _ENV_WHITELIST:
@@ -176,9 +184,9 @@ def _build_env(token: str, claude_token: str = "") -> dict[str, str]:
     # Always set GITHUB_TOKEN and GH_TOKEN for gh CLI compatibility
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token
-    # Per-task Claude token overrides any env-level token
-    if claude_token:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
+    # Per-task provider credential (name comes from local registry for this provider)
+    if credential:
+        env[env_var_name] = credential
     return env
 
 
@@ -412,10 +420,20 @@ def run_claude(
     abort_event: threading.Event | None = None,
     claude_token: str = "",
     model: str = "",
+    provider: str = "claude",
+    credential: str = "",
 ) -> ClaudeResult:
-    """Execute Claude CLI and return parsed result.
+    """Execute the provider CLI (selected via local registry) and return parsed result.
 
-    Runs: claude --print --output-format stream-json [--model M] -p <prompt>
+    The binary and credential env var name are looked up from the worker's
+    image-baked PROVIDER_REGISTRY using `provider` as the key. This makes the
+    CLI execution provider-agnostic while keeping the actual subprocess + output
+    parsing logic in one place for the initial rollout (claude-specific parsing
+    will be extended or split when additional providers are added).
+
+    Runs: <binary> --print --output-format stream-json [--model M] -p <prompt>
+    (flags may be provider-specific; registry + future per-provider recipes
+    will drive them).
 
     Stdout is read line-by-line so that on_output can stream each line
     to external consumers (e.g. Redis) as it arrives.  Stderr is drained
@@ -458,10 +476,22 @@ def run_claude(
     # never set so event.wait(timeout=N) behaves like time.sleep(N).
     _abort = abort_event if abort_event is not None else threading.Event()
 
-    env = _build_env(token, claude_token=claude_token)
+    # Support legacy callers that only pass claude_token
+    if not credential and claude_token:
+        credential = claude_token
+    if not provider:
+        provider = "claude"
+
+    # Local registry lookup (never from orchestrator payload)
+    recipe = get_provider_recipe(provider)
+    if recipe is None:
+        # Defensive: early reject in loop.py should have caught this.
+        recipe = ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN")
+
+    env = _build_env(token, credential=credential, env_var_name=recipe.env_var)
 
     cmd = [
-        "claude",
+        recipe.binary,
         "--print",
         "--verbose",
         "--output-format",
@@ -877,6 +907,8 @@ class ClaudeRunner:
         on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
         claude_token: str = "",
+        provider: str = "claude",
+        credential: str = "",
     ) -> RunnerResult:
 
         result = run_claude(
@@ -892,6 +924,8 @@ class ClaudeRunner:
             abort_event=abort_event,
             claude_token=claude_token,
             model=self.model,
+            provider=provider,
+            credential=credential,
         )
         needs_human, needs_human_reason = _parse_needs_human(result.raw_output)
         return RunnerResult(

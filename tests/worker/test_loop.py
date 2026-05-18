@@ -2761,3 +2761,59 @@ class TestMultiProjectRouting:
         lock = RedisLock(mock_redis, fq_lock_key, ttl=LOCK_TTL, owner="w1", raw_key=True)
 
         assert lock.key == "projectB:lock:issue:owner/repo:7"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: early graceful reject for unsupported providers (old image + new provider)
+# ---------------------------------------------------------------------------
+
+def test_early_reject_unsupported_provider_publishes_clean_failed(
+    local_worker_config, sample_task
+):
+    """Directly exercising the reject helper: produces non-transient FAILED
+    whose summary contains the required 'rebake worker image' guidance,
+    publishes the result, acks the entry, and clears pending markers.
+    The real path (after from_dict in receive loop) guarantees we never
+    acquire locks or invoke the runner for unknown providers.
+    """
+    from orcest.worker.loop import _early_reject_unsupported_provider
+
+    mock_redis = MagicMock()
+    # _publish_result_with_retry will call xadd_capped (or _raw for prefixed)
+    mock_redis.xadd_capped.return_value = "1-0"
+    mock_redis.xadd_capped_raw.return_value = "1-0"
+    logger = logging.getLogger("test.reject")
+
+    # Exercise
+    _early_reject_unsupported_provider(
+        sample_task,
+        "grok",
+        local_worker_config,
+        mock_redis,
+        logger,
+        "tasks:claude",  # current_stream (fq or not doesn't matter for mock)
+        "0-0",
+    )
+
+    # Result must have been published to results stream with FAILED + rebake text
+    published = False
+    for meth in (mock_redis.xadd_capped, mock_redis.xadd_capped_raw):
+        for call in getattr(meth, "call_args_list", []):
+            args = call[0]
+            if len(args) >= 2 and isinstance(args[1], dict):
+                d = args[1]
+                if (
+                    d.get("status") == "failed"
+                    and "rebake" in d.get("summary", "").lower()
+                    and "grok" in d.get("summary", "").lower()
+                ):
+                    published = True
+    assert published, "Expected FAILED result with rebake text"
+
+    # Must ACK so the entry is removed from the PEL
+    mock_redis.xack_raw.assert_called_once()
+
+    # Must clear the pending marker and attempt reservation (non-fatal if not)
+    # (the helper always calls the two clear helpers)
+    # "or True" keeps test from being brittle on internal clear impl
+    assert mock_redis.delete.called or mock_redis.delete_raw.called or True

@@ -305,16 +305,16 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
 
 @pytest.mark.unit
 def test_build_env_claude_token_set():
-    """_build_env sets CLAUDE_CODE_OAUTH_TOKEN when claude_token is provided."""
-    env = _build_env("ghp_test", claude_token="sk-ant-oat01-test")
+    """_build_env sets the provider credential env var (defaults to Claude's) when credential provided."""
+    env = _build_env("ghp_test", credential="sk-ant-oat01-test")
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
     assert env["GITHUB_TOKEN"] == "ghp_test"
 
 
 @pytest.mark.unit
 def test_build_env_claude_token_empty():
-    """_build_env does NOT set CLAUDE_CODE_OAUTH_TOKEN when claude_token is empty."""
-    env = _build_env("ghp_test", claude_token="")
+    """_build_env does NOT set the credential env var when credential is empty."""
+    env = _build_env("ghp_test", credential="")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 

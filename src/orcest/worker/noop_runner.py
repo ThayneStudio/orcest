@@ -35,7 +35,10 @@ class NoopRunner:
         on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
         claude_token: str = "",
+        provider: str = "claude",
+        credential: str = "",
     ) -> RunnerResult:
+        # provider/credential ignored for noop (used only for dispatch in real runners)
         sleep_duration = max(0.0, min(self.duration, max(timeout, 0)))
         if logger:
             logger.debug(f"NoopRunner sleeping {sleep_duration}s")

@@ -38,7 +38,12 @@ from orcest.shared.models import (
 )
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
-from orcest.worker.runner import Runner, RunnerResult, create_runner
+from orcest.worker.runner import (
+    Runner,
+    RunnerResult,
+    create_runner,
+    get_unsupported_reason,
+)
 from orcest.worker.workspace import Workspace, WorkspaceError
 
 RESULTS_STREAM = "results"
@@ -229,6 +234,59 @@ def _clear_task_attempt_reservation(redis: RedisClient, task: Task) -> None:
         redis.delete(key)
 
 
+def _early_reject_unsupported_provider(
+    task: Task,
+    provider: str,
+    config: WorkerConfig,
+    redis: RedisClient,
+    logger: logging.Logger,
+    current_stream: str,
+    entry_id: str,
+) -> None:
+    """Publish a clean permanent FAILED for an unknown/missing provider and ACK.
+
+    This is the early graceful reject path (before lock, heartbeat, clone, or
+    any runner work). The orchestrator will see a non-transient failure with
+    an actionable summary telling operators to rebake the worker image.
+    Credentials are never logged or leaked because we use the redacted path
+    only for DL (if publish fails) and TaskResult itself contains no secrets.
+    """
+    summary = f"Rebake worker image to include {provider} CLI"
+    result = _task_result(
+        task,
+        config,
+        ResultStatus.FAILED,
+        task.branch,
+        summary,
+        0,
+    )
+    _publish_result_with_retry(
+        redis,
+        result,
+        task,
+        logger,
+        current_stream,
+        entry_id,
+    )
+    try:
+        redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
+    except Exception:
+        logger.error(
+            f"Failed to ACK unsupported-provider task {task.id} (entry {entry_id})",
+            exc_info=True,
+        )
+    try:
+        _clear_pending_task_for_task(redis, task)
+        _clear_task_attempt_reservation(redis, task)
+    except Exception:
+        logger.warning(
+            "Failed to clear pending-task/attempt markers for unsupported "
+            f"provider task {task.resource_type} #{task.resource_id}",
+            exc_info=True,
+        )
+    logger.info(f"Early graceful reject for task {task.id} (provider={provider})")
+
+
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -339,6 +397,26 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                     f"Failed to ACK malformed entry {entry_id}",
                     exc_info=True,
                 )
+            continue
+
+        # === Early multi-provider dispatch (Task 6) ===
+        # Performed *immediately* after parse, before *any* lock acquisition,
+        # delivery-count DL logic, heartbeat, workspace clone, or runner work.
+        # This guarantees old worker images fail cleanly (non-transient FAILED)
+        # when they encounter a task for a provider they do not have baked in.
+        # The registry + binary check are strictly local to the worker image.
+        unsupported = get_unsupported_reason(task.provider)
+        if unsupported:
+            logger.warning(
+                "Task %s for provider=%s is unsupported on this worker image (%s); "
+                "early graceful reject (permanent FAILED, no runner reached)",
+                task.id,
+                task.provider,
+                unsupported,
+            )
+            _early_reject_unsupported_provider(
+                task, task.provider, config, redis, logger, current_stream, entry_id
+            )
             continue
 
         logger.info(
@@ -1085,7 +1163,8 @@ def _execute_task(
             except Exception:
                 pass
 
-        # Run the configured backend
+        # Run the configured backend (now provider-agnostic; binary+env chosen
+        # from the worker-local registry using task.provider).
         runner_result: RunnerResult = runner.run(
             prompt=task.prompt,
             work_dir=work_dir,
@@ -1096,6 +1175,8 @@ def _execute_task(
             on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=task.claude_token,
+            provider=task.provider,
+            credential=task.credential,
         )
 
         duration = int(time.monotonic() - start)

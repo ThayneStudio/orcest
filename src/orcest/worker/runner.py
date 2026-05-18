@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +18,46 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from orcest.shared.config import RunnerConfig
+
+
+@dataclass(frozen=True)
+class ProviderRecipe:
+    """Image-baked execution recipe for a given provider (local to worker).
+
+    The orchestrator never sends recipes; `task.provider` is the sole opaque
+    lookup key. This lives in the worker image (or worker-local config) only.
+    """
+
+    binary: str
+    env_var: str
+
+
+# PROVIDER_REGISTRY: the worker's local, image-baked dispatch table.
+# Keys are the opaque `task.provider` values. Add new providers here + the
+# corresponding CLI to the worker image (setup-worker.sh + rebake) to support them.
+# This is deliberately *not* populated from orchestrator ProviderEntry fields.
+PROVIDER_REGISTRY: dict[str, ProviderRecipe] = {
+    "claude": ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN"),
+}
+
+
+def get_provider_recipe(provider: str) -> ProviderRecipe | None:
+    """Return the baked recipe for `provider`, or None if unknown to this image."""
+    return PROVIDER_REGISTRY.get(provider)
+
+
+def get_unsupported_reason(provider: str) -> str | None:
+    """Return a short reason if the provider cannot be executed here, else None.
+
+    Covers both "unknown provider" (not in registry) and "missing binary"
+    (in registry but CLI not found in $PATH). Used for early graceful reject.
+    """
+    recipe = PROVIDER_REGISTRY.get(provider)
+    if recipe is None:
+        return f'unknown provider "{provider}"'
+    if shutil.which(recipe.binary) is None:
+        return f'missing binary "{recipe.binary}" for provider "{provider}"'
+    return None
 
 
 @dataclass
@@ -36,7 +77,14 @@ class RunnerResult:
 
 
 class Runner(Protocol):
-    """Protocol for task execution backends."""
+    """Protocol for task execution backends.
+
+    Generalized for multi-provider: callers now pass `provider` + `credential`
+    (the lean Task surface). Legacy `claude_token` is still accepted for
+    transition. Implementations must use the local PROVIDER_REGISTRY (via
+    provider name) to select binary + env var for credential injection.
+    Credentials are *never* passed on argv, only via environment.
+    """
 
     def run(
         self,
@@ -49,6 +97,8 @@ class Runner(Protocol):
         on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
         claude_token: str = "",
+        provider: str = "claude",
+        credential: str = "",
     ) -> RunnerResult: ...
 
 
