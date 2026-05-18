@@ -531,6 +531,65 @@ def test_poll_cycle_merge_conflict_token_exhausted_skips_needs_human(
     gh_mock.post_comment.assert_not_called()
 
 
+def test_poll_cycle_provider_pool_wiring_registers_and_rolls_back_on_publish_none(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """Supplies real non-exhausted ProviderPool; verifies register_task called and
+    task_completed invoked when a publish_* returns None (dedup/no-enqueue path).
+    Covers the happy wiring path (most prior tests used empty {} legacy token_pools).
+    """
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    pr_state = _make_pr_state(number=99, action=PRAction.ENQUEUE_FIX)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mock_publish_fix = mocker.patch(
+        "orcest.orchestrator.loop.publish_fix_task",
+        return_value=None,  # triggers the rollback path in _try_publish
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    mocker.patch("orcest.orchestrator.loop.publish_issue_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    entry = ProviderEntry(provider="claude", credential="tok-wiring-test-42")
+    pool = ProviderPool([entry])
+    reg_spy = mocker.spy(pool, "register_task")
+    comp_spy = mocker.spy(pool, "task_completed")
+
+    project_key = orchestrator_config.projects[0].key_prefix
+    logger = logging.getLogger("test")
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {project_key: pool},
+        logger,
+        3600,
+    )
+
+    # register_task called exactly once with generated task_id + the entry
+    assert reg_spy.call_count == 1
+    reg_call = reg_spy.call_args[0]
+    assert len(reg_call) == 2  # (task_id, entry) for bound method spy
+    registered_entry = reg_call[1]
+    assert registered_entry.provider == "claude"
+    assert registered_entry.credential == "tok-wiring-test-42"
+
+    # since publish returned None, _try_publish performed rollback
+    assert comp_spy.call_count == 1
+
+    mock_publish_fix.assert_called_once()
+    assert mock_publish_fix.call_args.kwargs["pr_state"] is pr_state
+
+
 def test_poll_cycle_skip_max_attempts_backs_off(
     mocker,
     fake_redis_client,
