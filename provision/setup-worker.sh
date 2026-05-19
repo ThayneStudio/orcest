@@ -39,6 +39,55 @@ if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
 
+# Grok (xAI) CLI — Task 7 enablement (first non-Claude provider)
+# ----------------------------------------------------------------
+# Execution contract (strictly worker-side; see PROVIDER_REGISTRY in
+# src/orcest/worker/runner.py — the orchestrator never knows these details):
+#
+#   binary="grok", env_var="XAI_API_KEY"
+#   Command line used by the generic runner (claude_runner.py):
+#       grok --print --verbose --output-format stream-json \
+#            --dangerously-skip-permissions -p "<full prompt>"
+#   Credential: injected only as $XAI_API_KEY in the child env (never argv,
+#   never logged).
+#   Output expectations for v1: stream-json JSONL on stdout (for summary
+#   extraction) and rate-limit/usage signals either on stderr or as
+#   rate_limit_event objects (reuses existing parsing helpers).
+#
+# How to add any future provider (complete runbook):
+#   1. Decide the opaque name the orchestrator will use (e.g. "grok", "gemini").
+#   2. Add exactly one line to PROVIDER_REGISTRY in the worker's runner.py
+#      (binary + env_var).  This is the single source of truth for dispatch.
+#   3. Add an install/verify block in this file (here) so rebaked images
+#      contain the CLI.  Update the final verification list if the binary
+#      should be mandatory.
+#   4. If the new CLI's flags, output format, or exhaustion signals differ
+#      materially, generalize the cmd construction / parsers in
+#      claude_runner.py (still registry-driven) or introduce a thin
+#      <provider>_runner.py that is selected by worker config (not by task).
+#   5. Run `orcest fleet rebake` (or equivalent) to produce a new worker
+#      template containing the new binary.
+#   6. In the *orchestrator* config, simply list the provider + credential
+#      (see orchestrator.example.yaml).  No Python changes on orchestrator.
+#
+# Because a production-ready `grok` coding-agent CLI package is not yet
+# published (unlike the Anthropic one), we deliberately do *not* install a
+# real binary here.  A worker image without "grok" in $PATH will cause
+# get_unsupported_reason("grok") to return a non-None value; any Grok task
+# will be early-rejected with a permanent FAILED result whose summary tells
+# the operator to "Rebake worker image to include grok CLI".
+# This is the intended graceful behaviour for version skew.
+#
+# When a real grok package becomes available, replace the comment block below
+# with an actual `curl | bash` or `npm install -g` (or dpkg) step exactly
+# like the claude block, then rebake.
+if command -v grok &>/dev/null; then
+    echo "Grok CLI detected on PATH (custom or future package install)"
+else
+    echo "Grok CLI not present — Grok-backed tasks will be cleanly rejected"
+    echo "  with a permanent FAILED + rebake instruction (by design for Task 7)."
+fi
+
 # Install Docker Engine
 if ! command -v docker &>/dev/null; then
     echo "Installing Docker Engine..."

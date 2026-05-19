@@ -1375,3 +1375,62 @@ def test_parse_needs_human_detects_signal_in_assistant_message():
     flag, reason = _parse_needs_human(stream)
     assert flag is True
     assert reason == "the role rename needs a product decision"
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Grok provider executes via the local registry (no orchestrator
+# knowledge of binary or env var)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_run_claude_uses_grok_registry_entry(mock_popen, mocker, tmp_path):
+    """When a task carries provider='grok', the runner looks up the local
+    baked recipe and launches the correct binary with the correct env var.
+
+    This proves the 'worker with Grok support executes using the local registry'
+    requirement.  The subprocess receives the credential *only* via the
+    XAI_API_KEY environment variable (never on the command line).
+    """
+    mock_cls, mock_proc = mock_popen
+    lines = _make_stdout_lines("Grok did the thing.")
+    mock_proc.stdout = iter(lines)
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 110.0),
+    )
+
+    # Exercise the grok path explicitly (credential comes from Task.credential)
+    result = run_claude(
+        PROMPT,
+        tmp_path,
+        TOKEN,
+        max_retries=1,
+        provider="grok",
+        credential="xai-test-credential-123",
+    )
+
+    assert result.success is True
+    assert "Grok did the thing." in result.summary
+
+    # Verify the Popen call used the registry-driven binary + env injection
+    assert mock_cls.called
+    # Popen(cmd_list, cwd=..., env=..., ...) — cmd_list is first positional arg
+    call_args = mock_cls.call_args
+    cmd = call_args[0][0] if call_args[0] else call_args[1].get("args")
+    assert isinstance(cmd, (list, tuple)), f"expected cmd list, got {cmd}"
+    assert cmd[0] == "grok", f"expected 'grok' binary from registry, got {cmd[0]!r}"
+
+    # env is a kwarg
+    env = call_args[1].get("env", {})
+    assert (
+        env.get("XAI_API_KEY") == "xai-test-credential-123"
+    ), "credential must be injected via XAI_API_KEY env only"
+
+    # Never on argv / command line
+    cmd_str = " ".join(map(str, cmd))
+    assert "xai-test-credential" not in cmd_str
+    assert "XAI_API_KEY" not in cmd_str

@@ -33,11 +33,40 @@ class ProviderRecipe:
 
 
 # PROVIDER_REGISTRY: the worker's local, image-baked dispatch table.
-# Keys are the opaque `task.provider` values. Add new providers here + the
-# corresponding CLI to the worker image (setup-worker.sh + rebake) to support them.
-# This is deliberately *not* populated from orchestrator ProviderEntry fields.
+# Keys are the opaque `task.provider` values sent by the orchestrator in Task.
+# The orchestrator is completely agnostic to binaries, env vars, flags, and
+# output formats — it only ever round-robins ProviderEntry(provider, credential, model).
+# Execution contract lives ONLY here and in the corresponding runner code
+# (claude_runner.py for the generic stream-json CLI path today).
+#
+# Adding a provider (see also provision/setup-worker.sh):
+#   1. Pick the provider name (e.g. "grok").
+#   2. Add a ProviderRecipe here with its baked binary name and the env var
+#      that will receive the per-task credential (injected via env, NEVER argv).
+#   3. Ensure the binary + any deps are installed by setup-worker.sh (and thus
+#      present after rebake).
+#   4. If the CLI uses different flags or produces different output for parsing
+#      exhaustion / results, extend the generic logic or add a dedicated runner.
+#
+# Grok execution contract (v1, Task 7):
+#   - provider name: "grok"
+#   - binary: "grok" (must be on $PATH inside the worker image)
+#   - env_var: "XAI_API_KEY" (receives the credential from Task.credential)
+#   - invocation (reuses generic path):
+#       grok --print --verbose --output-format stream-json \
+#            --dangerously-skip-permissions -p "<prompt>"
+#   - stdout: stream-json JSONL (or "result" envelope) for _extract_summary
+#   - exhaustion detection: reuses _is_usage_exhausted (stderr patterns) +
+#     _check_rate_limit_event (rate_limit_event + api_error_status 429) from
+#     claude_runner.  Real Grok CLI may emit different signals; extend the
+#     checks when the production binary contract is known.
+#   - credential handling: only via os.environ["XAI_API_KEY"] in the child;
+#     the parent worker process never logs it (see redaction in Task).
+#
+# Future providers follow the exact same pattern; no orchestrator changes.
 PROVIDER_REGISTRY: dict[str, ProviderRecipe] = {
     "claude": ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN"),
+    "grok": ProviderRecipe(binary="grok", env_var="XAI_API_KEY"),
 }
 
 

@@ -22,3 +22,28 @@ labels:
   blocked: "orcest:blocked"
   needs_human: "orcest:needs-human"
   ready: "orcest:ready"
+
+# Multi-provider configuration (Task 7+ Grok enablement and beyond)
+#
+# The orchestrator only ever sees opaque provider names + credentials + models.
+# All knowledge of *how* to execute a provider (which binary, which env var,
+# which CLI flags) lives exclusively inside the worker image's
+# PROVIDER_REGISTRY (src/orcest/worker/runner.py) and the baked CLIs.
+#
+# Example providers list (can be at top level or inside a per-project entry):
+#
+# providers:
+#   - provider: claude
+#     credential: claude-secret-or-env-fallback
+#     model: claude-3-5-sonnet-20241022
+#   - provider: grok
+#     credential: ""                 # falls back to XAI_API_KEY (or GROK_API_KEY)
+#     model: grok-3-latest
+#     # cli_binary / env_var here are advisory only (orchestrator ignores them;
+#     # the worker uses its own baked recipe for "grok").
+#     extras:
+#       temperature: "0.2"
+#
+# Workers that have the corresponding CLI baked will execute; workers that do
+# not will early-reject the task with a permanent FAILED + "rebake the worker
+# image" message.  This enables safe incremental rollout of new providers.
