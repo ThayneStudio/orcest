@@ -76,10 +76,18 @@ _ENV_WHITELIST: set[str] = {
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
-    # Claude CLI auth
-    # Note: CLAUDE_CODE_OAUTH_TOKEN is intentionally excluded — it is a
-    # per-task credential injected explicitly via the claude_token parameter,
-    # not inherited from the parent process environment.
+    # Provider credential env vars are *not* auto-whitelisted (they are injected
+    # explicitly from the per-task credential carried in Task, or via explicit
+    # fallback below when credential=="").  Adding common ones here allows
+    # workers to inherit operator-supplied fallbacks from /opt/orcest/.env when
+    # the orchestrator sends an entry with empty credential (use worker-local).
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "XAI_API_TOKEN",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    # Claude-specific (still intentionally not in the base whitelist for the
+    # explicit-injection path; the fallback logic below handles credential="").
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
@@ -173,8 +181,14 @@ def _build_env(
     Uses an allowlist of safe variables from the parent process, then
     injects GITHUB_TOKEN (also as GH_TOKEN for gh CLI compatibility)
     and the provider-specific credential env var (looked up from the
-    worker-local PROVIDER_REGISTRY) if provided.
-    Never injects via argv.
+    worker-local PROVIDER_REGISTRY).
+
+    - If `credential` is non-empty: injected directly (preferred, from Task).
+    - If `credential` is empty: falls back to parent os.environ[env_var_name]
+      (supports orchestrator "credential: ''" + worker /opt/orcest/.env).
+
+    Never injects via argv. The env_var_name comes from the registry entry
+    for the task's provider — the orchestrator itself is unaware of it.
     """
     env: dict[str, str] = {}
     for key in _ENV_WHITELIST:
@@ -184,9 +198,18 @@ def _build_env(
     # Always set GITHUB_TOKEN and GH_TOKEN for gh CLI compatibility
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token
-    # Per-task provider credential (name comes from local registry for this provider)
+    # Per-task provider credential (name comes from local registry for this provider).
+    # If credential is provided (non-empty), use it (orchestrator-supplied).
+    # If empty string, fall back to the value from the *parent* worker environment
+    # under the exact env_var_name declared in the worker's PROVIDER_REGISTRY.
+    # This enables "credential: ''" entries in orchestrator YAML (env fallback)
+    # to work on workers that have the corresponding var in /opt/orcest/.env.
     if credential:
         env[env_var_name] = credential
+    else:
+        parent_val = os.environ.get(env_var_name)
+        if parent_val:
+            env[env_var_name] = parent_val
     return env
 
 

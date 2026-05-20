@@ -25,25 +25,26 @@ labels:
 
 # Multi-provider configuration (Task 7+ Grok enablement and beyond)
 #
-# The orchestrator only ever sees opaque provider names + credentials + models.
-# All knowledge of *how* to execute a provider (which binary, which env var,
-# which CLI flags) lives exclusively inside the worker image's
-# PROVIDER_REGISTRY (src/orcest/worker/runner.py) and the baked CLIs.
+# The orchestrator is completely agnostic to execution mechanics.
+# See docs/rollout-multi-provider.md and the Provider Registration & Invocation Boundary.
+# All execution recipes live in the worker image (PROVIDER_REGISTRY in runner.py).
 #
-# Example providers list (can be at top level or inside a per-project entry):
+# Example mixed providers list (top-level applies to all projects; can be
+# overridden or merged per-project under projects[].providers):
 #
-# providers:
-#   - provider: claude
-#     credential: claude-secret-or-env-fallback
-#     model: claude-3-5-sonnet-20241022
-#   - provider: grok
-#     credential: ""                 # falls back to XAI_API_KEY (or GROK_API_KEY)
-#     model: grok-3-latest
-#     # cli_binary / env_var here are advisory only (orchestrator ignores them;
-#     # the worker uses its own baked recipe for "grok").
-#     extras:
-#       temperature: "0.2"
+providers:
+  - provider: claude
+    credential: ""                 # falls back via _PROVIDER_ENV_CANDIDATES or CLAUDE_CODE_OAUTH_TOKEN
+    model: claude-3-5-sonnet-20241022
+  # - provider: grok
+  #   credential: ""               # falls back to XAI_API_KEY / GROK_API_KEY (see config.py)
+  #   model: grok-3-latest
+  #   extras:
+  #     temperature: "0.2"
+
+# Legacy single-claude path (still supported via synthesis into ProviderEntry):
+# claude_tokens: ["sk-ant-..."]     # or set CLAUDE_CODE_OAUTH_TOKENS in env
 #
-# Workers that have the corresponding CLI baked will execute; workers that do
-# not will early-reject the task with a permanent FAILED + "rebake the worker
-# image" message.  This enables safe incremental rollout of new providers.
+# Workers that have the CLI for a provider baked will execute tasks for it;
+# workers that do not will early-reject with permanent FAILED + "rebake the
+# worker image to include <provider> CLI". Safe mixed claude + new providers.

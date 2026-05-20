@@ -58,3 +58,14 @@ Tests should cover the decision tree, not just line coverage:
 - stale results never add labels, comments, backoff, or terminal attempts
 - PR attempts without active pending/lock state do not produce silent stuck work
 - Redis loss may cause extra retries, but must not permanently suppress work
+
+## Multi-Provider Note (Tasks 1–10)
+
+The introduction of `ProviderEntry` / `ProviderPool` and per-`task.provider` dispatch (early registry lookup on the worker) does not alter the core state machine above. Task identity, PR snapshots, pending markers, locks, and result validation remain unchanged. The only additions are:
+
+- Task records now carry `provider` + `credential` (redacted) + `model`.
+- Worker early-rejects (permanent FAILED) for unknown providers before any snapshot validation or runner work.
+- Exhaustion and "rebake required" outcomes are tracked under per-provider Redis keys (`providers:<prov>:exhausted_skip`, `providers:<prov>:rebake_required_failures`).
+- All of the decision coverage items continue to apply identically for Claude, Grok, or future providers.
+
+The state machine guarantees remain the source of truth for coordination hygiene.

@@ -55,20 +55,23 @@ fi
 #   rate_limit_event objects (reuses existing parsing helpers).
 #
 # How to add any future provider (complete runbook):
-#   1. Decide the opaque name the orchestrator will use (e.g. "grok", "gemini").
-#   2. Add exactly one line to PROVIDER_REGISTRY in the worker's runner.py
-#      (binary + env_var).  This is the single source of truth for dispatch.
-#   3. Add an install/verify block in this file (here) so rebaked images
-#      contain the CLI.  Update the final verification list if the binary
-#      should be mandatory.
-#   4. If the new CLI's flags, output format, or exhaustion signals differ
-#      materially, generalize the cmd construction / parsers in
-#      claude_runner.py (still registry-driven) or introduce a thin
-#      <provider>_runner.py that is selected by worker config (not by task).
-#   5. Run `orcest fleet rebake` (or equivalent) to produce a new worker
-#      template containing the new binary.
-#   6. In the *orchestrator* config, simply list the provider + credential
-#      (see orchestrator.example.yaml).  No Python changes on orchestrator.
+#   See the dedicated step-by-step guide: docs/adding-a-provider.md
+#   (and docs/rollout-multi-provider.md for the overall sequencing).
+#
+#   Summary (worker image owns execution; orchestrator is agnostic):
+#   1. Decide the opaque lowercase provider name (e.g. "grok", "gemini").
+#   2. Add ONE line to PROVIDER_REGISTRY in src/orcest/worker/runner.py
+#      (binary + env_var). This is the *only* dispatch table.
+#   3. Add an install/verify block here (so `setup-worker.sh` + rebake
+#      includes the CLI and the verification list succeeds).
+#   4. Generalize claude_runner.py _build_cmd / parsers only if the new
+#      provider's output contract differs (still driven by registry).
+#   5. `orcest fleet rebake` (or manual) → new worker template.
+#   6. Add a declarative entry under providers: in the orchestrator YAML
+#      (credential may be "" to use the env var on the orchestrator host
+#      and/or workers). No orchestrator Python changes ever required.
+#   7. Test mixed-project skew: old workers cleanly reject with permanent
+#      FAILED + "rebake ... to include <name> CLI".
 #
 # Because a production-ready `grok` coding-agent CLI package is not yet
 # published (unlike the Anthropic one), we deliberately do *not* install a
