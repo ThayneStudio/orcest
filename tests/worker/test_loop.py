@@ -1119,6 +1119,15 @@ class TestRunWorker:
         mock_runner = MagicMock()
         mocker.patch("orcest.worker.loop.create_runner", return_value=mock_runner)
 
+        # The early multi-provider dispatch (Task 6) consults the local
+        # PROVIDER_REGISTRY + shutil.which() to decide whether the worker
+        # image can execute the task's provider.  CI runners do not have the
+        # `claude` (or `grok`) binary installed, so without this patch every
+        # run_worker test would early-reject and never reach the runner.
+        # Default to "supported" here; individual tests that exercise the
+        # unsupported path can override.
+        mocker.patch("orcest.worker.loop.get_unsupported_reason", return_value=None)
+
         # Patch Heartbeat to avoid spawning real daemon threads in unit tests.
         # Use the caller-supplied mock when provided so the dependency is explicit.
         if heartbeat_mock is None:
