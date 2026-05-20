@@ -1955,8 +1955,9 @@ def _handle_result(
                     )
 
     # Transient failures (clone timeout, provider overload, worker restart)
-    # should be retried automatically after backoff without burning the
-    # cross-SHA PR attempt budget.
+    # should be retried automatically without burning the cross-SHA PR attempt
+    # budget. They retry immediately until max_transient_failures is exceeded;
+    # after that they use the normal backoff cadence.
     is_transient = result.status == ResultStatus.FAILED and result.summary.startswith(
         TRANSIENT_SUMMARY_PREFIX
     )
@@ -1973,7 +1974,12 @@ def _handle_result(
             logger.debug("Failed to mark transient failure as processed", exc_info=True)
 
         try:
-            if is_issue:
+            if not transient_accounting_processed:
+                logger.debug(
+                    "Skipping duplicate transient cleanup for task %s",
+                    result.task_id,
+                )
+            elif is_issue:
                 clear_issue_attempts(redis, repo, resource_id)
             else:
                 head_sha = result.snapshot_head_sha
@@ -1990,23 +1996,21 @@ def _handle_result(
                         resource_id,
                         exc_info=True,
                     )
-                if transient_accounting_processed:
-                    # Each transient failure lengthens the backoff cooldown
-                    # (get_backoff_cooldown_seconds clamps the step, so it
-                    # plateaus rather than growing without bound). Orcest never
-                    # escalates a transient failure to a human -- it just keeps
-                    # retrying at the capped cadence.
-                    transient_count = increment_transient_failure_count(redis, repo, resource_id)
+                transient_count = increment_transient_failure_count(redis, repo, resource_id)
+                if transient_count > max(0, max_transient_failures):
+                    # Once the silent retry budget is exhausted, lengthen
+                    # the cooldown with each additional transient failure.
+                    # get_backoff_cooldown_seconds clamps the step, so this
+                    # plateaus rather than growing without bound.
+                    backoff_step = transient_count - max(0, max_transient_failures) - 1
                     set_backoff_cooldown(
                         redis,
                         repo,
                         resource_id,
-                        transient_count - 1,
+                        backoff_step,
                         head_sha=head_sha,
                     )
-                    clear_attempts(redis, repo, resource_id)
-                else:
-                    clear_attempts(redis, repo, resource_id)
+                clear_attempts(redis, repo, resource_id)
         except Exception as e:
             logger.error(
                 f"Failed to clear attempts for transient failure on "

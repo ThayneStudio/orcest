@@ -1200,11 +1200,11 @@ def test_run_claude_passes_model_flag(mock_popen, mocker, tmp_path):
         side_effect=_monotonic_seq(100.0, 100.0, 100.0, 101.0, 101.0),
     )
 
-    run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, model="claude-opus-4-7")
+    run_claude(PROMPT, tmp_path, TOKEN, max_retries=1, model="opus")
 
     cmd = mock_cls.call_args[0][0]
     assert "--model" in cmd
-    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-7"
+    assert cmd[cmd.index("--model") + 1] == "opus"
     # -p still carries the prompt
     assert cmd[-2:] == ["-p", PROMPT]
 

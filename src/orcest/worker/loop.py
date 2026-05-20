@@ -19,6 +19,7 @@ import redis as redis_py
 import yaml
 
 from orcest.orchestrator import gh
+from orcest.orchestrator.pr_ops import clear_attempts_if_head_sha
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
@@ -225,13 +226,22 @@ def _clear_task_attempt_reservation(redis: RedisClient, task: Task) -> None:
     """Clear the attempt reservation when no result can reach the orchestrator."""
     if task.resource_type == "issue":
         key = f"issue:{task.repo}:{task.resource_id}:attempts"
-    else:
-        key = f"pr:{task.repo}:{task.resource_id}:attempts"
+        if task.key_prefix:
+            redis.delete_raw(f"{task.key_prefix}:{key}")
+        else:
+            redis.delete(key)
+        return
 
     if task.key_prefix:
-        redis.delete_raw(f"{task.key_prefix}:{key}")
+        project_redis = RedisClient.from_client(redis.client, key_prefix=task.key_prefix)
     else:
-        redis.delete(key)
+        project_redis = redis
+    clear_attempts_if_head_sha(
+        project_redis,
+        task.repo,
+        task.resource_id,
+        task.snapshot_head_sha or "",
+    )
 
 
 def _early_reject_unsupported_provider(

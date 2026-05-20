@@ -18,6 +18,14 @@ polling:
 # Default runner backend for new tasks
 default_runner: "claude"
 
+# Runner settings used to compute task marker TTLs; keep these aligned with workers.
+runner:
+  timeout: 1800
+  max_retries: 3
+  retry_backoff: 10
+  # Optional Claude model; null/empty/omitted uses the Claude CLI default
+  # model: opus
+
 labels:
   blocked: "orcest:blocked"
   needs_human: "orcest:needs-human"

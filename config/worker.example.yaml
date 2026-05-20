@@ -26,3 +26,5 @@ runner:
   max_retries: 3
   # Seconds between retries
   retry_backoff: 10
+  # Optional Claude model; null/empty/omitted uses the Claude CLI default
+  # model: opus
