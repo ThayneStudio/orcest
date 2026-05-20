@@ -20,12 +20,32 @@ class ProviderEntry:
     env_var: str | None = None
     extras: dict[str, str] = field(default_factory=dict)
 
+    # WORKER-SIDE ONLY ---------------------------------------------------
+    # The two properties below encode *execution mechanics* (which binary to
+    # invoke, which env var carries the credential). Per the Provider
+    # Registration & Invocation Boundary (see CLAUDE.md), the orchestrator
+    # MUST NOT call these — execution recipes live in the worker-image-baked
+    # PROVIDER_REGISTRY (src/orcest/worker/runner.py). They exist on the
+    # shared dataclass only because explicit overrides (cli_binary, env_var)
+    # ride on the entry across the wire; the fallback table is a transitional
+    # convenience for worker-side defaulting and is not a registration source.
+    # If you find yourself calling these from orchestrator code paths, STOP
+    # and route through the worker registry instead.
+    # --------------------------------------------------------------------
+
     @property
     def effective_binary(self) -> str:
+        """WORKER-SIDE ONLY: resolve binary name (override or provider name)."""
         return self.cli_binary or self.provider
 
     @property
     def effective_env_var(self) -> str:
+        """WORKER-SIDE ONLY: resolve credential env var name.
+
+        Do not import or call from orchestrator code — see the boundary note
+        above. The hardcoded fallback table is a migration aid that must be
+        deleted once every entry carries an explicit ``env_var``.
+        """
         if self.env_var:
             return self.env_var
         return {"claude": "CLAUDE_CODE_OAUTH_TOKEN", "grok": "XAI_API_KEY"}.get(

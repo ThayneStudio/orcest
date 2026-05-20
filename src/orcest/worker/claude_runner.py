@@ -76,19 +76,13 @@ _ENV_WHITELIST: set[str] = {
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
-    # Provider credential env vars are *not* auto-whitelisted (they are injected
-    # explicitly from the per-task credential carried in Task, or via explicit
-    # fallback below when credential=="").  Adding common ones here allows
-    # workers to inherit operator-supplied fallbacks from /opt/orcest/.env when
-    # the orchestrator sends an entry with empty credential (use worker-local).
-    "XAI_API_KEY",
-    "GROK_API_KEY",
-    "XAI_API_TOKEN",
-    "GOOGLE_API_KEY",
-    "GEMINI_API_KEY",
-    # Claude-specific (still intentionally not in the base whitelist for the
-    # explicit-injection path; the fallback logic below handles credential="").
-    "ANTHROPIC_API_KEY",
+    # Provider routing flags (not credentials) — safe to forward to any
+    # subprocess, claude-specific in practice. Credential env vars themselves
+    # are NOT whitelisted: they would cross-leak (a grok subprocess inheriting
+    # ANTHROPIC_API_KEY, etc.). The credential for the *current* task's provider
+    # is injected explicitly by _build_env using the registry's env_var_name —
+    # either from the task payload or, when credential=="", by reading exactly
+    # that one env var from the parent os.environ.
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 }

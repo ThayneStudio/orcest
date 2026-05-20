@@ -578,12 +578,14 @@ def generate_env_file(
             lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{toks[0]}'")
             lines.append(f"CLAUDE_CODE_OAUTH_TOKENS='{','.join(toks)}'")
         else:
-            # Canonical env var name used by config fallback logic
+            # Canonical env var name used by config fallback logic.
+            # Only the singular form is emitted: no parser, worker, or compose
+            # file currently reads a plural <PROV>_API_KEYS env var, so emitting
+            # one would just produce dead output in generated .env files. Add a
+            # reader (mirroring CLAUDE_CODE_OAUTH_TOKENS consumption in
+            # shared/config.py) before reintroducing the plural form.
             env_name = {"grok": "XAI_API_KEY"}.get(prov, f"{prov.upper()}_API_KEY")
             lines.append(f"{env_name}='{toks[0]}'")
-            # Also emit a plural form for providers that may support pools later
-            if len(toks) > 1:
-                lines.append(f"{prov.upper()}_API_KEYS='{','.join(toks)}'")
 
     return "\n".join(lines) + "\n"
 

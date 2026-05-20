@@ -2874,6 +2874,10 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
     )
 
     # Result must have been published to results stream with FAILED + rebake text
+    # AND must be permanent (no transient prefix / flag) so the orchestrator
+    # surfaces it instead of retrying indefinitely.
+    from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX
+
     published = False
     for meth in (mock_redis.xadd_capped, mock_redis.xadd_capped_raw):
         for call in getattr(meth, "call_args_list", []):
@@ -2885,6 +2889,19 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
                     and "rebake" in d.get("summary", "").lower()
                     and "grok" in d.get("summary", "").lower()
                 ):
+                    # Lock in PERMANENT failure: summary must not carry the
+                    # transient wire-protocol prefix, and any explicit
+                    # serialized transient flag (now or future) must be falsy.
+                    assert not d.get("summary", "").startswith(TRANSIENT_SUMMARY_PREFIX), (
+                        "early reject must be permanent, not transient"
+                    )
+                    assert d.get("transient") in (
+                        None,
+                        "",
+                        "0",
+                        "false",
+                        "False",
+                    ), "early reject must not set transient flag"
                     published = True
     assert published, "Expected FAILED result with rebake text"
 
