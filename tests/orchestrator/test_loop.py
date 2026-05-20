@@ -719,6 +719,11 @@ def test_poll_cycle_increments_token_exhausted_skip_counter(
     assert raw_count == "1"
     assert fake_redis_client.ttl(_PROVIDER_EXHAUSTED_SKIP_KEY) > 0
 
+    # Task 8 per-provider counter also incremented for "claude"
+    per_prov_count = fake_redis_client.get("providers:claude:exhausted_skip")
+    assert per_prov_count == "1"
+    assert fake_redis_client.ttl("providers:claude:exhausted_skip") > 0
+
 
 def test_poll_cycle_token_exhausted_still_reruns_transient_ci(
     mocker,

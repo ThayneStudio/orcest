@@ -70,13 +70,13 @@ from orcest.shared.redis_client import RedisClient
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
 
-# Observability counter incremented when _select_provider_entry returns None
-# (all entries in the project's ProviderPool are cooling).  TTL keeps it self-cleaning
-# so operators can SCAN the keyspace without finding stale leftovers.
-# Per-provider exhausted-skip counters (using masked identities() as keys) and
-# further splitting are planned for Task 8; this provides the base providers: key.
-_PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"
+# Observability counters (Task 8 hygiene).
+# Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.
+# exhausted_skip incremented on full pool exhaustion (per provider in the pool).
+# rebake_required_failures incremented on clean "rebake worker image" FAILED results.
+_PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"  # aggregate for compat
 _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
+_REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
@@ -790,6 +790,8 @@ def _poll_project(
 
         entry = token_pool.next_entry()
         if entry is None:
+            # Increment aggregate (compat) + per-provider exhausted_skip counters
+            # (Task 8). Uses only provider name from lean surface.
             try:
                 count = project_redis.incr(_PROVIDER_EXHAUSTED_SKIP_KEY)
                 if count == 1:
@@ -799,6 +801,18 @@ def _poll_project(
             except Exception:
                 # Observability is best-effort; never break the poll cycle.
                 logger.debug("Failed to increment provider-exhaustion counter", exc_info=True)
+            for prov in token_pool.provider_names:
+                pkey = f"providers:{prov}:exhausted_skip"
+                try:
+                    pcount = project_redis.incr(pkey)
+                    if pcount == 1:
+                        project_redis.expire(pkey, _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS)
+                except Exception:
+                    logger.debug(
+                        "Failed to increment per-provider exhausted-skip counter for %s",
+                        prov,
+                        exc_info=True,
+                    )
             # Debug log includes masked identities only (from pool __repr__)
             logger.debug("Provider pool exhausted during selection: %r", token_pool)
         return entry
@@ -1909,6 +1923,30 @@ def _handle_result(
                     f"after USAGE_EXHAUSTED: {e}",
                     exc_info=True,
                 )
+
+    # Task 8: per-provider rebake_required_failures counter for "clean rebake" style
+    # permanent failures (worker image missing the provider CLI). Uses only the
+    # lean ProviderEntry.provider from the task registration (no execution details).
+    if (
+        result.status == ResultStatus.FAILED
+        and result.summary
+        and "rebake worker image" in result.summary.lower()
+    ):
+        if token_pool is not None:
+            entry = token_pool.get_task_entry(result.task_id)
+            if entry and hasattr(entry, "provider"):
+                prov = entry.provider
+                rkey = f"providers:{prov}:rebake_required_failures"
+                try:
+                    rcount = redis.incr(rkey)
+                    if rcount == 1:
+                        redis.expire(rkey, _REBAKE_REQUIRED_FAILURES_TTL_SECONDS)
+                except Exception:
+                    logger.debug(
+                        "Failed to increment rebake-required-failures counter for provider %s",
+                        prov,
+                        exc_info=True,
+                    )
 
     # Transient failures (clone timeout, provider overload, worker restart)
     # should be retried automatically after backoff without burning the

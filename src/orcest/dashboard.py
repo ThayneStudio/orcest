@@ -81,6 +81,8 @@ class SystemSnapshot:
     recent_results: list[RecentResult] = field(default_factory=list)
     attempt_counts: dict[str, int] = field(default_factory=dict)
     dead_letter_entries: list[DeadLetterEntry] = field(default_factory=list)
+    provider_health: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Task 8: per-provider counters e.g. "claude": {"exhausted_skip": N, "rebake..."}
 
 
 def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
@@ -214,7 +216,28 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
             except (ValueError, TypeError):
                 pass
 
-    return SystemSnapshot(
+    # Provider health counters (Task 8)
+    provider_health: dict[str, dict[str, int]] = {}
+    try:
+        prov_keys = redis.scan_iter(match="providers:*")
+        for k in prov_keys:
+            if not k.startswith("providers:"):
+                continue
+            val = redis.get(k) or "0"
+            # key format after strip: "providers:{prov}:{metric}"
+            parts = k.split(":", 2)
+            if len(parts) == 3:
+                _, prov, metric = parts
+                if prov not in provider_health:
+                    provider_health[prov] = {}
+                try:
+                    provider_health[prov][metric] = int(val)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        logger.debug("Failed to collect provider health counters", exc_info=True)
+
+    return SystemSnapshot(  # noqa: E501
         redis_ok=True,
         fetched_at=datetime.now(timezone.utc),
         queue_depths=queue_depths,
@@ -225,6 +248,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         recent_results=recent_results,
         attempt_counts=attempt_counts,
         dead_letter_entries=dead_letter_entries,
+        provider_health=provider_health,
     )
 
 

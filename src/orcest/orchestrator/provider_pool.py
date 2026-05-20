@@ -104,6 +104,19 @@ class ProviderPool:
             active = sum(1 for exp in self._cooldowns.values() if exp > now)
             return self.size - active
 
+    @property
+    def provider_names(self) -> list[str]:
+        """Return the provider names (lean surface only: no cli_binary/env_var/extras).
+        Used for per-provider observability counters (exhausted_skip, rebake failures).
+        """
+        with self._lock:
+            # unique preserving order of first appearance
+            seen: list[str] = []
+            for e in self._entries:
+                if e.provider not in seen:
+                    seen.append(e.provider)
+            return seen
+
     def _prune_cooldowns(self) -> None:
         """Remove expired cooldown entries. Must be called while holding self._lock."""
         now = datetime.now(timezone.utc)

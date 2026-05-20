@@ -239,6 +239,23 @@ def _status_once(redis: RedisClient) -> None:
             group_table.add_row(str(g.stream), g.name, str(g.consumers), str(g.pending))
         console.print(group_table)
 
+    # Task 8: surface per-provider health from counters (exhausted skips, rebake failures)
+    if getattr(snapshot, "provider_health", None):
+        ph = snapshot.provider_health
+        if ph:
+            ph_table = Table(title="Provider Health (per-provider counters)")
+            ph_table.add_column("Provider", style="cyan")
+            ph_table.add_column("exhausted_skip", style="yellow")
+            ph_table.add_column("rebake_required_failures", style="red")
+            for prov in sorted(ph.keys()):
+                m = ph[prov]
+                ph_table.add_row(
+                    prov,
+                    str(m.get("exhausted_skip", 0)),
+                    str(m.get("rebake_required_failures", 0)),
+                )
+            console.print(ph_table)
+
     console.print()
 
 
@@ -353,11 +370,11 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
         # Strip dead-letter metadata; keep only original task fields.
         task_fields = {k: v for k, v in fields.items() if k not in DEAD_LETTER_METADATA_FIELDS}
 
-        # Critical safety for post-Task-2 redaction: DL entries now contain
-        # "[REDACTED]" for secrets (via to_safe_dict in the write sites).
-        # Replaying them would inject literal "[REDACTED]" as credentials,
-        # causing auth failures. Detect and refuse with guidance; the original
-        # secrets are intentionally never stored in the dead-letter stream.
+        # Task 8: display uses the (already redacted-in-DL) fields; replay checks
+        # for redacted values and refuses (see below). DL write sites use to_safe_dict().
+        # (No mutation here so test samples with real creds continue to replay in unit tests.)
+
+        # Critical safety for post-Task-2 redaction...
         if any(task_fields.get(f) == "[REDACTED]" for f in REDACTED_FIELDS):
             redacted_secrets = [
                 f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"

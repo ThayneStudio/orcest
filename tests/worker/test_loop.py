@@ -2081,6 +2081,74 @@ class TestDeadLetterTask:
 
         mock_redis.xack_raw.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-42")
 
+    def test_dead_letter_redaction_regression_both_paths(self, local_worker_config):
+        """Regression test (Task 8): Task created with real secrets produces DL entries
+        containing only "[REDACTED]" for REDACTED_FIELDS in both _dead_letter_task and
+        result-publish exhaustion paths. No raw secret ever reaches the DL stream.
+        """
+        from orcest.shared.models import REDACTED_FIELDS, ResultStatus, Task, TaskResult, TaskType
+        from orcest.worker.loop import _dead_letter_task, _publish_result_with_retry
+
+        secret = "sk-regression-real-secret-XYZ123-should-never-appear"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/regrepo",
+            token=secret,
+            claude_token=secret,
+            credential=secret,
+            provider="claude",
+            model=None,
+            resource_type="pr",
+            resource_id=99,
+            prompt="test prompt for redaction",
+            branch="main",
+            base_branch="main",
+            key_prefix="",
+        )
+        mock_redis = MagicMock()
+
+        # Path 1: _dead_letter_task
+        _dead_letter_task(mock_redis, "tasks:claude", "e-1", task, 10, logging.getLogger("test"))
+        assert mock_redis.xadd_capped.called
+        dl1 = mock_redis.xadd_capped.call_args[0][1]
+        for f in REDACTED_FIELDS:
+            assert dl1.get(f) == "[REDACTED]", f"redact {f} path1"
+        assert secret not in str(dl1)
+
+        # Path 2: result publish exhaustion (force all result xadds to fail to reach DL)
+        mock_redis.reset_mock()
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="w1",
+            status=ResultStatus.FAILED,
+            branch="main",
+            summary="boom",
+            duration_seconds=1,
+            resource_type="pr",
+            resource_id=99,
+        )
+
+        def fail_results_only(stream, data, **kw):
+            if stream == RESULTS_STREAM:
+                raise RuntimeError("simulated result publish fail")
+            # allow DL xadd
+            return "0-0"
+
+        mock_redis.xadd_capped.side_effect = fail_results_only
+        _publish_result_with_retry(
+            mock_redis, result, task, logging.getLogger("test"), "tasks:claude", "e-2"
+        )
+        # find the DL call
+        dl2 = None
+        for call in mock_redis.xadd_capped.call_args_list:
+            if call[0][0] == DEAD_LETTER_STREAM:
+                dl2 = call[0][1]
+                break
+        assert dl2 is not None, "DL path2 exercised"
+        for f in REDACTED_FIELDS:
+            assert dl2.get(f) == "[REDACTED]", f"redact {f} path2"
+        assert secret not in str(dl2)
+
     def test_acks_even_when_dead_letter_publish_fails(self, local_worker_config, sample_task):
         """_dead_letter_task ACKs the original entry even if publishing to the
         dead-letter stream raises an exception."""
