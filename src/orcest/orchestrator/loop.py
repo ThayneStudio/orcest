@@ -13,6 +13,7 @@ import signal
 import sys
 import time
 import uuid
+from typing import Any, Callable
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
@@ -62,6 +63,7 @@ from orcest.shared.models import (
     CONSUMER_GROUP,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
+    Task,
     TaskResult,
 )
 from orcest.shared.providers import ProviderEntry
@@ -825,7 +827,11 @@ def _poll_project(
         if token_pool is not None:
             token_pool.register_task(task_id, entry)
 
-    def _try_publish(entry: ProviderEntry, publish_fn, **publish_kwargs):
+    def _try_publish(
+        entry: ProviderEntry,
+        publish_fn: Callable[..., Task | None],
+        **publish_kwargs: Any,
+    ) -> Task | None:
         """Encapsulates register + publish + rollback for the hardened contract.
 
         Injects lean surface (provider/credential/model/task_id) + claude_token shim,
