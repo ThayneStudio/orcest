@@ -139,6 +139,7 @@ def test_load_worker_config_from_yaml(tmp_path: Path):
         "  timeout: 900\n"
         "  max_retries: 5\n"
         "  retry_backoff: 20\n"
+        "  model: opus\n"
     )
 
     config = load_worker_config(cfg_file)
@@ -152,6 +153,16 @@ def test_load_worker_config_from_yaml(tmp_path: Path):
     assert config.runner.timeout == 900
     assert config.runner.max_retries == 5
     assert config.runner.retry_backoff == 20
+    assert config.runner.model == "opus"
+
+
+def test_load_worker_config_runner_model_null_uses_cli_default(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("runner:\n  model:\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.runner.model == ""
 
 
 def test_load_worker_config_env_overrides(
@@ -231,19 +242,35 @@ def test_load_orchestrator_config_runner_defaults(tmp_path: Path):
     defaults = RunnerConfig()
     assert config.runner.timeout == defaults.timeout
     assert config.runner.max_retries == defaults.max_retries
+    assert config.runner.model == defaults.model
 
 
 def test_load_orchestrator_config_runner_from_yaml(tmp_path: Path):
     """OrchestratorConfig.runner reflects values from the YAML runner section."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\nrunner:\n  timeout: 3600\n  max_retries: 5\n"
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "runner:\n"
+        "  timeout: 3600\n"
+        "  max_retries: 5\n"
+        "  model: opus\n"
     )
 
     config = load_orchestrator_config(cfg_file)
 
     assert config.runner.timeout == 3600
     assert config.runner.max_retries == 5
+    assert config.runner.model == "opus"
+
+
+def test_load_orchestrator_config_runner_model_null_uses_cli_default(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nrunner:\n  model:\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.runner.model == ""
 
 
 # -- Redis socket timeout defaults ------------------------------------------
@@ -848,11 +875,11 @@ def test_null_redis_key_prefix_raises(tmp_path: Path, monkeypatch: pytest.Monkey
         load_orchestrator_config(cfg_file)
 
 
-def test_runner_config_defaults_90min_opus():
-    """Fix tasks default to a 90-minute wall clock on Opus."""
+def test_runner_config_defaults_90min_and_cli_default_model():
+    """Fix tasks default to a 90-minute wall clock and the Claude CLI default model."""
     defaults = RunnerConfig()
     assert defaults.timeout == 5400
-    assert defaults.model == "claude-opus-4-7"
+    assert defaults.model == ""
 
 
 # -- providers: list + backward compat with claude_tokens (Task 4) ----------------

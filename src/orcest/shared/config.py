@@ -68,10 +68,9 @@ class RunnerConfig:
     timeout: int = 5400  # 90 minutes
     max_retries: int = 3
     retry_backoff: int = 10  # seconds between retries
-    # Model the worker passes to the Claude CLI. Fix tasks (DB migrations,
-    # multi-file refactors) benefit from the most capable model; without an
-    # explicit flag the CLI silently uses the token's default.
-    model: str = "claude-opus-4-7"
+    # Optional model the worker passes to the Claude CLI. Empty means no
+    # --model flag is passed, so the CLI/account default applies.
+    model: str = ""
     extra: dict[str, str] = field(default_factory=dict)
 
 
@@ -157,6 +156,13 @@ def _safe_str(value: Any, field_name: str) -> str:
             f"Config field '{field_name}' is explicitly set to null but a string is required."
         )
     return str(value)
+
+
+def _safe_optional_str(value: Any, field_name: str, default: str = "") -> str:
+    """Convert an optional string field, treating YAML null as ``default``."""
+    if value is None:
+        return default
+    return _safe_str(value, field_name)
 
 
 def _safe_bool(value: Any, field_name: str) -> bool:
@@ -534,6 +540,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         retry_backoff=_safe_int(
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
+        model=_safe_optional_str(runner_raw.get("model"), "runner.model", _runner_defaults.model),
         extra={
             _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in _safe_dict(runner_raw, "extra").items()
@@ -690,6 +697,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         retry_backoff=_safe_int(
             runner_raw.get("retry_backoff", _runner_defaults.retry_backoff), "runner.retry_backoff"
         ),
+        model=_safe_optional_str(runner_raw.get("model"), "runner.model", _runner_defaults.model),
         extra={
             _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in runner_extra_raw.items()

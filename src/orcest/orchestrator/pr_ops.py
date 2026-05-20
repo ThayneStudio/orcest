@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
+import redis as redis_py
+
 from orcest.orchestrator import gh
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import (
@@ -161,11 +163,22 @@ def clear_attempts_if_head_sha(
     if not head_sha:
         return False
     key = _make_attempts_key(repo, pr_number)
-    data: dict[str, str] = redis.hgetall(key)
-    if data.get("head_sha") != head_sha:
-        return False
-    redis.delete(key)
-    return True
+    fq_key = redis._prefixed(key)
+    while True:
+        pipe = redis.client.pipeline()
+        try:
+            pipe.watch(fq_key)
+            if pipe.hget(fq_key, "head_sha") != head_sha:
+                pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.delete(fq_key)
+            pipe.execute()
+            return True
+        except redis_py.WatchError:
+            continue
+        finally:
+            pipe.reset()
 
 
 def _make_total_attempts_key(repo: str, pr_number: int) -> str:

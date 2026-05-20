@@ -1044,7 +1044,7 @@ def test_consume_results_transient_failure_no_needs_human(
 def test_consume_results_transient_failure_clears_attempts(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """A transient FAILED result clears per-SHA attempts and backs off for retry."""
+    """A transient FAILED result clears per-SHA attempts for silent retry."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     pr_number = 56
@@ -1069,13 +1069,45 @@ def test_consume_results_transient_failure_clears_attempts(
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
     # Transient infrastructure/provider failures must never bump total_attempts.
     assert get_total_attempt_count(fake_redis_client, repo, pr_number) == 0
-    assert get_backoff_step(fake_redis_client, repo, pr_number) == 0
+    assert get_backoff_step(fake_redis_client, repo, pr_number) is None
+
+
+def test_consume_results_duplicate_transient_does_not_clear_new_pr_attempt(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A duplicate transient result must not erase a later task's PR attempt."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    pr_number = 57
+    head_sha = "abc123"
+    repo = orchestrator_config.github.repo
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        pr_number=pr_number,
+        task_id="task-transient-dup",
+        summary="[transient] Worker restarted mid-execution; task was not completed.",
+    )
+
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
+
+    increment_attempts(fake_redis_client, repo, pr_number, head_sha)
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 1
+    assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 1
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_consume_results_transient_failure_at_budget_still_retries(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """The configured transient budget is inclusive: count 5 still retries silently."""
+    """The configured transient budget is inclusive: count 5 does not back off."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     orchestrator_config.max_transient_failures = 5
 
@@ -1097,7 +1129,7 @@ def test_consume_results_transient_failure_at_budget_still_retries(
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
     assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 5
-    assert get_backoff_step(fake_redis_client, repo, pr_number) == 4
+    assert get_backoff_step(fake_redis_client, repo, pr_number) is None
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
     gh_mock.add_label.assert_not_called()
     gh_mock.post_comment.assert_not_called()
@@ -1131,8 +1163,8 @@ def test_consume_results_transient_failure_over_budget_keeps_retrying(
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
     assert get_transient_failure_count(fake_redis_client, repo, pr_number) == 6
-    # A backoff is still set (the step clamps rather than escalating).
-    assert get_backoff_step(fake_redis_client, repo, pr_number) is not None
+    # The first failure past the silent budget starts the backoff cadence.
+    assert get_backoff_step(fake_redis_client, repo, pr_number) == 0
     # Per-SHA attempts are cleared so the PR retries after the cooldown.
     assert get_attempt_count(fake_redis_client, repo, pr_number, head_sha) == 0
     gh_mock.add_label.assert_not_called()
@@ -1170,6 +1202,40 @@ def test_consume_results_transient_failure_clears_issue_attempts(
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
 
     # Transient failures are silent — no label or comment
+    gh_mock.add_issue_label.assert_not_called()
+    gh_mock.remove_issue_label.assert_not_called()
+    gh_mock.post_issue_comment.assert_not_called()
+
+
+def test_consume_results_duplicate_transient_does_not_clear_new_issue_attempt(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """A duplicate transient result must not erase a later issue attempt."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    issue_number = 62
+    repo = orchestrator_config.github.repo
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="task-issue-transient-dup",
+        branch="",
+        summary="[transient] Worker restarted mid-execution; task was not completed.",
+        duration=10,
+    )
+
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    logger = logging.getLogger("test")
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
     gh_mock.add_issue_label.assert_not_called()
     gh_mock.remove_issue_label.assert_not_called()
     gh_mock.post_issue_comment.assert_not_called()
@@ -2466,6 +2532,7 @@ def test_transient_result_backoff_records_result_snapshot_sha_without_attempt_ha
     gh_mock,
 ):
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    orchestrator_config.max_transient_failures = 0
 
     repo = orchestrator_config.github.repo
     pr_number = 210

@@ -2675,8 +2675,8 @@ class TestMultiProjectRouting:
 
         assert fake_redis_client.get("pending:pr:owner/repo:42") is None
 
-    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(self):
-        """No-result worker paths must clear PR attempts in the project namespace."""
+    def test_clear_task_attempt_reservation_deletes_pr_same_sha(self, fake_redis_client):
+        """No-result PR cleanup clears only the matching head SHA reservation."""
         task = Task.create(
             task_type=TaskType.FIX_PR,
             repo="owner/repo",
@@ -2685,14 +2685,68 @@ class TestMultiProjectRouting:
             resource_id=42,
             prompt="fix it",
             branch="feature",
+            snapshot_head_sha="sha-same",
+        )
+        key = "pr:owner/repo:42:attempts"
+        fake_redis_client.hset(key, "count", "1")
+        fake_redis_client.hset(key, "head_sha", "sha-same")
+
+        _clear_task_attempt_reservation(fake_redis_client, task)
+
+        assert fake_redis_client.hgetall(key) == {}
+
+    def test_clear_task_attempt_reservation_preserves_pr_different_sha(
+        self, fake_redis_client
+    ):
+        """Stale no-result PR cleanup must not clear a newer SHA reservation."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            snapshot_head_sha="sha-old",
+        )
+        key = "pr:owner/repo:42:attempts"
+        fake_redis_client.hset(key, "count", "1")
+        fake_redis_client.hset(key, "head_sha", "sha-new")
+
+        _clear_task_attempt_reservation(fake_redis_client, task)
+
+        assert fake_redis_client.hgetall(key) == {"count": "1", "head_sha": "sha-new"}
+
+    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(
+        self, fake_redis_client
+    ):
+        """PR cleanup compares and deletes attempts in the task project namespace."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="tok",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix it",
+            branch="feature",
+            snapshot_head_sha="sha-same",
             key_prefix="projectA",
         )
-        mock_redis = MagicMock()
+        key = "pr:owner/repo:42:attempts"
+        default_fq_key = "test:pr:owner/repo:42:attempts"
+        project_fq_key = "projectA:pr:owner/repo:42:attempts"
+        fake_redis_client.hset(key, "count", "1")
+        fake_redis_client.hset(key, "head_sha", "sha-same")
+        fake_redis_client.client.hset(project_fq_key, "count", "1")
+        fake_redis_client.client.hset(project_fq_key, "head_sha", "sha-same")
 
-        _clear_task_attempt_reservation(mock_redis, task)
+        _clear_task_attempt_reservation(fake_redis_client, task)
 
-        mock_redis.delete_raw.assert_called_once_with("projectA:pr:owner/repo:42:attempts")
-        mock_redis.delete.assert_not_called()
+        assert fake_redis_client.client.hgetall(project_fq_key) == {}
+        assert fake_redis_client.client.hgetall(default_fq_key) == {
+            "count": "1",
+            "head_sha": "sha-same",
+        }
 
     def test_clear_task_attempt_reservation_falls_back_to_default_for_issue(self):
         """No-result issue cleanup uses the normal prefixed delete path."""
@@ -2860,6 +2914,11 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
     # _publish_result_with_retry will call xadd_capped (or _raw for prefixed)
     mock_redis.xadd_capped.return_value = "1-0"
     mock_redis.xadd_capped_raw.return_value = "1-0"
+    mock_redis._prefixed.side_effect = lambda key: key
+    pipe = MagicMock()
+    mock_redis.client.pipeline.return_value = pipe
+    pipe.get.return_value = None
+    pipe.hget.return_value = sample_task.snapshot_head_sha
     logger = logging.getLogger("test.reject")
 
     # Exercise
@@ -2908,6 +2967,6 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
     # Must ACK so the entry is removed from the PEL
     mock_redis.xack_raw.assert_called_once()
 
-    # Must clear the attempt reservation. sample_task has no key_prefix, so
-    # _clear_task_attempt_reservation calls redis.delete (non-_raw) path.
-    assert mock_redis.delete.called, "early reject must clear the per-resource attempt reservation"
+    # Must clear the matching attempt reservation. PR cleanup is SHA-aware and
+    # uses WATCH/MULTI so a stale task cannot erase a newer SHA reservation.
+    pipe.delete.assert_called_with(f"pr:{sample_task.repo}:{sample_task.resource_id}:attempts")
