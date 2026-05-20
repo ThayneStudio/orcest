@@ -305,16 +305,16 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
 
 @pytest.mark.unit
 def test_build_env_claude_token_set():
-    """_build_env sets CLAUDE_CODE_OAUTH_TOKEN when claude_token is provided."""
-    env = _build_env("ghp_test", claude_token="sk-ant-oat01-test")
+    """_build_env sets the provider credential env var (defaults to Claude's) when set."""
+    env = _build_env("ghp_test", credential="sk-ant-oat01-test")
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
     assert env["GITHUB_TOKEN"] == "ghp_test"
 
 
 @pytest.mark.unit
 def test_build_env_claude_token_empty():
-    """_build_env does NOT set CLAUDE_CODE_OAUTH_TOKEN when claude_token is empty."""
-    env = _build_env("ghp_test", claude_token="")
+    """_build_env does NOT set the credential env var when credential is empty."""
+    env = _build_env("ghp_test", credential="")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
@@ -1375,3 +1375,62 @@ def test_parse_needs_human_detects_signal_in_assistant_message():
     flag, reason = _parse_needs_human(stream)
     assert flag is True
     assert reason == "the role rename needs a product decision"
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Grok provider executes via the local registry (no orchestrator
+# knowledge of binary or env var)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_run_claude_uses_grok_registry_entry(mock_popen, mocker, tmp_path):
+    """When a task carries provider='grok', the runner looks up the local
+    baked recipe and launches the correct binary with the correct env var.
+
+    This proves the 'worker with Grok support executes using the local registry'
+    requirement.  The subprocess receives the credential *only* via the
+    XAI_API_KEY environment variable (never on the command line).
+    """
+    mock_cls, mock_proc = mock_popen
+    lines = _make_stdout_lines("Grok did the thing.")
+    mock_proc.stdout = iter(lines)
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    mocker.patch(
+        "orcest.worker.claude_runner.time.monotonic",
+        side_effect=_monotonic_seq(100.0, 100.0, 100.0, 110.0, 110.0),
+    )
+
+    # Exercise the grok path explicitly (credential comes from Task.credential)
+    result = run_claude(
+        PROMPT,
+        tmp_path,
+        TOKEN,
+        max_retries=1,
+        provider="grok",
+        credential="xai-test-credential-123",
+    )
+
+    assert result.success is True
+    assert "Grok did the thing." in result.summary
+
+    # Verify the Popen call used the registry-driven binary + env injection
+    assert mock_cls.called
+    # Popen(cmd_list, cwd=..., env=..., ...) — cmd_list is first positional arg
+    call_args = mock_cls.call_args
+    cmd = call_args[0][0] if call_args[0] else call_args[1].get("args")
+    assert isinstance(cmd, (list, tuple)), f"expected cmd list, got {cmd}"
+    assert cmd[0] == "grok", f"expected 'grok' binary from registry, got {cmd[0]!r}"
+
+    # env is a kwarg
+    env = call_args[1].get("env", {})
+    assert env.get("XAI_API_KEY") == "xai-test-credential-123", (
+        "credential must be injected via XAI_API_KEY env only"
+    )
+
+    # Never on argv / command line
+    cmd_str = " ".join(map(str, cmd))
+    assert "xai-test-credential" not in cmd_str
+    assert "XAI_API_KEY" not in cmd_str

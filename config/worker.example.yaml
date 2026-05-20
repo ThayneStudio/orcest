@@ -10,11 +10,15 @@ worker_id: "worker-0"
 # Directory for temporary repo clones
 workspace_dir: "/tmp/orcest-workspaces"
 
-# Which task stream to subscribe to (tasks:claude, tasks:gemini, etc.)
+# Which task stream to subscribe to (tasks:claude, tasks:grok, etc.).
+# Each worker instance is typically specialized to one backend/stream, but the
+# local PROVIDER_REGISTRY (runner.py) can support dispatch for multiple providers
+# if you point the worker at a stream that carries heterogeneous tasks.
 backend: "claude"
 
 runner:
-  # Runner implementation (claude, noop, etc.)
+  # Runner implementation (claude, noop, etc.). The actual provider dispatch
+  # for a received Task uses the worker-local registry + generic CLI path.
   type: claude
   # Timeout in seconds for a single runner invocation
   timeout: 1800

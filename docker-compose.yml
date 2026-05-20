@@ -9,6 +9,9 @@ services:
       - GH_TOKEN=${GITHUB_TOKEN}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - CLAUDE_CODE_OAUTH_TOKENS=${CLAUDE_CODE_OAUTH_TOKENS:-}
+      # Additional providers (emitted by fleet generate_env_file when using provider_credentials)
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - GROK_API_KEY=${GROK_API_KEY:-}
       - ORCEST_REDIS_HOST=redis
       - ORCEST_REDIS_KEY_PREFIX
     restart: unless-stopped

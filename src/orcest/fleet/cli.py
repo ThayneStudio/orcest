@@ -765,6 +765,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             key_prefix=project_name,
             project_name=project_name,
             claude_tokens=org.claude_oauth_tokens,
+            provider_credentials=getattr(org, "provider_credentials", None),
         )
         config_yaml = generate_orchestrator_config(
             repo=repo,

@@ -521,6 +521,7 @@ def generate_env_file(
     project_name: str,
     claude_tokens: list[str] | None = None,
     claude_token: str = "",
+    provider_credentials: dict[str, list[str]] | None = None,
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
@@ -528,7 +529,17 @@ def generate_env_file(
     variable interpolation (``$`` references) or word splitting.
 
     Accepts either ``claude_tokens`` (list, preferred) or ``claude_token``
-    (single string, backward compat).
+    (single string, backward compat) for the claude provider, plus an
+    optional ``provider_credentials`` map for all providers (including
+    "claude" overrides). This generalizes the old claude-only behaviour
+    so that fleet can emit XAI_API_KEY, etc. for providers: entries that
+    rely on env-var fallback (see shared/config.py _parse_provider_entry
+    and rollout-multi-provider.md).
+
+    Canonical env var names for first credential:
+      claude -> CLAUDE_CODE_OAUTH_TOKEN (+ _TOKENS comma list)
+      grok   -> XAI_API_KEY (also accepts GROK_API_KEY in parsers)
+      other  -> <UPPER>_API_KEY
     """
     _validate_project_name(project_name)
     _validate_env_value(github_token, "github_token")
@@ -541,15 +552,41 @@ def generate_env_file(
         "ORCEST_IMAGE='orcest:latest'",
         f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'",
     ]
-    # Resolve token list: prefer explicit list, fall back to single string
+
+    # Build a unified map: provider -> list of credentials
+    creds: dict[str, list[str]] = {}
+    # Legacy claude path
     tokens = claude_tokens if claude_tokens else ([claude_token] if claude_token else [])
     if tokens:
         for i, t in enumerate(tokens):
             _validate_env_value(t, f"claude_tokens[{i}]")
-        # First token as CLAUDE_CODE_OAUTH_TOKEN (worker env fallback)
-        lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{tokens[0]}'")
-        # All tokens as comma-separated list for orchestrator round-robin
-        lines.append(f"CLAUDE_CODE_OAUTH_TOKENS='{','.join(tokens)}'")
+        creds["claude"] = tokens
+
+    # New generalized path (may override claude or add grok/others)
+    for prov, clist in (provider_credentials or {}).items():
+        if not clist:
+            continue
+        for i, t in enumerate(clist):
+            _validate_env_value(t, f"provider_credentials[{prov}][{i}]")
+        # merge: explicit provider_credentials wins for that provider
+        creds[prov] = clist
+
+    # Emit in deterministic order (claude first for diff stability, then others)
+    for prov in sorted(creds.keys(), key=lambda p: (0 if p == "claude" else 1, p)):
+        toks = creds[prov]
+        if prov == "claude":
+            lines.append(f"CLAUDE_CODE_OAUTH_TOKEN='{toks[0]}'")
+            lines.append(f"CLAUDE_CODE_OAUTH_TOKENS='{','.join(toks)}'")
+        else:
+            # Canonical env var name used by config fallback logic.
+            # Only the singular form is emitted: no parser, worker, or compose
+            # file currently reads a plural <PROV>_API_KEYS env var, so emitting
+            # one would just produce dead output in generated .env files. Add a
+            # reader (mirroring CLAUDE_CODE_OAUTH_TOKENS consumption in
+            # shared/config.py) before reintroducing the plural form.
+            env_name = {"grok": "XAI_API_KEY"}.get(prov, f"{prov.upper()}_API_KEY")
+            lines.append(f"{env_name}='{toks[0]}'")
+
     return "\n".join(lines) + "\n"
 
 

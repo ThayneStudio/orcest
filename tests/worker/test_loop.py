@@ -1119,6 +1119,15 @@ class TestRunWorker:
         mock_runner = MagicMock()
         mocker.patch("orcest.worker.loop.create_runner", return_value=mock_runner)
 
+        # The early multi-provider dispatch (Task 6) consults the local
+        # PROVIDER_REGISTRY + shutil.which() to decide whether the worker
+        # image can execute the task's provider.  CI runners do not have the
+        # `claude` (or `grok`) binary installed, so without this patch every
+        # run_worker test would early-reject and never reach the runner.
+        # Default to "supported" here; individual tests that exercise the
+        # unsupported path can override.
+        mocker.patch("orcest.worker.loop.get_unsupported_reason", return_value=None)
+
         # Patch Heartbeat to avoid spawning real daemon threads in unit tests.
         # Use the caller-supplied mock when provided so the dependency is explicit.
         if heartbeat_mock is None:
@@ -1653,6 +1662,10 @@ class TestRunWorker:
         assert "dead_letter_reason" in dl_fields
         assert "original_entry_id" in dl_fields
 
+        # Explicit redaction assertion at DL write site for worker integration test
+        assert dl_fields.get("token") == "[REDACTED]"
+        assert "test-token-loop" not in str(dl_fields)
+
         # The original entry must be ACKed so the main stream doesn't stall
         expected_fq_stream = f"{worker_config.redis.key_prefix}:tasks:{worker_config.backend}"
         mock_redis.xack_raw.assert_any_call(expected_fq_stream, CONSUMER_GROUP, "entry-1")
@@ -2068,7 +2081,82 @@ class TestDeadLetterTask:
         assert fields["tasks_stream"] == "tasks:claude"
         assert fields["delivery_count"] == "5"
 
+        # Explicit redaction assertion at the DL write site (code quality review)
+        assert fields.get("token") == "[REDACTED]", "secret token must be redacted in DL"
+        assert fields.get("credential") == "[REDACTED]"
+        assert fields.get("claude_token") == "[REDACTED]"
+        # sample secret must not appear
+        assert "test-token-loop" not in str(fields)
+
         mock_redis.xack_raw.assert_called_once_with("tasks:claude", CONSUMER_GROUP, "entry-42")
+
+    def test_dead_letter_redaction_regression_both_paths(self, local_worker_config):
+        """Regression test (Task 8): Task created with real secrets produces DL entries
+        containing only "[REDACTED]" for REDACTED_FIELDS in both _dead_letter_task and
+        result-publish exhaustion paths. No raw secret ever reaches the DL stream.
+        """
+        from orcest.shared.models import REDACTED_FIELDS, ResultStatus, Task, TaskResult, TaskType
+        from orcest.worker.loop import _dead_letter_task, _publish_result_with_retry
+
+        secret = "sk-regression-real-secret-XYZ123-should-never-appear"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/regrepo",
+            token=secret,
+            claude_token=secret,
+            credential=secret,
+            provider="claude",
+            model=None,
+            resource_type="pr",
+            resource_id=99,
+            prompt="test prompt for redaction",
+            branch="main",
+            base_branch="main",
+            key_prefix="",
+        )
+        mock_redis = MagicMock()
+
+        # Path 1: _dead_letter_task
+        _dead_letter_task(mock_redis, "tasks:claude", "e-1", task, 10, logging.getLogger("test"))
+        assert mock_redis.xadd_capped.called
+        dl1 = mock_redis.xadd_capped.call_args[0][1]
+        for f in REDACTED_FIELDS:
+            assert dl1.get(f) == "[REDACTED]", f"redact {f} path1"
+        assert secret not in str(dl1)
+
+        # Path 2: result publish exhaustion (force all result xadds to fail to reach DL)
+        mock_redis.reset_mock()
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="w1",
+            status=ResultStatus.FAILED,
+            branch="main",
+            summary="boom",
+            duration_seconds=1,
+            resource_type="pr",
+            resource_id=99,
+        )
+
+        def fail_results_only(stream, data, **kw):
+            if stream == RESULTS_STREAM:
+                raise RuntimeError("simulated result publish fail")
+            # allow DL xadd
+            return "0-0"
+
+        mock_redis.xadd_capped.side_effect = fail_results_only
+        _publish_result_with_retry(
+            mock_redis, result, task, logging.getLogger("test"), "tasks:claude", "e-2"
+        )
+        # find the DL call
+        dl2 = None
+        for call in mock_redis.xadd_capped.call_args_list:
+            if call[0][0] == DEAD_LETTER_STREAM:
+                dl2 = call[0][1]
+                break
+        assert dl2 is not None, "DL path2 exercised"
+        for f in REDACTED_FIELDS:
+            assert dl2.get(f) == "[REDACTED]", f"redact {f} path2"
+        assert secret not in str(dl2)
 
     def test_acks_even_when_dead_letter_publish_fails(self, local_worker_config, sample_task):
         """_dead_letter_task ACKs the original entry even if publishing to the
@@ -2273,6 +2361,12 @@ class TestPublishResultWithRetry:
         assert "dead_letter_reason" in dl_fields
         assert dl_fields["tasks_stream"] == "tasks:claude"
         assert dl_fields["original_entry_id"] == "entry-42"
+
+        # Explicit redaction assertion at the result-DL write site (code quality review)
+        assert dl_fields.get("token") == "[REDACTED]", (
+            "github token must be redacted even in result DL path"
+        )
+        assert "test-token-loop" not in str(dl_fields)
 
     def test_all_retries_fail_dead_letter_also_fails_returns_false(self, sample_task, caplog):
         """Returns False even when the dead-letter write itself raises."""
@@ -2746,3 +2840,74 @@ class TestMultiProjectRouting:
         lock = RedisLock(mock_redis, fq_lock_key, ttl=LOCK_TTL, owner="w1", raw_key=True)
 
         assert lock.key == "projectB:lock:issue:owner/repo:7"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: early graceful reject for unsupported providers (old image + new provider)
+# ---------------------------------------------------------------------------
+
+
+def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_config, sample_task):
+    """Directly exercising the reject helper: produces non-transient FAILED
+    whose summary contains the required 'rebake worker image' guidance,
+    publishes the result, acks the entry, and clears pending markers.
+    The real path (after from_dict in receive loop) guarantees we never
+    acquire locks or invoke the runner for unknown providers.
+    """
+    from orcest.worker.loop import _early_reject_unsupported_provider
+
+    mock_redis = MagicMock()
+    # _publish_result_with_retry will call xadd_capped (or _raw for prefixed)
+    mock_redis.xadd_capped.return_value = "1-0"
+    mock_redis.xadd_capped_raw.return_value = "1-0"
+    logger = logging.getLogger("test.reject")
+
+    # Exercise
+    _early_reject_unsupported_provider(
+        sample_task,
+        "grok",
+        local_worker_config,
+        mock_redis,
+        logger,
+        "tasks:claude",  # current_stream (fq or not doesn't matter for mock)
+        "0-0",
+    )
+
+    # Result must have been published to results stream with FAILED + rebake text
+    # AND must be permanent (no transient prefix / flag) so the orchestrator
+    # surfaces it instead of retrying indefinitely.
+    from orcest.shared.models import TRANSIENT_SUMMARY_PREFIX
+
+    published = False
+    for meth in (mock_redis.xadd_capped, mock_redis.xadd_capped_raw):
+        for call in getattr(meth, "call_args_list", []):
+            args = call[0]
+            if len(args) >= 2 and isinstance(args[1], dict):
+                d = args[1]
+                if (
+                    d.get("status") == "failed"
+                    and "rebake" in d.get("summary", "").lower()
+                    and "grok" in d.get("summary", "").lower()
+                ):
+                    # Lock in PERMANENT failure: summary must not carry the
+                    # transient wire-protocol prefix, and any explicit
+                    # serialized transient flag (now or future) must be falsy.
+                    assert not d.get("summary", "").startswith(TRANSIENT_SUMMARY_PREFIX), (
+                        "early reject must be permanent, not transient"
+                    )
+                    assert d.get("transient") in (
+                        None,
+                        "",
+                        "0",
+                        "false",
+                        "False",
+                    ), "early reject must not set transient flag"
+                    published = True
+    assert published, "Expected FAILED result with rebake text"
+
+    # Must ACK so the entry is removed from the PEL
+    mock_redis.xack_raw.assert_called_once()
+
+    # Must clear the attempt reservation. sample_task has no key_prefix, so
+    # _clear_task_attempt_reservation calls redis.delete (non-_raw) path.
+    assert mock_redis.delete.called, "early reject must clear the per-resource attempt reservation"
