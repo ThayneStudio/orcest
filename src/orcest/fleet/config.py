@@ -71,6 +71,12 @@ class OrgEntry:
 
     github_token: str = ""
     claude_oauth_tokens: list[str] = field(default_factory=list)
+    # Generalized multi-provider support (Task 10). Keys are provider names
+    # ("grok", etc.); values are lists of credentials (first is primary).
+    # These are emitted by generate_env_file into the orchestrator .env under
+    # the canonical env var for that provider (XAI_API_KEY, etc.) so that
+    # providers: entries with empty credential can fall back.
+    provider_credentials: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def claude_oauth_token(self) -> str:
@@ -250,9 +256,20 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         else:
             single = entry.get("claude_oauth_token", "")
             tokens = [single] if single else []
+        # provider_credentials: dict[str, list[str]]
+        raw_pc = entry.get("provider_credentials") or {}
+        if isinstance(raw_pc, dict):
+            provider_credentials = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in raw_pc.items()
+                if v
+            }
+        else:
+            provider_credentials = {}
         orgs[name] = OrgEntry(
             github_token=entry.get("github_token", ""),
             claude_oauth_tokens=tokens,
+            provider_credentials=provider_credentials,
         )
 
     projects: list[ProjectEntry] = []
@@ -324,6 +341,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             name: {
                 "github_token": org.github_token,
                 "claude_oauth_tokens": org.claude_oauth_tokens,
+                "provider_credentials": org.provider_credentials,
             }
             for name, org in config.orgs.items()
         },

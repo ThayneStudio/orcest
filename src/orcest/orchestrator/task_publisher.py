@@ -493,6 +493,12 @@ def publish_fix_task(
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
     skip_transient_rerun: bool = False,
+    # Lean multi-provider surface (Task 3 prep; defaults preserve all existing callers)
+    provider: str = "claude",
+    credential: str = "",
+    model: str | None = None,
+    # task_id for register-before-publish hardened failure handling (Task 5 wiring)
+    task_id: str | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -581,6 +587,11 @@ def publish_fix_task(
         snapshot_failed_checks=_check_fingerprints(pr_state.ci_failures),
         snapshot_review_thread_ids=_review_thread_ids(review_threads),
         snapshot_review_thread_fingerprints=_review_thread_fingerprints(review_threads),
+        # Forward lean provider fields (claude_token path still populates via internal sync)
+        provider=provider,
+        credential=credential,
+        model=model,
+        task_id=task_id,
     )
 
     published = _publish_and_notify(
@@ -609,6 +620,12 @@ def publish_followup_task(
     claude_token: str = "",
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
+    # Lean multi-provider surface (Task 3 prep)
+    provider: str = "claude",
+    credential: str = "",
+    model: str | None = None,
+    # task_id for register-before-publish hardened failure handling (Task 5 wiring)
+    task_id: str | None = None,
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -654,6 +671,10 @@ def publish_followup_task(
         decision_reason=DECISION_FOLLOWUP_THREADS,
         snapshot_review_thread_ids=_review_thread_ids(pr_state.review_threads),
         snapshot_review_thread_fingerprints=_review_thread_fingerprints(pr_state.review_threads),
+        provider=provider,
+        credential=credential,
+        model=model,
+        task_id=task_id,
     )
 
     published = _publish_and_notify(
@@ -684,6 +705,12 @@ def publish_rebase_task(
     key_prefix: str = "",
     proactive: bool = False,
     task_redis: RedisClient | None = None,
+    # Lean multi-provider surface (Task 3 prep)
+    provider: str = "claude",
+    credential: str = "",
+    model: str | None = None,
+    # task_id for register-before-publish hardened failure handling (Task 5 wiring)
+    task_id: str | None = None,
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -717,6 +744,10 @@ def publish_rebase_task(
         decision_reason=(
             DECISION_PROACTIVE_REBASE if proactive else DECISION_MERGE_CONFLICT_REBASE
         ),
+        provider=provider,
+        credential=credential,
+        model=model,
+        task_id=task_id,
     )
 
     published = _publish_and_notify(
@@ -746,6 +777,12 @@ def publish_issue_task(
     claude_token: str = "",
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
+    # Lean multi-provider surface (Task 3 prep)
+    provider: str = "claude",
+    credential: str = "",
+    model: str | None = None,
+    # task_id for register-before-publish hardened failure handling (Task 5 wiring)
+    task_id: str | None = None,
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -771,6 +808,10 @@ def publish_issue_task(
         branch=None,
         claude_token=claude_token,
         key_prefix=key_prefix,
+        provider=provider,
+        credential=credential,
+        model=model,
+        task_id=task_id,
     )
 
     published = _publish_issue_and_notify(

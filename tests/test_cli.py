@@ -369,7 +369,9 @@ def test_dead_letters_command_lists_tasks(fake_redis_client):
     output = buf.getvalue()
     assert "task-abc" in output
     assert "org/repo" in output
-    assert "tasks:claude" in output
+    # The sample uses a fully-qualified "test:tasks:claude" (to simulate prefixed original stream);
+    # rich table may truncate the column, so assert a distinguishing prefix that is always present.
+    assert "test:tas" in output
 
 
 def test_dead_letters_command_replay(fake_redis_client):
@@ -414,6 +416,39 @@ def test_dead_letters_command_replay_missing_tasks_stream(fake_redis_client):
     assert "skipping" in output
     assert "skipped (no tasks_stream field)" in output
     assert "error" not in output.lower()
+
+
+def test_dead_letters_command_replay_refuses_redacted_entries(fake_redis_client):
+    """--replay refuses (with clear guidance) when DL entry has redacted secrets.
+
+    Regression test for the Critical replay-safety issue after Task 2 redaction layer.
+    DL now stores only to_safe_dict() so replay must not blindly re-inject "[REDACTED]".
+    """
+    redacted = dict(_SAMPLE_DEAD_LETTER_FIELDS)
+    redacted["credential"] = "[REDACTED]"
+    redacted["claude_token"] = "[REDACTED]"
+    redacted["token"] = "[REDACTED]"
+    # Use sample's tasks_stream ("test:tasks:claude") -- raw replay path uses it directly.
+    fake_redis_client.xadd("dead-letter", redacted)
+
+    buf = io.StringIO()
+    with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
+        _dead_letters_command(fake_redis_client, replay=True, count=100)
+
+    output = buf.getvalue()
+    assert "Cannot replay" in output
+    assert "redacted" in output.lower()
+    assert "Replayed" not in output
+    assert "error" in output.lower()  # we count it as error
+
+    # No replayed task should have been xadd_raw'ed to the tasks stream
+    # (xread_after on the logical name will look in the prefixed stream used by sample)
+    replayed = fake_redis_client.xread_after("tasks:claude")
+    assert len(replayed) == 0, "redacted replay must not have injected a task"
+
+    # DL entry remains (we don't delete on refusal)
+    dl = fake_redis_client.xread_after("dead-letter")
+    assert len(dl) == 1
 
 
 def test_dead_letters_cli_redis_connection_failure(mocker, runner):

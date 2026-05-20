@@ -22,3 +22,29 @@ labels:
   blocked: "orcest:blocked"
   needs_human: "orcest:needs-human"
   ready: "orcest:ready"
+
+# Multi-provider configuration (Task 7+ Grok enablement and beyond)
+#
+# The orchestrator is completely agnostic to execution mechanics.
+# See docs/rollout-multi-provider.md and the Provider Registration & Invocation Boundary.
+# All execution recipes live in the worker image (PROVIDER_REGISTRY in runner.py).
+#
+# Example mixed providers list (top-level applies to all projects; can be
+# overridden or merged per-project under projects[].providers):
+#
+providers:
+  - provider: claude
+    credential: ""                 # falls back via _PROVIDER_ENV_CANDIDATES or CLAUDE_CODE_OAUTH_TOKEN
+    model: claude-3-5-sonnet-20241022
+  # - provider: grok
+  #   credential: ""               # falls back to XAI_API_KEY / GROK_API_KEY (see config.py)
+  #   model: grok-3-latest
+  #   extras:
+  #     temperature: "0.2"
+
+# Legacy single-claude path (still supported via synthesis into ProviderEntry):
+# claude_tokens: ["sk-ant-..."]     # or set CLAUDE_CODE_OAUTH_TOKENS in env
+#
+# Workers that have the CLI for a provider baked will execute tasks for it;
+# workers that do not will early-reject with permanent FAILED + "rebake the
+# worker image to include <provider> CLI". Safe mixed claude + new providers.

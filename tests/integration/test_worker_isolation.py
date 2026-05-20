@@ -77,6 +77,8 @@ class TestWorkerIsolation:
             on_stderr=None,
             abort_event=None,
             claude_token="",
+            provider="claude",
+            credential="",
         ):
             """Wrap NoopRunner.run to track concurrent executions."""
             with count_lock:
@@ -93,6 +95,8 @@ class TestWorkerIsolation:
                     on_stderr=on_stderr,
                     abort_event=abort_event,
                     claude_token=claude_token,
+                    provider=provider,
+                    credential=credential,
                 )
             finally:
                 with count_lock:
@@ -229,6 +233,8 @@ class TestWorkerIsolation:
             on_stderr=None,
             abort_event=None,
             claude_token="",
+            provider="claude",
+            credential="",
         ):
             with count_lock:
                 active_count["value"] += 1
@@ -244,6 +250,8 @@ class TestWorkerIsolation:
                     on_stderr=on_stderr,
                     abort_event=abort_event,
                     claude_token=claude_token,
+                    provider=provider,
+                    credential=credential,
                 )
             finally:
                 with count_lock:

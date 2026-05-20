@@ -23,6 +23,7 @@ export async function fetchSnapshot(maxResults = 20): Promise<SystemSnapshot> {
       attempt_counts: {},
       dead_letter_entries: [],
       queued_tasks: [],
+      provider_health: {},
     };
   }
 
@@ -42,6 +43,7 @@ export async function fetchSnapshot(maxResults = 20): Promise<SystemSnapshot> {
       attempt_counts: {},
       dead_letter_entries: [],
       queued_tasks: [],
+      provider_health: {},
     };
   }
 }
@@ -264,6 +266,31 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
     }
   }
 
+  // Provider health counters (Task 8) — project-scoped providers:{provider}:*
+  const providerHealth: Record<string, Record<string, number>> = {};
+  try {
+    const provKeys = await scanKeys("*:providers:*");
+    if (provKeys.length > 0) {
+      const ppipe = redis.pipeline();
+      for (const k of provKeys) ppipe.get(k);
+      const pres = await ppipe.exec();
+      for (let i = 0; i < provKeys.length; i++) {
+        const key = provKeys[i];
+        const val = (pres?.[i]?.[1] as string | null) || "0";
+        const m = key.match(/providers:([^:]+):(.+)$/);
+        if (m) {
+          const prov = m[1];
+          const metric = m[2];
+          if (!providerHealth[prov]) providerHealth[prov] = {};
+          const n = parseInt(val, 10);
+          if (!isNaN(n)) providerHealth[prov][metric] = n;
+        }
+      }
+    }
+  } catch {
+    // best effort
+  }
+
   return {
     redis_ok: true,
     fetched_at: new Date().toISOString(),
@@ -276,6 +303,7 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
     attempt_counts: attemptCounts,
     dead_letter_entries: deadLetterEntries,
     queued_tasks: queuedTasks,
+    provider_health: providerHealth,
   };
 }
 

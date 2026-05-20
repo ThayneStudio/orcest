@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from orcest.shared.providers import ProviderEntry
+
 
 @dataclass
 class RedisConfig:
@@ -38,6 +40,9 @@ class ProjectConfig:
     token: str  # GitHub PAT
     claude_tokens: list[str]  # Claude Code OAuth tokens (round-robin pool)
     key_prefix: str  # Redis key prefix for this project
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # New: multi-provider support. Legacy claude_tokens path synthesizes
+    # ProviderEntry objects with rich fields (cli_binary/env_var/extras) left None.
 
     @property
     def claude_token(self) -> str:
@@ -106,6 +111,9 @@ class OrchestratorConfig:
     # publish to this prefix so workers only need to read from one stream.
     # Defaults to redis.key_prefix for backward compatibility with single-project mode.
     task_key_prefix: str = ""
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # Top-level providers parsed from YAML (inherited deduped into each project's
+    # providers list, or used for the single legacy project in fallback mode).
 
 
 @dataclass
@@ -116,6 +124,8 @@ class WorkerConfig:
     backend: str = "claude"
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     ephemeral: bool = False  # When True, process one task and exit
+    providers: list[ProviderEntry] = field(default_factory=list)
+    # Optional provider declarations (for future multi-provider worker support)
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -168,6 +178,142 @@ def _safe_bool(value: Any, field_name: str) -> bool:
             "Use an unquoted YAML boolean (true or false)."
         )
     return value
+
+
+# Provider-specific env var name candidates (for credential fallback when omitted
+# from YAML). These are prepended to the generic {PROVIDER}_TOKEN/_API_KEY/_KEY
+# fallbacks. Adding a new provider here keeps the logic data-driven/future-proof
+# without touching the if-ladder.
+_PROVIDER_ENV_CANDIDATES: dict[str, list[str]] = {
+    "grok": ["XAI_API_KEY", "GROK_API_KEY", "XAI_API_TOKEN"],
+    "claude": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+}
+
+
+def _parse_provider_entry(raw: dict[str, Any], context: str) -> ProviderEntry:
+    """Parse a single provider dict from YAML into a ProviderEntry.
+
+    Supports all ProviderEntry fields (provider, credential, model, cli_binary,
+    env_var, extras). Credentials may come from the YAML value or fall back to
+    conventional environment variables for mixed YAML+env sources.
+
+    For the legacy claude_tokens path, callers synthesize entries directly with
+    rich fields (cli_binary, env_var, extras) explicitly left as None/defaults.
+    """
+    provider = _safe_str(raw.get("provider", ""), f"{context}.provider").strip()
+    if not provider:
+        raise ValueError(f"{context} must have a non-empty 'provider' field")
+
+    cred_raw = raw.get("credential")
+    if cred_raw is not None and str(cred_raw).strip():
+        credential = _safe_str(cred_raw, f"{context}.credential").strip()
+    else:
+        # Support mixed YAML + env var sources for new providers (e.g. grok via XAI_API_KEY)
+        candidates: list[str] = [
+            f"{provider.upper()}_TOKEN",
+            f"{provider.upper()}_API_KEY",
+            f"{provider.upper()}_KEY",
+        ]
+        specific = _PROVIDER_ENV_CANDIDATES.get(provider)
+        if specific:
+            candidates = specific + candidates
+
+        credential = ""
+        for cand in candidates:
+            v = os.environ.get(cand)
+            if v and str(v).strip():
+                credential = str(v).strip()
+                break
+
+        if not credential:
+            raise ValueError(
+                f"Provider entry at {context} for '{provider}' is missing 'credential' "
+                f"(not present in YAML and no matching env var among {candidates[:3]}... was set)"
+            )
+
+    model = raw.get("model")
+    if model is not None:
+        model = _safe_str(model, f"{context}.model").strip() or None
+
+    cli_binary = raw.get("cli_binary")
+    if cli_binary is not None:
+        cli_binary = _safe_str(cli_binary, f"{context}.cli_binary").strip() or None
+
+    env_var = raw.get("env_var")
+    if env_var is not None:
+        env_var = _safe_str(env_var, f"{context}.env_var").strip() or None
+
+    extras_raw = raw.get("extras", {}) or {}
+    if not isinstance(extras_raw, dict):
+        raise ValueError(
+            f"{context}.extras must be a YAML mapping, got {type(extras_raw).__name__}"
+        )
+    extras: dict[str, str] = {}
+    for k, v in extras_raw.items():
+        extras[_safe_str(k, f"{context}.extras key")] = _safe_str(v, f"{context}.extras value")
+
+    return ProviderEntry(
+        provider=provider,
+        credential=credential,
+        model=model,
+        cli_binary=cli_binary,
+        env_var=env_var,
+        extras=extras,
+    )
+
+
+def _parse_providers_list(raw: Any, context: str) -> list[ProviderEntry]:
+    """Validate and parse a providers: list (top-level, per-project, or worker).
+
+    - If raw is not a list (absent, null, or wrong type), returns [] (graceful).
+    - Each element must be a dict; otherwise raises ValueError with context like
+      "providers[0]" or "projects[0].providers[1]".
+    - Duplicates within the list (by .identity()) are dropped; first occurrence wins.
+      This implements the documented first-wins dedup policy for duplicate entries
+      inside any single providers: list in YAML.
+    """
+    if not isinstance(raw, list):
+        return []
+    providers: list[ProviderEntry] = []
+    seen: set[str] = set()
+    for j, e_raw in enumerate(raw):
+        if not isinstance(e_raw, dict):
+            raise ValueError(f"{context}[{j}] must be a YAML mapping, got {type(e_raw).__name__}")
+        entry = _parse_provider_entry(e_raw, f"{context}[{j}]")
+        ident = entry.identity()
+        if ident not in seen:
+            providers.append(entry)
+            seen.add(ident)
+    return providers
+
+
+def _dedup_merge(base: list[ProviderEntry], additions: list[ProviderEntry]) -> list[ProviderEntry]:
+    """Return base + additions, skipping any addition whose identity() is already present.
+
+    First occurrence (from base) wins. Used for top-level + per-project merge
+    and (via synth) for legacy claude dedup.
+    """
+    result = list(base)
+    existing = {e.identity() for e in result}
+    for e in additions:
+        ident = e.identity()
+        if ident not in existing:
+            result.append(e)
+            existing.add(ident)
+    return result
+
+
+def _with_legacy_claude_synthesis(
+    providers: list[ProviderEntry], claude_tokens: list[str]
+) -> list[ProviderEntry]:
+    """Append synthesized legacy claude entries (rich fields=None) for tokens not
+    already present by identity(). Reuses _dedup_merge so the two branches share
+    the synthesis+dedup logic.
+    """
+    synth: list[ProviderEntry] = [
+        ProviderEntry(provider="claude", credential=t, model=None) for t in claude_tokens
+    ]
+    return _dedup_merge(providers, synth)
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -274,6 +420,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         claude_token=_safe_str(claude_tokens[0], "github.claude_token") if claude_tokens else "",
     )
 
+    # Top-level providers list (new style; rich fields from YAML, creds via env fallback).
+    # Parsing helper dedups any duplicate entries inside the list (first occurrence wins).
+    top_providers = _parse_providers_list(raw.get("providers"), "providers")
+
     # Multi-project support: load projects list
     projects_raw = raw.get("projects")
     if projects_raw is not None and not isinstance(projects_raw, list):
@@ -295,6 +445,18 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 p_claude_tokens = [_safe_str(p["claude_token"], f"projects[{i}].claude_token")]
             else:
                 p_claude_tokens = list(claude_tokens)  # inherit from shared
+
+            # Per-project providers: parsed via helper (dedups intra-list), then
+            # dedup-merged with top-level (ensures no dup identity between top and
+            # per-project lists), then legacy claude synthesis (also deduped).
+            # This centralizes dedup and eliminates prior cross-dup and synth-dup.
+            p_providers_raw = p.get("providers")
+            per_project_providers = _parse_providers_list(
+                p_providers_raw, f"projects[{i}].providers"
+            )
+            p_providers = _dedup_merge(top_providers, per_project_providers)
+            p_providers = _with_legacy_claude_synthesis(p_providers, p_claude_tokens)
+
             projects.append(
                 ProjectConfig(
                     repo=_safe_str(p.get("repo", ""), f"projects[{i}].repo"),
@@ -305,6 +467,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                         p.get("key_prefix", redis_config.key_prefix),
                         f"projects[{i}].key_prefix",
                     ),
+                    providers=p_providers,
                 )
             )
         if len(projects) > 1:
@@ -329,12 +492,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 )
     else:
         # Backward compatibility: single-project mode
+        # Top providers (deduped by parse helper) + legacy claude synthesis via shared helper.
+        single_providers = _with_legacy_claude_synthesis(top_providers, claude_tokens)
+
         projects = [
             ProjectConfig(
                 repo=_safe_str(github_repo, "github.repo"),
                 token=_safe_str(github_token, "github.token"),
                 claude_tokens=list(claude_tokens),
                 key_prefix=_safe_str(redis_config.key_prefix, "redis.key_prefix"),
+                providers=single_providers,
             )
         ]
 
@@ -463,6 +630,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         delete_branch_on_merge=delete_branch_on_merge,
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
         task_key_prefix=task_key_prefix,
+        providers=top_providers,
     )
 
     # Validate required fields
@@ -535,6 +703,10 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     ephemeral_raw = raw.get("ephemeral", False)
     ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
 
+    # providers list (new multi-provider support; parsed for completeness).
+    # Uses shared helper which dedups intra-list duplicates (first wins).
+    worker_providers = _parse_providers_list(raw.get("providers"), "providers")
+
     config = WorkerConfig(
         redis=redis_config,
         worker_id=worker_id,
@@ -542,6 +714,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         backend=backend,
         runner=runner_config,
         ephemeral=ephemeral,
+        providers=worker_providers,
     )
 
     # Validate required fields

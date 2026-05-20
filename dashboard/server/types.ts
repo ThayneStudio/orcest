@@ -53,6 +53,7 @@ export interface SystemSnapshot {
   attempt_counts: Record<string, number>;
   dead_letter_entries: DeadLetterEntry[];
   queued_tasks: QueuedTask[];
+  provider_health?: Record<string, Record<string, number>>;  // Task 8 per-provider counters
 }
 
 export interface StuckTask {
