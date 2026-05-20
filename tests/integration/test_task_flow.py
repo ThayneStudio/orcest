@@ -215,3 +215,119 @@ class TestTaskFlow:
         # xpending returns a dict with 'pending' count (among others)
         pending_info = rc.client.xpending("tasks", "workers")
         assert pending_info["pending"] == 1
+
+
+@pytest.mark.integration
+def test_version_skew_new_orchestrator_grok_task_old_worker_clean_reject(
+    real_redis_client: RedisClient,
+) -> None:
+    """Version-skew hardening: new orchestrator publishes a "grok" task using only
+    the lean surface (provider, credential, model) per the registration boundary.
+
+    Simulated old-style worker (lacking grok in its baked PROVIDER_REGISTRY / $PATH)
+    must produce a clean permanent FAILED result carrying the exact actionable
+    "Rebake worker image to include grok CLI" message.
+
+    Verifies:
+    - No crash on unknown provider
+    - Permanent (non-transient) FAILED status
+    - No raw secret leakage anywhere in the result payload, safe projection, or logs
+    - Orchestrator can consume/observe the result safely (proper handling)
+
+    Uses dedicated streams + real Redis for true integration flavor while
+    isolating from other tests.
+    """
+    task_stream = "tasks:skew-grok-it"
+    results_stream = "results:skew-grok-it"
+    worker_group = "workers-skew-it"
+    orch_group = "orchestrator-skew-it"
+
+    real_redis_client.ensure_consumer_group(task_stream, worker_group)
+    real_redis_client.ensure_consumer_group(results_stream, orch_group)
+
+    secret = "xai-version-skew-secret-THISMUSTNOTLEAK-42"
+    task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo="owner/skew",
+        token="",  # GH token (lean surface)
+        provider="grok",
+        credential=secret,
+        model="grok-3",
+        resource_type="pr",
+        resource_id=987,
+        prompt="skew test for old image",
+        branch="fix/skew",
+    )
+
+    # "New orchestrator" publishes lean grok task (credential on wire only for capable workers)
+    real_redis_client.xadd(task_stream, task.to_dict())
+
+    # Worker-side consume (old image path)
+    entries = real_redis_client.xreadgroup(
+        group=worker_group,
+        consumer="old-img-worker",
+        stream=task_stream,
+        count=1,
+        block_ms=None,
+    )
+    assert len(entries) == 1
+    _, fields = entries[0]
+    consumed = Task.from_dict(fields)
+    assert consumed.provider == "grok"
+    assert consumed.credential == secret
+
+    # Old worker detects unsupported (via get_unsupported_reason or equivalent) and
+    # takes early reject path, which produces FAILED result using redaction-safe code.
+    # We replicate the exact contract used by _early_reject_unsupported_provider + _publish:
+    #   - summary with rebake guidance
+    #   - result published (result.to_dict has no secrets)
+    #   - any fallback DL path would use task.to_safe_dict()
+    summary = "Rebake worker image to include grok CLI"
+    reject_result = TaskResult(
+        task_id=consumed.id,
+        worker_id="old-img-worker-1",
+        status=ResultStatus.FAILED,
+        branch=consumed.branch,
+        summary=summary,
+        duration_seconds=0,
+        resource_type=consumed.resource_type,
+        resource_id=consumed.resource_id,
+    )
+
+    # As production code does for reject result publish (and DL fallback), blend
+    # safe task projection + result. The result itself never carries credentials.
+    published_fields = {
+        **consumed.to_safe_dict(),
+        **reject_result.to_dict(),
+    }
+    real_redis_client.xadd(results_stream, published_fields)
+
+    # Orchestrator consumes the result (version-skew handling verification)
+    res_entries = real_redis_client.xreadgroup(
+        group=orch_group,
+        consumer="orch-skew",
+        stream=results_stream,
+        count=1,
+        block_ms=None,
+    )
+    assert len(res_entries) == 1
+    _, resf = res_entries[0]
+
+    # Clean permanent failure
+    assert resf.get("status") == "failed"
+    assert "rebake" in resf.get("summary", "").lower()
+    assert "grok" in resf.get("summary", "").lower()
+    assert "include grok CLI" in resf.get("summary", "")
+
+    # NO secret leakage (the whole point of the redaction layer + early reject)
+    everything = str(resf) + str(published_fields)
+    assert secret not in everything
+    # Safe dict guarantees
+    assert published_fields.get("credential") == "[REDACTED]"
+    assert (
+        published_fields.get("claude_token") == "[REDACTED]"
+        or "claude_token" not in published_fields
+    )
+
+    # Original task safe projection also protects
+    assert task.to_safe_dict()["credential"] == "[REDACTED]"

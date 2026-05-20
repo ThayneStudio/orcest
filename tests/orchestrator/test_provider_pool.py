@@ -290,3 +290,90 @@ def test_legacy_shim_methods_exist_for_migration():
     # mark with old kwarg name
     pool.mark_exhausted("shim-task", cooldown_until=datetime.now(timezone.utc) + timedelta(minutes=10))
     assert pool.next_token() is None
+
+
+def test_high_concurrency_mixed_providers_with_exhaustion_and_redaction():
+    """High-concurrency (16+ threads) stress with mixed providers (claude + grok),
+    concurrent exhaustion simulation, round-robin under contention, duplicate-safe
+    handling, and strict redaction invariants (no raw credentials in identity(),
+    repr(), exceptions, or any observable state).
+
+    Validates the Provider Registration & Invocation Boundary: only lean surface
+    (provider/credential/model/identity()) is ever used internally; execution
+    details stay worker-side.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    claude1 = ProviderEntry(provider="claude", credential="claude-secret-cc01")
+    claude2 = ProviderEntry(provider="claude", credential="claude-secret-cc02")
+    grok1 = ProviderEntry(provider="grok", credential="grok-secret-gg01", model="grok-3")
+    entries = [claude1, grok1, claude2]
+    pool = ProviderPool(entries)
+
+    errors: list[str] = []
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(25):
+                e = pool.next_entry()
+                if e is not None:
+                    # Redaction: identity and repr must never contain raw secret
+                    ident = e.identity()
+                    r = repr(e)
+                    assert "claude-secret" not in ident
+                    assert "grok-secret" not in ident
+                    assert "secret" not in ident.lower()
+                    assert "claude-secret" not in r
+                    assert "grok-secret" not in r
+
+                    tid = f"mix-{threading.get_ident()}-{n}-{i}"
+                    pool.register_task(tid, e)
+                    time.sleep(0.0003)
+                    # Mix of complete + occasional exhaustion to create contention
+                    if (n + i) % 7 == 0:
+                        resets = datetime.now(timezone.utc) + timedelta(seconds=0.15)
+                        pool.mark_exhausted(tid, resets_at=resets)
+                    else:
+                        pool.task_completed(tid)
+                    with lock:
+                        seen.append(e.provider)
+                else:
+                    time.sleep(0.0005)
+        except Exception as exc:
+            with lock:
+                err_str = str(exc)
+                errors.append(err_str)
+                # Even exception strings must not leak secrets (defensive)
+                assert "claude-secret" not in err_str
+                assert "grok-secret" not in err_str
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8.0)
+
+    assert not errors, f"Concurrent mixed-provider ops raised: {errors}"
+
+    # Both providers must have been handed out under load
+    seen_set = set(seen)
+    assert "claude" in seen_set and "grok" in seen_set, f"Missing providers in mix: {seen_set}"
+
+    # After short cooldowns expire, pool must become available again (recovery)
+    deadline = time.time() + 3.0
+    recovered = False
+    while time.time() < deadline:
+        if pool.next_entry() is not None:
+            recovered = True
+            break
+        time.sleep(0.02)
+    assert recovered, "Mixed pool did not recover after concurrent partial exhaustion"
+
+    # Final sanity: no raw secrets in pool repr or any identity
+    pool_repr = repr(pool)
+    assert "claude-secret" not in pool_repr
+    assert "grok-secret" not in pool_repr
+    for e in entries:
+        assert "secret" not in e.identity()
