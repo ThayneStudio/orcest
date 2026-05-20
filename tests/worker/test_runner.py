@@ -88,6 +88,7 @@ def test_create_runner_noop_nan_duration_raises() -> None:
 # Task 7: Grok registry entries + early-reject behaviour for unsupported Grok
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.unit
 def test_provider_registry_contains_grok() -> None:
     """PROVIDER_REGISTRY (worker-local) must contain the 'grok' entry for Task 7."""
@@ -130,19 +131,3 @@ def test_grok_without_support_reports_missing_binary(monkeypatch) -> None:
     assert reason is not None
     assert 'missing binary "grok"' in reason
     assert "grok" in reason
-
-
-@pytest.mark.unit
-def test_grok_reject_message_uses_rebake_guidance() -> None:
-    """The early-reject helper (exercised for grok tasks) always emits the
-    actionable 'Rebake worker image to include <provider> CLI' text.
-
-    The existing integration of this path (unknown or missing binary) is
-    covered by test_early_reject_unsupported_provider_publishes_clean_failed
-    in test_loop.py which explicitly drives a 'grok' provider name.
-    """
-    # This test is a marker + documentation that the Grok-specific early
-    # reject contract is exercised by the shared helper test.
-    # No additional behaviour to assert here; the helper hard-codes the
-    # rebake wording for any provider name.
-    assert True

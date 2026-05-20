@@ -217,13 +217,11 @@ def test_task_new_provider_credential_model_fields_with_defaults():
     assert task_ct.model is None
 
     # Explicit new-style creation (for future providers)
-    task_grok = _make_task(
-        provider="grok", credential="xai-secret-abc987", model="grok-3-latest"
-    )
+    task_grok = _make_task(provider="grok", credential="xai-secret-abc987", model="grok-3-latest")
     assert task_grok.provider == "grok"
     assert task_grok.credential == "xai-secret-abc987"
     assert task_grok.model == "grok-3-latest"
-    # claude_token remains empty for non-claude (or could be populated; current design keeps separate)
+    # claude_token remains empty for non-claude (current design keeps them separate)
     assert task_grok.claude_token == ""
 
 
@@ -327,8 +325,12 @@ def test_task_from_dict_explicit_empty_credential_takes_precedence():
         "model": "",
     }
     task = Task.from_dict(payload)
-    assert task.credential == "", "explicit empty credential must be kept (not replaced by claude_token)"
-    assert task.claude_token == "sk-claude-present", "claude_token from input preserved when cred explicit empty"
+    assert task.credential == "", (
+        "explicit empty credential must be kept (not replaced by claude_token)"
+    )
+    assert task.claude_token == "sk-claude-present", (
+        "claude_token from input preserved when cred explicit empty"
+    )
     assert task.provider == "claude"
 
 

@@ -2363,7 +2363,9 @@ class TestPublishResultWithRetry:
         assert dl_fields["original_entry_id"] == "entry-42"
 
         # Explicit redaction assertion at the result-DL write site (code quality review)
-        assert dl_fields.get("token") == "[REDACTED]", "github token must be redacted even in result DL path"
+        assert dl_fields.get("token") == "[REDACTED]", (
+            "github token must be redacted even in result DL path"
+        )
         assert "test-token-loop" not in str(dl_fields)
 
     def test_all_retries_fail_dead_letter_also_fails_returns_false(self, sample_task, caplog):
@@ -2844,9 +2846,8 @@ class TestMultiProjectRouting:
 # Task 6: early graceful reject for unsupported providers (old image + new provider)
 # ---------------------------------------------------------------------------
 
-def test_early_reject_unsupported_provider_publishes_clean_failed(
-    local_worker_config, sample_task
-):
+
+def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_config, sample_task):
     """Directly exercising the reject helper: produces non-transient FAILED
     whose summary contains the required 'rebake worker image' guidance,
     publishes the result, acks the entry, and clears pending markers.
@@ -2890,7 +2891,6 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(
     # Must ACK so the entry is removed from the PEL
     mock_redis.xack_raw.assert_called_once()
 
-    # Must clear the pending marker and attempt reservation (non-fatal if not)
-    # (the helper always calls the two clear helpers)
-    # "or True" keeps test from being brittle on internal clear impl
-    assert mock_redis.delete.called or mock_redis.delete_raw.called or True
+    # Must clear the attempt reservation. sample_task has no key_prefix, so
+    # _clear_task_attempt_reservation calls redis.delete (non-_raw) path.
+    assert mock_redis.delete.called, "early reject must clear the per-resource attempt reservation"

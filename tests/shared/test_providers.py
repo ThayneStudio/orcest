@@ -20,7 +20,7 @@ def test_provider_entry_rich_fields_and_redaction():
         model="grok-3-latest",
         cli_binary="grok",
         env_var="XAI_API_KEY",
-        extras={"temperature": "0.2"}
+        extras={"temperature": "0.2"},
     )
     assert e.effective_binary == "grok"
     assert e.effective_env_var == "XAI_API_KEY"

@@ -3376,9 +3376,7 @@ def test_full_multi_provider_flow_exhaust_one_continue_on_other(
     for i, ge in enumerate([g1, g2]):
         tid = f"g-exh-{i}"
         pool.register_task(tid, ge)
-        pool.mark_exhausted(
-            tid, resets_at=datetime.now(timezone.utc) + timedelta(hours=1)
-        )
+        pool.mark_exhausted(tid, resets_at=datetime.now(timezone.utc) + timedelta(hours=1))
 
     # Only claude should remain available (grok fully benched independently)
     assert pool.available_count == 1

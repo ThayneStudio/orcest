@@ -68,9 +68,7 @@ class ProviderPool:
         self._counter: int = 0
         self._cooldowns: dict[str, datetime] = {}  # identity -> UTC expiry
         self._task_identities: dict[str, str] = {}  # task_id -> identity
-        self._identity_to_entry: dict[str, ProviderEntry] = {
-            e.identity(): e for e in entries
-        }
+        self._identity_to_entry: dict[str, ProviderEntry] = {e.identity(): e for e in entries}
         self._lock = threading.RLock()
 
     @classmethod

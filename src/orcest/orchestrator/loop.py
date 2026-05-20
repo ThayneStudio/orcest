@@ -2120,7 +2120,11 @@ def _handle_result(
 
         logger.info("Result comment: %s...", body[:100])
 
-    # Clean up token pool tracking. mark_exhausted already pops from _task_tokens
-    # for exhausted results, so task_completed is a no-op in that case (safe to call).
+    # Clean up ProviderPool tracking. This unconditional trailing call is the
+    # safety net guaranteeing the UUID -> identity mapping in
+    # ProviderPool._task_identities does NOT leak for any non-USAGE_EXHAUSTED,
+    # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED, BLOCKED,
+    # transient, etc.). mark_exhausted already pops the mapping for exhausted
+    # results, so task_completed is a no-op there (safe to call).
     if token_pool is not None:
         token_pool.task_completed(result.task_id)

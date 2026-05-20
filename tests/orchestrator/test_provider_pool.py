@@ -128,7 +128,7 @@ def test_task_completed_cleans_mapping():
 
 
 def test_register_before_publish_contract_and_cleanup_on_failure():
-    """register immediately after next, then on publish failure call task_completed to release mapping."""
+    """register immediately after next, then on publish failure call task_completed to release."""
     pool = ProviderPool(_make_entries(1))
     e = pool.next_entry()
     assert e is not None
@@ -176,7 +176,7 @@ def test_mixed_providers_independent_exhaustion():
 
 
 def test_concurrent_next_under_contention():
-    """Many threads calling next_entry concurrently must not crash and must respect round-robin + cooldowns."""
+    """Many threads calling next_entry concurrently must not crash and respect RR + cooldowns."""
     entries = _make_entries(3)
     pool = ProviderPool(entries)
     errors = []
@@ -277,8 +277,9 @@ def test_duplicate_identities_rejected():
 
 
 def test_legacy_shim_methods_exist_for_migration():
-    """ProviderPool must provide next_token / register_task(str) / get_task_token / mark with cooldown_until
-    so that existing call sites in loop.py continue to work during the phased port."""
+    """ProviderPool must provide next_token / register_task(str) / get_task_token / mark
+    with cooldown_until so existing call sites in loop.py continue to work during the
+    phased port."""
     pool = ProviderPool.from_claude_tokens(["shim-tok"])
     # next_token shim
     tok = pool.next_token()
@@ -288,7 +289,9 @@ def test_legacy_shim_methods_exist_for_migration():
     # get_task_token
     assert pool.get_task_token("shim-task") == "shim-tok"
     # mark with old kwarg name
-    pool.mark_exhausted("shim-task", cooldown_until=datetime.now(timezone.utc) + timedelta(minutes=10))
+    pool.mark_exhausted(
+        "shim-task", cooldown_until=datetime.now(timezone.utc) + timedelta(minutes=10)
+    )
     assert pool.next_token() is None
 
 

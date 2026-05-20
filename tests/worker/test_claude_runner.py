@@ -305,7 +305,7 @@ def test_run_claude_env_allowlist(mock_popen, monkeypatch, mocker, tmp_path):
 
 @pytest.mark.unit
 def test_build_env_claude_token_set():
-    """_build_env sets the provider credential env var (defaults to Claude's) when credential provided."""
+    """_build_env sets the provider credential env var (defaults to Claude's) when set."""
     env = _build_env("ghp_test", credential="sk-ant-oat01-test")
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
     assert env["GITHUB_TOKEN"] == "ghp_test"
@@ -1426,9 +1426,9 @@ def test_run_claude_uses_grok_registry_entry(mock_popen, mocker, tmp_path):
 
     # env is a kwarg
     env = call_args[1].get("env", {})
-    assert (
-        env.get("XAI_API_KEY") == "xai-test-credential-123"
-    ), "credential must be injected via XAI_API_KEY env only"
+    assert env.get("XAI_API_KEY") == "xai-test-credential-123", (
+        "credential must be injected via XAI_API_KEY env only"
+    )
 
     # Never on argv / command line
     cmd_str = " ".join(map(str, cmd))

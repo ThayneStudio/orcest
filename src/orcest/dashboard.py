@@ -216,7 +216,16 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
             except (ValueError, TypeError):
                 pass
 
-    # Provider health counters (Task 8)
+    # Provider health counters (Task 8).
+    #
+    # NOTE on the scan pattern: RedisClient.scan_iter(match=...) auto-prefixes
+    # the pattern with this client's bound project prefix and strips that prefix
+    # from the returned keys (see RedisClient.scan_iter). So "providers:*" here
+    # matches `{prefix}:providers:*` in the raw Redis keyspace and returns
+    # already-prefix-stripped keys like "providers:claude:rebake_required_failures".
+    # This is intentionally single-project (this CLI binds to one --prefix); the
+    # TypeScript dashboard uses "*:providers:*" because that runtime operates
+    # multi-project on the raw keyspace without auto-prefixing.
     provider_health: dict[str, dict[str, int]] = {}
     try:
         prov_keys = redis.scan_iter(match="providers:*")

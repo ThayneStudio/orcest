@@ -34,9 +34,7 @@ DEAD_LETTER_METADATA_FIELDS = frozenset(
 REDACTED_FIELDS = frozenset({"token", "claude_token", "credential"})
 
 
-def _sync_claude_for_provider(
-    provider: str, credential: str, claude_token: str
-) -> tuple[str, str]:
+def _sync_claude_for_provider(provider: str, credential: str, claude_token: str) -> tuple[str, str]:
     """Centralize the transition-era 'Claude provider sync' logic.
 
     For provider=="claude", ensure both credential and claude_token carry the
@@ -281,6 +279,7 @@ class Task:
         operators can still correlate "which token was involved" in logs without
         exposing the full secret.
         """
+
         def _mask(val: str) -> str:
             return (val[:4] + "...") if val else ""
 

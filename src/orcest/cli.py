@@ -376,9 +376,7 @@ def _dead_letters_command(redis: RedisClient, *, replay: bool, count: int) -> No
 
         # Critical safety for post-Task-2 redaction...
         if any(task_fields.get(f) == "[REDACTED]" for f in REDACTED_FIELDS):
-            redacted_secrets = [
-                f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"
-            ]
+            redacted_secrets = [f for f in REDACTED_FIELDS if task_fields.get(f) == "[REDACTED]"]
             console.print(
                 f"[red]Cannot replay entry {entry_id}: contains redacted values for "
                 f"{redacted_secrets}. Original credentials are not persisted in "

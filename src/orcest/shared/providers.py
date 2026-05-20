@@ -6,8 +6,9 @@ and guarantees no secret leakage via redacted __repr__ and non-secret identity()
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+
 import hashlib
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -37,4 +38,7 @@ class ProviderEntry:
 
     def __repr__(self) -> str:
         cred = self.credential[:4] + "..." if self.credential else ""
-        return f"ProviderEntry(provider={self.provider!r}, credential={cred!r}, model={self.model!r}, ...)"
+        return (
+            f"ProviderEntry(provider={self.provider!r}, credential={cred!r}, "
+            f"model={self.model!r}, ...)"
+        )
