@@ -887,12 +887,13 @@ def _publish_result_with_retry(
         exc_info=last_exc,
     )
     try:
-        # Use safe projection so credentials never land in the dead-letter stream
-        # (systematic redaction layer, Task 2 / security review). Result dicts
-        # contain no secrets, only the task part is redacted.
+        # Use safe projections so credentials never land in the dead-letter
+        # stream (a persistent, human-inspected recovery stream). The task
+        # carries the provider credential; the result may carry a rotated
+        # OAuth blob (credential_update) — both are redacted here.
         dl_fields = {
             **task.to_safe_dict(),
-            **result.to_dict(),
+            **result.to_safe_dict(),
             "dead_letter_reason": (
                 f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
             ),

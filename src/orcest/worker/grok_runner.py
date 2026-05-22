@@ -144,8 +144,11 @@ class GrokRunner(_BaseCliRunner):
                 grok_dir = home_dir / ".grok"
                 grok_dir.mkdir(parents=True, exist_ok=True)
                 auth_path = grok_dir / "auth.json"
+                # Create at 0o600 atomically — no world-readable window for the
+                # refresh token. fchmod also narrows a pre-existing looser file.
                 fd = os.open(str(auth_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as fh:
+                    os.fchmod(fh.fileno(), 0o600)
                     fh.write(blob)
                 return CredentialContext(extra_env={}, watch_path=auth_path)
         if credential:

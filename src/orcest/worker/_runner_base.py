@@ -55,6 +55,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 from orcest.worker.runner import RunnerResult
 
@@ -507,12 +508,14 @@ class _BaseCliRunner(ABC):
     driver (see module docstring).
     """
 
-    # Extra safe env keys to forward (CLI-specific routing flags).
-    extra_env_keys: set[str] = set()
+    # Extra safe env keys to forward (CLI-specific routing flags). ClassVar so
+    # type-checkers flag accidental ``self.extra_env_keys.add(...)`` mutation
+    # (which would silently corrupt the shared base-class set for all runners).
+    extra_env_keys: ClassVar[set[str]] = set()
 
     # When True, the prompt is piped on stdin instead of placed in argv
     # (Codex's ``codex exec ... -``). Claude/Grok use ``-p <prompt>`` on argv.
-    prompt_via_stdin: bool = False
+    prompt_via_stdin: ClassVar[bool] = False
 
     def __init__(
         self,
