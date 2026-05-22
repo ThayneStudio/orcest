@@ -1,0 +1,107 @@
+{"type":"thought","data":"The"}
+{"type":"thought","data":" task"}
+{"type":"thought","data":" is"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"Create"}
+{"type":"thought","data":" a"}
+{"type":"thought","data":" file"}
+{"type":"thought","data":" called"}
+{"type":"thought","data":" hello"}
+{"type":"thought","data":".txt"}
+{"type":"thought","data":" containing"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" single"}
+{"type":"thought","data":" word"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" world"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" Then"}
+{"type":"thought","data":" tell"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" you"}
+{"type":"thought","data":" are"}
+{"type":"thought","data":" done"}
+{"type":"thought","data":".\"\n"}
+{"type":"thought","data":"The"}
+{"type":"thought","data":" file"}
+{"type":"thought","data":" has"}
+{"type":"thought","data":" been"}
+{"type":"thought","data":" created"}
+{"type":"thought","data":" successfully"}
+{"type":"thought","data":" at"}
+{"type":"thought","data":" /"}
+{"type":"thought","data":"tmp"}
+{"type":"thought","data":"/g"}
+{"type":"thought","data":"rok"}
+{"type":"thought","data":"-test"}
+{"type":"thought","data":"/hello"}
+{"type":"thought","data":".txt"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" content"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"world"}
+{"type":"thought","data":"\".\n"}
+{"type":"thought","data":"The"}
+{"type":"thought","data":" read"}
+{"type":"thought","data":"_file"}
+{"type":"thought","data":" says"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"File"}
+{"type":"thought","data":" unchanged"}
+{"type":"thought","data":" since"}
+{"type":"thought","data":" last"}
+{"type":"thought","data":" read"}
+{"type":"thought","data":".\""}
+{"type":"thought","data":" But"}
+{"type":"thought","data":" I"}
+{"type":"thought","data":" didn't"}
+{"type":"thought","data":" read"}
+{"type":"thought","data":" it"}
+{"type":"thought","data":" before"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" The"}
+{"type":"thought","data":" write"}
+{"type":"thought","data":" tool"}
+{"type":"thought","data":" might"}
+{"type":"thought","data":" have"}
+{"type":"thought","data":" implicitly"}
+{"type":"thought","data":" read"}
+{"type":"thought","data":" or"}
+{"type":"thought","data":" something"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" Anyway"}
+{"type":"thought","data":","}
+{"type":"thought","data":" it"}
+{"type":"thought","data":" confirms"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" content"}
+{"type":"thought","data":" is"}
+{"type":"thought","data":" current"}
+{"type":"thought","data":".\n"}
+{"type":"text","data":"Done"}
+{"type":"text","data":"."}
+{"type":"text","data":" The"}
+{"type":"text","data":" file"}
+{"type":"text","data":" ["}
+{"type":"text","data":"hello"}
+{"type":"text","data":".txt"}
+{"type":"text","data":"](/"}
+{"type":"text","data":"tmp"}
+{"type":"text","data":"/g"}
+{"type":"text","data":"rok"}
+{"type":"text","data":"-test"}
+{"type":"text","data":"/hello"}
+{"type":"text","data":".txt"}
+{"type":"text","data":")"}
+{"type":"text","data":" has"}
+{"type":"text","data":" been"}
+{"type":"text","data":" created"}
+{"type":"text","data":" containing"}
+{"type":"text","data":" the"}
+{"type":"text","data":" single"}
+{"type":"text","data":" word"}
+{"type":"text","data":" \""}
+{"type":"text","data":"world"}
+{"type":"text","data":"\"."}
+{"type":"end","stopReason":"EndTurn","sessionId":"019e5048-7cfd-7281-a5d1-cb2de556360d","requestId":"37ea138b-54a5-4b67-9aec-d14fc2f4ee69"}

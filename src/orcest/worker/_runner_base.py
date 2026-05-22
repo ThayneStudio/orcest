@@ -1,43 +1,45 @@
 """Generic CLI runner base.
 
-Hosts the small pieces of the worker's execution contract that every provider
-shares: the ``NEEDS_HUMAN:`` worker convention, the env allowlist and
-credential injection helper, and the abstract ``_BaseCliRunner`` ABC that
-declares the hooks each per-provider Runner overrides.
+Hosts the shared worker execution contract: the ``NEEDS_HUMAN:`` convention,
+env construction, credential preparation, and a provider-agnostic subprocess
+driver (``_run_cli_agent``) with watchdog timeout, abort-on-lock-loss, and
+retry-with-backoff. Per-provider Runners subclass ``_BaseCliRunner`` and
+implement a small set of hooks; ``_BaseCliRunner.run`` drives them.
 
-Subprocess driving (Popen, watchdog, abort, retry) currently lives in
-``claude_runner.py`` alongside Claude's parsers. As additional providers land
-(PR 2: Codex, PR 3: Grok production) and share enough subprocess plumbing, a
-shared ``_run_one_subprocess_attempt`` helper will be lifted here. PR 1
-deliberately stops short of that extraction so the existing Claude tests can
-keep their tight coupling to ``run_claude``'s monotonic-call sequencing.
+Drift note: ``claude_runner.run_claude`` predates this driver and retains its
+own copy of the watchdog/retry loop (its test suite mocks that loop's
+internals directly). ``ClaudeRunner`` therefore overrides ``run`` to keep
+using ``run_claude``. ``_run_cli_agent`` is the canonical driver for all *new*
+runners (GrokRunner, future CodexRunner); ClaudeRunner should migrate onto it
+once PR #537 lands and its tests can be repointed. Keep the two loops in sync
+until then.
 
-Per-provider Runners subclass ``_BaseCliRunner`` and override:
+Hooks each per-provider Runner overrides:
     build_argv(binary, prompt, model, work_dir) -> list[str]
     extract_summary(stdout) -> str
     extract_agent_text(stdout) -> str   # feeds the shared _check_needs_human
     detect_exhaustion(stdout, stderr) -> tuple[bool, int]
     detect_overload(stdout, stderr) -> bool
-
-Class-attribute hooks:
-    prompt_via_stdin: bool  # True ⇒ the prompt is piped on stdin instead of
-                             # appearing in argv. Codex uses this; Claude/Grok
-                             # take ``-p <prompt>`` on argv.
+    prepare_credential(credential, work_dir, home_dir, env_var_name) -> CredentialContext
+    extract_credential_update(watch_path, original) -> str | None
 
 NEEDS_HUMAN contract: ``extract_agent_text`` returns only agent-authored text
-that the shared ``NEEDS_HUMAN:`` regex may scan. For CLIs whose output echoes
-the prompt back (e.g. Claude's stream-json ``user`` messages), the override
-MUST strip that echo — otherwise every task will match the prompt's own
-example ``NEEDS_HUMAN: <reason>`` line. For CLIs that take the prompt on
-stdin and never echo it (Codex), no stripping is needed.
+that the shared ``NEEDS_HUMAN:`` regex may scan. CLIs whose output echoes the
+prompt (Claude's stream-json ``user`` messages) MUST strip that echo;
+CLIs that take the prompt on stdin / never echo it (Codex, Grok) need not.
 
-Exhaustion-first dispatch invariant: callers check ``detect_exhaustion``
-and ``detect_overload`` BEFORE inspecting the exit code, because some CLIs
-(Claude) exit non-zero on silent rate-limit and others (Codex likely) exit 0
-with an error envelope embedded in stdout. ``detect_exhaustion`` is free to
-scan stdout, stderr, or both — Claude's implementation deliberately scans
-stderr only to avoid false-positives on stream-json ``"usage": {...}``
-blocks, but other providers may need stdout scanning.
+Exhaustion-first dispatch invariant: the driver checks ``detect_exhaustion``
+then ``detect_overload`` BEFORE the exit code, because some CLIs exit
+non-zero on a silent rate-limit while others exit 0 with an error envelope in
+stdout.
+
+Credential write-back (Path B / OAuth-blob providers): ``prepare_credential``
+may write a credential blob to a CLI cache file (Codex ``~/.codex/auth.json``,
+Grok ``~/.grok/auth.json``) under ``home_dir`` and return its path as
+``watch_path``. After the run, the driver calls ``extract_credential_update``
+on that path; if the CLI refreshed the token in place, the driver surfaces the
+new blob on ``RunnerResult.credential_update`` so the orchestrator can persist
+it (orchestrator-side persistence is a separate change).
 """
 
 from __future__ import annotations
@@ -45,22 +47,22 @@ from __future__ import annotations
 import logging
 import os
 import re
+import signal
+import subprocess
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
 
-if TYPE_CHECKING:
-    from orcest.worker.runner import RunnerResult
-
+from orcest.worker.runner import RunnerResult
 
 # Environment variables safe to forward to provider subprocesses.
 # Whitelist (not os.environ.copy()) to avoid leaking secrets for other services.
 # Credential env vars themselves are NOT whitelisted: they would cross-leak
 # (a grok subprocess inheriting ANTHROPIC_API_KEY, etc.). The credential for
-# the current task's provider is injected explicitly by _build_env using the
-# recipe's env_var_name.
+# the current task's provider is injected explicitly via prepare_credential.
 _ENV_WHITELIST: set[str] = {
     "PATH",
     "HOME",
@@ -87,30 +89,16 @@ _ENV_WHITELIST: set[str] = {
 }
 
 
-# NEEDS_HUMAN: <reason> — orcest worker convention, emitted by the fix
-# prompt. Anchored to start-of-line so a mid-sentence mention does not trip
-# it. Matched only against agent-authored text (each runner's
-# extract_agent_text strips the user-role echo).
+# NEEDS_HUMAN: <reason> — orcest worker convention, emitted by the fix prompt.
+# Anchored to start-of-line so a mid-sentence mention does not trip it.
 _NEEDS_HUMAN_RE = re.compile(r"(?m)^[ \t>]*NEEDS_HUMAN:[ \t]*([^\n]{1,300})")
 
 
-def _build_env(
-    token: str,
-    credential: str = "",
-    env_var_name: str = "",
-    extra_env_keys: set[str] | None = None,
-) -> dict[str, str]:
-    """Minimal environment for a provider subprocess.
+def _build_base_env(token: str, extra_env_keys: set[str] | None = None) -> dict[str, str]:
+    """Whitelisted env + GITHUB_TOKEN/GH_TOKEN, with NO provider credential.
 
-    - Whitelisted parent env vars only.
-    - GITHUB_TOKEN + GH_TOKEN (gh CLI compat) always set from ``token``.
-    - Provider credential injected under ``env_var_name``. If ``credential``
-      is empty, falls back to the parent process's value for that env var
-      (supports orchestrator ``credential: ''`` + worker ``/opt/orcest/.env``).
-    - ``extra_env_keys`` lets a per-provider runner forward additional safe
-      keys without polluting the base whitelist.
-
-    The credential is never placed on argv.
+    Credential injection is left to ``prepare_credential`` so env-var and
+    blob-file providers can be handled uniformly.
     """
     keys = _ENV_WHITELIST | (extra_env_keys or set())
     env: dict[str, str] = {}
@@ -120,6 +108,23 @@ def _build_env(
             env[key] = val
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token
+    return env
+
+
+def _build_env(
+    token: str,
+    credential: str = "",
+    env_var_name: str = "",
+    extra_env_keys: set[str] | None = None,
+) -> dict[str, str]:
+    """Minimal environment for a provider subprocess (env-var credential).
+
+    Whitelisted parent env vars + GITHUB_TOKEN/GH_TOKEN, plus the provider
+    credential under ``env_var_name``. If ``credential`` is empty, falls back
+    to the parent process's value for that var. The credential is never on
+    argv. Retained for ``claude_runner.run_claude`` (legacy driver).
+    """
+    env = _build_base_env(token, extra_env_keys)
     if env_var_name:
         if credential:
             env[env_var_name] = credential
@@ -131,20 +136,12 @@ def _build_env(
 
 
 def _check_needs_human(agent_text: str) -> tuple[bool, str]:
-    """Detect a worker-reported human-decision blocker.
+    """Detect a worker-reported human-decision blocker in already-filtered
+    agent text. Returns (flag, reason); a ``<placeholder>`` reason is ignored.
 
-    Callers MUST pass already-filtered agent text — never the raw transcript
-    or stderr blob. Each runner's ``extract_agent_text`` is responsible for
-    returning only agent-authored content (stripping any prompt echo that
-    contains the literal ``NEEDS_HUMAN:`` instruction the prompt itself uses
-    as an example).
-
-    Named distinctly from ``claude_runner._parse_needs_human`` (which takes
-    raw stream-json and extracts agent text internally) to avoid a
-    same-name-different-signature footgun for future runner authors.
-
-    Returns (flag, reason); reason is empty when absent. A reason starting
-    with ``<`` is treated as the prompt's placeholder example and ignored.
+    Named distinctly from ``claude_runner._parse_needs_human`` (which takes raw
+    stream-json and extracts agent text first) to avoid a same-name,
+    different-signature footgun.
     """
     if not agent_text:
         return False, ""
@@ -157,27 +154,364 @@ def _check_needs_human(agent_text: str) -> tuple[bool, str]:
     return True, reason
 
 
+@dataclass
+class CredentialContext:
+    """What ``prepare_credential`` tells the driver about credential delivery.
+
+    - ``extra_env``: env vars to inject (env-var-credential providers put the
+      credential here, e.g. ``{"XAI_API_KEY": ...}`` / ``{"CODEX_API_KEY": ...}``).
+    - ``watch_path``: a credential file the CLI may refresh in place
+      (OAuth-blob providers). After the run, the driver reads it back via
+      ``extract_credential_update`` to capture a rotated token.
+    """
+
+    extra_env: dict[str, str] = field(default_factory=dict)
+    watch_path: Path | None = None
+
+
+def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0) -> None:
+    """Kill a subprocess and all children via process-group signal.
+
+    The child leads its own process group (start_new_session=True), so
+    signalling the group reaps grandchildren too. SIGTERM, then SIGKILL after
+    ``sigterm_timeout``.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=sigterm_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Close stdout/stderr pipes; idempotent."""
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None and hasattr(pipe, "close"):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _drain_stderr(
+    proc: subprocess.Popen[str],
+    on_stderr: Callable[[str], None] | None = None,
+) -> tuple[list[str], threading.Thread]:
+    """Read stderr in a background thread to avoid pipe deadlock.
+
+    Returns (lines, thread); caller ``join``s before reading. ``on_stderr``
+    receives each line; callback raises are swallowed.
+    """
+    lines: list[str] = []
+
+    def _reader() -> None:
+        if proc.stderr is None:  # pragma: no cover
+            return
+        try:
+            for line in proc.stderr:
+                lines.append(line)
+                if on_stderr is not None:
+                    try:
+                        on_stderr(line)
+                    except Exception:
+                        pass
+        except (OSError, ValueError):
+            pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    return lines, thread
+
+
+def _run_cli_agent(
+    runner: _BaseCliRunner,
+    prompt: str,
+    work_dir: Path,
+    token: str,
+    timeout: int,
+    *,
+    binary: str,
+    env_var_name: str,
+    credential: str,
+    model: str,
+    home_dir: Path,
+    logger: logging.Logger | None,
+    on_output: Callable[[str], None] | None,
+    on_stderr: Callable[[str], None] | None,
+    abort_event: threading.Event,
+) -> RunnerResult:
+    """Provider-agnostic subprocess driver. Spawns the CLI, streams stdout,
+    drains stderr, enforces a watchdog timeout, retries transient crashes with
+    backoff, and dispatches parsing to the runner's hooks.
+
+    Credential delivery goes through ``runner.prepare_credential`` (env var or
+    blob file). After a completed run, ``runner.extract_credential_update`` is
+    consulted on any ``watch_path`` to capture a refreshed OAuth token.
+    """
+    env = _build_base_env(token, runner.extra_env_keys)
+    cred_ctx = runner.prepare_credential(credential, work_dir, home_dir, env_var_name)
+    env.update(cred_ctx.extra_env)
+    env["HOME"] = str(home_dir)
+
+    cmd = runner.build_argv(binary, "" if runner.prompt_via_stdin else prompt, model, work_dir)
+    stdin_input = prompt if runner.prompt_via_stdin else None
+
+    if logger:
+        logger.info(
+            "Launching %s: cwd=%s, home=%s, timeout=%ds, env_vars=%s",
+            binary,
+            work_dir,
+            home_dir,
+            timeout,
+            sorted(env.keys()),
+        )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _finish(result: RunnerResult) -> RunnerResult:
+        # Capture a refreshed credential blob (if the CLI rotated it in place).
+        if cred_ctx.watch_path is not None:
+            try:
+                update = runner.extract_credential_update(cred_ctx.watch_path, credential)
+            except Exception:  # pragma: no cover - defensive
+                update = None
+            if update:
+                result.credential_update = update
+        return result
+
+    for attempt in range(1, runner.max_retries + 1):
+        attempt_start = time.monotonic()
+        if logger:
+            logger.info("%s attempt %d/%d", binary, attempt, runner.max_retries)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=work_dir,
+                env=env,
+                stdin=subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as e:
+            if logger:
+                logger.error("Failed to start %s: %s", binary, e)
+            return _finish(RunnerResult(success=False, summary=f"Failed to start: {e}"))
+
+        if stdin_input is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_input)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        try:
+            stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=on_stderr)
+        except RuntimeError:
+            _kill_process_tree(proc)
+            _close_pipes(proc)
+            if attempt < runner.max_retries:
+                abort_event.wait(timeout=runner.retry_backoff)
+                if abort_event.is_set():
+                    break
+            continue
+
+        if proc.stdout is None:  # pragma: no cover
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            raise RuntimeError("Popen stdout pipe is None despite PIPE flag")
+
+        watchdog_cancelled = threading.Event()
+        watchdog_killed = threading.Event()
+        watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
+
+        def _watchdog(
+            _proc: subprocess.Popen[str] = proc,
+            _remaining: float = watchdog_remaining,
+            _cancelled: threading.Event = watchdog_cancelled,
+            _killed: threading.Event = watchdog_killed,
+        ) -> None:
+            if _remaining > 0:
+                _cancelled.wait(timeout=_remaining)
+            if not _cancelled.is_set():
+                _killed.set()
+                _kill_process_tree(_proc)
+
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        try:
+            watchdog_thread.start()
+        except RuntimeError:
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            if attempt < runner.max_retries:
+                abort_event.wait(timeout=runner.retry_backoff)
+                if abort_event.is_set():
+                    break
+            continue
+
+        stdout_lines = []
+        timed_out = False
+        streaming_on_output = on_output
+        try:
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                if streaming_on_output is not None:
+                    try:
+                        streaming_on_output(line)
+                    except Exception:
+                        if logger:
+                            logger.warning(
+                                "on_output callback raised; disabling streaming",
+                                exc_info=True,
+                            )
+                        streaming_on_output = None
+                if abort_event.is_set():
+                    watchdog_cancelled.set()
+                    watchdog_thread.join(timeout=5)
+                    _kill_process_tree(proc)
+                    stderr_thread.join(timeout=5)
+                    _close_pipes(proc)
+                    if logger:
+                        logger.warning("%s subprocess killed: lock lost", binary)
+                    return _finish(
+                        RunnerResult(success=False, summary="Aborted: lock lost", transient=True)
+                    )
+                if time.monotonic() - attempt_start >= timeout:
+                    timed_out = True
+                    break
+        except Exception as stdout_exc:
+            watchdog_cancelled.set()
+            watchdog_thread.join(timeout=5)
+            _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
+            if watchdog_killed.is_set():
+                timed_out = True
+            else:
+                if logger:
+                    logger.warning("stdout read failed: %s", stdout_exc, exc_info=True)
+                if attempt < runner.max_retries:
+                    abort_event.wait(timeout=runner.retry_backoff)
+                    if abort_event.is_set():
+                        break
+                continue
+
+        watchdog_cancelled.set()
+        watchdog_thread.join(timeout=5)
+        if not timed_out and watchdog_killed.is_set():
+            timed_out = True
+
+        if not timed_out:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        else:
+            _kill_process_tree(proc)
+        stderr_thread.join(timeout=5)
+        _close_pipes(proc)
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+
+        # Exhaustion / overload first (some CLIs exit 0 with an error envelope).
+        exhausted, resets_at = runner.detect_exhaustion(stdout, stderr)
+        if exhausted:
+            return _finish(
+                RunnerResult(
+                    success=False,
+                    summary="Usage limit reached",
+                    usage_exhausted=True,
+                    rate_limit_resets_at=resets_at,
+                )
+            )
+        if runner.detect_overload(stdout, stderr):
+            return _finish(
+                RunnerResult(success=False, summary="Provider overloaded", transient=True)
+            )
+
+        if timed_out:
+            if logger:
+                logger.error("%s timed out after %ds", binary, timeout)
+            return _finish(
+                RunnerResult(success=False, summary=f"Timed out after {timeout}s", transient=True)
+            )
+
+        rc = proc.returncode
+        if rc is None:
+            return _finish(
+                RunnerResult(
+                    success=False,
+                    summary="Process did not exit (stuck in D-state)",
+                    transient=True,
+                )
+            )
+        if rc == 0:
+            summary = runner.extract_summary(stdout)
+            needs_human, reason = _check_needs_human(runner.extract_agent_text(stdout))
+            return _finish(
+                RunnerResult(
+                    success=True,
+                    summary=summary,
+                    needs_human=needs_human,
+                    needs_human_reason=reason,
+                )
+            )
+
+        if logger:
+            logger.warning("%s exited with code %d: %s", binary, rc, stderr[:500])
+        if attempt < runner.max_retries:
+            abort_event.wait(timeout=runner.retry_backoff)
+            if abort_event.is_set():
+                break
+
+    # Repeated non-zero exits with no explicit transient signal: treat as
+    # transient infrastructure failure (retried by the orchestrator), never
+    # escalated to needs-human.
+    return _finish(
+        RunnerResult(
+            success=False,
+            summary=f"Failed after {runner.max_retries} attempts",
+            transient=True,
+        )
+    )
+
+
 class _BaseCliRunner(ABC):
     """Base for CLI-driven provider runners.
 
-    Declares the hook surface every Runner subclass implements. PR 1 leaves
-    the concrete ``run()`` method to subclasses (ClaudeRunner delegates to
-    the legacy ``run_claude`` function so the existing test suite's mock
-    points stay intact). A shared ``run()`` will land when there's a second
-    runner (PR 2 Codex) to validate the abstraction against.
+    Provides a concrete ``run`` (via ``_run_cli_agent``). Subclasses implement
+    the parsing/argv hooks; OAuth-blob providers also override the credential
+    hooks. ClaudeRunner overrides ``run`` to keep its legacy ``run_claude``
+    driver (see module docstring).
     """
 
-    # Subclasses may opt to forward extra env keys (CLI-specific routing
-    # flags) without polluting the global whitelist.
-    # Override with a new set literal in the subclass; never mutate at runtime
-    # (e.g. self.extra_env_keys.add(…)) — that mutates the base-class set and
-    # silently affects all other subclasses.
-    extra_env_keys: ClassVar[set[str]] = set()
+    # Extra safe env keys to forward (CLI-specific routing flags).
+    extra_env_keys: set[str] = set()
 
-    # When True, the prompt is piped on stdin rather than placed in argv.
-    # Codex's `codex exec ... -` uses this. Claude/Grok use ``-p <prompt>``
-    # on argv (False, the default). The shared subprocess driver (PR 2)
-    # will branch on this to decide between argv and stdin delivery.
+    # When True, the prompt is piped on stdin instead of placed in argv
+    # (Codex's ``codex exec ... -``). Claude/Grok use ``-p <prompt>`` on argv.
     prompt_via_stdin: bool = False
 
     def __init__(
@@ -192,16 +526,15 @@ class _BaseCliRunner(ABC):
         self.retry_backoff = retry_backoff
         self.model = model
 
+    # --- Parsing / argv hooks (required) -----------------------------------
+
     @abstractmethod
     def build_argv(self, binary: str, prompt: str, model: str, work_dir: Path) -> list[str]:
-        """Return the argv list. Credential MUST NOT appear here — env only.
+        """Return the argv list. Credential MUST NOT appear here — env/blob only.
 
-        ``work_dir`` is passed so providers that take a workspace flag
-        (Codex's ``--cd``, Grok's ``--cwd``) can include it directly.
-        Providers that don't (Claude — workspace is the subprocess cwd)
-        ignore the argument. ``prompt`` may be empty when
-        ``prompt_via_stdin`` is True; the driver pipes it on stdin instead.
-        """
+        ``work_dir`` is passed so providers with a workspace flag (Codex
+        ``--cd``, Grok ``--cwd``) can include it. ``prompt`` is empty when
+        ``prompt_via_stdin`` is True (the driver pipes it on stdin)."""
 
     @abstractmethod
     def extract_summary(self, stdout: str) -> str:
@@ -209,8 +542,7 @@ class _BaseCliRunner(ABC):
 
     @abstractmethod
     def extract_agent_text(self, stdout: str) -> str:
-        """Agent-authored text only — strip any user-role echo of the prompt.
-        Returned text feeds the shared NEEDS_HUMAN: detector."""
+        """Agent-authored text only (strip any prompt echo); feeds NEEDS_HUMAN."""
 
     @abstractmethod
     def detect_exhaustion(self, stdout: str, stderr: str) -> tuple[bool, int]:
@@ -220,7 +552,33 @@ class _BaseCliRunner(ABC):
     def detect_overload(self, stdout: str, stderr: str) -> bool:
         """Transient 5xx / overload — orchestrator retries with backoff."""
 
-    @abstractmethod
+    # --- Credential hooks (default: env-var injection) ---------------------
+
+    def prepare_credential(
+        self, credential: str, work_dir: Path, home_dir: Path, env_var_name: str
+    ) -> CredentialContext:
+        """Map ``credential`` to subprocess delivery.
+
+        Default: inject it as the ``env_var_name`` env var (API-key providers).
+        OAuth-blob providers (Grok, Codex) override this to write the blob to a
+        CLI cache file under ``home_dir`` and return its ``watch_path``.
+        """
+        if credential:
+            return CredentialContext(extra_env={env_var_name: credential})
+        # Empty credential: fall back to the parent env value if present
+        # (worker /opt/orcest/.env). Mirrors _build_env's fallback.
+        parent_val = os.environ.get(env_var_name)
+        if parent_val:
+            return CredentialContext(extra_env={env_var_name: parent_val})
+        return CredentialContext()
+
+    def extract_credential_update(self, watch_path: Path, original: str) -> str | None:
+        """Return a refreshed credential blob if the CLI rotated it, else None.
+        Default: no write-back (env-var providers don't rotate in place)."""
+        return None
+
+    # --- Driver ------------------------------------------------------------
+
     def run(
         self,
         prompt: str,
@@ -235,5 +593,44 @@ class _BaseCliRunner(ABC):
         provider: str = "",
         credential: str = "",
         model: str = "",
-    ) -> "RunnerResult":
-        """Execute one task end-to-end and return a RunnerResult."""
+        home_dir: Path | None = None,
+    ) -> RunnerResult:
+        from orcest.worker.runner import get_provider_recipe
+
+        if not credential and claude_token:
+            credential = claude_token
+        effective_provider = provider or self._default_provider()
+        recipe = get_provider_recipe(effective_provider)
+        binary = recipe.binary if recipe is not None else self._default_binary()
+        env_var_name = recipe.env_var if recipe is not None else self._default_env_var()
+
+        abort = abort_event if abort_event is not None else threading.Event()
+        resolved_home = home_dir if home_dir is not None else Path(os.environ.get("HOME", "/root"))
+
+        return _run_cli_agent(
+            self,
+            prompt,
+            work_dir,
+            token,
+            timeout,
+            binary=binary,
+            env_var_name=env_var_name,
+            credential=credential,
+            model=model or self.model,
+            home_dir=resolved_home,
+            logger=logger,
+            on_output=on_output,
+            on_stderr=on_stderr,
+            abort_event=abort,
+        )
+
+    # --- Defaults a subclass may override ----------------------------------
+
+    def _default_provider(self) -> str:
+        return ""
+
+    def _default_binary(self) -> str:
+        return ""
+
+    def _default_env_var(self) -> str:
+        return ""

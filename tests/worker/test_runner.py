@@ -7,14 +7,12 @@ import shutil
 import pytest
 
 from orcest.shared.config import RunnerConfig
-from orcest.worker import _GrokPlaceholderRunner
-from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.claude_runner import ClaudeRunner
+from orcest.worker.grok_runner import GrokRunner
 from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.runner import (
     PROVIDER_REGISTRY,
     ProviderRecipe,
-    RunnerResult,
     create_runner,
     get_provider_recipe,
     get_unsupported_reason,
@@ -94,36 +92,15 @@ def test_create_runner_noop_nan_duration_raises() -> None:
 
 @pytest.mark.unit
 def test_provider_registry_contains_grok() -> None:
-    """PROVIDER_REGISTRY (worker-local) must contain the 'grok' entry for Task 7."""
+    """PROVIDER_REGISTRY (worker-local) must contain the 'grok' entry."""
     assert "grok" in PROVIDER_REGISTRY
     recipe = PROVIDER_REGISTRY["grok"]
     assert isinstance(recipe, ProviderRecipe)
     assert recipe.binary == "grok"
     assert recipe.env_var == "XAI_API_KEY"
-    # Grok uses a placeholder stub runner (not ClaudeRunner) until PR 3.
-    # The stub returns an immediate permanent FAILED so that installing the
-    # grok binary before the dedicated GrokRunner ships never produces
-    # confusing transient failures from ClaudeRunner's Claude-specific flags.
-    assert recipe.runner_cls is _GrokPlaceholderRunner
-    assert issubclass(recipe.runner_cls, _BaseCliRunner)
-
-
-@pytest.mark.unit
-def test_grok_placeholder_runner_returns_permanent_failed() -> None:
-    """_GrokPlaceholderRunner.run() returns a permanent (non-transient) FAILED."""
-    runner = _GrokPlaceholderRunner()
-    from pathlib import Path
-
-    result = runner.run(
-        prompt="dummy",
-        work_dir=Path("/tmp"),
-        token="tok",
-        timeout=60,
-    )
-    assert isinstance(result, RunnerResult)
-    assert result.success is False
-    assert result.transient is False
-    assert "rebake" in result.summary.lower() or "not yet implemented" in result.summary.lower()
+    # Grok is served by the dedicated GrokRunner (Path B / OAuth-blob auth),
+    # which superseded the earlier _GrokPlaceholderRunner stub.
+    assert recipe.runner_cls is GrokRunner
 
 
 @pytest.mark.unit
