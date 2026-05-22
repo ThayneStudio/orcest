@@ -144,8 +144,9 @@ class GrokRunner(_BaseCliRunner):
                 grok_dir = home_dir / ".grok"
                 grok_dir.mkdir(parents=True, exist_ok=True)
                 auth_path = grok_dir / "auth.json"
-                auth_path.write_text(blob)
-                os.chmod(auth_path, 0o600)
+                fd = os.open(str(auth_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(blob)
                 return CredentialContext(extra_env={}, watch_path=auth_path)
         if credential:
             # API-key path (funded xAI API team): inject XAI_API_KEY.
