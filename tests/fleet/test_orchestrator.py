@@ -136,6 +136,32 @@ class TestGenerateOrchestratorConfig:
         data = yaml.safe_load(generate_orchestrator_config(repo="O/r", key_prefix="alpha"))
         assert data["redis"]["key_prefix"] == "alpha"
 
+    def test_no_providers_block_without_extra_providers(self):
+        """Default: no providers: block (claude comes from legacy synthesis)."""
+        data = yaml.safe_load(generate_orchestrator_config(repo="O/r", key_prefix="p"))
+        assert "providers" not in data
+
+    def test_emits_providers_block_for_grok(self):
+        """A non-claude provider is emitted as a credential-empty providers entry
+        (the orchestrator resolves the value from .env via XAI_API_KEY)."""
+        data = yaml.safe_load(
+            generate_orchestrator_config(
+                repo="O/r", key_prefix="p", extra_providers=["grok"]
+            )
+        )
+        assert data["providers"] == [{"provider": "grok", "credential": "", "model": ""}]
+
+    def test_claude_excluded_from_providers_block(self):
+        """Claude is synthesized from CLAUDE_CODE_OAUTH_TOKENS, not listed here,
+        so it is dropped from extra_providers to avoid a double entry."""
+        data = yaml.safe_load(
+            generate_orchestrator_config(
+                repo="O/r", key_prefix="p", extra_providers=["claude", "grok"]
+            )
+        )
+        provs = [p["provider"] for p in data["providers"]]
+        assert provs == ["grok"]
+
 
 class TestImageExists:
     def test_returns_true_when_image_found(self, mocker):

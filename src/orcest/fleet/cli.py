@@ -770,6 +770,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         config_yaml = generate_orchestrator_config(
             repo=repo,
             key_prefix=project_name,
+            extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
         )
         write_project_files(ssh_target, project_name, env_content, config_yaml)
         console.print("  Project files written [green]ok[/green]")
