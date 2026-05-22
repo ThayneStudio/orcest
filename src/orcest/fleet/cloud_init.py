@@ -165,17 +165,21 @@ def _worker_tooling_runcmd() -> list[str]:
             "curl -fsSL --connect-timeout 30 --max-time 300"
             " https://x.ai/cli/install.sh -o /tmp/grok-install.sh"
         ),
-        # Optional integrity gate (no-op until _GROK_INSTALLER_SHA256 is set).
+        # Optional integrity gate + install in ONE entry joined by `&&`:
+        # cloud-init has no `set -e` across runcmd entries, so a separate
+        # checksum step would only log on mismatch and the install would run
+        # anyway. Combining them makes the gate actually enforcing once
+        # _GROK_INSTALLER_SHA256 is set (no-op `[ -z "" ]` true short-circuit
+        # while empty). Installer contract (verified against grok 0.1.216 at
+        # x.ai/cli/install.sh): GROK_BIN_DIR selects the symlink dir and the
+        # version is a bare positional arg — undocumented beta details the cp
+        # below depends on; re-verify when bumping _GROK_VERSION.
         (
-            f'[ -z "{_GROK_INSTALLER_SHA256}" ] || '
-            f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -'
+            f'{{ [ -z "{_GROK_INSTALLER_SHA256}" ] || '
+            f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -; }}'
+            f" && HOME=/root GROK_BIN_DIR=/root/.local/bin "
+            f"bash /tmp/grok-install.sh {_GROK_VERSION}"
         ),
-        # Installer contract (verified against grok 0.1.216 at x.ai/cli/install.sh):
-        # GROK_BIN_DIR selects the symlink dir, and the version is accepted as a
-        # bare positional arg. Both are undocumented beta-installer details — the
-        # cp below depends on them, so re-verify against the installer when
-        # bumping _GROK_VERSION.
-        (f"HOME=/root GROK_BIN_DIR=/root/.local/bin bash /tmp/grok-install.sh {_GROK_VERSION}"),
         'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
         "chmod 755 /usr/local/bin/grok",
         "rm -f /tmp/grok-install.sh",

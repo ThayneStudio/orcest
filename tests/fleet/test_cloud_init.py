@@ -231,6 +231,15 @@ class TestTemplateUserdata:
         assert "chmod 755 /usr/local/bin/grok" in runcmd
         # No silent-failure swallow on the install (the original miss).
         assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
+        # The checksum gate and the install must be ONE runcmd entry joined by
+        # `&&` — cloud-init has no `set -e` across entries, so a separate gate
+        # wouldn't actually block the install on a checksum mismatch.
+        gated = [
+            c
+            for c in data["runcmd"]
+            if "sha256sum" in str(c) and "bash /tmp/grok-install.sh" in str(c) and "&&" in str(c)
+        ]
+        assert gated, "grok checksum gate and install must be combined with && in one entry"
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())
