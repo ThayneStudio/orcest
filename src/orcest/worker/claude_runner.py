@@ -865,9 +865,7 @@ class ClaudeRunner(_BaseCliRunner):
 
     # --- _BaseCliRunner hook implementations -------------------------------
 
-    def build_argv(
-        self, binary: str, prompt: str, model: str, work_dir: Path
-    ) -> list[str]:
+    def build_argv(self, binary: str, prompt: str, model: str, work_dir: Path) -> list[str]:
         # work_dir is ignored — Claude takes the workspace via subprocess cwd,
         # not an explicit flag. The parameter is in the signature so Codex /
         # Grok runners (later PRs) can use it via the same hook.

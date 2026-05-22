@@ -189,9 +189,7 @@ class _BaseCliRunner(ABC):
         self.model = model
 
     @abstractmethod
-    def build_argv(
-        self, binary: str, prompt: str, model: str, work_dir: Path
-    ) -> list[str]:
+    def build_argv(self, binary: str, prompt: str, model: str, work_dir: Path) -> list[str]:
         """Return the argv list. Credential MUST NOT appear here — env only.
 
         ``work_dir`` is passed so providers that take a workspace flag

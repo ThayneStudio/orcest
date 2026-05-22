@@ -2696,9 +2696,7 @@ class TestMultiProjectRouting:
 
         assert fake_redis_client.hgetall(key) == {}
 
-    def test_clear_task_attempt_reservation_preserves_pr_different_sha(
-        self, fake_redis_client
-    ):
+    def test_clear_task_attempt_reservation_preserves_pr_different_sha(self, fake_redis_client):
         """Stale no-result PR cleanup must not clear a newer SHA reservation."""
         task = Task.create(
             task_type=TaskType.FIX_PR,
@@ -2718,9 +2716,7 @@ class TestMultiProjectRouting:
 
         assert fake_redis_client.hgetall(key) == {"count": "1", "head_sha": "sha-new"}
 
-    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(
-        self, fake_redis_client
-    ):
+    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(self, fake_redis_client):
         """PR cleanup compares and deletes attempts in the task project namespace."""
         task = Task.create(
             task_type=TaskType.FIX_PR,
@@ -2982,9 +2978,7 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
 class TestRunnerForTask:
     """Per-task dispatch picks the right Runner instance based on PROVIDER_REGISTRY."""
 
-    def test_matching_provider_uses_fallback(
-        self, local_worker_config, sample_task
-    ):
+    def test_matching_provider_uses_fallback(self, local_worker_config, sample_task):
         """task.provider == config.runner.type → reuse the pre-created fallback.
 
         This is the common path (claude worker, claude task) and the contract
@@ -2999,9 +2993,7 @@ class TestRunnerForTask:
 
         assert runner is fallback
 
-    def test_different_provider_instantiates_from_registry(
-        self, local_worker_config, sample_task
-    ):
+    def test_different_provider_instantiates_from_registry(self, local_worker_config, sample_task):
         """task.provider != config.runner.type → fresh instance from the registry.
 
         Demonstrates the new per-task dispatch surface: a worker configured
@@ -3061,9 +3053,7 @@ class TestRunnerForTask:
 
         assert runner is fallback
 
-    def test_unknown_provider_falls_back(
-        self, local_worker_config, sample_task, monkeypatch
-    ):
+    def test_unknown_provider_falls_back(self, local_worker_config, sample_task, monkeypatch):
         """Provider absent from the registry → use the fallback.
 
         The main loop's early-reject normally catches unknown providers, but

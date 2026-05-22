@@ -208,8 +208,7 @@ def test_claude_runner_hooks_match_module_functions() -> None:
 
     # detect_exhaustion fuses stderr usage check + stdout rate_limit_event.
     rate_limited_stdout = (
-        '{"type":"rate_limit_event","rate_limit_info":'
-        '{"status":"blocked","resetsAt":1700000000}}\n'
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"blocked","resetsAt":1700000000}}\n'
     )
     exhausted, resets_at = runner.detect_exhaustion(rate_limited_stdout, "")
     assert exhausted is True
