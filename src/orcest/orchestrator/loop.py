@@ -81,6 +81,47 @@ _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
+# Credential write-back: rotated OAuth blobs (Grok/Codex) keyed by the stable
+# provider identity. A Redis hash (field=identity -> {"blob","minted_at"}),
+# project-scoped via key_prefix. No TTL — the latest blob persists so a
+# refreshed token survives an orchestrator restart instead of reverting to
+# the stale config blob.
+_CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
+
+
+def _persist_credential_override(
+    redis: RedisClient, identity: str, blob: str, minted_at: float, logger: logging.Logger
+) -> None:
+    """Persist a rotated credential blob (keyed by provider identity)."""
+    try:
+        redis.hset(
+            _CREDENTIAL_OVERRIDES_KEY,
+            identity,
+            json.dumps({"blob": blob, "minted_at": minted_at}),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to persist credential override for identity %s", identity, exc_info=True
+        )
+
+
+def _load_credential_overrides(
+    redis: RedisClient, pool: "ProviderPool", logger: logging.Logger
+) -> None:
+    """Seed a pool's credential overrides from Redis at startup."""
+    try:
+        stored = redis.hgetall(_CREDENTIAL_OVERRIDES_KEY)
+    except Exception:
+        logger.warning("Failed to load credential overrides", exc_info=True)
+        return
+    for identity, raw in stored.items():
+        try:
+            obj = json.loads(raw)
+            pool.seed_credential_override(
+                identity, str(obj.get("blob", "")), float(obj.get("minted_at", 0))
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
 _USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS = 24 * 3600
 _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS = 24 * 3600
@@ -621,6 +662,14 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
                 [e.provider for e in unique],
             )
 
+    # Restore persisted credential write-back overrides (rotated OAuth blobs)
+    # so a refreshed token survives an orchestrator restart instead of
+    # reverting to the stale config blob.
+    for project, project_redis in project_clients:
+        pool = token_pools.get(project.key_prefix)
+        if pool is not None:
+            _load_credential_overrides(project_redis, pool, logger)
+
     # Graceful shutdown
     shutdown = False
 
@@ -840,14 +889,21 @@ def _poll_project(
         """
         task_id = str(uuid.uuid4())
         _register_task(task_id, entry)
+        # Use the latest written-back credential blob if the CLI rotated it
+        # (OAuth-blob providers). Falls back to the original config credential.
+        cred = (
+            token_pool.effective_credential(entry)
+            if token_pool is not None
+            else entry.credential
+        )
         try:
             res = publish_fn(
                 **publish_kwargs,
-                claude_token=entry.credential if entry.provider == "claude" else "",
+                claude_token=cred if entry.provider == "claude" else "",
                 key_prefix=key_prefix,
                 task_redis=task_redis,
                 provider=entry.provider,
-                credential=entry.credential,
+                credential=cred,
                 model=entry.model,
                 task_id=task_id,
             )
@@ -1737,6 +1793,24 @@ def _handle_result(
         result.worker_id,
         result.duration_seconds,
     )
+
+    # Credential write-back: capture a rotated OAuth blob BEFORE any staleness
+    # or exhaustion handling pops the task->identity mapping. Valid regardless
+    # of task staleness (the token rotation is real either way).
+    if result.credential_update and token_pool is not None:
+        minted_at = time.time()
+        ident = token_pool.apply_credential_update(
+            result.task_id, result.credential_update, minted_at
+        )
+        if ident is not None:
+            _persist_credential_override(
+                redis, ident, result.credential_update, minted_at, logger
+            )
+            logger.info(
+                "Captured refreshed credential for provider identity %s (task %s)",
+                ident,
+                result.task_id,
+            )
 
     repo = project.repo
     token = project.token
