@@ -308,6 +308,7 @@ class TestTemplateUserdata:
         assert f"node_major={_NODE_MAJOR}" in content
         assert f"playwright_major={_PLAYWRIGHT_MAJOR}" in content
         assert f"supabase_version={_SUPABASE_VERSION}" in content
+        assert f"grok_version={_GROK_VERSION}" in content
         assert "bumped_at=" in content
 
     def test_template_versions_bumped_at_is_iso_timestamp(self):

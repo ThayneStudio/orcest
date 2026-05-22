@@ -83,6 +83,7 @@ def _template_versions_write_file() -> dict:
         f"node_major={_NODE_MAJOR}\n"
         f"playwright_major={_PLAYWRIGHT_MAJOR}\n"
         f"supabase_version={_SUPABASE_VERSION}\n"
+        f"grok_version={_GROK_VERSION}\n"
         f"bumped_at={bumped_at}\n"
     )
     return {
@@ -169,6 +170,11 @@ def _worker_tooling_runcmd() -> list[str]:
             f'[ -z "{_GROK_INSTALLER_SHA256}" ] || '
             f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -'
         ),
+        # Installer contract (verified against grok 0.1.216 at x.ai/cli/install.sh):
+        # GROK_BIN_DIR selects the symlink dir, and the version is accepted as a
+        # bare positional arg. Both are undocumented beta-installer details — the
+        # cp below depends on them, so re-verify against the installer when
+        # bumping _GROK_VERSION.
         (f"HOME=/root GROK_BIN_DIR=/root/.local/bin bash /tmp/grok-install.sh {_GROK_VERSION}"),
         'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
         "chmod 755 /usr/local/bin/grok",
