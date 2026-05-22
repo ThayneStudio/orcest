@@ -220,6 +220,10 @@ class TestTemplateUserdata:
         assert "npm install -g bun" in runcmd
         assert "astral.sh/uv/install.sh" in runcmd
         assert "npm install -g wrangler" in runcmd
+        # Grok CLI: official installer fetched, self-contained binary copied to
+        # a system path so the orcest worker user can execute it.
+        assert "x.ai/cli/install.sh" in runcmd
+        assert "/usr/local/bin/grok" in runcmd
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())

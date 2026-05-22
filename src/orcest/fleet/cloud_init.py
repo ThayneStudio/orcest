@@ -53,6 +53,11 @@ _PLAYWRIGHT_MAJOR = "1"  # 1.x line — npx resolves latest 1.x at install time
 # Bump when rebaking; verify against https://github.com/supabase/cli/releases
 _SUPABASE_VERSION = "2.95.4"
 
+# Grok (xAI Grok Build) CLI — beta; the streaming-json event schema can shift
+# between releases, so pin it and re-validate the GrokRunner parsers
+# (tests/worker/test_grok_runner.py) on bump.
+_GROK_VERSION = "0.1.216"
+
 
 def _template_versions_write_file() -> dict:
     """Build the cloud-init write_files entry for ``/etc/orcest/template.versions``.
@@ -131,7 +136,7 @@ def _docker_install_runcmd(*, include_compose_plugin: bool = False) -> list[str]
 def _worker_tooling_runcmd() -> list[str]:
     """Commands to install worker tooling.
 
-    Installs (in order): Node, Docker, Claude CLI, gh, Supabase CLI,
+    Installs (in order): Node, Docker, Claude CLI, Grok CLI, gh, Supabase CLI,
     Playwright + Chromium, Deno, Bun, uv, wrangler.
     """
     return [
@@ -142,6 +147,20 @@ def _worker_tooling_runcmd() -> list[str]:
         *_docker_install_runcmd(),
         # Claude CLI: floats to npm-latest; rebakes pull current.
         "npm install -g @anthropic-ai/claude-code",
+        # Grok CLI (xAI Grok Build): the official installer fetches a
+        # self-contained binary (no auth needed to download). Auth is injected
+        # per-task to ~/.grok/auth.json by GrokRunner (Path B), never baked.
+        # The installer drops the binary under /root/.grok/downloads and
+        # symlinks it; copy the RESOLVED binary to /usr/local/bin so the
+        # non-root orcest worker user can execute it. Pinned to _GROK_VERSION.
+        "curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh",
+        (
+            "HOME=/root GROK_BIN_DIR=/root/.local/bin "
+            f"bash /tmp/grok-install.sh {_GROK_VERSION} || true"
+        ),
+        'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok 2>/dev/null || true',
+        "chmod 755 /usr/local/bin/grok 2>/dev/null || true",
+        "rm -f /tmp/grok-install.sh",
         # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"
