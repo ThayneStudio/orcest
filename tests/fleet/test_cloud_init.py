@@ -226,9 +226,17 @@ class TestTemplateUserdata:
         assert "x.ai/cli/install.sh" in runcmd
         assert _GROK_VERSION in runcmd
         # Resolved binary copied to a system path + made executable for the
-        # non-root orcest user.
+        # non-root orcest user. The installer's symlink-into-/root must be
+        # removed first (rm before cp) — /root is 0700, so a symlink there is
+        # unexecutable by orcest (EACCES); cp would follow it, not replace it.
         assert "/usr/local/bin/grok" in runcmd
         assert "chmod 755 /usr/local/bin/grok" in runcmd
+        rm_idx = next(i for i, c in enumerate(data["runcmd"]) if "rm -f /usr/local/bin/grok" in c)
+        cp_idx = next(i for i, c in enumerate(data["runcmd"]) if 'cp "$(readlink' in c)
+        assert rm_idx < cp_idx, "must rm the installer symlink before cp'ing the real binary"
+        # The post-install check runs as the orcest worker user, so it catches
+        # exec-permission regressions (not just root-visible presence).
+        assert "sudo -u orcest -H bash -lc 'command -v grok && grok --version'" in runcmd
         # No silent-failure swallow on the install (the original miss).
         assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
         # The checksum gate and the install must be ONE runcmd entry joined by

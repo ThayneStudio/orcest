@@ -180,13 +180,20 @@ def _worker_tooling_runcmd() -> list[str]:
             f" && HOME=/root GROK_BIN_DIR=/root/.local/bin "
             f"bash /tmp/grok-install.sh {_GROK_VERSION}"
         ),
+        # The installer symlinks /usr/local/bin/grok -> /root/.local/bin/grok
+        # -> /root/.grok/downloads/<binary>. /root is 0700, so the non-root
+        # orcest worker user can't traverse it and gets EACCES on exec. Remove
+        # that symlink and replace it with a REAL copy of the resolved binary
+        # (cp would otherwise follow the symlink and write through it, leaving
+        # the unreachable-by-orcest symlink in place).
+        "rm -f /usr/local/bin/grok",
         'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
         "chmod 755 /usr/local/bin/grok",
         "rm -f /tmp/grok-install.sh",
-        # Surface a missing binary in the cloud-init log (does not abort the
-        # bake — cloud-init runcmd has no set -e — but makes the failure
-        # visible; the live post-rebake check is the hard gate).
-        "command -v grok && grok --version",
+        # Surface a missing/broken binary in the cloud-init log. Run as the
+        # orcest user (the worker's runtime user) so this also catches the
+        # exec-permission regression above — not just root visibility.
+        "sudo -u orcest -H bash -lc 'command -v grok && grok --version'",
         # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"
