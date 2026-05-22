@@ -53,6 +53,16 @@ _PLAYWRIGHT_MAJOR = "1"  # 1.x line — npx resolves latest 1.x at install time
 # Bump when rebaking; verify against https://github.com/supabase/cli/releases
 _SUPABASE_VERSION = "2.95.4"
 
+# Grok (xAI Grok Build) CLI — beta; the streaming-json event schema can shift
+# between releases, so pin it and re-validate the GrokRunner parsers
+# (tests/worker/test_grok_runner.py) on bump.
+_GROK_VERSION = "0.1.216"
+# Optional SHA-256 of the grok installer script, to defend against a
+# compromised CDN/DNS executing arbitrary code as root at bake time. Empty =
+# skip (xAI publishes no checksum for the beta installer yet); set once a
+# trusted digest is known and the verify step becomes enforcing.
+_GROK_INSTALLER_SHA256 = ""
+
 
 def _template_versions_write_file() -> dict:
     """Build the cloud-init write_files entry for ``/etc/orcest/template.versions``.
@@ -73,6 +83,7 @@ def _template_versions_write_file() -> dict:
         f"node_major={_NODE_MAJOR}\n"
         f"playwright_major={_PLAYWRIGHT_MAJOR}\n"
         f"supabase_version={_SUPABASE_VERSION}\n"
+        f"grok_version={_GROK_VERSION}\n"
         f"bumped_at={bumped_at}\n"
     )
     return {
@@ -131,7 +142,7 @@ def _docker_install_runcmd(*, include_compose_plugin: bool = False) -> list[str]
 def _worker_tooling_runcmd() -> list[str]:
     """Commands to install worker tooling.
 
-    Installs (in order): Node, Docker, Claude CLI, gh, Supabase CLI,
+    Installs (in order): Node, Docker, Claude CLI, Grok CLI, gh, Supabase CLI,
     Playwright + Chromium, Deno, Bun, uv, wrangler.
     """
     return [
@@ -142,6 +153,40 @@ def _worker_tooling_runcmd() -> list[str]:
         *_docker_install_runcmd(),
         # Claude CLI: floats to npm-latest; rebakes pull current.
         "npm install -g @anthropic-ai/claude-code",
+        # Grok CLI (xAI Grok Build): the official installer fetches a
+        # self-contained binary (no auth needed to download). Auth is injected
+        # per-task to ~/.grok/auth.json by GrokRunner (Path B), never baked.
+        # The installer drops the binary under /root/.grok/downloads and
+        # symlinks it; copy the RESOLVED binary to /usr/local/bin so the
+        # non-root orcest worker user can execute it. Pinned to _GROK_VERSION.
+        # NB: no `|| true` — a failed install must surface in the cloud-init
+        # log rather than silently shipping a template without the grok binary.
+        (
+            "curl -fsSL --connect-timeout 30 --max-time 300"
+            " https://x.ai/cli/install.sh -o /tmp/grok-install.sh"
+        ),
+        # Optional integrity gate + install in ONE entry joined by `&&`:
+        # cloud-init has no `set -e` across runcmd entries, so a separate
+        # checksum step would only log on mismatch and the install would run
+        # anyway. Combining them makes the gate actually enforcing once
+        # _GROK_INSTALLER_SHA256 is set (no-op `[ -z "" ]` true short-circuit
+        # while empty). Installer contract (verified against grok 0.1.216 at
+        # x.ai/cli/install.sh): GROK_BIN_DIR selects the symlink dir and the
+        # version is a bare positional arg — undocumented beta details the cp
+        # below depends on; re-verify when bumping _GROK_VERSION.
+        (
+            f'{{ [ -z "{_GROK_INSTALLER_SHA256}" ] || '
+            f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -; }}'
+            f" && HOME=/root GROK_BIN_DIR=/root/.local/bin "
+            f"bash /tmp/grok-install.sh {_GROK_VERSION}"
+        ),
+        'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
+        "chmod 755 /usr/local/bin/grok",
+        "rm -f /tmp/grok-install.sh",
+        # Surface a missing binary in the cloud-init log (does not abort the
+        # bake — cloud-init runcmd has no set -e — but makes the failure
+        # visible; the live post-rebake check is the hard gate).
+        "command -v grok && grok --version",
         # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"

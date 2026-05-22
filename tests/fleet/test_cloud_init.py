@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    _GROK_VERSION,
     _NODE_MAJOR,
     _PLAYWRIGHT_MAJOR,
     _SUPABASE_VERSION,
@@ -220,6 +221,25 @@ class TestTemplateUserdata:
         assert "npm install -g bun" in runcmd
         assert "astral.sh/uv/install.sh" in runcmd
         assert "npm install -g wrangler" in runcmd
+        # Grok CLI: official installer fetched, pinned version, self-contained
+        # binary copied to a system path so the orcest worker user can run it.
+        assert "x.ai/cli/install.sh" in runcmd
+        assert _GROK_VERSION in runcmd
+        # Resolved binary copied to a system path + made executable for the
+        # non-root orcest user.
+        assert "/usr/local/bin/grok" in runcmd
+        assert "chmod 755 /usr/local/bin/grok" in runcmd
+        # No silent-failure swallow on the install (the original miss).
+        assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
+        # The checksum gate and the install must be ONE runcmd entry joined by
+        # `&&` — cloud-init has no `set -e` across entries, so a separate gate
+        # wouldn't actually block the install on a checksum mismatch.
+        gated = [
+            c
+            for c in data["runcmd"]
+            if "sha256sum" in str(c) and "bash /tmp/grok-install.sh" in str(c) and "&&" in str(c)
+        ]
+        assert gated, "grok checksum gate and install must be combined with && in one entry"
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())
@@ -297,6 +317,7 @@ class TestTemplateUserdata:
         assert f"node_major={_NODE_MAJOR}" in content
         assert f"playwright_major={_PLAYWRIGHT_MAJOR}" in content
         assert f"supabase_version={_SUPABASE_VERSION}" in content
+        assert f"grok_version={_GROK_VERSION}" in content
         assert "bumped_at=" in content
 
     def test_template_versions_bumped_at_is_iso_timestamp(self):
