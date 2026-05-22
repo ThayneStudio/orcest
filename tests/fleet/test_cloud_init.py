@@ -225,8 +225,10 @@ class TestTemplateUserdata:
         # binary copied to a system path so the orcest worker user can run it.
         assert "x.ai/cli/install.sh" in runcmd
         assert _GROK_VERSION in runcmd
+        # Resolved binary copied to a system path + made executable for the
+        # non-root orcest user.
         assert "/usr/local/bin/grok" in runcmd
-        assert _GROK_VERSION in runcmd
+        assert "chmod 755 /usr/local/bin/grok" in runcmd
         # No silent-failure swallow on the install (the original miss).
         assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
 
