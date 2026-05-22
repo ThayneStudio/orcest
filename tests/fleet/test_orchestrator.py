@@ -145,9 +145,7 @@ class TestGenerateOrchestratorConfig:
         """A non-claude provider is emitted as a credential-empty providers entry
         (the orchestrator resolves the value from .env via XAI_API_KEY)."""
         data = yaml.safe_load(
-            generate_orchestrator_config(
-                repo="O/r", key_prefix="p", extra_providers=["grok"]
-            )
+            generate_orchestrator_config(repo="O/r", key_prefix="p", extra_providers=["grok"])
         )
         assert data["providers"] == [{"provider": "grok", "credential": "", "model": ""}]
 

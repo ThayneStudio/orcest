@@ -66,22 +66,14 @@ def _iter_events(stdout: str) -> Iterator[dict]:
 
 def _concat_text(stdout: str) -> str:
     """Concatenate ``data`` from all ``text`` events — the agent's answer."""
-    parts = [
-        str(e.get("data", ""))
-        for e in _iter_events(stdout)
-        if e.get("type") == "text"
-    ]
+    parts = [str(e.get("data", "")) for e in _iter_events(stdout) if e.get("type") == "text"]
     return "".join(parts)
 
 
 def _grok_error_text(stdout: str, stderr: str) -> str:
     """All error-bearing text to scan for rate-limit / overload signals:
     ``error`` event messages from stdout plus raw stderr."""
-    msgs = [
-        str(e.get("message", ""))
-        for e in _iter_events(stdout)
-        if e.get("type") == "error"
-    ]
+    msgs = [str(e.get("message", "")) for e in _iter_events(stdout) if e.get("type") == "error"]
     return "\n".join(msgs) + "\n" + stderr
 
 

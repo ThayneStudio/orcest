@@ -618,7 +618,5 @@ def generate_orchestrator_config(
     }
     providers = [p for p in sorted(extra_providers or []) if p and p != "claude"]
     if providers:
-        config["providers"] = [
-            {"provider": p, "credential": "", "model": ""} for p in providers
-        ]
+        config["providers"] = [{"provider": p, "credential": "", "model": ""} for p in providers]
     return yaml.dump(config, default_flow_style=False, sort_keys=False)
