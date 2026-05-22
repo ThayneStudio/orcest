@@ -255,9 +255,7 @@ class ProviderPool:
             override = self._credential_overrides.get(entry.identity())
             return override[0] if override else entry.credential
 
-    def apply_credential_update(
-        self, task_id: str, blob: str, minted_at: float
-    ) -> str | None:
+    def apply_credential_update(self, task_id: str, blob: str, minted_at: float) -> str | None:
         """Record a rotated credential blob reported for *task_id*.
 
         Keyed by the task's entry identity (the stable config anchor).

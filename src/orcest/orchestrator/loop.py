@@ -122,6 +122,8 @@ def _load_credential_overrides(
             )
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
+
+
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
 _USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS = 24 * 3600
 _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS = 24 * 3600
@@ -892,9 +894,7 @@ def _poll_project(
         # Use the latest written-back credential blob if the CLI rotated it
         # (OAuth-blob providers). Falls back to the original config credential.
         cred = (
-            token_pool.effective_credential(entry)
-            if token_pool is not None
-            else entry.credential
+            token_pool.effective_credential(entry) if token_pool is not None else entry.credential
         )
         try:
             res = publish_fn(
@@ -1803,9 +1803,7 @@ def _handle_result(
             result.task_id, result.credential_update, minted_at
         )
         if ident is not None:
-            _persist_credential_override(
-                redis, ident, result.credential_update, minted_at, logger
-            )
+            _persist_credential_override(redis, ident, result.credential_update, minted_at, logger)
             logger.info(
                 "Captured refreshed credential for provider identity %s (task %s)",
                 ident,
