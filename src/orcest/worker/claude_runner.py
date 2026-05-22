@@ -3,7 +3,14 @@
 Executes Claude Code in non-interactive (--print) mode with stream-json
 output format, parses the result summary, and handles retries on crash.
 Timeouts and usage exhaustion are NOT retried.
+
+The shared worker conventions (NEEDS_HUMAN regex, env allowlist, credential
+injection) live in ``_runner_base``; Claude-specific parsing stays here.
+``ClaudeRunner`` inherits the ``_BaseCliRunner`` hook contract so the worker
+dispatch in ``loop.py`` can pick a runner per task.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -17,11 +24,28 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from orcest.worker._runner_base import (
+    _BaseCliRunner,
+    _build_env,
+    _check_needs_human,
+)
 from orcest.worker.runner import (
     ProviderRecipe,
     RunnerResult,
     get_provider_recipe,
 )
+
+# Re-exports of helpers that tests import directly from this module.
+__all__ = [
+    "ClaudeResult",
+    "ClaudeRunner",
+    "_build_env",
+    "_check_overloaded_event",
+    "_check_rate_limit_event",
+    "_extract_summary",
+    "_is_usage_exhausted",
+    "run_claude",
+]
 
 # Patterns that indicate Claude usage/rate limit exhaustion.
 # Checked against stderr only (case-insensitive).
@@ -32,60 +56,17 @@ _USAGE_EXHAUSTION_PATTERNS: list[tuple[str, str]] = [
     ("billing", "limit"),
 ]
 
-# Regex for rate-limit errors.  Two intentional constraints:
-#
-# 1. Word-order: the indicator (exceeded/reached/hit/error) must appear *after*
-#    "rate limit", so inverted-order phrases like "You've hit the rate limit"
-#    won't match.  False positives are the bigger risk; this is deliberate.
-#
-# 2. Trailing lookahead (?=[^a-zA-Z]|$): the indicator must be followed by a
-#    non-alphabetic character or end-of-line.  This matches real API error
-#    messages that carry trailing context on the same line, e.g.
-#    "Rate limit exceeded. Retry after 60 seconds." or
-#    "Rate limit exceeded for your plan".  The primary false-positive guard
-#    is that this regex is only ever checked against stderr
-#    (see _is_usage_exhausted), not user-visible stdout.
+# Rate-limit regex. Two intentional constraints:
+#  1. Word order: indicator (exceeded/reached/hit/error) must follow "rate
+#     limit" — inverted phrasings like "You've hit the rate limit" won't match.
+#     False positives are the bigger risk; this is deliberate.
+#  2. Trailing lookahead: indicator must be followed by non-alpha or EOL, so
+#     real API error suffixes ("Retry after 60 seconds.", "for your plan")
+#     still match. Only ever checked against stderr.
 _RATE_LIMIT_RE = re.compile(
     r"\brate\s+limit\b.{0,20}(?:exceeded|reached|hit|error)(?=[^a-zA-Z]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
-
-# Environment variables that are safe to forward to the Claude subprocess.
-# We use a whitelist rather than os.environ.copy() to avoid leaking secrets
-# (database passwords, API keys for other services, SSH credentials, etc.).
-_ENV_WHITELIST: set[str] = {
-    # Basic system vars needed by most programs
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "TMPDIR",
-    "TZ",
-    # Node.js / Claude Code specific
-    "NODE_PATH",
-    "NODE_OPTIONS",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    # Git config (needed for commits inside Claude)
-    "GIT_AUTHOR_NAME",
-    "GIT_AUTHOR_EMAIL",
-    "GIT_COMMITTER_NAME",
-    "GIT_COMMITTER_EMAIL",
-    # Provider routing flags (not credentials) — safe to forward to any
-    # subprocess, claude-specific in practice. Credential env vars themselves
-    # are NOT whitelisted: they would cross-leak (a grok subprocess inheriting
-    # ANTHROPIC_API_KEY, etc.). The credential for the *current* task's provider
-    # is injected explicitly by _build_env using the registry's env_var_name —
-    # either from the task payload or, when credential=="", by reading exactly
-    # that one env var from the parent os.environ.
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-}
 
 
 @dataclass
@@ -99,15 +80,6 @@ class ClaudeResult:
     usage_exhausted: bool = False
     rate_limit_resets_at: int = 0  # Unix timestamp from rate_limit_event, 0 = not set
     transient: bool = False
-
-
-# A worker reports a genuine human-decision blocker by ending its final
-# message with a standalone `NEEDS_HUMAN: <reason>` line. The pattern is
-# anchored to the start of a line (after optional indent / markdown quote) so
-# that a mid-sentence mention ("I considered NEEDS_HUMAN: ...") does not trip
-# it. It is matched only against agent-authored text -- never the echoed
-# prompt -- see _agent_text_from_stream_json.
-_NEEDS_HUMAN_RE = re.compile(r"(?m)^[ \t>]*NEEDS_HUMAN:[ \t]*([^\n]{1,300})")
 
 
 def _agent_text_from_stream_json(output: str) -> str:
@@ -151,60 +123,32 @@ def _parse_needs_human(output: str) -> tuple[bool, str]:
 
     The fix prompt instructs Claude to end its final message with a standalone
     ``NEEDS_HUMAN: <reason>`` line, only for a genuine human-decision blocker.
+    This extracts Claude-specific agent text from the raw stream-json, then
+    delegates the regex match to the shared ``_check_needs_human`` so the
+    NEEDS_HUMAN convention lives in exactly one place across all providers.
     Returns (flag, reason); reason is empty when the signal is absent.
     """
     text = _agent_text_from_stream_json(output)
-    if not text:
-        return False, ""
-    m = _NEEDS_HUMAN_RE.search(text)
-    if not m:
-        return False, ""
-    reason = m.group(1).strip()
-    # The prompt's example uses a <placeholder>; an echoed-back placeholder is
-    # not a real reason.
-    if reason.startswith("<"):
-        return False, ""
-    return True, reason
+    return _check_needs_human(text)
 
 
-def _build_env(
-    token: str, credential: str = "", env_var_name: str = "CLAUDE_CODE_OAUTH_TOKEN"
-) -> dict[str, str]:
-    """Build a minimal environment for the provider subprocess.
-
-    Uses an allowlist of safe variables from the parent process, then
-    injects GITHUB_TOKEN (also as GH_TOKEN for gh CLI compatibility)
-    and the provider-specific credential env var (looked up from the
-    worker-local PROVIDER_REGISTRY).
-
-    - If `credential` is non-empty: injected directly (preferred, from Task).
-    - If `credential` is empty: falls back to parent os.environ[env_var_name]
-      (supports orchestrator "credential: ''" + worker /opt/orcest/.env).
-
-    Never injects via argv. The env_var_name comes from the registry entry
-    for the task's provider — the orchestrator itself is unaware of it.
+def _build_claude_argv(binary: str, prompt: str, model: str) -> list[str]:
+    """Construct the Claude CLI argv. Single source of truth shared by
+    ``ClaudeRunner.build_argv`` (the per-provider hook) and ``run_claude``'s
+    legacy inline path, so the two cannot drift. Credential is never on argv.
     """
-    env: dict[str, str] = {}
-    for key in _ENV_WHITELIST:
-        val = os.environ.get(key)
-        if val is not None:
-            env[key] = val
-    # Always set GITHUB_TOKEN and GH_TOKEN for gh CLI compatibility
-    env["GITHUB_TOKEN"] = token
-    env["GH_TOKEN"] = token
-    # Per-task provider credential (name comes from local registry for this provider).
-    # If credential is provided (non-empty), use it (orchestrator-supplied).
-    # If empty string, fall back to the value from the *parent* worker environment
-    # under the exact env_var_name declared in the worker's PROVIDER_REGISTRY.
-    # This enables "credential: ''" entries in orchestrator YAML (env fallback)
-    # to work on workers that have the corresponding var in /opt/orcest/.env.
-    if credential:
-        env[env_var_name] = credential
-    else:
-        parent_val = os.environ.get(env_var_name)
-        if parent_val:
-            env[env_var_name] = parent_val
-    return env
+    cmd = [
+        binary,
+        "--print",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--dangerously-skip-permissions",
+    ]
+    if model:
+        cmd += ["--model", model]
+    cmd += ["-p", prompt]
+    return cmd
 
 
 def _is_usage_exhausted(stderr: str) -> bool:
@@ -238,7 +182,6 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
     Returns (is_exhausted, resets_at_unix) where resets_at_unix is the
     Unix timestamp from the event (0 if not available).
     """
-    import json
 
     def _parse_resets_at(value: object) -> int:
         if value is None or value == "" or isinstance(value, bool):
@@ -274,8 +217,6 @@ def _check_rate_limit_event(stdout: str) -> tuple[bool, int]:
 
 def _check_overloaded_event(stdout: str) -> bool:
     """Check stream-json stdout for Claude server overload errors."""
-    import json
-
     for line in stdout.splitlines():
         line = line.strip()
         if not line or (
@@ -439,6 +380,7 @@ def run_claude(
     model: str = "",
     provider: str = "claude",
     credential: str = "",
+    cmd_argv: list[str] | None = None,
 ) -> ClaudeResult:
     """Execute the provider CLI (selected via local registry) and return parsed result.
 
@@ -499,25 +441,34 @@ def run_claude(
     if not provider:
         provider = "claude"
 
-    # Local registry lookup (never from orchestrator payload)
+    # Local registry lookup (never from orchestrator payload).
+    # Defensive fallback: this is run_claude — its job is to run the Claude
+    # CLI — so a missing recipe defaults to the Claude binary + env var. In
+    # production this branch is unreachable: the loop.py early-reject filters
+    # unknown providers, and PROVIDER_REGISTRY is always seeded by the worker
+    # package __init__ before any task is dispatched. It exists only for
+    # direct/ad-hoc callers of run_claude (tests). A non-Claude task can never
+    # reach here because only ClaudeRunner.run (claude + grok-placeholder)
+    # calls run_claude, and both providers carry a recipe.
     recipe = get_provider_recipe(provider)
     if recipe is None:
-        # Defensive: early reject in loop.py should have caught this.
-        recipe = ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN")
+        recipe = ProviderRecipe(
+            binary="claude",
+            env_var="CLAUDE_CODE_OAUTH_TOKEN",
+            runner_cls=ClaudeRunner,
+        )
 
     env = _build_env(token, credential=credential, env_var_name=recipe.env_var)
 
-    cmd = [
-        recipe.binary,
-        "--print",
-        "--verbose",
-        "--output-format",
-        "stream-json",
-        "--dangerously-skip-permissions",
-    ]
-    if model:
-        cmd += ["--model", model]
-    cmd += ["-p", prompt]
+    if cmd_argv is not None:
+        # Caller (typically ClaudeRunner.run) supplied the argv via the
+        # build_argv hook. Trust it. This is the path that exercises the
+        # per-provider hook contract; the branch below is the legacy
+        # direct-call fallback (tests, ad-hoc callers) and builds from the
+        # same _build_claude_argv source of truth so they cannot drift.
+        cmd = list(cmd_argv)
+    else:
+        cmd = _build_claude_argv(recipe.binary, prompt, model)
 
     if logger:
         env_keys = sorted(env.keys())
@@ -900,7 +851,7 @@ def run_claude(
     )
 
 
-class ClaudeRunner:
+class ClaudeRunner(_BaseCliRunner):
     """Runner implementation that executes tasks via the Claude CLI."""
 
     def __init__(
@@ -909,9 +860,33 @@ class ClaudeRunner:
         retry_backoff: int = 10,
         model: str = "",
     ):
-        self.max_retries = max_retries
-        self.retry_backoff = retry_backoff
-        self.model = model
+        super().__init__(max_retries=max_retries, retry_backoff=retry_backoff, model=model)
+
+    # --- _BaseCliRunner hook implementations -------------------------------
+
+    def build_argv(self, binary: str, prompt: str, model: str, work_dir: Path) -> list[str]:
+        # work_dir is ignored — Claude takes the workspace via subprocess cwd,
+        # not an explicit flag. The parameter is in the signature so Codex /
+        # Grok runners (later PRs) can use it via the same hook.
+        del work_dir
+        return _build_claude_argv(binary, prompt, model)
+
+    def extract_summary(self, stdout: str) -> str:
+        return _extract_summary(stdout)
+
+    def extract_agent_text(self, stdout: str) -> str:
+        return _agent_text_from_stream_json(stdout)
+
+    def detect_exhaustion(self, stdout: str, stderr: str) -> tuple[bool, int]:
+        rate_blocked, resets_at = _check_rate_limit_event(stdout)
+        if _is_usage_exhausted(stderr) or rate_blocked:
+            return True, resets_at
+        return False, 0
+
+    def detect_overload(self, stdout: str, stderr: str) -> bool:
+        return _check_overloaded_event(stdout)
+
+    # --- Runner protocol ---------------------------------------------------
 
     def run(
         self,
@@ -926,8 +901,15 @@ class ClaudeRunner:
         claude_token: str = "",
         provider: str = "claude",
         credential: str = "",
+        model: str = "",
     ) -> RunnerResult:
-
+        effective_model = model or self.model
+        # Resolve the binary from the registry so build_argv sees the same
+        # binary that run_claude would. Falls back defensively if the
+        # registry hasn't been seeded for this provider.
+        recipe = get_provider_recipe(provider)
+        binary = recipe.binary if recipe is not None else "claude"
+        cmd_argv = self.build_argv(binary, prompt, effective_model, work_dir)
         result = run_claude(
             prompt=prompt,
             work_dir=work_dir,
@@ -940,9 +922,9 @@ class ClaudeRunner:
             on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=claude_token,
-            model=self.model,
             provider=provider,
             credential=credential,
+            cmd_argv=cmd_argv,
         )
         needs_human, needs_human_reason = _parse_needs_human(result.raw_output)
         return RunnerResult(

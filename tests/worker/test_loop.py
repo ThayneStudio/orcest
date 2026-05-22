@@ -31,9 +31,10 @@ from orcest.worker.loop import (
     _execute_task,
     _make_abort_event,
     _publish_result_with_retry,
+    _runner_for_task,
     run_worker,
 )
-from orcest.worker.runner import RunnerResult
+from orcest.worker.runner import PROVIDER_REGISTRY, ProviderRecipe, RunnerResult
 from orcest.worker.workspace import WorkspaceError
 
 # ---------------------------------------------------------------------------
@@ -2695,9 +2696,7 @@ class TestMultiProjectRouting:
 
         assert fake_redis_client.hgetall(key) == {}
 
-    def test_clear_task_attempt_reservation_preserves_pr_different_sha(
-        self, fake_redis_client
-    ):
+    def test_clear_task_attempt_reservation_preserves_pr_different_sha(self, fake_redis_client):
         """Stale no-result PR cleanup must not clear a newer SHA reservation."""
         task = Task.create(
             task_type=TaskType.FIX_PR,
@@ -2717,9 +2716,7 @@ class TestMultiProjectRouting:
 
         assert fake_redis_client.hgetall(key) == {"count": "1", "head_sha": "sha-new"}
 
-    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(
-        self, fake_redis_client
-    ):
+    def test_clear_task_attempt_reservation_uses_task_key_prefix_for_pr(self, fake_redis_client):
         """PR cleanup compares and deletes attempts in the task project namespace."""
         task = Task.create(
             task_type=TaskType.FIX_PR,
@@ -2970,3 +2967,275 @@ def test_early_reject_unsupported_provider_publishes_clean_failed(local_worker_c
     # Must clear the matching attempt reservation. PR cleanup is SHA-aware and
     # uses WATCH/MULTI so a stale task cannot erase a newer SHA reservation.
     pipe.delete.assert_called_with(f"pr:{sample_task.repo}:{sample_task.resource_id}:attempts")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _runner_for_task (PR 1: per-task runner dispatch)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRunnerForTask:
+    """Per-task dispatch picks the right Runner instance based on PROVIDER_REGISTRY."""
+
+    def test_matching_provider_uses_fallback(self, local_worker_config, sample_task):
+        """task.provider == config.runner.type → reuse the pre-created fallback.
+
+        This is the common path (claude worker, claude task) and the contract
+        tests rely on: the runner the worker was initialized with is what
+        actually runs the task. No per-task re-instantiation.
+        """
+        fallback = MagicMock()
+        assert sample_task.provider == "claude"
+        assert local_worker_config.runner.type == "claude"
+
+        runner = _runner_for_task(sample_task, local_worker_config, fallback)
+
+        assert runner is fallback
+
+    def test_different_provider_instantiates_from_registry(self, local_worker_config, sample_task):
+        """task.provider != config.runner.type → fresh instance from the registry.
+
+        Demonstrates the new per-task dispatch surface: a worker configured
+        with one provider can serve a task for another, provided the
+        registry has a Runner registered for that provider.
+        """
+        # Configure the worker as "noop" so the task's "claude" provider
+        # diverges from config.runner.type and triggers registry lookup.
+        from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
+
+        config = WorkerConfig(
+            worker_id="test-worker",
+            backend="claude",
+            redis=RedisConfig(host="localhost", port=6379),
+            workspace_dir="/tmp/x",
+            runner=RunnerConfig(
+                type="noop",
+                timeout=10,
+                max_retries=1,
+                retry_backoff=0,
+                model="some-test-model",
+            ),
+        )
+        fallback = MagicMock()  # represents the noop runner; should NOT be used
+
+        runner = _runner_for_task(sample_task, config, fallback)
+
+        # Registry's runner_cls for "claude" is ClaudeRunner — that's what we get.
+        from orcest.worker.claude_runner import ClaudeRunner
+
+        assert isinstance(runner, ClaudeRunner)
+        assert runner is not fallback
+        # RunnerConfig.model flows through to the freshly-instantiated runner.
+        assert runner.model == "some-test-model"
+
+    def test_unregistered_provider_falls_back_to_workers_runner(
+        self, local_worker_config, sample_task, monkeypatch
+    ):
+        """Worker configured for claude, task for an unregistered provider →
+        fallback (the worker's claude runner). Captures the real PR-1/PR-2
+        skew window: until codex is in the registry, a stray codex task
+        falls back to the worker's ClaudeRunner. ClaudeRunner.run on a codex
+        task will fail with an auth error (CODEX_API_KEY vs Claude env var),
+        but the dispatch itself is well-defined.
+
+        Today this is identical to the "unknown provider" path. When PR 2
+        registers codex, this test should grow to assert "fallback iff codex
+        not registered" — keep the explicit name to make the regression
+        easy to find.
+        """
+        # 'codex' is intentionally NOT in PROVIDER_REGISTRY in PR 1.
+        assert "codex" not in PROVIDER_REGISTRY
+        monkeypatch.setattr(sample_task, "provider", "codex")
+        fallback = MagicMock()
+
+        runner = _runner_for_task(sample_task, local_worker_config, fallback)
+
+        assert runner is fallback
+
+    def test_unknown_provider_falls_back(self, local_worker_config, sample_task, monkeypatch):
+        """Provider absent from the registry → use the fallback.
+
+        The main loop's early-reject normally catches unknown providers, but
+        if dispatch is reached anyway (e.g. via a direct unit test path) the
+        fallback is preserved — never instantiates something arbitrary.
+        """
+        monkeypatch.setattr(sample_task, "provider", "neverregistered")
+        fallback = MagicMock()
+
+        runner = _runner_for_task(sample_task, local_worker_config, fallback)
+
+        assert runner is fallback
+
+    def test_registry_entry_without_runner_cls_falls_back(
+        self, local_worker_config, sample_task, monkeypatch
+    ):
+        """A ProviderRecipe with runner_cls=None falls back.
+
+        Backwards-compat path: any recipe lacking a runner_cls keeps the
+        worker's configured runner instead of crashing on None().
+        """
+        monkeypatch.setattr(sample_task, "provider", "no-runner-cls")
+        monkeypatch.setitem(
+            PROVIDER_REGISTRY,
+            "no-runner-cls",
+            ProviderRecipe(binary="fake", env_var="FAKE_TOKEN", runner_cls=None),
+        )
+        fallback = MagicMock()
+
+        runner = _runner_for_task(sample_task, local_worker_config, fallback)
+
+        assert runner is fallback
+
+
+@pytest.mark.unit
+def test_execute_task_passes_per_task_model_override(
+    local_worker_config, sample_task, mock_workspace, monkeypatch
+):
+    """When task.model is set, it overrides config.runner.model in runner.run().
+
+    Verifies the model plumbing added in PR 1: a per-task model is forwarded
+    as a kwarg to the runner, so different tasks against the same provider
+    can use different models on the same worker.
+    """
+    monkeypatch.setattr(sample_task, "model", "claude-3-opus-test")
+
+    mock_runner = MagicMock()
+    mock_runner.run.return_value = _success_runner_result()
+    mock_redis = MagicMock()
+    mock_redis.xadd_capped.return_value = "1-0"
+
+    _execute_task(
+        sample_task,
+        local_worker_config,
+        mock_runner,
+        mock_workspace,
+        mock_redis,
+        logging.getLogger("test"),
+    )
+
+    mock_runner.run.assert_called_once()
+    _, kwargs = mock_runner.run.call_args
+    assert kwargs["model"] == "claude-3-opus-test"
+
+
+@pytest.mark.unit
+def test_execute_task_falls_back_to_config_model_when_task_unset(
+    local_worker_config, sample_task, mock_workspace
+):
+    """When task.model is empty, config.runner.model is used.
+
+    Complements the override test: the worker-wide default still applies
+    when the task carries no per-task override (the default case for
+    pre-multi-runner publishers).
+    """
+    from orcest.shared.config import RunnerConfig, WorkerConfig
+
+    config = WorkerConfig(
+        worker_id=local_worker_config.worker_id,
+        backend=local_worker_config.backend,
+        redis=local_worker_config.redis,
+        workspace_dir=local_worker_config.workspace_dir,
+        runner=RunnerConfig(
+            timeout=10,
+            max_retries=1,
+            retry_backoff=0,
+            model="worker-default-model",
+        ),
+    )
+    assert not sample_task.model  # baseline
+
+    mock_runner = MagicMock()
+    mock_runner.run.return_value = _success_runner_result()
+    mock_redis = MagicMock()
+    mock_redis.xadd_capped.return_value = "1-0"
+
+    _execute_task(
+        sample_task,
+        config,
+        mock_runner,
+        mock_workspace,
+        mock_redis,
+        logging.getLogger("test"),
+    )
+
+    mock_runner.run.assert_called_once()
+    _, kwargs = mock_runner.run.call_args
+    assert kwargs["model"] == "worker-default-model"
+
+
+@pytest.mark.unit
+def test_execute_task_model_empty_string_falls_back(
+    local_worker_config, sample_task, mock_workspace, monkeypatch
+):
+    """Empty-string task.model (not None) still falls back to config.runner.model.
+
+    Pins the specific `task.model or config.runner.model` expression — a
+    naive refactor to `task.model if task.model is not None else …` would
+    silently regress this case (empty string is a real value Task may carry).
+    """
+    from orcest.shared.config import RunnerConfig, WorkerConfig
+
+    config = WorkerConfig(
+        worker_id=local_worker_config.worker_id,
+        backend=local_worker_config.backend,
+        redis=local_worker_config.redis,
+        workspace_dir=local_worker_config.workspace_dir,
+        runner=RunnerConfig(
+            timeout=10,
+            max_retries=1,
+            retry_backoff=0,
+            model="worker-default-model",
+        ),
+    )
+    monkeypatch.setattr(sample_task, "model", "")
+
+    mock_runner = MagicMock()
+    mock_runner.run.return_value = _success_runner_result()
+    mock_redis = MagicMock()
+    mock_redis.xadd_capped.return_value = "1-0"
+
+    _execute_task(
+        sample_task,
+        config,
+        mock_runner,
+        mock_workspace,
+        mock_redis,
+        logging.getLogger("test"),
+    )
+
+    mock_runner.run.assert_called_once()
+    _, kwargs = mock_runner.run.call_args
+    assert kwargs["model"] == "worker-default-model"
+
+
+@pytest.mark.unit
+def test_execute_task_model_override_when_config_default_empty(
+    local_worker_config, sample_task, monkeypatch, mock_workspace
+):
+    """task.model wins even when config.runner.model is empty.
+
+    Symmetric to the override test: per-task model is honored regardless of
+    whether the worker has a default.
+    """
+    monkeypatch.setattr(sample_task, "model", "claude-3-opus-test")
+    # local_worker_config has RunnerConfig(..., model="") by default — pin it.
+    assert local_worker_config.runner.model == ""
+
+    mock_runner = MagicMock()
+    mock_runner.run.return_value = _success_runner_result()
+    mock_redis = MagicMock()
+    mock_redis.xadd_capped.return_value = "1-0"
+
+    _execute_task(
+        sample_task,
+        local_worker_config,
+        mock_runner,
+        mock_workspace,
+        mock_redis,
+        logging.getLogger("test"),
+    )
+
+    mock_runner.run.assert_called_once()
+    _, kwargs = mock_runner.run.call_args
+    assert kwargs["model"] == "claude-3-opus-test"
