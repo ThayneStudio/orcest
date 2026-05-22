@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from orcest.worker._runner_base import CredentialContext, _BaseCliRunner
@@ -49,7 +50,7 @@ _GROK_OVERLOAD_RE = re.compile(
 )
 
 
-def _iter_events(stdout: str):
+def _iter_events(stdout: str) -> Iterator[dict]:
     """Yield parsed JSON event dicts from grok streaming-json stdout."""
     for line in stdout.splitlines():
         line = line.strip()

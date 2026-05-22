@@ -902,6 +902,7 @@ class ClaudeRunner(_BaseCliRunner):
         provider: str = "claude",
         credential: str = "",
         model: str = "",
+        home_dir: Path | None = None,
     ) -> RunnerResult:
         effective_model = model or self.model
         # Resolve the binary from the registry so build_argv sees the same
