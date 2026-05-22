@@ -104,6 +104,10 @@ class RunnerResult:
     # the orcest:needs-human label -- orcest never infers it from failure counts.
     needs_human: bool = False
     needs_human_reason: str = ""
+    # OAuth-blob providers (Grok/Codex) may refresh their token mid-run; the
+    # worker surfaces the rotated blob here so the orchestrator can persist it.
+    # None for the common case (env-var credentials never rotate in place).
+    credential_update: str | None = None
 
 
 class Runner(Protocol):

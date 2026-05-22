@@ -313,6 +313,10 @@ class TaskResult:
     # label; orcest never infers it from failure counts.
     needs_human: bool = False
     needs_human_reason: str = ""
+    # OAuth-blob providers (Grok/Codex) may refresh their token in place during
+    # a run; the worker surfaces the rotated blob here so the orchestrator can
+    # persist it. A SECRET — redacted in to_safe_dict, never logged in plaintext.
+    credential_update: str = ""
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -338,6 +342,15 @@ class TaskResult:
         if self.needs_human:
             d["needs_human"] = "1"
             d["needs_human_reason"] = self.needs_human_reason
+        if self.credential_update:
+            d["credential_update"] = self.credential_update
+        return d
+
+    def to_safe_dict(self) -> dict[str, str]:
+        """to_dict() with the credential blob redacted, for logging/diagnostics."""
+        d = self.to_dict()
+        if d.get("credential_update"):
+            d["credential_update"] = "[REDACTED]"
         return d
 
     @classmethod
@@ -362,6 +375,7 @@ class TaskResult:
             ),
             needs_human=data.get("needs_human", "") == "1",
             needs_human_reason=data.get("needs_human_reason", ""),
+            credential_update=data.get("credential_update", ""),
         )
 
 

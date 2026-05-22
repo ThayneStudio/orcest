@@ -98,6 +98,29 @@ def test_task_type_enum_round_trip():
         assert TaskType(member.value) is member
 
 
+def test_task_result_credential_update_round_trip():
+    """credential_update survives serialization (worker -> Redis -> orchestrator)."""
+    original = _make_task_result(credential_update='{"key":"rotated","refresh_token":"rt"}')
+    rebuilt = TaskResult.from_dict(original.to_dict())
+    assert rebuilt.credential_update == '{"key":"rotated","refresh_token":"rt"}'
+
+
+def test_task_result_credential_update_absent_by_default():
+    d = _make_task_result().to_dict()
+    assert "credential_update" not in d
+    assert TaskResult.from_dict(d).credential_update == ""
+
+
+def test_task_result_to_safe_dict_redacts_credential_update():
+    """The blob is a secret — to_safe_dict masks it for logging."""
+    r = _make_task_result(credential_update='{"key":"secret-token"}')
+    safe = r.to_safe_dict()
+    assert safe["credential_update"] == "[REDACTED]"
+    assert "secret-token" not in str(safe)
+    # to_dict (the Redis payload, trusted channel) keeps the real value.
+    assert r.to_dict()["credential_update"] == '{"key":"secret-token"}'
+
+
 def test_task_result_to_dict_from_dict_round_trip():
     original = _make_task_result(
         snapshot_head_sha="abc123",

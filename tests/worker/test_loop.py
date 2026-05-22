@@ -2244,6 +2244,50 @@ class TestPublishResultWithRetry:
             duration_seconds=1,
         )
 
+    def test_dead_letter_redacts_credential_update(self, sample_task):
+        """When all result-publish attempts fail, the dead-letter payload must
+        NOT contain the plaintext OAuth blob (credential_update)."""
+        result = self._make_result(sample_task)
+        result.credential_update = '{"key":"super-secret-refresh-token"}'
+
+        dead_letter_payloads = []
+
+        def xadd_capped(stream, data, **kwargs):
+            if stream == RESULTS_STREAM:
+                raise ConnectionError("results stream down")
+            return "1-0"
+
+        def xadd_capped_raw(fq, data, **kwargs):
+            if "dead" in fq.lower() or DEAD_LETTER_STREAM in fq:
+                dead_letter_payloads.append(data)
+            return "1-0"
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.side_effect = xadd_capped
+        mock_redis.xadd_capped_raw.side_effect = xadd_capped_raw
+        abort_event = MagicMock(spec=threading.Event)
+        abort_event.wait.side_effect = lambda timeout: False
+
+        _publish_result_with_retry(
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "1-1",
+            abort_event=abort_event,
+        )
+
+        # The dead-letter write happened and the secret is redacted.
+        all_payloads = dead_letter_payloads or [
+            c.args[1] for c in mock_redis.xadd_capped.call_args_list if "dead" in str(c).lower()
+        ]
+        assert all_payloads, "expected a dead-letter write after all retries failed"
+        for payload in all_payloads:
+            assert "super-secret-refresh-token" not in str(payload)
+            if "credential_update" in payload:
+                assert payload["credential_update"] == "[REDACTED]"
+
     def test_succeeds_on_first_attempt(self, sample_task):
         """Returns True and calls xadd_capped once when the first attempt succeeds."""
         mock_redis = MagicMock()

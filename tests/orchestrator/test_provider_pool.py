@@ -380,3 +380,72 @@ def test_high_concurrency_mixed_providers_with_exhaustion_and_redaction():
     assert "grok-secret" not in pool_repr
     for e in entries:
         assert "secret" not in e.identity()
+
+
+# ---------------------------------------------------------------------------
+# Credential write-back (OAuth-blob providers: Grok/Codex)
+# ---------------------------------------------------------------------------
+
+
+def _grok_entry(blob: str = "orig-blob") -> ProviderEntry:
+    return ProviderEntry(provider="grok", credential=blob)
+
+
+def test_effective_credential_returns_original_without_override():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    assert pool.effective_credential(entry) == "orig"
+
+
+def test_apply_credential_update_overrides_published_credential():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+
+    ident = pool.apply_credential_update("t1", "rotated-blob", minted_at=100.0)
+    assert ident == entry.identity()
+    # Published credential now reflects the rotated blob...
+    assert pool.effective_credential(entry) == "rotated-blob"
+    # ...but the entry identity (pool anchor) is unchanged.
+    assert pool.next_entry().identity() == entry.identity()
+
+
+def test_apply_credential_update_ignores_stale_minted_at():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+    assert pool.apply_credential_update("t1", "newer", minted_at=200.0) == entry.identity()
+    # An older update must not clobber the newer blob.
+    pool.register_task("t2", entry)
+    assert pool.apply_credential_update("t2", "older", minted_at=150.0) is None
+    assert pool.effective_credential(entry) == "newer"
+
+
+def test_apply_credential_update_unknown_task_is_noop():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    assert pool.apply_credential_update("never-registered", "blob", minted_at=1.0) is None
+    assert pool.effective_credential(entry) == "orig"
+
+
+def test_apply_credential_update_empty_blob_is_noop():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+    assert pool.apply_credential_update("t1", "", minted_at=1.0) is None
+    assert pool.effective_credential(entry) == "orig"
+
+
+def test_seed_credential_override_restores_on_startup():
+    """A persisted override (loaded at startup) is applied to the matching entry."""
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.seed_credential_override(entry.identity(), "restored-blob", minted_at=50.0)
+    assert pool.effective_credential(entry) == "restored-blob"
+
+
+def test_seed_credential_override_ignores_unknown_identity():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.seed_credential_override("identity-from-removed-config", "x", minted_at=1.0)
+    assert pool.effective_credential(entry) == "orig"

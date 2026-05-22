@@ -69,6 +69,14 @@ class ProviderPool:
         self._cooldowns: dict[str, datetime] = {}  # identity -> UTC expiry
         self._task_identities: dict[str, str] = {}  # task_id -> identity
         self._identity_to_entry: dict[str, ProviderEntry] = {e.identity(): e for e in entries}
+        # Credential write-back overrides (OAuth-blob providers like Grok/Codex).
+        # identity -> (latest_blob, minted_at). The identity is the STABLE anchor
+        # (hash of the original config credential); the blob is the rotated token
+        # the CLI refreshed in place. effective_credential() consults this so
+        # publishes use the latest blob without changing the entry's identity.
+        # Persistence to Redis lives in the orchestrator, not here (this class
+        # stays Redis-free per the pool boundary).
+        self._credential_overrides: dict[str, tuple[str, float]] = {}
         self._lock = threading.RLock()
 
     @classmethod
@@ -231,6 +239,54 @@ class ProviderPool:
         with self._lock:
             ident = self._task_identities.get(task_id)
             return self._identity_to_entry.get(ident) if ident else None
+
+    # ------------------------------------------------------------------
+    # Credential write-back (OAuth-blob providers: Grok, Codex)
+    # ------------------------------------------------------------------
+
+    def effective_credential(self, entry: ProviderEntry) -> str:
+        """Credential to actually publish for *entry*: the latest rotated blob
+        if one was written back, else the original config credential.
+
+        The entry's identity() (and thus all pool tracking) stays anchored to
+        the original config credential; only the published value differs.
+        """
+        with self._lock:
+            override = self._credential_overrides.get(entry.identity())
+            return override[0] if override else entry.credential
+
+    def apply_credential_update(self, task_id: str, blob: str, minted_at: float) -> str | None:
+        """Record a rotated credential blob reported for *task_id*.
+
+        Keyed by the task's entry identity (the stable config anchor).
+        Last-write-wins by ``minted_at`` (a stale, out-of-order update is
+        ignored). Returns the identity if stored (so the caller can persist to
+        Redis), else None (no mapping for the task, empty blob, or stale).
+        """
+        if not blob:
+            return None
+        with self._lock:
+            ident = self._task_identities.get(task_id)
+            if ident is None or ident not in self._identity_to_entry:
+                return None
+            existing = self._credential_overrides.get(ident)
+            if existing is not None and existing[1] >= minted_at:
+                return None  # stale / duplicate
+            self._credential_overrides[ident] = (blob, minted_at)
+            return ident
+
+    def seed_credential_override(self, identity: str, blob: str, minted_at: float) -> None:
+        """Load a persisted credential override at startup (keyed by identity).
+        No-op if the identity isn't in this pool (config changed) or the blob is
+        empty. Last-write-wins by ``minted_at``.
+        """
+        if not blob or identity not in self._identity_to_entry:
+            return
+        with self._lock:
+            existing = self._credential_overrides.get(identity)
+            if existing is not None and existing[1] >= minted_at:
+                return
+            self._credential_overrides[identity] = (blob, minted_at)
 
     # ------------------------------------------------------------------
     # Legacy shims (so claude_tokens call sites continue to work after swap-in)

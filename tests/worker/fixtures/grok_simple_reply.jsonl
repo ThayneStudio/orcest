@@ -1,0 +1,22 @@
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" query"}
+{"type":"thought","data":" is"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"Reply"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" exactly"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" text"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" hello"}
+{"type":"thought","data":" from"}
+{"type":"thought","data":" gro"}
+{"type":"thought","data":"k"}
+{"type":"thought","data":"\"\n"}
+{"type":"text","data":"hello"}
+{"type":"text","data":" from"}
+{"type":"text","data":" gro"}
+{"type":"text","data":"k"}
+{"type":"end","stopReason":"EndTurn","sessionId":"019e5046-7b47-7d62-bb00-e296ff480e9a","requestId":"96a7187b-2ea0-4c5e-bfb2-1238385f7d3e"}
