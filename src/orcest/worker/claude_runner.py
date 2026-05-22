@@ -923,7 +923,6 @@ class ClaudeRunner(_BaseCliRunner):
             on_stderr=on_stderr,
             abort_event=abort_event,
             claude_token=claude_token,
-            model=effective_model,
             provider=provider,
             credential=credential,
             cmd_argv=cmd_argv,

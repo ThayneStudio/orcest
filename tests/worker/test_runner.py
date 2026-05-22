@@ -7,11 +7,14 @@ import shutil
 import pytest
 
 from orcest.shared.config import RunnerConfig
+from orcest.worker import _GrokPlaceholderRunner
+from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.claude_runner import ClaudeRunner
 from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.runner import (
     PROVIDER_REGISTRY,
     ProviderRecipe,
+    RunnerResult,
     create_runner,
     get_provider_recipe,
     get_unsupported_reason,
@@ -97,10 +100,30 @@ def test_provider_registry_contains_grok() -> None:
     assert isinstance(recipe, ProviderRecipe)
     assert recipe.binary == "grok"
     assert recipe.env_var == "XAI_API_KEY"
-    # PR 1 multi-runner refactor: every shipped entry carries a runner_cls.
-    # Grok currently points at ClaudeRunner as a placeholder until the
-    # dedicated GrokRunner ships in PR 3.
-    assert recipe.runner_cls is ClaudeRunner
+    # Grok uses a placeholder stub runner (not ClaudeRunner) until PR 3.
+    # The stub returns an immediate permanent FAILED so that installing the
+    # grok binary before the dedicated GrokRunner ships never produces
+    # confusing transient failures from ClaudeRunner's Claude-specific flags.
+    assert recipe.runner_cls is _GrokPlaceholderRunner
+    assert issubclass(recipe.runner_cls, _BaseCliRunner)
+
+
+@pytest.mark.unit
+def test_grok_placeholder_runner_returns_permanent_failed() -> None:
+    """_GrokPlaceholderRunner.run() returns a permanent (non-transient) FAILED."""
+    runner = _GrokPlaceholderRunner()
+    from pathlib import Path
+
+    result = runner.run(
+        prompt="dummy",
+        work_dir=Path("/tmp"),
+        token="tok",
+        timeout=60,
+    )
+    assert isinstance(result, RunnerResult)
+    assert result.success is False
+    assert result.transient is False
+    assert "rebake" in result.summary.lower() or "not yet implemented" in result.summary.lower()
 
 
 @pytest.mark.unit
