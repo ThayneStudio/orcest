@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    _GROK_VERSION,
     _NODE_MAJOR,
     _PLAYWRIGHT_MAJOR,
     _SUPABASE_VERSION,
@@ -220,10 +221,13 @@ class TestTemplateUserdata:
         assert "npm install -g bun" in runcmd
         assert "astral.sh/uv/install.sh" in runcmd
         assert "npm install -g wrangler" in runcmd
-        # Grok CLI: official installer fetched, self-contained binary copied to
-        # a system path so the orcest worker user can execute it.
+        # Grok CLI: official installer fetched, pinned version, self-contained
+        # binary copied to a system path so the orcest worker user can run it.
         assert "x.ai/cli/install.sh" in runcmd
         assert "/usr/local/bin/grok" in runcmd
+        assert _GROK_VERSION in runcmd
+        # No silent-failure swallow on the install (the original miss).
+        assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())

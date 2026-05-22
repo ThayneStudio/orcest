@@ -57,6 +57,11 @@ _SUPABASE_VERSION = "2.95.4"
 # between releases, so pin it and re-validate the GrokRunner parsers
 # (tests/worker/test_grok_runner.py) on bump.
 _GROK_VERSION = "0.1.216"
+# Optional SHA-256 of the grok installer script, to defend against a
+# compromised CDN/DNS executing arbitrary code as root at bake time. Empty =
+# skip (xAI publishes no checksum for the beta installer yet); set once a
+# trusted digest is known and the verify step becomes enforcing.
+_GROK_INSTALLER_SHA256 = ""
 
 
 def _template_versions_write_file() -> dict:
@@ -153,14 +158,25 @@ def _worker_tooling_runcmd() -> list[str]:
         # The installer drops the binary under /root/.grok/downloads and
         # symlinks it; copy the RESOLVED binary to /usr/local/bin so the
         # non-root orcest worker user can execute it. Pinned to _GROK_VERSION.
+        # NB: no `|| true` — a failed install must surface in the cloud-init
+        # log rather than silently shipping a template without the grok binary.
         "curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh",
+        # Optional integrity gate (no-op until _GROK_INSTALLER_SHA256 is set).
+        (
+            f'[ -z "{_GROK_INSTALLER_SHA256}" ] || '
+            f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -'
+        ),
         (
             "HOME=/root GROK_BIN_DIR=/root/.local/bin "
-            f"bash /tmp/grok-install.sh {_GROK_VERSION} || true"
+            f"bash /tmp/grok-install.sh {_GROK_VERSION}"
         ),
-        'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok 2>/dev/null || true',
-        "chmod 755 /usr/local/bin/grok 2>/dev/null || true",
+        'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
+        "chmod 755 /usr/local/bin/grok",
         "rm -f /tmp/grok-install.sh",
+        # Surface a missing binary in the cloud-init log (does not abort the
+        # bake — cloud-init runcmd has no set -e — but makes the failure
+        # visible; the live post-rebake check is the hard gate).
+        "command -v grok && grok --version",
         # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"
