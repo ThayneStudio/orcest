@@ -224,6 +224,7 @@ class TestTemplateUserdata:
         # Grok CLI: official installer fetched, pinned version, self-contained
         # binary copied to a system path so the orcest worker user can run it.
         assert "x.ai/cli/install.sh" in runcmd
+        assert _GROK_VERSION in runcmd
         assert "/usr/local/bin/grok" in runcmd
         assert _GROK_VERSION in runcmd
         # No silent-failure swallow on the install (the original miss).
