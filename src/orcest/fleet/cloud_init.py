@@ -160,7 +160,10 @@ def _worker_tooling_runcmd() -> list[str]:
         # non-root orcest worker user can execute it. Pinned to _GROK_VERSION.
         # NB: no `|| true` — a failed install must surface in the cloud-init
         # log rather than silently shipping a template without the grok binary.
-        "curl -fsSL --connect-timeout 30 --max-time 300 https://x.ai/cli/install.sh -o /tmp/grok-install.sh",
+        (
+            "curl -fsSL --connect-timeout 30 --max-time 300"
+            " https://x.ai/cli/install.sh -o /tmp/grok-install.sh"
+        ),
         # Optional integrity gate (no-op until _GROK_INSTALLER_SHA256 is set).
         (
             f'[ -z "{_GROK_INSTALLER_SHA256}" ] || '
