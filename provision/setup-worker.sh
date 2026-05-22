@@ -57,9 +57,27 @@ fi
 #
 # Adding any future provider: see docs/adding-a-provider.md.
 GROK_VERSION="0.1.216"
+# Optional: pin the installer's SHA-256 to defend against a compromised CDN /
+# DNS hijack executing arbitrary code at bake time. Leave empty to skip
+# verification (xAI does not yet publish a checksum for the beta installer);
+# set it once a trusted digest is known. Either way we download to a file
+# first rather than piping a (possibly partial) download straight into bash.
+GROK_INSTALLER_SHA256="${GROK_INSTALLER_SHA256:-}"
 if ! command -v grok &>/dev/null; then
     echo "Installing Grok CLI ${GROK_VERSION}..."
-    curl -fsSL https://x.ai/cli/install.sh | bash -s "${GROK_VERSION}" || true
+    _grok_installer="$(mktemp)"
+    if curl -fsSL https://x.ai/cli/install.sh -o "${_grok_installer}"; then
+        _grok_ok=1
+        if [ -n "${GROK_INSTALLER_SHA256}" ]; then
+            echo "${GROK_INSTALLER_SHA256}  ${_grok_installer}" | sha256sum -c - || _grok_ok=0
+        fi
+        if [ "${_grok_ok}" = "1" ]; then
+            bash "${_grok_installer}" "${GROK_VERSION}" || true
+        else
+            echo "Grok installer checksum mismatch — skipping install"
+        fi
+    fi
+    rm -f "${_grok_installer}"
     # The installer symlinks ~/.local/bin/grok -> ~/.grok/downloads/<binary>.
     # The worker runs as a systemd service whose PATH may not include
     # ~/.local/bin, so copy the resolved, self-contained binary to a system

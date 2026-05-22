@@ -162,6 +162,13 @@ class GrokRunner(_BaseCliRunner):
         except OSError:
             return None
         # Only surface a change (token refreshed/rotated in place).
-        if current.strip() and current != original:
-            return current
-        return None
+        if not current.strip() or current == original:
+            return None
+        # Guard against a partial/corrupt write (e.g. grok killed mid-refresh):
+        # never propagate an invalid blob — it would be persisted to Redis and
+        # brick the credential for every subsequent task until cleared by hand.
+        try:
+            json.loads(current)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return current

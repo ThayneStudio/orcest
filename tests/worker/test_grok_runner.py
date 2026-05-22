@@ -234,6 +234,16 @@ def test_extract_credential_update_detects_refresh(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_extract_credential_update_rejects_corrupt_blob(tmp_path) -> None:
+    """A partial/corrupt auth.json (e.g. grok killed mid-write) must NOT be
+    propagated — returning it would persist a credential that bricks all
+    subsequent tasks for that identity."""
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"key":"tok","refresh_to')  # truncated JSON
+    assert GrokRunner().extract_credential_update(auth, '{"key":"old"}') is None
+
+
+@pytest.mark.unit
 def test_extract_credential_update_none_when_unchanged(tmp_path) -> None:
     auth = tmp_path / "auth.json"
     blob = json.dumps({"key": "tok"})
