@@ -169,10 +169,7 @@ def _worker_tooling_runcmd() -> list[str]:
             f'[ -z "{_GROK_INSTALLER_SHA256}" ] || '
             f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -'
         ),
-        (
-            "HOME=/root GROK_BIN_DIR=/root/.local/bin "
-            f"bash /tmp/grok-install.sh {_GROK_VERSION}"
-        ),
+        (f"HOME=/root GROK_BIN_DIR=/root/.local/bin bash /tmp/grok-install.sh {_GROK_VERSION}"),
         'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
         "chmod 755 /usr/local/bin/grok",
         "rm -f /tmp/grok-install.sh",
