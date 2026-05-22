@@ -1,8 +1,13 @@
 """Runner protocol and factory for pluggable worker backends.
 
-Each backend (Claude, Gemini, Codex, etc.) implements the Runner protocol.
-Workers are configured with a backend (which stream to subscribe to) and
-a runner (how to execute tasks).
+Each backend (Claude, Codex, Grok, ...) ships its own ``Runner`` subclass and
+its own ``ProviderRecipe`` entry in PROVIDER_REGISTRY. Workers are configured
+with a backend (which stream to subscribe to); per-task dispatch chooses the
+runner from the registry using ``task.provider``.
+
+The orchestrator never imports the registry — it only round-robins lean
+``ProviderEntry(provider, credential, model)`` and publishes tasks. Execution
+contracts live in this module + the per-provider runner files only.
 """
 
 from __future__ import annotations
@@ -18,60 +23,52 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from orcest.shared.config import RunnerConfig
+    from orcest.worker._runner_base import _BaseCliRunner
 
 
 @dataclass(frozen=True)
 class ProviderRecipe:
     """Image-baked execution recipe for a given provider (local to worker).
 
-    The orchestrator never sends recipes; `task.provider` is the sole opaque
-    lookup key. This lives in the worker image (or worker-local config) only.
+    The orchestrator never sends recipes; ``task.provider`` is the sole
+    opaque lookup key. This lives in the worker image (or worker-local
+    config) only.
+
+    ``runner_cls`` is the Runner subclass responsible for executing tasks
+    for this provider. Allowing None preserves backwards-compat for any
+    third-party recipe construction while the multi-runner refactor lands;
+    in practice every shipped entry sets it.
     """
 
     binary: str
     env_var: str
+    runner_cls: type[_BaseCliRunner] | None = None
 
 
 # PROVIDER_REGISTRY: the worker's local, image-baked dispatch table.
-# Keys are the opaque `task.provider` values sent by the orchestrator in Task.
+# Keys are the opaque ``task.provider`` values sent by the orchestrator.
 # The orchestrator is completely agnostic to binaries, env vars, flags, and
-# output formats — it only ever round-robins ProviderEntry(provider, credential, model).
-# Execution contract lives ONLY here and in the corresponding runner code
-# (claude_runner.py for the generic stream-json CLI path today).
+# output formats — it only ever round-robins ProviderEntry(provider,
+# credential, model).
 #
-# Adding a provider (see also provision/setup-worker.sh):
-#   1. Pick the provider name (e.g. "grok").
-#   2. Add a ProviderRecipe here with its baked binary name and the env var
-#      that will receive the per-task credential (injected via env, NEVER argv).
-#   3. Ensure the binary + any deps are installed by setup-worker.sh (and thus
-#      present after rebake).
-#   4. If the CLI uses different flags or produces different output for parsing
-#      exhaustion / results, extend the generic logic or add a dedicated runner.
+# This dict is declared empty here and SEEDED IN ``orcest/worker/__init__.py``
+# on package import. Doing the seeding in the package init avoids a circular
+# import: ``claude_runner`` imports ``ProviderRecipe`` from this module, so
+# importing ``ClaudeRunner`` from inside this module's load would deadlock.
 #
-# Grok execution contract (v1, Task 7):
-#   - provider name: "grok"
-#   - binary: "grok" (must be on $PATH inside the worker image)
-#   - env_var: "XAI_API_KEY" (receives the credential from Task.credential)
-#   - invocation (reuses generic path):
-#       grok --print --verbose --output-format stream-json \
-#            --dangerously-skip-permissions -p "<prompt>"
-#   - stdout: stream-json JSONL (or "result" envelope) for _extract_summary
-#   - exhaustion detection: reuses _is_usage_exhausted (stderr patterns) +
-#     _check_rate_limit_event (rate_limit_event + api_error_status 429) from
-#     claude_runner.  Real Grok CLI may emit different signals; extend the
-#     checks when the production binary contract is known.
-#   - credential handling: only via os.environ["XAI_API_KEY"] in the child;
-#     the parent worker process never logs it (see redaction in Task).
-#
-# Future providers follow the exact same pattern; no orchestrator changes.
-PROVIDER_REGISTRY: dict[str, ProviderRecipe] = {
-    "claude": ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN"),
-    "grok": ProviderRecipe(binary="grok", env_var="XAI_API_KEY"),
-}
+# Adding a provider (see also provision/setup-worker.sh and
+# docs/adding-a-provider.md):
+#   1. Pick the provider name (e.g. "codex").
+#   2. Implement a Runner subclass in src/orcest/worker/<name>_runner.py.
+#   3. Add a registry entry in src/orcest/worker/__init__.py with the baked
+#      binary name, env var, and Runner class.
+#   4. Ensure the binary + any deps are installed by setup-worker.sh and
+#      rebake the worker template.
+PROVIDER_REGISTRY: dict[str, ProviderRecipe] = {}
 
 
 def get_provider_recipe(provider: str) -> ProviderRecipe | None:
-    """Return the baked recipe for `provider`, or None if unknown to this image."""
+    """Return the baked recipe for ``provider``, or None if unknown."""
     return PROVIDER_REGISTRY.get(provider)
 
 
@@ -80,11 +77,15 @@ def get_unsupported_reason(provider: str) -> str | None:
 
     Covers both "unknown provider" (not in registry) and "missing binary"
     (in registry but CLI not found in $PATH). Used for early graceful reject.
+
+    A registered entry with ``binary == ""`` is treated as "no baked binary
+    required" — useful for in-process runners like ``noop`` that don't shell
+    out at all.
     """
     recipe = PROVIDER_REGISTRY.get(provider)
     if recipe is None:
         return f'unknown provider "{provider}"'
-    if shutil.which(recipe.binary) is None:
+    if recipe.binary and shutil.which(recipe.binary) is None:
         return f'missing binary "{recipe.binary}" for provider "{provider}"'
     return None
 
@@ -99,8 +100,8 @@ class RunnerResult:
     rate_limit_resets_at: int = 0  # Unix timestamp when rate limit resets (0 = unknown)
     transient: bool = False
     # Set when the worker's agent explicitly reported a genuine human-decision
-    # blocker (a `NEEDS_HUMAN:` line). This is the only signal that warrants the
-    # orcest:needs-human label -- orcest never infers it from failure counts.
+    # blocker (a ``NEEDS_HUMAN:`` line). This is the only signal that warrants
+    # the orcest:needs-human label -- orcest never infers it from failure counts.
     needs_human: bool = False
     needs_human_reason: str = ""
 
@@ -108,11 +109,13 @@ class RunnerResult:
 class Runner(Protocol):
     """Protocol for task execution backends.
 
-    Generalized for multi-provider: callers now pass `provider` + `credential`
-    (the lean Task surface). Legacy `claude_token` is still accepted for
-    transition. Implementations must use the local PROVIDER_REGISTRY (via
-    provider name) to select binary + env var for credential injection.
-    Credentials are *never* passed on argv, only via environment.
+    Callers pass ``provider`` + ``credential`` (the lean Task surface). Legacy
+    ``claude_token`` is still accepted for transition. Implementations must
+    use the local PROVIDER_REGISTRY to select binary + env var for credential
+    injection. Credentials are never passed on argv, only via environment.
+
+    ``model`` is the optional per-task model override. When empty, the runner
+    falls back to its instance default (configured via ``RunnerConfig.model``).
     """
 
     def run(
@@ -128,11 +131,17 @@ class Runner(Protocol):
         claude_token: str = "",
         provider: str = "claude",
         credential: str = "",
+        model: str = "",
     ) -> RunnerResult: ...
 
 
 def create_runner(config: RunnerConfig) -> Runner:
-    """Create a runner instance from configuration."""
+    """Create a runner instance from configuration.
+
+    This factory still drives the worker's *default* runner (used by tests
+    and the ``noop`` path). Per-task dispatch via PROVIDER_REGISTRY happens
+    in ``worker/loop.py:_execute_task`` and supersedes this for real tasks.
+    """
     if config.type == "claude":
         from orcest.worker.claude_runner import ClaudeRunner
 
@@ -152,3 +161,7 @@ def create_runner(config: RunnerConfig) -> Runner:
         return NoopRunner(duration)
     else:
         raise ValueError(f"Unknown runner type: {config.type!r}")
+
+
+# Registry seeding happens in ``orcest/worker/__init__.py`` (see comment on
+# PROVIDER_REGISTRY above for why).

@@ -79,6 +79,7 @@ class TestWorkerIsolation:
             claude_token="",
             provider="claude",
             credential="",
+            model="",
         ):
             """Wrap NoopRunner.run to track concurrent executions."""
             with count_lock:
@@ -97,6 +98,7 @@ class TestWorkerIsolation:
                     claude_token=claude_token,
                     provider=provider,
                     credential=credential,
+                    model=model,
                 )
             finally:
                 with count_lock:
@@ -120,6 +122,7 @@ class TestWorkerIsolation:
                 task_type=TaskType.FIX_CI,
                 repo="owner/testrepo",
                 token="fake",
+                provider="noop",
                 resource_type="pr",
                 resource_id=pr_number,
                 prompt=f"Task {i}",
@@ -235,6 +238,7 @@ class TestWorkerIsolation:
             claude_token="",
             provider="claude",
             credential="",
+            model="",
         ):
             with count_lock:
                 active_count["value"] += 1
@@ -252,6 +256,7 @@ class TestWorkerIsolation:
                     claude_token=claude_token,
                     provider=provider,
                     credential=credential,
+                    model=model,
                 )
             finally:
                 with count_lock:
@@ -282,6 +287,7 @@ class TestWorkerIsolation:
                 task_type=TaskType.FIX_CI,
                 repo="owner/testrepo",
                 token="fake",
+                provider="noop",
                 resource_type="pr",
                 resource_id=pr_number,  # Different PR per worker!
                 prompt=f"Task for PR {pr_number}",
@@ -352,6 +358,7 @@ class TestWorkerIsolation:
                 task_type=TaskType.FIX_CI,
                 repo="owner/testrepo",
                 token="fake",
+                provider="noop",
                 resource_type="pr",
                 resource_id=1,  # Same PR!
                 prompt=f"Task {i}",
@@ -537,6 +544,7 @@ class TestWorkerIsolation:
             task_type=TaskType.FIX_CI,
             repo="owner/testrepo",
             token="fake",
+            provider="noop",
             resource_type="pr",
             resource_id=pr_number,
             prompt="This should be skipped",
@@ -550,6 +558,7 @@ class TestWorkerIsolation:
             task_type=TaskType.FIX_CI,
             repo="owner/testrepo",
             token="fake",
+            provider="noop",
             resource_type="pr",
             resource_id=pr_number + 1,  # Different PR
             prompt="This should succeed",

@@ -40,6 +40,7 @@ from orcest.shared.models import (
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.runner import (
+    PROVIDER_REGISTRY,
     Runner,
     RunnerResult,
     create_runner,
@@ -73,6 +74,32 @@ _FAILURE_CONCLUSIONS = frozenset(
 )
 _CI_DECISIONS = frozenset({"ci_failure"})
 _REVIEW_DECISIONS = frozenset({"changes_requested", "followup_threads"})
+
+
+def _runner_for_task(task: Task, config: WorkerConfig, fallback: Runner) -> Runner:
+    """Return the Runner instance to execute ``task``.
+
+    Dispatch policy:
+      - When ``task.provider`` matches the worker's configured runner type
+        (the common case — a Claude worker receiving a Claude task), use
+        the pre-instantiated fallback. Avoids per-task instantiation and
+        preserves the contract that tests inject a runner via the fallback.
+      - When the provider differs and is registered in PROVIDER_REGISTRY
+        with a ``runner_cls``, instantiate that class fresh.
+      - Otherwise (unknown provider, or registered without a ``runner_cls``),
+        fall back. The early-reject in the main loop already filters
+        genuinely unknown providers before dispatch.
+    """
+    if task.provider == config.runner.type:
+        return fallback
+    recipe = PROVIDER_REGISTRY.get(task.provider)
+    if recipe is None or recipe.runner_cls is None:
+        return fallback
+    return recipe.runner_cls(
+        max_retries=config.runner.max_retries,
+        retry_backoff=config.runner.retry_backoff,
+        model=config.runner.model,
+    )
 
 
 def _check_gh_credentials(logger: logging.Logger) -> None:
@@ -1173,9 +1200,14 @@ def _execute_task(
             except Exception:
                 pass
 
-        # Run the configured backend (now provider-agnostic; binary+env chosen
-        # from the worker-local registry using task.provider).
-        runner_result: RunnerResult = runner.run(
+        # Per-task runner dispatch: select the Runner class baked into the
+        # registry entry for ``task.provider``. Falls back to the worker's
+        # configured default runner (so the ``noop`` path used in tests, and
+        # any legacy single-runner deployment, still works). Per-task model
+        # from ``task.model`` overrides the worker-wide default.
+        per_task_runner = _runner_for_task(task, config, fallback=runner)
+        effective_model = task.model or config.runner.model
+        runner_result: RunnerResult = per_task_runner.run(
             prompt=task.prompt,
             work_dir=work_dir,
             token=task.token,
@@ -1187,6 +1219,7 @@ def _execute_task(
             claude_token=task.claude_token,
             provider=task.provider,
             credential=task.credential,
+            model=effective_model,
         )
 
         duration = int(time.monotonic() - start)
