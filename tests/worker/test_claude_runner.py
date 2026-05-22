@@ -322,10 +322,10 @@ def test_build_env_claude_token_empty():
 
 @pytest.mark.unit
 def test_build_env_no_env_var_name():
-    """_build_env with env_var_name='' (default) injects no credential, failing loudly."""
+    """_build_env with env_var_name='' (default) silently skips credential injection."""
     env = _build_env("ghp_test", credential="sk-ant-oat01-test")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
-    assert "" not in env
+    assert "sk-ant-oat01-test" not in env.values()
 
 
 # ---------------------------------------------------------------------------

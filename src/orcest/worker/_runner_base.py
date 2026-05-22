@@ -231,7 +231,6 @@ class _BaseCliRunner(ABC):
         on_output: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         abort_event: threading.Event | None = None,
-        claude_token: str = "",
         provider: str = "",
         credential: str = "",
         model: str = "",
