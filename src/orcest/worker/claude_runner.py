@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -282,9 +284,6 @@ def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0
     Sends SIGTERM first to allow Claude to exit cleanly, waits up to
     ``sigterm_timeout`` seconds, then sends SIGKILL if still alive.
     """
-    import os
-    import signal
-
     try:
         pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError):

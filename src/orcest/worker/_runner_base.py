@@ -49,7 +49,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from orcest.worker.runner import RunnerResult
@@ -97,7 +97,7 @@ _NEEDS_HUMAN_RE = re.compile(r"(?m)^[ \t>]*NEEDS_HUMAN:[ \t]*([^\n]{1,300})")
 def _build_env(
     token: str,
     credential: str = "",
-    env_var_name: str = "CLAUDE_CODE_OAUTH_TOKEN",
+    env_var_name: str = "",
     extra_env_keys: set[str] | None = None,
 ) -> dict[str, str]:
     """Minimal environment for a provider subprocess.
@@ -120,12 +120,13 @@ def _build_env(
             env[key] = val
     env["GITHUB_TOKEN"] = token
     env["GH_TOKEN"] = token
-    if credential:
-        env[env_var_name] = credential
-    else:
-        parent_val = os.environ.get(env_var_name)
-        if parent_val:
-            env[env_var_name] = parent_val
+    if env_var_name:
+        if credential:
+            env[env_var_name] = credential
+        else:
+            parent_val = os.environ.get(env_var_name)
+            if parent_val:
+                env[env_var_name] = parent_val
     return env
 
 
@@ -168,7 +169,10 @@ class _BaseCliRunner(ABC):
 
     # Subclasses may opt to forward extra env keys (CLI-specific routing
     # flags) without polluting the global whitelist.
-    extra_env_keys: set[str] = set()
+    # Override with a new set literal in the subclass; never mutate at runtime
+    # (e.g. self.extra_env_keys.add(…)) — that mutates the base-class set and
+    # silently affects all other subclasses.
+    extra_env_keys: ClassVar[set[str]] = set()
 
     # When True, the prompt is piped on stdin rather than placed in argv.
     # Codex's `codex exec ... -` uses this. Claude/Grok use ``-p <prompt>``
