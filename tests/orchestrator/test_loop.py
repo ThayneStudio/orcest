@@ -3489,3 +3489,51 @@ def test_full_multi_provider_flow_exhaust_one_continue_on_other(
     # skip counter should now be >0
     raw2 = fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY)
     assert raw2 is not None and int(raw2) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Credential write-back persistence (rotated OAuth blobs survive restart)
+# ---------------------------------------------------------------------------
+
+
+def test_credential_override_persist_and_load_round_trip(fake_redis_client):
+    """A rotated blob persisted to Redis is restored into a fresh pool at
+    startup (simulating an orchestrator restart) — not reverting to the
+    stale config blob."""
+    import logging
+
+    from orcest.orchestrator.loop import (
+        _load_credential_overrides,
+        _persist_credential_override,
+    )
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    logger = logging.getLogger("test")
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    ident = entry.identity()
+
+    # Worker reported a rotated blob; orchestrator persisted it.
+    _persist_credential_override(fake_redis_client, ident, "rotated-blob", 123.0, logger)
+
+    # Fresh pool from the SAME config (restart) starts with the config blob...
+    pool = ProviderPool([entry])
+    assert pool.effective_credential(entry) == "config-blob"
+    # ...then load from Redis restores the rotated blob.
+    _load_credential_overrides(fake_redis_client, pool, logger)
+    assert pool.effective_credential(entry) == "rotated-blob"
+
+
+def test_credential_override_load_ignores_corrupt_entries(fake_redis_client):
+    import logging
+
+    from orcest.orchestrator.loop import _CREDENTIAL_OVERRIDES_KEY, _load_credential_overrides
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    fake_redis_client.hset(_CREDENTIAL_OVERRIDES_KEY, entry.identity(), "not-json{")
+    pool = ProviderPool([entry])
+    _load_credential_overrides(fake_redis_client, pool, logging.getLogger("test"))
+    # Corrupt entry skipped; falls back to the config blob (no crash).
+    assert pool.effective_credential(entry) == "config-blob"

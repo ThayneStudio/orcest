@@ -591,7 +591,10 @@ def generate_env_file(
 
 
 def generate_orchestrator_config(
-    repo: str, key_prefix: str, task_key_prefix: str = "orcest"
+    repo: str,
+    key_prefix: str,
+    task_key_prefix: str = "orcest",
+    extra_providers: list[str] | None = None,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
 
@@ -599,10 +602,21 @@ def generate_orchestrator_config(
     and the project's key prefix for namespace isolation. The
     ``task_key_prefix`` is the shared prefix used for the task stream
     that workers read from.
+
+    ``extra_providers`` lists non-claude provider names the org has
+    credentials for (e.g. ["grok"]). Each is emitted as a declarative
+    ``providers:`` entry with an empty credential, so the orchestrator
+    resolves the value from the generated ``.env`` via the env-var fallback
+    (``_PROVIDER_ENV_CANDIDATES`` in shared/config.py — e.g. XAI_API_KEY for
+    grok). Claude is intentionally omitted: it is synthesized from
+    CLAUDE_CODE_OAUTH_TOKENS by the legacy path and coexists with this list.
     """
-    config = {
+    config: dict = {
         "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
         "task_key_prefix": task_key_prefix,
         "github": {"repo": repo},
     }
+    providers = [p for p in sorted(extra_providers or []) if p and p != "claude"]
+    if providers:
+        config["providers"] = [{"provider": p, "credential": "", "model": ""} for p in providers]
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

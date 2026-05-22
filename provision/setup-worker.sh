@@ -39,56 +39,61 @@ if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
 
-# Grok (xAI) CLI — Task 7 enablement (first non-Claude provider)
+# Grok (xAI Grok Build) CLI — provider "grok".
 # ----------------------------------------------------------------
-# Execution contract (strictly worker-side; see PROVIDER_REGISTRY in
-# src/orcest/worker/runner.py — the orchestrator never knows these details):
+# Execution + auth contract lives worker-side in
+# src/orcest/worker/grok_runner.py (GrokRunner). The orchestrator stays
+# agnostic; see PROVIDER_REGISTRY in src/orcest/worker/runner.py.
 #
-#   binary="grok", env_var="XAI_API_KEY"
-#   Command line used by the generic runner (claude_runner.py):
-#       grok --print --verbose --output-format stream-json \
-#            --dangerously-skip-permissions -p "<full prompt>"
-#   Credential: injected only as $XAI_API_KEY in the child env (never argv,
-#   never logged).
-#   Output expectations for v1: stream-json JSONL on stdout (for summary
-#   extraction) and rate-limit/usage signals either on stderr or as
-#   rate_limit_event objects (reuses existing parsing helpers).
+# Auth is NOT baked here. GrokRunner.prepare_credential writes the per-task
+# SuperGrok OAuth blob to $HOME/.grok/auth.json at run time (Path B), so grok
+# authenticates unattended off the subscription — no XAI_API_KEY, no login.
+# We only bake the self-contained binary; the credential arrives per task in
+# the Task payload.
 #
-# How to add any future provider (complete runbook):
-#   See the dedicated step-by-step guide: docs/adding-a-provider.md
-#   (and docs/rollout-multi-provider.md for the overall sequencing).
+# Pinned version: Grok Build is beta and its streaming-json event schema can
+# shift between releases. Bump deliberately and re-validate the GrokRunner
+# parsers (tests/worker/test_grok_runner.py) when upgrading.
 #
-#   Summary (worker image owns execution; orchestrator is agnostic):
-#   1. Decide the opaque lowercase provider name (e.g. "grok", "gemini").
-#   2. Add ONE line to PROVIDER_REGISTRY in src/orcest/worker/runner.py
-#      (binary + env_var). This is the *only* dispatch table.
-#   3. Add an install/verify block here (so `setup-worker.sh` + rebake
-#      includes the CLI and the verification list succeeds).
-#   4. Generalize claude_runner.py _build_cmd / parsers only if the new
-#      provider's output contract differs (still driven by registry).
-#   5. `orcest fleet rebake` (or manual) → new worker template.
-#   6. Add a declarative entry under providers: in the orchestrator YAML
-#      (credential may be "" to use the env var on the orchestrator host
-#      and/or workers). No orchestrator Python changes ever required.
-#   7. Test mixed-project skew: old workers cleanly reject with permanent
-#      FAILED + "rebake ... to include <name> CLI".
-#
-# Because a production-ready `grok` coding-agent CLI package is not yet
-# published (unlike the Anthropic one), we deliberately do *not* install a
-# real binary here.  A worker image without "grok" in $PATH will cause
-# get_unsupported_reason("grok") to return a non-None value; any Grok task
-# will be early-rejected with a permanent FAILED result whose summary tells
-# the operator to "Rebake worker image to include grok CLI".
-# This is the intended graceful behaviour for version skew.
-#
-# When a real grok package becomes available, replace the comment block below
-# with an actual `curl | bash` or `npm install -g` (or dpkg) step exactly
-# like the claude block, then rebake.
+# Adding any future provider: see docs/adding-a-provider.md.
+GROK_VERSION="0.1.216"
+# Optional: pin the installer's SHA-256 to defend against a compromised CDN /
+# DNS hijack executing arbitrary code at bake time. Leave empty to skip
+# verification (xAI does not yet publish a checksum for the beta installer);
+# set it once a trusted digest is known. Either way we download to a file
+# first rather than piping a (possibly partial) download straight into bash.
+GROK_INSTALLER_SHA256="${GROK_INSTALLER_SHA256:-}"
+if ! command -v grok &>/dev/null; then
+    echo "Installing Grok CLI ${GROK_VERSION}..."
+    _grok_installer="$(mktemp)"
+    if curl -fsSL https://x.ai/cli/install.sh -o "${_grok_installer}"; then
+        _grok_ok=1
+        if [ -n "${GROK_INSTALLER_SHA256}" ]; then
+            echo "${GROK_INSTALLER_SHA256}  ${_grok_installer}" | sha256sum -c - || _grok_ok=0
+        fi
+        if [ "${_grok_ok}" = "1" ]; then
+            bash "${_grok_installer}" "${GROK_VERSION}" || true
+        else
+            echo "Grok installer checksum mismatch — skipping install"
+        fi
+    fi
+    rm -f "${_grok_installer}"
+    # The installer symlinks ~/.local/bin/grok -> ~/.grok/downloads/<binary>.
+    # The worker runs as a systemd service whose PATH may not include
+    # ~/.local/bin, so copy the resolved, self-contained binary to a system
+    # path. (Verified: grok needs only the binary + a per-task auth.json; no
+    # bundled runtime dir.)
+    GROK_BIN="$(readlink -f "${HOME}/.local/bin/grok" 2>/dev/null || true)"
+    if [ -n "${GROK_BIN}" ] && [ -x "${GROK_BIN}" ]; then
+        sudo cp "${GROK_BIN}" /usr/local/bin/grok
+        sudo chmod 755 /usr/local/bin/grok
+    fi
+fi
 if command -v grok &>/dev/null; then
-    echo "Grok CLI detected on PATH (custom or future package install)"
+    echo "Grok CLI present: $(grok --version 2>/dev/null | head -1)"
 else
-    echo "Grok CLI not present — Grok-backed tasks will be cleanly rejected"
-    echo "  with a permanent FAILED + rebake instruction (by design for Task 7)."
+    echo "WARNING: Grok CLI install failed — Grok tasks will be cleanly rejected"
+    echo "  with a permanent FAILED + rebake instruction until the binary is present."
 fi
 
 # Install Docker Engine
@@ -177,6 +182,14 @@ for cmd in python3 node claude gh git docker go; do
         exit 1
     fi
 done
+# grok is verified softly: it's beta, and a missing binary degrades gracefully
+# (grok tasks early-reject with a rebake instruction) rather than breaking the
+# whole worker image.
+if command -v grok &>/dev/null; then
+    echo "  grok: ok"
+else
+    echo "  grok: MISSING (grok-backed tasks will be cleanly rejected)"
+fi
 ORCEST_BIN="$WORKSPACE_DIR/venv/bin/orcest"
 if [[ -x "$ORCEST_BIN" ]]; then
     echo "  orcest: ok"
