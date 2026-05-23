@@ -193,6 +193,11 @@ def _safe_bool(value: Any, field_name: str) -> bool:
 _PROVIDER_ENV_CANDIDATES: dict[str, list[str]] = {
     "grok": ["XAI_API_KEY", "GROK_API_KEY", "XAI_API_TOKEN"],
     "claude": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    # codex exec specifically reads CODEX_API_KEY (NOT OPENAI_API_KEY) for
+    # headless API auth; OPENAI_API_KEY is kept as a last-resort fallback
+    # for env-resolution only (the worker still injects CODEX_API_KEY since
+    # that's the recipe env_var).
+    "codex": ["CODEX_API_KEY", "OPENAI_API_KEY"],
 }
 
 

@@ -10,6 +10,7 @@ than at the bottom of ``runner.py``) avoids a top-of-module circular import:
 from __future__ import annotations
 
 from orcest.worker.claude_runner import ClaudeRunner
+from orcest.worker.codex_runner import CodexRunner
 from orcest.worker.grok_runner import GrokRunner
 from orcest.worker.runner import PROVIDER_REGISTRY, ProviderRecipe
 
@@ -26,6 +27,16 @@ PROVIDER_REGISTRY["grok"] = ProviderRecipe(
     binary="grok",
     env_var="XAI_API_KEY",
     runner_cls=GrokRunner,
+)
+
+# Codex (OpenAI Codex CLI). Primary auth is the ChatGPT OAuth blob written to
+# ~/.codex/auth.json by CodexRunner.prepare_credential (Path B, mirrors grok);
+# env_var is the API-key fallback for funded OpenAI API users. Codex exec uses
+# CODEX_API_KEY specifically (NOT OPENAI_API_KEY) for headless API auth.
+PROVIDER_REGISTRY["codex"] = ProviderRecipe(
+    binary="codex",
+    env_var="CODEX_API_KEY",
+    runner_cls=CodexRunner,
 )
 
 # Noop: registered so integration / stress tests that publish noop-provider

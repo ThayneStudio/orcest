@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    _CODEX_VERSION,
     _GROK_VERSION,
     _NODE_MAJOR,
     _PLAYWRIGHT_MAJOR,
@@ -248,6 +249,13 @@ class TestTemplateUserdata:
             if "sha256sum" in str(c) and "bash /tmp/grok-install.sh" in str(c) and "&&" in str(c)
         ]
         assert gated, "grok checksum gate and install must be combined with && in one entry"
+        # Codex CLI (OpenAI codex-cli): pinned npm-global install, no
+        # silent-failure swallow, and verified as the orcest worker user so
+        # any exec-perms regression (mirroring the grok /root/.local/bin
+        # /root=0700 incident) surfaces at bake time, not first-task time.
+        assert f"npm install -g @openai/codex@{_CODEX_VERSION}" in runcmd
+        assert f"npm install -g @openai/codex@{_CODEX_VERSION} || true" not in runcmd
+        assert "sudo -u orcest -H bash -lc 'command -v codex && codex --version'" in runcmd
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())
@@ -326,6 +334,7 @@ class TestTemplateUserdata:
         assert f"playwright_major={_PLAYWRIGHT_MAJOR}" in content
         assert f"supabase_version={_SUPABASE_VERSION}" in content
         assert f"grok_version={_GROK_VERSION}" in content
+        assert f"codex_version={_CODEX_VERSION}" in content
         assert "bumped_at=" in content
 
     def test_template_versions_bumped_at_is_iso_timestamp(self):
