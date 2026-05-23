@@ -9,9 +9,14 @@ services:
       - GH_TOKEN=${GITHUB_TOKEN}
       - CLAUDE_CODE_OAUTH_TOKEN
       - CLAUDE_CODE_OAUTH_TOKENS
-      # Multi-provider support (populated via fleet org provider_credentials + generate_env_file)
+      # Multi-provider support (populated via fleet org provider_credentials + generate_env_file).
+      # Each new provider needs its canonical env var listed here for Docker
+      # Compose to passthrough (Compose only forwards explicitly-named env
+      # vars; otherwise the .env value never reaches the container).
       - XAI_API_KEY
       - GROK_API_KEY
+      - CODEX_API_KEY
+      - OPENAI_API_KEY
       - ORCEST_REDIS_HOST=redis
       - ORCEST_REDIS_KEY_PREFIX
     restart: unless-stopped
