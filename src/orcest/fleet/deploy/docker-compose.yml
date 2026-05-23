@@ -4,6 +4,13 @@ services:
     build: .
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
+      # Verbatim per-task trace archive. When ORCEST_TRACE_HOST_PATH is unset
+      # (default), this falls back to /dev/null — the in-container archiver
+      # probes writability at startup, sees it fail, and self-disables. When
+      # set to a directory, the archiver writes per-task .jsonl + .meta.json
+      # files there. Storage backend (NFS, local disk, anything) is opaque to
+      # orcest; the operator mounts whatever they want at ORCEST_TRACE_HOST_PATH.
+      - ${ORCEST_TRACE_HOST_PATH:-/dev/null}:/var/lib/orcest/traces
     environment:
       - GITHUB_TOKEN
       - GH_TOKEN=${GITHUB_TOKEN}

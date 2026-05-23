@@ -766,11 +766,13 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             project_name=project_name,
             claude_tokens=org.claude_oauth_tokens,
             provider_credentials=getattr(org, "provider_credentials", None),
+            trace_archive_host_path=cfg.trace_archive_host_path,
         )
         config_yaml = generate_orchestrator_config(
             repo=repo,
             key_prefix=project_name,
             extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
+            trace_archive_enabled=bool(cfg.trace_archive_host_path),
         )
         write_project_files(ssh_target, project_name, env_content, config_yaml)
         console.print("  Project files written [green]ok[/green]")
@@ -942,6 +944,19 @@ def update(config: str) -> None:
             console.print(f"[yellow]failed: {exc}[/yellow]")
 
     console.print("\n[bold]Fleet update complete.[/bold]")
+
+    # Surface the known config-regen gap: fleet update only rebuilds the
+    # image and restarts containers; it does NOT regenerate per-project
+    # .env / orchestrator.yaml files. New top-level fleet settings (like
+    # trace_archive_host_path) won't take effect on existing projects until
+    # they're re-onboarded or their config files are regenerated manually.
+    if cfg.trace_archive_host_path:
+        console.print(
+            "\n[yellow]Note:[/yellow] trace_archive_host_path is set in fleet config, "
+            "but `fleet update` does not regenerate per-project .env / orchestrator.yaml. "
+            "Re-onboard each project (or run a generate_env_file/generate_orchestrator_config "
+            "sweep) for the archiver to actually run."
+        )
 
 
 @fleet.command()

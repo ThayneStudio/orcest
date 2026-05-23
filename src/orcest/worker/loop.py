@@ -52,7 +52,7 @@ RESULTS_STREAM = "results"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
-_STREAM_MAXLEN = 2000
+_STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB across 4 workers)
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
@@ -1104,6 +1104,7 @@ def _execute_task(
                     "type": "task_end",
                     "task_id": task.id,
                     "status": status.value,
+                    "worker_id": config.worker_id,
                 },
                 maxlen=_STREAM_MAXLEN,
             )
@@ -1111,7 +1112,10 @@ def _execute_task(
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
 
     try:
-        # Publish task start marker (non-critical; don't fail the task)
+        # Publish task start marker (non-critical; don't fail the task).
+        # Extra fields (repo, resource_type, resource_id, provider, worker_id)
+        # let the trace archiver materialize a .meta.json sidecar without
+        # cross-referencing the results stream.
         try:
             redis.xadd_capped(
                 output_stream,
@@ -1119,6 +1123,12 @@ def _execute_task(
                     "type": "task_start",
                     "task_id": task.id,
                     "resource": f"{task.resource_type} #{task.resource_id}",
+                    "repo": task.repo,
+                    "resource_type": task.resource_type,
+                    "resource_id": str(task.resource_id),
+                    "provider": task.provider or config.runner.type,
+                    "worker_id": config.worker_id,
+                    "branch": task.branch or "",
                 },
                 maxlen=_STREAM_MAXLEN,
             )
