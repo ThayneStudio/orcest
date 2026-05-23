@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
@@ -1117,3 +1118,233 @@ def check_github_token() -> None:
         else:
             click.echo("Token validation failed", err=True)
     raise SystemExit(result.returncode)
+
+
+def _resolve_archive_root(archive_root: str | None) -> Path:
+    """Return the archive root path or exit with a helpful message.
+
+    Precedence: CLI flag > ORCEST_TRACE_ARCHIVE_ROOT env var > fleet config
+    (``/etc/orcest/config.yaml``: ``trace_archive_host_path``).
+    """
+    import os as _os
+
+    if archive_root:
+        return Path(archive_root)
+    env_value = _os.environ.get("ORCEST_TRACE_ARCHIVE_ROOT")
+    if env_value:
+        return Path(env_value)
+    try:
+        from orcest.fleet.config import load_config as _load_fleet_config
+
+        cfg = _load_fleet_config()
+        if cfg.trace_archive_host_path:
+            return Path(cfg.trace_archive_host_path)
+    except Exception:
+        pass
+    click.echo(
+        "Error: archive root not found. Pass --archive-root, set "
+        "ORCEST_TRACE_ARCHIVE_ROOT, or configure trace_archive_host_path in "
+        "/etc/orcest/config.yaml.",
+        err=True,
+    )
+    raise SystemExit(1)
+
+
+_TRACE_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+
+
+def _trace_paths_for_task(root: Path, task_id: str) -> tuple[Path, Path] | None:
+    """Resolve (jsonl_path, meta_path) for a task_id using the index pointer.
+
+    Returns None if the task is unknown OR if the index pointer would direct
+    us outside ``root`` (defense against a hostile pointer file planted on a
+    multi-tenant share).
+    """
+    if not _TRACE_TASK_ID_RE.match(task_id):
+        return None
+    pointer = root / "index" / "by-task-id" / task_id[:2] / task_id
+    try:
+        rel = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not rel:
+        return None
+    try:
+        root_resolved = root.resolve(strict=False)
+        jsonl = (root / rel / f"{task_id}.jsonl").resolve(strict=False)
+        meta = (root / rel / f"{task_id}.meta.json").resolve(strict=False)
+    except OSError:
+        return None
+    if not jsonl.is_relative_to(root_resolved) or not meta.is_relative_to(root_resolved):
+        return None
+    return jsonl, meta
+
+
+@main.command("trace")
+@click.argument("identifier", required=False)
+@click.option("--meta", "show_meta", is_flag=True, help="Print the .meta.json sidecar.")
+@click.option(
+    "--pr",
+    "pr_ref",
+    default=None,
+    help="Find the most recent task for a PR. Format: 'owner/repo#NUMBER'.",
+)
+@click.option(
+    "--list",
+    "list_project",
+    default=None,
+    help="List archived task IDs in this project (newest first).",
+)
+@click.option(
+    "--archive-root",
+    default=None,
+    help="Override the archive root (default: ORCEST_TRACE_ARCHIVE_ROOT or fleet config).",
+)
+@click.option("--raw", is_flag=True, help="Print raw JSONL instead of pretty-formatting it.")
+@click.option(
+    "--limit",
+    default=50,
+    type=int,
+    help="Max entries returned by --list (default: 50).",
+    show_default=False,
+)
+def trace(
+    identifier: str | None,
+    show_meta: bool,
+    pr_ref: str | None,
+    list_project: str | None,
+    archive_root: str | None,
+    raw: bool,
+    limit: int,
+) -> None:
+    """Inspect an archived worker trace.
+
+    Examples:
+        orcest trace 9a686e05-a81a-4d22-b17d-be7c17d17b0e
+        orcest trace 9a686e05-... --meta
+        orcest trace --pr bluebamboollc/bbr-platform#3546
+        orcest trace --list bbr-platform --limit 20
+
+    Note: this is not retroactive — only tasks completed after the archiver
+    was enabled appear here. Older traces that lived only in Redis are gone
+    once their stream MAXLEN trimmed them out.
+    """
+    import json as _json
+
+    from orcest.dashboard import format_stream_json_line
+
+    root = _resolve_archive_root(archive_root)
+    if not root.exists():
+        click.echo(f"Error: archive root {root} does not exist.", err=True)
+        raise SystemExit(1)
+
+    if list_project:
+        if limit <= 0:
+            click.echo("Error: --limit must be positive.", err=True)
+            raise SystemExit(1)
+        project_dir = root / list_project
+        if not project_dir.is_dir():
+            click.echo(f"Error: project '{list_project}' not found at {project_dir}", err=True)
+            raise SystemExit(1)
+        entries: list[tuple[float, Path]] = []
+        for meta_file in project_dir.rglob("*.meta.json"):
+            try:
+                mtime = meta_file.stat().st_mtime
+            except OSError:
+                continue
+            entries.append((mtime, meta_file))
+        entries.sort(reverse=True)
+        if not entries:
+            click.echo(f"(no archived traces in {list_project})")
+            return
+        console = Console(file=sys.stdout)
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("task_id")
+        table.add_column("when")
+        table.add_column("status")
+        table.add_column("resource")
+        for _, meta_file in entries[:limit]:
+            try:
+                meta = _json.loads(meta_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            task_id = str(meta.get("task_id", meta_file.stem.removesuffix(".meta")))
+            ended = str(meta.get("ended_at") or meta.get("started_at", ""))
+            status = str(meta.get("status", ""))
+            resource = (
+                f"{meta.get('resource_type', '')} #{meta.get('resource_id', '')}"
+                if meta.get("resource_id")
+                else ""
+            )
+            table.add_row(task_id, ended, status, resource)
+        console.print(table)
+        return
+
+    if pr_ref:
+        if "#" not in pr_ref:
+            click.echo("Error: --pr expects 'owner/repo#NUMBER' format.", err=True)
+            raise SystemExit(1)
+        repo, num_str = pr_ref.split("#", 1)
+        try:
+            num = int(num_str)
+        except ValueError:
+            click.echo(f"Error: PR number '{num_str}' is not an integer.", err=True)
+            raise SystemExit(1)
+        best: tuple[float, Path] | None = None
+        for meta_file in root.rglob("*.meta.json"):
+            try:
+                meta = _json.loads(meta_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if meta.get("repo") != repo:
+                continue
+            if meta.get("resource_type") != "pr":
+                continue
+            try:
+                if int(meta.get("resource_id", 0)) != num:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                mtime = meta_file.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, meta_file)
+        if best is None:
+            click.echo(f"No archived trace found for PR {pr_ref}.", err=True)
+            raise SystemExit(1)
+        identifier = best[1].stem.removesuffix(".meta")
+
+    if not identifier:
+        click.echo("Error: pass a task-id, --pr, or --list.", err=True)
+        raise SystemExit(1)
+
+    paths = _trace_paths_for_task(root, identifier)
+    if paths is None:
+        click.echo(f"No archived trace found for task {identifier}.", err=True)
+        raise SystemExit(1)
+    jsonl_path, meta_path = paths
+
+    if show_meta:
+        if not meta_path.exists():
+            click.echo(f"No .meta.json sidecar for task {identifier}.", err=True)
+            raise SystemExit(1)
+        click.echo(meta_path.read_text(encoding="utf-8"), nl=False)
+        return
+
+    if not jsonl_path.exists():
+        click.echo(f"No .jsonl file for task {identifier}.", err=True)
+        raise SystemExit(1)
+
+    if raw:
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                click.echo(line, nl=False)
+        return
+
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            formatted = format_stream_json_line(line.strip())
+            if formatted:
+                click.echo(formatted)

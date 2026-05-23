@@ -522,6 +522,7 @@ def generate_env_file(
     claude_tokens: list[str] | None = None,
     claude_token: str = "",
     provider_credentials: dict[str, list[str]] | None = None,
+    trace_archive_host_path: str | None = None,
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
@@ -552,6 +553,17 @@ def generate_env_file(
         "ORCEST_IMAGE='orcest:latest'",
         f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'",
     ]
+    if trace_archive_host_path:
+        _validate_env_value(trace_archive_host_path, "trace_archive_host_path")
+        if not trace_archive_host_path.startswith("/"):
+            # Compose bind-mount sources must be absolute; a relative value
+            # would silently bind ``./<value>`` from the per-project compose
+            # cwd, which is a footgun rather than a useful behavior.
+            raise ValueError(
+                "trace_archive_host_path must be an absolute path "
+                f"(got {trace_archive_host_path!r})"
+            )
+        lines.append(f"ORCEST_TRACE_HOST_PATH='{trace_archive_host_path}'")
 
     # Build a unified map: provider -> list of credentials
     creds: dict[str, list[str]] = {}
@@ -595,6 +607,7 @@ def generate_orchestrator_config(
     key_prefix: str,
     task_key_prefix: str = "orcest",
     extra_providers: list[str] | None = None,
+    trace_archive_enabled: bool = False,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
 
@@ -619,4 +632,8 @@ def generate_orchestrator_config(
     providers = [p for p in sorted(extra_providers or []) if p and p != "claude"]
     if providers:
         config["providers"] = [{"provider": p, "credential": "", "model": ""} for p in providers]
+    if trace_archive_enabled:
+        # In-container path; the operator bind-mounts whatever filesystem they
+        # want at ORCEST_TRACE_HOST_PATH on the host side (see docker-compose.yml).
+        config["trace_archive_path"] = "/var/lib/orcest/traces"
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

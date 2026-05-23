@@ -113,6 +113,11 @@ class OrchestratorConfig:
     providers: list[ProviderEntry] = field(default_factory=list)
     # Top-level providers parsed from YAML (inherited deduped into each project's
     # providers list, or used for the single legacy project in fallback mode).
+    # Absolute path on the orchestrator process where verbatim per-task traces
+    # are archived. None disables the archiver (default; behavior identical
+    # to pre-archive). Storage backend (NFS, local disk, etc.) is opaque to
+    # orcest — operator mounts whatever they want at this path.
+    trace_archive_path: str | None = None
 
 
 @dataclass
@@ -627,6 +632,15 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         or redis_config.key_prefix
     )
 
+    # Optional verbatim-trace archive path. YAML null or absent → archiver disabled.
+    trace_archive_raw = raw.get("trace_archive_path")
+    if trace_archive_raw is None or (
+        isinstance(trace_archive_raw, str) and not trace_archive_raw.strip()
+    ):
+        trace_archive_path: str | None = None
+    else:
+        trace_archive_path = _safe_str(trace_archive_raw, "trace_archive_path").strip()
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -643,6 +657,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         stale_pending_timeout_seconds=stale_pending_timeout_seconds,
         task_key_prefix=task_key_prefix,
         providers=top_providers,
+        trace_archive_path=trace_archive_path,
     )
 
     # Validate required fields

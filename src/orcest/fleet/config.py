@@ -172,6 +172,12 @@ class FleetConfig:
     orgs: dict[str, OrgEntry] = field(default_factory=dict)
     projects: list[ProjectEntry] = field(default_factory=list)
     pool: PoolConfig = field(default_factory=PoolConfig)
+    # Optional absolute path on the orchestrator VM where verbatim per-task
+    # traces are archived. ``None`` disables archiving (orchestrator falls back
+    # to today's Redis-only output stream). When set, ``generate_env_file``
+    # emits ``ORCEST_TRACE_HOST_PATH`` and ``generate_orchestrator_config``
+    # emits ``trace_archive_path`` per project.
+    trace_archive_host_path: str | None = None
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -306,12 +312,19 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     # so call ``validate_vmid_ranges`` only when we have a usable range.
     pool.validate_vmid_ranges()
 
+    trace_archive_host_path_raw = data.get("trace_archive_host_path")
+    if isinstance(trace_archive_host_path_raw, str) and trace_archive_host_path_raw.strip():
+        trace_archive_host_path: str | None = trace_archive_host_path_raw.strip()
+    else:
+        trace_archive_host_path = None
+
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
         orgs=orgs,
         projects=projects,
         pool=pool,
+        trace_archive_host_path=trace_archive_host_path,
     )
 
 
@@ -366,6 +379,9 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "snippet_storage": config.pool.snippet_storage,
         },
     }
+
+    if config.trace_archive_host_path:
+        data["trace_archive_host_path"] = config.trace_archive_host_path
 
     # Atomic write: write to temp file then rename, with restrictive permissions
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")

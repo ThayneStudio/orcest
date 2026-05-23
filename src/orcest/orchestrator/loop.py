@@ -47,6 +47,7 @@ from orcest.orchestrator.task_publisher import (
     publish_rebase_task,
     rerun_all_transient_ci,
 )
+from orcest.orchestrator.trace_archiver import TraceArchiver
 from orcest.orchestrator.usage_check import get_token_reset_time
 from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
@@ -685,6 +686,18 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     pending_task_ttl = compute_pending_task_ttl(config.runner)
 
+    # Trace archiver: tails output:* streams to per-task files on
+    # config.trace_archive_path. Start silently disables when path is unset,
+    # so it's safe to construct unconditionally.
+    repo_to_project = {p.repo: p.key_prefix for p in config.projects if p.repo and p.key_prefix}
+    trace_archiver = TraceArchiver(
+        redis=redis,
+        archive_path=config.trace_archive_path,
+        repo_to_project=repo_to_project,
+        logger=logger,
+    )
+    trace_archiver.start()
+
     repos = ", ".join(p.repo for p in config.projects) if config.projects else "(none)"
     logger.info(
         "Orchestrator started. Projects: %s, poll interval: %ds",
@@ -713,6 +726,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
                 break
             time.sleep(1)
 
+    trace_archiver.shutdown()
     logger.info("Orchestrator shut down cleanly.")
 
 
