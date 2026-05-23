@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"019e5221-fake-7401-rate-limit"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"Internal error: exceeded retry limit, last status: 429 Too Many Requests"}}

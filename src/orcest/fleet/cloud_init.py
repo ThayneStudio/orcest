@@ -63,6 +63,12 @@ _GROK_VERSION = "0.1.216"
 # trusted digest is known and the verify step becomes enforcing.
 _GROK_INSTALLER_SHA256 = ""
 
+# OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
+# template rebakes are reproducible; the experimental JSON event vocabulary
+# parsed by CodexRunner (tests/worker/test_codex_runner.py) is tied to this
+# version, so re-validate fixtures + parser on bump.
+_CODEX_VERSION = "0.131.0"
+
 
 def _template_versions_write_file() -> dict:
     """Build the cloud-init write_files entry for ``/etc/orcest/template.versions``.
@@ -84,6 +90,7 @@ def _template_versions_write_file() -> dict:
         f"playwright_major={_PLAYWRIGHT_MAJOR}\n"
         f"supabase_version={_SUPABASE_VERSION}\n"
         f"grok_version={_GROK_VERSION}\n"
+        f"codex_version={_CODEX_VERSION}\n"
         f"bumped_at={bumped_at}\n"
     )
     return {
@@ -142,8 +149,8 @@ def _docker_install_runcmd(*, include_compose_plugin: bool = False) -> list[str]
 def _worker_tooling_runcmd() -> list[str]:
     """Commands to install worker tooling.
 
-    Installs (in order): Node, Docker, Claude CLI, Grok CLI, gh, Supabase CLI,
-    Playwright + Chromium, Deno, Bun, uv, wrangler.
+    Installs (in order): Node, Docker, Claude CLI, Grok CLI, Codex CLI, gh,
+    Supabase CLI, Playwright + Chromium, Deno, Bun, uv, wrangler.
     """
     return [
         # Node.js: NodeSource channel for the configured major version.
@@ -194,6 +201,21 @@ def _worker_tooling_runcmd() -> list[str]:
         # orcest user (the worker's runtime user) so this also catches the
         # exec-permission regression above — not just root visibility.
         "sudo -u orcest -H bash -lc 'command -v grok && grok --version'",
+        # Codex CLI (OpenAI codex-cli): published as an npm package
+        # ``@openai/codex`` — version-pinned for reproducible rebakes. The
+        # CodexRunner JSON event parser (tests/worker/test_codex_runner.py)
+        # is tied to this version; re-validate fixtures on bump.
+        # Auth is per-task: an OAuth blob written to ~/.codex/auth.json by
+        # CodexRunner.prepare_credential (Path B), never baked into the
+        # template. No silent-failure swallow (no `|| true`): a bad install
+        # must surface in the cloud-init log rather than ship a broken image.
+        f"npm install -g @openai/codex@{_CODEX_VERSION}",
+        # Defense in depth: ``npm i -g`` symlinks /usr/local/bin/codex into
+        # /usr/local/lib/node_modules — world-readable by default, but in
+        # case a future Node packaging quirk drops perms (mirroring the grok
+        # /root/.local/bin exec-perms regression), verify as the orcest
+        # worker user, not root, so any such regression is loud at bake.
+        "sudo -u orcest -H bash -lc 'command -v codex && codex --version'",
         # gh CLI: GitHub apt repo, stable channel.
         (
             "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg"

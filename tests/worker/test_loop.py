@@ -3073,29 +3073,26 @@ class TestRunnerForTask:
         # RunnerConfig.model flows through to the freshly-instantiated runner.
         assert runner.model == "some-test-model"
 
-    def test_unregistered_provider_falls_back_to_workers_runner(
+    def test_codex_provider_dispatches_to_codex_runner(
         self, local_worker_config, sample_task, monkeypatch
     ):
-        """Worker configured for claude, task for an unregistered provider →
-        fallback (the worker's claude runner). Captures the real PR-1/PR-2
-        skew window: until codex is in the registry, a stray codex task
-        falls back to the worker's ClaudeRunner. ClaudeRunner.run on a codex
-        task will fail with an auth error (CODEX_API_KEY vs Claude env var),
-        but the dispatch itself is well-defined.
+        """Codex registration regression: once ``codex`` is in
+        PROVIDER_REGISTRY, a task with ``provider="codex"`` must instantiate
+        CodexRunner — never fall back to ClaudeRunner, which would 401
+        against codex auth (Claude OAuth header vs CODEX_API_KEY /
+        ~/.codex/auth.json). The previous version of this test asserted the
+        opposite ("codex not in registry, falls back"); flipped here when
+        the registration landed."""
+        from orcest.worker.codex_runner import CodexRunner
 
-        Today this is identical to the "unknown provider" path. When PR 2
-        registers codex, this test should grow to assert "fallback iff codex
-        not registered" — keep the explicit name to make the regression
-        easy to find.
-        """
-        # 'codex' is intentionally NOT in PROVIDER_REGISTRY in PR 1.
-        assert "codex" not in PROVIDER_REGISTRY
+        assert "codex" in PROVIDER_REGISTRY
         monkeypatch.setattr(sample_task, "provider", "codex")
         fallback = MagicMock()
 
         runner = _runner_for_task(sample_task, local_worker_config, fallback)
 
-        assert runner is fallback
+        assert isinstance(runner, CodexRunner)
+        assert runner is not fallback
 
     def test_unknown_provider_falls_back(self, local_worker_config, sample_task, monkeypatch):
         """Provider absent from the registry → use the fallback.
