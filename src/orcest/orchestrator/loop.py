@@ -607,6 +607,40 @@ def _back_off_pr_retries(
     )
 
 
+def _load_fleet_repo_to_project_map(logger: logging.Logger) -> dict[str, str]:
+    """Best-effort load of repo→project_name from a mounted fleet config.
+
+    The orchestrator container has only its own per-project view; when fleet
+    config is also bind-mounted (see docker-compose.yml), this gives the
+    archiver visibility into ALL projects so per-project subdirectories are
+    chosen correctly instead of falling back to ``unknown/``. Silently returns
+    an empty mapping if the file is absent or unparseable — orcest still works
+    in single-project / unmounted setups.
+    """
+    candidates = [
+        "/home/orcest/app/config/fleet.yaml",
+        "/etc/orcest/config.yaml",
+    ]
+    for path in candidates:
+        try:
+            from orcest.fleet.config import load_config
+
+            fleet_cfg = load_config(path)
+        except Exception:
+            continue
+        if not fleet_cfg.projects:
+            continue
+        mapping = {p.repo: p.name for p in fleet_cfg.projects if p.repo and p.name}
+        if mapping:
+            logger.info(
+                "Loaded fleet repo→project map from %s: %d project(s)",
+                path,
+                len(mapping),
+            )
+            return mapping
+    return {}
+
+
 def run_orchestrator(config: OrchestratorConfig) -> None:
     """Main orchestrator entry point. Polls GitHub in a loop."""
     logger = setup_logging("orchestrator", "main")
@@ -690,6 +724,12 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     # config.trace_archive_path. Start silently disables when path is unset,
     # so it's safe to construct unconditionally.
     repo_to_project = {p.repo: p.key_prefix for p in config.projects if p.repo and p.key_prefix}
+    # Best-effort enrichment from fleet config (mounted into the container by
+    # docker-compose.yml when the trace archive is enabled). Each per-project
+    # orchestrator only sees its own ProjectConfig; the fleet config carries
+    # ALL projects so traces from other projects get the right key_prefix
+    # subdirectory instead of falling to the ``unknown/`` bucket.
+    repo_to_project.update(_load_fleet_repo_to_project_map(logger))
     trace_archiver = TraceArchiver(
         redis=redis,
         archive_path=config.trace_archive_path,

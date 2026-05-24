@@ -11,6 +11,13 @@ services:
       # files there. Storage backend (NFS, local disk, anything) is opaque to
       # orcest; the operator mounts whatever they want at ORCEST_TRACE_HOST_PATH.
       - ${ORCEST_TRACE_HOST_PATH:-/dev/null}:/var/lib/orcest/traces
+      # Optional fleet config read-only mount. When present, the archiver
+      # builds a global repo→project map from it so traces for projects
+      # other than this orchestrator's own land under the right project
+      # directory (instead of the ``unknown/`` fallback). Falls back to
+      # /dev/null when the host file is missing; the loader silently
+      # skips on parse error.
+      - ${ORCEST_FLEET_CONFIG_PATH:-/dev/null}:/home/orcest/app/config/fleet.yaml:ro
     environment:
       - GITHUB_TOKEN
       - GH_TOKEN=${GITHUB_TOKEN}
