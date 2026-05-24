@@ -564,6 +564,11 @@ def generate_env_file(
                 f"(got {trace_archive_host_path!r})"
             )
         lines.append(f"ORCEST_TRACE_HOST_PATH='{trace_archive_host_path}'")
+        # Mount the fleet config into the orchestrator container so the
+        # archiver can build a global repo→project map. /etc/orcest/config.yaml
+        # is the canonical location on the orchestrator VM (already populated
+        # by ``upload_fleet_config`` for the pool manager).
+        lines.append("ORCEST_FLEET_CONFIG_PATH='/etc/orcest/config.yaml'")
 
     # Build a unified map: provider -> list of credentials
     creds: dict[str, list[str]] = {}
