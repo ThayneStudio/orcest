@@ -14,10 +14,11 @@ services:
       # Optional fleet config read-only mount. When present, the archiver
       # builds a global repo→project map from it so traces for projects
       # other than this orchestrator's own land under the right project
-      # directory (instead of the ``unknown/`` fallback). Falls back to
-      # /dev/null when the host file is missing; the loader silently
-      # skips on parse error.
-      - ${ORCEST_FLEET_CONFIG_PATH:-/dev/null}:/home/orcest/app/config/fleet.yaml:ro
+      # directory (instead of the ``unknown/`` fallback). Mounted outside
+      # the read-only /home/orcest/app/config dir to avoid the OCI
+      # read-only-mountpoint error. Falls back to /dev/null when the host
+      # file is missing; the loader silently skips on parse error.
+      - ${ORCEST_FLEET_CONFIG_PATH:-/dev/null}:/home/orcest/fleet-config.yaml:ro
     environment:
       - GITHUB_TOKEN
       - GH_TOKEN=${GITHUB_TOKEN}

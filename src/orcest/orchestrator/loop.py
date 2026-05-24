@@ -618,6 +618,7 @@ def _load_fleet_repo_to_project_map(logger: logging.Logger) -> dict[str, str]:
     in single-project / unmounted setups.
     """
     candidates = [
+        "/home/orcest/fleet-config.yaml",
         "/home/orcest/app/config/fleet.yaml",
         "/etc/orcest/config.yaml",
     ]
