@@ -794,6 +794,44 @@ def get_issue(repo: str, number: int, token: str) -> dict:
         raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
 
 
+def get_issue_state(repo: str, number: int, token: str) -> str:
+    """Return "open" / "closed" / "missing" for a single issue.
+
+    Lighter than `get_issue` — only the `state` field is requested.
+    "missing" is returned when gh reports the issue cannot be found,
+    so callers can treat deleted / wrong-number references as non-blocking.
+    """
+    _validate_repo(repo)
+    try:
+        output = _run_gh(
+            [
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "state",
+            ],
+            token,
+        )
+    except GhCliError as exc:
+        stderr_lc = (exc.stderr or "").lower()
+        if "could not resolve" in stderr_lc or "not found" in stderr_lc:
+            return "missing"
+        raise
+    if not output:
+        return "missing"
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+    state = (data.get("state") or "").lower()
+    if state in ("open", "closed"):
+        return state
+    return "missing"
+
+
 def add_issue_label(repo: str, number: int, label: str, token: str) -> None:
     """Add a label to an issue via REST API."""
     _validate_repo(repo)

@@ -6,10 +6,15 @@ with recommended actions.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from orcest.orchestrator import gh
+from orcest.orchestrator.issue_deps import (
+    fetch_blocker_states,
+    open_blockers,
+    parse_blocker_refs,
+)
 from orcest.shared.config import LabelConfig
 from orcest.shared.coordination import make_issue_lock_key, make_pending_task_key
 from orcest.shared.redis_client import RedisClient
@@ -30,6 +35,7 @@ class IssueAction(str, Enum):
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"
+    SKIP_DEPENDENCY = "skip_dependency"  # One or more prerequisite issues still open
 
 
 @dataclass
@@ -41,6 +47,7 @@ class IssueState:
     body: str
     action: IssueAction
     labels: list[str]
+    open_blockers: list[int] = field(default_factory=list)
 
 
 def _make_attempts_key(repo: str, issue_number: int) -> str:
@@ -114,7 +121,8 @@ def discover_actionable_issues(
     6. Skip if task already in flight (attempts > 0 with a pending marker)
     7. Clear orphaned attempts (attempts > 0 without a pending marker)
     8. Skip if task already pending in the queue
-    9. Everything else -> ENQUEUE_IMPLEMENT
+    9. Skip if any referenced blocker issue is still open
+    10. Everything else -> ENQUEUE_IMPLEMENT
     """
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
@@ -123,6 +131,10 @@ def discover_actionable_issues(
         label_config.blocked,
         label_config.needs_human,
     }
+
+    # Cache of blocker issue states for the duration of this discovery cycle.
+    # If 10 dependent issues all reference #5, we hit gh once.
+    blocker_state_cache: dict[int, str] = {}
 
     for issue_data in issues:
         number: int = issue_data["number"]
@@ -229,6 +241,26 @@ def discover_actionable_issues(
                 )
             )
             continue
+
+        # Skip if any referenced blocker issue is still open.
+        # Position matters: blocker resolution costs gh API calls, so it
+        # runs after all the cheap Redis skips.
+        blocker_refs = parse_blocker_refs(body)
+        if blocker_refs:
+            states = fetch_blocker_states(repo, blocker_refs, token, blocker_state_cache)
+            still_open = open_blockers(blocker_refs, states)
+            if still_open:
+                results.append(
+                    IssueState(
+                        number=number,
+                        title=title,
+                        body=body,
+                        action=IssueAction.SKIP_DEPENDENCY,
+                        labels=issue_labels,
+                        open_blockers=still_open,
+                    )
+                )
+                continue
 
         # Ready for implementation
         results.append(

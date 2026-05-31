@@ -451,6 +451,184 @@ def test_issue_body_none_defaults_to_empty_string(issue_gh_mock, fake_redis_clie
 
 
 # ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def issue_state_mock(mocker):
+    """Patch gh.get_issue_state (called via issue_deps)."""
+    return mocker.patch("orcest.orchestrator.gh.get_issue_state")
+
+
+def test_skip_dependency_when_blocker_is_open(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=200, body="Blocked by #101", labels=[]),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == [101]
+    issue_state_mock.assert_called_once_with(REPO, 101, TOKEN)
+
+
+def test_enqueue_when_blocker_is_closed(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=201, body="Blocked by #50", labels=[]),
+    ]
+    issue_state_mock.return_value = "closed"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+
+
+def test_enqueue_when_blocker_is_missing(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A deleted or wrong-number blocker reference should not defer the issue."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=205, body="Blocked by #99999", labels=[]),
+    ]
+    issue_state_mock.return_value = "missing"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+
+
+def test_skip_dependency_when_blocker_lookup_fails_transiently(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """Transient gh failures must fail-safe to deferral, not enqueue."""
+    import orcest.orchestrator.gh as gh_module
+
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=206, body="Blocked by #100", labels=[]),
+    ]
+    issue_state_mock.side_effect = gh_module.GhRateLimitError("rate limited")
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == [100]
+
+
+def test_closes_directive_does_not_block(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """`Closes #N` is an output, not a blocker — issue must still enqueue."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=202, body="Closes #999", labels=[]),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    issue_state_mock.assert_not_called()
+
+
+def test_shared_blocker_cache_dedupes_gh_calls(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """Two dependents on the same blocker only cost one gh lookup."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=210, body="Blocked by #1", labels=[]),
+        _make_issue_data(number=211, body="Depends on #1", labels=[]),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 2
+    assert all(r.action == IssueAction.SKIP_DEPENDENCY for r in results)
+    assert issue_state_mock.call_count == 1
+
+
+def test_mixed_blockers_open_and_closed(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=220, body="Blocked by #1 and depends on #2", labels=[]),
+    ]
+    issue_state_mock.side_effect = lambda repo, number, token: (
+        "closed" if number == 1 else "open"
+    )
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == [2]
+
+
+def test_dependency_check_runs_after_cheap_filters(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A locked issue must not incur a gh.get_issue_state call."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=230, body="Blocked by #1", labels=[]),
+    ]
+    fake_redis_client.set_ex(make_issue_lock_key(REPO, 230), "worker-1", 86400)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_LOCKED
+    issue_state_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Attempt helper functions
 # ---------------------------------------------------------------------------
 
