@@ -1713,6 +1713,13 @@ def _poll_project(
             )
         elif issue_state.action == IssueAction.SKIP_LABELED:
             logger.debug(f"Issue #{issue_state.number}: terminal label, skipping")
+        elif issue_state.action == IssueAction.SKIP_DEPENDENCY:
+            blockers = ", ".join(f"#{n}" for n in issue_state.open_blockers)
+            logger.info(
+                "Issue #%d: deferred, waiting on open blocker(s): %s",
+                issue_state.number,
+                blockers or "(unknown)",
+            )
         else:
             logger.warning(
                 f"Issue #{issue_state.number}: unhandled action {issue_state.action!r}, skipping"

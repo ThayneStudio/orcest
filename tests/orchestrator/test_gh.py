@@ -24,6 +24,7 @@ from orcest.orchestrator.gh import (
     get_ci_status,
     get_failed_run_logs,
     get_issue,
+    get_issue_state,
     get_pr,
     get_pr_diff,
     get_unresolved_review_threads,
@@ -198,6 +199,74 @@ def test_add_label_calls_correct_args(mocker):
     assert "api" in args_passed
     assert f"repos/{REPO}/issues/7/labels" in args_passed
     assert "labels[]=orcest:queued" in args_passed
+
+
+# ---------------------------------------------------------------------------
+# get_issue_state
+# ---------------------------------------------------------------------------
+
+
+def _run_completes_with(stdout: str) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=["gh"], returncode=0, stdout=stdout, stderr="")
+
+
+def test_get_issue_state_open(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=_run_completes_with('{"state":"OPEN"}'),
+    )
+    assert get_issue_state(REPO, 5, TOKEN) == "open"
+
+
+def test_get_issue_state_closed(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=_run_completes_with('{"state":"CLOSED"}'),
+    )
+    assert get_issue_state(REPO, 5, TOKEN) == "closed"
+
+
+def test_get_issue_state_unknown_value_returns_missing(mocker):
+    """A state value gh shouldn't emit normalizes to "missing" defensively."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=_run_completes_with('{"state":"DELETED"}'),
+    )
+    assert get_issue_state(REPO, 5, TOKEN) == "missing"
+
+
+def test_get_issue_state_empty_output_returns_missing(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=_run_completes_with(""),
+    )
+    assert get_issue_state(REPO, 5, TOKEN) == "missing"
+
+
+def test_get_issue_state_not_found_returns_missing(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "issue", "view"],
+            stderr="GraphQL: Could not resolve to an Issue with the number of 999.",
+        ),
+    )
+    assert get_issue_state(REPO, 999, TOKEN) == "missing"
+
+
+def test_get_issue_state_other_gh_failure_propagates(mocker):
+    """Non-NotFound failures (auth, network) re-raise so the caller can fail-safe."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "issue", "view"],
+            stderr="authentication required",
+        ),
+    )
+    with pytest.raises(GhCliError):
+        get_issue_state(REPO, 5, TOKEN)
 
 
 # ---------------------------------------------------------------------------

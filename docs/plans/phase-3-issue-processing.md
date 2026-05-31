@@ -18,10 +18,25 @@ Turn GitHub issues into working pull requests. Orcest picks up issues labeled `a
 
 ### Dependency Resolution + Topological Sort
 
-- Port the dependency resolution logic from the existing `ralph.sh` in bbr-platform
-- Parse issue references (`depends on #123`, `blocked by #456`) to build a dependency graph
-- Topological sort to determine implementation order
-- Skip issues whose dependencies are still open
+**Status: shipped (body-text variant, same-repo).** Implemented in
+`src/orcest/orchestrator/issue_deps.py` and wired into the
+`discover_actionable_issues()` cascade as `IssueAction.SKIP_DEPENDENCY`.
+
+Recognised reference patterns (case-insensitive, body only):
+`blocked by #N`, `depends on #N`, `requires #N`, `prerequisite[s]: #N`,
+`after #N {merges|lands|closes|ships|is done}`, and unchecked task-list
+items `- [ ] #N`. `Closes #N` / `Fixes #N` / `Resolves #N` are
+deliberately ignored — those are PR outputs, not prerequisites.
+
+Per-discovery-cycle cache de-duplicates `gh` calls when many dependents
+share a blocker.
+
+**Still future work** (intentionally deferred):
+- Topological sort / ordering — not needed today since workers run in
+  parallel and the next tick re-evaluates everything.
+- Cross-repo references (`owner/repo#N`).
+- Scanning issue comments in addition to the body.
+- GitHub native sub-issue / `tracked-by` GraphQL relationships.
 
 ### Claude Implementation
 
