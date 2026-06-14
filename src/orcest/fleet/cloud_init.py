@@ -274,12 +274,22 @@ def _worker_tooling_runcmd() -> list[str]:
 
 
 def _worker_workspace_runcmd() -> list[str]:
-    """Commands to set up the worker workspace directories."""
+    """Commands to set up the worker workspace directories.
+
+    Every ``/home/orcest`` directory listed in the worker unit's
+    ``ReadWritePaths`` (_WORKER_READ_WRITE_PATHS) MUST be created here: under
+    ``ProtectHome=read-only`` systemd (>=249) refuses to start a unit whose
+    ReadWritePaths target is missing, so an un-created .codex/.grok dir would
+    make every worker fail ``systemctl enable --now orcest-worker``.
+    """
     return [
         "mkdir -p /opt/orcest/workspaces",
         "chown -R orcest:orcest /opt/orcest",
-        "mkdir -p /home/orcest/.claude",
-        "mkdir -p /home/orcest/.cache",
+        # ReadWritePaths home targets — keep in sync with _WORKER_READ_WRITE_PATHS.
+        "mkdir -p /home/orcest/.claude",  # Claude CLI state
+        "mkdir -p /home/orcest/.cache",  # generic caches
+        "mkdir -p /home/orcest/.codex",  # CodexRunner writes auth.json
+        "mkdir -p /home/orcest/.grok",  # GrokRunner writes auth.json
         "chown -R orcest:orcest /home/orcest",
     ]
 
@@ -484,6 +494,15 @@ def render_clone_userdata(
             # is needed because the version number (0.1.0) doesn't change.
             "sudo -u orcest /opt/orcest/venv/bin/pip install -q --no-cache-dir"
             " --force-reinstall 'git+https://github.com/ThayneStudio/orcest.git'",
+            # Ensure every /home/orcest ReadWritePaths target exists BEFORE the
+            # unit is enabled. A warm template baked before .codex/.grok were
+            # added would otherwise be missing them, and under
+            # ProtectHome=read-only systemd refuses to start a unit whose
+            # ReadWritePaths target is absent -> the worker never boots. Keep in
+            # sync with _WORKER_READ_WRITE_PATHS / the systemd unit.
+            "mkdir -p /home/orcest/.claude /home/orcest/.cache"
+            " /home/orcest/.codex /home/orcest/.grok",
+            "chown -R orcest:orcest /home/orcest",
             "systemctl daemon-reload",
             "systemctl enable --now orcest-worker",
         ],

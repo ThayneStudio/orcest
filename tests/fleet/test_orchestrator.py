@@ -434,6 +434,80 @@ class TestRedisCliRoutedThroughDockerExec:
             assert "sudo docker exec orcest-redis-redis-1 redis-cli" in call[0][1]
 
 
+class TestUploadSource:
+    """M1-infra: the deploy build context must stage requirements.lock at its
+    root so the deploy Dockerfile's ``COPY requirements.lock .`` resolves.
+
+    The Dockerfile (src/orcest/fleet/deploy/Dockerfile) does
+    ``COPY requirements.lock .`` reading from the *context root*. upload_source
+    assembles that context; if requirements.lock is not staged at the root the
+    image build fails at the COPY. We also require the stale-file cleanup ``rm``
+    to remove a previously-extracted requirements.lock so a re-deploy does not
+    leave a stale lock behind.
+    """
+
+    def _ok(self, *a, **kw):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _run_upload(self, mocker):
+        """Drive upload_source with _ssh/_scp mocked; capture the tarball
+        members (the tarball still exists when _scp is invoked) and every
+        _ssh command string. Returns (tar_members, ssh_cmds)."""
+        import tarfile
+
+        from orcest.fleet import orchestrator as orch
+
+        ssh_cmds: list[str] = []
+        captured: dict[str, list[str]] = {}
+
+        def ssh_side_effect(target, cmd):
+            ssh_cmds.append(cmd)
+            return self._ok()
+
+        def scp_side_effect(src, dest_target, dest_path):
+            # The tarball is the build context; record its members.
+            with tarfile.open(src, "r:gz") as tf:
+                captured["members"] = tf.getnames()
+            return self._ok()
+
+        mocker.patch.object(orch, "_ssh", side_effect=ssh_side_effect)
+        mocker.patch.object(orch, "_scp", side_effect=scp_side_effect)
+        orch.upload_source("user@host")
+        return captured.get("members", []), ssh_cmds
+
+    def test_requirements_lock_staged_at_context_root(self, mocker):
+        members, _ = self._run_upload(mocker)
+        # tar was created with cwd=staging, so root-level files appear bare.
+        assert "requirements.lock" in members, (
+            "requirements.lock must be at the deploy context root for the "
+            f"Dockerfile COPY to resolve; got {members!r}"
+        )
+
+    def test_root_lock_not_only_the_source_tree_copy(self, mocker):
+        """The lock the Dockerfile COPYs is the one at the context root, not the
+        one nested under src/orcest/fleet/deploy/. Guard that the root copy is
+        present even though a nested copy also rides along in src/."""
+        members, _ = self._run_upload(mocker)
+        nested = [
+            m for m in members if m.endswith("requirements.lock") and m != "requirements.lock"
+        ]
+        # A nested copy under src/ may exist (package data) but is irrelevant to
+        # the COPY; the root copy is what matters and must be present.
+        assert "requirements.lock" in members
+        # Sanity: the nested copies (if any) live under src/, never at the root.
+        for m in nested:
+            assert m.startswith("src/"), f"unexpected non-root lock copy: {m!r}"
+
+    def test_cleanup_rm_removes_stale_requirements_lock(self, mocker):
+        _, ssh_cmds = self._run_upload(mocker)
+        rm_cmds = [c for c in ssh_cmds if c.startswith("cd /opt/orcest && rm -rf")]
+        assert rm_cmds, f"expected a stale-file cleanup rm; ssh cmds were {ssh_cmds!r}"
+        assert any("requirements.lock" in c for c in rm_cmds), (
+            "stale-file cleanup must remove a previously-deployed "
+            f"requirements.lock; got {rm_cmds!r}"
+        )
+
+
 class TestCleanPendingTasks:
     def _ok(self, *a, **kw):
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")

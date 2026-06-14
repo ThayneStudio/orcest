@@ -245,5 +245,8 @@ process.on("SIGINT", shutdown);
 // --- Start ---
 
 server.listen(PORT, () => {
-  console.log(`Orcest dashboard listening on http://0.0.0.0:${PORT}`);
+  // The container binds 0.0.0.0 internally, but the port is published on
+  // loopback only (docker-compose.dashboard.yml maps 127.0.0.1:PORT:PORT),
+  // so the dashboard is reachable solely via localhost. Log that.
+  console.log(`Orcest dashboard listening on http://127.0.0.1:${PORT}`);
 });
