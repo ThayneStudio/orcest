@@ -12,142 +12,17 @@ from orcest.fleet.cloud_init import (
     render_clone_userdata,
     render_orchestrator_userdata,
     render_template_userdata,
-    render_worker_userdata,
 )
 
 pytestmark = pytest.mark.unit
 
 
-def _render(**overrides):
-    defaults = {
-        "redis_host": "10.20.0.23",
-        "key_prefix": "orcest",
-        "worker_id": "worker-200",
-        "github_token": "ghp_fake",
-        "claude_oauth_token": "sk-ant-oat01-fake",
-        "repo": "ThayneStudio/orcest",
-    }
-    defaults.update(overrides)
-    return render_worker_userdata(**defaults)
-
-
-def test_output_starts_with_cloud_config_header():
-    """The rendered user-data must start with #cloud-config."""
-    output = _render()
-    assert output.startswith("#cloud-config\n")
-
-
-def test_output_is_valid_yaml():
-    """The rendered user-data is valid YAML after the header."""
-    output = _render()
-    data = yaml.safe_load(output)
-    assert isinstance(data, dict)
-
-
-def test_worker_yaml_in_write_files():
-    """The worker.yaml content is included in write_files."""
-    output = _render(redis_host="10.0.0.1", key_prefix="myproject")
-    data = yaml.safe_load(output)
-
-    worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
-    worker_cfg = yaml.safe_load(worker_file["content"])
-    assert worker_cfg["redis"]["host"] == "10.0.0.1"
-    assert worker_cfg["redis"]["port"] == 6379
-    assert worker_cfg["redis"]["key_prefix"] == "myproject"
-    assert worker_cfg["worker_id"] == "worker-200"
-
-
-def test_env_file_in_write_files():
-    """The .env file contains GITHUB_TOKEN and CLAUDE_CODE_OAUTH_TOKEN."""
-    output = _render(github_token="ghp_test123", claude_oauth_token="sk-test")
-    data = yaml.safe_load(output)
-
-    env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
-    assert "GITHUB_TOKEN=ghp_test123" in env_file["content"]
-    assert "CLAUDE_CODE_OAUTH_TOKEN=sk-test" in env_file["content"]
-    assert env_file["permissions"] == "0600"
-
-
-def test_systemd_unit_in_write_files():
-    """The systemd unit file is written to the correct path."""
-    output = _render()
-    data = yaml.safe_load(output)
-
-    unit_file = next(
-        f for f in data["write_files"] if f["path"] == "/etc/systemd/system/orcest-worker.service"
-    )
-    assert "ExecStart=/opt/orcest/venv/bin/orcest work" in unit_file["content"]
-    assert "NoNewPrivileges=yes" in unit_file["content"]
-
-
-def test_claude_json_onboarding_bypass():
-    """The .claude.json is written to bypass Claude CLI onboarding."""
-    output = _render()
-    data = yaml.safe_load(output)
-
-    claude_file = next(f for f in data["write_files"] if f["path"] == "/home/orcest/.claude.json")
-    assert "hasCompletedOnboarding" in claude_file["content"]
-
-
-def test_runcmd_installs_key_tools():
-    """runcmd entries install the full worker tooling stack."""
-    output = _render()
-    data = yaml.safe_load(output)
-    runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
-
-    assert f"setup_{_NODE_MAJOR}.x" in runcmd
-    assert "docker-ce" in runcmd
-    assert "claude-code" in runcmd
-    assert "gh" in runcmd
-    assert f"v{_SUPABASE_VERSION}" in runcmd
-    assert f"playwright@{_PLAYWRIGHT_MAJOR}" in runcmd
-    assert "deno.land/install.sh" in runcmd
-    assert "npm install -g bun" in runcmd
-    assert "astral.sh/uv/install.sh" in runcmd
-    assert "npm install -g wrangler" in runcmd
-
-
-def test_runcmd_supabase_url_is_static():
-    """Regression guard: Supabase install must NOT use the dynamic GitHub-API
-    fetch — every clone must get the same pinned bytes."""
-    output = _render()
-    data = yaml.safe_load(output)
-    runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
-    assert "api.github.com/repos/supabase" not in runcmd
-    assert f"supabase_{_SUPABASE_VERSION}_linux_" in runcmd
-
-
-def test_runcmd_installs_orcest_from_repo():
-    """runcmd installs orcest from the given GitHub repo."""
-    output = _render(repo="MyOrg/my-project")
-    data = yaml.safe_load(output)
-    runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
-
-    assert "git+https://github.com/MyOrg/my-project.git" in runcmd
-
-
-def test_runcmd_enables_worker_service():
-    """runcmd enables and starts the worker systemd service."""
-    output = _render()
-    data = yaml.safe_load(output)
-    runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
-
-    assert "systemctl enable --now orcest-worker" in runcmd
-
-
-def test_packages_include_golang():
-    """The packages list includes Go for worker toolchain."""
-    output = _render()
-    data = yaml.safe_load(output)
-    assert "golang-go" in data["packages"]
-
-
-def test_worker_no_ssh_keys():
-    """Workers are ephemeral — no SSH key injection."""
-    output = _render()
-    data = yaml.safe_load(output)
-    assert "ssh_authorized_keys" not in data
-    assert "ssh_authorized_keys" not in data["users"][1]
+# NOTE: the dead, secret-leaking ``render_worker_userdata`` and its
+# ``_render`` helper (plus ~13 tests that exercised it) were removed in M4 —
+# that path baked long-lived GitHub + Claude tokens into retrievable
+# cloud-init user-data. Equivalent coverage for the LIVE paths lives under
+# TestTemplateUserdata and TestCloneUserdata, and the regression guard
+# ``test_render_worker_userdata_removed`` keeps it deleted.
 
 
 # ── Orchestrator userdata tests ─────────────────────────────
@@ -436,13 +311,167 @@ class TestCloneUserdata:
                 )
 
 
-def test_worker_orcest_owned_writes_are_deferred():
-    """Bug 6: render_worker_userdata also defers orcest-owned write_files."""
-    output = _render()
-    data = yaml.safe_load(output)
-    for entry in data["write_files"]:
-        owner = entry.get("owner", "")
-        if owner.startswith("orcest"):
-            assert entry.get("defer") is True, (
-                f"write_files entry for {entry['path']} owned by {owner!r} must set defer=true"
-            )
+# ── M4: dead secret-leaking render_worker_userdata must stay deleted ──
+
+
+def test_render_worker_userdata_removed():
+    """M4: the dead render_worker_userdata (which baked long-lived GitHub +
+    Claude tokens into retrievable cloud-init user-data) must stay deleted so
+    it cannot be reintroduced. The live pool path is render_clone_userdata,
+    which carries no secrets.
+    """
+    import orcest.fleet.cloud_init as ci
+
+    assert not hasattr(ci, "render_worker_userdata"), (
+        "render_worker_userdata was re-added — it embeds GITHUB_TOKEN/"
+        "CLAUDE_CODE_OAUTH_TOKEN into cloud-init user-data retrievable from the VM"
+    )
+    # The shared systemd helper used by the live clone path must still exist.
+    assert hasattr(ci, "_systemd_unit")
+    assert hasattr(ci, "render_clone_userdata")
+
+    # And the live clone path must not embed those secret env vars.
+    clone = ci.render_clone_userdata(
+        redis_host="10.0.0.1", worker_id="orcest-worker-10009", key_prefix="orcest"
+    )
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in clone
+    assert "GITHUB_TOKEN" not in clone
+
+
+# ── M3: reconcile generated + static systemd unit to one hardened body ──
+
+
+def test_systemd_unit_hardening_reconciled():
+    """M3: the generated worker unit must carry BOTH the StartLimit fix AND the
+    full hardening (ProtectSystem/ProtectHome/ReadWritePaths), reconciled with
+    the static provision/systemd unit. ReadWritePaths must include the Grok and
+    Codex credential dirs or those providers EROFS under ProtectHome=read-only.
+    """
+    from pathlib import Path
+
+    from orcest.fleet.cloud_init import _systemd_unit
+
+    unit = _systemd_unit(worker_id="orcest-worker-10005")
+
+    # StartLimit fix (workers-die-on-Redis-restart bug).
+    assert "StartLimitBurst=10" in unit
+    assert "StartLimitIntervalSec=300" in unit
+    assert "StartLimitBurst=5" not in unit
+
+    # Filesystem hardening that the generated unit was missing.
+    assert "ProtectSystem=strict" in unit
+    assert "ProtectHome=read-only" in unit
+    assert "NoNewPrivileges=yes" in unit
+    assert "RestrictSUIDSGID=yes" in unit
+    assert "PrivateTmp=yes" in unit
+
+    # ReadWritePaths must cover every dir the worker + providers write at
+    # runtime, or ProtectHome/ProtectSystem break them.
+    rw_line = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
+    for needed in (
+        "/opt/orcest",
+        "/home/orcest/.claude",
+        "/home/orcest/.codex",
+        "/home/orcest/.grok",
+    ):
+        assert needed in rw_line, f"ReadWritePaths missing {needed}: {rw_line}"
+
+    # Optional EnvironmentFile so clone VMs (no .env) still start.
+    assert "EnvironmentFile=-/opt/orcest/.env" in unit
+
+    # The static provision unit must be reconciled to the same hardened values.
+    static = Path(__file__).resolve().parents[2] / "provision" / "systemd" / "orcest-worker.service"
+    static_text = static.read_text()
+    assert "StartLimitBurst=10" in static_text
+    assert "StartLimitBurst=5" not in static_text
+    assert "ProtectSystem=strict" in static_text
+    assert "ProtectHome=read-only" in static_text
+    static_rw = next(
+        line for line in static_text.splitlines() if line.startswith("ReadWritePaths=")
+    )
+    for needed in ("/home/orcest/.codex", "/home/orcest/.grok"):
+        assert needed in static_rw, f"static ReadWritePaths missing {needed}: {static_rw}"
+
+
+# ── M2-infra: grok installer SHA-256 gate must FAIL CLOSED when unset ──
+
+
+def test_grok_installer_gate_fails_closed_when_sha_unset(monkeypatch):
+    """M2: with no trusted Grok installer SHA-256 configured, the template must
+    NOT execute the curl'd installer as root. An empty digest must FAIL CLOSED
+    (skip the install), not short-circuit the checksum to true.
+    """
+    import orcest.fleet.cloud_init as ci
+
+    monkeypatch.delenv("ORCEST_GROK_INSTALLER_SHA256", raising=False)
+    monkeypatch.setattr(ci, "_GROK_INSTALLER_SHA256", "", raising=True)
+
+    runcmd = ci._worker_tooling_runcmd()
+    joined = "\n".join(str(c) for c in runcmd)
+
+    # The installer is still downloaded to a file (so a real digest CAN gate it)...
+    assert "https://x.ai/cli/install.sh -o /tmp/grok-install.sh" in joined
+    # ...but with no SHA configured it must NOT be executed.
+    assert "bash /tmp/grok-install.sh" in joined, "install command should be present but guarded"
+    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    # The empty-digest short-circuit `[ -z "" ] ||` must be GONE — that is the bug.
+    assert '[ -z "" ]' not in str(grok_entry)
+    # The execution must be gated behind a NON-empty-sha test that fails closed.
+    assert 'if [ -n ""' in str(grok_entry) or "SKIPPING grok install" in str(grok_entry), (
+        "empty SHA must skip the install, not run it unverified"
+    )
+
+
+def test_grok_installer_gate_enforces_sha_when_set(monkeypatch):
+    """M2: when a digest IS configured (via env override), the installer runs
+    only after a sha256sum -c check against that exact digest."""
+    import orcest.fleet.cloud_init as ci
+
+    fake_sha = "a" * 64
+    monkeypatch.setenv("ORCEST_GROK_INSTALLER_SHA256", fake_sha)
+
+    runcmd = ci._worker_tooling_runcmd()
+    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    s = str(grok_entry)
+    assert fake_sha in s
+    assert "sha256sum -c -" in s
+    # The install is conditional on the checksum passing.
+    assert s.index("sha256sum -c -") < s.index("bash /tmp/grok-install.sh")
+
+
+# ── M1: reproducible image builds — complete lock + Dockerfiles use it ──
+
+
+def test_requirements_lock_and_dockerfiles_are_reproducible():
+    """M1: requirements.lock must pin every declared runtime dependency
+    (incl. proxmoxer + requests), and both Dockerfiles must install from the
+    lock rather than re-resolving unpinned ranges out of pyproject.toml.
+    """
+    import re
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    lock = (root / "requirements.lock").read_text().lower()
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+    deps = pyproject["project"]["dependencies"]
+
+    # Every direct runtime dependency must appear (pinned with ==) in the lock.
+    for spec in deps:
+        name = re.split(r"[<>=!~\[ ]", spec, 1)[0].strip().lower()
+        assert name in lock, f"requirements.lock is missing direct dependency {name!r}"
+        assert f"{name}==" in lock, f"requirements.lock must PIN {name!r} with =="
+
+    # Specifically the two the audit flagged as missing.
+    assert "proxmoxer==" in lock
+    assert "requests==" in lock
+
+    # Both Dockerfiles must install from the lock, not parse pyproject deps.
+    for df in (root / "Dockerfile", root / "src" / "orcest" / "fleet" / "deploy" / "Dockerfile"):
+        text = df.read_text()
+        assert "pip install --no-cache-dir -r requirements.lock" in text, (
+            f"{df} must install pinned deps from requirements.lock"
+        )
+        assert "tomllib.load" not in text, (
+            f"{df} still resolves unpinned deps from pyproject.toml — non-reproducible"
+        )
