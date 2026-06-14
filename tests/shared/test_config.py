@@ -636,6 +636,71 @@ def test_null_integer_field_raises(tmp_path: Path):
         load_orchestrator_config(cfg_file)
 
 
+# -- task_key_prefix resolution -----------------------------------------------
+
+
+def test_task_key_prefix_null_falls_back_to_redis_key_prefix(tmp_path: Path):
+    """M2-logic: task_key_prefix: null in YAML must fall back to redis.key_prefix,
+    never the literal string 'None' (which would publish to an unconsumed
+    'None:tasks:*' stream).
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "redis:\n  key_prefix: myproj\n"
+        "task_key_prefix: null\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.task_key_prefix == "myproj"
+    assert config.task_key_prefix != "None"
+
+
+def test_task_key_prefix_empty_string_falls_back_to_redis_key_prefix(tmp_path: Path):
+    """M2-logic: an explicit empty-string task_key_prefix is falsy and must fall
+    back to redis.key_prefix (unchanged behavior)."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "redis:\n  key_prefix: myproj\n"
+        'task_key_prefix: ""\n'
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.task_key_prefix == "myproj"
+
+
+def test_task_key_prefix_explicit_value_passes_through(tmp_path: Path):
+    """A real task_key_prefix string overrides the redis.key_prefix fallback."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "redis:\n  key_prefix: myproj\n"
+        "task_key_prefix: shared-tasks\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.task_key_prefix == "shared-tasks"
+
+
+def test_task_key_prefix_env_overrides_yaml(tmp_path: Path, monkeypatch):
+    """ORCEST_TASK_KEY_PREFIX env var overrides the YAML value."""
+    monkeypatch.setenv("ORCEST_TASK_KEY_PREFIX", "env-tasks")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "redis:\n  key_prefix: myproj\n"
+        "task_key_prefix: yaml-tasks\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.task_key_prefix == "env-tasks"
+
+
 # -- Multi-project orchestrator config ----------------------------------------
 
 
@@ -900,6 +965,40 @@ def test_load_orchestrator_config_legacy_claude_synthesizes_provider_entries(tmp
     assert e.cli_binary is None
     assert e.env_var is None
     assert e.extras == {}
+
+
+def test_legacy_claude_token_not_double_registered_when_account_already_a_provider(
+    tmp_path: Path,
+):
+    """H3-logic: a claude account declared in providers: under an explicit model must
+    NOT be re-synthesized as a second model=None entry from claude_tokens (legacy).
+    Double registration would double the account's round-robin weight and give it an
+    independent exhaustion cooldown, defeating per-account rate-limit benching.
+    """
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n"
+        "  repo: acme/widgets\n"
+        "  claude_token: shared-acct\n"
+        "providers:\n"
+        "  - provider: claude\n"
+        "    credential: shared-acct\n"
+        "    model: opus\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    proj = config.projects[0]
+    claude_entries = [e for e in proj.providers if e.provider == "claude"]
+    # The same account must appear exactly once (the model=opus provider entry),
+    # NOT also as a synthesized model=None legacy entry.
+    assert len(claude_entries) == 1
+    only = claude_entries[0]
+    assert only.credential == "shared-acct"
+    assert only.model == "opus"
+    # And the single entry's account is unique across the whole providers list.
+    account_keys = [e.account_key() for e in proj.providers]
+    assert len(account_keys) == len(set(account_keys))
 
 
 def test_load_orchestrator_config_providers_list_from_yaml(tmp_path: Path):
