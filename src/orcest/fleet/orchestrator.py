@@ -523,6 +523,7 @@ def generate_env_file(
     claude_token: str = "",
     provider_credentials: dict[str, list[str]] | None = None,
     trace_archive_host_path: str | None = None,
+    redis_password: str = "",
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
@@ -553,6 +554,12 @@ def generate_env_file(
         "ORCEST_IMAGE='orcest:latest'",
         f"ORCEST_CONFIG_DIR='/opt/orcest/projects/{project_name}/config'",
     ]
+    if redis_password:
+        # C1: forwarded to the orchestrator container via docker-compose.yml so
+        # it can AUTH to the now-password-protected Redis. The same value backs
+        # the redis stack's --requirepass; the .env is written 0600.
+        _validate_env_value(redis_password, "redis_password")
+        lines.append(f"ORCEST_REDIS_PASSWORD='{redis_password}'")
     if trace_archive_host_path:
         _validate_env_value(trace_archive_host_path, "trace_archive_host_path")
         if not trace_archive_host_path.startswith("/"):

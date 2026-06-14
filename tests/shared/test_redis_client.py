@@ -876,3 +876,67 @@ def test_scan_iter_no_matches(fake_redis_client):
     fake_redis_client.sadd("myset", "val")
     keys = fake_redis_client.scan_iter("nonexistent:*")
     assert keys == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for xtrim_acked_entries (M1-conc)
+# ---------------------------------------------------------------------------
+
+
+def test_xtrim_acked_entries_keeps_unacked_and_reclaims_acked(fake_redis_client):
+    """M1-conc: trims delivered+ACKed entries up to the lowest still-pending id,
+    keeping the un-ACKed entry (and its credentials) plus anything after it."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    id1 = fake_redis_client.xadd(stream, {"token": "ghp_secret1"})
+    id2 = fake_redis_client.xadd(stream, {"token": "ghp_secret2"})
+    id3 = fake_redis_client.xadd(stream, {"token": "ghp_secret3"})
+    # Deliver all three to one consumer, then ACK only the first two.
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, count=10, block_ms=None)
+    fake_redis_client.xack(stream, group, id1)
+    fake_redis_client.xack(stream, group, id2)
+
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+
+    assert removed == 2  # id1, id2 reclaimed
+    assert fake_redis_client.xlen(stream) == 1  # id3 (un-ACKed) survives
+    # The surviving entry is exactly the still-pending one, creds intact.
+    survivors = fake_redis_client.xrevrange(stream, count=10)
+    assert [eid for eid, _ in survivors] == [id3]
+    assert survivors[0][1]["token"] == "ghp_secret3"
+
+
+def test_xtrim_acked_entries_does_not_trim_undelivered(fake_redis_client):
+    """M1-conc: never drop work nobody has read yet (last-delivered-id is 0-0)."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"token": "ghp_a"})
+    fake_redis_client.xadd(stream, {"token": "ghp_b"})
+    # Nothing delivered, nothing pending.
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+    assert removed == 0
+    assert fake_redis_client.xlen(stream) == 2
+
+
+def test_xtrim_acked_entries_reclaims_fully_drained_stream(fake_redis_client):
+    """M1-conc: when every delivered entry is ACKed (empty PEL), reclaim via
+    last-delivered-id so credentials don't linger forever."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"token": "ghp_a"})
+    id2 = fake_redis_client.xadd(stream, {"token": "ghp_b"})
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, count=10, block_ms=None)
+    fake_redis_client.xack(stream, group, fake_redis_client.xrevrange(stream, count=10)[1][0])
+    fake_redis_client.xack(stream, group, id2)
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+    # At least the trailing ACKed entries are reclaimed; nothing un-ACKed remains.
+    assert removed >= 1
+    assert fake_redis_client.xlen(stream) <= 1
+
+
+def test_xtrim_acked_entries_missing_stream_returns_zero(fake_redis_client):
+    """M1-conc: no stream / no group -> safe no-op, never raises."""
+    assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0
