@@ -313,6 +313,77 @@ class TestDestroyVm:
         pipe.execute.assert_called_once()
 
 
+class TestDestroyVmRangeGuard:
+    """C2: _destroy_vm must never touch a VMID outside the worker range."""
+
+    def test_refuses_to_destroy_orchestrator_vmid(self):
+        # Worker range is [300, 399]; the orchestrator VM is 199 (out of range).
+        config = _make_config(vm_id_start=300)
+        config.pool.vm_id_end = 399
+        manager, proxmox, redis = _make_manager(config=config)
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._destroy_vm(199)
+
+        # No Proxmox lifecycle call may happen for an out-of-range VMID.
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+        # And no Redis tracking pipeline is run for it either.
+        pipe.execute.assert_not_called()
+
+    def test_poisoned_done_key_does_not_destroy_orchestrator(self):
+        # End-to-end via the done-key path: a poisoned key naming VM 199.
+        config = _make_config(vm_id_start=300)
+        config.pool.vm_id_end = 399
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scan_iter.return_value = ["pool:done:orcest-worker-199"]
+
+        manager._check_done_workers()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+        # The poisoned key is still cleaned up so it cannot accumulate.
+        redis.delete.assert_any_call("pool:done:orcest-worker-199")
+
+    def test_in_range_vmid_still_destroyed(self):
+        # Regression: a legitimate in-range worker VM is destroyed as before.
+        config = _make_config(vm_id_start=300)
+        config.pool.vm_id_end = 399
+        manager, proxmox, redis = _make_manager(config=config)
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._destroy_vm(305)
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+
+    def test_open_ended_range_destroys_high_vmid(self):
+        # vm_id_end unset (0) means open-ended above vm_id_start.
+        config = _make_config(vm_id_start=300)  # vm_id_end defaults to 0
+        manager, proxmox, redis = _make_manager(config=config)
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._destroy_vm(99999)
+
+        proxmox.destroy_vm.assert_called_once_with(99999)
+
+    def test_unconfigured_start_destroys_nothing(self):
+        # Without a configured worker range, nothing is provably a worker VM.
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(vm_id_start=0),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+
+        manager._destroy_vm(300)
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+
 # ── _clone_and_boot ──────────────────────────────────────────
 
 
@@ -826,6 +897,50 @@ class TestFillPool:
         assert proxmox.stop_vm.call_count == 1
         assert proxmox.destroy_vm.call_count == 1
 
+    def test_drain_skips_vm_that_claimed_task_mid_pass(self):
+        """M2-conc: a VM that claimed a task is never drained on pool shrink."""
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 2  # 2 idle
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300", "301"}
+        # VM 300 has claimed a task since _detect_active_workers ran: its
+        # consumer now reports a pending entry.
+        redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-300", "pending": 1},
+        ]
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._fill_pool()
+
+        # excess = 1; VM 300 is busy and must be skipped, so VM 301 is drained.
+        proxmox.destroy_vm.assert_called_once_with(301)
+        # VM 300 (with the pending task) must NOT be destroyed.
+        for call in proxmox.destroy_vm.call_args_list:
+            assert call.args[0] != 300
+
+    def test_drain_skips_all_busy_vms(self):
+        """If every idle VM is busy, nothing is drained this pass."""
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 2
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300", "301"}
+        redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-300", "pending": 1},
+            {"name": "orcest-worker-301", "pending": 1},
+        ]
+        pipe = MagicMock()
+        redis.pipeline.return_value = pipe
+
+        manager._fill_pool()
+
+        # Both idle VMs hold a pending task -> none drained.
+        proxmox.destroy_vm.assert_not_called()
+
 
 # ── _health_check ────────────────────────────────────────────
 
@@ -974,6 +1089,96 @@ class TestHealthCheck:
 
         # Both VMs should have been attempted
         assert proxmox.stop_vm.call_count == 2
+
+
+# ── _health_check reap coordination (H2-conc) ────────────────
+
+
+class TestHealthCheckReapCoordination:
+    """H2-conc: reaping an over-duration VM must coordinate Redis, not strand it."""
+
+    def _build(self, fake_redis_client):
+        from orcest.fleet.pool_manager import PoolManager
+
+        config = _make_config(max_task_duration=3600, vm_id_start=300)
+        config.pool.vm_id_end = 399
+        proxmox = _make_proxmox()
+        manager = PoolManager(
+            config=config,
+            proxmox=proxmox,
+            redis=fake_redis_client,
+            key_prefix="test",
+        )
+        return manager, proxmox
+
+    def test_reaped_vm_publishes_transient_failure_and_clears_marker(self, fake_redis_client):
+        import time as _time
+
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.models import CONSUMER_GROUP, ResultStatus, Task, TaskResult, TaskType
+
+        rc = fake_redis_client  # prefix 'test'
+        manager, proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        # Task stream is single-project here: key_prefix 'test' -> 'test:tasks:claude'.
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        # Pending marker the orchestrator set when it enqueued the task.
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        # Enqueue the task into the shared stream and have VM 305 claim it (PEL).
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", task.to_dict())
+        claimed = rc.xreadgroup(
+            group=CONSUMER_GROUP, consumer=worker_id, stream="tasks:claude", block_ms=None
+        )
+        assert len(claimed) == 1
+        # Mark VM 305 active and over-duration.
+        rc.hset("pool:active", "305", str(_time.time() - 99999))
+
+        manager._health_check()
+
+        # 1) VM destroyed.
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+        # 2) Pending marker cleared so the orchestrator can re-enqueue.
+        assert get_pending_task(rc, "owner/repo", "pr", 42) is None
+        # 3) A transient-FAILED result was published to the project results stream.
+        results = rc.xrevrange("results", count=10)
+        assert len(results) == 1
+        _, fields = results[0]
+        published = TaskResult.from_dict(fields)
+        assert published.task_id == task.id
+        assert published.status == ResultStatus.FAILED
+        assert published.summary.startswith("[transient] ")
+        assert published.resource_id == 42
+        # 4) The consumer's PEL slot was released (consumer deleted / no pending).
+        consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
+        assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reap_with_no_pending_entry_still_destroys(self, fake_redis_client):
+        # A VM over-duration but with an empty PEL (e.g. already ACKed) must
+        # still be destroyed without error and without publishing a result.
+        import time as _time
+
+        from orcest.shared.models import CONSUMER_GROUP
+
+        rc = fake_redis_client
+        manager, proxmox = self._build(rc)
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.hset("pool:active", "305", str(_time.time() - 99999))
+
+        manager._health_check()
+
+        proxmox.destroy_vm.assert_called_once_with(305)
+        assert rc.xrevrange("results", count=10) == []
 
 
 # ── _reconcile_orphans ────────────────────────────────────────
@@ -1316,6 +1521,61 @@ class TestReconcileStaleRedis:
         assert redis.hdel.call_count == 2
 
 
+# ── _sweep_orphan_pel (H3-conc) ──────────────────────────────
+
+
+class TestSweepOrphanPel:
+    def test_deletes_consumer_for_dead_vmid(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()  # nothing idle
+        redis.hgetall.return_value = {}  # nothing active
+        proxmox.list_vms.return_value = []  # not in Proxmox
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 2},
+        ]
+        manager._sweep_orphan_pel()
+        # delconsumer_raw called for the dead consumer on each task stream.
+        assert redis.delconsumer_raw.call_count == 2  # two task streams
+        redis.delconsumer_raw.assert_any_call("orcest:tasks:claude", "workers", "orcest-worker-305")
+
+    def test_keeps_consumer_for_live_idle_vmid(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = {"305"}  # 305 is idle -> live
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 1},
+        ]
+        manager._sweep_orphan_pel()
+        redis.delconsumer_raw.assert_not_called()
+
+    def test_ignores_non_worker_consumer(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "not-a-worker", "pending": 5},
+        ]
+        manager._sweep_orphan_pel()
+        redis.delconsumer_raw.assert_not_called()
+
+    def test_skips_consumer_with_zero_pending(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 0},
+        ]
+        manager._sweep_orphan_pel()
+        redis.delconsumer_raw.assert_not_called()
+
+
 # ── reconcile ────────────────────────────────────────────────
 
 
@@ -1329,6 +1589,7 @@ class TestReconcile:
             patch.object(manager, "_fill_pool") as mock_fill,
             patch.object(manager, "_health_check") as mock_health,
             patch.object(manager, "_reconcile_stale_redis") as mock_stale,
+            patch.object(manager, "_sweep_orphan_pel") as mock_sweep,
         ):
             manager.reconcile()
 
@@ -1337,6 +1598,7 @@ class TestReconcile:
         mock_fill.assert_called_once()
         mock_health.assert_called_once()
         mock_stale.assert_called_once()
+        mock_sweep.assert_called_once()
 
     def test_error_does_not_crash(self):
         manager, proxmox, redis = _make_manager()
@@ -1375,6 +1637,11 @@ class TestReconcile:
                 "_reconcile_stale_redis",
                 side_effect=lambda: call_order.append("reconcile_stale"),
             ),
+            patch.object(
+                manager,
+                "_sweep_orphan_pel",
+                side_effect=lambda: call_order.append("sweep_orphan_pel"),
+            ),
         ):
             manager.reconcile()
 
@@ -1384,6 +1651,7 @@ class TestReconcile:
             "fill_pool",
             "health_check",
             "reconcile_stale",
+            "sweep_orphan_pel",
         ]
 
     def test_error_is_logged(self):
