@@ -84,6 +84,11 @@ CODE_PATTERNS: list[str] = [
     r"AttributeError",
     r"compilation failed",
     r"type.?check.*fail",
+    # mypy / tsc type errors: "error: Incompatible types ...". These are a CODE
+    # defect, not a dependency problem -- pin them here so the narrowed
+    # DEPENDENCY `incompatible` patterns below cannot swallow them.
+    r"Incompatible types",
+    r"Incompatible return value type",
 ]
 
 DEPENDENCY_PATTERNS: list[str] = [
@@ -93,7 +98,16 @@ DEPENDENCY_PATTERNS: list[str] = [
     r"ERESOLVE",
     r"dependency resolution failed",
     r"version conflict",
-    r"incompatible",
+    # Only treat 'incompatible' as a dependency signal when it is clearly about
+    # package/version resolution -- NOT a mypy/tsc 'Incompatible types' error,
+    # which must classify as CODE via the Incompatible-types CODE_PATTERNS.
+    r"incompatible (?:version|dependenc(?:y|ies)|requirement|package)",
+    r"(?:version|dependenc(?:y|ies)|requirement|package)[^\n]*incompatible",
+    # Resolver phrasing: "X is incompatible with Y" / "X and Y are incompatible".
+    # mypy/tsc say "Incompatible types in assignment" (no "with"), so anchoring
+    # on "incompatible with" / "are incompatible" avoids swallowing type errors.
+    r"incompatible with",
+    r"are incompatible",
 ]
 
 
