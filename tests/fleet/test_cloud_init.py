@@ -465,7 +465,7 @@ def test_clone_userdata_writes_redis_password_env():
         )
     )
     env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
-    assert "ORCEST_REDIS_PASSWORD=pool-pw" in env_file["content"]
+    assert "ORCEST_REDIS_PASSWORD='pool-pw'" in env_file["content"]
     # Secret-at-rest: the worker .env must be 0600 and orcest-owned + deferred.
     assert env_file["permissions"] == "0600"
     assert env_file["owner"] == "orcest:orcest"
@@ -486,7 +486,8 @@ def test_clone_userdata_no_env_when_password_absent():
 
 def test_worker_userdata_writes_redis_password_env():
     """C1: the legacy direct-provision path (render_worker_userdata) also injects
-    ORCEST_REDIS_PASSWORD into /opt/orcest/.env."""
+    ORCEST_REDIS_PASSWORD into /opt/orcest/.env (single-quoted, parity with
+    generate_env_file)."""
     data = yaml.safe_load(
         render_worker_userdata(
             redis_host="10.20.0.23",
@@ -499,5 +500,61 @@ def test_worker_userdata_writes_redis_password_env():
         )
     )
     env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
-    assert "ORCEST_REDIS_PASSWORD=direct-pw" in env_file["content"]
+    assert "ORCEST_REDIS_PASSWORD='direct-pw'" in env_file["content"]
     assert env_file["permissions"] == "0600"
+
+
+# ── C1: worker .env password write hardened (quote + validate) ──
+
+
+def test_clone_redis_password_is_single_quoted():
+    """C1 hardening: the clone .env ORCEST_REDIS_PASSWORD line must be
+    single-quoted (parity with generate_env_file) so the .env survives a value
+    that systemd/shell would otherwise mangle."""
+    data = yaml.safe_load(
+        render_clone_userdata(
+            redis_host="10.20.0.23",
+            worker_id="orcest-worker-10002",
+            key_prefix="orcest",
+            redis_password="pool-pw",
+        )
+    )
+    env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
+    assert "ORCEST_REDIS_PASSWORD='pool-pw'" in env_file["content"]
+
+
+def test_clone_rejects_newline_in_redis_password():
+    """C1 hardening: a newline (or hash) in the password must not be allowed to
+    corrupt /opt/orcest/.env -- validated like generate_env_file."""
+    with pytest.raises(ValueError, match="redis_password"):
+        render_clone_userdata(
+            redis_host="10.20.0.23",
+            worker_id="w-1",
+            key_prefix="orcest",
+            redis_password="pw\nINJECTED=evil",
+        )
+
+
+def test_clone_rejects_single_quote_in_redis_password():
+    """C1 hardening: single-quoted in .env, so a single quote breaks quoting."""
+    with pytest.raises(ValueError, match="redis_password"):
+        render_clone_userdata(
+            redis_host="10.20.0.23",
+            worker_id="w-1",
+            key_prefix="orcest",
+            redis_password="pw'injected",
+        )
+
+
+def test_worker_rejects_newline_in_redis_password():
+    """C1 hardening: render_worker_userdata validates the password too."""
+    with pytest.raises(ValueError, match="redis_password"):
+        render_worker_userdata(
+            redis_host="10.20.0.23",
+            key_prefix="orcest",
+            worker_id="worker-200",
+            github_token="ghp_fake",
+            claude_oauth_token="sk-ant-oat01-fake",
+            repo="ThayneStudio/orcest",
+            redis_password="pw\nINJECTED=evil",
+        )

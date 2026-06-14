@@ -14,6 +14,20 @@ import yaml
 
 # ── Shared building blocks ──────────────────────────────────
 
+
+def _validate_env_value(value: str, name: str) -> None:
+    """Raise ValueError if *value* is unsafe to single-quote in an .env file.
+
+    Parity with ``orchestrator.generate_env_file._validate_env_value`` (C1):
+    the worker .env writes ``NAME='<value>'``, so a single quote breaks quoting,
+    and a newline / carriage return / null byte could smuggle an extra line
+    (e.g. inject another env var) into the file.
+    """
+    if any(c in value for c in ("\n", "\r", "\0")):
+        raise ValueError(f"{name} must not contain newlines or null bytes")
+    if "'" in value:
+        raise ValueError(f"{name} must not contain single quotes")
+
 _BASE_PACKAGES: list[str] = [
     "qemu-guest-agent",
     "curl",
@@ -463,13 +477,15 @@ def render_clone_userdata(
         # C1: Redis AUTH for the worker. build_redis_config reads
         # ORCEST_REDIS_PASSWORD from the env ONLY (never worker.yaml), and the
         # systemd unit loads /opt/orcest/.env via EnvironmentFile=-. 0600 +
-        # orcest-owned + defer.
+        # orcest-owned + defer. Single-quoted + validated (parity with
+        # generate_env_file) so a newline/hash/quote can't corrupt the .env.
+        _validate_env_value(redis_password, "redis_password")
         clone_write_files.append(
             {
                 "path": "/opt/orcest/.env",
                 "owner": "orcest:orcest",
                 "permissions": "0600",
-                "content": f"ORCEST_REDIS_PASSWORD={redis_password}\n",
+                "content": f"ORCEST_REDIS_PASSWORD='{redis_password}'\n",
                 "defer": True,
             }
         )
@@ -549,7 +565,10 @@ def render_worker_userdata(
     if redis_password:
         # C1: Redis AUTH. Read from the env only (build_redis_config ignores
         # worker.yaml redis.password); the systemd unit loads this .env.
-        env_content += f"ORCEST_REDIS_PASSWORD={redis_password}\n"
+        # Single-quoted + validated (parity with generate_env_file) so a
+        # newline/hash/quote in the password can't corrupt the .env.
+        _validate_env_value(redis_password, "redis_password")
+        env_content += f"ORCEST_REDIS_PASSWORD='{redis_password}'\n"
 
     systemd_unit = _systemd_unit(worker_id=worker_id)
 

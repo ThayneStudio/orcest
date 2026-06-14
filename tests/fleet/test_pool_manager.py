@@ -510,6 +510,60 @@ class TestCloneAndBoot:
         proxmox.destroy_vm.assert_called_once_with(300)
 
 
+class TestCloneRedisPassword:
+    """C1: the pool manager must forward the Redis AUTH password to cloned
+    worker VMs via render_clone_userdata. The pool-manager container receives
+    ORCEST_REDIS_PASSWORD in its own env (delivered by the pool compose stack's
+    --env-file / passthrough). Without this, cloned workers cannot AUTH and
+    every task stalls (NOAUTH)."""
+
+    def test_clone_passes_redis_password_from_env(self, monkeypatch):
+        monkeypatch.setenv("ORCEST_REDIS_PASSWORD", "pool-secret-pw")
+        manager, proxmox, redis = _make_manager()
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            render.return_value = "#cloud-config\n"
+            manager._clone_and_boot()
+
+        render.assert_called_once()
+        kwargs = render.call_args.kwargs
+        assert kwargs.get("redis_password") == "pool-secret-pw"
+
+    def test_clone_omits_password_when_env_unset(self, monkeypatch):
+        """Backward compat: with no ORCEST_REDIS_PASSWORD in the pool-manager env
+        the clone is rendered without a password (empty string), preserving the
+        unauthenticated/dev path rather than crashing."""
+        monkeypatch.delenv("ORCEST_REDIS_PASSWORD", raising=False)
+        manager, proxmox, redis = _make_manager()
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            render.return_value = "#cloud-config\n"
+            manager._clone_and_boot()
+
+        render.assert_called_once()
+        kwargs = render.call_args.kwargs
+        assert kwargs.get("redis_password", "") == ""
+
+    def test_cloned_userdata_actually_contains_password(self, monkeypatch):
+        """End-to-end through the real render: the booted clone's /opt/orcest/.env
+        carries the password so build_redis_config can AUTH."""
+        import yaml
+
+        monkeypatch.setenv("ORCEST_REDIS_PASSWORD", "e2e-pw")
+        manager, proxmox, redis = _make_manager()
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        manager._clone_and_boot()
+
+        userdata = proxmox.set_cloud_init_userdata.call_args.args[1]
+        data = yaml.safe_load(userdata)
+        env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
+        assert "ORCEST_REDIS_PASSWORD" in env_file["content"]
+        assert "e2e-pw" in env_file["content"]
+
+
 def _make_range_config(template_vmid_range: list[int] | None = None) -> FleetConfig:
     """Build a config with a template VMID range (blue/green template mode)."""
     return FleetConfig(

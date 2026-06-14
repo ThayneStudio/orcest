@@ -34,12 +34,34 @@ _SSH_OPTS = [
     "LogLevel=ERROR",
 ]
 
+# Path to the 0600 env file on the orchestrator VM that holds the minted
+# ORCEST_REDIS_PASSWORD. It is the single source of truth for the Redis AUTH
+# secret: --env-file'd into the redis / pool compose stacks (so
+# ${ORCEST_REDIS_PASSWORD} interpolates) and read back by the fleet CLI to wire
+# the per-project .env and the worker clones.
+REDIS_ENV_PATH = "/opt/orcest/.redis.env"
+
 # The orchestrator VM does not have ``redis-cli`` installed natively —
 # Redis runs inside the ``orcest-redis-redis-1`` container started by the
 # ``docker-compose.redis.yml`` stack. All redis-cli invocations from the
 # fleet CLI must be routed through ``docker exec`` against that container.
 _REDIS_CONTAINER = "orcest-redis-redis-1"
-_REDIS_CLI_PREFIX = f"sudo docker exec {_REDIS_CONTAINER} redis-cli"
+# C1: Redis now requires AUTH, so the CLI must authenticate. The password is
+# read from the container's own environment (delivered via the redis stack's
+# --env-file) rather than interpolated by the outer ssh shell — that keeps the
+# secret off the fleet host's argv / process listing / ssh debug logs.
+#
+# Form: ``docker exec C sh -c 'exec redis-cli -a "$ORCEST_REDIS_PASSWORD"
+# --no-auth-warning "$@"' redis-cli``. Call sites append a flat argument string
+# after the prefix (e.g. ``--raw SMEMBERS key``); the outer ssh shell word-splits
+# it and docker passes the tokens as separate argv to the in-container ``sh``,
+# where ``"$@"`` forwards them to redis-cli. The trailing ``redis-cli`` token
+# becomes ``$0`` so appended args line up at ``$1`` onward. ``exec`` hands the
+# real redis-cli exit status back through ``sh``/``docker exec``.
+_REDIS_CLI_PREFIX = (
+    f"sudo docker exec {_REDIS_CONTAINER} "
+    "sh -c 'exec redis-cli -a \"$ORCEST_REDIS_PASSWORD\" --no-auth-warning \"$@\"' redis-cli"
+)
 
 
 def _ssh(ssh_target: str, cmd: str) -> subprocess.CompletedProcess[str]:
@@ -180,17 +202,81 @@ def upload_source(ssh_target: str) -> None:
                 pass
 
 
+def ensure_redis_password(ssh_target: str) -> str:
+    """Mint + persist the Redis AUTH password on the orchestrator VM (idempotent).
+
+    C1: ``docker-compose.redis.yml`` runs ``redis-server --requirepass
+    ${ORCEST_REDIS_PASSWORD}``. That variable must come from somewhere, or Redis
+    boots with an *empty* requirepass — which Compose renders as
+    ``--requirepass --appendonly yes`` (the next flag is consumed as the
+    password's value), a FATAL misconfiguration / total outage. This helper is
+    the single source of truth for that secret.
+
+    Behaviour:
+      * If :data:`REDIS_ENV_PATH` already exists and is non-empty, its value is
+        **reused** — the password is NEVER rotated. Rotating would orphan every
+        running worker VM and the persisted Redis AOF (workers can no longer
+        AUTH, and the existing data is locked behind the old password).
+      * Otherwise a strong CSPRNG password (``openssl rand -hex 32``) is minted
+        and written ``0600`` (secret at rest).
+
+    The minting is done in-band by an idempotent shell command (``[ -s file ]``
+    guard under ``umask 077``), so concurrent/repeat deploys converge on one
+    value. Returns the persisted password (read back from the file).
+
+    Must be called BEFORE :func:`ensure_redis_stack` / :func:`ensure_pool_manager`
+    so the ``--env-file`` they pass actually contains a value.
+    """
+    logger.info("Ensuring Redis password on %s", ssh_target)
+    quoted = shlex.quote(REDIS_ENV_PATH)
+    # Idempotent mint: only generate when the file is missing or empty.
+    # umask 077 makes the freshly-created file 0600 even before the explicit
+    # chmod (closes the brief world-readable window). Single quotes around the
+    # inner script keep $(openssl ...) from expanding on the fleet host.
+    mint_cmd = (
+        "sudo mkdir -p /opt/orcest && "
+        "sudo sh -c '" + "umask 077; "
+        f"[ -s {quoted} ] || "
+        f'printf "ORCEST_REDIS_PASSWORD=%s\\n" "$(openssl rand -hex 32)" > {quoted}; '
+        f"chmod 600 {quoted}'"
+    )
+    result = _ssh(ssh_target, mint_cmd)
+    if result.returncode != 0:
+        logger.error("Redis password mint failed: %s", result.stderr.strip())
+        raise RuntimeError(f"Failed to mint Redis password: {result.stderr.strip()}")
+
+    # Read the persisted value back (the single source of truth).
+    read = _ssh(ssh_target, f"sudo cat {quoted}")
+    if read.returncode != 0:
+        raise RuntimeError(f"Failed to read Redis password: {read.stderr.strip()}")
+    password = ""
+    for line in read.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("ORCEST_REDIS_PASSWORD="):
+            password = line.split("=", 1)[1]
+            break
+    if not password:
+        raise RuntimeError(f"Minted Redis password file at {REDIS_ENV_PATH} is empty")
+    return password
+
+
 def ensure_redis_stack(ssh_target: str) -> None:
     """Ensure the shared Redis stack is running.
 
     Starts (or updates) the shared Redis service from docker-compose.redis.yml.
     This creates the ``orcest`` Docker network that per-project stacks join.
     Idempotent -- safe to call if Redis is already running.
+
+    C1: ``--env-file`` supplies ${ORCEST_REDIS_PASSWORD} (minted by
+    :func:`ensure_redis_password`) so ``redis-server --requirepass`` gets a real
+    value instead of booting unauthenticated / mis-parsing the next flag.
     """
     logger.info("Ensuring shared Redis stack on %s", ssh_target)
     result = _ssh(
         ssh_target,
-        "cd /opt/orcest && docker compose -f docker-compose.redis.yml -p orcest-redis up -d",
+        "cd /opt/orcest && docker compose"
+        f" --env-file {REDIS_ENV_PATH}"
+        " -f docker-compose.redis.yml -p orcest-redis up -d",
     )
     if result.returncode != 0:
         logger.error("Redis stack failed: %s", result.stderr.strip())
@@ -248,9 +334,13 @@ def ensure_pool_manager(
     """
     logger.info("Ensuring pool manager on %s", ssh_target)
     quoted_path = shlex.quote(fleet_config_path)
+    # C1: --env-file delivers ORCEST_REDIS_PASSWORD into the pool-manager
+    # container's environment (docker-compose.pool.yml passes it through), so the
+    # pool manager can AUTH to Redis and forward the value to worker clones.
     result = _ssh(
         ssh_target,
         f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
+        f" --env-file {REDIS_ENV_PATH}"
         " -f docker-compose.pool.yml"
         " -p orcest-pool"
         " up -d",
@@ -365,6 +455,26 @@ def clean_pending_tasks(ssh_target: str) -> int:
     return len(keys)
 
 
+def _project_compose_args(project_name: str) -> str:
+    """Return ``-p`` value + ``--env-file`` flags for a per-project compose run.
+
+    Layers two env files (Compose merges them; later wins on interpolation):
+      1. :data:`REDIS_ENV_PATH` -- guarantees ${ORCEST_REDIS_PASSWORD} is present
+         for the orchestrator container's AUTH even if a project's .env predates
+         the C1 password write (e.g. an old onboarding).
+      2. ``projects/<name>/.env`` -- the project's own credentials/config; takes
+         precedence, and (post-C1) also carries ORCEST_REDIS_PASSWORD from
+         :func:`generate_env_file`.
+
+    ``_validate_project_name`` restricts to ``[a-zA-Z0-9._-]``, but the values
+    are shell-quoted for defense-in-depth in case that validation is relaxed.
+    """
+    qname = shlex.quote(f"orcest-{project_name}")
+    qredis = shlex.quote(REDIS_ENV_PATH)
+    qenv = shlex.quote(f"projects/{project_name}/.env")
+    return f"{qname} --env-file {qredis} --env-file {qenv}"
+
+
 def deploy_stack(ssh_target: str, project_name: str) -> None:
     """Start/update a per-project Docker Compose stack.
 
@@ -373,13 +483,9 @@ def deploy_stack(ssh_target: str, project_name: str) -> None:
     """
     _validate_project_name(project_name)
     logger.info("Deploying stack orcest-%s on %s", project_name, ssh_target)
-    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
-    # defense-in-depth in case the validation is ever relaxed.
-    qname = shlex.quote(f"orcest-{project_name}")
-    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} up -d",
+        f"cd /opt/orcest && docker compose -p {_project_compose_args(project_name)} up -d",
     )
     if result.returncode != 0:
         logger.error("Deploy failed: %s", result.stderr.strip())
@@ -391,13 +497,9 @@ def teardown_stack(ssh_target: str, project_name: str) -> None:
     """Stop and remove a per-project Docker Compose stack."""
     _validate_project_name(project_name)
     logger.info("Tearing down stack orcest-%s on %s", project_name, ssh_target)
-    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
-    # defense-in-depth in case the validation is ever relaxed.
-    qname = shlex.quote(f"orcest-{project_name}")
-    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} down -v",
+        f"cd /opt/orcest && docker compose -p {_project_compose_args(project_name)} down -v",
     )
     if result.returncode != 0:
         logger.error("Teardown failed: %s", result.stderr.strip())
@@ -411,13 +513,10 @@ def restart_stack(ssh_target: str, project_name: str) -> None:
     """Force-recreate the orchestrator container for a project."""
     _validate_project_name(project_name)
     logger.info("Restarting stack orcest-%s on %s", project_name, ssh_target)
-    # _validate_project_name restricts to [a-zA-Z0-9._-], but quote for
-    # defense-in-depth in case the validation is ever relaxed.
-    qname = shlex.quote(f"orcest-{project_name}")
-    qenv = shlex.quote(f"projects/{project_name}/.env")
     result = _ssh(
         ssh_target,
-        f"cd /opt/orcest && docker compose -p {qname} --env-file {qenv} up -d --force-recreate",
+        f"cd /opt/orcest && docker compose -p {_project_compose_args(project_name)}"
+        " up -d --force-recreate",
     )
     if result.returncode != 0:
         logger.error("Restart failed: %s", result.stderr.strip())

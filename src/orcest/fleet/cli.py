@@ -640,10 +640,15 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
         save_config(cfg, config)
         sys.exit(1)
 
-    # Step 7: Start shared Redis stack
+    # Step 7: Mint Redis password, then start shared Redis stack
     try:
-        from orcest.fleet.orchestrator import ensure_redis_stack
+        from orcest.fleet.orchestrator import ensure_redis_password, ensure_redis_stack
 
+        # C1: mint BEFORE the stack starts so --requirepass gets a real value
+        # (an empty ORCEST_REDIS_PASSWORD makes Redis consume the next flag as
+        # its password -- a FATAL boot / total outage).
+        console.print("  Minting Redis password...")
+        ensure_redis_password(ssh_target)
         console.print("  Starting shared Redis stack...")
         ensure_redis_stack(ssh_target)
         console.print("  Redis stack [green]ok[/green]")
@@ -755,10 +760,17 @@ def onboard(repo: str, name: str | None, config: str) -> None:
     console.print("\n  Deploying orchestrator stack...")
     try:
         from orcest.fleet.orchestrator import (
+            ensure_redis_password,
             generate_env_file,
             generate_orchestrator_config,
             write_project_files,
         )
+
+        # C1: mint/persist the Redis AUTH password BEFORE generating the .env
+        # (so it carries ORCEST_REDIS_PASSWORD) and BEFORE ensure_redis_stack
+        # (so Redis never boots with an empty requirepass). Idempotent: reuses an
+        # existing password, so re-onboarding never rotates it.
+        redis_password = ensure_redis_password(ssh_target)
 
         env_content = generate_env_file(
             github_token=org.github_token,
@@ -767,6 +779,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
             claude_tokens=org.claude_oauth_tokens,
             provider_credentials=getattr(org, "provider_credentials", None),
             trace_archive_host_path=cfg.trace_archive_host_path,
+            redis_password=redis_password,
         )
         config_yaml = generate_orchestrator_config(
             repo=repo,
@@ -905,8 +918,12 @@ def update(config: str) -> None:
     # Step 2: Update shared Redis stack
     console.print("  Updating shared Redis stack...", end=" ")
     try:
-        from orcest.fleet.orchestrator import ensure_redis_stack
+        from orcest.fleet.orchestrator import ensure_redis_password, ensure_redis_stack
 
+        # C1: ensure the password exists (idempotent; reuses an existing one) so
+        # the --env-file'd stack restarts with --requirepass populated rather
+        # than empty.
+        ensure_redis_password(ssh_target)
         ensure_redis_stack(ssh_target)
         console.print("[green]ok[/green]")
     except Exception as exc:
@@ -2121,7 +2138,11 @@ def start(config: str) -> None:
     will begin cloning worker VMs to reach the target pool size.
     """
     from orcest.fleet.config import load_config
-    from orcest.fleet.orchestrator import ensure_pool_manager, upload_fleet_config
+    from orcest.fleet.orchestrator import (
+        ensure_pool_manager,
+        ensure_redis_password,
+        upload_fleet_config,
+    )
 
     console = Console()
     cfg = load_config(config)
@@ -2163,6 +2184,14 @@ def start(config: str) -> None:
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
         sys.exit(1)
+
+    # C1: the pool-manager stack --env-file's REDIS_ENV_PATH so the manager can
+    # AUTH to Redis and forward the password to worker clones; ensure it exists
+    # first (idempotent; the redis stack normally minted it already).
+    try:
+        ensure_redis_password(ssh_target)
+    except Exception as exc:
+        console.print(f"  [yellow]Could not ensure Redis password: {exc}[/yellow]")
 
     console.print("  Starting pool manager...", end=" ")
     try:

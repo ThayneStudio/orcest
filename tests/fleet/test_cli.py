@@ -70,6 +70,7 @@ def test_onboard_creates_project(runner, cfg_path, mocker):
         orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
@@ -103,6 +104,7 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
         orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
     mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
     mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
     mocker.patch("orcest.fleet.orchestrator.write_project_files")
@@ -124,6 +126,61 @@ def test_onboard_custom_name(runner, cfg_path, mocker):
     with open(cfg_path) as f:
         data = yaml.safe_load(f)
     assert data["projects"][0]["name"] == "custom-name"
+
+
+def test_onboard_mints_and_passes_redis_password(runner, cfg_path, mocker):
+    """C1: onboard must mint the Redis password and pass it to generate_env_file
+    (read from the minted .redis.env) so the per-project .env carries the value
+    the orchestrator container uses to AUTH. Round 1 left this caller without a
+    redis_password arg, so the param was dead code."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+    )
+    _save(cfg, cfg_path)
+    gen = mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
+    mocker.patch("orcest.fleet.orchestrator.deploy_stack")
+    mint = mocker.patch(
+        "orcest.fleet.orchestrator.ensure_redis_password", return_value="minted-pw-123"
+    )
+    result = runner.invoke(fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    mint.assert_called_once()
+    assert gen.call_args.kwargs.get("redis_password") == "minted-pw-123"
+
+
+def test_onboard_mints_password_before_starting_redis(runner, cfg_path, mocker):
+    """KEY regression: the password must be minted BEFORE ensure_redis_stack so
+    Redis never boots with an empty requirepass (FATAL boot / total outage)."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+    )
+    _save(cfg, cfg_path)
+    order: list[str] = []
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
+    mocker.patch("orcest.fleet.orchestrator.deploy_stack")
+    mocker.patch(
+        "orcest.fleet.orchestrator.ensure_redis_password",
+        side_effect=lambda *a, **k: (order.append("mint"), "pw")[1],
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.ensure_redis_stack",
+        side_effect=lambda *a, **k: order.append("redis"),
+    )
+    result = runner.invoke(fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    assert "mint" in order and "redis" in order
+    assert order.index("mint") < order.index("redis"), (
+        "password must be minted before the redis stack is started"
+    )
 
 
 def test_onboard_requires_orchestrator_host(runner, cfg_path):
@@ -379,6 +436,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
 
     result = runner.invoke(
@@ -433,6 +491,7 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
     _save(cfg, cfg_path)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
     mock_ensure_redis = mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mock_restart = mocker.patch("orcest.fleet.orchestrator.restart_stack")
 
@@ -1395,11 +1454,14 @@ def test_start_uploads_config_and_starts(runner, cfg_path, mocker):
 
     mock_upload = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
     mock_ensure = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    mock_pw = mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
 
     result = runner.invoke(fleet, ["start", "--config", cfg_path])
     assert result.exit_code == 0
     mock_upload.assert_called_once()
     mock_ensure.assert_called_once()
+    # C1: the pool stack --env-file's the minted password file; ensure it exists.
+    mock_pw.assert_called_once()
     assert "target size: 4" in result.output
 
 
@@ -1470,6 +1532,7 @@ def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mock_upload_cfg = mocker.patch(
         "orcest.fleet.orchestrator.upload_fleet_config",
