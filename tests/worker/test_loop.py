@@ -1429,6 +1429,14 @@ class TestRunWorker:
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
 
+        # Pending marker still points at this task so the dedup guard (M4-conc)
+        # lets the recovery result through (genuine restart mid-execution).
+        from orcest.shared.coordination import PendingTaskMetadata
+
+        marker = PendingTaskMetadata(task_id=sample_task.id).to_json()
+        mock_redis.get.return_value = marker
+        mock_redis.get_raw.return_value = marker
+
         task_fields = sample_task.to_dict()
         drain_call_count = 0
 
@@ -1485,6 +1493,15 @@ class TestRunWorker:
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
         mock_attempts = mocker.patch("orcest.worker.loop._clear_task_attempt_reservation")
+
+        # Pending marker still points at this task so the dedup guard (M4-conc)
+        # lets the recovery publish be attempted (which then fails below),
+        # exercising the publish-failure cleanup path this test targets.
+        from orcest.shared.coordination import PendingTaskMetadata
+
+        marker = PendingTaskMetadata(task_id=sample_task.id).to_json()
+        mock_redis.get.return_value = marker
+        mock_redis.get_raw.return_value = marker
 
         # Make the results-stream publish fail during drain
         mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
@@ -2639,6 +2656,13 @@ def test_drain_pending_tasks_preserves_snapshot_metadata(local_worker_config):
         [("tasks", "1-0", task.to_dict())],
         [],
     ]
+    # Pending marker still points at this task so the dedup guard (M4-conc)
+    # lets the recovery result through (genuine restart, not a replayed dupe).
+    from orcest.shared.coordination import PendingTaskMetadata
+
+    marker = PendingTaskMetadata(task_id=task.id).to_json()
+    mock_redis.get.return_value = marker
+    mock_redis.get_raw.return_value = marker
 
     _drain_pending_tasks_raw(
         mock_redis,
@@ -2652,6 +2676,105 @@ def test_drain_pending_tasks_preserves_snapshot_metadata(local_worker_config):
     assert result.snapshot_head_sha == "sha-old"
     assert result.decision_reason == "ci_failure"
     assert result.snapshot_failed_checks == ["tests"]
+
+
+@pytest.mark.unit
+def test_drain_skips_duplicate_recovery_result_for_completed_issue(local_worker_config):
+    """Regression for M4-conc: a drained PEL entry whose pending marker is gone
+    (original result already processed by the orchestrator, which clears the
+    marker on every result) must NOT produce a duplicate recovery FAILED.
+
+    Without the dedup guard, the drain path republishes a [transient] FAILED for
+    an already-completed ISSUE; the orchestrator has no snapshot-staleness check
+    for issues, so the duplicate clears issue attempts / re-triggers work on an
+    already-implemented issue. The entry must still be ACKed and the attempt
+    reservation cleared, just no second result.
+    """
+    task = Task.create(
+        task_type=TaskType.IMPLEMENT_ISSUE,
+        repo="owner/repo",
+        token="tok",
+        resource_type="issue",
+        resource_id=7,
+        prompt="implement it",
+        branch="impl-7",
+    )
+    mock_redis = MagicMock()
+    # One pending entry on the drain pass, then empty.
+    mock_redis.xreadgroup_multi.side_effect = [
+        [("tasks:issue:claude", "1-0", task.to_dict())],
+        [],
+    ]
+    # Pending marker absent => original result already processed by orchestrator.
+    mock_redis.get.return_value = None
+    mock_redis.get_raw.return_value = None
+    mock_redis.xadd_capped.return_value = "1-0"
+    mock_redis.xack_raw.return_value = 1
+
+    _drain_pending_tasks_raw(
+        mock_redis,
+        "tasks:issue:claude",
+        local_worker_config,
+        logging.getLogger("test"),
+    )
+
+    # No recovery result should be published to the results stream.
+    results_calls = [
+        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+    ]
+    assert results_calls == [], (
+        "drain published a duplicate recovery result for an already-completed "
+        "issue whose pending marker was already cleared"
+    )
+    # The orphaned PEL entry must still be ACKed so it is not redelivered.
+    mock_redis.xack_raw.assert_any_call("tasks:issue:claude", CONSUMER_GROUP, "1-0")
+
+
+@pytest.mark.unit
+def test_drain_publishes_recovery_result_when_marker_still_matches(local_worker_config):
+    """Companion to the dedup test: when the pending marker STILL points at the
+    drained task (genuine restart mid-execution, original result never sent),
+    the drain path MUST still publish the [transient] FAILED recovery result so
+    the orchestrator can unblock the resource. Pins that the guard does not
+    over-suppress.
+    """
+    from orcest.shared.coordination import PendingTaskMetadata
+
+    task = Task.create(
+        task_type=TaskType.IMPLEMENT_ISSUE,
+        repo="owner/repo",
+        token="tok",
+        resource_type="issue",
+        resource_id=7,
+        prompt="implement it",
+        branch="impl-7",
+    )
+    mock_redis = MagicMock()
+    mock_redis.xreadgroup_multi.side_effect = [
+        [("tasks:issue:claude", "1-0", task.to_dict())],
+        [],
+    ]
+    # Marker still points at THIS task => original result never reached orchestrator.
+    mock_redis.get.return_value = PendingTaskMetadata(task_id=task.id).to_json()
+    mock_redis.get_raw.return_value = PendingTaskMetadata(task_id=task.id).to_json()
+    mock_redis.xadd_capped.return_value = "1-0"
+    mock_redis.xack_raw.return_value = 1
+
+    _drain_pending_tasks_raw(
+        mock_redis,
+        "tasks:issue:claude",
+        local_worker_config,
+        logging.getLogger("test"),
+    )
+
+    results_calls = [
+        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+    ]
+    assert len(results_calls) == 1, "genuine restart recovery result must still be published"
+    parsed = TaskResult.from_dict(results_calls[0][0][1])
+    assert parsed.status == ResultStatus.FAILED
+    assert parsed.task_id == task.id
+    assert parsed.summary.startswith("[transient] ")
 
 
 @pytest.mark.unit

@@ -140,3 +140,36 @@ class TestHeartbeat:
         thread.join(timeout=5)
         assert not thread.is_alive(), "Heartbeat thread should stop after failed refresh"
         hb.stop()
+
+    def test_heartbeat_refresh_exception_triggers_lock_lost_and_stops(self, mock_lock):
+        """A refresh() that RAISES (Redis blip) must be treated as a lost lock.
+
+        Regression for H1-conc: RedisLock.refresh() runs a Lua script that
+        raises (e.g. redis.exceptions.ConnectionError) on a Redis hiccup
+        rather than returning False. Before the fix, the unhandled exception
+        killed the heartbeat daemon thread WITHOUT firing on_lock_lost or
+        setting the stop event, so the worker kept running on an unlocked
+        resource (allowing a second worker on the same branch). After the fix,
+        any exception is caught, on_lock_lost fires exactly as for a False
+        return, and the thread stops itself.
+        """
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        mock_lock.refresh.side_effect = RedisConnectionError("transient Redis blip")
+        lock_lost = threading.Event()
+
+        hb = Heartbeat(mock_lock, interval=0.05, on_lock_lost=lock_lost.set)
+        hb.start()
+        thread = hb._thread
+        try:
+            assert lock_lost.wait(timeout=5), (
+                "on_lock_lost was not called within 5s after refresh() raised; "
+                "a Redis blip must be treated as a lost lock, not silently kill the thread"
+            )
+            assert thread is not None
+            thread.join(timeout=5)
+            assert not thread.is_alive(), (
+                "Heartbeat thread should stop itself after a refresh() exception"
+            )
+        finally:
+            hb.stop()

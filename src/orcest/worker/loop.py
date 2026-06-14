@@ -25,6 +25,7 @@ from orcest.shared.coordination import (
     RedisLock,
     clear_pending_task_if_matches,
     make_issue_lock_key,
+    make_pending_task_key,
     make_pr_lock_key,
     parse_pending_task_metadata,
 )
@@ -679,6 +680,23 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     logger.info("Worker shut down cleanly.")
 
 
+def _pending_task_id_for_task(redis: RedisClient, task: Task) -> str | None:
+    """Return the task_id currently recorded in the pending marker for ``task``.
+
+    Routed by ``task.key_prefix`` to mirror ``_clear_pending_task_for_task`` so
+    multi-project markers are read from the correct namespace. Returns None when
+    no marker is present (the orchestrator clears the marker on every result, so
+    its absence means the original result was already processed).
+    """
+    base_key = make_pending_task_key(task.repo, task.resource_type, task.resource_id)
+    if task.key_prefix:
+        raw = redis.get_raw(f"{task.key_prefix}:{base_key}")
+    else:
+        raw = redis.get(base_key)
+    metadata = parse_pending_task_metadata(raw)
+    return metadata.task_id if metadata is not None else None
+
+
 def _drain_pending_tasks_raw(
     redis: RedisClient,
     fq_stream: str,
@@ -712,34 +730,68 @@ def _drain_pending_tasks_raw(
                     f"for {task.resource_type} #{task.resource_id}) — "
                     f"publishing FAILED result"
                 )
-                task_result = _task_result(
-                    task,
-                    config,
-                    ResultStatus.FAILED,
-                    task.branch,
-                    (
-                        f"{TRANSIENT_SUMMARY_PREFIX}"
-                        "Worker restarted mid-execution; task was not completed."
-                    ),
-                    0,
-                )
+                # Dedup/staleness guard (M4-conc): only publish a recovery
+                # FAILED when the pending marker STILL points at this task.
+                # If the marker is gone or points at a newer task, the original
+                # result already reached the orchestrator (which clears the
+                # marker on every result), so a second result here would be a
+                # duplicate. For PRs the orchestrator's snapshot staleness check
+                # would drop it, but ISSUE results have no such guard, so a
+                # replayed FAILED could clear attempts / re-trigger an already
+                # implemented issue. Suppress it; still ACK + clear reservation
+                # below. Fail open: if the marker read raises, publish anyway to
+                # preserve restart-recovery behavior.
+                should_publish_recovery = True
                 try:
-                    # Publish result to the correct project's results stream
-                    if task.key_prefix:
-                        fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                        redis.xadd_capped_raw(
-                            fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                    current_pending_id = _pending_task_id_for_task(redis, task)
+                    if current_pending_id != task.id:
+                        should_publish_recovery = False
+                        logger.info(
+                            "Skipping duplicate recovery result for %s #%d: "
+                            "pending marker no longer matches task %s (now %r); "
+                            "original result already processed",
+                            task.resource_type,
+                            task.resource_id,
+                            task.id,
+                            current_pending_id,
                         )
-                    else:
-                        redis.xadd_capped(
-                            RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
-                        )
-                    recovery_result_published = True
                 except Exception:
-                    logger.error(
-                        f"Failed to publish recovery result for task {task.id}",
+                    logger.warning(
+                        "Failed to read pending marker for %s #%d during drain; "
+                        "publishing recovery result",
+                        task.resource_type,
+                        task.resource_id,
                         exc_info=True,
                     )
+                if should_publish_recovery:
+                    task_result = _task_result(
+                        task,
+                        config,
+                        ResultStatus.FAILED,
+                        task.branch,
+                        (
+                            f"{TRANSIENT_SUMMARY_PREFIX}"
+                            "Worker restarted mid-execution; task was not completed."
+                        ),
+                        0,
+                    )
+                    try:
+                        # Publish result to the correct project's results stream
+                        if task.key_prefix:
+                            fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
+                            redis.xadd_capped_raw(
+                                fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                            )
+                        else:
+                            redis.xadd_capped(
+                                RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
+                            )
+                        recovery_result_published = True
+                    except Exception:
+                        logger.error(
+                            f"Failed to publish recovery result for task {task.id}",
+                            exc_info=True,
+                        )
             except (KeyError, ValueError) as e:
                 logger.error(
                     f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
