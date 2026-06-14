@@ -73,14 +73,31 @@ class Heartbeat:
             self._stop_event.wait(timeout=self.interval)
             if self._stop_event.is_set():
                 break
-            refreshed = self.lock.refresh()
-            if self.logger:
-                if refreshed:
-                    self.logger.debug(f"Heartbeat: refreshed {self.lock.key}")
-                else:
+            # RedisLock.refresh() runs a Lua script that RAISES (not returns
+            # False) on a Redis blip -- ConnectionError, TimeoutError,
+            # ResponseError, etc. An unhandled raise here would kill this daemon
+            # thread without firing _on_lock_lost or setting _stop_event, leaving
+            # the worker running on an unlocked resource until the TTL expires
+            # (enabling a second worker on the same branch). Treat any exception
+            # as a failed refresh so the lock-lost path below fires.
+            try:
+                refreshed = self.lock.refresh()
+            except Exception as exc:
+                if self.logger:
                     self.logger.warning(
-                        f"Heartbeat: failed to refresh {self.lock.key} (lock lost?)"
+                        f"Heartbeat: error refreshing {self.lock.key}; "
+                        f"treating as lock lost: {exc}",
+                        exc_info=True,
                     )
+                refreshed = False
+            else:
+                if self.logger:
+                    if refreshed:
+                        self.logger.debug(f"Heartbeat: refreshed {self.lock.key}")
+                    else:
+                        self.logger.warning(
+                            f"Heartbeat: failed to refresh {self.lock.key} (lock lost?)"
+                        )
             if not refreshed:
                 if self._on_lock_lost is not None:
                     self._on_lock_lost()
