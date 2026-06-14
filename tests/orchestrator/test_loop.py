@@ -49,7 +49,7 @@ from orcest.shared.coordination import (
     increment_transient_failure_count,
     set_pending_task,
 )
-from orcest.shared.models import ResultStatus, TaskResult
+from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult
 
 
 def _consume_results(config: OrchestratorConfig, redis, logger):
@@ -853,6 +853,33 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 
     # Should not raise — per-project error isolation catches and logs
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+
+def test_poll_cycle_trims_acked_task_entries(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """M1-conc: a poll cycle reclaims delivered+ACKed entries from the task
+    streams (so credentials don't live forever) but keeps un-ACKed entries."""
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    # default_runner defaults to "claude".
+    stream = f"tasks:{orchestrator_config.default_runner}"
+    fake_redis_client.ensure_consumer_group(stream, CONSUMER_GROUP)
+    acked = fake_redis_client.xadd(stream, {"token": "ghp_acked"})
+    unacked = fake_redis_client.xadd(stream, {"token": "ghp_unacked"})
+    fake_redis_client.xreadgroup(
+        group=CONSUMER_GROUP, consumer="c1", stream=stream, count=10, block_ms=None
+    )
+    fake_redis_client.xack(stream, CONSUMER_GROUP, acked)
+
+    logger = logging.getLogger("test")
+    # task_redis is the same fake client as the project redis in these tests.
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    remaining = [eid for eid, _ in fake_redis_client.xrevrange(stream, count=10)]
+    assert acked not in remaining  # ACKed credential entry reclaimed
+    assert unacked in remaining  # in-flight work preserved
 
 
 # ---------------------------------------------------------------------------
@@ -3537,3 +3564,140 @@ def test_credential_override_load_ignores_corrupt_entries(fake_redis_client):
     _load_credential_overrides(fake_redis_client, pool, logging.getLogger("test"))
     # Corrupt entry skipped; falls back to the config blob (no crash).
     assert pool.effective_credential(entry) == "config-blob"
+
+
+# ---------------------------------------------------------------------------
+# M4-logic: no-credential project must not publish credential-less tasks
+# ---------------------------------------------------------------------------
+
+
+def test_poll_cycle_no_credentials_does_not_publish_credentialless_task(
+    mocker,
+    fake_redis_client,
+    gh_mock,
+    caplog,
+):
+    """A project with empty providers AND empty claude_tokens must NOT publish a
+    task with credential='' (which fails on every worker). It should skip and
+    log a clear operator error instead."""
+    from orcest.shared.config import LabelConfig
+
+    # Project with no credentials at all and no pool entry.
+    config = OrchestratorConfig(
+        labels=LabelConfig(),
+        projects=[
+            ProjectConfig(
+                repo="acme/uncredentialed",
+                token="gh-token",
+                claude_tokens=[],  # no claude token
+                providers=[],      # no providers
+                key_prefix="uncred",
+            ),
+        ],
+    )
+
+    pr_state = _make_pr_state(number=10, action=PRAction.ENQUEUE_FIX)
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mock_publish_fix = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch("orcest.orchestrator.loop.publish_rebase_task")
+    mocker.patch("orcest.orchestrator.loop.publish_issue_task")
+
+    project_redis = fake_redis_client.__class__.from_client(
+        fake_redis_client.client, key_prefix="uncred"
+    )
+    project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    with caplog.at_level(logging.ERROR):
+        # token_pools={} -> no pool for this project -> token_pool is None path.
+        _poll_cycle(config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    # No credential-less task may be published.
+    mock_publish_fix.assert_not_called()
+
+    # A clear operator error naming the project must be logged.
+    error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(
+        "acme/uncredentialed" in m and "no" in m.lower() and "credential" in m.lower()
+        for m in error_msgs
+    ), f"expected a no-credential operator error, got: {error_msgs}"
+
+
+# ---------------------------------------------------------------------------
+# M5-logic: shared issue stream must not starve other projects' discovery
+# ---------------------------------------------------------------------------
+
+
+def test_busy_project_does_not_permanently_starve_other_project_issue_discovery(
+    mocker,
+    fake_redis_client,
+    gh_mock,
+):
+    """With a backlog on the SHARED issue stream, issue discovery must still
+    rotate to every project across cycles -- one busy project cannot gate all
+    others indefinitely.
+
+    Fails against current code, where every project sees unclaimed_issue_tasks>0
+    on the shared stream and defers discovery, so project B is never polled for
+    issues.
+    """
+    from orcest.shared.config import LabelConfig
+
+    config = OrchestratorConfig(
+        labels=LabelConfig(),
+        projects=[
+            ProjectConfig(
+                repo="acme/busy", token="t-busy",
+                claude_tokens=["c-busy"], key_prefix="busy",
+            ),
+            ProjectConfig(
+                repo="acme/quiet", token="t-quiet",
+                claude_tokens=["c-quiet"], key_prefix="quiet",
+            ),
+        ],
+    )
+
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    mocker.patch("orcest.orchestrator.loop.publish_issue_task")
+
+    # Record which repos got issue discovery (override the autouse mock so we can spy).
+    discovered_repos: list[str] = []
+
+    def fake_discover_issues(*, repo, **kwargs):
+        discovered_repos.append(repo)
+        return []
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_issues",
+        side_effect=fake_discover_issues,
+    )
+
+    # Pre-load a backlog on the SHARED issue stream so the gate trips.
+    fake_redis_client.ensure_consumer_group("tasks:issue:claude", "workers")
+    fake_redis_client.xadd("tasks:issue:claude", {"a": "1"})
+    fake_redis_client.xadd("tasks:issue:claude", {"a": "2"})
+    assert fake_redis_client.stream_unread_count("tasks:issue:claude", "workers") > 0
+
+    for project in config.projects:
+        pr = fake_redis_client.__class__.from_client(
+            fake_redis_client.client, key_prefix=project.key_prefix
+        )
+        pr.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    logger = logging.getLogger("test")
+    # Run as many cycles as there are projects: with rotation, every project
+    # gets at least one issue-discovery turn even though the shared queue stays
+    # non-empty the whole time.
+    for _ in range(len(config.projects)):
+        _poll_cycle(config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    assert "acme/busy" in discovered_repos
+    assert "acme/quiet" in discovered_repos, (
+        "quiet project was starved of issue discovery by the shared-stream gate"
+    )

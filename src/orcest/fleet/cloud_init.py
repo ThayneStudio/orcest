@@ -7,12 +7,26 @@ and configures the appropriate services.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
-from typing import Any
 
 import yaml
 
 # ── Shared building blocks ──────────────────────────────────
+
+
+def _validate_env_value(value: str, name: str) -> None:
+    """Raise ValueError if *value* is unsafe to single-quote in an .env file.
+
+    Parity with ``orchestrator.generate_env_file._validate_env_value`` (C1):
+    the worker .env writes ``NAME='<value>'``, so a single quote breaks quoting,
+    and a newline / carriage return / null byte could smuggle an extra line
+    (e.g. inject another env var) into the file.
+    """
+    if any(c in value for c in ("\n", "\r", "\0")):
+        raise ValueError(f"{name} must not contain newlines or null bytes")
+    if "'" in value:
+        raise ValueError(f"{name} must not contain single quotes")
 
 _BASE_PACKAGES: list[str] = [
     "qemu-guest-agent",
@@ -57,10 +71,21 @@ _SUPABASE_VERSION = "2.95.4"
 # between releases, so pin it and re-validate the GrokRunner parsers
 # (tests/worker/test_grok_runner.py) on bump.
 _GROK_VERSION = "0.1.216"
-# Optional SHA-256 of the grok installer script, to defend against a
-# compromised CDN/DNS executing arbitrary code as root at bake time. Empty =
-# skip (xAI publishes no checksum for the beta installer yet); set once a
-# trusted digest is known and the verify step becomes enforcing.
+# SHA-256 of the grok installer script (x.ai/cli/install.sh) for _GROK_VERSION,
+# to defend against a compromised CDN/DNS executing arbitrary code as root at
+# bake time.
+#
+# FAIL CLOSED: if this is empty the installer is NOT executed (curl|bash as
+# root with no integrity gate is the threat). Grok degrades gracefully when
+# absent — grok-backed tasks early-reject with a rebake instruction (runner
+# skew handling + setup-worker.sh), never a stuck task or secret leak.
+#
+# To enable grok, pin a trusted digest here OR export it at bake time without a
+# code edit:
+#   curl -fsSL https://x.ai/cli/install.sh | sha256sum
+#   export ORCEST_GROK_INSTALLER_SHA256=<that digest>
+# xAI publishes no checksum for the beta installer yet, and the digest can
+# drift between fetches, so this stays empty (grok off) by default.
 _GROK_INSTALLER_SHA256 = ""
 
 # OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
@@ -68,6 +93,21 @@ _GROK_INSTALLER_SHA256 = ""
 # parsed by CodexRunner (tests/worker/test_codex_runner.py) is tied to this
 # version, so re-validate fixtures + parser on bump.
 _CODEX_VERSION = "0.131.0"
+
+# Provider CLIs that ``_worker_tooling_runcmd`` installs and which a worker
+# MUST be able to exec (as the non-root ``orcest`` user) for any provider task
+# to run. cloud-init's runcmd has no cross-entry ``set -e``: a failed install
+# in the middle of the list still lets cloud-final exit ``status: done``, so a
+# half-baked template can otherwise ship missing one of these. The bake path
+# (``orcest fleet create-template`` / ``rebake``) runs a post-bake smoke-check
+# of this exact list on PATH *before* the irreversible convert-to-template /
+# pool-pointer swap — keep this in sync with the install commands above.
+REQUIRED_PROVIDER_BINARIES: tuple[str, ...] = ("claude", "grok", "codex")
+# systemd ReadWritePaths for the worker unit (M3). Every dir the worker +
+# providers write at RUNTIME under ProtectHome=read-only/ProtectSystem=strict,
+# else those writes EROFS. Single line (a systemd directive cannot wrap); kept
+# as a constant so the unit f-strings stay under the line-length limit.
+_WORKER_READ_WRITE_PATHS = "/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok"  # noqa: E501
 
 
 def _template_versions_write_file() -> dict:
@@ -152,6 +192,9 @@ def _worker_tooling_runcmd() -> list[str]:
     Installs (in order): Node, Docker, Claude CLI, Grok CLI, Codex CLI, gh,
     Supabase CLI, Playwright + Chromium, Deno, Bun, uv, wrangler.
     """
+    # Effective grok installer digest: env override (set at bake time, no code
+    # edit) falls back to the pinned constant. Empty => FAIL CLOSED (skip).
+    grok_sha = os.environ.get("ORCEST_GROK_INSTALLER_SHA256", _GROK_INSTALLER_SHA256)
     return [
         # Node.js: NodeSource channel for the configured major version.
         f"curl -fsSL https://deb.nodesource.com/setup_{_NODE_MAJOR}.x | bash -",
@@ -172,20 +215,23 @@ def _worker_tooling_runcmd() -> list[str]:
             "curl -fsSL --connect-timeout 30 --max-time 300"
             " https://x.ai/cli/install.sh -o /tmp/grok-install.sh"
         ),
-        # Optional integrity gate + install in ONE entry joined by `&&`:
-        # cloud-init has no `set -e` across runcmd entries, so a separate
-        # checksum step would only log on mismatch and the install would run
-        # anyway. Combining them makes the gate actually enforcing once
-        # _GROK_INSTALLER_SHA256 is set (no-op `[ -z "" ]` true short-circuit
-        # while empty). Installer contract (verified against grok 0.1.216 at
+        # Integrity gate + install in ONE entry (cloud-init has no `set -e`
+        # across runcmd entries, so a separate gate could not block the
+        # install). FAIL CLOSED: the installer runs ONLY when a NON-empty
+        # digest matches the downloaded file. An empty/unset digest skips the
+        # install entirely and logs how to enable it — never curl|bash-as-root
+        # unverified. The `&&` between the `[ -n ... ]` test and the
+        # `sha256sum -c -` check keeps both conditions in one entry.
+        # Installer contract (verified against grok 0.1.216 at
         # x.ai/cli/install.sh): GROK_BIN_DIR selects the symlink dir and the
         # version is a bare positional arg — undocumented beta details the cp
         # below depends on; re-verify when bumping _GROK_VERSION.
         (
-            f'{{ [ -z "{_GROK_INSTALLER_SHA256}" ] || '
-            f'echo "{_GROK_INSTALLER_SHA256}  /tmp/grok-install.sh" | sha256sum -c -; }}'
-            f" && HOME=/root GROK_BIN_DIR=/root/.local/bin "
-            f"bash /tmp/grok-install.sh {_GROK_VERSION}"
+            f'if [ -n "{grok_sha}" ] && '
+            f'echo "{grok_sha}  /tmp/grok-install.sh" | sha256sum -c -; then '
+            f"HOME=/root GROK_BIN_DIR=/root/.local/bin bash /tmp/grok-install.sh {_GROK_VERSION}; "
+            f'else echo "grok installer SHA-256 unset/mismatch — SKIPPING grok install '
+            f'(set ORCEST_GROK_INSTALLER_SHA256 to enable); grok tasks will be rejected"; fi'
         ),
         # The installer symlinks /usr/local/bin/grok -> /root/.local/bin/grok
         # -> /root/.grok/downloads/<binary>. /root is 0700, so the non-root
@@ -251,12 +297,22 @@ def _worker_tooling_runcmd() -> list[str]:
 
 
 def _worker_workspace_runcmd() -> list[str]:
-    """Commands to set up the worker workspace directories."""
+    """Commands to set up the worker workspace directories.
+
+    Every ``/home/orcest`` directory listed in the worker unit's
+    ``ReadWritePaths`` (_WORKER_READ_WRITE_PATHS) MUST be created here: under
+    ``ProtectHome=read-only`` systemd (>=249) refuses to start a unit whose
+    ReadWritePaths target is missing, so an un-created .codex/.grok dir would
+    make every worker fail ``systemctl enable --now orcest-worker``.
+    """
     return [
         "mkdir -p /opt/orcest/workspaces",
         "chown -R orcest:orcest /opt/orcest",
-        "mkdir -p /home/orcest/.claude",
-        "mkdir -p /home/orcest/.cache",
+        # ReadWritePaths home targets — keep in sync with _WORKER_READ_WRITE_PATHS.
+        "mkdir -p /home/orcest/.claude",  # Claude CLI state
+        "mkdir -p /home/orcest/.cache",  # generic caches
+        "mkdir -p /home/orcest/.codex",  # CodexRunner writes auth.json
+        "mkdir -p /home/orcest/.grok",  # GrokRunner writes auth.json
         "chown -R orcest:orcest /home/orcest",
     ]
 
@@ -403,6 +459,7 @@ def render_clone_userdata(
     redis_host: str,
     worker_id: str,
     key_prefix: str = "orcest",
+    redis_password: str = "",
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
 
@@ -414,6 +471,11 @@ def render_clone_userdata(
         redis_host: Redis host (orchestrator VM IP).
         worker_id: Unique worker identifier (e.g. ``orcest-worker-10002``).
         key_prefix: Redis key prefix (shared across all projects).
+        redis_password: Redis AUTH password. When set, written to
+            ``/opt/orcest/.env`` (0600) so the worker can authenticate to the
+            password-protected Redis. ``build_redis_config`` reads it from the
+            env var ONLY (never worker.yaml), and the systemd unit loads
+            ``/opt/orcest/.env`` via ``EnvironmentFile=-``.
     """
     redis_section: dict = {"host": redis_host, "port": 6379, "key_prefix": key_prefix}
     worker_yaml = yaml.dump(
@@ -429,121 +491,15 @@ def render_clone_userdata(
 
     systemd_unit = _systemd_unit(worker_id=worker_id)
 
-    cloud_config = {
-        "hostname": worker_id,
-        "write_files": [
-            {
-                # ``defer`` ensures the orcest user exists before the file
-                # is chowned to it (cc_write_files otherwise runs in the
-                # config stage, before cc_users_groups).
-                "path": "/opt/orcest/worker.yaml",
-                "owner": "orcest:orcest",
-                "permissions": "0600",
-                "content": worker_yaml,
-                "defer": True,
-            },
-            {
-                "path": "/etc/systemd/system/orcest-worker.service",
-                "permissions": "0644",
-                "content": systemd_unit,
-            },
-            {
-                "path": "/home/orcest/.claude.json",
-                "owner": "orcest:orcest",
-                "permissions": "0644",
-                "content": '{"hasCompletedOnboarding": true}',
-                "defer": True,
-            },
-        ],
-        "runcmd": [
-            # Reinstall orcest from latest commit before starting the worker.
-            # The template may have an older version baked in. --force-reinstall
-            # is needed because the version number (0.1.0) doesn't change.
-            "sudo -u orcest /opt/orcest/venv/bin/pip install -q --no-cache-dir"
-            " --force-reinstall 'git+https://github.com/ThayneStudio/orcest.git'",
-            "systemctl daemon-reload",
-            "systemctl enable --now orcest-worker",
-        ],
-    }
-    return _render(cloud_config)
-
-
-# ── Worker (ephemeral, cloned from template) ────────────────
-
-
-def render_worker_userdata(
-    *,
-    redis_host: str,
-    key_prefix: str,
-    worker_id: str,
-    github_token: str,
-    claude_oauth_token: str,
-    repo: str,
-) -> str:
-    """Render a cloud-init user-data YAML for a worker VM.
-
-    The generated user-data includes:
-    - System package installation (Python, Node, Docker, Go, etc.)
-    - Claude CLI and gh CLI installation
-    - Orcest user creation and workspace setup
-    - Worker config, env file, and systemd service
-    - Claude Code authentication (headless OAuth token)
-    - GitHub CLI authentication
-    - Orcest package installation from PyPI or git
-
-    Workers are ephemeral clones — SSH key injection is not needed.
-    Credentials are injected via cloud-init write_files.
-
-    Args:
-        redis_host: Orchestrator Redis host (IP or hostname).
-        key_prefix: Redis key prefix for namespace isolation.
-        worker_id: Unique worker identifier (used in heartbeats).
-        github_token: GitHub token for gh CLI and orcest.
-        claude_oauth_token: Claude Code OAuth token from ``claude setup-token``.
-        repo: GitHub repo in "owner/repo" format (for orcest install).
-    """
-    worker_yaml = yaml.dump(
+    clone_write_files: list[dict[str, Any]] = [
         {
-            "redis": {"host": redis_host, "port": 6379, "key_prefix": key_prefix},
-            "worker_id": worker_id,
-            "workspace_dir": "/opt/orcest/workspaces",
-            "backend": "claude",
-            "runner": {
-                "type": "claude",
-                "timeout": 1800,
-                "max_retries": 3,
-                "retry_backoff": 10,
-            },
-        },
-        default_flow_style=False,
-    )
-
-    env_content = (
-        f"GITHUB_TOKEN={github_token}\n"
-        f"GH_TOKEN={github_token}\n"
-        f"CLAUDE_CODE_OAUTH_TOKEN={claude_oauth_token}\n"
-    )
-
-    systemd_unit = _systemd_unit(worker_id=worker_id)
-
-    claude_json = '{"hasCompletedOnboarding": true}'
-
-    write_files: list[dict[str, Any]] = [
-        # ``defer: true`` waits for cc_users_groups to create the orcest
-        # user before chown/chmod — the config stage runs cc_write_files
-        # before users exist, which logs ``Unknown user or group: "orcest"``.
-        {
+            # ``defer`` ensures the orcest user exists before the file
+            # is chowned to it (cc_write_files otherwise runs in the
+            # config stage, before cc_users_groups).
             "path": "/opt/orcest/worker.yaml",
             "owner": "orcest:orcest",
             "permissions": "0600",
             "content": worker_yaml,
-            "defer": True,
-        },
-        {
-            "path": "/opt/orcest/.env",
-            "owner": "orcest:orcest",
-            "permissions": "0600",
-            "content": env_content,
             "defer": True,
         },
         {
@@ -555,37 +511,49 @@ def render_worker_userdata(
             "path": "/home/orcest/.claude.json",
             "owner": "orcest:orcest",
             "permissions": "0644",
-            "content": claude_json,
-            "defer": True,
-        },
-        {
-            "path": "/opt/orcest/.gh-token",
-            "owner": "orcest:orcest",
-            "permissions": "0600",
-            "content": f"{github_token}\n",
+            "content": '{"hasCompletedOnboarding": true}',
             "defer": True,
         },
     ]
+    if redis_password:
+        # C1: Redis AUTH for the worker. build_redis_config reads
+        # ORCEST_REDIS_PASSWORD from the env ONLY (never worker.yaml), and the
+        # systemd unit loads /opt/orcest/.env via EnvironmentFile=-. 0600 +
+        # orcest-owned + defer. Single-quoted + validated (parity with
+        # generate_env_file) so a newline/hash/quote can't corrupt the .env.
+        _validate_env_value(redis_password, "redis_password")
+        clone_write_files.append(
+            {
+                "path": "/opt/orcest/.env",
+                "owner": "orcest:orcest",
+                "permissions": "0600",
+                "content": f"ORCEST_REDIS_PASSWORD='{redis_password}'\n",
+                "defer": True,
+            }
+        )
 
-    # Workers are ephemeral clones — SSH key injection is not needed
-    # (credentials and config are injected via cloud-init write_files).
-    cloud_config = _base_cloud_config(
-        packages=list(_WORKER_PACKAGES),
-        runcmd=[
-            *_guest_agent_runcmd(),
-            *_worker_workspace_runcmd(),
-            *_worker_tooling_runcmd(),
-            # Authenticate gh CLI for the orcest user using the pre-written token file
-            "su - orcest -c 'gh auth login --with-token < /opt/orcest/.gh-token'",
-            # Create Python virtualenv and install orcest
-            "sudo -u orcest python3 -m venv /opt/orcest/venv",
-            f"sudo -u orcest /opt/orcest/venv/bin/pip install 'git+https://github.com/{repo}.git'",
-            # Enable and start the worker service
+    cloud_config = {
+        "hostname": worker_id,
+        "write_files": clone_write_files,
+        "runcmd": [
+            # Reinstall orcest from latest commit before starting the worker.
+            # The template may have an older version baked in. --force-reinstall
+            # is needed because the version number (0.1.0) doesn't change.
+            "sudo -u orcest /opt/orcest/venv/bin/pip install -q --no-cache-dir"
+            " --force-reinstall 'git+https://github.com/ThayneStudio/orcest.git'",
+            # Ensure every /home/orcest ReadWritePaths target exists BEFORE the
+            # unit is enabled. A warm template baked before .codex/.grok were
+            # added would otherwise be missing them, and under
+            # ProtectHome=read-only systemd refuses to start a unit whose
+            # ReadWritePaths target is absent -> the worker never boots. Keep in
+            # sync with _WORKER_READ_WRITE_PATHS / the systemd unit.
+            "mkdir -p /home/orcest/.claude /home/orcest/.cache"
+            " /home/orcest/.codex /home/orcest/.grok",
+            "chown -R orcest:orcest /home/orcest",
             "systemctl daemon-reload",
             "systemctl enable --now orcest-worker",
         ],
-        write_files=write_files,
-    )
+    }
     return _render(cloud_config)
 
 
@@ -602,6 +570,20 @@ def _systemd_unit(worker_id: str = "%H") -> str:
     # the in-process ~60 s Redis-connect retry in worker/loop.py, a brief
     # Redis container restart during ``orcest fleet update`` is well within
     # the recovery window without manual ``systemctl reset-failed`` per VM.
+    #
+    # Hardening (ProtectSystem=strict + ProtectHome=read-only + …) is the
+    # reconciled superset of this generated unit and the static
+    # provision/systemd/orcest-worker.service (M3). ReadWritePaths MUST list
+    # every dir the worker + providers write at RUNTIME under the unit sandbox,
+    # or ProtectHome/ProtectSystem turn those writes into EROFS:
+    #   /opt/orcest          — clone-written worker.yaml + venv reinstall
+    #   /home/orcest/.claude — Claude CLI state
+    #   /home/orcest/.cache  — generic caches
+    #   /home/orcest/.codex  — CodexRunner writes auth.json (codex_runner.py)
+    #   /home/orcest/.grok   — GrokRunner writes auth.json (grok_runner.py)
+    # Note: gh cannot refresh its token under ProtectHome=read-only, which is
+    # why setup-worker.sh mandates a non-expiring PAT — accepted behaviour, do
+    # NOT add ~/.config here to "fix" it.
     return f"""\
 [Unit]
 Description=Orcest Worker
@@ -619,6 +601,9 @@ RestartSec=10
 TimeoutStopSec=120
 MemoryMax=8G
 Environment=PYTHONUNBUFFERED=1
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={_WORKER_READ_WRITE_PATHS}
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes

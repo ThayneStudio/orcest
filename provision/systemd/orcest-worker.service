@@ -1,7 +1,7 @@
 [Unit]
 Description=Orcest Worker
 After=network.target
-StartLimitBurst=5
+StartLimitBurst=10
 StartLimitIntervalSec=300
 
 [Service]
@@ -12,15 +12,15 @@ ExecStart=/opt/orcest/venv/bin/orcest work --id %H --config /opt/orcest/worker.y
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
-MemoryMax=4G
+MemoryMax=8G
 Environment=PYTHONUNBUFFERED=1
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/orcest/workspaces /home/orcest/.claude /home/orcest/.cache
+ReadWritePaths=/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
-EnvironmentFile=/opt/orcest/.env
+EnvironmentFile=-/opt/orcest/.env
 
 [Install]
 WantedBy=multi-user.target

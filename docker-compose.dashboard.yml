@@ -2,7 +2,11 @@ services:
   dashboard:
     build: ./dashboard
     ports:
-      - "8080:8080"
+      # Bind to loopback only: the dashboard is a human-browser convenience
+      # stack, not a cross-VM service (unlike Redis). Reach it via an SSH
+      # tunnel / reverse proxy. Combined with the now-fail-closed auth, this
+      # keeps the port off the LAN. See M2-sec.
+      - "127.0.0.1:8080:8080"
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379

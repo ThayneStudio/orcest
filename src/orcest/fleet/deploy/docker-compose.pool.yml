@@ -12,8 +12,9 @@ services:
     network_mode: host
     environment:
       ORCEST_REDIS_HOST: "127.0.0.1"
+      ORCEST_REDIS_PASSWORD: ${ORCEST_REDIS_PASSWORD}
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; redis.Redis('127.0.0.1').ping()"]
+      test: ["CMD", "python", "-c", "import os,redis; redis.Redis('127.0.0.1', password=os.environ.get('ORCEST_REDIS_PASSWORD')).ping()"]
       interval: 30s
       timeout: 5s
       retries: 3
