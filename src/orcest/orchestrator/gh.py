@@ -740,35 +740,110 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
     return results
 
 
-def list_labeled_issues(repo: str, label: str, token: str) -> list[dict]:
-    """List open issues with a specific label.
+def list_labeled_issues(repo: str, label: str, token: str, limit: int = 1000) -> list[dict]:
+    """List open issues with a specific label, oldest first.
 
     Returns list of dicts with keys: number, title, body, labels.
+    Paginated via GraphQL cursor (mirrors list_open_prs) so repos with more
+    than 100 labeled issues do not silently drop the oldest ones. Capped at
+    _MAX_PAGES * 100 issues.
     """
     _validate_repo(repo)
-    output = _run_gh(
-        [
-            "issue",
-            "list",
-            "--repo",
-            repo,
-            "--label",
-            label,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels",
-            "--limit",
-            "100",
-        ],
-        token,
-    )
-    if not output:
+    if limit < 1:
         return []
-    try:
-        return json.loads(output)
-    except json.JSONDecodeError as e:
-        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+    owner, name = repo.split("/", 1)
+    query = """
+query($owner: String!, $repo: String!, $label: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    issues(
+      states: OPEN
+      first: $first
+      after: $after
+      filterBy: {labels: [$label]}
+      orderBy: {field: CREATED_AT, direction: ASC}
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        body
+        labels(first: 100) { nodes { name color description } }
+      }
+    }
+  }
+}
+"""
+    issues: list[dict] = []
+    cursor: str | None = None
+    page_count = 0
+    issues_conn: dict[str, Any] = {}
+    while len(issues) < limit and page_count < _MAX_PAGES:
+        page_count += 1
+        page_size = min(100, limit - len(issues))
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={name}",
+            "-f",
+            f"label={label}",
+            "-F",
+            f"first={page_size}",
+            "-f",
+            f"query={query}",
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"after={cursor}"])
+        output = _run_gh(args, token)
+        if not output:
+            return issues
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+        if isinstance(data, list):
+            return data
+        if "errors" in data:
+            msgs = [e.get("message", str(e)) for e in data["errors"]]
+            raise GhCliError(f"GraphQL errors fetching labeled issues: {'; '.join(msgs)}")
+        repo_data = (data.get("data") or {}).get("repository")
+        if not repo_data:
+            raise GhCliError(
+                f"GraphQL returned null repository for {repo!r} -- "
+                "check that the repo exists and the token has access"
+            )
+        issues_conn = repo_data.get("issues") or {}
+        for node in issues_conn.get("nodes") or []:
+            labels = (node.get("labels") or {}).get("nodes") or []
+            normalized = dict(node)
+            normalized["labels"] = labels
+            issues.append(normalized)
+        page_info = issues_conn.get("pageInfo") or {}
+        if page_info.get("hasNextPage") and len(issues) < limit:
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                logger.warning(
+                    "Labeled-issue pagination for %s had hasNextPage=True but no endCursor; "
+                    "stopping with %d issues fetched",
+                    repo,
+                    len(issues),
+                )
+                break
+        else:
+            break
+    else:
+        page_info = issues_conn.get("pageInfo") or {}
+        if page_info.get("hasNextPage") and len(issues) < limit:
+            logger.warning(
+                "Labeled-issue listing for %s reached MAX_PAGES (%d); some issues may "
+                "have been truncated (%d fetched so far)",
+                repo,
+                _MAX_PAGES,
+                len(issues),
+            )
+    return issues
 
 
 def get_issue(repo: str, number: int, token: str) -> dict:
@@ -818,7 +893,10 @@ def get_issue_state(repo: str, number: int, token: str) -> str:
     except GhCliError as exc:
         stderr_lc = (exc.stderr or "").lower()
         if "could not resolve" in stderr_lc or "not found" in stderr_lc:
-            return "missing"
+            # The number may belong to a PR, not an Issue (shared number space).
+            # `gh issue view` errors on a PR number; fall back to a PR lookup so
+            # `blocked by #PR` / `after #PR merges` correctly defers the dependent.
+            return _pr_state_for_blocker(repo, number, token)
         raise
     if not output:
         return "missing"
@@ -829,6 +907,34 @@ def get_issue_state(repo: str, number: int, token: str) -> str:
     state = (data.get("state") or "").lower()
     if state in ("open", "closed"):
         return state
+    return "missing"
+
+
+def _pr_state_for_blocker(repo: str, number: int, token: str) -> str:
+    """Resolve a blocker number that is not an issue as a PR. Returns
+    'open' (OPEN), 'closed' (CLOSED/MERGED), or 'missing' (genuinely absent).
+    """
+    try:
+        output = _run_gh(
+            ["pr", "view", str(number), "--repo", repo, "--json", "state"],
+            token,
+        )
+    except GhCliError as exc:
+        stderr_lc = (exc.stderr or "").lower()
+        if "could not resolve" in stderr_lc or "not found" in stderr_lc:
+            return "missing"
+        raise
+    if not output:
+        return "missing"
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GhCliError(f"Failed to parse gh output as JSON: {e}") from e
+    state = (data.get("state") or "").lower()
+    if state == "open":
+        return "open"
+    if state in ("closed", "merged"):
+        return "closed"
     return "missing"
 
 
