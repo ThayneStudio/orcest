@@ -131,13 +131,21 @@ def upload_source(ssh_target: str) -> None:
     # Assemble build context in a temp directory
     staging = tempfile.mkdtemp(prefix="orcest-upload-")
     try:
-        # Copy deploy files (Dockerfile, compose files, pyproject.toml) to staging root
+        # Copy deploy files (Dockerfile, compose files, pyproject.toml,
+        # requirements.lock) to the staging root. ``requirements.lock`` MUST be
+        # staged at the context root because the deploy Dockerfile does
+        # ``COPY requirements.lock .`` (reading the context root, not src/);
+        # without it the image build fails at that COPY. The lock ships as
+        # package data under deploy/ (see pyproject ``orcest.fleet`` package-data
+        # ``deploy/*``), so deploy_dir/requirements.lock is the canonical,
+        # pip-install-safe source mirroring the repo-root lock.
         deploy_files = (
             "Dockerfile",
             "docker-compose.yml",
             "docker-compose.redis.yml",
             "docker-compose.pool.yml",
             "pyproject.toml",
+            "requirements.lock",
         )
         for fname in deploy_files:
             src_path = os.path.join(deploy_dir, fname)
@@ -177,7 +185,8 @@ def upload_source(ssh_target: str) -> None:
             )
         clean_result = _ssh(
             ssh_target,
-            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose*.yml pyproject.toml",
+            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose*.yml"
+            " pyproject.toml requirements.lock",
         )
         if clean_result.returncode != 0:
             raise RuntimeError(
