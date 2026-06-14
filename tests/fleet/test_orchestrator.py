@@ -117,6 +117,34 @@ class TestGenerateEnvFile:
         # The $dollar should be preserved literally inside single quotes
         assert "GITHUB_TOKEN='ghp_has$dollar'" in env
 
+    def test_generate_env_file_emits_redis_password(self):
+        """C1: a supplied redis_password is written (single-quoted) into the .env
+        so the orchestrator container can AUTH to the password-protected Redis."""
+        env = generate_env_file(
+            github_token="ghp_test",
+            key_prefix="myproj",
+            project_name="myproj",
+            redis_password="s3cr3t-pw",
+        )
+        assert "ORCEST_REDIS_PASSWORD='s3cr3t-pw'" in env
+
+    def test_generate_env_file_omits_redis_password_when_empty(self):
+        """C1: backward compat -- no password arg means no ORCEST_REDIS_PASSWORD
+        line (so existing single-token onboarding output is unchanged)."""
+        env = generate_env_file(github_token="t", key_prefix="p", project_name="p")
+        assert "ORCEST_REDIS_PASSWORD" not in env
+
+    def test_generate_env_file_rejects_single_quote_in_redis_password(self):
+        """C1: the password is single-quoted in .env, so a single quote must be
+        rejected (mirrors the github_token/key_prefix injection guards)."""
+        with pytest.raises(ValueError, match="redis_password"):
+            generate_env_file(
+                github_token="t",
+                key_prefix="p",
+                project_name="p",
+                redis_password="pw'injected",
+            )
+
 
 class TestGenerateOrchestratorConfig:
     def test_basic_structure(self):

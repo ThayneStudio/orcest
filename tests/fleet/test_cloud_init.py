@@ -446,3 +446,58 @@ def test_worker_orcest_owned_writes_are_deferred():
             assert entry.get("defer") is True, (
                 f"write_files entry for {entry['path']} owned by {owner!r} must set defer=true"
             )
+
+
+# ── C1: Redis AUTH password injected into worker .env ──
+
+
+def test_clone_userdata_writes_redis_password_env():
+    """C1: pool-manager-provisioned workers (render_clone_userdata) must get the
+    Redis password in /opt/orcest/.env (build_redis_config reads it from env
+    only, and systemd loads EnvironmentFile=-/opt/orcest/.env). Bug: today the
+    clone path writes no .env at all."""
+    data = yaml.safe_load(
+        render_clone_userdata(
+            redis_host="10.20.0.23",
+            worker_id="orcest-worker-10002",
+            key_prefix="orcest",
+            redis_password="pool-pw",
+        )
+    )
+    env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
+    assert "ORCEST_REDIS_PASSWORD=pool-pw" in env_file["content"]
+    # Secret-at-rest: the worker .env must be 0600 and orcest-owned + deferred.
+    assert env_file["permissions"] == "0600"
+    assert env_file["owner"] == "orcest:orcest"
+    assert env_file.get("defer") is True
+    # And it must NOT go into worker.yaml (config.py ignores yaml redis.password).
+    worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+    assert "pool-pw" not in worker_file["content"]
+
+
+def test_clone_userdata_no_env_when_password_absent():
+    """C1: backward compat -- no redis_password means the clone writes no .env
+    (preserves today's behaviour for unauthenticated/dev stacks)."""
+    data = yaml.safe_load(
+        render_clone_userdata(redis_host="10.0.0.1", worker_id="w-1", key_prefix="orcest")
+    )
+    assert all(f["path"] != "/opt/orcest/.env" for f in data["write_files"])
+
+
+def test_worker_userdata_writes_redis_password_env():
+    """C1: the legacy direct-provision path (render_worker_userdata) also injects
+    ORCEST_REDIS_PASSWORD into /opt/orcest/.env."""
+    data = yaml.safe_load(
+        render_worker_userdata(
+            redis_host="10.20.0.23",
+            key_prefix="orcest",
+            worker_id="worker-200",
+            github_token="ghp_fake",
+            claude_oauth_token="sk-ant-oat01-fake",
+            repo="ThayneStudio/orcest",
+            redis_password="direct-pw",
+        )
+    )
+    env_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/.env")
+    assert "ORCEST_REDIS_PASSWORD=direct-pw" in env_file["content"]
+    assert env_file["permissions"] == "0600"

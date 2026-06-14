@@ -49,7 +49,7 @@ from orcest.shared.coordination import (
     increment_transient_failure_count,
     set_pending_task,
 )
-from orcest.shared.models import ResultStatus, TaskResult
+from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult
 
 
 def _consume_results(config: OrchestratorConfig, redis, logger):
@@ -853,6 +853,33 @@ def test_poll_cycle_exception_handled(mocker, fake_redis_client, orchestrator_co
 
     # Should not raise — per-project error isolation catches and logs
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+
+def test_poll_cycle_trims_acked_task_entries(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    """M1-conc: a poll cycle reclaims delivered+ACKed entries from the task
+    streams (so credentials don't live forever) but keeps un-ACKed entries."""
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    # default_runner defaults to "claude".
+    stream = f"tasks:{orchestrator_config.default_runner}"
+    fake_redis_client.ensure_consumer_group(stream, CONSUMER_GROUP)
+    acked = fake_redis_client.xadd(stream, {"token": "ghp_acked"})
+    unacked = fake_redis_client.xadd(stream, {"token": "ghp_unacked"})
+    fake_redis_client.xreadgroup(
+        group=CONSUMER_GROUP, consumer="c1", stream=stream, count=10, block_ms=None
+    )
+    fake_redis_client.xack(stream, CONSUMER_GROUP, acked)
+
+    logger = logging.getLogger("test")
+    # task_redis is the same fake client as the project redis in these tests.
+    _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
+
+    remaining = [eid for eid, _ in fake_redis_client.xrevrange(stream, count=10)]
+    assert acked not in remaining  # ACKed credential entry reclaimed
+    assert unacked in remaining  # in-flight work preserved
 
 
 # ---------------------------------------------------------------------------
