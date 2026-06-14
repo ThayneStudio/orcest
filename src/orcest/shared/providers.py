@@ -52,9 +52,21 @@ class ProviderEntry:
             self.provider, f"{self.provider.upper()}_TOKEN"
         )
 
+    def _credential_hash(self) -> str:
+        return hashlib.sha256(self.credential.encode()).hexdigest()[:12]
+
     def identity(self) -> str:
-        h = hashlib.sha256(self.credential.encode()).hexdigest()[:12]
-        return f"{self.provider}:{self.model or ''}:{h}"
+        """Selection / round-robin / credential-override anchor (model-inclusive)."""
+        return f"{self.provider}:{self.model or ''}:{self._credential_hash()}"
+
+    def account_key(self) -> str:
+        """Exhaustion-cooldown key: the rate-limited ACCOUNT, independent of model.
+
+        Claude/Grok rate limits are per-account (credential), so an account
+        pinned under two models must share a single cooldown. Never contains a
+        raw secret (only the credential hash + provider).
+        """
+        return f"{self.provider}:{self._credential_hash()}"
 
     def __repr__(self) -> str:
         cred = self.credential[:4] + "..." if self.credential else ""

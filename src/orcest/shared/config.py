@@ -306,8 +306,10 @@ def _parse_providers_list(raw: Any, context: str) -> list[ProviderEntry]:
 def _dedup_merge(base: list[ProviderEntry], additions: list[ProviderEntry]) -> list[ProviderEntry]:
     """Return base + additions, skipping any addition whose identity() is already present.
 
-    First occurrence (from base) wins. Used for top-level + per-project merge
-    and (via synth) for legacy claude dedup.
+    First occurrence (from base) wins. Used for the top-level + per-project
+    provider merge, where two model-entries of one account are legitimately
+    distinct pool entries (deduped only on exact identity). Legacy claude
+    synthesis dedups by account_key instead -- see _with_legacy_claude_synthesis.
     """
     result = list(base)
     existing = {e.identity() for e in result}
@@ -322,14 +324,21 @@ def _dedup_merge(base: list[ProviderEntry], additions: list[ProviderEntry]) -> l
 def _with_legacy_claude_synthesis(
     providers: list[ProviderEntry], claude_tokens: list[str]
 ) -> list[ProviderEntry]:
-    """Append synthesized legacy claude entries (rich fields=None) for tokens not
-    already present by identity(). Reuses _dedup_merge so the two branches share
-    the synthesis+dedup logic.
+    """Append synthesized legacy claude entries (rich fields=None) for tokens whose
+    ACCOUNT (provider + credential) is not already present. Dedup is by account_key,
+    not identity(): a claude account already declared under an explicit model must
+    not be re-registered as a second model=None entry (which would double its
+    round-robin weight and give it an independent exhaustion cooldown).
     """
-    synth: list[ProviderEntry] = [
-        ProviderEntry(provider="claude", credential=t, model=None) for t in claude_tokens
-    ]
-    return _dedup_merge(providers, synth)
+    result = list(providers)
+    existing_accounts = {e.account_key() for e in result}
+    for t in claude_tokens:
+        synth = ProviderEntry(provider="claude", credential=t, model=None)
+        acct = synth.account_key()
+        if acct not in existing_accounts:
+            result.append(synth)
+            existing_accounts.add(acct)
+    return result
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -627,8 +636,13 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
 
     # Shared task stream prefix: all per-project orchestrators publish tasks
     # to this prefix so workers only need to read from one stream.
+    # Route through _safe_optional_str so YAML `task_key_prefix: null` becomes
+    # '' (not the literal string 'None') and falls back to redis.key_prefix.
     task_key_prefix = (
-        str(os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix", "")))
+        _safe_optional_str(
+            os.environ.get("ORCEST_TASK_KEY_PREFIX", raw.get("task_key_prefix")),
+            "task_key_prefix",
+        )
         or redis_config.key_prefix
     )
 

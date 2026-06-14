@@ -175,6 +175,40 @@ def test_mixed_providers_independent_exhaustion():
     assert "claude" not in remaining
 
 
+def test_exhaustion_cooldown_is_per_account_not_per_model():
+    """H3-logic: rate limits are per-account, so benching an account benches every
+    model-entry that shares its credential -- a second model pinned to the same
+    account must NOT remain selectable and must NOT get an independent cooldown.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    shared = "acct-shared"
+    opus = ProviderEntry("claude", shared, model="opus")
+    sonnet = ProviderEntry("claude", shared, model="sonnet")
+    other = ProviderEntry("claude", "acct-other")
+    pool = ProviderPool([opus, sonnet, other])
+    assert pool.size == 3
+    assert pool.available_count == 3
+
+    # Serve a task on the opus entry of the shared account, then mark exhausted.
+    pool.register_task("task-opus", opus)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    pool.mark_exhausted("task-opus", resets_at=future)
+
+    # The shared ACCOUNT is benched: BOTH opus and sonnet entries are gone,
+    # leaving only the other account (1 entry available, not 2).
+    assert pool.available_count == 1
+
+    # next_entry must never hand back the benched account under any model;
+    # only acct-other should ever come out while the account is cooled down.
+    creds_seen = set()
+    for _ in range(6):
+        e = pool.next_entry()
+        assert e is not None
+        creds_seen.add(e.credential)
+    assert creds_seen == {"acct-other"}
+
+
 def test_concurrent_next_under_contention():
     """Many threads calling next_entry concurrently must not crash and respect RR + cooldowns."""
     entries = _make_entries(3)
