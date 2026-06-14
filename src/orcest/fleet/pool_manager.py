@@ -12,6 +12,7 @@ instances could clash.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -19,7 +20,14 @@ import time
 from orcest.fleet.cloud_init import render_clone_userdata
 from orcest.fleet.config import FleetConfig
 from orcest.fleet.proxmox_api import ProxmoxClient, mac_for_vm_id
-from orcest.shared.models import CONSUMER_GROUP
+from orcest.shared.coordination import clear_pending_task_if_matches
+from orcest.shared.models import (
+    CONSUMER_GROUP,
+    TRANSIENT_SUMMARY_PREFIX,
+    ResultStatus,
+    Task,
+    TaskResult,
+)
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -28,6 +36,12 @@ logger = logging.getLogger(__name__)
 _POOL_IDLE_KEY = "pool:idle"
 _POOL_ACTIVE_KEY = "pool:active"
 _POOL_DONE_PREFIX = "pool:done:"
+# Results stream + cap, mirroring worker/loop.py so the reaper writes a
+# transient-FAILED result to the same place the orchestrator reads.
+_RESULTS_STREAM = "results"
+_RESULT_MAXLEN = 20000
+# Fixed worker_id stamped on reaper-published results (operator-facing).
+_REAPER_WORKER_ID = "pool-manager-reaper"
 # Pointer naming the active worker template VMID. Set by `orcest fleet rebake`
 # (or initialised from `pool.template_vm_id` on first run for backward compat).
 _POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
@@ -81,6 +95,7 @@ class PoolManager:
             self._fill_pool()
             self._health_check()
             self._reconcile_stale_redis()
+            self._sweep_orphan_pel()
         except Exception:
             logger.error("Reconciliation pass failed", exc_info=True)
 
@@ -130,22 +145,7 @@ class PoolManager:
             return
 
         # Get consumers with pending entries from task streams
-        active_consumers: set[str] = set()
-        for stream_name in self._task_streams():
-            try:
-                groups = self._redis.xinfo_groups_raw(stream_name)
-            except Exception:
-                continue
-            for group in groups:
-                if group.get("name") != CONSUMER_GROUP:
-                    continue
-                try:
-                    consumers = self._redis.xinfo_consumers_raw(stream_name, CONSUMER_GROUP)
-                except Exception:
-                    continue
-                for consumer in consumers:
-                    if consumer.get("pending", 0) > 0:
-                        active_consumers.add(str(consumer.get("name", "")))
+        active_consumers = self._consumers_with_pending()
 
         # Move idle VMs to active if their consumer has pending entries
         # Batch all transitions into a single pipeline
@@ -209,17 +209,51 @@ class PoolManager:
                 self._pool.size,
                 excess,
             )
+            # Re-read consumer pending state NOW (not the snapshot from
+            # _detect_active_workers earlier in this pass): a VM may have
+            # claimed a task since then. Never drain a VM with a pending entry.
+            busy_consumers = self._consumers_with_pending()
             idle_members = list(self._redis.smembers(_POOL_IDLE_KEY))
-            for member in idle_members[:excess]:
+            drained = 0
+            for member in idle_members:
+                if drained >= excess:
+                    break
                 try:
                     vm_id = int(member)
                 except (ValueError, TypeError):
                     continue
+                if self._vm_id_to_worker_id(vm_id) in busy_consumers:
+                    logger.info(
+                        "Skipping drain of VM %d: it has a pending task "
+                        "(claimed since active-detection ran this pass)",
+                        vm_id,
+                    )
+                    continue
                 logger.info("Draining excess idle VM %d", vm_id)
                 self._destroy_vm(vm_id)
+                drained += 1
 
     def _destroy_vm(self, vm_id: int) -> None:
-        """Stop and destroy a VM, remove from tracking sets."""
+        """Stop and destroy a VM, remove from tracking sets.
+
+        A hard VMID-range guard runs first: only VMIDs inside the configured
+        worker range ``[pool.vm_id_start, pool.vm_id_end]`` may ever be touched
+        in Proxmox. This is defence-in-depth against a poisoned/garbled
+        ``pool:done:*`` key (or any other caller) resolving to the orchestrator
+        VM, a template, or some unrelated VMID. Out-of-range requests are
+        logged and dropped (no Proxmox call). Every destroy path funnels
+        through here, so this one check covers them all.
+        """
+        if not self._is_destroyable_vm_id(vm_id):
+            logger.error(
+                "Refusing to destroy VM %d: outside configured worker VMID range "
+                "[%s, %s]. This is a safety guard against a poisoned done-key or "
+                "misrouted destroy targeting the orchestrator/template/unrelated VM.",
+                vm_id,
+                self._pool.vm_id_start,
+                self._pool.vm_id_end or "open",
+            )
+            return
         try:
             self._proxmox.stop_vm(vm_id)
             # Brief wait for VM to stop before destroying
@@ -459,10 +493,18 @@ class PoolManager:
 
         # Set cloud-init userdata so the clone starts the worker service
         try:
+            # C1: forward the Redis AUTH password to the clone so its worker can
+            # authenticate to the now-password-protected Redis. The pool-manager
+            # container receives ORCEST_REDIS_PASSWORD in its own environment via
+            # the pool compose stack's --env-file/passthrough (see
+            # ensure_pool_manager + docker-compose.pool.yml). Absent (dev/legacy
+            # unauthenticated stack) -> empty string -> clone writes no .env,
+            # preserving the old behaviour.
             userdata = render_clone_userdata(
                 redis_host=self._config.orchestrator.host,
                 worker_id=name,
                 key_prefix=self._key_prefix,
+                redis_password=os.environ.get("ORCEST_REDIS_PASSWORD", ""),
             )
             self._proxmox.set_cloud_init_userdata(
                 new_id,
@@ -542,6 +584,19 @@ class PoolManager:
                     elapsed,
                     max_duration,
                 )
+                # Reap coordination FIRST: clear the pending marker, release the
+                # PEL slot, and publish a transient-FAILED result so the
+                # orchestrator re-enqueues instead of waiting out the ~4.6h
+                # marker TTL. Best-effort; never blocks the destroy.
+                try:
+                    self._coordinate_reaped_vm(vm_id)
+                except Exception:
+                    logger.error(
+                        "Failed to coordinate Redis state for reaped VM %d; "
+                        "destroying anyway (orchestrator will recover on marker TTL)",
+                        vm_id,
+                        exc_info=True,
+                    )
                 # _destroy_vm handles all exceptions internally.
                 self._destroy_vm(vm_id)
 
@@ -723,6 +778,31 @@ class PoolManager:
             f"{prefix}:tasks:issue:claude",
         )
 
+    def _consumers_with_pending(self) -> set[str]:
+        """Names of consumer-group consumers that currently hold a pending entry.
+
+        Read fresh from Redis each call. Used both to promote idle->active and,
+        critically, to re-check just before draining an excess idle VM so a VM
+        that claimed a task mid-reconcile is never destroyed.
+        """
+        names: set[str] = set()
+        for stream_name in self._task_streams():
+            try:
+                groups = self._redis.xinfo_groups_raw(stream_name)
+            except Exception:
+                continue
+            for group in groups:
+                if group.get("name") != CONSUMER_GROUP:
+                    continue
+                try:
+                    consumers = self._redis.xinfo_consumers_raw(stream_name, CONSUMER_GROUP)
+                except Exception:
+                    continue
+                for consumer in consumers:
+                    if consumer.get("pending", 0) > 0:
+                        names.add(str(consumer.get("name", "")))
+        return names
+
     def _is_template_vmid(self, vm_id: int) -> bool:
         """Return True if *vm_id* names a template (active or pending GC).
 
@@ -739,6 +819,26 @@ class PoolManager:
             return True
         active = self._resolve_template_vmid()
         return active is not None and vm_id == active
+
+    def _is_destroyable_vm_id(self, vm_id: int) -> bool:
+        """Return True only if *vm_id* is inside the configured worker range.
+
+        Worker clones are allocated from ``[vm_id_start, vm_id_end]`` (with
+        ``vm_id_end == 0`` meaning open-ended). Any VMID below the start, or
+        above a configured end, must never be destroyed -- it could be the
+        orchestrator VM, a template, or an unrelated guest. When the worker
+        range is unconfigured (``vm_id_start <= 0``) nothing is destroyable:
+        without a range we cannot prove a VMID is a worker clone.
+        """
+        start = self._pool.vm_id_start
+        end = self._pool.vm_id_end
+        if start <= 0:
+            return False
+        if vm_id < start:
+            return False
+        if end > 0 and vm_id > end:
+            return False
+        return True
 
     @staticmethod
     def _is_proxmox_template(vm_info: dict) -> bool:
@@ -823,3 +923,203 @@ class PoolManager:
     def _vm_id_to_worker_id(vm_id: int) -> str:
         """Build worker ID from VM ID (e.g. 300 -> 'orcest-worker-300')."""
         return f"{_VM_NAME_PREFIX}{vm_id}"
+
+    # ── reap coordination (H2-conc) ──────────────────────────
+
+    def _coordinate_reaped_vm(self, vm_id: int) -> None:
+        """Recover orchestrator-visible state for a force-reaped worker VM.
+
+        Reads the reaped consumer's pending stream entries, reconstructs each
+        Task, clears its pending marker, publishes a transient-FAILED result
+        (so the orchestrator re-enqueues), then ACKs the entry and deletes the
+        consumer to release its PEL slot. All best-effort.
+        """
+        consumer = self._vm_id_to_worker_id(vm_id)
+        for fq_stream in self._task_streams():
+            entries = self._read_consumer_pending(fq_stream, consumer)
+            for entry_id, fields in entries:
+                try:
+                    task = Task.from_dict(fields)
+                except (KeyError, ValueError):
+                    logger.warning(
+                        "Reaped VM %d: malformed pending entry %s on %s; ACKing to release it",
+                        vm_id,
+                        entry_id,
+                        fq_stream,
+                    )
+                    self._safe_xack(fq_stream, entry_id)
+                    continue
+                self._clear_reaped_pending_marker(task)
+                self._publish_reaped_failure(task)
+                self._safe_xack(fq_stream, entry_id)
+            # Release the now-empty consumer so its PEL slot does not linger.
+            try:
+                self._redis.client.xgroup_delconsumer(fq_stream, CONSUMER_GROUP, consumer)
+            except Exception:
+                logger.warning(
+                    "Reaped VM %d: failed to delete consumer %s on %s",
+                    vm_id,
+                    consumer,
+                    fq_stream,
+                    exc_info=True,
+                )
+
+    def _read_consumer_pending(
+        self, fq_stream: str, consumer: str
+    ) -> list[tuple[str, dict[str, str]]]:
+        """Return ``[(entry_id, fields), ...]`` currently pending for *consumer*."""
+        try:
+            pending = self._redis.client.xpending_range(
+                fq_stream, CONSUMER_GROUP, min="-", max="+", count=100, consumername=consumer
+            )
+        except Exception:
+            return []
+        # Guard against non-list responses (e.g. a MagicMock in unit tests):
+        # a truthy-but-non-list would otherwise iterate into garbage.
+        if not isinstance(pending, list):
+            return []
+        out: list[tuple[str, dict[str, str]]] = []
+        for p in pending:
+            entry_id = p.get("message_id")
+            if entry_id is None:
+                continue
+            try:
+                rng = self._redis.client.xrange(fq_stream, min=entry_id, max=entry_id)
+            except Exception:
+                rng = []
+            fields = rng[0][1] if rng else {}
+            out.append((entry_id, fields))
+        return out
+
+    def _clear_reaped_pending_marker(self, task: Task) -> None:
+        """Clear the pending marker for *task* using its own key_prefix."""
+        try:
+            if task.key_prefix:
+                project_redis = RedisClient.from_client(
+                    self._redis.client, key_prefix=task.key_prefix
+                )
+            else:
+                project_redis = self._redis
+            clear_pending_task_if_matches(
+                project_redis, task.repo, task.resource_type, task.resource_id, task.id
+            )
+        except Exception:
+            logger.warning(
+                "Reaped task %s: failed to clear pending marker for %s #%s",
+                task.id,
+                task.resource_type,
+                task.resource_id,
+                exc_info=True,
+            )
+
+    def _publish_reaped_failure(self, task: Task) -> None:
+        """Publish a transient-FAILED result so the orchestrator re-enqueues."""
+        result = TaskResult(
+            task_id=task.id,
+            worker_id=_REAPER_WORKER_ID,
+            status=ResultStatus.FAILED,
+            branch=task.branch,
+            summary=(
+                f"{TRANSIENT_SUMMARY_PREFIX}Worker VM exceeded max task duration "
+                "and was force-reaped by the pool manager; task not completed."
+            ),
+            duration_seconds=0,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            snapshot_head_sha=task.snapshot_head_sha,
+            decision_reason=task.decision_reason,
+            snapshot_failed_checks=task.snapshot_failed_checks,
+            snapshot_review_thread_ids=task.snapshot_review_thread_ids,
+            snapshot_review_thread_fingerprints=task.snapshot_review_thread_fingerprints,
+        )
+        try:
+            if task.key_prefix:
+                fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
+                self._redis.xadd_capped_raw(fq_results, result.to_dict(), maxlen=_RESULT_MAXLEN)
+            else:
+                self._redis.xadd_capped(_RESULTS_STREAM, result.to_dict(), maxlen=_RESULT_MAXLEN)
+        except Exception:
+            logger.warning(
+                "Reaped task %s: failed to publish transient-FAILED result",
+                task.id,
+                exc_info=True,
+            )
+
+    def _safe_xack(self, fq_stream: str, entry_id: str) -> None:
+        try:
+            self._redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
+        except Exception:
+            logger.warning(
+                "Failed to ACK reaped entry %s on %s", entry_id, fq_stream, exc_info=True
+            )
+
+    # ── orphan-PEL sweeper (H3-conc) ─────────────────────────
+
+    def _sweep_orphan_pel(self) -> None:
+        """Delete PEL-holding consumers whose worker VM is no longer live.
+
+        A dead ephemeral worker leaves its consumer (orcest-worker-<vmid>)
+        registered with pending entries that nothing else reclaims. Deleting
+        the consumer returns its entries to the group's global PEL, where the
+        orchestrator's existing recovery drain re-enqueues the work. We only
+        delete a consumer that is PROVABLY dead: its name parses to a worker
+        VMID, that VMID is absent from pool:idle and pool:active, and it is
+        not an existing Proxmox worker VM.
+        """
+        live_vm_ids = self._live_vm_ids()
+        for fq_stream in self._task_streams():
+            try:
+                consumers = self._redis.xinfo_consumers_raw(fq_stream, CONSUMER_GROUP)
+            except Exception:
+                continue
+            for consumer in consumers:
+                name = str(consumer.get("name", ""))
+                pending = int(consumer.get("pending", 0) or 0)
+                if pending <= 0:
+                    continue
+                vm_id = self._worker_id_to_vm_id(name)
+                if vm_id is None:
+                    # Not a worker consumer (e.g. orchestrator/results consumer)
+                    continue
+                if vm_id in live_vm_ids:
+                    continue
+                logger.warning(
+                    "Orphan PEL: consumer %s (VM %d) has %d pending entries but the "
+                    "VM is not live; deleting consumer to return entries to the PEL",
+                    name,
+                    vm_id,
+                    pending,
+                )
+                try:
+                    self._redis.delconsumer_raw(fq_stream, CONSUMER_GROUP, name)
+                except Exception:
+                    logger.error(
+                        "Failed to delete orphan consumer %s on %s",
+                        name,
+                        fq_stream,
+                        exc_info=True,
+                    )
+
+    def _live_vm_ids(self) -> set[int]:
+        """VMIDs currently tracked as idle/active or present in Proxmox."""
+        live: set[int] = set()
+        for member in self._redis.smembers(_POOL_IDLE_KEY):
+            try:
+                live.add(int(member))
+            except (ValueError, TypeError):
+                pass
+        for member in self._redis.hgetall(_POOL_ACTIVE_KEY):
+            try:
+                live.add(int(member))
+            except (ValueError, TypeError):
+                pass
+        try:
+            for vm in self._proxmox.list_vms(name_prefix=_VM_NAME_PREFIX):
+                raw = vm.get("vmid")
+                if raw is not None:
+                    live.add(int(raw))
+        except Exception:
+            # On a Proxmox listing failure, be conservative: treat the set we
+            # have (idle+active) as authoritative but do NOT additionally widen.
+            logger.warning("Orphan-PEL sweep: failed to list Proxmox VMs", exc_info=True)
+        return live

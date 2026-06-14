@@ -22,18 +22,19 @@ RUN useradd --create-home --shell /bin/false orcest \
 
 WORKDIR /home/orcest/app
 
-# Install dependencies in a separate layer for better cache reuse
-COPY --chown=orcest:orcest pyproject.toml .
-RUN python3 - <<'PYEOF'
-import subprocess
-import sys
-import tomllib
-with open('pyproject.toml', 'rb') as f:
-    deps = tomllib.load(f)['project']['dependencies']
-subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + deps)
-PYEOF
+# Install pinned dependencies from the lock for reproducible builds.
+# Mirror of the repo-root requirements.lock, shipped as package data so it is
+# present in the deploy build context (assembled by
+# orcest.fleet.orchestrator.upload_source). Regenerate with `make lock` and
+# copy into this dir alongside pyproject.toml. NB: upload_source must include
+# "requirements.lock" in its deploy_files tuple for this COPY to resolve.
+COPY --chown=orcest:orcest requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
-# Install orcest package (source only, deps already installed)
+# Install the orcest package itself. --no-deps means pyproject's unpinned
+# ranges are NOT re-resolved — every dependency already came from the lock
+# above; pyproject.toml is needed only to build the package metadata.
+COPY --chown=orcest:orcest pyproject.toml .
 COPY --chown=orcest:orcest src/ src/
 RUN pip install --no-cache-dir --no-deps .
 

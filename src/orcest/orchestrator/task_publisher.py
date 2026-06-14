@@ -13,7 +13,6 @@ from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import (
     IssueState,
-    clear_attempts as clear_issue_attempts,
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.pr_ops import (
@@ -169,6 +168,38 @@ def _rollback_pr_attempt_increment(
         logger.warning(
             "Failed to roll back attempt counter for PR #%d after publish abort",
             pr_number,
+            exc_info=True,
+        )
+
+
+def _rollback_issue_attempt_increment(
+    redis: RedisClient,
+    repo: str,
+    issue_number: int,
+    logger: logging.Logger,
+) -> None:
+    """Undo exactly one pre-publish attempt reservation for an issue."""
+    key = f"issue:{repo}:{issue_number}:attempts"
+    try:
+        data: dict[str, str] = redis.hgetall(key)
+        if not data:
+            return
+        try:
+            current = int(data.get("count", 0))
+        except (TypeError, ValueError):
+            redis.delete(key)
+            return
+        if current <= 1:
+            redis.delete(key)
+            return
+        pipe = redis.pipeline(transaction=True)
+        pipe.hincrby(key, "count", -1)
+        pipe.expire(key, 7 * 24 * 3600)
+        pipe.execute()
+    except Exception:
+        logger.warning(
+            "Failed to roll back attempt counter for issue #%d after publish abort",
+            issue_number,
             exc_info=True,
         )
 
@@ -878,7 +909,7 @@ def _publish_issue_and_notify(
             f"Failed to publish task {task.id} for issue #{issue_state.number} to Redis",
             exc_info=True,
         )
-        clear_issue_attempts(redis, repo, issue_state.number)
+        _rollback_issue_attempt_increment(redis, repo, issue_state.number, _log)
         _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
         raise
 
@@ -919,8 +950,10 @@ def _render_issue_prompt(
         "5. Run the project's linter and tests to verify your changes.",
         "6. Commit your changes with a descriptive message referencing the issue.",
         f"7. Push the branch: `git push -u origin {branch_name}`",
-        f'8. Open a PR: `gh pr create --repo {repo} --title "{issue_title}" '
-        f'--body "Closes #{issue_number}" --head {branch_name}`',
+        f"8. Open a PR with `gh pr create --repo {repo} --head {branch_name} "
+        f'--body "Closes #{issue_number}"`. Choose a concise PR title that '
+        f"describes your change and pass it with `--title` (write the title "
+        f"yourself; do not copy the issue title verbatim).",
         "",
         "Important:",
         "- Make minimal, focused changes.",

@@ -89,6 +89,12 @@ _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 # the stale config blob.
 _CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
 
+# Round-robin pointer over projects deciding which single project bypasses the
+# shared issue-stream backpressure gate each poll cycle (M5 fairness). The
+# orchestrator is single-instance, so a plain INCR on the shared client is a
+# cheap, restart-tolerant counter; no TTL needed.
+_ISSUE_DISCOVERY_CYCLE_SEQ_KEY = "issue_discovery:cycle_seq"
+
 
 def _persist_credential_override(
     redis: RedisClient, identity: str, blob: str, minted_at: float, logger: logging.Logger
@@ -810,17 +816,44 @@ def _poll_cycle(
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
-    # Do not trim task/result streams by consumer-group last-delivered-id.
-    # That ID can include delivered but unACKed PEL entries; trimming them would
-    # erase the only recoverable task/result body and leave Redis coordination
-    # state as the only memory of work.
+    # M1-conc: reclaim delivered+ACKed task entries (which carry plaintext
+    # GitHub PAT + provider credential) once per poll cycle. xtrim_acked_entries
+    # trims only up to the LOWEST still-pending id (or last-delivered-id when the
+    # PEL is empty), so un-ACKed / undelivered work is never dropped -- it does
+    # NOT trim by raw last-delivered-id while entries are still in flight.
+    for _task_stream in (
+        f"tasks:{config.default_runner}",
+        f"tasks:issue:{config.default_runner}",
+    ):
+        try:
+            task_redis.xtrim_acked_entries(_task_stream, CONSUMER_GROUP)
+        except Exception:
+            logger.debug("Failed to trim ACKed entries from %s", _task_stream, exc_info=True)
 
-    # Step 2: Poll each project
+    # Step 2: Poll each project.
+    #
+    # Issue discovery is gated on the SHARED issue stream. To stop one busy
+    # project from starving all others' issue discovery indefinitely (M5),
+    # rotate a single "issue-priority" slot round-robin across projects each
+    # cycle: that one project bypasses the shared-stream backpressure gate so
+    # every project eventually gets a discovery turn even while the queue is
+    # backed up. Single-instance orchestrator -> a plain shared-client INCR is a
+    # cheap, restart-tolerant rotation pointer.
+    n_projects = len(project_clients)
+    priority_idx = -1
+    if n_projects:
+        try:
+            cycle_seq = redis.incr(_ISSUE_DISCOVERY_CYCLE_SEQ_KEY)
+            priority_idx = (cycle_seq - 1) % n_projects
+        except Exception:
+            # Fairness rotation is best-effort; never break the poll cycle.
+            logger.debug("Failed to advance issue-discovery rotation pointer", exc_info=True)
+
     total_enqueued = 0
     total_merged = 0
     total_prs = 0
     total_issues = 0
-    for project, project_redis in project_clients:
+    for i, (project, project_redis) in enumerate(project_clients):
         try:
             pool = token_pools.get(project.key_prefix)
             enqueued, merged, prs_checked, issues_checked = _poll_project(
@@ -831,6 +864,7 @@ def _poll_cycle(
                 logger,
                 pending_task_ttl,
                 token_pool=pool,
+                force_issue_discovery=(i == priority_idx),
             )
             total_enqueued += enqueued
             total_merged += merged
@@ -856,6 +890,7 @@ def _poll_project(
     logger: logging.Logger,
     pending_task_ttl: int,
     token_pool: ProviderPool | None = None,
+    force_issue_discovery: bool = False,
 ) -> tuple[int, int, int, int]:
     """Poll a single project for actionable PRs and issues.
 
@@ -888,12 +923,28 @@ def _poll_project(
         On exhaustion, increments the (transition) per-project Redis skip counter.
         """
         if token_pool is None:
-            # Preserve legacy behavior for test fixtures (which use empty claude_token
-            # in GithubConfig and pass {} for token_pools): always return a (possibly
-            # empty-cred) lean entry so publish_* is still invoked as before.
-            # Real configs with providers or claude_tokens get pools, so this path
-            # is mainly for direct-test compat.
+            # No pool was built for this project. That happens either because a
+            # single legacy claude_token is configured (return it) OR because the
+            # project has NO credentials at all -- in which case publishing a
+            # task with credential="" makes every worker fail this project each
+            # cycle, burning attempts and GitHub comments with no config-time
+            # error. Fail loudly and skip instead.
             cred = project.claude_token or ""
+            # Genuinely-no-credential case: neither a providers: list nor any
+            # claude_tokens entry is configured. (run() builds no pool for this,
+            # so we land here in production -- not just in unit tests.) An empty
+            # *list* is the signal; a [""] degenerate token still flows through
+            # the legacy single-token path below so existing fixtures keep
+            # working.
+            if not project.claude_tokens and not project.providers:
+                logger.error(
+                    "Project %s has no providers and no claude_tokens configured; "
+                    "skipping task publish (a credential-less task would fail on "
+                    "every worker). Add a providers: entry or claude_tokens to this "
+                    "project's orchestrator config.",
+                    project.repo,
+                )
+                return None
             return ProviderEntry(provider="claude", credential=cred, model=None)
 
         entry = token_pool.next_entry()
@@ -1637,11 +1688,21 @@ def _poll_project(
     # Tasks that workers have already claimed don't block: they're consuming
     # capacity, freeing other idle workers to take new work. PR-fix tasks
     # ride a separate stream and share worker capacity organically.
+    # The issue stream is SHARED across all projects (tasks:issue:{runner}).
+    # If we let that shared backlog gate every project, one busy project that
+    # keeps the stream non-empty would starve issue discovery for every other
+    # project indefinitely. To preserve the backpressure intent while keeping
+    # fairness, exactly one project per poll cycle (force_issue_discovery,
+    # rotated round-robin in _poll_cycle) is allowed to bypass the gate.
+    # Downstream set_pending_task + per-issue attempt guards still prevent any
+    # double-enqueue, so a forced discovery cannot bloat the queue.
     issue_states: list = []
-    if unclaimed_issue_tasks > 0:
+    if unclaimed_issue_tasks > 0 and not force_issue_discovery:
         logger.info(
-            f"Issue task queue has {unclaimed_issue_tasks} unclaimed entries, "
-            f"deferring issue discovery until queue drains"
+            "Issue task queue has %d unclaimed entries; deferring issue "
+            "discovery for %s this cycle (another project has priority)",
+            unclaimed_issue_tasks,
+            repo,
         )
     else:
         try:

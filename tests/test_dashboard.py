@@ -587,3 +587,76 @@ class TestFetchSnapshotConsumerGroups:
         group = snap.consumer_groups[0]
         assert group.stream == "tasks:claude"
         assert group.name == "workers"
+
+
+# ---------------------------------------------------------------------------
+# M2-sec: TypeScript dashboard auth must FAIL CLOSED (source-text guards).
+#
+# The fail-open bug lives in the TypeScript dashboard (dashboard/server/*.ts),
+# a different codebase from the Python ``orcest.dashboard`` module exercised
+# above — a Python pytest cannot import or call the TS ``isAuthorized``. The
+# faithful regression pin is the vitest test in dashboard/server/auth.test.ts.
+# These coarse text-assertions are a pytest-runnable guard so ``make
+# test-unit`` (Python-only) still fails if the fail-open code or the
+# all-interfaces port binding is reintroduced.
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardAuthFailsClosed:
+    """M2-sec: the TS dashboard must deny when no token is configured and the
+    published port must bind to loopback only."""
+
+    def _repo_root(self):
+        from pathlib import Path
+
+        return Path(__file__).resolve().parents[1]
+
+    def test_isauthorized_does_not_fail_open(self):
+        """The fail-open shortcut ``if (!DASHBOARD_TOKEN) return true;`` must be
+        gone from every dashboard server source file."""
+        server_dir = self._repo_root() / "dashboard" / "server"
+        for ts_file in server_dir.glob("*.ts"):
+            text = ts_file.read_text()
+            assert "return true" not in text or "!DASHBOARD_TOKEN" not in text, (
+                f"{ts_file} still fails open: a missing DASHBOARD_TOKEN must DENY, not allow"
+            )
+            # The specific buggy line must not reappear in any form.
+            assert "if (!DASHBOARD_TOKEN) return true" not in text, (
+                f"{ts_file} reintroduced the fail-open auth shortcut"
+            )
+
+    def test_auth_module_extracted_and_fails_closed(self):
+        """Auth logic lives in an importable, side-effect-free auth.ts that
+        fails closed when no token is configured."""
+        auth_ts = self._repo_root() / "dashboard" / "server" / "auth.ts"
+        assert auth_ts.exists(), "auth logic must be extracted into dashboard/server/auth.ts"
+        text = auth_ts.read_text()
+        assert "export function isAuthorized" in text
+        # Fail closed on an unset token.
+        assert "if (!token) return false" in text
+        # The constant-time comparison must be preserved.
+        assert "timingSafeEqual" in text
+        # auth.ts must NOT import index.ts (which has the server.listen side
+        # effect) — that is the whole point of extracting it.
+        assert "./index" not in text
+
+    def test_index_imports_isauthorized_from_auth_module(self):
+        """index.ts must consume the shared isAuthorized rather than keep its
+        own (previously fail-open) copy."""
+        index_ts = self._repo_root() / "dashboard" / "server" / "index.ts"
+        text = index_ts.read_text()
+        assert 'from "./auth.js"' in text, "index.ts must import isAuthorized from ./auth.js"
+        # index.ts must no longer define its own isAuthorized.
+        assert "function isAuthorized" not in text
+
+    def test_published_dashboard_port_binds_to_loopback(self):
+        """docker-compose.dashboard.yml must publish the port on 127.0.0.1, not
+        on all interfaces."""
+        compose = self._repo_root() / "docker-compose.dashboard.yml"
+        text = compose.read_text()
+        assert "127.0.0.1:8080:8080" in text, (
+            "dashboard port must bind to loopback (127.0.0.1:8080:8080)"
+        )
+        assert '"8080:8080"' not in text, (
+            "dashboard port must not be published on all interfaces"
+        )

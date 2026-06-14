@@ -876,3 +876,132 @@ def test_scan_iter_no_matches(fake_redis_client):
     fake_redis_client.sadd("myset", "val")
     keys = fake_redis_client.scan_iter("nonexistent:*")
     assert keys == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for delconsumer_raw / xautoclaim_raw (H3-conc)
+# ---------------------------------------------------------------------------
+
+
+def test_delconsumer_raw_returns_pending_count_and_releases_entries(fake_redis_client):
+    """H3-conc: delconsumer_raw removes a consumer and reports its PEL size."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v1"})
+    rc.client.xadd(fq, {"k": "v2"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    # Dead consumer claims both, never ACKs.
+    rc.client.xreadgroup(
+        groupname="workers", consumername="orcest-worker-305", streams={fq: ">"}, count=10
+    )
+    consumers = {c["name"]: c for c in rc.client.xinfo_consumers(fq, "workers")}
+    assert consumers["orcest-worker-305"]["pending"] == 2
+
+    reclaimed = rc.delconsumer_raw(fq, "workers", "orcest-worker-305")
+
+    assert reclaimed == 2
+    names = [c["name"] for c in rc.client.xinfo_consumers(fq, "workers")]
+    assert "orcest-worker-305" not in names
+    # Entries are still in the group's global PEL (recoverable), not lost.
+    pel = rc.client.xpending(fq, "workers")
+    assert pel["pending"] == 2
+
+
+def test_delconsumer_raw_missing_group_returns_zero(fake_redis_client):
+    """delconsumer_raw on a nonexistent stream/group returns 0, no raise."""
+    rc = fake_redis_client
+    assert rc.delconsumer_raw(rc._prefixed("nope"), "workers", "orcest-worker-1") == 0
+
+
+def test_xautoclaim_raw_reclaims_idle_entries(fake_redis_client):
+    """xautoclaim_raw transfers idle PEL entries to a new consumer."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v1"})
+    rc.client.xadd(fq, {"k": "v2"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    rc.client.xreadgroup(groupname="workers", consumername="dead", streams={fq: ">"}, count=10)
+
+    cursor, claimed = rc.xautoclaim_raw(
+        fq, "workers", "pool-manager-sweeper", min_idle_ms=0, start_id="0-0", count=100
+    )
+
+    assert isinstance(cursor, str)
+    assert len(claimed) == 2
+    assert claimed[0][1]["k"] == "v1"
+    # Ownership moved to the sweeper consumer.
+    owners = {
+        p["consumer"] for p in rc.client.xpending_range(fq, "workers", min="-", max="+", count=10)
+    }
+    assert owners == {"pool-manager-sweeper"}
+
+
+def test_xautoclaim_raw_empty_pel_returns_empty(fake_redis_client):
+    """xautoclaim_raw on an empty PEL returns ('0-0', [])."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    cursor, claimed = rc.xautoclaim_raw(fq, "workers", "sweeper", min_idle_ms=0)
+    assert claimed == []
+# Tests for xtrim_acked_entries (M1-conc)
+# ---------------------------------------------------------------------------
+
+
+def test_xtrim_acked_entries_keeps_unacked_and_reclaims_acked(fake_redis_client):
+    """M1-conc: trims delivered+ACKed entries up to the lowest still-pending id,
+    keeping the un-ACKed entry (and its credentials) plus anything after it."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    id1 = fake_redis_client.xadd(stream, {"token": "ghp_secret1"})
+    id2 = fake_redis_client.xadd(stream, {"token": "ghp_secret2"})
+    id3 = fake_redis_client.xadd(stream, {"token": "ghp_secret3"})
+    # Deliver all three to one consumer, then ACK only the first two.
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, count=10, block_ms=None)
+    fake_redis_client.xack(stream, group, id1)
+    fake_redis_client.xack(stream, group, id2)
+
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+
+    assert removed == 2  # id1, id2 reclaimed
+    assert fake_redis_client.xlen(stream) == 1  # id3 (un-ACKed) survives
+    # The surviving entry is exactly the still-pending one, creds intact.
+    survivors = fake_redis_client.xrevrange(stream, count=10)
+    assert [eid for eid, _ in survivors] == [id3]
+    assert survivors[0][1]["token"] == "ghp_secret3"
+
+
+def test_xtrim_acked_entries_does_not_trim_undelivered(fake_redis_client):
+    """M1-conc: never drop work nobody has read yet (last-delivered-id is 0-0)."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"token": "ghp_a"})
+    fake_redis_client.xadd(stream, {"token": "ghp_b"})
+    # Nothing delivered, nothing pending.
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+    assert removed == 0
+    assert fake_redis_client.xlen(stream) == 2
+
+
+def test_xtrim_acked_entries_reclaims_fully_drained_stream(fake_redis_client):
+    """M1-conc: when every delivered entry is ACKed (empty PEL), reclaim via
+    last-delivered-id so credentials don't linger forever."""
+    stream = "tasks:claude"
+    group = "workers"
+    fake_redis_client.ensure_consumer_group(stream, group)
+    fake_redis_client.xadd(stream, {"token": "ghp_a"})
+    id2 = fake_redis_client.xadd(stream, {"token": "ghp_b"})
+    fake_redis_client.xreadgroup(group=group, consumer="c1", stream=stream, count=10, block_ms=None)
+    fake_redis_client.xack(stream, group, fake_redis_client.xrevrange(stream, count=10)[1][0])
+    fake_redis_client.xack(stream, group, id2)
+    removed = fake_redis_client.xtrim_acked_entries(stream, group)
+    # At least the trailing ACKed entries are reclaimed; nothing un-ACKed remains.
+    assert removed >= 1
+    assert fake_redis_client.xlen(stream) <= 1
+
+
+def test_xtrim_acked_entries_missing_stream_returns_zero(fake_redis_client):
+    """M1-conc: no stream / no group -> safe no-op, never raises."""
+    assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0

@@ -155,3 +155,27 @@ def test_postgres_syntax_error_beats_incidental_timeout():
 def test_pg_prove_failed_summary_is_code():
     logs = "timeout helper loaded\nFailed 3 of 19 subtests\n"
     assert classify_ci_failure("pg_prove", logs) is CIFailureType.CODE
+
+
+# -- M6-logic: type errors must not be misclassified as dependency -----------
+
+
+def test_mypy_incompatible_types_is_code_not_dependency():
+    """A mypy 'Incompatible types' failure is a CODE defect, not a dependency
+    problem. The bare 'incompatible' DEPENDENCY pattern previously swallowed it."""
+    logs = (
+        "src/orcest/foo.py:10: error: Incompatible types in assignment "
+        '(expression has type "int", variable has type "str")  [assignment]\n'
+        "Found 1 error in 1 file (checked 42 source files)\n"
+    )
+    assert classify_ci_failure("mypy", logs) is CIFailureType.CODE
+
+
+def test_genuine_dependency_incompatibility_still_dependency():
+    """Real resolver incompatibility output still classifies as DEPENDENCY."""
+    logs = (
+        "ERROR: Cannot install foo==1.0 and bar==2.0 because these package "
+        "versions have conflicting dependencies.\n"
+        "foo 1.0 depends on baz<2; bar 2.0 is incompatible with baz<2.\n"
+    )
+    assert classify_ci_failure("pip-install", logs) is CIFailureType.DEPENDENCY
