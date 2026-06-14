@@ -738,14 +738,24 @@ def _drain_pending_tasks_raw(
                 # duplicate. For PRs the orchestrator's snapshot staleness check
                 # would drop it, but ISSUE results have no such guard, so a
                 # replayed FAILED could clear attempts / re-trigger an already
-                # implemented issue. Suppress it; still ACK + clear reservation
-                # below. Fail open: if the marker read raises, publish anyway to
+                # implemented issue. Suppress it; still ACK below. Fail open: if
+                # the marker read raises, treat the marker as matching (publish
+                # anyway, and clear the reservation if that publish fails) to
                 # preserve restart-recovery behavior.
+                #
+                # ``marker_matches_task`` also gates the attempt-reservation
+                # clear below (Case B): when the marker points at a NEWER task,
+                # that newer task owns the reservation now, so the suppressed
+                # stale duplicate must NOT delete it (for issues the clear is an
+                # unconditional DELETE of the attempts key — it would wipe the
+                # newer in-flight task's counter).
                 should_publish_recovery = True
+                marker_matches_task = True
                 try:
                     current_pending_id = _pending_task_id_for_task(redis, task)
                     if current_pending_id != task.id:
                         should_publish_recovery = False
+                        marker_matches_task = False
                         logger.info(
                             "Skipping duplicate recovery result for %s #%d: "
                             "pending marker no longer matches task %s (now %r); "
@@ -806,8 +816,21 @@ def _drain_pending_tasks_raw(
                 )
             if task is not None:
                 try:
+                    # ``_clear_pending_task_for_task`` is CAS-guarded (only
+                    # deletes when the marker still equals task.id), so it is a
+                    # safe no-op when the marker points at a newer task.
                     _clear_pending_task_for_task(redis, task)
-                    if not recovery_result_published:
+                    # Clear the attempt reservation only when no result reached
+                    # the orchestrator AND the pending marker still points at
+                    # THIS task. When the marker points at a newer task
+                    # (``marker_matches_task`` is False), that newer in-flight
+                    # task owns the reservation now; clearing it here would wipe
+                    # its counter (M4-conc Case B) — the issue clear is an
+                    # unconditional DELETE with no SHA guard. When the marker is
+                    # gone the original result already cleared/managed the
+                    # reservation via the orchestrator, so there is nothing this
+                    # path needs to clear either.
+                    if not recovery_result_published and marker_matches_task:
                         _clear_task_attempt_reservation(redis, task)
                 except Exception:
                     logger.warning(

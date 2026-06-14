@@ -2731,6 +2731,85 @@ def test_drain_skips_duplicate_recovery_result_for_completed_issue(local_worker_
 
 
 @pytest.mark.unit
+def test_drain_superseded_duplicate_does_not_clear_newer_issue_reservation(local_worker_config):
+    """Case B for M4-conc: a drained stale duplicate whose pending marker points
+    at a NEWER in-flight task must NOT wipe the newer task's issue attempts
+    counter.
+
+    Round 1 suppressed the duplicate recovery *result* but still ran
+    ``_clear_task_attempt_reservation`` unconditionally on the suppress path
+    (``recovery_result_published`` stays False because no result is published),
+    which for issues is an UNCONDITIONAL ``DELETE issue:<repo>:<id>:attempts`` —
+    clobbering the reservation of the newer task the marker now points at. That
+    is a behavioral regression vs master.
+
+    Here a stale duplicate (older task id) is drained while the pending marker
+    points at a NEWER task. The drain must suppress the recovery result, ACK the
+    orphaned PEL entry, clear the (CAS-guarded, so safely no-op) pending marker,
+    and leave the newer task's attempts counter untouched — i.e. it must NOT
+    issue any delete against the issue attempts key.
+    """
+    from orcest.shared.coordination import PendingTaskMetadata
+
+    stale_task = Task.create(
+        task_type=TaskType.IMPLEMENT_ISSUE,
+        repo="owner/repo",
+        token="tok",
+        resource_type="issue",
+        resource_id=7,
+        prompt="implement it",
+        branch="impl-7",
+    )
+    newer_task_id = "newer-task-id-9999"
+    assert newer_task_id != stale_task.id
+
+    mock_redis = MagicMock()
+    # One stale-duplicate entry on the drain pass, then empty.
+    mock_redis.xreadgroup_multi.side_effect = [
+        [("tasks:issue:claude", "1-0", stale_task.to_dict())],
+        [],
+    ]
+    # Pending marker points at the NEWER task => original result was already
+    # processed and the orchestrator re-enqueued newer work.
+    newer_marker = PendingTaskMetadata(task_id=newer_task_id).to_json()
+    mock_redis.get.return_value = newer_marker
+    mock_redis.get_raw.return_value = newer_marker
+    mock_redis.xadd_capped.return_value = "1-0"
+    mock_redis.xack_raw.return_value = 1
+
+    _drain_pending_tasks_raw(
+        mock_redis,
+        "tasks:issue:claude",
+        local_worker_config,
+        logging.getLogger("test"),
+    )
+
+    # No recovery result published (the marker no longer matches the stale task).
+    results_calls = [
+        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+    ]
+    assert results_calls == [], (
+        "drain published a recovery result for a superseded stale duplicate"
+    )
+    # The orphaned PEL entry must still be ACKed so it is not redelivered.
+    mock_redis.xack_raw.assert_any_call("tasks:issue:claude", CONSUMER_GROUP, "1-0")
+    # CRITICAL: the suppressed stale duplicate must NOT delete the NEWER task's
+    # issue attempts counter. For a no-prefix issue task the unconditional clear
+    # would call redis.delete("issue:owner/repo:7:attempts").
+    attempts_key = "issue:owner/repo:7:attempts"
+    delete_calls = [c.args for c in mock_redis.delete.call_args_list]
+    delete_raw_calls = [c.args for c in mock_redis.delete_raw.call_args_list]
+    assert (attempts_key,) not in delete_calls, (
+        "drain wiped the NEWER in-flight task's issue attempts counter "
+        f"(delete calls: {delete_calls})"
+    )
+    assert all(attempts_key not in args for args in delete_raw_calls), (
+        "drain wiped the NEWER in-flight task's issue attempts counter via "
+        f"delete_raw (calls: {delete_raw_calls})"
+    )
+
+
+@pytest.mark.unit
 def test_drain_publishes_recovery_result_when_marker_still_matches(local_worker_config):
     """Companion to the dedup test: when the pending marker STILL points at the
     drained task (genuine restart mid-execution, original result never sent),
