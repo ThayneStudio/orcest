@@ -540,6 +540,53 @@ class RedisClient:
         result: list[dict[str, Any]] = self._client.xinfo_consumers(fq_stream, group)  # type: ignore[assignment]
         return result
 
+    def delconsumer_raw(self, fq_stream: str, group: str, consumer: str) -> int:
+        """XGROUP DELCONSUMER on a fully-qualified stream name.
+
+        Returns the number of pending entries that belonged to *consumer*
+        (those entries are returned to the group's global PEL). Returns 0 if
+        the consumer or group does not exist.
+        """
+        try:
+            return int(self._client.xgroup_delconsumer(fq_stream, group, consumer))
+        except redis.ResponseError:
+            return 0
+
+    def xautoclaim_raw(
+        self,
+        fq_stream: str,
+        group: str,
+        consumer: str,
+        min_idle_ms: int,
+        start_id: str = "0-0",
+        count: int = 100,
+    ) -> tuple[str, list[tuple[str, dict[str, str]]]]:
+        """XAUTOCLAIM on a fully-qualified stream name.
+
+        Reclaims up to *count* PEL entries idle for at least *min_idle_ms*,
+        transferring ownership to *consumer*. Returns ``(next_cursor, claimed)``
+        where ``claimed`` is a list of ``(entry_id, fields)``. Entries that no
+        longer exist in the stream (deleted) are dropped by Redis and not
+        returned. Returns ``("0-0", [])`` on error or empty PEL.
+        """
+        try:
+            result = self._client.xautoclaim(
+                fq_stream,
+                group,
+                consumer,
+                min_idle_time=min_idle_ms,
+                start_id=start_id,
+                count=count,
+            )
+        except redis.ResponseError:
+            return "0-0", []
+        # redis-py returns [next_cursor, [(id, fields), ...], [deleted_ids]].
+        if not result:
+            return "0-0", []
+        next_cursor = str(result[0])
+        claimed = [(str(eid), fields) for eid, fields in (result[1] or [])]
+        return next_cursor, claimed
+
     def xrevrange(self, stream: str, count: int) -> list[tuple[str, dict[str, str]]]:
         """XREVRANGE stream + - COUNT count."""
         result: list[Any] = self._client.xrevrange(self._prefixed(stream), count=count)  # type: ignore[assignment]

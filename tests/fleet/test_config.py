@@ -372,3 +372,30 @@ class TestProxmoxConfigIsLocalhost:
 
     def test_hostname_is_not_localhost(self):
         assert ProxmoxConfig(endpoint="https://pve.local:8006").is_localhost() is False
+
+
+# ── max_task_duration default (H2-conc) ──────────────────────
+
+
+class TestMaxTaskDurationDefault:
+    """H2-conc: the force-kill threshold must exceed the runner timeout.
+
+    A default below the runner's own timeout (RunnerConfig.timeout, 5400s)
+    makes the pool reap healthy long-running tasks before they can finish.
+    """
+
+    def test_default_exceeds_runner_timeout(self):
+        from orcest.shared.config import RunnerConfig
+
+        assert PoolConfig().max_task_duration > RunnerConfig().timeout
+
+    def test_default_value(self):
+        # 5400 (runner timeout) + 1800 (grace) = 7200s. See config comment.
+        assert PoolConfig().max_task_duration == 7200
+
+    def test_load_legacy_config_default(self, tmp_path):
+        """A config without an explicit max_task_duration gets the new default."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        cfg = load_config(path)
+        assert cfg.pool.max_task_duration == 7200
