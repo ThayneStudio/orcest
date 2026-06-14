@@ -163,6 +163,18 @@ sudo mkdir -p "$WORKSPACE_DIR"
 sudo mkdir -p "$WORKSPACE_DIR/workspaces"
 sudo chown -R orcest:orcest "$WORKSPACE_DIR"
 
+# Create the /home/orcest ReadWritePaths targets required by the hardened
+# worker systemd unit (provision/systemd/orcest-worker.service). Under
+# ProtectHome=read-only systemd refuses to start a unit whose ReadWritePaths
+# target is missing, so .codex (CodexRunner auth.json) and .grok (GrokRunner
+# auth.json) — alongside .claude/.cache — must pre-exist. Keep this list in
+# sync with that unit's ReadWritePaths line.
+sudo mkdir -p /home/orcest/.claude
+sudo mkdir -p /home/orcest/.cache
+sudo mkdir -p /home/orcest/.codex
+sudo mkdir -p /home/orcest/.grok
+sudo chown -R orcest:orcest /home/orcest
+
 # Create virtualenv for orcest
 echo "Creating virtualenv at $WORKSPACE_DIR/venv..."
 sudo -u orcest python3 -m venv "$WORKSPACE_DIR/venv"

@@ -393,6 +393,112 @@ def test_systemd_unit_hardening_reconciled():
         assert needed in static_rw, f"static ReadWritePaths missing {needed}: {static_rw}"
 
 
+# ── M3: ReadWritePaths dirs must be CREATED, or systemd refuses to start ──
+
+
+def _runcmd_text(userdata: str) -> str:
+    """Join a rendered cloud-init's runcmd entries into one searchable string."""
+    data = yaml.safe_load(userdata)
+    return "\n".join(str(cmd) for cmd in data.get("runcmd", []))
+
+
+def test_template_runcmd_creates_codex_and_grok_dirs():
+    """M3: the template bake (render_template_userdata, via
+    _worker_workspace_runcmd) must mkdir /home/orcest/.codex and
+    /home/orcest/.grok. They are listed in the worker unit's ReadWritePaths,
+    and under ProtectHome=read-only systemd (>=249) refuses to start a unit
+    whose ReadWritePaths target is missing — so the dirs must pre-exist.
+    """
+    runcmd = _runcmd_text(render_template_userdata())
+    # Match the existing .claude/.cache creation pattern.
+    assert "mkdir -p /home/orcest/.claude" in runcmd
+    assert "mkdir -p /home/orcest/.cache" in runcmd
+    assert "mkdir -p /home/orcest/.codex" in runcmd, (
+        "template must create /home/orcest/.codex (a ReadWritePaths target) "
+        "or workers EROFS/fail to start under ProtectHome=read-only"
+    )
+    assert "mkdir -p /home/orcest/.grok" in runcmd, (
+        "template must create /home/orcest/.grok (a ReadWritePaths target) "
+        "or workers EROFS/fail to start under ProtectHome=read-only"
+    )
+    # Ownership must be fixed up so the orcest user can write at runtime.
+    assert "chown -R orcest:orcest /home/orcest" in runcmd
+
+
+def test_worker_workspace_runcmd_creates_all_readwrite_home_dirs():
+    """M3: every /home/orcest ReadWritePaths target must be created by the
+    shared workspace runcmd, so both the template and any caller stay in sync
+    with the systemd unit's ReadWritePaths line."""
+    from orcest.fleet.cloud_init import _WORKER_READ_WRITE_PATHS, _worker_workspace_runcmd
+
+    cmds = _worker_workspace_runcmd()
+    joined = "\n".join(cmds)
+    home_targets = [p for p in _WORKER_READ_WRITE_PATHS.split() if p.startswith("/home/orcest/")]
+    assert home_targets, "expected /home/orcest ReadWritePaths targets to exist"
+    for target in home_targets:
+        assert f"mkdir -p {target}" in joined, (
+            f"ReadWritePaths target {target} is never created by "
+            f"_worker_workspace_runcmd; systemd will refuse to start the unit"
+        )
+
+
+def test_clone_runcmd_creates_codex_and_grok_dirs():
+    """M3: the LIVE pool path (render_clone_userdata) writes the hardened unit
+    (ProtectHome=read-only, ReadWritePaths includes .codex/.grok) but the warm
+    template may predate those dirs. The clone runcmd must (idempotently)
+    create every /home/orcest ReadWritePaths target BEFORE
+    ``systemctl enable --now orcest-worker`` so the unit can start.
+    """
+    output = render_clone_userdata(
+        redis_host="10.0.0.1", worker_id="orcest-worker-10009", key_prefix="orcest"
+    )
+    data = yaml.safe_load(output)
+    runcmd = [str(c) for c in data["runcmd"]]
+
+    def mkdir_idx(path: str) -> int:
+        # Tolerate both ``mkdir -p <path>`` and a combined
+        # ``mkdir -p <a> <b> <path> ...`` form.
+        return next(i for i, c in enumerate(runcmd) if "mkdir" in c and path in c)
+
+    enable_idx = next(i for i, c in enumerate(runcmd) if "enable --now orcest-worker" in c)
+    # The dirs must be created (and owned) BEFORE the unit is enabled/started,
+    # otherwise the first start fails on the missing ReadWritePaths target.
+    for path in ("/home/orcest/.codex", "/home/orcest/.grok"):
+        idx = mkdir_idx(path)  # raises StopIteration -> test failure if absent
+        assert idx < enable_idx, f"{path} must be created before enabling the worker unit"
+
+    # And the orcest user must own them so runtime writes (auth.json) succeed.
+    chown_idx = next(
+        (
+            i
+            for i, c in enumerate(runcmd)
+            if "chown" in c and "orcest:orcest" in c and "/home/orcest" in c
+        ),
+        None,
+    )
+    assert chown_idx is not None, "clone path must chown the created /home/orcest dirs to orcest"
+    assert chown_idx < enable_idx, "chown must run before the unit is enabled"
+
+
+def test_setup_worker_sh_creates_codex_and_grok_dirs():
+    """M3: the static-worker provisioning script must also create the
+    /home/orcest ReadWritePaths targets (.codex/.grok), or static workers
+    running the hardened unit fail to start the same way pool workers do.
+    """
+    from pathlib import Path
+
+    setup = Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh"
+    text = setup.read_text()
+    assert "mkdir -p /home/orcest/.codex" in text, (
+        "setup-worker.sh must create /home/orcest/.codex (a ReadWritePaths target)"
+    )
+    assert "mkdir -p /home/orcest/.grok" in text, (
+        "setup-worker.sh must create /home/orcest/.grok (a ReadWritePaths target)"
+    )
+    # Owned by orcest so the worker can write auth.json under them at runtime.
+    assert "chown -R orcest:orcest /home/orcest" in text
+
+
 # ── M2-infra: grok installer SHA-256 gate must FAIL CLOSED when unset ──
 
 
