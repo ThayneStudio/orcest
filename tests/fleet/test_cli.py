@@ -964,6 +964,40 @@ def test_gc_templates_destroys_inactive_only(runner, cfg_path, mocker):
     assert destroyed == {9000, 9002}
 
 
+def test_gc_templates_skips_template_that_becomes_active_mid_run(runner, cfg_path, mocker):
+    """M3-conc: a concurrent rebake can swap the active pointer to a VMID that
+    gc classified as a candidate. gc must re-read the pointer before each
+    destroy and never destroy the freshly-active template.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9002, "name": "orcest-worker-template", "template": True},
+    ]
+    # Initial read (used to compute candidates) -> 9001 active, so candidates
+    # are [9000, 9002]. Then a rebake swaps the pointer to 9002 before gc
+    # reaches it: the per-destroy re-reads return 9002.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        side_effect=[9001, 9002, 9002],
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
+    # 9000 destroyed; 9002 spared because it became the active template mid-run.
+    assert destroyed == {9000}
+    assert 9002 not in destroyed
+
+
 def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
     """gc-templates --dry-run reports candidates but does not destroy them."""
     cfg = _proxmox_cfg(
@@ -1654,3 +1688,31 @@ class TestWaitForCloudInit:
 
         mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
         assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
+
+    def test_hard_fails_when_status_not_done(self, mocker):
+        """H1-infra: boot-finished present but `cloud-init status` != done must
+        HARD-FAIL (return False) so the caller aborts before the pointer swap.
+
+        Old code printed a yellow warning and returned True, letting a
+        half-baked template (e.g. a failed provider-CLI install in runcmd,
+        which has no cross-entry `set -e`) flip
+        orcest:pool:current_template_vmid.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        # boot-finished marker exists (returncode 0), but status reports error.
+        boot_finished = mocker.MagicMock(returncode=0)
+        status_error = mocker.MagicMock(
+            returncode=1, stdout="status: error", stderr=""
+        )
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[boot_finished, status_error],
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert (
+            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60)
+            is False
+        )

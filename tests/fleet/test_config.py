@@ -191,6 +191,29 @@ class TestConfigPersistence:
         assert loaded.pool.worker_disk_size == 100
         assert loaded.pool.max_task_duration == 7200
 
+    def test_round_trip_proxmox_verify_ssl(self, tmp_path):
+        """H2-infra: proxmox.verify_ssl must persist through save/load so an
+        operator can opt into TLS verification of the Proxmox API endpoint.
+        """
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            proxmox=ProxmoxConfig(
+                endpoint="https://pve.example.com:8006",
+                api_token_id="root@pam!t",
+                verify_ssl=True,
+            ),
+        )
+        save_config(original, path)
+        loaded = load_config(path)
+        assert loaded.proxmox.verify_ssl is True
+
+    def test_proxmox_verify_ssl_defaults_false(self, tmp_path):
+        """H2-infra: default stays False (no behavior change for self-signed labs)."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"proxmox": {"node": "pve"}}))
+        loaded = load_config(path)
+        assert loaded.proxmox.verify_ssl is False
+
     def test_load_legacy_config_without_pool(self, tmp_path):
         """Old configs without pool section get correct defaults."""
         path = tmp_path / "config.yaml"

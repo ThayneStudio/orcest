@@ -268,6 +268,7 @@ def _create_proxmox_client(cfg: FleetConfig) -> ProxmoxClient:
         token_id=cfg.proxmox.api_token_id,
         token_secret=cfg.proxmox.api_token_secret,
         node=cfg.proxmox.node,
+        verify_ssl=cfg.proxmox.verify_ssl,
     )
 
 
@@ -307,9 +308,11 @@ def _wait_for_cloud_init(
             time.sleep(5)
             continue
         if result.returncode == 0:
-            # Cloud-final exited. If status reports an error we still proceed
-            # (recoverable issues like the write_files one are not blocking),
-            # but surface a warning so the operator can investigate.
+            # Cloud-final exited. The pointer swap in `rebake` is irreversible
+            # from the pool manager's point of view, so a non-`done` status
+            # (error/degraded) must HARD-FAIL the bake rather than warn and
+            # proceed -- otherwise a failed provider-CLI install (runcmd has no
+            # cross-entry `set -e`) would silently ship a broken template.
             try:
                 status = subprocess.run(
                     ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status"],
@@ -322,11 +325,13 @@ def _wait_for_cloud_init(
                 output = ""
             if "status: done" in output:
                 console.print("[green]ok[/green]")
+                return True
+            console.print("[red]failed[/red]")
+            if output:
+                console.print(f"    cloud-init: {output}")
             else:
-                console.print("[yellow]warning[/yellow]")
-                if output:
-                    console.print(f"    cloud-init: {output}")
-            return True
+                console.print("    cloud-init: status unreadable")
+            return False
         time.sleep(5)
     console.print("[red]timed out[/red]")
     return False
@@ -1928,6 +1933,28 @@ def gc_templates(dry_run: bool, config: str) -> None:
         if dry_run:
             console.print(f"  [dry-run] would destroy VM {vmid}")
             continue
+        # Re-read the active pointer right before each destroy: a concurrent
+        # `rebake` may have swapped orcest:pool:current_template_vmid to a VMID
+        # we classified as a candidate at start-up. Fail safe -- never destroy
+        # the currently-active template even if the pointer moved mid-run.
+        if cfg.orchestrator.host:
+            try:
+                current = get_current_template_vmid(cfg.ssh_target())
+            except Exception:
+                # Pointer unreadable now (was readable at start): fail closed,
+                # skip the rest rather than risk destroying a live template.
+                console.print(
+                    "  [yellow]Active pointer became unreadable; aborting further"
+                    " destroys to avoid racing a rebake.[/yellow]"
+                )
+                break
+            if current is not None and current == vmid:
+                console.print(
+                    f"  [yellow]skipped[/yellow]: VM {vmid} became the active"
+                    " template (concurrent rebake)"
+                )
+                skipped.append(vmid)
+                continue
         console.print(f"  Destroying VM {vmid}...", end=" ")
         try:
             try:
