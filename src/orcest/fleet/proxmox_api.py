@@ -457,6 +457,8 @@ class ProxmoxClient:
         storage: str = "local",
         content_type: str = "iso",
         timeout: int = 600,
+        checksum: str = "",
+        checksum_algorithm: str = "",
     ) -> str:
         """Download a file from a URL to Proxmox storage.
 
@@ -469,20 +471,26 @@ class ProxmoxClient:
             storage: Proxmox storage name (default ``"local"``).
             content_type: Storage content type (default ``"iso"``).
             timeout: Seconds to wait for the download task to complete.
+            checksum: Expected digest of the downloaded file. When set,
+                Proxmox verifies it node-side and fails the task on mismatch.
+            checksum_algorithm: Digest algorithm for ``checksum`` (e.g.
+                ``"sha256"``). Required by Proxmox whenever ``checksum`` is set.
 
         Returns:
             The Proxmox task UPID string.
         """
         logger.info("Downloading %s -> %s:%s/%s", url, storage, content_type, filename)
-        upid = (
-            self._api.nodes(self._node)
-            .storage(storage)("download-url")
-            .post(
-                content=content_type,
-                filename=filename,
-                url=url,
-            )
-        )
+        params: dict[str, object] = {
+            "content": content_type,
+            "filename": filename,
+            "url": url,
+        }
+        # Proxmox requires both fields together; only pass them when a digest
+        # is supplied so the no-checksum path stays byte-for-byte unchanged.
+        if checksum and checksum_algorithm:
+            params["checksum"] = checksum
+            params["checksum-algorithm"] = checksum_algorithm
+        upid = self._api.nodes(self._node).storage(storage)("download-url").post(**params)
         self.wait_for_task(upid, timeout=timeout)
         return upid
 

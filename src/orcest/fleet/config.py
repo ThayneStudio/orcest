@@ -43,6 +43,11 @@ class ProxmoxConfig:
     storage: str = "local-lvm"
     api_token_id: str = ""  # e.g. "root@pam!orcest"
     api_token_secret: str = ""
+    # Verify the Proxmox API server's TLS certificate. Defaults to False for
+    # self-signed lab deployments (no behavior change); set True (and use a
+    # CA-trusted endpoint) to defend the root API token against MITM on the
+    # management network.
+    verify_ssl: bool = False
 
     def is_localhost(self) -> bool:
         """Return True if the endpoint points to localhost (unreachable from VMs)."""
@@ -240,6 +245,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         storage=px.get("storage", "local-lvm"),
         api_token_id=px.get("api_token_id", ""),
         api_token_secret=px.get("api_token_secret", ""),
+        verify_ssl=bool(px.get("verify_ssl", False)),
     )
 
     orch = data.get("orchestrator") or {}
@@ -340,6 +346,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "storage": config.proxmox.storage,
             "api_token_id": config.proxmox.api_token_id,
             "api_token_secret": config.proxmox.api_token_secret,
+            "verify_ssl": config.proxmox.verify_ssl,
         },
         "orchestrator": {
             "vm_id": config.orchestrator.vm_id,

@@ -633,6 +633,55 @@ class TestDownloadImage:
         with pytest.raises(RuntimeError, match="download failed"):
             client.download_image("https://example.com/bad.img", "bad.img")
 
+    def test_passes_checksum_to_download_url(self):
+        """M5-infra: when a checksum + algorithm are supplied they must be
+        forwarded to the Proxmox download-url call so the node verifies the
+        image integrity (parity with provision/create-vm.sh GPG+sha256).
+        """
+        client, mock_api = _make_client()
+        mock_storage = mock_api.nodes("pve").storage("local")
+        mock_storage("download-url").post.return_value = "UPID:pve:dl-sum"
+
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        client.download_image(
+            "https://example.com/image.img",
+            "image.img",
+            storage="local",
+            checksum="abc123",
+            checksum_algorithm="sha256",
+        )
+        mock_storage("download-url").post.assert_called_once_with(
+            content="iso",
+            filename="image.img",
+            url="https://example.com/image.img",
+            checksum="abc123",
+            **{"checksum-algorithm": "sha256"},
+        )
+
+    def test_omits_checksum_when_not_provided(self):
+        """M5-infra: no checksum supplied -> POST is unchanged (back-compat)."""
+        client, mock_api = _make_client()
+        mock_storage = mock_api.nodes("pve").storage("local")
+        mock_storage("download-url").post.return_value = "UPID:pve:dl"
+
+        mock_task_status = MagicMock()
+        mock_task_status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+        mock_task = MagicMock()
+        mock_task.status = mock_task_status
+        mock_api.nodes("pve").tasks.return_value = mock_task
+
+        client.download_image("https://example.com/i.img", "i.img", storage="local")
+        mock_storage("download-url").post.assert_called_once_with(
+            content="iso",
+            filename="i.img",
+            url="https://example.com/i.img",
+        )
+
 
 class TestCreateVm:
     def test_creates_vm_with_kwargs(self):
