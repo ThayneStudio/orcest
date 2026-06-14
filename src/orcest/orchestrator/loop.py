@@ -816,10 +816,19 @@ def _poll_cycle(
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
 
-    # Do not trim task/result streams by consumer-group last-delivered-id.
-    # That ID can include delivered but unACKed PEL entries; trimming them would
-    # erase the only recoverable task/result body and leave Redis coordination
-    # state as the only memory of work.
+    # M1-conc: reclaim delivered+ACKed task entries (which carry plaintext
+    # GitHub PAT + provider credential) once per poll cycle. xtrim_acked_entries
+    # trims only up to the LOWEST still-pending id (or last-delivered-id when the
+    # PEL is empty), so un-ACKed / undelivered work is never dropped -- it does
+    # NOT trim by raw last-delivered-id while entries are still in flight.
+    for _task_stream in (
+        f"tasks:{config.default_runner}",
+        f"tasks:issue:{config.default_runner}",
+    ):
+        try:
+            task_redis.xtrim_acked_entries(_task_stream, CONSUMER_GROUP)
+        except Exception:
+            logger.debug("Failed to trim ACKed entries from %s", _task_stream, exc_info=True)
 
     # Step 2: Poll each project.
     #

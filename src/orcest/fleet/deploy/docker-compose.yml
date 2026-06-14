@@ -34,9 +34,12 @@ services:
       - OPENAI_API_KEY
       - ORCEST_REDIS_HOST=redis
       - ORCEST_REDIS_KEY_PREFIX
+      # Forwarded from the per-project .env so the orchestrator authenticates to
+      # the now-password-protected Redis (Compose only passes named vars).
+      - ORCEST_REDIS_PASSWORD
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; redis.Redis('redis').ping()"]
+      test: ["CMD", "python", "-c", "import os,redis; redis.Redis('redis', password=os.environ.get('ORCEST_REDIS_PASSWORD')).ping()"]
       interval: 30s
       timeout: 5s
       retries: 3

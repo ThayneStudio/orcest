@@ -12,6 +12,7 @@ instances could clash.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -492,10 +493,18 @@ class PoolManager:
 
         # Set cloud-init userdata so the clone starts the worker service
         try:
+            # C1: forward the Redis AUTH password to the clone so its worker can
+            # authenticate to the now-password-protected Redis. The pool-manager
+            # container receives ORCEST_REDIS_PASSWORD in its own environment via
+            # the pool compose stack's --env-file/passthrough (see
+            # ensure_pool_manager + docker-compose.pool.yml). Absent (dev/legacy
+            # unauthenticated stack) -> empty string -> clone writes no .env,
+            # preserving the old behaviour.
             userdata = render_clone_userdata(
                 redis_host=self._config.orchestrator.host,
                 worker_id=name,
                 key_prefix=self._key_prefix,
+                redis_password=os.environ.get("ORCEST_REDIS_PASSWORD", ""),
             )
             self._proxmox.set_cloud_init_userdata(
                 new_id,
