@@ -109,7 +109,12 @@ class PoolConfig:
     worker_memory: int = 16384  # MB per worker VM
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
-    max_task_duration: int = 3600  # seconds before force-kill
+    # Force-kill threshold for an active worker VM. MUST exceed the worker's
+    # RunnerConfig.timeout (default 5400s) plus a grace window, otherwise the
+    # pool reaps HEALTHY long-running tasks before they can finish. Default =
+    # 5400 (runner timeout) + 1800 (grace) = 7200s. Raise both together if you
+    # raise the runner timeout (see project memory: pool_max_task_duration_vs_runner_timeout).
+    max_task_duration: int = 7200  # seconds before force-kill (> runner timeout + grace)
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
 
     def template_range(self) -> tuple[int, int] | None:
@@ -302,7 +307,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_memory=pl.get("worker_memory", 16384),
         worker_cores=pl.get("worker_cores", 8),
         worker_disk_size=pl.get("worker_disk_size", 30),
-        max_task_duration=pl.get("max_task_duration", 3600),
+        max_task_duration=pl.get("max_task_duration", 7200),
         snippet_storage=pl.get("snippet_storage", "local"),
     )
     # Surface VMID-range overlap at load time rather than at clone time:
