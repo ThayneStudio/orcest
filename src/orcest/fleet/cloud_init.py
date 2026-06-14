@@ -69,6 +69,16 @@ _GROK_INSTALLER_SHA256 = ""
 # version, so re-validate fixtures + parser on bump.
 _CODEX_VERSION = "0.131.0"
 
+# Provider CLIs that ``_worker_tooling_runcmd`` installs and which a worker
+# MUST be able to exec (as the non-root ``orcest`` user) for any provider task
+# to run. cloud-init's runcmd has no cross-entry ``set -e``: a failed install
+# in the middle of the list still lets cloud-final exit ``status: done``, so a
+# half-baked template can otherwise ship missing one of these. The bake path
+# (``orcest fleet create-template`` / ``rebake``) runs a post-bake smoke-check
+# of this exact list on PATH *before* the irreversible convert-to-template /
+# pool-pointer swap — keep this in sync with the install commands above.
+REQUIRED_PROVIDER_BINARIES: tuple[str, ...] = ("claude", "grok", "codex")
+
 
 def _template_versions_write_file() -> dict:
     """Build the cloud-init write_files entry for ``/etc/orcest/template.versions``.

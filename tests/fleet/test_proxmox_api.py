@@ -682,6 +682,35 @@ class TestDownloadImage:
             url="https://example.com/i.img",
         )
 
+    def test_lone_checksum_raises(self):
+        """M5-infra: a checksum WITHOUT an algorithm is a mis-wiring, not a
+        reason to silently skip verification. The old AND-guard treated it as
+        the no-checksum path and downloaded unverified. It must RAISE.
+        """
+        client, _mock_api = _make_client()
+        with pytest.raises(ValueError, match="checksum"):
+            client.download_image(
+                "https://example.com/i.img",
+                "i.img",
+                storage="local",
+                checksum="abc123",
+                # checksum_algorithm deliberately omitted
+            )
+
+    def test_lone_checksum_algorithm_raises(self):
+        """M5-infra: an algorithm WITHOUT a checksum is likewise a mis-wiring
+        and must RAISE rather than silently download unverified.
+        """
+        client, _mock_api = _make_client()
+        with pytest.raises(ValueError, match="checksum"):
+            client.download_image(
+                "https://example.com/i.img",
+                "i.img",
+                storage="local",
+                checksum_algorithm="sha256",
+                # checksum deliberately omitted
+            )
+
 
 class TestCreateVm:
     def test_creates_vm_with_kwargs(self):

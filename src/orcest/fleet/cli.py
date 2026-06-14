@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -309,31 +310,66 @@ def _wait_for_cloud_init(
             continue
         if result.returncode == 0:
             # Cloud-final exited. The pointer swap in `rebake` is irreversible
-            # from the pool manager's point of view, so a non-`done` status
-            # (error/degraded) must HARD-FAIL the bake rather than warn and
-            # proceed -- otherwise a failed provider-CLI install (runcmd has no
-            # cross-entry `set -e`) would silently ship a broken template.
-            try:
-                status = subprocess.run(
-                    ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                output = (status.stdout or "").strip()
-            except subprocess.TimeoutExpired:
-                output = ""
-            if "status: done" in output:
-                console.print("[green]ok[/green]")
-                return True
-            console.print("[red]failed[/red]")
-            if output:
-                console.print(f"    cloud-init: {output}")
-            else:
-                console.print("    cloud-init: status unreadable")
-            return False
+            # from the pool manager's point of view, so a DEFINITIVE non-`done`
+            # status (error/degraded) must HARD-FAIL the bake rather than warn
+            # and proceed -- otherwise a failed provider-CLI install (runcmd has
+            # no cross-entry `set -e`) would silently ship a broken template.
+            #
+            # But distinguish a definitive bad status from a TRANSIENT read
+            # failure (a single flaky SSH read / timeout, or empty output):
+            # one flaky read must not abort an otherwise-good bake. Retry the
+            # status read a few times; only a real `status: <something>` line
+            # decides the outcome. If every read is transiently unreadable we
+            # still fail closed (never accept a template we couldn't verify).
+            return _read_cloud_init_status(ssh_target, console)
         time.sleep(5)
     console.print("[red]timed out[/red]")
+    return False
+
+
+# Maximum transient-read retries for `cloud-init status` after boot-finished.
+_CLOUD_INIT_STATUS_READ_ATTEMPTS = 5
+
+
+def _read_cloud_init_status(ssh_target: str, console: Console) -> bool:
+    """Read ``cloud-init status`` after boot-finished and decide pass/fail.
+
+    Returns True only on a definitive ``status: done``. A definitive non-done
+    status (e.g. ``status: error`` / ``degraded``) returns False immediately
+    -- the retry budget is reserved for TRANSIENT read failures (SSH timeout or
+    empty/unreadable output), so a single flaky read can't abort a good bake.
+    If every attempt is transiently unreadable, fails closed (returns False).
+    """
+    for attempt in range(_CLOUD_INIT_STATUS_READ_ATTEMPTS):
+        try:
+            status = subprocess.run(
+                ["ssh", *_SSH_OPTS, ssh_target, "cloud-init status"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = (status.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            output = ""  # transient: SSH read timed out
+
+        if "status: done" in output:
+            console.print("[green]ok[/green]")
+            return True
+        if "status:" in output:
+            # Definitive non-done status (error/degraded): hard-fail now, do
+            # not burn the retry budget on a genuinely-bad outcome.
+            console.print("[red]failed[/red]")
+            console.print(f"    cloud-init: {output}")
+            return False
+        # Transient: no readable status line. Retry a few times before deciding.
+        if attempt < _CLOUD_INIT_STATUS_READ_ATTEMPTS - 1:
+            time.sleep(5)
+
+    console.print("[red]failed[/red]")
+    console.print(
+        "    cloud-init: status unreadable after"
+        f" {_CLOUD_INIT_STATUS_READ_ATTEMPTS} attempts (failing closed)"
+    )
     return False
 
 
@@ -350,6 +386,58 @@ def _ssh_run(host: str, user: str, cmd: str, timeout: int = 60) -> subprocess.Co
         text=True,
         timeout=timeout,
     )
+
+
+def _verify_provider_clis(host: str, user: str, console: Console) -> bool:
+    """Smoke-check that every required provider CLI is on PATH on the template.
+
+    Runs *after* ``cloud-init status: done`` and *before* the irreversible
+    convert-to-template / pool-pointer swap. cloud-init's runcmd has no
+    cross-entry ``set -e``, so a failed provider-CLI install in the middle of
+    the list still lets cloud-final report ``done`` -- a half-baked template
+    could otherwise ship missing ``claude`` / ``grok`` / ``codex`` and the
+    pointer would flip to it, breaking every task routed to that provider.
+
+    Probes each binary in :data:`cloud_init.REQUIRED_PROVIDER_BINARIES` as the
+    non-root ``orcest`` worker user (the runtime user) so it also catches an
+    exec-permission regression (e.g. the grok binary symlinked under root-only
+    ``/root``), not merely root visibility.
+
+    Returns True only if every binary resolves. Fails closed: any missing
+    binary, non-zero probe, or transient SSH read failure returns False so the
+    caller aborts and cleans up.
+    """
+    import shlex
+
+    from orcest.fleet.cloud_init import REQUIRED_PROVIDER_BINARIES
+
+    console.print("  Verifying provider CLIs on template...", end=" ")
+    missing: list[str] = []
+    for binary in REQUIRED_PROVIDER_BINARIES:
+        # Resolve on PATH as the orcest user's login shell (-l) so PATH matches
+        # what the systemd worker unit will see at runtime.
+        probe = f"sudo -u orcest -H bash -lc {shlex.quote(f'command -v {binary}')}"
+        try:
+            result = _ssh_run(host, user, probe, timeout=30)
+        except subprocess.TimeoutExpired:
+            console.print("[red]failed[/red]")
+            console.print(f"    provider-CLI check timed out probing '{binary}' (failing closed)")
+            return False
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            missing.append(binary)
+
+    if missing:
+        console.print("[red]failed[/red]")
+        console.print(
+            f"    provider CLI(s) missing on PATH for the orcest user: {', '.join(missing)}.\n"
+            "    A provider-CLI install failed mid cloud-init (runcmd has no"
+            " cross-entry `set -e`).\n"
+            "    Refusing to convert this half-baked VM to a template."
+        )
+        return False
+
+    console.print("[green]ok[/green]")
+    return True
 
 
 def _wait_for_ssh(host: str, user: str, console: Console, timeout: int = 300) -> bool:
@@ -1084,6 +1172,130 @@ def status(config: str) -> None:
     console.print(pool_table)
 
 
+def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) -> str:
+    """Return a VERIFIED sha256 hex digest for *image_url* (M5-infra).
+
+    Fail-closed image integrity for the template cloud image, mirroring
+    ``provision/create-vm.sh`` (GPG-verify ``SHA256SUMS`` then ``sha256sum -c``)
+    so the Proxmox node can verify the bytes it downloads as root.
+
+    Resolution order:
+
+    1. If ``pool.expected_image_sha256`` is set (64 hex chars), use it directly
+       -- the offline / air-gapped pin. No network, no GPG fetch.
+    2. Otherwise fetch the image's published ``SHA256SUMS`` + ``SHA256SUMS.gpg``
+       (same directory as the image), import + GPG-verify against
+       ``pool.expected_image_gpg_key`` (the ``VALIDSIG ... <fpr>`` line), and
+       extract the digest for the pinned image filename.
+
+    Raises:
+        RuntimeError: on any verification failure (bad signature, missing
+            filename in SHA256SUMS, fetch failure). The caller aborts the bake
+            rather than download the image unverified.
+    """
+    from urllib.parse import urlparse
+
+    # 1) Pinned digest short-circuit (offline / air-gapped).
+    pinned = (cfg.pool.expected_image_sha256 or "").strip().lower()
+    if pinned:
+        if not re.fullmatch(r"[0-9a-f]{64}", pinned):
+            raise RuntimeError(
+                f"pool.expected_image_sha256 must be 64 hex chars, got {pinned!r}"
+            )
+        console.print("  Image checksum: [green]pinned (config)[/green]")
+        return pinned
+
+    # 2) Fetch + GPG-verify the published SHA256SUMS.
+    gpg_key = (cfg.pool.expected_image_gpg_key or "").strip()
+    if not gpg_key:
+        raise RuntimeError(
+            "Image integrity is unverifiable: neither pool.expected_image_sha256"
+            " nor pool.expected_image_gpg_key is set. Refusing to download the"
+            " cloud image unverified."
+        )
+
+    parsed = urlparse(image_url)
+    image_filename = parsed.path.rsplit("/", 1)[-1]
+    base_url = image_url.rsplit("/", 1)[0]
+    sums_url = f"{base_url}/SHA256SUMS"
+    sig_url = f"{base_url}/SHA256SUMS.gpg"
+
+    console.print("  Verifying image checksum (GPG)...", end=" ")
+    workdir = Path(tempfile.mkdtemp(prefix="orcest-img-verify-"))
+    sums_path = workdir / "SHA256SUMS"
+    sig_path = workdir / "SHA256SUMS.gpg"
+    gnupg_home = workdir / "gnupg"
+    try:
+        gnupg_home.mkdir(mode=0o700, exist_ok=True)
+
+        def _run(cmd: list[str], *, what: str) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"image checksum: {what} failed: {exc}") from exc
+
+        # Fetch SHA256SUMS and its detached signature (no redirects).
+        r = _run(
+            ["curl", "-fsSL", "--max-redirs", "0", "-o", str(sums_path), sums_url],
+            what="fetch SHA256SUMS",
+        )
+        if r.returncode != 0 or not sums_path.exists():
+            raise RuntimeError(f"image checksum: could not fetch {sums_url}: {r.stderr.strip()}")
+        r = _run(
+            ["curl", "-fsSL", "--max-redirs", "0", "-o", str(sig_path), sig_url],
+            what="fetch SHA256SUMS.gpg",
+        )
+        if r.returncode != 0 or not sig_path.exists():
+            raise RuntimeError(f"image checksum: could not fetch {sig_url}: {r.stderr.strip()}")
+
+        # Import the expected signing key into the throwaway keyring, then
+        # GPG-verify the signature. Anchor on the primary-key fingerprint in
+        # the VALIDSIG status line (Ubuntu may sign with a subkey).
+        gpg_base = ["gpg", "--homedir", str(gnupg_home), "--batch"]
+        _run(
+            [*gpg_base, "--keyserver", "hkps://keyserver.ubuntu.com", "--recv-keys", gpg_key],
+            what="import signing key",
+        )
+        verify = _run(
+            [*gpg_base, "--status-fd", "1", "--verify", str(sig_path), str(sums_path)],
+            what="gpg --verify",
+        )
+        validsig = any(
+            line.startswith("[GNUPG:] VALIDSIG") and line.rstrip().endswith(gpg_key)
+            for line in (verify.stdout or "").splitlines()
+        )
+        if verify.returncode != 0 or not validsig:
+            raise RuntimeError(
+                "image checksum: GPG signature verification failed or was signed by"
+                f" an unexpected key (expected {gpg_key})."
+            )
+
+        # Extract the digest for the pinned image filename. Lines look like
+        # "<sha256> *noble-server-cloudimg-amd64.img" (or two-space separator).
+        digest = ""
+        for line in sums_path.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                sha, name = parts
+                if name.lstrip("*") == image_filename:
+                    digest = sha.strip().lower()
+                    break
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(
+                f"image checksum: no sha256 for {image_filename!r} found in the"
+                " GPG-verified SHA256SUMS."
+            )
+        console.print("[green]ok[/green]")
+        return digest
+    except RuntimeError:
+        console.print("[red]failed[/red]")
+        raise
+    finally:
+        import shutil
+
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _create_vm_from_cloud_image(
     px: ProxmoxClient,
     cfg: FleetConfig,
@@ -1121,11 +1333,25 @@ def _create_vm_from_cloud_image(
     if not filename or filename.startswith("."):
         filename = "cloud-image.img"
 
-    # Step 1: Download cloud image to Proxmox local storage (skip if already present)
+    # Step 0: Resolve a VERIFIED sha256 for the image (fail-closed). Either a
+    # GPG-verified entry from the image's published SHA256SUMS, or a pinned
+    # pool.expected_image_sha256. Raises (aborting the bake) if the digest
+    # cannot be resolved/verified -- we never download the cloud image (run as
+    # root on the Proxmox node) without integrity verification.
+    image_sha256 = _resolve_image_checksum(image_url, cfg, console)
+
+    # Step 1: Download cloud image to Proxmox local storage (skip if already
+    # present). The node verifies the downloaded bytes against image_sha256.
     download_storage = "local"
     console.print("  Downloading cloud image...", end=" ")
     try:
-        px.download_image(image_url, filename, storage=download_storage)
+        px.download_image(
+            image_url,
+            filename,
+            storage=download_storage,
+            checksum=image_sha256,
+            checksum_algorithm="sha256",
+        )
         console.print("[green]ok[/green]")
     except RuntimeError as exc:
         if "already exists" in str(exc) or "override existing" in str(exc):
@@ -1386,6 +1612,16 @@ def _create_template_at_vmid(
     # Step 6: Wait for cloud-init to finish
     if not _wait_for_cloud_init(vm_ip, cfg.orchestrator.user, console):
         console.print("[red]Cloud-init timed out. Template creation aborted.[/red]")
+        _cleanup_vm()
+        sys.exit(1)
+
+    # Step 6b: Smoke-check the baked provider CLIs are actually on PATH for the
+    # orcest worker user BEFORE the irreversible convert-to-template / pointer
+    # swap. cloud-init reporting `done` does not prove every install in runcmd
+    # succeeded (no cross-entry `set -e`), so a failed provider-CLI install
+    # could otherwise flip the pool pointer to a broken template.
+    if not _verify_provider_clis(vm_ip, cfg.orchestrator.user, console):
+        console.print("[red]Provider-CLI smoke-check failed. Template creation aborted.[/red]")
         _cleanup_vm()
         sys.exit(1)
 
