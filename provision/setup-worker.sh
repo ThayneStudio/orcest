@@ -57,24 +57,30 @@ fi
 #
 # Adding any future provider: see docs/adding-a-provider.md.
 GROK_VERSION="0.1.216"
-# Optional: pin the installer's SHA-256 to defend against a compromised CDN /
-# DNS hijack executing arbitrary code at bake time. Leave empty to skip
-# verification (xAI does not yet publish a checksum for the beta installer);
-# set it once a trusted digest is known. Either way we download to a file
-# first rather than piping a (possibly partial) download straight into bash.
+# Pin the installer's SHA-256 to defend against a compromised CDN / DNS hijack
+# executing arbitrary code at bake time. FAIL CLOSED: leave empty and the
+# installer is NOT run (curl|bash-as-root with no integrity gate is the
+# threat); grok degrades gracefully (grok tasks early-reject with a rebake
+# hint). Set GROK_INSTALLER_SHA256=<sha256 of x.ai/cli/install.sh> to enable:
+#   curl -fsSL https://x.ai/cli/install.sh | sha256sum
+# Either way we download to a file first rather than piping a (possibly
+# partial) download straight into bash.
 GROK_INSTALLER_SHA256="${GROK_INSTALLER_SHA256:-}"
 if ! command -v grok &>/dev/null; then
     echo "Installing Grok CLI ${GROK_VERSION}..."
     _grok_installer="$(mktemp)"
     if curl -fsSL https://x.ai/cli/install.sh -o "${_grok_installer}"; then
-        _grok_ok=1
-        if [ -n "${GROK_INSTALLER_SHA256}" ]; then
-            echo "${GROK_INSTALLER_SHA256}  ${_grok_installer}" | sha256sum -c - || _grok_ok=0
+        _grok_ok=0
+        if [ -z "${GROK_INSTALLER_SHA256}" ]; then
+            echo "GROK_INSTALLER_SHA256 unset — SKIPPING grok install (fail-closed)."
+            echo "  Set GROK_INSTALLER_SHA256=<sha256 of x.ai/cli/install.sh> to enable."
+        elif echo "${GROK_INSTALLER_SHA256}  ${_grok_installer}" | sha256sum -c -; then
+            _grok_ok=1
+        else
+            echo "Grok installer checksum mismatch — skipping install"
         fi
         if [ "${_grok_ok}" = "1" ]; then
             bash "${_grok_installer}" "${GROK_VERSION}" || true
-        else
-            echo "Grok installer checksum mismatch — skipping install"
         fi
     fi
     rm -f "${_grok_installer}"

@@ -1,11 +1,11 @@
 import { createServer, type IncomingMessage } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
-import { timingSafeEqual, createHash } from "crypto";
 import type { Duplex } from "stream";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { healthCheck, redis } from "./redis.js";
+import { isAuthorized } from "./auth.js";
 import { fetchSnapshot } from "./snapshot.js";
 import { detectStuck } from "./stuck.js";
 import { discoverWorkers, findTaskStartId, readTaskOutput } from "./workers.js";
@@ -14,27 +14,6 @@ import type { DashboardMessage, TaskOutputMessage } from "./types.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const PING_INTERVAL = 30000;
-const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN;
-
-function tokenMatches(candidate: string): boolean {
-  if (!DASHBOARD_TOKEN) return false;
-  const a = createHash("sha256").update(candidate).digest();
-  const b = createHash("sha256").update(DASHBOARD_TOKEN).digest();
-  return timingSafeEqual(a, b);
-}
-
-function isAuthorized(req: IncomingMessage): boolean {
-  if (!DASHBOARD_TOKEN) return true;
-  const auth = (req as { headers: Record<string, string | string[] | undefined> }).headers.authorization;
-  if (typeof auth === "string" && auth.startsWith("Bearer ") && tokenMatches(auth.slice(7))) return true;
-  // Fallback to query-param token for WebSocket connections — browsers cannot
-  // set custom headers (Authorization) on the WebSocket handshake request,
-  // so the token must be passed as a query parameter instead.
-  const url = new URL(req.url || "", `http://localhost:${PORT}`);
-  const queryToken = url.searchParams.get("token");
-  if (queryToken !== null && tokenMatches(queryToken)) return true;
-  return false;
-}
 
 const app = express();
 const server = createServer(app);
