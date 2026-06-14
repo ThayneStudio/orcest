@@ -13,6 +13,32 @@ from orcest.shared.models import Task, TaskType
 from orcest.shared.providers import ProviderEntry
 
 
+def test_account_key_is_model_independent_but_identity_is_not():
+    """H3-logic: account_key() collapses model so two model-entries sharing one
+    credential map to the same rate-limit account, while identity() (the
+    selection/round-robin/credential-override anchor) still distinguishes model.
+    Neither must ever leak the raw credential.
+    """
+    cred = "acct-shared-secret-1234567890"
+    opus = ProviderEntry("claude", cred, model="opus")
+    sonnet = ProviderEntry("claude", cred, model="sonnet")
+    other = ProviderEntry("claude", "different-secret")
+
+    # Same account, different identities.
+    assert opus.account_key() == sonnet.account_key()
+    assert opus.identity() != sonnet.identity()
+
+    # account_key is provider + credential hash (model-free) and never the secret.
+    assert "opus" not in opus.account_key()
+    assert "sonnet" not in sonnet.account_key()
+    assert cred not in opus.account_key()
+    assert "secret" not in opus.account_key().lower()
+    assert opus.account_key().startswith("claude:")
+
+    # A different credential yields a different account.
+    assert other.account_key() != opus.account_key()
+
+
 def test_provider_entry_rich_fields_and_redaction():
     e = ProviderEntry(
         provider="grok",

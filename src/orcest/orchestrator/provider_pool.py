@@ -66,9 +66,15 @@ class ProviderPool:
 
         self._entries: list[ProviderEntry] = list(entries)  # order preserved for RR
         self._counter: int = 0
-        self._cooldowns: dict[str, datetime] = {}  # identity -> UTC expiry
+        # Cooldowns are keyed by ACCOUNT (provider + credential hash), NOT by
+        # identity(): rate limits are per-account, so benching an account benches
+        # every model-entry that shares its credential. See ProviderEntry.account_key.
+        self._cooldowns: dict[str, datetime] = {}  # account_key -> UTC expiry
         self._task_identities: dict[str, str] = {}  # task_id -> identity
         self._identity_to_entry: dict[str, ProviderEntry] = {e.identity(): e for e in entries}
+        self._identity_to_account: dict[str, str] = {
+            e.identity(): e.account_key() for e in entries
+        }
         # Credential write-back overrides (OAuth-blob providers like Grok/Codex).
         # identity -> (latest_blob, minted_at). The identity is the STABLE anchor
         # (hash of the original config credential); the blob is the rotated token
@@ -104,11 +110,15 @@ class ProviderPool:
 
     @property
     def available_count(self) -> int:
-        """Number of entries not currently on cooldown."""
+        """Number of entries whose ACCOUNT is not currently on cooldown.
+
+        Counts entries (not accounts): a benched account removes every one of
+        its model-entries from availability.
+        """
         with self._lock:
             now = datetime.now(timezone.utc)
-            active = sum(1 for exp in self._cooldowns.values() if exp > now)
-            return self.size - active
+            benched = {k for k, exp in self._cooldowns.items() if exp > now}
+            return sum(1 for e in self._entries if e.account_key() not in benched)
 
     @property
     def provider_names(self) -> list[str]:
@@ -151,8 +161,7 @@ class ProviderPool:
                 idx = self._counter % n
                 self._counter += 1
                 entry = self._entries[idx]
-                ident = entry.identity()
-                if ident not in self._cooldowns:
+                if entry.account_key() not in self._cooldowns:
                     return entry
             return None
 
@@ -209,23 +218,29 @@ class ProviderPool:
             if ident is None:
                 return
 
+            # Bench by ACCOUNT, not identity: a rate-limited account is benched
+            # regardless of which model entry served the task.
+            account = self._identity_to_account.get(ident)
+            if account is None:
+                return
+
             default = datetime.now(timezone.utc) + timedelta(minutes=30)
             candidate = resets_at or cooldown_until or default
 
-            existing = self._cooldowns.get(ident)
+            existing = self._cooldowns.get(account)
             if existing is not None and existing > candidate:
                 expiry = existing
             else:
                 expiry = candidate
 
-            self._cooldowns[ident] = expiry
+            self._cooldowns[account] = expiry
 
             entry = self._identity_to_entry.get(ident)
             prov = entry.provider if entry else "?"
             logger.info(
-                "Provider %s (id=%s) benched until %s",
+                "Provider %s (account=%s) benched until %s",
                 prov,
-                ident,
+                account,
                 expiry.isoformat(),
             )
 
