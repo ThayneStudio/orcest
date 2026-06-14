@@ -1,6 +1,8 @@
 """Tests for orcest.fleet.cli."""
 
+import subprocess
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -390,8 +392,6 @@ def test_add_org_skips_on_connection_error(runner, cfg_path, mocker):
 
 def test_add_org_skips_on_timeout(runner, cfg_path, mocker):
     """fleet add-org skips validation when orchestrator command times out."""
-    import subprocess
-
     cfg = FleetConfig(orchestrator=OrchestratorConfig(host="10.20.0.23"))
     _save(cfg, cfg_path)
     mocker.patch(
@@ -756,6 +756,10 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    # Let the provider-CLI smoke-check (step 6b) pass so this test exercises the
+    # *cloud-init clean* step (step 7) failing -- the smoke-check shares the
+    # _ssh_run mock and would otherwise abort first.
+    mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         return_value=mocker.MagicMock(returncode=1, stderr="permission denied"),
@@ -811,6 +815,357 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     assert result.exit_code != 0
     assert "VM did not stop" in result.output
     mock_px.destroy_vm.assert_called_once_with(200)
+
+
+# ── provider-CLI smoke-check tests (H1-infra repair 1) ──────
+
+
+def test_create_template_fails_when_provider_cli_missing(runner, cfg_path, mocker):
+    """H1-infra (repair 1): after cloud-init reports done, the bake SSHes a
+    `command -v` check for every required provider CLI. If any is missing
+    (e.g. a failed install mid-runcmd, which has no `set -e`), the bake must
+    FAIL and CLEAN UP -- never convert-to-template / set the pointer.
+    """
+    cfg = _proxmox_cfg()
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    # The provider-CLI smoke-check reports a missing binary.
+    mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=False)
+
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        input="\n",
+    )
+    assert result.exit_code != 0, result.output
+    # Must never convert a half-baked VM to a template.
+    mock_px.convert_to_template.assert_not_called()
+    # Must clean up the half-built VM.
+    mock_px.destroy_vm.assert_called_once_with(200)
+
+
+def test_rebake_fails_and_keeps_pointer_when_provider_cli_missing(runner, cfg_path, mocker):
+    """H1-infra (repair 1): a missing provider CLI must abort rebake BEFORE the
+    pointer swap so a half-baked template can never become the active one.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest", ssh_key="ssh-ed25519 AAA"),
+        pool=PoolConfig(
+            template_vmid_range=[9000, 9009],
+            template_vm_id=9000,
+            storage="ssd-pool",
+            snippet_storage="local",
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True}
+    ]
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=False)
+    mock_set = mocker.patch("orcest.fleet.orchestrator.set_current_template_vmid")
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code != 0, result.output
+    mock_px.convert_to_template.assert_not_called()
+    mock_set.assert_not_called()
+    mock_px.destroy_vm.assert_called_once_with(9001)
+
+
+class TestVerifyProviderClis:
+    """H1-infra (repair 1): the smoke-check itself."""
+
+    def test_required_binaries_match_baked_set(self):
+        """The required-binary list lives where the installs are defined
+        (cloud_init.py) and enumerates the baked provider CLIs: claude, grok,
+        codex.
+        """
+        from orcest.fleet.cloud_init import REQUIRED_PROVIDER_BINARIES
+
+        assert set(REQUIRED_PROVIDER_BINARIES) == {"claude", "grok", "codex"}
+
+    def test_passes_when_all_clis_present(self, mocker):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+
+        # Every `command -v <bin>` succeeds.
+        mocker.patch(
+            "orcest.fleet.cli._ssh_run",
+            return_value=mocker.MagicMock(returncode=0, stdout="/usr/local/bin/x", stderr=""),
+        )
+        assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is True
+
+    def test_fails_when_a_cli_is_missing(self, mocker):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+        from orcest.fleet.cloud_init import REQUIRED_PROVIDER_BINARIES
+
+        # First binary present, the rest missing (command -v returns non-zero).
+        def fake_ssh(host, user, cmd, timeout=60):
+            present = REQUIRED_PROVIDER_BINARIES[0]
+            rc = 0 if present in cmd else 1
+            return mocker.MagicMock(returncode=rc, stdout="", stderr="")
+
+        mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
+        assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is False
+
+    def test_checks_as_runtime_worker_user_on_path(self, mocker):
+        """The check must verify the CLI is on PATH for the orcest *worker*
+        user (the runtime user), so it catches the grok exec-permission
+        regression -- not just root visibility. We assert the probe runs as
+        the orcest user (sudo -u orcest) and uses `command -v`.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+
+        seen_cmds: list[str] = []
+
+        def fake_ssh(host, user, cmd, timeout=60):
+            seen_cmds.append(cmd)
+            return mocker.MagicMock(returncode=0, stdout="/x", stderr="")
+
+        mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
+        _verify_provider_clis("10.0.0.1", "orcest", Console())
+        assert seen_cmds, "smoke-check ran no probes"
+        for cmd in seen_cmds:
+            assert "command -v" in cmd
+            assert "orcest" in cmd  # probes the worker user, not root
+
+    def test_transient_ssh_timeout_fails_closed(self, mocker):
+        """A timed-out probe must fail closed (return False) rather than
+        accept the template -- we cannot prove the CLI is installed.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+
+        mocker.patch(
+            "orcest.fleet.cli._ssh_run",
+            side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=60),
+        )
+        assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is False
+
+
+# ── image-digest verification wiring tests (M5-infra repair 3) ──
+
+
+def test_create_vm_from_cloud_image_passes_verified_checksum(mocker):
+    """M5-infra (repair 3): the sole download caller must resolve a verified
+    sha256 and forward it to download_image (checksum + algorithm), so the
+    Proxmox node actually verifies the cloud image. Round 1 passed nothing,
+    so download_image never verified.
+    """
+    from rich.console import Console
+
+    from orcest.fleet.cli import _create_vm_from_cloud_image
+
+    cfg = _proxmox_cfg()
+    mock_px = mocker.MagicMock()
+    # The resolver returns a verified digest (GPG-checked SHA256SUMS upstream).
+    mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        return_value="deadbeef" * 8,
+    )
+    mocker.patch("orcest.fleet.cli.subprocess.run", return_value=mocker.MagicMock(returncode=0))
+
+    _create_vm_from_cloud_image(
+        mock_px,
+        cfg,
+        200,
+        "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+        Console(),
+        storage="ssd-pool",
+        snippet_storage="local",
+    )
+
+    mock_px.download_image.assert_called_once()
+    kwargs = mock_px.download_image.call_args.kwargs
+    assert kwargs.get("checksum") == "deadbeef" * 8
+    assert kwargs.get("checksum_algorithm") == "sha256"
+
+
+def test_create_vm_from_cloud_image_aborts_when_checksum_unresolvable(mocker):
+    """M5-infra (repair 3): verification is FAIL-CLOSED. If the digest cannot
+    be resolved/verified, the bake must raise -- never download unverified.
+    """
+    from rich.console import Console
+
+    from orcest.fleet.cli import _create_vm_from_cloud_image
+
+    cfg = _proxmox_cfg()
+    mock_px = mocker.MagicMock()
+    mocker.patch(
+        "orcest.fleet.cli._resolve_image_checksum",
+        side_effect=RuntimeError("GPG signature verification failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="GPG signature verification failed"):
+        _create_vm_from_cloud_image(
+            mock_px,
+            cfg,
+            200,
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+            Console(),
+            storage="ssd-pool",
+            snippet_storage="local",
+        )
+    mock_px.download_image.assert_not_called()
+
+
+class TestResolveImageChecksum:
+    """M5-infra (repair 3): the GPG-verified SHA256SUMS resolver."""
+
+    def test_uses_config_pinned_sha256_without_network(self, mocker):
+        """A pinned pool.expected_image_sha256 short-circuits the GPG fetch
+        (air-gapped / offline bakes) and is returned directly. No subprocess
+        (gpg/curl) is invoked.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(pool=PoolConfig(expected_image_sha256="f" * 64))
+        run = mocker.patch("orcest.fleet.cli.subprocess.run")
+        digest = _resolve_image_checksum(
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+            cfg,
+            Console(),
+        )
+        assert digest == "f" * 64
+        run.assert_not_called()
+
+    def test_gpg_verifies_and_extracts_sha_for_filename(self, mocker, tmp_path):
+        """Without a pinned digest: fetch SHA256SUMS + .gpg, GPG-verify against
+        the expected key, and extract the sha256 for the pinned image filename.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(
+            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+        )
+        target_sha = "a1b2c3" + "0" * 58
+        sums = (
+            f"{target_sha} *noble-server-cloudimg-amd64.img\n"
+            "ffff000000000000000000000000000000000000000000000000000000000000 *other.img\n"
+        )
+
+        # Sequence of subprocess.run calls inside the resolver:
+        #   1. fetch SHA256SUMS, 2. fetch SHA256SUMS.gpg,
+        #   3. gpg --recv-keys (import), 4. gpg --verify (VALIDSIG present)
+        def fake_run(cmd, *args, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "curl" in joined and "-o" in cmd:
+                # curl -f -o <path> writes the file on success. The .gpg
+                # detached signature content is opaque to the resolver.
+                out = cmd[cmd.index("-o") + 1]
+                Path(out).write_text(sums if out.endswith("SHA256SUMS") else "SIG")
+                return mocker.MagicMock(returncode=0, stdout="", stderr="")
+            if "--recv-keys" in joined or "--list-keys" in joined:
+                return mocker.MagicMock(returncode=0, stdout="", stderr="")
+            if "--verify" in joined:
+                return mocker.MagicMock(
+                    returncode=0,
+                    stdout="[GNUPG:] VALIDSIG X 843938DF228D22F7B3742BC0D94AA3F0EFE21092\n",
+                    stderr="",
+                )
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+
+        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
+        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+
+        digest = _resolve_image_checksum(
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+            cfg,
+            Console(),
+        )
+        assert digest == target_sha
+
+    def test_raises_when_gpg_signature_invalid(self, mocker, tmp_path):
+        """Fail-closed: a bad/missing GPG signature must raise, never return a
+        digest that could have been tampered with.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(
+            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+        )
+
+        def fake_run(cmd, *args, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
+                out = cmd[cmd.index("-o") + 1]
+                Path(out).write_text("deadbeef *noble-server-cloudimg-amd64.img\n")
+                return mocker.MagicMock(returncode=0, stdout="", stderr="")
+            if "--verify" in joined:
+                # No VALIDSIG line / non-zero => signature failed.
+                return mocker.MagicMock(returncode=1, stdout="", stderr="BADSIG")
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+
+        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
+        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+
+        with pytest.raises(RuntimeError, match="GPG"):
+            _resolve_image_checksum(
+                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+                cfg,
+                Console(),
+            )
+
+    def test_raises_when_filename_absent_from_sums(self, mocker, tmp_path):
+        """Fail-closed: if the pinned image filename is not present in the
+        verified SHA256SUMS, raise rather than download unverified.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _resolve_image_checksum
+
+        cfg = _proxmox_cfg(
+            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+        )
+
+        def fake_run(cmd, *args, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "SHA256SUMS" in joined and "curl" in joined and "-o" in cmd:
+                out = cmd[cmd.index("-o") + 1]
+                Path(out).write_text("aaaa *some-other-image.img\n")
+                return mocker.MagicMock(returncode=0, stdout="", stderr="")
+            if "--verify" in joined:
+                return mocker.MagicMock(
+                    returncode=0,
+                    stdout="[GNUPG:] VALIDSIG X 843938DF228D22F7B3742BC0D94AA3F0EFE21092\n",
+                    stderr="",
+                )
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+
+        mocker.patch("orcest.fleet.cli.subprocess.run", side_effect=fake_run)
+        mocker.patch("orcest.fleet.cli.tempfile.mkdtemp", return_value=str(tmp_path))
+
+        with pytest.raises(RuntimeError, match="noble-server-cloudimg-amd64.img"):
+            _resolve_image_checksum(
+                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+                cfg,
+                Console(),
+            )
 
 
 # ── rebake / destroy-template / gc-templates tests ──────────
@@ -1021,6 +1376,40 @@ def test_gc_templates_destroys_inactive_only(runner, cfg_path, mocker):
     # 9000 and 9002 destroyed; 9001 (active) preserved
     destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
     assert destroyed == {9000, 9002}
+
+
+def test_gc_templates_skips_template_that_becomes_active_mid_run(runner, cfg_path, mocker):
+    """M3-conc: a concurrent rebake can swap the active pointer to a VMID that
+    gc classified as a candidate. gc must re-read the pointer before each
+    destroy and never destroy the freshly-active template.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9002, "name": "orcest-worker-template", "template": True},
+    ]
+    # Initial read (used to compute candidates) -> 9001 active, so candidates
+    # are [9000, 9002]. Then a rebake swaps the pointer to 9002 before gc
+    # reaches it: the per-destroy re-reads return 9002.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        side_effect=[9001, 9002, 9002],
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
+    # 9000 destroyed; 9002 spared because it became the active template mid-run.
+    assert destroyed == {9000}
+    assert 9002 not in destroyed
 
 
 def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
@@ -1717,3 +2106,96 @@ class TestWaitForCloudInit:
 
         mocker.patch("orcest.fleet.cli.time.monotonic", new=fake_monotonic)
         assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=10) is False
+
+    def test_hard_fails_when_status_not_done(self, mocker):
+        """H1-infra: boot-finished present but `cloud-init status` != done must
+        HARD-FAIL (return False) so the caller aborts before the pointer swap.
+
+        Old code printed a yellow warning and returned True, letting a
+        half-baked template (e.g. a failed provider-CLI install in runcmd,
+        which has no cross-entry `set -e`) flip
+        orcest:pool:current_template_vmid.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        # boot-finished marker exists (returncode 0), but status reports error.
+        boot_finished = mocker.MagicMock(returncode=0)
+        status_error = mocker.MagicMock(
+            returncode=1, stdout="status: error", stderr=""
+        )
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[boot_finished, status_error],
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert (
+            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60)
+            is False
+        )
+
+    def test_transient_status_read_is_retried_not_aborted(self, mocker):
+        """H1-infra (repair 2): a single flaky SSH read of `cloud-init status`
+        AFTER boot-finished must NOT abort a good bake. Round 1 returned False
+        when the status read timed out / was unreadable. The read must be
+        retried a few times; if a later attempt reports `status: done`, the
+        bake succeeds.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        boot_finished = mocker.MagicMock(returncode=0)
+        # First status read times out (transient SSH blip), second succeeds.
+        status_done = mocker.MagicMock(returncode=0, stdout="status: done", stderr="")
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[
+                boot_finished,
+                subprocess.TimeoutExpired(cmd="ssh", timeout=15),
+                status_done,
+            ],
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is True
+
+    def test_definitive_error_status_hard_fails_without_retry_loop(self, mocker):
+        """H1-infra (repair 2): a DEFINITIVE non-done status (error/degraded)
+        must hard-fail -- the retry budget is only for transient read failures,
+        not for a genuine bad status. One `status: error` read => return False.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        boot_finished = mocker.MagicMock(returncode=0)
+        status_error = mocker.MagicMock(returncode=1, stdout="status: error", stderr="")
+        run = mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[boot_finished, status_error],
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is False
+        # boot-finished check + exactly one status read: a definitive error is
+        # not retried (only transient read failures are).
+        assert run.call_count == 2
+
+    def test_all_status_reads_transient_eventually_fails(self, mocker):
+        """H1-infra (repair 2): if EVERY status read is transiently unreadable
+        (never a definitive status, never `done`), the bake must still fail
+        closed after exhausting the retry budget -- a half-baked template must
+        never be accepted just because its status was never readable.
+        """
+        from rich.console import Console
+
+        from orcest.fleet.cli import _wait_for_cloud_init
+
+        boot_finished = mocker.MagicMock(returncode=0)
+        mocker.patch(
+            "orcest.fleet.cli.subprocess.run",
+            side_effect=[boot_finished]
+            + [subprocess.TimeoutExpired(cmd="ssh", timeout=15)] * 20,
+        )
+        mocker.patch("orcest.fleet.cli.time.sleep")
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is False

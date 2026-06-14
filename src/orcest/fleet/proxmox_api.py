@@ -457,6 +457,8 @@ class ProxmoxClient:
         storage: str = "local",
         content_type: str = "iso",
         timeout: int = 600,
+        checksum: str = "",
+        checksum_algorithm: str = "",
     ) -> str:
         """Download a file from a URL to Proxmox storage.
 
@@ -469,20 +471,38 @@ class ProxmoxClient:
             storage: Proxmox storage name (default ``"local"``).
             content_type: Storage content type (default ``"iso"``).
             timeout: Seconds to wait for the download task to complete.
+            checksum: Expected digest of the downloaded file. When set,
+                Proxmox verifies it node-side and fails the task on mismatch.
+            checksum_algorithm: Digest algorithm for ``checksum`` (e.g.
+                ``"sha256"``). Required by Proxmox whenever ``checksum`` is set.
 
         Returns:
             The Proxmox task UPID string.
         """
         logger.info("Downloading %s -> %s:%s/%s", url, storage, content_type, filename)
-        upid = (
-            self._api.nodes(self._node)
-            .storage(storage)("download-url")
-            .post(
-                content=content_type,
-                filename=filename,
-                url=url,
+        params: dict[str, object] = {
+            "content": content_type,
+            "filename": filename,
+            "url": url,
+        }
+        # Proxmox requires both fields together. A LONE checksum or lone
+        # algorithm is a caller mis-wiring (e.g. a digest resolved but the
+        # algorithm dropped on the floor); silently skipping verification in
+        # that case would download the image UNVERIFIED while the caller
+        # believes it asked for verification. Fail loudly instead. Only the
+        # explicit no-checksum path (both empty) stays byte-for-byte unchanged.
+        if bool(checksum) != bool(checksum_algorithm):
+            raise ValueError(
+                "download_image: checksum and checksum_algorithm must be supplied"
+                " together (got"
+                f" checksum={'set' if checksum else 'empty'},"
+                f" checksum_algorithm={'set' if checksum_algorithm else 'empty'});"
+                " a lone value would silently download the image unverified."
             )
-        )
+        if checksum and checksum_algorithm:
+            params["checksum"] = checksum
+            params["checksum-algorithm"] = checksum_algorithm
+        upid = self._api.nodes(self._node).storage(storage)("download-url").post(**params)
         self.wait_for_task(upid, timeout=timeout)
         return upid
 
