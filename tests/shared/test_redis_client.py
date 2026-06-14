@@ -876,3 +876,71 @@ def test_scan_iter_no_matches(fake_redis_client):
     fake_redis_client.sadd("myset", "val")
     keys = fake_redis_client.scan_iter("nonexistent:*")
     assert keys == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for delconsumer_raw / xautoclaim_raw (H3-conc)
+# ---------------------------------------------------------------------------
+
+
+def test_delconsumer_raw_returns_pending_count_and_releases_entries(fake_redis_client):
+    """H3-conc: delconsumer_raw removes a consumer and reports its PEL size."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v1"})
+    rc.client.xadd(fq, {"k": "v2"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    # Dead consumer claims both, never ACKs.
+    rc.client.xreadgroup(
+        groupname="workers", consumername="orcest-worker-305", streams={fq: ">"}, count=10
+    )
+    consumers = {c["name"]: c for c in rc.client.xinfo_consumers(fq, "workers")}
+    assert consumers["orcest-worker-305"]["pending"] == 2
+
+    reclaimed = rc.delconsumer_raw(fq, "workers", "orcest-worker-305")
+
+    assert reclaimed == 2
+    names = [c["name"] for c in rc.client.xinfo_consumers(fq, "workers")]
+    assert "orcest-worker-305" not in names
+    # Entries are still in the group's global PEL (recoverable), not lost.
+    pel = rc.client.xpending(fq, "workers")
+    assert pel["pending"] == 2
+
+
+def test_delconsumer_raw_missing_group_returns_zero(fake_redis_client):
+    """delconsumer_raw on a nonexistent stream/group returns 0, no raise."""
+    rc = fake_redis_client
+    assert rc.delconsumer_raw(rc._prefixed("nope"), "workers", "orcest-worker-1") == 0
+
+
+def test_xautoclaim_raw_reclaims_idle_entries(fake_redis_client):
+    """xautoclaim_raw transfers idle PEL entries to a new consumer."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v1"})
+    rc.client.xadd(fq, {"k": "v2"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    rc.client.xreadgroup(groupname="workers", consumername="dead", streams={fq: ">"}, count=10)
+
+    cursor, claimed = rc.xautoclaim_raw(
+        fq, "workers", "pool-manager-sweeper", min_idle_ms=0, start_id="0-0", count=100
+    )
+
+    assert isinstance(cursor, str)
+    assert len(claimed) == 2
+    assert claimed[0][1]["k"] == "v1"
+    # Ownership moved to the sweeper consumer.
+    owners = {
+        p["consumer"] for p in rc.client.xpending_range(fq, "workers", min="-", max="+", count=10)
+    }
+    assert owners == {"pool-manager-sweeper"}
+
+
+def test_xautoclaim_raw_empty_pel_returns_empty(fake_redis_client):
+    """xautoclaim_raw on an empty PEL returns ('0-0', [])."""
+    rc = fake_redis_client
+    fq = rc._prefixed("tasks:claude")
+    rc.client.xadd(fq, {"k": "v"})
+    rc.client.xgroup_create(fq, "workers", id="0")
+    cursor, claimed = rc.xautoclaim_raw(fq, "workers", "sweeper", min_idle_ms=0)
+    assert claimed == []
