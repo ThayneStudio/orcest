@@ -485,8 +485,20 @@ class ProxmoxClient:
             "filename": filename,
             "url": url,
         }
-        # Proxmox requires both fields together; only pass them when a digest
-        # is supplied so the no-checksum path stays byte-for-byte unchanged.
+        # Proxmox requires both fields together. A LONE checksum or lone
+        # algorithm is a caller mis-wiring (e.g. a digest resolved but the
+        # algorithm dropped on the floor); silently skipping verification in
+        # that case would download the image UNVERIFIED while the caller
+        # believes it asked for verification. Fail loudly instead. Only the
+        # explicit no-checksum path (both empty) stays byte-for-byte unchanged.
+        if bool(checksum) != bool(checksum_algorithm):
+            raise ValueError(
+                "download_image: checksum and checksum_algorithm must be supplied"
+                " together (got"
+                f" checksum={'set' if checksum else 'empty'},"
+                f" checksum_algorithm={'set' if checksum_algorithm else 'empty'});"
+                " a lone value would silently download the image unverified."
+            )
         if checksum and checksum_algorithm:
             params["checksum"] = checksum
             params["checksum-algorithm"] = checksum_algorithm

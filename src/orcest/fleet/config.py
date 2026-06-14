@@ -116,6 +116,20 @@ class PoolConfig:
     worker_disk_size: int = 30  # GB
     max_task_duration: int = 3600  # seconds before force-kill
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
+    # Image-integrity verification for the template cloud image (M5-infra).
+    # By default the bake fetches the image's published ``SHA256SUMS`` +
+    # ``SHA256SUMS.gpg``, GPG-verifies them against ``expected_image_gpg_key``,
+    # extracts the sha256 for the pinned image filename, and passes it to the
+    # Proxmox download so the node verifies the bytes. Set
+    # ``expected_image_sha256`` to a 64-hex digest to PIN it instead (offline /
+    # air-gapped bakes) -- the digest is then used directly with no network
+    # GPG fetch. Either way verification is fail-closed: an unresolvable /
+    # unverifiable digest aborts the bake rather than downloading unverified.
+    expected_image_sha256: str = ""
+    # GPG signing-key fingerprint the SHA256SUMS signature must validate
+    # against. Defaults to Ubuntu's Cloud Image Builder key (the same key
+    # provision/create-vm.sh pins).
+    expected_image_gpg_key: str = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
 
     def template_range(self) -> tuple[int, int] | None:
         """Return ``(start, end)`` template VMID range, or ``None`` if not configured.
@@ -310,6 +324,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_disk_size=pl.get("worker_disk_size", 30),
         max_task_duration=pl.get("max_task_duration", 3600),
         snippet_storage=pl.get("snippet_storage", "local"),
+        expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
+        expected_image_gpg_key=str(
+            pl.get("expected_image_gpg_key", "")
+            or "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+        ),
     )
     # Surface VMID-range overlap at load time rather than at clone time:
     # an overlap means the pool manager will eventually destroy a
@@ -384,6 +403,8 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "worker_disk_size": config.pool.worker_disk_size,
             "max_task_duration": config.pool.max_task_duration,
             "snippet_storage": config.pool.snippet_storage,
+            "expected_image_sha256": config.pool.expected_image_sha256,
+            "expected_image_gpg_key": config.pool.expected_image_gpg_key,
         },
     }
 

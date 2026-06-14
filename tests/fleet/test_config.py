@@ -214,6 +214,35 @@ class TestConfigPersistence:
         loaded = load_config(path)
         assert loaded.proxmox.verify_ssl is False
 
+    def test_round_trip_image_verification_fields(self, tmp_path):
+        """M5-infra: the image-integrity knobs (expected_image_sha256 override
+        and the GPG signing key) must persist through save/load so an operator
+        can pin a digest for air-gapped/offline bakes.
+        """
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            pool=PoolConfig(
+                expected_image_sha256="a" * 64,
+                expected_image_gpg_key="DEADBEEF",
+            ),
+        )
+        save_config(original, path)
+        loaded = load_config(path)
+        assert loaded.pool.expected_image_sha256 == "a" * 64
+        assert loaded.pool.expected_image_gpg_key == "DEADBEEF"
+
+    def test_image_verification_defaults(self, tmp_path):
+        """M5-infra: with no overrides, expected_image_sha256 is empty (use the
+        runtime GPG-fetched SHA256SUMS) and the GPG key defaults to Ubuntu's
+        Cloud Image signing key fingerprint.
+        """
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        loaded = load_config(path)
+        assert loaded.pool.expected_image_sha256 == ""
+        # Default = Ubuntu Cloud Image Builder signing key (see provision/create-vm.sh).
+        assert loaded.pool.expected_image_gpg_key == "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+
     def test_load_legacy_config_without_pool(self, tmp_path):
         """Old configs without pool section get correct defaults."""
         path = tmp_path / "config.yaml"
