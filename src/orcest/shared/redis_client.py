@@ -525,6 +525,52 @@ class RedisClient:
         result: int = self._client.xtrim(self._prefixed(stream), minid=minid)  # type: ignore[assignment]
         return result
 
+    def xtrim_acked_entries(self, stream: str, group: str) -> int:
+        """Reclaim delivered+ACKed entries from *stream* for consumer *group*.
+
+        Trims via XTRIM MINID using the group's LOWEST still-pending entry id
+        (so the un-ACKed PEL entry -- and everything appended after it -- is
+        preserved). When nothing is pending, falls back to the group's
+        last-delivered-id, which still never removes undelivered (lag) entries
+        because their ids are strictly greater than last-delivered-id. Returns
+        the number of entries removed (0 if the stream/group is missing, empty,
+        or there is nothing safe to trim).
+        """
+        try:
+            summary = self._client.xpending(self._prefixed(stream), group)
+        except redis.ResponseError:
+            # Real Redis: NOGROUP when the stream or group does not exist.
+            return 0
+        except (IndexError, KeyError):
+            # fakeredis returns a malformed/empty summary for a missing
+            # stream+group that redis-py's parser chokes on (IndexError);
+            # treat the same as "nothing to trim".
+            return 0
+        minid: str | None = None
+        # redis-py returns a dict for the XPENDING summary form.
+        if isinstance(summary, dict) and summary.get("pending"):
+            minid = summary.get("min")
+        if not minid or minid == "0-0":
+            # PEL empty (or only sentinel): everything delivered is ACKed, so it
+            # is safe to trim up to last-delivered-id. Undelivered entries have
+            # larger ids and are untouched by MINID.
+            try:
+                groups = self._client.xinfo_groups(self._prefixed(stream))
+            except redis.ResponseError:
+                return 0
+            if not isinstance(groups, list):
+                return 0
+            last_delivered = None
+            for g in groups:
+                if g.get("name") == group:
+                    last_delivered = g.get("last-delivered-id")
+                    break
+            if not last_delivered or last_delivered == "0-0":
+                return 0
+            minid = last_delivered
+        result: int = self._client.xtrim(self._prefixed(stream), minid=minid)  # type: ignore[assignment]
+        return result
+
     def xinfo_groups(self, stream: str) -> list[dict[str, Any]]:
         """XINFO GROUPS stream."""
         result: list[dict[str, Any]] = self._client.xinfo_groups(self._prefixed(stream))  # type: ignore[assignment]

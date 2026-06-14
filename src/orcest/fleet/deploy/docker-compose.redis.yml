@@ -10,10 +10,15 @@ services:
       - "0.0.0.0:6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    # AUTH required. ORCEST_REDIS_PASSWORD is supplied via the compose --env-file
+    # / process env on the orchestrator VM. 0.0.0.0 bind retained intentionally
+    # (multi-VM fleet: worker VMs reach Redis over the private subnet); the bind
+    # is no longer unauthenticated.
+    command: redis-server --requirepass ${ORCEST_REDIS_PASSWORD} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # $$ escapes Compose interpolation so the var is read inside the container.
+      test: ["CMD-SHELL", "redis-cli -a $${ORCEST_REDIS_PASSWORD} --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 3

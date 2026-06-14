@@ -14,6 +14,20 @@ import yaml
 
 # ── Shared building blocks ──────────────────────────────────
 
+
+def _validate_env_value(value: str, name: str) -> None:
+    """Raise ValueError if *value* is unsafe to single-quote in an .env file.
+
+    Parity with ``orchestrator.generate_env_file._validate_env_value`` (C1):
+    the worker .env writes ``NAME='<value>'``, so a single quote breaks quoting,
+    and a newline / carriage return / null byte could smuggle an extra line
+    (e.g. inject another env var) into the file.
+    """
+    if any(c in value for c in ("\n", "\r", "\0")):
+        raise ValueError(f"{name} must not contain newlines or null bytes")
+    if "'" in value:
+        raise ValueError(f"{name} must not contain single quotes")
+
 _BASE_PACKAGES: list[str] = [
     "qemu-guest-agent",
     "curl",
@@ -403,6 +417,7 @@ def render_clone_userdata(
     redis_host: str,
     worker_id: str,
     key_prefix: str = "orcest",
+    redis_password: str = "",
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
 
@@ -414,6 +429,11 @@ def render_clone_userdata(
         redis_host: Redis host (orchestrator VM IP).
         worker_id: Unique worker identifier (e.g. ``orcest-worker-10002``).
         key_prefix: Redis key prefix (shared across all projects).
+        redis_password: Redis AUTH password. When set, written to
+            ``/opt/orcest/.env`` (0600) so the worker can authenticate to the
+            password-protected Redis. ``build_redis_config`` reads it from the
+            env var ONLY (never worker.yaml), and the systemd unit loads
+            ``/opt/orcest/.env`` via ``EnvironmentFile=-``.
     """
     redis_section: dict = {"host": redis_host, "port": 6379, "key_prefix": key_prefix}
     worker_yaml = yaml.dump(
@@ -429,32 +449,50 @@ def render_clone_userdata(
 
     systemd_unit = _systemd_unit(worker_id=worker_id)
 
-    cloud_config = {
-        "hostname": worker_id,
-        "write_files": [
+    clone_write_files: list[dict[str, Any]] = [
+        {
+            # ``defer`` ensures the orcest user exists before the file
+            # is chowned to it (cc_write_files otherwise runs in the
+            # config stage, before cc_users_groups).
+            "path": "/opt/orcest/worker.yaml",
+            "owner": "orcest:orcest",
+            "permissions": "0600",
+            "content": worker_yaml,
+            "defer": True,
+        },
+        {
+            "path": "/etc/systemd/system/orcest-worker.service",
+            "permissions": "0644",
+            "content": systemd_unit,
+        },
+        {
+            "path": "/home/orcest/.claude.json",
+            "owner": "orcest:orcest",
+            "permissions": "0644",
+            "content": '{"hasCompletedOnboarding": true}',
+            "defer": True,
+        },
+    ]
+    if redis_password:
+        # C1: Redis AUTH for the worker. build_redis_config reads
+        # ORCEST_REDIS_PASSWORD from the env ONLY (never worker.yaml), and the
+        # systemd unit loads /opt/orcest/.env via EnvironmentFile=-. 0600 +
+        # orcest-owned + defer. Single-quoted + validated (parity with
+        # generate_env_file) so a newline/hash/quote can't corrupt the .env.
+        _validate_env_value(redis_password, "redis_password")
+        clone_write_files.append(
             {
-                # ``defer`` ensures the orcest user exists before the file
-                # is chowned to it (cc_write_files otherwise runs in the
-                # config stage, before cc_users_groups).
-                "path": "/opt/orcest/worker.yaml",
+                "path": "/opt/orcest/.env",
                 "owner": "orcest:orcest",
                 "permissions": "0600",
-                "content": worker_yaml,
+                "content": f"ORCEST_REDIS_PASSWORD='{redis_password}'\n",
                 "defer": True,
-            },
-            {
-                "path": "/etc/systemd/system/orcest-worker.service",
-                "permissions": "0644",
-                "content": systemd_unit,
-            },
-            {
-                "path": "/home/orcest/.claude.json",
-                "owner": "orcest:orcest",
-                "permissions": "0644",
-                "content": '{"hasCompletedOnboarding": true}',
-                "defer": True,
-            },
-        ],
+            }
+        )
+
+    cloud_config = {
+        "hostname": worker_id,
+        "write_files": clone_write_files,
         "runcmd": [
             # Reinstall orcest from latest commit before starting the worker.
             # The template may have an older version baked in. --force-reinstall
@@ -479,6 +517,7 @@ def render_worker_userdata(
     github_token: str,
     claude_oauth_token: str,
     repo: str,
+    redis_password: str = "",
 ) -> str:
     """Render a cloud-init user-data YAML for a worker VM.
 
@@ -523,6 +562,13 @@ def render_worker_userdata(
         f"GH_TOKEN={github_token}\n"
         f"CLAUDE_CODE_OAUTH_TOKEN={claude_oauth_token}\n"
     )
+    if redis_password:
+        # C1: Redis AUTH. Read from the env only (build_redis_config ignores
+        # worker.yaml redis.password); the systemd unit loads this .env.
+        # Single-quoted + validated (parity with generate_env_file) so a
+        # newline/hash/quote in the password can't corrupt the .env.
+        _validate_env_value(redis_password, "redis_password")
+        env_content += f"ORCEST_REDIS_PASSWORD='{redis_password}'\n"
 
     systemd_unit = _systemd_unit(worker_id=worker_id)
 

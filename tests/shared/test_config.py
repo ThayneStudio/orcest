@@ -181,6 +181,22 @@ def test_load_worker_config_env_overrides(
     assert config.workspace_dir == "/env/path"
 
 
+def test_worker_config_reads_redis_password_from_env(monkeypatch, tmp_path: Path):
+    """C1: a worker's RedisConfig.password comes from ORCEST_REDIS_PASSWORD in the
+    environment (the .env the systemd unit loads), NOT from worker.yaml. Guards
+    the trap where a yaml-only password would be silently dropped."""
+    for var in ("ORCEST_REDIS_HOST", "ORCEST_REDIS_PORT", "ORCEST_REDIS_KEY_PREFIX"):
+        monkeypatch.delenv(var, raising=False)
+    cfg_file = tmp_path / "worker.yaml"
+    # yaml carries a DIFFERENT password to prove the env wins and yaml is ignored.
+    cfg_file.write_text(
+        "worker_id: w-1\nredis:\n  host: 10.0.0.9\n  password: yaml-password-MUST-be-ignored\n"
+    )
+    monkeypatch.setenv("ORCEST_REDIS_PASSWORD", "env-only-pw")
+    cfg = load_worker_config(cfg_file)
+    assert cfg.redis.password == "env-only-pw"
+
+
 def test_load_orchestrator_config_invalid_yaml(tmp_path: Path):
     cfg_file = tmp_path / "bad.yaml"
     cfg_file.write_text("[ invalid")
