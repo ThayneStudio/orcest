@@ -14,6 +14,14 @@ services:
     # / process env on the orchestrator VM. 0.0.0.0 bind retained intentionally
     # (multi-VM fleet: worker VMs reach Redis over the private subnet); the bind
     # is no longer unauthenticated.
+    environment:
+      # --env-file only interpolates ${VAR} into the command above; it does NOT
+      # put the var into the container's runtime env. The healthcheck (below)
+      # and `docker exec ... redis-cli -a "$ORCEST_REDIS_PASSWORD"` (the fleet's
+      # _REDIS_CLI_PREFIX) read it INSIDE the container, so it must be here too,
+      # else the healthcheck auths with an empty password -> container reports
+      # "unhealthy" and fleet redis-cli ops fail WRONGPASS.
+      - ORCEST_REDIS_PASSWORD=${ORCEST_REDIS_PASSWORD}
     command: redis-server --requirepass ${ORCEST_REDIS_PASSWORD} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
     restart: unless-stopped
     healthcheck:
