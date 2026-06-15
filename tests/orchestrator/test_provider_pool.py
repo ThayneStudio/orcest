@@ -436,8 +436,8 @@ def test_apply_credential_update_overrides_published_credential():
     pool = ProviderPool([entry])
     pool.register_task("t1", entry)
 
-    ident = pool.apply_credential_update("t1", "rotated-blob", minted_at=100.0)
-    assert ident == entry.identity()
+    account = pool.apply_credential_update("t1", "rotated-blob", minted_at=100.0)
+    assert account == entry.account_key()
     # Published credential now reflects the rotated blob...
     assert pool.effective_credential(entry) == "rotated-blob"
     # ...but the entry identity (pool anchor) is unchanged.
@@ -448,7 +448,7 @@ def test_apply_credential_update_ignores_stale_minted_at():
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])
     pool.register_task("t1", entry)
-    assert pool.apply_credential_update("t1", "newer", minted_at=200.0) == entry.identity()
+    assert pool.apply_credential_update("t1", "newer", minted_at=200.0) == entry.account_key()
     # An older update must not clobber the newer blob.
     pool.register_task("t2", entry)
     assert pool.apply_credential_update("t2", "older", minted_at=150.0) is None
@@ -471,14 +471,35 @@ def test_apply_credential_update_empty_blob_is_noop():
 
 
 def test_seed_credential_override_restores_on_startup():
-    """A persisted override (loaded at startup) is applied to the matching entry."""
+    """A legacy identity override is converted to the matching account."""
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])
     pool.seed_credential_override(entry.identity(), "restored-blob", minted_at=50.0)
     assert pool.effective_credential(entry) == "restored-blob"
 
 
-def test_seed_credential_override_ignores_unknown_identity():
+def test_seed_credential_override_restores_account_key_on_startup():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.seed_credential_override(entry.account_key(), "restored-blob", minted_at=50.0)
+    assert pool.effective_credential(entry) == "restored-blob"
+
+
+def test_account_scoped_override_applies_to_model_variants():
+    opus = ProviderEntry(provider="grok", credential="orig", model="opus")
+    sonnet = ProviderEntry(provider="grok", credential="orig", model="sonnet")
+    pool = ProviderPool([opus, sonnet])
+    pool.register_task("t1", opus)
+
+    assert pool.apply_credential_update("t1", "rotated-blob", minted_at=100.0) == (
+        opus.account_key()
+    )
+
+    assert pool.effective_credential(opus) == "rotated-blob"
+    assert pool.effective_credential(sonnet) == "rotated-blob"
+
+
+def test_seed_credential_override_ignores_unknown_key():
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])
     pool.seed_credential_override("identity-from-removed-config", "x", minted_at=1.0)

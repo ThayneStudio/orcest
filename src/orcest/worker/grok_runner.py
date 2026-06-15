@@ -49,6 +49,11 @@ _GROK_OVERLOAD_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GROK_AUTH_PROMPT_RE = re.compile(
+    r"(signing in with grok|open this url to sign in|auth\.x\.ai/oauth2/authorize)",
+    re.IGNORECASE,
+)
+
 
 def _iter_events(stdout: str) -> Iterator[dict]:
     """Yield parsed JSON event dicts from grok streaming-json stdout."""
@@ -124,6 +129,12 @@ class GrokRunner(_BaseCliRunner):
 
     def detect_overload(self, stdout: str, stderr: str) -> bool:
         return bool(_GROK_OVERLOAD_RE.search(_grok_error_text(stdout, stderr)))
+
+    def detect_auth_prompt(self, text: str) -> bool:
+        return bool(_GROK_AUTH_PROMPT_RE.search(text))
+
+    def auth_required_summary(self) -> str:
+        return "Grok authentication required: CLI requested browser sign-in"
 
     # --- credential hooks (Path B: OAuth blob) ----------------------------
 

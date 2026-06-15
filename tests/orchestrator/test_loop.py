@@ -50,6 +50,7 @@ from orcest.shared.coordination import (
     set_pending_task,
 )
 from orcest.shared.models import CONSUMER_GROUP, ResultStatus, TaskResult
+from orcest.shared.redis_client import RedisClient
 
 
 def _consume_results(config: OrchestratorConfig, redis, logger):
@@ -3524,12 +3525,13 @@ def test_full_multi_provider_flow_exhaust_one_continue_on_other(
 
 
 def test_credential_override_persist_and_load_round_trip(fake_redis_client):
-    """A rotated blob persisted to Redis is restored into a fresh pool at
-    startup (simulating an orchestrator restart) — not reverting to the
+    """A rotated blob persisted to shared Redis is restored into a fresh pool
+    at startup (simulating an orchestrator restart) — not reverting to the
     stale config blob."""
     import logging
 
     from orcest.orchestrator.loop import (
+        _SHARED_CREDENTIAL_OVERRIDES_KEY,
         _load_credential_overrides,
         _persist_credential_override,
     )
@@ -3538,17 +3540,44 @@ def test_credential_override_persist_and_load_round_trip(fake_redis_client):
 
     logger = logging.getLogger("test")
     entry = ProviderEntry(provider="grok", credential="config-blob")
-    ident = entry.identity()
+    account = entry.account_key()
+    shared_redis = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
 
     # Worker reported a rotated blob; orchestrator persisted it.
-    _persist_credential_override(fake_redis_client, ident, "rotated-blob", 123.0, logger)
+    _persist_credential_override(
+        fake_redis_client,
+        account,
+        "rotated-blob",
+        123.0,
+        logger,
+        shared_redis=shared_redis,
+    )
+    assert shared_redis.hgetall(_SHARED_CREDENTIAL_OVERRIDES_KEY)
 
     # Fresh pool from the SAME config (restart) starts with the config blob...
     pool = ProviderPool([entry])
     assert pool.effective_credential(entry) == "config-blob"
     # ...then load from Redis restores the rotated blob.
-    _load_credential_overrides(fake_redis_client, pool, logger)
+    _load_credential_overrides(fake_redis_client, pool, logger, shared_redis=shared_redis)
     assert pool.effective_credential(entry) == "rotated-blob"
+
+
+def test_credential_override_loads_legacy_project_identity(fake_redis_client):
+    import logging
+
+    from orcest.orchestrator.loop import _CREDENTIAL_OVERRIDES_KEY, _load_credential_overrides
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    fake_redis_client.hset(
+        _CREDENTIAL_OVERRIDES_KEY,
+        entry.identity(),
+        json.dumps({"blob": "legacy-rotated-blob", "minted_at": 123.0}),
+    )
+    pool = ProviderPool([entry])
+    _load_credential_overrides(fake_redis_client, pool, logging.getLogger("test"))
+    assert pool.effective_credential(entry) == "legacy-rotated-blob"
 
 
 def test_credential_override_load_ignores_corrupt_entries(fake_redis_client):

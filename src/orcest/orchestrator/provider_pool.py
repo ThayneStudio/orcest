@@ -76,10 +76,11 @@ class ProviderPool:
             e.identity(): e.account_key() for e in entries
         }
         # Credential write-back overrides (OAuth-blob providers like Grok/Codex).
-        # identity -> (latest_blob, minted_at). The identity is the STABLE anchor
-        # (hash of the original config credential); the blob is the rotated token
-        # the CLI refreshed in place. effective_credential() consults this so
-        # publishes use the latest blob without changing the entry's identity.
+        # account_key -> (latest_blob, minted_at). OAuth refresh tokens are
+        # account-scoped, not model/project scoped, so the override must follow
+        # the provider account rather than a model-inclusive identity().
+        # effective_credential() consults this so publishes use the latest blob
+        # without changing the entry's stable identity.
         # Persistence to Redis lives in the orchestrator, not here (this class
         # stays Redis-free per the pool boundary).
         self._credential_overrides: dict[str, tuple[str, float]] = {}
@@ -267,15 +268,15 @@ class ProviderPool:
         the original config credential; only the published value differs.
         """
         with self._lock:
-            override = self._credential_overrides.get(entry.identity())
+            override = self._credential_overrides.get(entry.account_key())
             return override[0] if override else entry.credential
 
     def apply_credential_update(self, task_id: str, blob: str, minted_at: float) -> str | None:
         """Record a rotated credential blob reported for *task_id*.
 
-        Keyed by the task's entry identity (the stable config anchor).
+        Keyed by the task's provider account (provider + credential hash).
         Last-write-wins by ``minted_at`` (a stale, out-of-order update is
-        ignored). Returns the identity if stored (so the caller can persist to
+        ignored). Returns the account key if stored (so the caller can persist to
         Redis), else None (no mapping for the task, empty blob, or stale).
         """
         if not blob:
@@ -284,24 +285,37 @@ class ProviderPool:
             ident = self._task_identities.get(task_id)
             if ident is None or ident not in self._identity_to_entry:
                 return None
-            existing = self._credential_overrides.get(ident)
+            account = self._identity_to_account.get(ident)
+            if account is None:
+                return None
+            existing = self._credential_overrides.get(account)
             if existing is not None and existing[1] >= minted_at:
                 return None  # stale / duplicate
-            self._credential_overrides[ident] = (blob, minted_at)
-            return ident
+            self._credential_overrides[account] = (blob, minted_at)
+            return account
 
-    def seed_credential_override(self, identity: str, blob: str, minted_at: float) -> None:
-        """Load a persisted credential override at startup (keyed by identity).
-        No-op if the identity isn't in this pool (config changed) or the blob is
-        empty. Last-write-wins by ``minted_at``.
+    def seed_credential_override(self, key: str, blob: str, minted_at: float) -> None:
+        """Load a persisted credential override at startup.
+
+        ``key`` may be the current account key (``provider:<credential-hash>``)
+        or a legacy model-inclusive identity. Legacy keys are converted to the
+        corresponding account key so existing persisted overrides continue to
+        work after the account-scoped migration.
         """
-        if not blob or identity not in self._identity_to_entry:
+        if not blob:
+            return
+        if key in self._identity_to_entry:
+            account = self._identity_to_account.get(key)
+        else:
+            account_keys = set(self._identity_to_account.values())
+            account = key if key in account_keys else None
+        if account is None:
             return
         with self._lock:
-            existing = self._credential_overrides.get(identity)
+            existing = self._credential_overrides.get(account)
             if existing is not None and existing[1] >= minted_at:
                 return
-            self._credential_overrides[identity] = (blob, minted_at)
+            self._credential_overrides[account] = (blob, minted_at)
 
     # ------------------------------------------------------------------
     # Legacy shims (so claude_tokens call sites continue to work after swap-in)
