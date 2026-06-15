@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from typing import Any
 
 import yaml
 
@@ -84,9 +85,13 @@ _GROK_VERSION = "0.1.216"
 # code edit:
 #   curl -fsSL https://x.ai/cli/install.sh | sha256sum
 #   export ORCEST_GROK_INSTALLER_SHA256=<that digest>
-# xAI publishes no checksum for the beta installer yet, and the digest can
-# drift between fetches, so this stays empty (grok off) by default.
-_GROK_INSTALLER_SHA256 = ""
+# NOTE: this digest is of the BOOTSTRAP SCRIPT, not the grok binary. install.sh
+# is a stable bootstrap that resolves + downloads the latest stable grok at run
+# time, so pinning it does NOT freeze grok at a version -- daily grok releases
+# still flow. Re-pin only when xAI changes install.sh itself (then the bake
+# fail-closes with a clear "SHA mismatch" instead of running an unexpected
+# script). Verified against the live installer on 2026-06-15.
+_GROK_INSTALLER_SHA256 = "2019f38002a2beab27f65b928db5d33d2bbe8c2828e4e41081ac23ec33b7a658"
 
 # OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
 # template rebakes are reproducible; the experimental JSON event vocabulary
