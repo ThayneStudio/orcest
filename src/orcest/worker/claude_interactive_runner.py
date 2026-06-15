@@ -136,6 +136,16 @@ class ClaudeInteractiveRunner:
             and "entertoconfirm" in normalized
         )
 
+    def _looks_like_bypass_permissions_prompt(self, text: str) -> bool:
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
+        normalized = re.sub(r"\s+", "", stripped).lower()
+        return (
+            "bypasspermissionsmode" in normalized
+            and "no,exit" in normalized
+            and "yes,iaccept" in normalized
+            and "entertoconfirm" in normalized
+        )
+
     def _confirm_workspace_trust_if_needed(
         self,
         master_fd: int,
@@ -151,6 +161,24 @@ class ClaudeInteractiveRunner:
         os.write(master_fd, b"\r")
         if logger:
             logger.info("Confirmed Claude workspace trust prompt")
+        return True
+
+    def _confirm_bypass_permissions_if_needed(
+        self,
+        master_fd: int,
+        terminal_output: list[str],
+        already_confirmed: bool,
+        logger: logging.Logger | None,
+    ) -> bool:
+        if already_confirmed:
+            return True
+        recent_output = "".join(terminal_output[-8:])
+        if not self._looks_like_bypass_permissions_prompt(recent_output):
+            return False
+        # The warning defaults to "No, exit"; move to "Yes, I accept" first.
+        os.write(master_fd, b"\x1b[B\r")
+        if logger:
+            logger.info("Confirmed Claude bypass-permissions prompt")
         return True
 
     def _result_from_summary(self, summary: str) -> RunnerResult:
@@ -227,6 +255,7 @@ class ClaudeInteractiveRunner:
                         self.max_retries,
                     )
                 workspace_trust_confirmed = False
+                bypass_permissions_confirmed = False
                 self._drain_startup_output(
                     master_fd,
                     proc,
@@ -238,6 +267,12 @@ class ClaudeInteractiveRunner:
                     master_fd,
                     terminal_output,
                     workspace_trust_confirmed,
+                    logger,
+                )
+                bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
+                    master_fd,
+                    terminal_output,
+                    bypass_permissions_confirmed,
                     logger,
                 )
 
@@ -285,6 +320,12 @@ class ClaudeInteractiveRunner:
                         master_fd,
                         terminal_output,
                         workspace_trust_confirmed,
+                        logger,
+                    )
+                    bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
+                        master_fd,
+                        terminal_output,
+                        bypass_permissions_confirmed,
                         logger,
                     )
 
