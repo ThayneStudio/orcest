@@ -321,8 +321,22 @@ def _run_cli_agent(
             except (BrokenPipeError, OSError):
                 pass
 
+        auth_required = threading.Event()
+
+        def _handle_stderr(line: str) -> None:
+            if on_stderr is not None:
+                try:
+                    on_stderr(line)
+                except Exception:
+                    pass
+            if runner.detect_auth_prompt(line):
+                auth_required.set()
+                if logger:
+                    logger.warning("%s requested interactive authentication", binary)
+                _kill_process_tree(proc)
+
         try:
-            stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=on_stderr)
+            stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=_handle_stderr)
         except RuntimeError:
             _kill_process_tree(proc)
             _close_pipes(proc)
@@ -435,6 +449,14 @@ def _run_cli_agent(
 
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_lines)
+
+        if auth_required.is_set():
+            return _finish(
+                RunnerResult(
+                    success=False,
+                    summary=runner.auth_required_summary(),
+                )
+            )
 
         # Exhaustion / overload first (some CLIs exit 0 with an error envelope).
         exhausted, resets_at = runner.detect_exhaustion(stdout, stderr)
@@ -554,6 +576,14 @@ class _BaseCliRunner(ABC):
     @abstractmethod
     def detect_overload(self, stdout: str, stderr: str) -> bool:
         """Transient 5xx / overload — orchestrator retries with backoff."""
+
+    def detect_auth_prompt(self, text: str) -> bool:
+        """Return True when a CLI requested interactive browser authentication."""
+        return False
+
+    def auth_required_summary(self) -> str:
+        """Summary used when ``detect_auth_prompt`` aborts the subprocess."""
+        return "Provider authentication required"
 
     # --- Credential hooks (default: env-var injection) ---------------------
 

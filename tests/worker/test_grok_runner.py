@@ -5,6 +5,8 @@ captured from a live grok 0.1.216 run."""
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -89,6 +91,49 @@ def test_extract_summary_empty_output() -> None:
 def test_extract_agent_text_equals_concatenated_text() -> None:
     out = _fixture("grok_simple_reply.jsonl")
     assert GrokRunner().extract_agent_text(out) == "hello from grok"
+
+
+@pytest.mark.unit
+def test_detect_auth_prompt_matches_browser_login_text() -> None:
+    runner = GrokRunner()
+    assert runner.detect_auth_prompt("Signing in with Grok...\n")
+    assert runner.detect_auth_prompt("Open this URL to sign in:\n")
+    assert runner.detect_auth_prompt("https://auth.x.ai/oauth2/authorize?state=x\n")
+    assert not runner.detect_auth_prompt("normal stderr\n")
+
+
+@pytest.mark.unit
+def test_run_aborts_quickly_on_browser_login_prompt(tmp_path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_grok = bin_dir / "grok"
+    fake_grok.write_text(
+        "#!/bin/sh\n"
+        "echo 'Signing in with Grok...' >&2\n"
+        "echo 'Open this URL to sign in:' >&2\n"
+        "echo 'https://auth.x.ai/oauth2/authorize?state=x' >&2\n"
+        "sleep 30\n"
+    )
+    fake_grok.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    start = time.monotonic()
+    result = GrokRunner(max_retries=1).run(
+        prompt="hello",
+        work_dir=tmp_path,
+        token="ghp_test",
+        timeout=30,
+        provider="grok",
+        credential=json.dumps({"key": "stale", "refresh_token": "stale-rt"}),
+        home_dir=home,
+    )
+
+    assert time.monotonic() - start < 5
+    assert result.success is False
+    assert result.transient is False
+    assert result.summary == "Grok authentication required: CLI requested browser sign-in"
 
 
 # ---------------------------------------------------------------------------

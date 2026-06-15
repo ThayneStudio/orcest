@@ -452,6 +452,16 @@ class RedisClient:
         result: int = self._client.hset(self._prefixed(key), field, value)  # type: ignore[assignment]
         return result
 
+    def hgetall_raw(self, fq_key: str) -> dict[str, str]:
+        """HGETALL on a fully-qualified key name."""
+        result: dict[str, str] = self._client.hgetall(fq_key)  # type: ignore[assignment]
+        return result
+
+    def hset_raw(self, fq_key: str, field: str, value: str) -> int:
+        """HSET on a fully-qualified key name."""
+        result: int = self._client.hset(fq_key, field, value)  # type: ignore[assignment]
+        return result
+
     # ------------------------------------------------------------------
     # Set operations (auto-prefix)
     # ------------------------------------------------------------------

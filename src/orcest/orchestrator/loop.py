@@ -82,12 +82,12 @@ _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
-# Credential write-back: rotated OAuth blobs (Grok/Codex) keyed by the stable
-# provider identity. A Redis hash (field=identity -> {"blob","minted_at"}),
-# project-scoped via key_prefix. No TTL — the latest blob persists so a
-# refreshed token survives an orchestrator restart instead of reverting to
-# the stale config blob.
+# Credential write-back: rotated OAuth blobs (Grok/Codex) keyed by provider
+# account. The canonical store is shared under the task key prefix so all
+# project orchestrators that share the same OAuth account see the newest blob.
+# Legacy project-prefixed identity fields are still read/written for rollback.
 _CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
+_SHARED_CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
 
 # Round-robin pointer over projects deciding which single project bypasses the
 # shared issue-stream backpressure gate each poll cycle (M5 fairness). The
@@ -96,39 +96,78 @@ _CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
 _ISSUE_DISCOVERY_CYCLE_SEQ_KEY = "issue_discovery:cycle_seq"
 
 
+def _legacy_credential_override_key(key: str) -> str:
+    """Return the legacy identity-shaped field for an account key."""
+    parts = key.split(":")
+    if len(parts) == 2:
+        provider, credential_hash = parts
+        return f"{provider}::{credential_hash}"
+    return key
+
+
 def _persist_credential_override(
-    redis: RedisClient, identity: str, blob: str, minted_at: float, logger: logging.Logger
+    redis: RedisClient,
+    key: str,
+    blob: str,
+    minted_at: float,
+    logger: logging.Logger,
+    shared_redis: RedisClient | None = None,
 ) -> None:
-    """Persist a rotated credential blob (keyed by provider identity)."""
+    """Persist a rotated credential blob.
+
+    ``key`` is the account key returned by ProviderPool. The shared store uses
+    that account key directly; the project-prefixed legacy store uses the old
+    identity-shaped field for rollback compatibility.
+    """
+    payload = json.dumps({"blob": blob, "minted_at": minted_at})
+    if shared_redis is not None:
+        try:
+            shared_redis.hset(_SHARED_CREDENTIAL_OVERRIDES_KEY, key, payload)
+        except Exception:
+            logger.warning(
+                "Failed to persist shared credential override for account %s",
+                key,
+                exc_info=True,
+            )
     try:
         redis.hset(
             _CREDENTIAL_OVERRIDES_KEY,
-            identity,
-            json.dumps({"blob": blob, "minted_at": minted_at}),
+            _legacy_credential_override_key(key),
+            payload,
         )
     except Exception:
         logger.warning(
-            "Failed to persist credential override for identity %s", identity, exc_info=True
+            "Failed to persist credential override for account %s", key, exc_info=True
         )
 
 
 def _load_credential_overrides(
-    redis: RedisClient, pool: "ProviderPool", logger: logging.Logger
+    redis: RedisClient,
+    pool: "ProviderPool",
+    logger: logging.Logger,
+    shared_redis: RedisClient | None = None,
 ) -> None:
     """Seed a pool's credential overrides from Redis at startup."""
+    stores: list[tuple[str, RedisClient, str]] = []
+    if shared_redis is not None:
+        stores.append(("shared", shared_redis, _SHARED_CREDENTIAL_OVERRIDES_KEY))
+    stores.append(("project", redis, _CREDENTIAL_OVERRIDES_KEY))
     try:
-        stored = redis.hgetall(_CREDENTIAL_OVERRIDES_KEY)
+        stored_by_scope = [
+            (scope, client.hgetall(key)) for scope, client, key in stores
+        ]
     except Exception:
         logger.warning("Failed to load credential overrides", exc_info=True)
         return
-    for identity, raw in stored.items():
-        try:
-            obj = json.loads(raw)
-            pool.seed_credential_override(
-                identity, str(obj.get("blob", "")), float(obj.get("minted_at", 0))
-            )
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
+    for _scope, stored in stored_by_scope:
+        for key, raw in stored.items():
+            try:
+                obj = json.loads(raw)
+                pool.seed_credential_override(
+                    key, str(obj.get("blob", "")), float(obj.get("minted_at", 0))
+                )
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
 
 
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
@@ -712,7 +751,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     for project, project_redis in project_clients:
         pool = token_pools.get(project.key_prefix)
         if pool is not None:
-            _load_credential_overrides(project_redis, pool, logger)
+            _load_credential_overrides(project_redis, pool, logger, shared_redis=task_redis)
 
     # Graceful shutdown
     shutdown = False
@@ -812,6 +851,7 @@ def _poll_cycle(
                 logger,
                 token_pool=pool,
                 max_transient_failures=config.max_transient_failures,
+                shared_credential_redis=task_redis,
             )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
@@ -1796,6 +1836,7 @@ def _consume_results_for_project(
     logger: logging.Logger,
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
+    shared_credential_redis: RedisClient | None = None,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -1830,6 +1871,7 @@ def _consume_results_for_project(
                     logger,
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
+                    shared_credential_redis=shared_credential_redis,
                 )
                 logger.info(f"Recovered pending result {entry_id}")
             except Exception as e:
@@ -1869,6 +1911,7 @@ def _consume_results_for_project(
                     logger,
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
+                    shared_credential_redis=shared_credential_redis,
                 )
             except Exception as e:
                 logger.error(
@@ -1898,6 +1941,7 @@ def _handle_result(
     logger: logging.Logger,
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
+    shared_credential_redis: RedisClient | None = None,
 ) -> None:
     """Process a single task result.
 
@@ -1922,14 +1966,21 @@ def _handle_result(
     # of task staleness (the token rotation is real either way).
     if result.credential_update and token_pool is not None:
         minted_at = time.time()
-        ident = token_pool.apply_credential_update(
+        account = token_pool.apply_credential_update(
             result.task_id, result.credential_update, minted_at
         )
-        if ident is not None:
-            _persist_credential_override(redis, ident, result.credential_update, minted_at, logger)
+        if account is not None:
+            _persist_credential_override(
+                redis,
+                account,
+                result.credential_update,
+                minted_at,
+                logger,
+                shared_redis=shared_credential_redis,
+            )
             logger.info(
-                "Captured refreshed credential for provider identity %s (task %s)",
-                ident,
+                "Captured refreshed credential for provider account %s (task %s)",
+                account,
                 result.task_id,
             )
 
