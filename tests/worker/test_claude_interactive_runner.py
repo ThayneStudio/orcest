@@ -174,7 +174,7 @@ print(
     flush=True,
 )
 confirmation = os.read(0, 16)
-if b"\\x1b[B" not in confirmation or (b"\\r" not in confirmation and b"\\n" not in confirmation):
+if b"2" not in confirmation or (b"\\r" not in confirmation and b"\\n" not in confirmation):
     print(f"BAD_CONFIRMATION={confirmation!r}", flush=True)
     time.sleep(10)
     raise SystemExit(1)
