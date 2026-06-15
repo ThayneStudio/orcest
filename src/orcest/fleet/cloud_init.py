@@ -489,6 +489,10 @@ def render_clone_userdata(
             "worker_id": worker_id,
             "workspace_dir": "/opt/orcest/workspaces",
             "backend": "claude",
+            "runner": {
+                "type": "claude",
+                "extra": {"mode": "interactive"},
+            },
             "ephemeral": True,
         },
         default_flow_style=False,

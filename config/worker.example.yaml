@@ -20,6 +20,10 @@ runner:
   # Runner implementation (claude, noop, etc.). The actual provider dispatch
   # for a received Task uses the worker-local registry + generic CLI path.
   type: claude
+  # Pool workers use Claude's interactive mode to avoid the `claude -p` path.
+  # Omit this block to use the legacy non-interactive ClaudeRunner.
+  extra:
+    mode: interactive
   # Timeout in seconds for a single runner invocation
   timeout: 1800
   # Max retries on runner crash
