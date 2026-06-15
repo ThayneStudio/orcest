@@ -17,7 +17,7 @@
 #   - Run on the Proxmox host (needs qm, wget, and gpg)
 #   - SSH public key at ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
 #   - (optional) Pre-import Ubuntu cloud image signing key for offline use:
-#       gpg --recv-keys 843938DF228D22F7B3742BC0D94AA3F0EFE21092
+#       gpg --recv-keys D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
 #     (if absent, the script auto-imports from keyserver.ubuntu.com)
 
 set -euo pipefail
@@ -121,7 +121,7 @@ fi
 # --- Verify cloud image checksum and GPG signature ---
 echo "Verifying image checksum..."
 # Ubuntu Cloud Image Builder (signing key fingerprint)
-UBUNTU_SIGNING_KEY="843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+UBUNTU_SIGNING_KEY="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 wget -q --max-redirect=0 \
     "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS" \
     -O "${IMG_CACHE}/SHA256SUMS"

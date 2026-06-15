@@ -132,9 +132,9 @@ class PoolConfig:
     # unverifiable digest aborts the bake rather than downloading unverified.
     expected_image_sha256: str = ""
     # GPG signing-key fingerprint the SHA256SUMS signature must validate
-    # against. Defaults to Ubuntu's Cloud Image Builder key (the same key
-    # provision/create-vm.sh pins).
-    expected_image_gpg_key: str = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+    # against. Defaults to Ubuntu's UEC Image Automatic Signing Key
+    # (cdimage@ubuntu.com) -- the same key provision/create-vm.sh pins.
+    expected_image_gpg_key: str = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 
     def template_range(self) -> tuple[int, int] | None:
         """Return ``(start, end)`` template VMID range, or ``None`` if not configured.
@@ -332,7 +332,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
             pl.get("expected_image_gpg_key", "")
-            or "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+            or "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
         ),
     )
     # Surface VMID-range overlap at load time rather than at clone time:
