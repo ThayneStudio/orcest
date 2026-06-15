@@ -1008,6 +1008,8 @@ def update(config: str) -> None:
         console.print(f"  [red]failed[/red]: {exc}")
         sys.exit(1)
 
+    failures: list[str] = []
+
     # Step 2: Update shared Redis stack
     console.print("  Updating shared Redis stack...", end=" ")
     try:
@@ -1020,7 +1022,8 @@ def update(config: str) -> None:
         ensure_redis_stack(ssh_target)
         console.print("[green]ok[/green]")
     except Exception as exc:
-        console.print(f"[yellow]failed: {exc}[/yellow]")
+        console.print(f"[red]failed: {exc}[/red]")
+        failures.append(f"shared Redis stack: {exc}")
 
     # Step 3: Update pool manager (if template and Proxmox creds are configured)
     if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
@@ -1040,7 +1043,8 @@ def update(config: str) -> None:
                 ensure_pool_manager(ssh_target)
                 console.print("[green]ok[/green]")
             except Exception as exc:
-                console.print(f"[yellow]failed: {exc}[/yellow]")
+                console.print(f"[red]failed: {exc}[/red]")
+                failures.append(f"pool manager: {exc}")
 
     # Step 4: Restart all project stacks
     from orcest.fleet.orchestrator import restart_stack
@@ -1051,7 +1055,14 @@ def update(config: str) -> None:
             restart_stack(ssh_target, project.name)
             console.print("[green]ok[/green]")
         except Exception as exc:
-            console.print(f"[yellow]failed: {exc}[/yellow]")
+            console.print(f"[red]failed: {exc}[/red]")
+            failures.append(f"project stack {project.name}: {exc}")
+
+    if failures:
+        console.print(f"\n[bold red]Fleet update FAILED ({len(failures)} step(s)):[/bold red]")
+        for f in failures:
+            console.print(f"  - {f}")
+        sys.exit(1)
 
     console.print("\n[bold]Fleet update complete.[/bold]")
 

@@ -242,12 +242,20 @@ def ensure_redis_password(ssh_target: str) -> str:
     # umask 077 makes the freshly-created file 0600 even before the explicit
     # chmod (closes the brief world-readable window). Single quotes around the
     # inner script keep $(openssl ...) from expanding on the fleet host.
+    # NOTE: the file is owned by the SSH/deploy user ($SUDO_USER), not root.
+    # ensure_redis_stack / ensure_pool_manager / restart_stack run
+    # ``docker compose --env-file`` WITHOUT sudo (the deploy user is in the
+    # docker group), so a root-owned 0600 file would be unreadable to them
+    # ("open .redis.env: permission denied"). chown 0600 to the deploy user keeps
+    # it secret-at-rest AND readable by the (non-sudo) compose invocations.
     mint_cmd = (
         "sudo mkdir -p /opt/orcest && "
         "sudo sh -c '" + "umask 077; "
         f"[ -s {quoted} ] || "
         f'printf "ORCEST_REDIS_PASSWORD=%s\\n" "$(openssl rand -hex 32)" > {quoted}; '
-        f"chmod 600 {quoted}'"
+        f"chmod 600 {quoted}; "
+        f'chown "${{SUDO_USER:-root}}:${{SUDO_USER:-root}}" {quoted}'
+        "'"
     )
     result = _ssh(ssh_target, mint_cmd)
     if result.returncode != 0:
