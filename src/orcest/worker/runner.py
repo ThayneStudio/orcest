@@ -147,6 +147,14 @@ def create_runner(config: RunnerConfig) -> Runner:
     in ``worker/loop.py:_execute_task`` and supersedes this for real tasks.
     """
     if config.type == "claude":
+        if config.extra.get("mode") == "interactive":
+            from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
+
+            return ClaudeInteractiveRunner(
+                config.max_retries,
+                config.retry_backoff,
+                config.model,
+            )
         from orcest.worker.claude_runner import ClaudeRunner
 
         return ClaudeRunner(config.max_retries, config.retry_backoff, config.model)

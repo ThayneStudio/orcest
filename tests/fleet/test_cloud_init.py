@@ -255,6 +255,8 @@ class TestCloneUserdata:
         assert cfg["redis"]["key_prefix"] == "myprefix"
         assert cfg["worker_id"] == "w-99"
         assert cfg["ephemeral"] is True
+        assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
 
     def test_systemd_unit_written(self):
         data = yaml.safe_load(self._render())

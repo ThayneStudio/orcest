@@ -7,6 +7,7 @@ import shutil
 import pytest
 
 from orcest.shared.config import RunnerConfig
+from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
 from orcest.worker.claude_runner import ClaudeRunner
 from orcest.worker.grok_runner import GrokRunner
 from orcest.worker.noop_runner import NoopRunner
@@ -25,6 +26,14 @@ def test_create_runner_claude() -> None:
     config = RunnerConfig(type="claude")
     runner = create_runner(config)
     assert isinstance(runner, ClaudeRunner)
+
+
+@pytest.mark.unit
+def test_create_runner_claude_interactive_mode() -> None:
+    """runner.extra.mode=interactive selects the PTY Claude runner."""
+    config = RunnerConfig(type="claude", extra={"mode": "interactive"})
+    runner = create_runner(config)
+    assert isinstance(runner, ClaudeInteractiveRunner)
 
 
 @pytest.mark.unit
