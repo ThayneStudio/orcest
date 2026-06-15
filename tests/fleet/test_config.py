@@ -241,7 +241,7 @@ class TestConfigPersistence:
         loaded = load_config(path)
         assert loaded.pool.expected_image_sha256 == ""
         # Default = Ubuntu Cloud Image Builder signing key (see provision/create-vm.sh).
-        assert loaded.pool.expected_image_gpg_key == "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+        assert loaded.pool.expected_image_gpg_key == "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 
     def test_load_legacy_config_without_pool(self, tmp_path):
         """Old configs without pool section get correct defaults."""

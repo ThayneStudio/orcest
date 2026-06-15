@@ -1059,7 +1059,7 @@ class TestResolveImageChecksum:
         from orcest.fleet.cli import _resolve_image_checksum
 
         cfg = _proxmox_cfg(
-            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+            pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
         target_sha = "a1b2c3" + "0" * 58
         sums = (
@@ -1083,7 +1083,7 @@ class TestResolveImageChecksum:
             if "--verify" in joined:
                 return mocker.MagicMock(
                     returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X 843938DF228D22F7B3742BC0D94AA3F0EFE21092\n",
+                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
                     stderr="",
                 )
             return mocker.MagicMock(returncode=0, stdout="", stderr="")
@@ -1107,7 +1107,7 @@ class TestResolveImageChecksum:
         from orcest.fleet.cli import _resolve_image_checksum
 
         cfg = _proxmox_cfg(
-            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+            pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
         def fake_run(cmd, *args, **kwargs):
@@ -1140,7 +1140,7 @@ class TestResolveImageChecksum:
         from orcest.fleet.cli import _resolve_image_checksum
 
         cfg = _proxmox_cfg(
-            pool=PoolConfig(expected_image_gpg_key="843938DF228D22F7B3742BC0D94AA3F0EFE21092")
+            pool=PoolConfig(expected_image_gpg_key="D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81")
         )
 
         def fake_run(cmd, *args, **kwargs):
@@ -1152,7 +1152,7 @@ class TestResolveImageChecksum:
             if "--verify" in joined:
                 return mocker.MagicMock(
                     returncode=0,
-                    stdout="[GNUPG:] VALIDSIG X 843938DF228D22F7B3742BC0D94AA3F0EFE21092\n",
+                    stdout="[GNUPG:] VALIDSIG X D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
                     stderr="",
                 )
             return mocker.MagicMock(returncode=0, stdout="", stderr="")
