@@ -175,8 +175,8 @@ class ClaudeInteractiveRunner:
         recent_output = "".join(terminal_output[-8:])
         if not self._looks_like_bypass_permissions_prompt(recent_output):
             return False
-        # The warning defaults to "No, exit"; move to "Yes, I accept" first.
-        os.write(master_fd, b"\x1b[B\r")
+        # The warning defaults to "No, exit"; select numbered option 2 directly.
+        os.write(master_fd, b"2\r")
         if logger:
             logger.info("Confirmed Claude bypass-permissions prompt")
         return True
