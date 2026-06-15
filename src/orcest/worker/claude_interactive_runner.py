@@ -12,6 +12,7 @@ import fcntl
 import logging
 import os
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -25,6 +26,11 @@ from pathlib import Path
 from orcest.worker._runner_base import _build_env, _check_needs_human, _kill_process_tree
 from orcest.worker.claude_runner import _is_usage_exhausted
 from orcest.worker.runner import RunnerResult, get_provider_recipe
+
+_ANSI_RE = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class ClaudeInteractiveRunner:
@@ -121,6 +127,32 @@ class ClaudeInteractiveRunner:
             return None
         return text or None
 
+    def _looks_like_workspace_trust_prompt(self, text: str) -> bool:
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
+        normalized = re.sub(r"\s+", "", stripped).lower()
+        return (
+            "quicksafetycheck" in normalized
+            and "itrustthisfolder" in normalized
+            and "entertoconfirm" in normalized
+        )
+
+    def _confirm_workspace_trust_if_needed(
+        self,
+        master_fd: int,
+        terminal_output: list[str],
+        already_confirmed: bool,
+        logger: logging.Logger | None,
+    ) -> bool:
+        if already_confirmed:
+            return True
+        recent_output = "".join(terminal_output[-8:])
+        if not self._looks_like_workspace_trust_prompt(recent_output):
+            return False
+        os.write(master_fd, b"\r")
+        if logger:
+            logger.info("Confirmed Claude workspace trust prompt")
+        return True
+
     def _result_from_summary(self, summary: str) -> RunnerResult:
         needs_human, reason = _check_needs_human(summary)
         return RunnerResult(
@@ -194,11 +226,18 @@ class ClaudeInteractiveRunner:
                         attempt,
                         self.max_retries,
                     )
+                workspace_trust_confirmed = False
                 self._drain_startup_output(
                     master_fd,
                     proc,
                     terminal_output,
                     on_output,
+                    logger,
+                )
+                workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
+                    master_fd,
+                    terminal_output,
+                    workspace_trust_confirmed,
                     logger,
                 )
 
@@ -242,6 +281,12 @@ class ClaudeInteractiveRunner:
                         continue
                     if not self._read_available(master_fd, terminal_output, on_output, logger):
                         break
+                    workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
+                        master_fd,
+                        terminal_output,
+                        workspace_trust_confirmed,
+                        logger,
+                    )
 
                 combined = "".join(terminal_output)
                 if _is_usage_exhausted(combined):
