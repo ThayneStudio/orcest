@@ -146,6 +146,16 @@ class ClaudeInteractiveRunner:
             and "entertoconfirm" in normalized
         )
 
+    def _looks_like_mcp_server_prompt(self, text: str) -> bool:
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
+        normalized = re.sub(r"\s+", "", stripped).lower()
+        return (
+            "newmcpserverfoundinthisproject" in normalized
+            and "usethismcpserver" in normalized
+            and "continuewithoutusingthismcpserver" in normalized
+            and "entertoconfirm" in normalized
+        )
+
     def _confirm_workspace_trust_if_needed(
         self,
         master_fd: int,
@@ -179,6 +189,24 @@ class ClaudeInteractiveRunner:
         os.write(master_fd, b"2\r")
         if logger:
             logger.info("Confirmed Claude bypass-permissions prompt")
+        return True
+
+    def _confirm_mcp_server_if_needed(
+        self,
+        master_fd: int,
+        terminal_output: list[str],
+        already_confirmed: bool,
+        logger: logging.Logger | None,
+    ) -> bool:
+        if already_confirmed:
+            return True
+        recent_output = "".join(terminal_output[-8:])
+        if not self._looks_like_mcp_server_prompt(recent_output):
+            return False
+        # Option 3 continues without enabling project MCP servers in unattended runs.
+        os.write(master_fd, b"3\r")
+        if logger:
+            logger.info("Declined Claude project MCP server prompt")
         return True
 
     def _result_from_summary(self, summary: str) -> RunnerResult:
@@ -256,6 +284,7 @@ class ClaudeInteractiveRunner:
                     )
                 workspace_trust_confirmed = False
                 bypass_permissions_confirmed = False
+                mcp_server_confirmed = False
                 self._drain_startup_output(
                     master_fd,
                     proc,
@@ -273,6 +302,12 @@ class ClaudeInteractiveRunner:
                     master_fd,
                     terminal_output,
                     bypass_permissions_confirmed,
+                    logger,
+                )
+                mcp_server_confirmed = self._confirm_mcp_server_if_needed(
+                    master_fd,
+                    terminal_output,
+                    mcp_server_confirmed,
                     logger,
                 )
 
@@ -326,6 +361,12 @@ class ClaudeInteractiveRunner:
                         master_fd,
                         terminal_output,
                         bypass_permissions_confirmed,
+                        logger,
+                    )
+                    mcp_server_confirmed = self._confirm_mcp_server_if_needed(
+                        master_fd,
+                        terminal_output,
+                        mcp_server_confirmed,
                         logger,
                     )
 

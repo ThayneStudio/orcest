@@ -52,6 +52,20 @@ def test_bypass_permissions_prompt_detector_handles_tui_output() -> None:
     assert runner._looks_like_bypass_permissions_prompt(text) is True
 
 
+def test_mcp_server_prompt_detector_handles_tui_output() -> None:
+    runner = ClaudeInteractiveRunner()
+
+    text = (
+        "\x1b[38;5;220mNew MCP server found in this project: supabase"
+        "1. Use this MCP server"
+        "2. Use this and all future MCP servers in this project"
+        "3. Continue without using this MCP server"
+        "Enter to confirm / Esc to cancel"
+    )
+
+    assert runner._looks_like_mcp_server_prompt(text) is True
+
+
 def test_run_provides_controlling_tty_and_reads_result(tmp_path, monkeypatch) -> None:
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
@@ -209,3 +223,58 @@ raise SystemExit(0)
 
     assert result.success is True
     assert result.summary == "bypass prompt confirmed"
+
+
+def test_run_declines_mcp_server_prompt(tmp_path, monkeypatch) -> None:
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import sys
+import time
+
+print(
+    "New MCP server found in this project: supabase\\n"
+    "1. Use this MCP server\\n"
+    "2. Use this and all future MCP servers in this project\\n"
+    "3. Continue without using this MCP server\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+confirmation = os.read(0, 16)
+if b"3" not in confirmation or (b"\\r" not in confirmation and b"\\n" not in confirmation):
+    print(f"BAD_CONFIRMATION={confirmation!r}", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+
+buf = "\\n".join(sys.argv[1:])
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", buf)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("mcp prompt declined\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=3,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "mcp prompt declined"
