@@ -1,6 +1,8 @@
 """Unit tests for the dashboard data-fetching and formatting layers."""
 
 import json
+import os
+import subprocess
 
 import pytest
 import redis as redis_lib
@@ -611,6 +613,19 @@ class TestDashboardAuthFailsClosed:
 
         return Path(__file__).resolve().parents[1]
 
+    def _run_dashboard_guard(self, *, env=None):
+        guard_env = os.environ.copy()
+        if env:
+            guard_env.update(env)
+        return subprocess.run(
+            ["sh", "dashboard/scripts/check-tracked-files.sh"],
+            cwd=self._repo_root(),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=guard_env,
+        )
+
     def test_isauthorized_does_not_fail_open(self):
         """The fail-open shortcut ``if (!DASHBOARD_TOKEN) return true;`` must be
         gone from every dashboard server source file."""
@@ -660,3 +675,1413 @@ class TestDashboardAuthFailsClosed:
         assert '"8080:8080"' not in text, (
             "dashboard port must not be published on all interfaces"
         )
+
+    def test_compose_requires_dashboard_token(self):
+        """Direct docker compose usage must fail before starting a tokenless
+        dashboard that would pass health checks but reject every real request."""
+        compose = self._repo_root() / "docker-compose.dashboard.yml"
+        text = compose.read_text()
+        assert "image: ${DASHBOARD_IMAGE:-orcest-dashboard:latest}" in text
+        assert "name: ${ORCEST_DOCKER_NETWORK:-orcest}" in text
+        assert "DASHBOARD_TOKEN=${DASHBOARD_TOKEN:?DASHBOARD_TOKEN is required}" in text
+        assert "LOCK_TTL_SECONDS=180" not in text
+        assert "- LOCK_TTL_SECONDS" in text
+        assert "- DASHBOARD_LOCK_TTL_SECONDS" in text
+        assert "- ORCEST_LOCK_TTL_SECONDS" in text
+
+    def test_deploy_dashboard_wires_required_env_files(self):
+        """The dashboard compose deploy target must pass Redis auth and require
+        a dashboard token before starting the fail-closed service."""
+        makefile = self._repo_root() / "Makefile"
+        text = makefile.read_text()
+        assert "DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env" in text
+        assert "DASHBOARD_ENV ?= /opt/orcest/.dashboard.env" in text
+        assert 'set -- --env-file "$(DASHBOARD_REDIS_ENV)"' in text
+        assert 'set -- "$$@" --env-file "$(DASHBOARD_ENV)"' in text
+        assert "DASHBOARD_TOKEN" in text
+        assert "dashboard/scripts/deploy-compose-dashboard.sh" in text
+        assert "DASHBOARD_ENV_FILE=\"$$published_env_file\"" in text
+        assert "DASHBOARD_REMOTE_COMPOSE" in text
+        assert "/api/ready" in text
+        assert "DASHBOARD_AUDIT_LEVEL ?= moderate" in text
+        assert "npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL)" in text
+        assert "npm run build && npm run check:bundle-runtime" in text
+
+    def test_dashboard_ci_runs_bundle_runtime_smoke_after_build(self):
+        """CI must run the production bundle runtime smoke, not stop at build."""
+        ci = self._repo_root() / ".github" / "workflows" / "ci.yml"
+        makefile = self._repo_root() / "Makefile"
+        ci_text = ci.read_text()
+        make_text = makefile.read_text()
+        assert "run: make test-dashboard" in ci_text
+        build_index = make_text.index("npm run build")
+        runtime_index = make_text.index("npm run check:bundle-runtime")
+        assert build_index < runtime_index
+
+    def test_dashboard_build_uses_root_relative_assets_for_spa_deep_links(self):
+        """Deep-linked SPA routes must request /assets/... rather than
+        resolving relative bundle URLs beneath the route path."""
+        vite_config = self._repo_root() / "dashboard" / "vite.config.ts"
+        text = vite_config.read_text()
+        assert 'base: "/"' in text
+        assert 'base: "./"' not in text
+
+    def test_dashboard_deploy_scripts_do_not_mask_asset_listing_failures(self):
+        """Deploy and smoke gates must not hide a failed container asset
+        listing behind a successful tr process."""
+        makefile = self._repo_root() / "Makefile"
+        smoke_compose = self._repo_root() / "dashboard" / "scripts" / "smoke-compose.sh"
+        deploy_script = self._repo_root() / "dashboard" / "scripts" / "deploy-compose-dashboard.sh"
+        asset_script = self._repo_root() / "dashboard" / "scripts" / "list-published-assets.sh"
+
+        assert "ls -1 dist/assets/index-*.js dist/assets/index-*.css' | tr" not in makefile.read_text()
+        assert "deploy-compose-dashboard.sh $compose" in smoke_compose.read_text()
+        deploy_text = deploy_script.read_text()
+        assert 'dashboard_image="${DASHBOARD_IMAGE:-orcest-dashboard:latest}"' in deploy_text
+        assert 'dashboard_image="$(env_file_value DASHBOARD_IMAGE)"' in deploy_text
+        assert 'rollback_image="${DASHBOARD_ROLLBACK_IMAGE:-orcest-dashboard:rollback-$$}"' in deploy_text
+        assert 'deploy_lock_dir="${DASHBOARD_DEPLOY_LOCK_DIR:-.dashboard-deploy.lock}"' in deploy_text
+        assert 'deploy_lock_held="${DASHBOARD_DEPLOY_LOCK_HELD:-0}"' in deploy_text
+        assert "acquire_deploy_lock()" in deploy_text
+        assert 'acquire_deploy_lock "$@"' in deploy_text
+        assert deploy_text.index('acquire_deploy_lock "$@"') < deploy_text.index('previous_container=')
+        assert 'DASHBOARD_DEPLOY_LOCK_HELD=1 but dashboard deploy lock is missing' in deploy_text
+        assert "release_deploy_lock()" in deploy_text
+        assert "handle_signal()" in deploy_text
+        assert "Dashboard deploy interrupted after candidate start; rolling back" in deploy_text
+        assert 'docker tag "$previous_image_id" "$rollback_image"' in deploy_text
+        assert 'restorable_image_name()' in deploy_text
+        assert 'restore_rollback_image_tag()' in deploy_text
+        assert 'restore_previous_image_tag()' in deploy_text
+        assert 'DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard' in deploy_text
+        assert '"$@" images -q dashboard' not in deploy_text
+        assert 'candidate_image="$dashboard_image"' in deploy_text
+        assert 'docker image inspect -f \'{{.Id}}\' "$candidate_image"' in deploy_text
+        assert 'check_candidate_bundle_runtime "$candidate_image"' in deploy_text
+        assert 'collect_candidate_assets "$candidate_image"' in deploy_text
+        assert "candidate_may_be_live=1" in deploy_text
+        assert '"$@" up -d --no-build --force-recreate dashboard' in deploy_text
+        assert 'rollback_compose_image="$rollback_image"' in deploy_text
+        assert 'restore_previous_image_tag' in deploy_text
+        assert 'restore_rollback_image_tag "$previous_image_name"' in deploy_text
+        assert 'rollback_compose_image="$dashboard_image"' in deploy_text
+        assert 'rollback_compose_image="$previous_image_name"' in deploy_text
+        assert 'DASHBOARD_IMAGE="$rollback_compose_image" "$@" up -d --no-build --force-recreate dashboard' in deploy_text
+        assert 'running_image_id' in deploy_text
+        assert 'did not match candidate image' in deploy_text
+        assert 'rollback_dashboard "$@" || true' in deploy_text
+        assert 'check_bundle_runtime "$@"' in deploy_text
+        assert 'node scripts/check-bundle-runtime.mjs' in deploy_text
+        assert 'Dashboard bundle runtime check failed' in deploy_text
+        assert "published_dashboard_network()" in deploy_text
+        assert "printf 'container:%s\\n' \"$container\"" in deploy_text
+        assert 'DASHBOARD_PUBLISHED_DOCKER_NETWORK="$published_network"' in deploy_text
+        assert "DASHBOARD_VERIFY_HOST_PUBLISHED" in deploy_text
+        assert 'host_published_network="${DASHBOARD_HOST_PUBLISHED_DOCKER_NETWORK:-host}"' in deploy_text
+        assert 'if truthy "$verify_host_published"; then' in deploy_text
+        assert 'DASHBOARD_PUBLISHED_DOCKER_NETWORK="$host_published_network"' in deploy_text
+        assert "sh dashboard/scripts/check-published.sh || return $?" in deploy_text
+        assert 'check_published "$expected_assets" "$@"' in deploy_text
+        assert 'check_published_unpinned "$@"' in deploy_text
+        smoke_text = smoke_compose.read_text()
+        assert "deploy-compose-dashboard.sh $compose" in smoke_text
+        assert "DASHBOARD_VERIFY_HOST_PUBLISHED=1" in smoke_text
+        assert "smoke_image=" in smoke_text
+        assert "python3 -" in smoke_text
+        assert "18080 + $$ % 20000" not in smoke_text
+        assert "ports: !override" not in smoke_text
+        assert 'compose_file="$(mktemp)"' in smoke_text
+        assert '-f "$compose_file"' in smoke_text
+        assert 'context: "$repo_root/dashboard"' in smoke_text
+        assert '-f docker-compose.dashboard.yml -f' not in smoke_text
+        assert "image: $smoke_image" in smoke_text
+        assert 'network_name="${DASHBOARD_SMOKE_NETWORK:-${project}-network}"' in smoke_text
+        assert "ORCEST_DOCKER_NETWORK=$network_name" in smoke_text
+        assert 'docker network create "$network_name"' in smoke_text
+        assert "DASHBOARD_STRICT_DEGRADED=1" in smoke_text
+        assert "redis_cli HSET tasks:metadata purpose dashboard-smoke" in smoke_text
+        assert "redis_cli XADD tasks:claude 1-0" in smoke_text
+        assert "verify_seeded_snapshot_contract" in smoke_text
+        assert 'queueDepths["tasks:claude"] !== 1' in smoke_text
+        assert "non-stream tasks:metadata appeared in queue_depths" in smoke_text
+        assert "non-stream tasks:metadata appeared in consumer_groups" in smoke_text
+        assert "non-stream tasks:metadata appeared in queued_tasks" in smoke_text
+        assert '--network "$network_name"' in smoke_text
+        assert "--network orcest" not in smoke_text
+        assert 'DASHBOARD_IMAGE="$smoke_image"' in smoke_text
+        assert 'docker image rm "$smoke_image"' in smoke_text
+        smoke_image = self._repo_root() / "dashboard" / "scripts" / "smoke-image.sh"
+        assert "node scripts/check-bundle-runtime.mjs" in smoke_image.read_text()
+        asset_text = asset_script.read_text()
+        assert 'exec -T dashboard sh -lc' in asset_text
+        assert 'tr \'\\n\' \' \' <"$asset_file"' in asset_text
+
+    def test_dashboard_deploy_refuses_concurrent_lock(self, tmp_path):
+        """Concurrent dashboard deploys must not race image tags or rollback
+        state; an existing lock fails before compose/docker mutation."""
+        lock_dir = tmp_path / "dashboard-deploy.lock"
+        lock_dir.mkdir()
+        (lock_dir / "info").write_text("pid=123\nhost=existing\n")
+        calls = tmp_path / "compose-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+exit 99
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+echo "docker should not be called while deploy lock is held" >&2
+exit 99
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(lock_dir)
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert f"Dashboard deploy lock is already held: {lock_dir}" in result.stderr
+        assert "pid=123" in result.stderr
+        assert "host=existing" in result.stderr
+        assert "Refusing to run a concurrent dashboard deploy" in result.stderr
+        assert not calls.exists()
+        assert lock_dir.exists()
+
+    def test_dashboard_deploy_validates_candidate_before_live_start(
+        self,
+        tmp_path,
+    ):
+        """A bad newly built bundle must fail before compose replaces the
+        currently served dashboard."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    exit 0
+    ;;
+	  build)
+	    exit 0
+	    ;;
+	  up)
+	    echo "live service should not be started before candidate validation" >&2
+	    exit 99
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+	printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+	if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+	  printf '%s\\n' sha256:candidate
+	  exit 0
+	fi
+	if [ "${1:-}" = "run" ]; then
+	  exit 1
+	fi
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        for key in [
+            "DASHBOARD_TOKEN",
+            "DASHBOARD_READY_ATTEMPTS",
+            "DASHBOARD_READY_INTERVAL_MS",
+            "DASHBOARD_ALLOW_DEGRADED",
+            "DASHBOARD_STRICT_DEGRADED",
+            "DASHBOARD_ALLOW_UNPINNED_ASSETS",
+        ]:
+            env.pop(key, None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+        lock_dir = tmp_path / "deploy.lock"
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(lock_dir)
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard candidate bundle runtime check failed" in result.stderr
+        assert "build dashboard" in calls.read_text()
+        assert "images -q dashboard" not in calls.read_text()
+        assert "up " not in calls.read_text()
+        docker_text = docker_calls.read_text()
+        assert "image inspect -f {{.Id}} orcest-dashboard:latest" in docker_text
+        assert "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        assert "image rm orcest-dashboard:latest" in docker_text
+        assert not lock_dir.exists()
+
+    def test_dashboard_deploy_falls_back_to_explicit_candidate_image(
+        self,
+        tmp_path,
+    ):
+        """Compose image discovery can fail against a stale running container;
+        the deploy wrapper should still validate the explicit service image."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    printf '%s\n' previous-container
+    exit 0
+    ;;
+	  build)
+	    exit 0
+	    ;;
+	  up)
+	    exit 1
+	    ;;
+  logs|rm)
+    exit 0
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+  inspect)
+    case "$3" in
+      "{{.Image}}")
+        printf '%s\n' sha256:previous
+        ;;
+      "{{.Config.Image}}")
+        printf '%s\n' custom-previous:old
+        ;;
+    esac
+    exit 0
+    ;;
+	  image)
+	    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ] && [ "${5:-}" = "orcest-dashboard:latest" ]; then
+	      printf '%s\\n' sha256:candidate
+	      exit 0
+	    fi
+	    ;;
+	  run)
+	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+	      exit 0
+	    fi
+	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+	      printf '%s\\n' dist/assets/index-candidate.js dist/assets/index-candidate.css
+	      exit 0
+	    fi
+	    ;;
+  tag)
+    exit 0
+    ;;
+esac
+exit 1
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env.pop("DASHBOARD_IMAGE", None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard compose start failed" in result.stderr
+        calls_text = calls.read_text()
+        assert "build dashboard" in calls_text
+        assert "images -q dashboard" not in calls_text
+        assert "up -d --no-build --force-recreate dashboard" in calls_text
+        docker_text = docker_calls.read_text()
+        assert "image inspect -f {{.Id}} orcest-dashboard:latest" in docker_text
+        assert "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        assert "run --rm orcest-dashboard:latest sh -lc" in docker_text
+        assert "image inspect custom-previous:old" not in docker_text
+        assert "run --rm custom-previous:old node scripts/check-bundle-runtime.mjs" not in docker_text
+        assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
+        assert "up -d --no-build --force-recreate dashboard" in calls_text
+
+    def test_dashboard_deploy_validates_env_file_dashboard_image(
+        self,
+        tmp_path,
+    ):
+        """The deploy wrapper must validate the image selected through Compose
+        env files, not only the hard-coded default image name."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        env_file = tmp_path / ".dashboard.env"
+        env_file.write_text('DASHBOARD_IMAGE="custom-dashboard:env" # comment\n')
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    exit 0
+    ;;
+  build)
+    exit 0
+    ;;
+  up)
+    echo "live service should not be started before candidate validation" >&2
+    exit 99
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ] && [ "${5:-}" = "custom-dashboard:env" ]; then
+  printf '%s\\n' sha256:candidate
+  exit 0
+fi
+if [ "${1:-}" = "run" ] && [ "${3:-}" = "custom-dashboard:env" ] && [ "${4:-}" = "node" ]; then
+  exit 1
+fi
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "rm" ]; then
+  exit 0
+fi
+exit 1
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env.pop("DASHBOARD_IMAGE", None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+        env["DASHBOARD_ENV_FILE"] = str(env_file)
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard candidate bundle runtime check failed" in result.stderr
+        assert "up " not in calls.read_text()
+        docker_text = docker_calls.read_text()
+        assert "image inspect -f {{.Id}} custom-dashboard:env" in docker_text
+        assert "run --rm custom-dashboard:env node scripts/check-bundle-runtime.mjs" in docker_text
+        assert "image rm custom-dashboard:env" in docker_text
+
+    def test_dashboard_runtime_bundle_check_is_packaged_with_image(self):
+        """Deploy gates execute the production bundle inside the runtime image,
+        so the script and DOM runtime must be available after npm --omit=dev."""
+        repo_root = self._repo_root()
+        package = json.loads((repo_root / "dashboard" / "package.json").read_text())
+        package_lock = json.loads((repo_root / "dashboard" / "package-lock.json").read_text())
+        dockerfile = (repo_root / "dashboard" / "Dockerfile").read_text()
+        runtime_script = (repo_root / "dashboard" / "scripts" / "check-bundle-runtime.mjs").read_text()
+
+        assert package["scripts"]["check:bundle-runtime"] == "node scripts/check-bundle-runtime.mjs"
+        assert "happy-dom" in package["dependencies"]
+        assert "happy-dom" not in package["devDependencies"]
+        assert "happy-dom" in package_lock["packages"][""]["dependencies"]
+        assert "dev" not in package_lock["packages"]["node_modules/happy-dom"]
+        assert "COPY --from=builder /app/scripts/check-bundle-runtime.mjs ./scripts/check-bundle-runtime.mjs" in dockerfile
+        assert "new Window" in runtime_script
+        assert "class SmokeWebSocket" in runtime_script
+        assert "Dashboard bundle runtime verified" in runtime_script
+
+    def test_dashboard_deploy_removes_failed_fresh_service(self, tmp_path):
+        """A first dashboard deploy that fails published readiness must not
+        leave the newly started bad service running."""
+        calls = tmp_path / "compose-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+	set -eu
+	printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+	printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+	case "$1" in
+	  ps)
+	    if [ -f "$COMPOSE_CALLS.up" ]; then
+	      printf '%s\\n' candidate-container
+	    fi
+	    exit 0
+	    ;;
+	  build)
+	    exit 0
+	    ;;
+	  up)
+	    : > "$COMPOSE_CALLS.up"
+	    exit 0
+	    ;;
+  exec)
+    printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+    exit 0
+    ;;
+  logs|rm)
+    exit 0
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+	if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+	  printf '%s\\n' sha256:candidate
+	  exit 0
+	fi
+	if [ "${1:-}" = "inspect" ] && [ "${3:-}" = "{{.Image}}" ]; then
+	  printf '%s\\n' sha256:candidate
+	  exit 0
+	fi
+	if [ "${1:-}" = "run" ]; then
+	  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+	    exit 0
+	  fi
+	  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+	    printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+	    exit 0
+	  fi
+  exit 1
+fi
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        for key in [
+            "DASHBOARD_TOKEN",
+            "DASHBOARD_READY_ATTEMPTS",
+            "DASHBOARD_READY_INTERVAL_MS",
+            "DASHBOARD_ALLOW_DEGRADED",
+            "DASHBOARD_STRICT_DEGRADED",
+            "DASHBOARD_ALLOW_UNPINNED_ASSETS",
+        ]:
+            env.pop(key, None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_READY_ATTEMPTS"] = "1"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard did not become published-ready" in result.stderr
+        assert "No previous dashboard image is available for rollback" in result.stderr
+        calls_text = calls.read_text()
+        assert "build dashboard" in calls_text
+        assert "images -q dashboard" not in calls_text
+        assert "up -d --no-build --force-recreate dashboard" in calls_text
+        assert "exec -T dashboard" in calls_text
+        assert "rm -sf dashboard" in calls_text
+
+    def test_dashboard_deploy_signal_rolls_back_live_candidate(self, tmp_path):
+        """If a deploy is interrupted after the candidate may be live, the trap
+        must roll back before removing the pinned previous image."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    if [ -f "$COMPOSE_CALLS.rollback" ]; then
+      printf '%s\\n' previous-container
+    elif [ -f "$COMPOSE_CALLS.candidate" ]; then
+      printf '%s\\n' candidate-container
+    else
+      printf '%s\\n' previous-container
+    fi
+    exit 0
+    ;;
+  build|logs|rm)
+    exit 0
+    ;;
+  up)
+    if [ -f "$COMPOSE_CALLS.candidate" ]; then
+      : > "$COMPOSE_CALLS.rollback"
+      exit 0
+    fi
+    : > "$COMPOSE_CALLS.candidate"
+    kill -TERM "$PPID"
+    exit 0
+    ;;
+  exec)
+    if [ "${4:-}" = "node" ]; then
+      exit 0
+    fi
+    printf '%s\\n' dist/assets/index-previous.js dist/assets/index-previous.css
+    exit 0
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+  image)
+    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ]; then
+      printf '%s\\n' sha256:candidate
+      exit 0
+    fi
+    [ "${2:-}" = "rm" ] && exit 0
+    ;;
+  inspect)
+    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
+      printf '%s\\n' sha256:candidate
+      exit 0
+    fi
+    case "$3" in
+      "{{.Image}}")
+        printf '%s\\n' sha256:previous
+        ;;
+      "{{.Config.Image}}")
+        printf '%s\\n' orcest-dashboard:latest
+        ;;
+    esac
+    exit 0
+    ;;
+  tag)
+    exit 0
+    ;;
+  run)
+    for arg do
+      [ "$arg" = "fake-node" ] && exit 0
+    done
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+      exit 0
+    fi
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+      printf '%s\\n' dist/assets/index-candidate.js dist/assets/index-candidate.css
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(tmp_path / "deploy.lock")
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 143
+        assert "Dashboard deploy interrupted after candidate start; rolling back" in result.stderr
+        assert "Dashboard rollback published readiness verified" in result.stdout
+        calls_text = calls.read_text()
+        assert calls_text.count("up -d --no-build --force-recreate dashboard") == 2
+        assert "DASHBOARD_IMAGE=orcest-dashboard:latest" in calls_text
+        docker_text = docker_calls.read_text()
+        assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
+        assert "image rm orcest-dashboard:rollback-" in docker_text
+        assert not (tmp_path / "deploy.lock").exists()
+
+    def test_dashboard_rollback_checks_readiness_when_previous_assets_missing(
+        self,
+        tmp_path,
+    ):
+        """Rollback to a known previous image should still prove readiness when
+        the old asset list could not be captured before deploy."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+	set -eu
+	printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+	printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+	case "$1" in
+	  ps)
+	    if [ -f "$COMPOSE_CALLS.candidate" ]; then
+	      printf '%s\\n' candidate-container
+	    else
+	      printf '%s\\n' previous-container
+	    fi
+	    exit 0
+	    ;;
+	  build)
+	    exit 0
+	    ;;
+	  up|logs)
+	    if [ "$1" = "up" ]; then
+	      : > "$COMPOSE_CALLS.candidate"
+	    fi
+	    exit 0
+	    ;;
+  exec)
+    exit 1
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+	  image)
+	    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ]; then
+	      printf '%s\\n' sha256:candidate
+	      exit 0
+	    fi
+	    [ "${2:-}" = "inspect" ] && exit 0
+	    ;;
+	  inspect)
+	    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
+	      printf '%s\\n' sha256:candidate
+	      exit 0
+	    fi
+	    case "$3" in
+	      "{{.Image}}")
+	        printf '%s\\n' sha256:previous
+        ;;
+      "{{.Config.Image}}")
+        printf '%s\\n' orcest-dashboard:latest
+        ;;
+    esac
+    exit 0
+    ;;
+	  tag)
+	    exit 0
+	    ;;
+	  run)
+	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+	      exit 0
+	    fi
+	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+	      printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+	      exit 0
+	    fi
+	    if [ "${3:-}" = "fake-node" ]; then
+	      exit 0
+	    fi
+	    exit 0
+	    ;;
+esac
+exit 1
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_READY_ATTEMPTS"] = "1"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard rollback readiness verified without asset pin" in result.stdout
+        assert "previous asset list was unavailable" in result.stderr
+        calls_text = calls.read_text()
+        assert "build dashboard" in calls_text
+        assert "images -q dashboard" not in calls_text
+        assert "up -d --no-build --force-recreate dashboard" in calls_text
+        docker_text = docker_calls.read_text()
+        assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
+        assert "tag orcest-dashboard:rollback-" in docker_text
+        assert "orcest-dashboard:latest" in docker_text
+        assert "DASHBOARD_IMAGE=orcest-dashboard:latest" in calls_text
+        assert "run --rm orcest-dashboard:latest sh -lc" in docker_text
+        assert "DASHBOARD_ALLOW_UNPINNED_ASSETS=1" in docker_text
+        assert "DASHBOARD_EXPECTED_ASSETS=" in docker_text
+        assert "--network container:candidate-container" in docker_text
+        assert "DASHBOARD_BASE_URL=http://127.0.0.1:8080" in docker_text
+
+    def test_dashboard_rollback_restores_custom_previous_image_tag(
+        self,
+        tmp_path,
+    ):
+        """Rollback should recreate compose from the previous stable image name
+        when the old dashboard was not using the default dashboard tag."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps)
+    if [ -f "$COMPOSE_CALLS.candidate" ]; then
+      printf '%s\\n' candidate-container
+    else
+      printf '%s\\n' previous-container
+    fi
+    exit 0
+    ;;
+  build)
+    exit 0
+    ;;
+  up|logs)
+    if [ "$1" = "up" ]; then
+      : > "$COMPOSE_CALLS.candidate"
+    fi
+    exit 0
+    ;;
+  exec)
+    exit 1
+    ;;
+esac
+exit 1
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+  image)
+    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ]; then
+      printf '%s\\n' sha256:candidate
+      exit 0
+    fi
+    [ "${2:-}" = "rm" ] && exit 0
+    ;;
+  inspect)
+    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
+      printf '%s\\n' sha256:candidate
+      exit 0
+    fi
+    case "$3" in
+      "{{.Image}}")
+        printf '%s\\n' sha256:previous
+        ;;
+      "{{.Config.Image}}")
+        printf '%s\\n' custom-previous:old
+        ;;
+    esac
+    exit 0
+    ;;
+  tag)
+    exit 0
+    ;;
+  run)
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+      exit 0
+    fi
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+      printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+      exit 0
+    fi
+    for arg do
+      [ "$arg" = "fake-node" ] && exit 0
+    done
+    ;;
+esac
+exit 1
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_TOKEN"] = "test-token"
+        env["DASHBOARD_READY_ATTEMPTS"] = "1"
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "Dashboard rollback readiness verified without asset pin" in result.stdout
+        calls_text = calls.read_text()
+        docker_text = docker_calls.read_text()
+        assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
+        assert "tag orcest-dashboard:rollback-" in docker_text
+        assert "custom-previous:old" in docker_text
+        assert "DASHBOARD_IMAGE=custom-previous:old" in calls_text
+        assert "DASHBOARD_IMAGE=orcest-dashboard:rollback-" not in calls_text
+
+    def test_published_readiness_warns_on_degraded_snapshots_by_default(self):
+        """A successful dashboard deploy should still verify snapshot delivery
+        without rolling back a healthy build for pre-existing partial data."""
+        check_script = self._repo_root() / "dashboard" / "scripts" / "check-published.sh"
+        text = check_script.read_text()
+        assert 'DASHBOARD_ALLOW_DEGRADED="${DASHBOARD_ALLOW_DEGRADED:-}"' not in text
+        assert 'allow_degraded="${DASHBOARD_ALLOW_DEGRADED:-0}"' not in text
+        assert 'allow_degraded="$(env_file_value DASHBOARD_ALLOW_DEGRADED)"' in text
+        assert 'strict_degraded="$(env_file_value DASHBOARD_STRICT_DEGRADED)"' in text
+        assert 'DASHBOARD_ALLOW_DEGRADED=$allow_degraded' in text
+        assert 'DASHBOARD_STRICT_DEGRADED=$strict_degraded' in text
+        assert '-e DASHBOARD_ALLOW_DEGRADED="$allow_degraded"' not in text
+        assert 'message.snapshot.redis_ok !== true' in text
+        assert 'snapshot websocket reported Redis unavailable' in text
+        assert 'message.snapshot.degraded_sections' in text
+        assert 'strictDegraded && !allowDegraded' in text
+        assert 'Warning: ${degradedMessage}' in text
+        assert 'snapshot reported degraded sections' in text
+
+    def test_published_readiness_requires_expected_assets_by_default(self):
+        """Standalone published readiness must not silently downgrade to a
+        readiness-only check without proving the served bundle identity."""
+        check_script = self._repo_root() / "dashboard" / "scripts" / "check-published.sh"
+        text = check_script.read_text()
+        assert 'allow_unpinned_assets="${DASHBOARD_ALLOW_UNPINNED_ASSETS:-0}"' not in text
+        assert 'allow_unpinned_assets="$(env_file_value DASHBOARD_ALLOW_UNPINNED_ASSETS)"' in text
+        assert 'DASHBOARD_ALLOW_UNPINNED_ASSETS=$allow_unpinned_assets' in text
+        assert '-e DASHBOARD_ALLOW_UNPINNED_ASSETS="$allow_unpinned_assets"' not in text
+        assert 'const allowUnpinnedAssets = ' in text
+        assert 'if (allowUnpinnedAssets) return;' in text
+        assert 'DASHBOARD_EXPECTED_ASSETS must include a ${kind} asset' in text
+        assert 'DASHBOARD_ALLOW_UNPINNED_ASSETS=1 for readiness-only checks' in text
+        assert 'await expectStatus(jsPath, 401);' in text
+        assert 'await expectStatus(cssPath, 401);' in text
+        assert 'const deepLinkPath = "/work/results";' in text
+        assert 'assetPathsFromHtml(deepLinkText, ".js", deepLinkPath)' in text
+        assert 'fetchAsset(deepLinkJsPath, deepLinkPath, cookieHeaders, "javascript", "JS")' in text
+        assert 'dashboard deep-link HTML did not reference both JS and CSS assets' in text
+
+    def test_published_readiness_env_file_knobs_are_not_clobbered_by_defaults(self):
+        """Env-file readiness knobs should survive unless the caller
+        deliberately supplies an override in the shell environment."""
+        check_script = self._repo_root() / "dashboard" / "scripts" / "check-published.sh"
+        text = check_script.read_text()
+        assert 'attempts="${DASHBOARD_READY_ATTEMPTS:-60}"' not in text
+        assert 'interval_ms="${DASHBOARD_READY_INTERVAL_MS:-1000}"' not in text
+        assert 'ready_attempts="$(env_file_value DASHBOARD_READY_ATTEMPTS)"' in text
+        assert 'ready_interval_ms="$(env_file_value DASHBOARD_READY_INTERVAL_MS)"' in text
+        assert 'published_docker_network="$(env_file_value DASHBOARD_PUBLISHED_DOCKER_NETWORK)"' in text
+        assert 'published_docker_network="${published_docker_network:-host}"' in text
+        assert 'set -- "$@" --network "$published_docker_network"' in text
+        assert 'DASHBOARD_READY_ATTEMPTS=$ready_attempts' in text
+        assert 'DASHBOARD_READY_INTERVAL_MS=$ready_interval_ms' in text
+        assert '-e DASHBOARD_READY_ATTEMPTS="$attempts"' not in text
+        assert '-e DASHBOARD_READY_INTERVAL_MS="$interval_ms"' not in text
+
+    def test_published_readiness_parses_compose_env_file_values(self, tmp_path):
+        """The readiness checker must strip Compose-style quotes/comments before
+        passing env-file values into the Docker smoke container."""
+        env_file = tmp_path / ".dashboard.env"
+        env_file.write_text(
+            "\n".join([
+                'DASHBOARD_TOKEN="secret-token" # comment',
+                "DASHBOARD_READY_ATTEMPTS = '2' # comment",
+                "DASHBOARD_READY_INTERVAL_MS=250 # comment",
+                'DASHBOARD_ALLOW_DEGRADED="true" # comment',
+                "DASHBOARD_STRICT_DEGRADED='1' # comment",
+                "DASHBOARD_ALLOW_UNPINNED_ASSETS='1' # comment",
+                "DASHBOARD_PUBLISHED_DOCKER_NETWORK='container:dashboard-1' # comment",
+                "",
+            ])
+        )
+        docker_calls = tmp_path / "docker-calls.log"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+for arg do
+  printf '<%s>\\n' "$arg" >> "$DOCKER_CALLS"
+done
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        for key in [
+            "DASHBOARD_TOKEN",
+            "DASHBOARD_READY_ATTEMPTS",
+            "DASHBOARD_READY_INTERVAL_MS",
+            "DASHBOARD_ALLOW_DEGRADED",
+            "DASHBOARD_STRICT_DEGRADED",
+            "DASHBOARD_ALLOW_UNPINNED_ASSETS",
+            "DASHBOARD_PUBLISHED_DOCKER_NETWORK",
+        ]:
+            env.pop(key, None)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_ENV_FILE"] = str(env_file)
+        env["DASHBOARD_NODE_IMAGE"] = "fake-node"
+        env["DASHBOARD_EXPECTED_ASSETS"] = "dist/assets/index-test.js dist/assets/index-test.css"
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/check-published.sh"],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        args = docker_calls.read_text()
+        assert "<--env-file>" not in args
+        assert "<--network>" in args
+        assert "<container:dashboard-1>" in args
+        assert "<DASHBOARD_TOKEN=secret-token>" in args
+        assert "<DASHBOARD_READY_ATTEMPTS=2>" in args
+        assert "<DASHBOARD_READY_INTERVAL_MS=250>" in args
+        assert "<DASHBOARD_ALLOW_DEGRADED=true>" in args
+        assert "<DASHBOARD_STRICT_DEGRADED=1>" in args
+        assert "<DASHBOARD_ALLOW_UNPINNED_ASSETS=1>" in args
+
+    def test_remote_deploy_shell_quotes_embedded_single_quotes(self):
+        """The remote deploy helper must preserve single-quoted grep regexes
+        when it sends scripts over SSH stdin."""
+        makefile = self._repo_root() / "Makefile"
+        text = makefile.read_text()
+        assert "DASHBOARD_SHELL_QUOTE = '$(subst ','\\'',$(1))'" in text
+        assert "printf '%s\\n' $(call DASHBOARD_SHELL_QUOTE,$(1))" in text
+
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "sync-dashboard-remote-unlocked",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+            ],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout
+        assert "grep -Eq '\\''^ORCEST_REDIS_PASSWORD=.+$'\\'' .redis.env" in output
+        assert "grep -Eq '\\''^DASHBOARD_TOKEN=.+$'\\'' .dashboard.env" in output
+        assert "grep -Eq '^ORCEST_REDIS_PASSWORD=.+$' .redis.env" not in output
+        assert "grep -Eq '^DASHBOARD_TOKEN=.+$' .dashboard.env" not in output
+
+    def test_remote_deploy_preflights_env_before_destructive_sync(self):
+        """Remote deploy must validate target-local env/secrets before any
+        rsync --delete mutates the target dashboard directory."""
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "sync-dashboard-remote-unlocked",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+            ],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout
+        env_check_index = output.index("grep -Eq '\\''^ORCEST_REDIS_PASSWORD=.+$'\\'' .redis.env")
+        sync_index = output.index("rsync -az --delete --exclude")
+        assert env_check_index < sync_index
+
+    def test_remote_deploy_lock_covers_sync_and_compose_deploy(self):
+        """The pve-test remote deploy lock must be held before rsync starts and
+        remain held while the remote compose deploy runs."""
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "deploy-dashboard-remote",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+            ],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout
+        acquire_index = output.index("target=deploy-dashboard-remote")
+        sync_index = output.index("make sync-dashboard-remote-unlocked")
+        deploy_index = output.index("DASHBOARD_DEPLOY_LOCK_HELD=1")
+        release_index = output.index("release_remote_lock")
+        assert acquire_index < sync_index < deploy_index
+        assert release_index < acquire_index
+        assert "DASHBOARD_DEPLOY_LOCK_DIR='\\''/opt/orcest/.dashboard-deploy.lock'\\''" in output
+
+    def test_remote_sync_rejects_unsafe_dashboard_remote_dir(self):
+        """Remote sync must not rsync-delete the dashboard into the compose root."""
+        result = subprocess.run(
+            [
+                "make",
+                "sync-dashboard-remote",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+                "DASHBOARD_REMOTE_DIR=/opt/orcest",
+            ],
+            cwd=self._repo_root(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        combined_output = result.stdout + result.stderr
+        assert "Refusing unsafe DASHBOARD_REMOTE_DIR=/opt/orcest" in combined_output
+        assert "dashboard.example.invalid sh" not in combined_output
+
+    def test_remote_sync_rejects_unsafe_compose_root(self):
+        """Remote sync must reject protected or traversal compose roots before rsync."""
+        for unsafe_root in ["/", "/opt", "/etc", "..", "/opt/orcest/../other"]:
+            result = subprocess.run(
+                [
+                    "make",
+                    "sync-dashboard-remote",
+                    "DASHBOARD_REMOTE=dashboard.example.invalid",
+                    f"DASHBOARD_REMOTE_ORCEST_DIR={unsafe_root}",
+                    f"DASHBOARD_REMOTE_DIR={unsafe_root.rstrip('/')}/dashboard",
+                ],
+                cwd=self._repo_root(),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            assert result.returncode != 0
+            combined_output = result.stdout + result.stderr
+            normalized_root = unsafe_root.rstrip("/")
+            assert (
+                f"Refusing unsafe DASHBOARD_REMOTE_ORCEST_DIR={normalized_root}"
+                in combined_output
+            )
+            assert "dashboard.example.invalid sh" not in combined_output
+
+    def test_remote_sync_preserves_excluded_target_files(self):
+        """Remote sync should delete stale tracked files without deleting target
+        local secrets or generated files covered by rsync excludes."""
+        makefile = self._repo_root() / "Makefile"
+        text = makefile.read_text()
+
+        assert "rsync -az --delete --delete-excluded" not in text
+        assert "rsync -az --delete $(DASHBOARD_RSYNC_EXCLUDES)" in text
+        assert "--exclude='.env'" in text
+        assert "--exclude='.env.*'" in text
+        assert "--exclude='*.env'" in text
+        assert "--exclude='.npmrc*'" in text
+
+    def test_remote_sync_rejects_symlinked_target_dirs_before_delete(self):
+        """Remote sync must reject symlinked directories before rsync --delete."""
+        makefile = self._repo_root() / "Makefile"
+        text = makefile.read_text()
+
+        assert "$(DASHBOARD_REMOTE_EXEC) sh -eu" in text
+        assert 'test ! -L "$$orcest_dir" && test ! -L "$$remote_dir"' in text
+        assert "Remote dashboard directories must not be symlinks" in text
+        assert 'pwd -P' in text
+        assert "Remote dashboard directories must resolve to configured paths" in text
+
+    def test_remote_sync_inspects_configured_docker_network(self):
+        """Remote network preflight must follow ORCEST_DOCKER_NETWORK instead
+        of hard-coding the default network name."""
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "sync-dashboard-remote-unlocked",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+            ],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout
+        assert "ORCEST_DOCKER_NETWORK" in output
+        assert "^[[:space:]]*ORCEST_DOCKER_NETWORK[[:space:]]*=" in output
+        assert 'sprintf("%c", 39)' in output
+        assert "end=index(body, q)" in output
+        assert "[[:space:]]+#.*" in output
+        assert "/opt/orcest" in output
+        assert ".redis.env" in output
+        assert ".dashboard.env" in output
+        assert "docker compose version >/dev/null; network_name=" in output
+        assert "docker compose version >/dev/null && network_name=" not in output
+        assert 'cd "/opt/orcest" && docker compose version' not in output
+        assert 'docker network inspect "$network_name"' in output
+        assert "docker network inspect orcest" not in output
+
+    def test_remote_deploy_propagates_published_readiness_overrides(self):
+        """Known degraded snapshots and slow starts need an explicit remote
+        deploy override path; unset local knobs should not be forced remotely."""
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "deploy-dashboard-remote",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+                "DASHBOARD_ALLOW_DEGRADED=1",
+                "DASHBOARD_STRICT_DEGRADED=1",
+                "DASHBOARD_READY_ATTEMPTS=2",
+                "DASHBOARD_READY_INTERVAL_MS=250",
+                "DASHBOARD_ALLOW_UNPINNED_ASSETS=1",
+            ],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout
+        assert "DASHBOARD_ALLOW_DEGRADED='\\''1'\\''" in output
+        assert "DASHBOARD_STRICT_DEGRADED='\\''1'\\''" in output
+        assert "DASHBOARD_READY_ATTEMPTS='\\''2'\\''" in output
+        assert "DASHBOARD_READY_INTERVAL_MS='\\''250'\\''" in output
+        assert "DASHBOARD_ALLOW_UNPINNED_ASSETS='\\''1'\\''" in output
+        assert 'DASHBOARD_ALLOW_DEGRADED="1"' not in output
+
+    def test_dashboard_dockerfile_does_not_copy_npmrc(self):
+        """The dashboard image must not copy local npm config into build layers
+        or the final runtime image. Future .npmrc auth tokens should not leak
+        through the Dockerfile."""
+        dockerfile = self._repo_root() / "dashboard" / "Dockerfile"
+        text = dockerfile.read_text()
+        assert ".npmrc" not in text
+        assert "NPM_CONFIG_ENGINE_STRICT=true" in text
+        assert "NPM_CONFIG_AUDIT=false" in text
+        assert "NPM_CONFIG_FUND=false" in text
+        assert "NPM_CONFIG_PROGRESS=false" in text
+        assert "NPM_CONFIG_UPDATE_NOTIFIER=false" in text
+        assert "npm ci --omit=dev" in text
+
+    def test_dashboard_dockerignore_excludes_local_secrets(self):
+        """The dashboard Docker context should exclude local env and npm
+        credential files by default."""
+        dockerignore = self._repo_root() / "dashboard" / ".dockerignore"
+        entries = {
+            line.strip()
+            for line in dockerignore.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        assert ".env" in entries
+        assert ".env.*" in entries
+        assert "*.env" in entries
+        assert ".npmrc*" in entries
+
+    def test_dashboard_clean_copy_runs_inside_container_filesystem(self):
+        """Clean-copy Docker validation should not install node_modules into a
+        host bind mount, which can make Vitest workers lose preload files."""
+        makefile = self._repo_root() / "Makefile"
+        text = makefile.read_text()
+        assert "DASHBOARD_NPM_ENV =" in text
+        assert "NPM_CONFIG_UPDATE_NOTIFIER=false" in text
+        assert 'docker run --rm -i -e HOME=/tmp $(DASHBOARD_NPM_ENV) -w /app $(DASHBOARD_NODE_IMAGE)' in text
+        assert "tar -C /app -xf - && $(1)" in text
+        assert '-v "$$tmpdir:/app"' not in text
+
+    def test_dashboard_tracked_guard_rejects_unstaged_edits(self, tmp_path):
+        """Dashboard Make targets copy the working tree and deploy root compose
+        files, so the guard must fail when tracked verification files have
+        unstaged content."""
+        script = self._repo_root() / "dashboard" / "scripts" / "check-tracked-files.sh"
+        repo = tmp_path / "repo"
+        (repo / "dashboard" / "scripts").mkdir(parents=True)
+        (repo / "dashboard" / "server").mkdir(parents=True)
+        (repo / ".github" / "workflows").mkdir(parents=True)
+        (repo / "tests").mkdir()
+        (repo / "dashboard" / "scripts" / "check-tracked-files.sh").write_text(script.read_text())
+        (repo / "dashboard" / "scripts" / "check-tracked-files.sh").chmod(0o755)
+        (repo / "dashboard" / "server" / "index.ts").write_text("export const value = 1;\n")
+        (repo / "docker-compose.dashboard.yml").write_text("services: {}\n")
+        (repo / "Makefile").write_text("test:\n\ttrue\n")
+        (repo / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+        (repo / "tests" / "test_dashboard.py").write_text("def test_placeholder():\n    pass\n")
+
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=dashboard@example.test",
+                "-c",
+                "user.name=Dashboard Test",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "dashboard" / "server" / "index.ts").write_text("export const value = 2;\n")
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/check-tracked-files.sh"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "Dashboard verification has unstaged tracked file changes." in result.stderr
+        assert "dashboard/server/index.ts" in result.stderr
+
+    def test_dashboard_tracked_guard_allows_copy_excluded_ignored_files(self):
+        """Generated dashboard artifacts that copy/deploy excludes skip must not
+        block local verification."""
+        repo_root = self._repo_root()
+        paths = [
+            repo_root / "dashboard" / "dist" / "guard-allowed.js",
+            repo_root / "dashboard" / "build" / "guard-allowed.js",
+            repo_root / "dashboard" / "vite.config.ts.timestamp-guard.mjs",
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("generated\n")
+
+        try:
+            result = self._run_dashboard_guard()
+        finally:
+            for path in paths:
+                path.unlink(missing_ok=True)
+
+        assert result.returncode == 0, result.stderr
+
+    def test_dashboard_tracked_guard_rejects_ignored_files_that_would_be_copied(
+        self,
+        tmp_path,
+    ):
+        """Ignored files still need to fail if the dashboard copy/deploy excludes
+        would include them."""
+        repo_root = self._repo_root()
+        ignored_file = repo_root / "dashboard" / "guard-copied.fixture"
+        excludes_file = tmp_path / "dashboard-excludes"
+        gitconfig = tmp_path / "gitconfig"
+        excludes_file.write_text("dashboard/guard-copied.fixture\n")
+        gitconfig.write_text(f"[core]\n\texcludesFile = {excludes_file}\n")
+        ignored_file.write_text("ignored but copied\n")
+
+        try:
+            result = self._run_dashboard_guard(
+                env={"GIT_CONFIG_GLOBAL": str(gitconfig)}
+            )
+        finally:
+            ignored_file.unlink(missing_ok=True)
+
+        assert result.returncode == 1
+        assert "Ignored untracked dashboard files that would be copied:" in result.stderr
+        assert "dashboard/guard-copied.fixture" in result.stderr

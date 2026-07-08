@@ -1,22 +1,82 @@
+import { useEffect, useState } from "react";
+import { snapshotConnectionStatus, snapshotDisplayTime } from "../lib/connection";
+
 interface Props {
   connected: boolean;
+  error?: string | null;
   lastUpdate: Date | null;
 }
 
-export function ConnectionStatus({ connected, lastUpdate }: Props) {
+function dotClass(kind: string): string {
+  switch (kind) {
+    case "connected":
+      return "bg-emerald-400";
+    case "waiting":
+    case "stale":
+      return "bg-yellow-400 animate-pulse";
+    default:
+      return "bg-red-400 animate-pulse";
+  }
+}
+
+function labelClass(kind: string): string {
+  switch (kind) {
+    case "connected":
+      return "text-zinc-400";
+    case "waiting":
+    case "stale":
+      return "text-yellow-400";
+    default:
+      return "text-red-400";
+  }
+}
+
+function detailClass(kind: string): string {
+  return kind === "stale" ? "text-yellow-300" : "text-red-300";
+}
+
+export function ConnectionStatus({ connected, error, lastUpdate }: Props) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    if (!lastUpdate) return;
+    const timer = setInterval(() => setNowMs(Date.now()), 5000);
+    return () => clearInterval(timer);
+  }, [lastUpdate]);
+
+  const status = snapshotConnectionStatus(connected, error, lastUpdate, nowMs);
+  const displayTime = snapshotDisplayTime(lastUpdate);
+  const announcementDetail = status.announcement.startsWith(`${status.label}: `)
+    ? status.announcement.slice(status.label.length + 2)
+    : "";
+
   return (
-    <div className="flex items-center gap-2 text-sm">
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm sm:justify-end">
       <span
-        className={`inline-block h-2 w-2 rounded-full ${
-          connected ? "bg-emerald-400" : "bg-red-400 animate-pulse"
-        }`}
+        aria-hidden="true"
+        className={`inline-block h-2 w-2 shrink-0 rounded-full ${dotClass(status.kind)}`}
       />
-      <span className={connected ? "text-zinc-400" : "text-red-400"}>
-        {connected ? "Connected" : "Disconnected"}
+      <span
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className={`shrink-0 ${labelClass(status.kind)}`}
+      >
+        {status.label}
+        {announcementDetail && <span className="sr-only">: {announcementDetail}</span>}
       </span>
-      {lastUpdate && (
-        <span className="text-zinc-500">
-          {lastUpdate.toLocaleTimeString()}
+      {status.detail && (
+        <span
+          className={`min-w-0 max-w-full truncate text-xs sm:max-w-[28rem] ${detailClass(status.kind)}`}
+          title={status.detail}
+        >
+          {status.detail}
+        </span>
+      )}
+      {displayTime && (
+        <span className="shrink-0 text-zinc-500">
+          {displayTime}
         </span>
       )}
     </div>
