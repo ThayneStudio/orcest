@@ -698,9 +698,9 @@ class TestDashboardAuthFailsClosed:
 
         assert "- ORCEST_BUILD_REVISION=" not in compose_text
         assert "ENV ORCEST_BUILD_REVISION=" not in dockerfile_text
-        assert '> /app/.orcest-revision' in dockerfile_text
+        assert "> /app/.orcest-revision" in dockerfile_text
         assert 'previous_revision=""' in deploy_text
-        assert 'org.opencontainers.image.revision' in deploy_text
+        assert "org.opencontainers.image.revision" in deploy_text
         assert 'DASHBOARD_EXPECTED_REVISION="$previous_revision" check_published' in deploy_text
 
     def test_deploy_dashboard_wires_required_env_files(self):
