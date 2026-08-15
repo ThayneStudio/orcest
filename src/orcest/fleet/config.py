@@ -266,6 +266,38 @@ class FleetConfig:
             )
         return self.orgs[org_name]
 
+    def provider_stream_mismatches(self) -> dict[str, list[str]]:
+        """Return project providers not consumed by the managed worker pool.
+
+        The fleet creates one homogeneous worker pool and every clone consumes
+        only ``tasks:<pool.worker_backend>`` plus its matching issue stream.
+        Orchestrators publish explicit providers to provider-specific streams,
+        so accepting a different provider here would create durable work that
+        no fleet-managed worker can claim. Non-fleet installations may still
+        run multiple specialized worker groups; this check is intentionally
+        scoped to fleet deployment paths.
+        """
+        from orcest.shared.models import is_claude_provider
+
+        backend = self.pool.worker_backend.strip() or "claude"
+        mismatches: dict[str, list[str]] = {}
+        for project in self.projects:
+            org = self.resolve_org(project)
+            providers = {
+                str(provider).strip()
+                for provider in org.provider_credentials
+                if str(provider).strip() and str(provider).strip() != "claude"
+            }
+            has_claude_credentials = bool(
+                org.claude_oauth_tokens or org.provider_credentials.get("claude")
+            )
+            if has_claude_credentials:
+                providers.add(backend if is_claude_provider(backend) else "claude")
+            unsupported = sorted(provider for provider in providers if provider != backend)
+            if unsupported:
+                mismatches[project.name] = unsupported
+        return mismatches
+
     def ssh_target(self) -> str:
         """Return user@host for the orchestrator VM."""
         if not self.orchestrator.host:

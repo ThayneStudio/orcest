@@ -121,6 +121,39 @@ def test_main_help(runner):
     assert "status" in result.stdout
 
 
+def test_rollout_health_text_output_includes_metrics(runner, mocker):
+    revision = "a" * 40
+    client = MagicMock()
+    mocker.patch("orcest.cli._resolve_redis_config", return_value=MagicMock())
+    mocker.patch("orcest.shared.redis_client.RedisClient", return_value=client)
+    mocker.patch(
+        "orcest.rollout_health.collect_rollout_health",
+        return_value={
+            "ok": True,
+            "revision": revision,
+            "checks": [
+                {
+                    "name": "checker_revision",
+                    "passed": True,
+                    "actual": revision,
+                    "expected": revision,
+                }
+            ],
+            "metrics": {"queue_depth": 3, "pending": 1, "lag": 2},
+        },
+    )
+
+    result = runner.invoke(
+        main,
+        ["rollout-health", "localhost", "--expected-revision", revision],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "PASS checker_revision" in result.output
+    assert 'METRICS {"lag": 2, "pending": 1, "queue_depth": 3}' in result.output
+    client.close.assert_called_once()
+
+
 def test_work_missing_required_id(runner):
     """work without --id exits non-zero (--id is a required option)."""
     result = runner.invoke(main, ["work"])

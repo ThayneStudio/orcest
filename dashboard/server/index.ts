@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server } from "http";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import type { Duplex } from "stream";
@@ -30,6 +31,8 @@ const PING_INTERVAL = 30000;
 const SNAPSHOT_REFRESH_INTERVAL = 2000;
 const SHUTDOWN_TIMEOUT_MS = 5000;
 const WEBSOCKET_CLOSE_GRACE_MS = 1000;
+const CLEAN_REVISION_RE = /^[0-9a-f]{7,64}$/;
+const BUILD_REVISION_PATH = "/app/.orcest-revision";
 
 type LogFn = (...args: unknown[]) => void;
 type SnapshotSendSocket = Pick<WebSocket, "readyState" | "send" | "terminate">;
@@ -81,6 +84,25 @@ function parsePortValue(
 
 export function dashboardPortFromEnv(raw = process.env.PORT): number {
   return parsePortValue(raw, DEFAULT_PORT, true);
+}
+
+export function dashboardRevisionFromEnv(
+  raw = process.env.ORCEST_BUILD_REVISION,
+): string {
+  const revision = raw?.trim().toLowerCase() ?? "";
+  return CLEAN_REVISION_RE.test(revision) ? revision : "unknown";
+}
+
+export function dashboardBuildRevision(
+  path = BUILD_REVISION_PATH,
+  environmentFallback = process.env.ORCEST_BUILD_REVISION,
+): string {
+  try {
+    return dashboardRevisionFromEnv(fs.readFileSync(path, "utf8"));
+  } catch {
+    // Source checkouts do not have the image-baked revision file.
+    return dashboardRevisionFromEnv(environmentFallback);
+  }
 }
 
 function dashboardServerDeps(overrides: Partial<DashboardServerDeps> = {}): DashboardServerDeps {
@@ -194,6 +216,7 @@ export function createDashboardServer(
     options.snapshotRefreshIntervalMs ?? SNAPSHOT_REFRESH_INTERVAL;
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS;
   const deps = dashboardServerDeps(options.deps);
+  const revision = dashboardBuildRevision();
   const app = express();
   const server = createServer(app);
   let closing = false;
@@ -238,16 +261,16 @@ export function createDashboardServer(
   // --- Health checks (intentionally unauthenticated so container/runtime probes can poll them) ---
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true });
+    res.json({ ok: true, revision });
   });
 
   app.get("/api/ready", async (_req, res) => {
     try {
       const redisOk = await deps.healthCheck();
-      res.status(redisOk ? 200 : 503).json({ ok: redisOk, redis_ok: redisOk });
+      res.status(redisOk ? 200 : 503).json({ ok: redisOk, redis_ok: redisOk, revision });
     } catch (err) {
       deps.logError("Dashboard readiness check failed:", err);
-      res.status(503).json({ ok: false, redis_ok: false });
+      res.status(503).json({ ok: false, redis_ok: false, revision });
     }
   });
 

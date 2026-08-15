@@ -1,10 +1,11 @@
-.PHONY: test test-unit check-dashboard-tracked check-dashboard-clean-copy test-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
 DASHBOARD_ENV ?= /opt/orcest/.dashboard.env
 DASHBOARD_NODE_VERSION ?= $(shell cat dashboard/.node-version)
 DASHBOARD_NODE_IMAGE ?= node:$(DASHBOARD_NODE_VERSION)-slim
 DASHBOARD_AUDIT_LEVEL ?= moderate
+ORCEST_BUILD_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 DASHBOARD_NPM_ENV = -e NPM_CONFIG_AUDIT=false -e NPM_CONFIG_FUND=false -e NPM_CONFIG_PROGRESS=false -e NPM_CONFIG_UPDATE_NOTIFIER=false
 DASHBOARD_DOCKER_RUN = docker run --rm --user "$(shell id -u):$(shell id -g)" -e HOME=/tmp $(DASHBOARD_NPM_ENV) -v "$(CURDIR)/dashboard:/app" -w /app $(DASHBOARD_NODE_IMAGE)
 DASHBOARD_SOURCE_TAR_EXCLUDES = --exclude='./node_modules' --exclude='./dist' --exclude='./build' --exclude='./.git' --exclude='./.env' --exclude='./.env.*' --exclude='./*.env' --exclude='./.npmrc*' --exclude='./npm-debug.log*' --exclude='./vite.config.ts.timestamp-*.mjs'
@@ -20,7 +21,7 @@ DASHBOARD_REMOTE_COMPOSE_STATE_FILE ?= $(DASHBOARD_REMOTE_ORCEST_DIR)/.dashboard
 DASHBOARD_REMOTE_RSYNC_SHELL ?= ssh -o BatchMode=yes
 DASHBOARD_REMOTE_EXEC ?= ssh -o BatchMode=yes $(DASHBOARD_REMOTE)
 DASHBOARD_REMOTE_COMPOSE ?= docker compose --env-file .redis.env --env-file .dashboard.env -f docker-compose.dashboard.yml
-DASHBOARD_REMOTE_PUBLISHED_ENV = $(if $(DASHBOARD_READY_ATTEMPTS),DASHBOARD_READY_ATTEMPTS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_READY_ATTEMPTS)) ,)$(if $(DASHBOARD_READY_INTERVAL_MS),DASHBOARD_READY_INTERVAL_MS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_READY_INTERVAL_MS)) ,)$(if $(DASHBOARD_ALLOW_DEGRADED),DASHBOARD_ALLOW_DEGRADED=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_ALLOW_DEGRADED)) ,)$(if $(DASHBOARD_STRICT_DEGRADED),DASHBOARD_STRICT_DEGRADED=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_STRICT_DEGRADED)) ,)$(if $(DASHBOARD_ALLOW_UNPINNED_ASSETS),DASHBOARD_ALLOW_UNPINNED_ASSETS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_ALLOW_UNPINNED_ASSETS)) ,)
+DASHBOARD_REMOTE_PUBLISHED_ENV = ORCEST_BUILD_REVISION=$(call DASHBOARD_SHELL_QUOTE,$(ORCEST_BUILD_REVISION)) DASHBOARD_EXPECTED_REVISION=$(call DASHBOARD_SHELL_QUOTE,$(ORCEST_BUILD_REVISION)) $(if $(DASHBOARD_READY_ATTEMPTS),DASHBOARD_READY_ATTEMPTS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_READY_ATTEMPTS)) ,)$(if $(DASHBOARD_READY_INTERVAL_MS),DASHBOARD_READY_INTERVAL_MS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_READY_INTERVAL_MS)) ,)$(if $(DASHBOARD_ALLOW_DEGRADED),DASHBOARD_ALLOW_DEGRADED=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_ALLOW_DEGRADED)) ,)$(if $(DASHBOARD_STRICT_DEGRADED),DASHBOARD_STRICT_DEGRADED=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_STRICT_DEGRADED)) ,)$(if $(DASHBOARD_ALLOW_UNPINNED_ASSETS),DASHBOARD_ALLOW_UNPINNED_ASSETS=$(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_ALLOW_UNPINNED_ASSETS)) ,)
 DASHBOARD_DEV_API_HOST_PORT ?= 8080
 DASHBOARD_DEV_VITE_HOST_PORT ?= 5173
 DASHBOARD_DEV_REDIS_HOST ?= host.docker.internal
@@ -51,6 +52,13 @@ test-unit:
 
 check-dashboard-tracked:
 	sh dashboard/scripts/check-tracked-files.sh
+
+check-dashboard-release-revision:
+	@revision=$(call DASHBOARD_SHELL_QUOTE,$(ORCEST_BUILD_REVISION)); \
+	actual=$$(git rev-parse HEAD 2>/dev/null || true); \
+	printf '%s\n' "$$revision" | grep -Eq '^[0-9a-f]{7,64}$$' || { echo "ORCEST_BUILD_REVISION must be an exact clean Git revision"; exit 1; }; \
+	[ "$$revision" = "$$actual" ] || { echo "ORCEST_BUILD_REVISION does not match the checked-out commit $$actual"; exit 1; }; \
+	[ -z "$$(git status --porcelain 2>/dev/null)" ] || { echo "Dashboard deployment requires a clean Git checkout"; exit 1; }
 
 check-dashboard-clean-copy: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,test -f package.json && test -f scripts/check-node-version.mjs && test ! -e node_modules && test ! -e dist && test ! -e build && touch .clean-copy-write-check && rm .clean-copy-write-check && npm run check:node)
@@ -187,7 +195,7 @@ sync-dashboard-remote-unlocked: preflight-dashboard-remote
 	rsync -az --delete $(DASHBOARD_RSYNC_EXCLUDES) -e $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_RSYNC_SHELL)) $(call DASHBOARD_SHELL_QUOTE,$(CURDIR)/dashboard/) $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE):$(DASHBOARD_REMOTE_DIR)/)
 	rsync -az -e $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_RSYNC_SHELL)) $(call DASHBOARD_SHELL_QUOTE,$(CURDIR)/docker-compose.dashboard.yml) $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE):$(DASHBOARD_REMOTE_ORCEST_DIR)/docker-compose.dashboard.yml)
 
-deploy-dashboard: check-dashboard-tracked
+deploy-dashboard: check-dashboard-tracked check-dashboard-release-revision
 	@test -r "$(DASHBOARD_REDIS_ENV)" || { echo "Missing $(DASHBOARD_REDIS_ENV); deploy Redis first or set DASHBOARD_REDIS_ENV"; exit 1; }
 	@if [ -z "$${ORCEST_REDIS_PASSWORD:-}" ] && ! grep -Eq '^ORCEST_REDIS_PASSWORD=.+$$' "$(DASHBOARD_REDIS_ENV)" 2>/dev/null; then \
 		echo "Missing ORCEST_REDIS_PASSWORD; export it or define it in $(DASHBOARD_REDIS_ENV)"; \
@@ -202,9 +210,9 @@ deploy-dashboard: check-dashboard-tracked
 	published_env_file=""; \
 	if [ -r "$(DASHBOARD_ENV)" ]; then published_env_file="$(DASHBOARD_ENV)"; fi; \
 	set -- docker compose "$$@" -f docker-compose.dashboard.yml; \
-	DASHBOARD_NODE_VERSION="$(DASHBOARD_NODE_VERSION)" DASHBOARD_NODE_IMAGE="$(DASHBOARD_NODE_IMAGE)" DASHBOARD_BASE_URL="http://127.0.0.1:8080" DASHBOARD_ENV_FILE="$$published_env_file" DASHBOARD_COMPOSE_FILE="$(CURDIR)/docker-compose.dashboard.yml" DASHBOARD_COMPOSE_STATE_FILE="$(DASHBOARD_COMPOSE_STATE_FILE)" sh dashboard/scripts/deploy-compose-dashboard.sh "$$@"
+	ORCEST_BUILD_REVISION="$(ORCEST_BUILD_REVISION)" DASHBOARD_EXPECTED_REVISION="$(ORCEST_BUILD_REVISION)" DASHBOARD_NODE_VERSION="$(DASHBOARD_NODE_VERSION)" DASHBOARD_NODE_IMAGE="$(DASHBOARD_NODE_IMAGE)" DASHBOARD_BASE_URL="http://127.0.0.1:8080" DASHBOARD_ENV_FILE="$$published_env_file" DASHBOARD_COMPOSE_FILE="$(CURDIR)/docker-compose.dashboard.yml" DASHBOARD_COMPOSE_STATE_FILE="$(DASHBOARD_COMPOSE_STATE_FILE)" sh dashboard/scripts/deploy-compose-dashboard.sh "$$@"
 
-deploy-dashboard-remote: check-dashboard-remote-paths
+deploy-dashboard-remote: check-dashboard-remote-paths check-dashboard-release-revision
 	@set -eu; \
 	remote_lock_acquired=0; \
 	release_remote_lock() { \

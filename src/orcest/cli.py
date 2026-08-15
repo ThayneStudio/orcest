@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -94,6 +95,98 @@ def _resolve_redis_config(
 @click.group()
 def main() -> None:
     """Orcest: Autonomous CI/CD orchestration system."""
+
+
+@main.command()
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--short", is_flag=True, help="Print only the revision value.")
+def revision(json_output: bool, short: bool) -> None:
+    """Show the exact source revision baked into this Orcest installation."""
+    from orcest.revision import get_build_revision, revision_is_attested
+
+    value = get_build_revision()
+    if short:
+        click.echo(value)
+        return
+    payload = {"revision": value, "attested": revision_is_attested(value)}
+    if json_output:
+        click.echo(json.dumps(payload, sort_keys=True))
+        return
+    state = "attested" if payload["attested"] else "unattested"
+    click.echo(f"{value} ({state})")
+
+
+@main.command("rollout-health")
+@click.argument("redis_host", required=False, default=None)
+@click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
+@click.option("--prefix", default=None, help="Redis key prefix (project name).")
+@click.option("--task-prefix", default="orcest", show_default=True, help="Shared task prefix.")
+@click.option(
+    "--expected-revision",
+    required=True,
+    help="Exact clean revision expected for this checker installation.",
+)
+@click.option("--expected-pool-size", type=click.IntRange(min=0), default=None)
+@click.option("--baseline-dead-letters", type=click.IntRange(min=0), default=None)
+@click.option("--baseline-exhausted-skips", type=click.IntRange(min=0), default=None)
+@click.option("--baseline-rebake-failures", type=click.IntRange(min=0), default=None)
+@click.option("--max-private-recovery", type=click.IntRange(min=0), default=0, show_default=True)
+@click.option("--require-quiescent", is_flag=True, help="Require empty queues and no active VMs.")
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+def rollout_health(
+    redis_host: str | None,
+    config: str,
+    prefix: str | None,
+    task_prefix: str,
+    expected_revision: str,
+    expected_pool_size: int | None,
+    baseline_dead_letters: int | None,
+    baseline_exhausted_skips: int | None,
+    baseline_rebake_failures: int | None,
+    max_private_recovery: int,
+    require_quiescent: bool,
+    json_output: bool,
+) -> None:
+    """Run read-only deployment gates suitable for scripts and watch loops."""
+    from orcest.revision import normalize_revision
+    from orcest.rollout_health import collect_rollout_health
+    from orcest.shared.redis_client import RedisClient
+
+    normalized = normalize_revision(expected_revision)
+    if normalized is None or normalized.endswith("-dirty"):
+        raise click.BadParameter(
+            "must be an exact clean hexadecimal revision",
+            param_hint="--expected-revision",
+        )
+
+    redis_cfg = _resolve_redis_config(redis_host, config, prefix)
+    redis = RedisClient(redis_cfg)
+    try:
+        report = collect_rollout_health(
+            redis,
+            expected_revision=normalized,
+            task_prefix=task_prefix,
+            expected_pool_size=expected_pool_size,
+            baseline_dead_letters=baseline_dead_letters,
+            baseline_exhausted_skips=baseline_exhausted_skips,
+            baseline_rebake_failures=baseline_rebake_failures,
+            max_private_recovery=max_private_recovery,
+            require_quiescent=require_quiescent,
+        )
+    finally:
+        redis.close()
+
+    if json_output:
+        click.echo(json.dumps(report, sort_keys=True))
+    else:
+        for check in report["checks"]:
+            marker = "PASS" if check["passed"] else "FAIL"
+            click.echo(
+                f"{marker} {check['name']}: {check['actual']} (expected {check['expected']})"
+            )
+        click.echo(f"METRICS {json.dumps(report['metrics'], sort_keys=True)}")
+    if not report["ok"]:
+        raise SystemExit(1)
 
 
 @main.command()

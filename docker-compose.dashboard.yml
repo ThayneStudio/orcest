@@ -5,6 +5,7 @@ services:
       context: ./dashboard
       args:
         NODE_VERSION: ${DASHBOARD_NODE_VERSION:-20.18.3}
+        ORCEST_BUILD_REVISION: ${ORCEST_BUILD_REVISION:-unknown}
     ports:
       # Bind to loopback only: the dashboard is a human-browser convenience
       # stack, not a cross-VM service (unlike Redis). Reach it via an SSH

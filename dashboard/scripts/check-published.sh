@@ -110,6 +110,9 @@ fi
 if [ -n "$allow_unpinned_assets" ]; then
   set -- "$@" -e "DASHBOARD_ALLOW_UNPINNED_ASSETS=$allow_unpinned_assets"
 fi
+if [ -n "${DASHBOARD_EXPECTED_REVISION:-}" ]; then
+  set -- "$@" -e "DASHBOARD_EXPECTED_REVISION=$DASHBOARD_EXPECTED_REVISION"
+fi
 
 docker run --rm -i "$@" \
   -e DASHBOARD_BASE_URL="$base_url" \
@@ -359,6 +362,12 @@ async function check() {
   }
   if (ready.status !== 200 || readyBody.ok !== true || readyBody.redis_ok !== true) {
     throw new Error(`readiness failed: ${ready.status} ${JSON.stringify(readyBody)}`);
+  }
+  const expectedRevision = (process.env.DASHBOARD_EXPECTED_REVISION || "").trim().toLowerCase();
+  if (expectedRevision && readyBody.revision !== expectedRevision) {
+    throw new Error(
+      `readiness revision mismatch: expected ${expectedRevision}, got ${String(readyBody.revision)}`,
+    );
   }
   if (!token) {
     throw new Error("DASHBOARD_TOKEN is required for published static verification");
