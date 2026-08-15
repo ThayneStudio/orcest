@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -2512,6 +2513,101 @@ exit 0
         assert result.returncode != 0
         assert "Dashboard verification has unstaged tracked file changes." in result.stderr
         assert "dashboard/server/index.ts" in result.stderr
+
+    @pytest.mark.parametrize(
+        ("failed_query", "expected_error"),
+        [
+            ("untracked", "could not inspect untracked files"),
+            ("ignored", "could not inspect ignored untracked dashboard files"),
+            ("status", "could not inspect dashboard worktree status"),
+            ("diff", "could not inspect unstaged dashboard changes"),
+        ],
+    )
+    def test_dashboard_tracked_guard_fails_closed_when_git_query_fails(
+        self,
+        tmp_path,
+        failed_query,
+        expected_error,
+    ):
+        """Every Git inventory probe must fail the guard when Git fails,
+        including probes whose output is filtered without POSIX pipefail."""
+        script = self._repo_root() / "dashboard" / "scripts" / "check-tracked-files.sh"
+        repo = tmp_path / "repo"
+        fake_bin = tmp_path / "bin"
+        (repo / "dashboard" / "scripts").mkdir(parents=True)
+        fake_bin.mkdir()
+        copied_script = repo / "dashboard" / "scripts" / "check-tracked-files.sh"
+        copied_script.write_text(script.read_text())
+        copied_script.chmod(0o755)
+        (repo / "dashboard" / "tracked.txt").write_text("tracked\n")
+
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=dashboard@example.test",
+                "-c",
+                "user.name=Dashboard Test",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            cwd=repo,
+            check=True,
+        )
+
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            """#!/bin/sh
+command_name=$1
+shift
+saw_ignored=0
+for arg do
+  if [ "$arg" = "--ignored" ]; then
+    saw_ignored=1
+  fi
+done
+
+should_fail=0
+case "$DASHBOARD_TEST_FAILED_GIT_QUERY:$command_name:$saw_ignored" in
+  untracked:ls-files:0|ignored:ls-files:1|status:status:*|diff:diff:*)
+    should_fail=1
+    ;;
+esac
+if [ "$should_fail" -eq 1 ]; then
+  echo "simulated Git query failure" >&2
+  exit 71
+fi
+exec "$DASHBOARD_TEST_REAL_GIT" "$command_name" "$@"
+"""
+        )
+        fake_git.chmod(0o755)
+        real_git = shutil.which("git")
+        assert real_git is not None
+        env = os.environ.copy()
+        env.update(
+            {
+                "DASHBOARD_TEST_FAILED_GIT_QUERY": failed_query,
+                "DASHBOARD_TEST_REAL_GIT": real_git,
+                "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            }
+        )
+
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/check-tracked-files.sh"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "simulated Git query failure" in result.stderr
+        assert expected_error in result.stderr
 
     def test_dashboard_tracked_guard_allows_copy_excluded_ignored_files(self):
         """Generated dashboard artifacts that copy/deploy excludes skip must not

@@ -1591,6 +1591,168 @@ class TestHealthCheckReapCoordination:
         consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
         assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
 
+    def test_health_reaper_fences_worker_before_pel_inspection(self, fake_redis_client):
+        """No late worker write can race Redis recovery after timeout detection."""
+        import time as _time
+
+        manager, _proxmox = self._build(fake_redis_client)
+        fake_redis_client.hset("pool:active", "305", str(_time.time() - 99999))
+        events: list[str] = []
+
+        def stopped(_vm_id):
+            events.append("stopped")
+            return True
+
+        def coordinated(_vm_id):
+            assert events == ["stopped"]
+            events.append("redis-coordinated")
+            return True
+
+        with (
+            patch.object(manager, "_stop_vm", side_effect=stopped),
+            patch.object(manager, "_coordinate_reaped_vm", side_effect=coordinated),
+            patch.object(
+                manager,
+                "_destroy_stopped_vm",
+                side_effect=lambda _vm_id: events.append("destroyed") or True,
+            ),
+        ):
+            manager._health_check()
+
+        assert events == ["stopped", "redis-coordinated", "destroyed"]
+
+    def test_health_reaper_stop_failure_never_inspects_or_mutates_pel(self, fake_redis_client):
+        """Failure to fence a live writer preserves all Redis recovery state."""
+        import time as _time
+
+        manager, _proxmox = self._build(fake_redis_client)
+        fake_redis_client.hset("pool:active", "305", str(_time.time() - 99999))
+        with (
+            patch.object(manager, "_stop_vm", return_value=False),
+            patch.object(manager, "_coordinate_reaped_vm") as coordinate,
+            patch.object(manager, "_destroy_stopped_vm") as destroy,
+        ):
+            manager._health_check()
+
+        coordinate.assert_not_called()
+        destroy.assert_not_called()
+        assert fake_redis_client.hgetall("pool:active").get("305") is not None
+
+    def test_reaper_malformed_entry_is_redacted_and_durable_before_ack(self, fake_redis_client):
+        from orcest.shared.models import CONSUMER_GROUP
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        entry_id = rc.xadd(
+            "tasks:claude",
+            {
+                "id": "malformed-secret-task",
+                "repo": "owner/repo",
+                "resource_type": "pr",
+                "resource_id": "42",
+                "token": "github-secret",
+                "credential": "provider-secret",
+                "claude_token": "claude-secret",
+                "unexpected": "unknown-secret",
+            },
+        )
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+
+        assert manager._coordinate_reaped_vm(305) is True
+
+        rows = rc.client.xrevrange("test:dead-letter", count=10)
+        assert len(rows) == 1
+        fields = rows[0][1]
+        assert fields["token"] == "[REDACTED]"
+        assert fields["credential"] == "[REDACTED]"
+        assert fields["claude_token"] == "[REDACTED]"
+        assert "unexpected" not in fields
+        assert all(
+            secret not in str(fields)
+            for secret in ("github-secret", "provider-secret", "claude-secret", "unknown-secret")
+        )
+        assert fields["original_entry_id"] == entry_id
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
+
+    def test_reaper_malformed_ack_failure_is_incomplete_and_idempotent(
+        self, fake_redis_client, monkeypatch
+    ):
+        from orcest.shared.models import CONSUMER_GROUP
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", {"id": "bad", "token": "secret"})
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+        original_ack = rc.xack_raw
+        original_delconsumer = rc.client.xgroup_delconsumer
+        deleted_consumers: list[str] = []
+
+        def fail_ack(*_args, **_kwargs):
+            raise ConnectionError("ACK unavailable")
+
+        def track_delconsumer(stream, group, consumer):
+            deleted_consumers.append(stream)
+            return original_delconsumer(stream, group, consumer)
+
+        monkeypatch.setattr(rc, "xack_raw", fail_ack)
+        monkeypatch.setattr(rc.client, "xgroup_delconsumer", track_delconsumer)
+
+        assert manager._coordinate_reaped_vm(305) is False
+        assert "test:tasks:claude" not in deleted_consumers
+        assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 1
+        receipt_keys = list(rc.client.scan_iter(match="test:dead-letter:handoff:*"))
+        assert len(receipt_keys) == 1
+        assert rc.client.ttl(receipt_keys[0]) == -1
+
+        monkeypatch.setattr(rc, "xack_raw", original_ack)
+        assert manager._coordinate_reaped_vm(305) is True
+        assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
+
+    def test_reaper_malformed_post_apply_ack_response_loss_is_terminal(
+        self, fake_redis_client, monkeypatch
+    ):
+        from orcest.shared.models import CONSUMER_GROUP
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", {"id": "bad", "token": "secret"})
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+        original_ack = rc.xack_raw
+
+        def apply_then_lose_response(*args, **kwargs):
+            original_ack(*args, **kwargs)
+            raise ConnectionError("ACK response lost")
+
+        monkeypatch.setattr(rc, "xack_raw", apply_then_lose_response)
+
+        assert manager._coordinate_reaped_vm(305) is True
+        assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
+        assert list(rc.client.scan_iter(match="test:dead-letter:handoff:*")) == []
+
     def test_reaped_vm_recovers_backend_stream_discovered_from_redis(self, fake_redis_client):
         import time as _time
 
@@ -1632,6 +1794,231 @@ class TestHealthCheckReapCoordination:
         assert published.summary.startswith("[transient] ")
         consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:grok", CONSUMER_GROUP)}
         assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reaper_finishes_checkpoint_only_credential_handoff_after_marker_ttl(
+        self, fake_redis_client
+    ):
+        """A persistent private checkpoint outranks generic force-reap recovery."""
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.credential_handoff import (
+            credential_checkpoint_key,
+            store_credential_checkpoint,
+        )
+        from orcest.shared.models import (
+            CONSUMER_GROUP,
+            ResultStatus,
+            Task,
+            TaskResult,
+            TaskType,
+        )
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        entry_id = rc.xadd("tasks:claude", task.to_dict())
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id=worker_id,
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="rotation completed",
+            duration_seconds=5,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"private-rotated-secret"}',
+            credential_update_minted_at=0,
+        )
+        checkpoint = store_credential_checkpoint(
+            rc,
+            "test:results",
+            "test:tasks:claude",
+            entry_id,
+            task.id,
+            result.to_dict(),
+        )
+        # This is the >30-day condition: any bounded public diagnostic/receipt
+        # may already be gone, while the private checkpoint never expires.
+        assert rc.client.ttl(checkpoint.key) == -1
+
+        assert manager._coordinate_reaped_vm(305) is True
+
+        rows = rc.client.xrevrange("test:results", count=10)
+        assert len(rows) == 1
+        recovered = TaskResult.from_dict(rows[0][1])
+        assert recovered.status is ResultStatus.COMPLETED
+        assert recovered.credential_update == '{"refresh_token":"private-rotated-secret"}'
+        assert recovered.credential_update_minted_at > 0
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        assert (
+            rc.client.exists(
+                credential_checkpoint_key("test:results", "test:tasks:claude", entry_id, task.id)
+            )
+            == 0
+        )
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
+
+    def test_reaper_deduplicates_already_durable_credential_with_checkpoint(
+        self, fake_redis_client
+    ):
+        """The old publish-before-ACK window finishes without a second secret row."""
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.credential_handoff import (
+            HANDOFF_FINGERPRINT_FIELD,
+            handoff_marker_key,
+            handoff_payload_fingerprint,
+            store_credential_checkpoint,
+        )
+        from orcest.shared.models import (
+            CONSUMER_GROUP,
+            ResultStatus,
+            Task,
+            TaskResult,
+            TaskType,
+        )
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        entry_id = rc.xadd("tasks:claude", task.to_dict())
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id=worker_id,
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="rotation completed",
+            duration_seconds=5,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"private-rotated-secret"}',
+            credential_update_minted_at=123,
+        )
+        fields = result.to_dict()
+        checkpoint = store_credential_checkpoint(
+            rc,
+            "test:results",
+            "test:tasks:claude",
+            entry_id,
+            task.id,
+            fields,
+        )
+        fingerprint = handoff_payload_fingerprint(fields)
+        result_id = rc.client.xadd(
+            "test:results",
+            {**fields, HANDOFF_FINGERPRINT_FIELD: fingerprint},
+        )
+        marker = handoff_marker_key("test:results", "test:tasks:claude", entry_id, task.id)
+        rc.client.set(marker, f"{result_id}|{fingerprint}")
+
+        assert manager._coordinate_reaped_vm(305) is True
+
+        assert len(rc.client.xrevrange("test:results", count=10)) == 1
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        assert rc.client.exists(checkpoint.key) == 0
+        assert rc.client.exists(marker) == 1
+        assert rc.client.ttl(marker) > 0
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
+
+    def test_reaper_intent_without_checkpoint_never_publishes_generic_failure(
+        self, fake_redis_client
+    ):
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.credential_handoff import store_credential_checkpoint
+        from orcest.shared.models import (
+            CONSUMER_GROUP,
+            ResultStatus,
+            Task,
+            TaskResult,
+            TaskType,
+        )
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        entry_id = rc.xadd("tasks:claude", task.to_dict())
+        assert rc.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer=worker_id,
+            stream="tasks:claude",
+            block_ms=None,
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id=worker_id,
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="rotation completed",
+            duration_seconds=5,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"private-rotated-secret"}',
+            credential_update_minted_at=123,
+        )
+        checkpoint = store_credential_checkpoint(
+            rc,
+            "test:results",
+            "test:tasks:claude",
+            entry_id,
+            task.id,
+            result.to_dict(),
+        )
+        rc.client.delete(checkpoint.key)
+
+        assert manager._coordinate_reaped_vm(305) is False
+
+        assert rc.client.xrevrange("test:results", count=10) == []
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 1
 
     def test_reaped_vm_publish_failure_does_not_clear_or_ack(self, fake_redis_client, monkeypatch):
         from orcest.shared.coordination import get_pending_task, set_pending_task

@@ -6,6 +6,7 @@ per resource, runs Claude, and publishes results back to a results stream
 for the orchestrator.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -13,21 +14,35 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import cast
 
 import redis as redis_py
 import yaml
 
 from orcest.orchestrator import gh
-from orcest.orchestrator.pr_ops import clear_attempts_if_head_sha
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
-    clear_pending_task_if_matches,
     make_issue_lock_key,
     make_pending_task_key,
     make_pr_lock_key,
     parse_pending_task_metadata,
+)
+from orcest.shared.credential_handoff import (
+    CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX as _CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX,
+    CredentialCheckpointStatus,
+    CredentialRecoveryOutcome,
+    CredentialTerminalOutcome,
+    credential_checkpoint_key as _shared_credential_checkpoint_key,
+    load_credential_checkpoint as _load_private_credential_checkpoint,
+    recover_credential_checkpoint as _recover_private_credential_checkpoint,
+    safe_dead_letter_fields as _shared_safe_dead_letter_fields,
+    store_credential_checkpoint as _store_private_credential_checkpoint,
+    terminal_credential_handoff_once as _terminal_credential_handoff_once,
+    version_credential_checkpoint as _version_credential_checkpoint,
 )
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
@@ -58,6 +73,9 @@ _STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB a
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 _EPHEMERAL_RESULT_RETRY_SECONDS = 5
+_SOURCE_ACK_RETRY_BASE_SECONDS = 1
+_HANDOFF_MARKER_TTL_SECONDS = 30 * 24 * 3600
+_HANDOFF_FINGERPRINT_FIELD = "orcest_handoff_fingerprint"
 if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
     raise ValueError(
         "_RESULT_PUBLISH_BACKOFF must have exactly _RESULT_PUBLISH_RETRIES - 1 entries"
@@ -77,9 +95,76 @@ _FAILURE_CONCLUSIONS = frozenset(
 )
 _POOL_DRAINING_KEY = "pool:draining"
 _DRAIN_RESTART_EXIT_CODE = 75
-_CREDENTIAL_UPDATE_VERSION_KEY = "providers:credential_update_version"
 _CI_DECISIONS = frozenset({"ci_failure"})
 _REVIEW_DECISIONS = frozenset({"changes_requested", "followup_threads"})
+
+_ATOMIC_XADD_MARKER_LUA = r"""
+local marker = redis.call('GET', KEYS[2])
+if marker then
+  local split = string.find(marker, '|', 1, true)
+  if split then
+    local entry_id = string.sub(marker, 1, split - 1)
+    local fingerprint = string.sub(marker, split + 1)
+    if fingerprint == ARGV[3] then
+      local rows = redis.call('XRANGE', KEYS[1], entry_id, entry_id, 'COUNT', 1)
+      if #rows == 1 then
+        local row = rows[1][2]
+        for i = 1, #row, 2 do
+          if row[i] == ARGV[4] and row[i + 1] == fingerprint then
+            return {0, entry_id}
+          end
+        end
+      end
+    end
+  end
+end
+
+local xargs = {}
+for i = 5, #ARGV do
+  table.insert(xargs, ARGV[i])
+end
+local entry_id = redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[1], '*', unpack(xargs))
+redis.call('SET', KEYS[2], entry_id .. '|' .. ARGV[3], 'EX', ARGV[2])
+return {1, entry_id}
+"""
+
+
+class ResultPublishOutcome(Enum):
+    """Durability boundary reached while handing off a worker result."""
+
+    PUBLISHED = "published"
+    DEAD_LETTERED = "dead_lettered"
+    LOST = "lost"
+    ABORTED = "aborted"
+    BLOCKED = "blocked"
+
+    @property
+    def durable(self) -> bool:
+        """Whether Redis now holds a recoverable copy of the result."""
+        return self in {self.PUBLISHED, self.DEAD_LETTERED}
+
+
+@dataclass(frozen=True)
+class ResultHandoff:
+    """Result publication plus the source-stream acknowledgement boundary."""
+
+    publish_outcome: ResultPublishOutcome
+    source_acked: bool
+
+    @property
+    def terminal(self) -> bool:
+        """Whether the result is durable and the source PEL entry is gone."""
+        return self.publish_outcome.durable and self.source_acked
+
+
+@dataclass(frozen=True)
+class CoordinationIdentity:
+    task_id: str
+    repo: str
+    resource_type: str
+    resource_id: int
+    key_prefix: str = ""
+    snapshot_head_sha: str = ""
 
 
 def _runner_for_task(task: Task, config: WorkerConfig, fallback: Runner) -> Runner:
@@ -169,7 +254,11 @@ def _check_gh_credentials(logger: logging.Logger) -> None:
             )
 
 
-def _wait_for_redis(redis: RedisClient, logger: logging.Logger) -> bool:
+def _wait_for_redis(
+    redis: RedisClient,
+    logger: logging.Logger,
+    abort_event: threading.Event | None = None,
+) -> bool:
     """Ping Redis with exponential backoff so a brief outage doesn't kill the worker.
 
     During ``orcest fleet update`` the Redis container restarts briefly.  Without
@@ -184,7 +273,10 @@ def _wait_for_redis(redis: RedisClient, logger: logging.Logger) -> bool:
     Logs each attempt at INFO so operators can tell the worker is patient,
     not stuck.
     """
+    abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_STARTUP_PING_RETRIES):
+        if abort.is_set():
+            return False
         if redis.health_check():
             if attempt > 0:
                 logger.info("Redis reachable after %d attempt(s)", attempt + 1)
@@ -197,7 +289,8 @@ def _wait_for_redis(redis: RedisClient, logger: logging.Logger) -> bool:
                 _STARTUP_PING_RETRIES,
                 sleep_s,
             )
-            time.sleep(sleep_s)
+            if abort.wait(timeout=sleep_s):
+                return False
     return False
 
 
@@ -227,64 +320,595 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
     return combined
 
 
-def _clear_pending_task_for_task(redis: RedisClient, task: Task) -> None:
-    """Clear the pending-task marker using the task's key_prefix for correct routing.
+def _task_coordination_identity(task: Task) -> CoordinationIdentity:
+    return CoordinationIdentity(
+        task_id=task.id,
+        repo=task.repo,
+        resource_type=task.resource_type,
+        resource_id=task.resource_id,
+        key_prefix=task.key_prefix,
+        snapshot_head_sha=task.snapshot_head_sha,
+    )
 
-    When the task carries a key_prefix, use it to ensure the marker is cleared
-    in the correct project namespace. Falls back to the redis client's default
-    prefix if the task has no key_prefix set.
-    """
-    if task.key_prefix:
-        # Build the fully-qualified pending key directly
-        fq_key = f"{task.key_prefix}:pending:{task.resource_type}:{task.repo}:{task.resource_id}"
-        _clear_raw_pending_task_if_matches(redis, fq_key, task.id)
+
+def _cleanup_coordination_once(
+    redis: RedisClient,
+    identity: CoordinationIdentity,
+) -> bool:
+    """Atomically clear owned pending+attempt state; mismatch is a safe no-op."""
+    pending_base = make_pending_task_key(
+        identity.repo,
+        identity.resource_type,
+        identity.resource_id,
+    )
+    attempts_base = (
+        f"issue:{identity.repo}:{identity.resource_id}:attempts"
+        if identity.resource_type == "issue"
+        else f"pr:{identity.repo}:{identity.resource_id}:attempts"
+    )
+    if identity.key_prefix:
+        pending_key = f"{identity.key_prefix}:{pending_base}"
+        attempts_key = f"{identity.key_prefix}:{attempts_base}"
     else:
-        clear_pending_task_if_matches(
-            redis, task.repo, task.resource_type, task.resource_id, task.id
+        pending_key = redis._prefixed(pending_base)
+        attempts_key = redis._prefixed(attempts_base)
+
+    pipe = redis.client.pipeline()
+    try:
+        pipe.watch(pending_key, attempts_key)
+        raw_pending = pipe.get(pending_key)
+        if isinstance(raw_pending, bytes):
+            raw_pending = raw_pending.decode("utf-8")
+        metadata = parse_pending_task_metadata(
+            raw_pending if isinstance(raw_pending, str) else None
+        )
+        if metadata is None or metadata.task_id != identity.task_id:
+            pipe.unwatch()
+            return True
+
+        clear_attempts = identity.resource_type == "issue"
+        if identity.resource_type == "pr" and identity.snapshot_head_sha:
+            raw_head_sha = pipe.hget(attempts_key, "head_sha")
+            if isinstance(raw_head_sha, bytes):
+                raw_head_sha = raw_head_sha.decode("utf-8")
+            clear_attempts = raw_head_sha == identity.snapshot_head_sha
+
+        pipe.multi()
+        pipe.delete(pending_key)
+        if clear_attempts:
+            pipe.delete(attempts_key)
+        pipe.execute()
+        return True
+    except redis_py.WatchError:
+        return False
+    finally:
+        pipe.reset()
+
+
+def _cleanup_coordination_until_terminal(
+    redis: RedisClient,
+    identity: CoordinationIdentity,
+    logger: logging.Logger,
+    abort_event: threading.Event,
+) -> bool:
+    attempt = 0
+    while True:
+        try:
+            if _cleanup_coordination_once(redis, identity):
+                return True
+        except Exception:
+            logger.warning(
+                "Failed atomic coordination cleanup for task %s",
+                identity.task_id,
+                exc_info=True,
+            )
+        attempt += 1
+        if abort_event.wait(
+            timeout=min(30, _SOURCE_ACK_RETRY_BASE_SECONDS * 2 ** min(attempt - 1, 5))
+        ):
+            return False
+
+
+def _ack_source_entry_until_confirmed(
+    redis: RedisClient,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+    logger: logging.Logger,
+    abort_event: threading.Event,
+) -> bool:
+    """Retry XACK until Redis confirms the command or shutdown is requested."""
+    attempt = 0
+    while True:
+        try:
+            # A successful command with a zero count is also terminal: it means
+            # an earlier ambiguous XACK already removed the entry from this PEL.
+            redis.xack_raw(tasks_stream, CONSUMER_GROUP, entry_id)
+            return True
+        except Exception:
+            attempt += 1
+            logger.error(
+                "Failed to ACK task %s entry %s (attempt %d); retrying",
+                task_id,
+                entry_id,
+                attempt,
+                exc_info=True,
+            )
+            if abort_event.wait(
+                timeout=min(30, _SOURCE_ACK_RETRY_BASE_SECONDS * 2 ** min(attempt - 1, 5))
+            ):
+                return False
+
+
+def _stream_handoff_identity(
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+) -> str:
+    identity = "\0".join((target_stream, tasks_stream, entry_id, task_id))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _fully_qualified_stream(redis: RedisClient, logical_stream: str) -> str:
+    value = redis._prefixed(logical_stream)
+    return value if isinstance(value, str) else logical_stream
+
+
+def _handoff_marker_key(
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+) -> str:
+    identity = _stream_handoff_identity(target_stream, tasks_stream, entry_id, task_id)
+    return f"{target_stream}:handoff:{identity}"
+
+
+def _credential_checkpoint_key(
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+) -> str:
+    return _shared_credential_checkpoint_key(target_stream, tasks_stream, entry_id, task_id)
+
+
+def _handoff_payload_fingerprint(fields: dict[str, str]) -> str:
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _store_credential_checkpoint(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+    result_fields: dict[str, str],
+) -> None:
+    """Persist a private replayable result; never copy this payload to diagnostics."""
+    _store_private_credential_checkpoint(
+        redis, target_stream, tasks_stream, entry_id, task_id, result_fields
+    )
+
+
+def _load_credential_checkpoint(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task: Task,
+    logger: logging.Logger,
+) -> tuple[CredentialCheckpointStatus, dict[str, str] | None]:
+    status, checkpoint = _load_private_credential_checkpoint(
+        redis, target_stream, tasks_stream, entry_id, task, logger
+    )
+    return status, checkpoint.result_fields if checkpoint is not None else None
+
+
+def _handoff_marker_present(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    handoff_id: str,
+    logger: logging.Logger,
+) -> bool | None:
+    try:
+        marker = redis.client.get(
+            _handoff_marker_key(
+                target_stream,
+                tasks_stream,
+                entry_id,
+                handoff_id,
+            )
+        )
+        return isinstance(marker, (str, bytes))
+    except Exception:
+        logger.warning(
+            "Failed to inspect credential diagnostic marker for task %s",
+            handoff_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _delete_handoff_marker_best_effort(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    handoff_id: str,
+    logger: logging.Logger,
+) -> None:
+    try:
+        redis.client.delete(
+            _handoff_marker_key(
+                target_stream,
+                tasks_stream,
+                entry_id,
+                handoff_id,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Failed to delete completed handoff marker for task %s; TTL cleanup remains",
+            handoff_id,
+            exc_info=True,
         )
 
 
-def _clear_raw_pending_task_if_matches(redis: RedisClient, fq_key: str, task_id: str) -> bool:
-    while True:
-        pipe = redis.client.pipeline()
-        try:
-            pipe.watch(fq_key)
-            raw = pipe.get(fq_key)
-            raw_str = str(raw) if raw is not None else None
-            metadata = parse_pending_task_metadata(raw_str)
-            if metadata is None or metadata.task_id != task_id:
-                pipe.unwatch()
-                return False
-            pipe.multi()
-            pipe.delete(fq_key)
-            pipe.execute()
-            return True
-        except redis_py.WatchError:
-            continue
-        finally:
-            pipe.reset()
-
-
-def _clear_task_attempt_reservation(redis: RedisClient, task: Task) -> None:
-    """Clear the attempt reservation when no result can reach the orchestrator."""
-    if task.resource_type == "issue":
-        key = f"issue:{task.repo}:{task.resource_id}:attempts"
-        if task.key_prefix:
-            redis.delete_raw(f"{task.key_prefix}:{key}")
-        else:
-            redis.delete(key)
-        return
-
-    if task.key_prefix:
-        project_redis = RedisClient.from_client(redis.client, key_prefix=task.key_prefix)
-    else:
-        project_redis = redis
-    clear_attempts_if_head_sha(
-        project_redis,
-        task.repo,
-        task.resource_id,
-        task.snapshot_head_sha or "",
+def _atomic_xadd_capped_with_marker(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+    fields: dict[str, str],
+    *,
+    raw_target: bool,
+    logical_target: str,
+) -> str:
+    """Atomically append a stream row and its bounded idempotency marker."""
+    fingerprint = _handoff_payload_fingerprint(fields)
+    marked_fields = {**fields, _HANDOFF_FINGERPRINT_FIELD: fingerprint}
+    marker_key = _handoff_marker_key(target_stream, tasks_stream, entry_id, task_id)
+    flattened_fields = [item for pair in marked_fields.items() for item in pair]
+    response = cast(
+        object,
+        redis.client.eval(
+            _ATOMIC_XADD_MARKER_LUA,
+            2,
+            target_stream,
+            marker_key,
+            str(_STREAM_MAXLEN),
+            str(_HANDOFF_MARKER_TTL_SECONDS),
+            fingerprint,
+            _HANDOFF_FINGERPRINT_FIELD,
+            *flattened_fields,
+        ),
     )
+    if isinstance(response, (list, tuple)) and len(response) == 2:
+        raw_entry_id = response[1]
+        if isinstance(raw_entry_id, bytes):
+            return raw_entry_id.decode("utf-8")
+        return str(raw_entry_id)
+
+    # Unit-test doubles do not execute Lua. Preserve their observable wrapper
+    # calls while production Redis always takes the atomic path above.
+    if raw_target:
+        published_id = redis.xadd_capped_raw(target_stream, marked_fields, maxlen=_STREAM_MAXLEN)
+    else:
+        published_id = redis.xadd_capped(logical_target, marked_fields, maxlen=_STREAM_MAXLEN)
+    redis.client.set(
+        marker_key,
+        f"{published_id}|{fingerprint}",
+        ex=_HANDOFF_MARKER_TTL_SECONDS,
+    )
+    return published_id
+
+
+def _stream_handoff_state(
+    redis: RedisClient,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    task_id: str,
+    logger: logging.Logger,
+) -> bool | None:
+    """Verify an O(1) companion marker against its exact retained stream row."""
+    marker_key = _handoff_marker_key(target_stream, tasks_stream, entry_id, task_id)
+    try:
+        raw_marker = redis.client.get(marker_key)
+    except Exception:
+        logger.warning("Failed to inspect handoff marker for task %s", task_id, exc_info=True)
+        return None
+    if isinstance(raw_marker, bytes):
+        raw_marker = raw_marker.decode("utf-8")
+    if not isinstance(raw_marker, str) or "|" not in raw_marker:
+        return False
+    stream_entry_id, fingerprint = raw_marker.split("|", 1)
+    try:
+        rows = cast(
+            object,
+            redis.client.xrange(
+                target_stream,
+                min=stream_entry_id,
+                max=stream_entry_id,
+                count=1,
+            ),
+        )
+    except Exception:
+        logger.warning("Failed to verify handoff stream row for task %s", task_id, exc_info=True)
+        return None
+    if not isinstance(rows, list) or len(rows) != 1:
+        return False
+    row_id, row_fields = rows[0]
+    if isinstance(row_id, bytes):
+        row_id = row_id.decode("utf-8")
+    if row_id != stream_entry_id or not isinstance(row_fields, dict):
+        return False
+    row_fingerprint = row_fields.get(_HANDOFF_FINGERPRINT_FIELD)
+    if isinstance(row_fingerprint, bytes):
+        row_fingerprint = row_fingerprint.decode("utf-8")
+    return row_fingerprint == fingerprint
+
+
+def _restore_credential_checkpoint(
+    redis: RedisClient,
+    task: Task,
+    target_stream: str,
+    tasks_stream: str,
+    entry_id: str,
+    logger: logging.Logger,
+) -> CredentialRecoveryOutcome:
+    """Restore an exact rotated-credential result before generic startup recovery."""
+    return _recover_private_credential_checkpoint(
+        redis,
+        task,
+        target_stream,
+        tasks_stream,
+        entry_id,
+        _fully_qualified_stream(redis, DEAD_LETTER_STREAM),
+        logger,
+        maxlen=_STREAM_MAXLEN,
+    )
+
+
+def _handoff_dead_letter_fields_until_terminal(
+    redis: RedisClient,
+    tasks_stream: str,
+    entry_id: str,
+    fields: dict[str, str],
+    task_id: str,
+    logger: logging.Logger,
+    abort_event: threading.Event | None = None,
+    *,
+    retry: bool = True,
+    coordination: CoordinationIdentity | None = None,
+) -> bool:
+    """Persist safe DLQ fields and ACK their source without duplicate writes."""
+    abort = abort_event if abort_event is not None else threading.Event()
+    target_stream = _fully_qualified_stream(redis, DEAD_LETTER_STREAM)
+    while True:
+        existing = _stream_handoff_state(
+            redis, target_stream, tasks_stream, entry_id, task_id, logger
+        )
+        if existing is True:
+            break
+        if existing is None:
+            if not retry or abort.wait(timeout=_EPHEMERAL_RESULT_RETRY_SECONDS):
+                return False
+            continue
+        try:
+            _atomic_xadd_capped_with_marker(
+                redis,
+                target_stream,
+                tasks_stream,
+                entry_id,
+                task_id,
+                fields,
+                raw_target=False,
+                logical_target=DEAD_LETTER_STREAM,
+            )
+            break
+        except Exception:
+            logger.error(
+                "Failed to publish dead-letter entry for task %s; retaining source and retrying",
+                task_id,
+                exc_info=True,
+            )
+            if not retry or abort.wait(timeout=_EPHEMERAL_RESULT_RETRY_SECONDS):
+                return False
+
+    if coordination is not None:
+        if retry:
+            cleanup_terminal = _cleanup_coordination_until_terminal(
+                redis, coordination, logger, abort
+            )
+        else:
+            try:
+                cleanup_terminal = _cleanup_coordination_once(redis, coordination)
+            except Exception:
+                logger.warning(
+                    "Startup coordination cleanup failed for task %s",
+                    coordination.task_id,
+                    exc_info=True,
+                )
+                cleanup_terminal = False
+        if not cleanup_terminal:
+            return False
+
+    if retry:
+        source_acked = _ack_source_entry_until_confirmed(
+            redis,
+            tasks_stream,
+            entry_id,
+            task_id,
+            logger,
+            abort,
+        )
+    else:
+        try:
+            redis.xack_raw(tasks_stream, CONSUMER_GROUP, entry_id)
+            source_acked = True
+        except Exception:
+            logger.error(
+                "Failed to ACK startup-recovery entry %s; preserving coordination",
+                entry_id,
+                exc_info=True,
+            )
+            source_acked = False
+    if source_acked:
+        _delete_handoff_marker_best_effort(
+            redis,
+            target_stream,
+            tasks_stream,
+            entry_id,
+            task_id,
+            logger,
+        )
+    return source_acked
+
+
+def _safe_raw_dead_letter_fields(
+    fields: dict[str, str],
+    tasks_stream: str,
+    entry_id: str,
+    reason: str,
+) -> dict[str, str]:
+    """Build a diagnostic payload without deserializing or persisting secrets."""
+    return _shared_safe_dead_letter_fields(fields, tasks_stream, entry_id, reason)
+
+
+def _malformed_coordination_identity(
+    fields: dict[str, str],
+    logger: logging.Logger,
+) -> CoordinationIdentity | None:
+    """Extract only the validated identity needed for atomic coordination cleanup."""
+    task_id = fields.get("id", "")
+    repo = fields.get("repo", "")
+    resource_type = fields.get("resource_type", "")
+    resource_id_raw = fields.get("resource_id", "")
+    if not task_id or not repo or resource_type not in {"pr", "issue"}:
+        logger.warning("Malformed task lacks a safe coordination identity; marker will expire")
+        return None
+    try:
+        resource_id = int(resource_id_raw)
+    except (TypeError, ValueError):
+        logger.warning("Malformed task has an invalid resource ID; marker will expire")
+        return None
+    return CoordinationIdentity(
+        task_id=task_id,
+        repo=repo,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        key_prefix=fields.get("key_prefix", ""),
+        snapshot_head_sha=fields.get("snapshot_head_sha", ""),
+    )
+
+
+def _handoff_result_until_terminal(
+    redis: RedisClient,
+    result: TaskResult,
+    task: Task,
+    logger: logging.Logger,
+    tasks_stream: str,
+    entry_id: str,
+    abort_event: threading.Event | None = None,
+) -> ResultHandoff:
+    """Publish a result, then remove its source entry without rerunning work.
+
+    Publication and XACK are separate Redis commands. Once publication is
+    durable, only XACK is retried so an ACK outage cannot duplicate results or
+    dead letters. Shutdown leaves the source PEL entry and coordination state
+    intact for startup/pool recovery.
+    """
+    abort = abort_event if abort_event is not None else threading.Event()
+    publish_outcome = _publish_result_with_retry(
+        redis,
+        result,
+        task,
+        logger,
+        tasks_stream,
+        entry_id,
+        abort_event=abort,
+    )
+    if publish_outcome is ResultPublishOutcome.BLOCKED:
+        return ResultHandoff(publish_outcome, source_acked=False)
+    while not publish_outcome.durable:
+        logger.error(
+            "Result publish failed for task %s; retaining its source entry and retrying",
+            task.id,
+        )
+        if abort.wait(timeout=_EPHEMERAL_RESULT_RETRY_SECONDS):
+            return ResultHandoff(publish_outcome, source_acked=False)
+        publish_outcome = _publish_result_with_retry(
+            redis,
+            result,
+            task,
+            logger,
+            tasks_stream,
+            entry_id,
+            abort_event=abort,
+        )
+        if publish_outcome is ResultPublishOutcome.BLOCKED:
+            return ResultHandoff(publish_outcome, source_acked=False)
+
+    if publish_outcome is ResultPublishOutcome.DEAD_LETTERED:
+        if not _cleanup_coordination_until_terminal(
+            redis,
+            _task_coordination_identity(task),
+            logger,
+            abort,
+        ):
+            return ResultHandoff(publish_outcome, source_acked=False)
+
+    result_target_stream = (
+        f"{task.key_prefix}:{RESULTS_STREAM}"
+        if task.key_prefix
+        else _fully_qualified_stream(redis, RESULTS_STREAM)
+    )
+    if publish_outcome is ResultPublishOutcome.PUBLISHED and result.credential_update:
+        # Credential publication is already terminal: its shared Lua script
+        # appends the exact result, ACKs this source, and deletes the private
+        # checkpoint in one idempotent operation.
+        source_acked = True
+    else:
+        source_acked = _ack_source_entry_until_confirmed(
+            redis,
+            tasks_stream,
+            entry_id,
+            task.id,
+            logger,
+            abort,
+        )
+    if source_acked:
+        if not (publish_outcome is ResultPublishOutcome.PUBLISHED and result.credential_update):
+            target_stream = (
+                result_target_stream
+                if publish_outcome is ResultPublishOutcome.PUBLISHED
+                else _fully_qualified_stream(redis, DEAD_LETTER_STREAM)
+            )
+            _delete_handoff_marker_best_effort(
+                redis,
+                target_stream,
+                tasks_stream,
+                entry_id,
+                task.id,
+                logger,
+            )
+        if result.credential_update:
+            _delete_handoff_marker_best_effort(
+                redis,
+                _fully_qualified_stream(redis, DEAD_LETTER_STREAM),
+                tasks_stream,
+                entry_id,
+                f"{_CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX}{task.id}",
+                logger,
+            )
+    return ResultHandoff(publish_outcome, source_acked)
 
 
 def _early_reject_unsupported_provider(
@@ -295,14 +919,18 @@ def _early_reject_unsupported_provider(
     logger: logging.Logger,
     current_stream: str,
     entry_id: str,
-) -> None:
-    """Publish a clean permanent FAILED for an unknown/missing provider and ACK.
+    abort_event: threading.Event | None = None,
+) -> ResultHandoff:
+    """Publish a clean permanent FAILED for an unknown/missing provider.
 
     This is the early graceful reject path (before lock, heartbeat, clone, or
     any runner work). The orchestrator will see a non-transient failure with
     an actionable summary telling operators to rebake the worker image.
     Credentials are never logged or leaked because we use the redacted path
     only for DL (if publish fails) and TaskResult itself contains no secrets.
+    The source task is ACKed only after either the result or its full recovery
+    payload is durable in Redis. Primary-result coordination remains for the
+    orchestrator consumer; DLQ coordination is cleared here.
     """
     summary = f"Rebake worker image to include {provider} CLI"
     result = _task_result(
@@ -313,31 +941,23 @@ def _early_reject_unsupported_provider(
         summary,
         0,
     )
-    _publish_result_with_retry(
+    handoff = _handoff_result_until_terminal(
         redis,
         result,
         task,
         logger,
         current_stream,
         entry_id,
+        abort_event=abort_event,
     )
-    try:
-        redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
-    except Exception:
+    if not handoff.terminal:
         logger.error(
-            f"Failed to ACK unsupported-provider task {task.id} (entry {entry_id})",
-            exc_info=True,
-        )
-    try:
-        _clear_pending_task_for_task(redis, task)
-        _clear_task_attempt_reservation(redis, task)
-    except Exception:
-        logger.warning(
-            "Failed to clear pending-task/attempt markers for unsupported "
-            f"provider task {task.resource_type} #{task.resource_id}",
-            exc_info=True,
+            "Unsupported-provider result for task %s has no terminal handoff; "
+            "leaving the source entry and coordination state pending",
+            task.id,
         )
     logger.info(f"Early graceful reject for task {task.id} (provider={provider})")
+    return handoff
 
 
 def _signal_ephemeral_done(
@@ -399,9 +1019,30 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         pr_fq = pr_stream
         issue_fq = issue_stream
 
+    # Install shutdown handling before any Redis retries so SIGTERM and an
+    # external stop request can interrupt startup ping backoff as well as
+    # recovery/result handoffs.
+    shutdown = False
+    shutdown_event = threading.Event()
+
+    def handle_signal(signum: int, frame: object) -> None:
+        nonlocal shutdown
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        shutdown = True
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    terminal_abort_event = (
+        _make_abort_event(shutdown_event, stop_event) if stop_event is not None else shutdown_event
+    )
+
     # Verify Redis connection with retry budget so a brief Redis restart
     # (e.g. during ``orcest fleet update``) doesn't kill the worker.
-    if not _wait_for_redis(redis, logger):
+    if not _wait_for_redis(redis, logger, terminal_abort_event):
+        if terminal_abort_event.is_set():
+            logger.info("Redis startup wait stopped by shutdown request")
+            return
         logger.error(
             "Redis unreachable after %d retries (~%ds); exiting for systemd to handle",
             _STARTUP_PING_RETRIES,
@@ -414,25 +1055,29 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     redis.ensure_consumer_group(issue_stream, CONSUMER_GROUP)
 
     # Drain pending tasks from previous worker lifecycle.
-    if not _drain_pending_tasks_raw(redis, pr_fq, config, logger):
+    pr_drain_complete, pr_drained = _drain_pending_tasks_raw(
+        redis, pr_fq, config, logger, abort_event=terminal_abort_event
+    )
+    if not pr_drain_complete:
+        if terminal_abort_event.is_set():
+            logger.info("Startup recovery stopped by shutdown request")
+            return
         logger.error("Pending PR-task recovery is not durable; exiting for a backed-off retry")
         raise SystemExit(1)
-    if not _drain_pending_tasks_raw(redis, issue_fq, config, logger):
+    issue_drain_complete, issue_drained = _drain_pending_tasks_raw(
+        redis, issue_fq, config, logger, abort_event=terminal_abort_event
+    )
+    if not issue_drain_complete:
+        if terminal_abort_event.is_set():
+            logger.info("Startup recovery stopped by shutdown request")
+            return
         logger.error("Pending issue-task recovery is not durable; exiting for a backed-off retry")
         raise SystemExit(1)
 
-    # Graceful shutdown
-    shutdown = False
-    shutdown_event = threading.Event()
-
-    def handle_signal(signum: int, frame: object) -> None:
-        nonlocal shutdown
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
-        shutdown = True
-        shutdown_event.set()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    if config.ephemeral and pr_drained + issue_drained > 0:
+        _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
+        logger.info("Ephemeral mode: recovered prior pending work, shutting down.")
+        return
 
     workspace = Workspace(config.workspace_dir)
     runner_mode = config.runner.extra.get("mode", "default")
@@ -493,18 +1138,32 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             continue  # Timeout, loop back to check shutdown
         try:
             task = Task.from_dict(fields)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError):
             logger.error(
-                f"Malformed task entry {entry_id}: {e}; ACKing to skip",
-                exc_info=True,
+                "Malformed task entry %s; routing redacted diagnostics to dead-letter recovery",
+                entry_id,
             )
-            try:
-                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
-            except Exception:
-                logger.error(
-                    f"Failed to ACK malformed entry {entry_id}",
-                    exc_info=True,
-                )
+            malformed_terminal = _handoff_dead_letter_fields_until_terminal(
+                redis,
+                current_stream,
+                entry_id,
+                _safe_raw_dead_letter_fields(
+                    fields,
+                    current_stream,
+                    entry_id,
+                    "Malformed task payload",
+                ),
+                fields.get("id", f"malformed:{entry_id}"),
+                logger,
+                terminal_abort_event,
+                coordination=_malformed_coordination_identity(fields, logger),
+            )
+            if config.ephemeral:
+                if malformed_terminal:
+                    _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
+                logger.info("Ephemeral mode: malformed task handled, shutting down.")
+                shutdown = True
+                shutdown_event.set()
             continue
 
         # === Early multi-provider dispatch (Task 6) ===
@@ -522,9 +1181,29 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 task.provider,
                 unsupported,
             )
-            _early_reject_unsupported_provider(
-                task, task.provider, config, redis, logger, current_stream, entry_id
+            handoff = _early_reject_unsupported_provider(
+                task,
+                task.provider,
+                config,
+                redis,
+                logger,
+                current_stream,
+                entry_id,
+                abort_event=terminal_abort_event,
             )
+
+            if config.ephemeral:
+                if handoff.terminal:
+                    _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
+                else:
+                    logger.error(
+                        "Ephemeral unsupported-provider task %s remains unACKed "
+                        "after shutdown; leaving it for recovery",
+                        task.id,
+                    )
+                logger.info("Ephemeral mode: unsupported task handled, shutting down.")
+                shutdown = True
+                shutdown_event.set()
             continue
 
         logger.info(
@@ -537,9 +1216,18 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # dead-letter stream instead of running Claude again.
         delivery_count = redis.xpending_count_raw(current_stream, CONSUMER_GROUP, entry_id)
         if delivery_count >= MAX_DELIVERY_COUNT:
-            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
+            dead_letter_terminal = _dead_letter_task(
+                redis,
+                current_stream,
+                entry_id,
+                task,
+                delivery_count,
+                logger,
+                abort_event=terminal_abort_event,
+            )
             if config.ephemeral:
-                _signal_ephemeral_done(redis, config, logger, shutdown_event)
+                if dead_letter_terminal:
+                    _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
                 logger.info("Ephemeral mode: dead-lettered task, shutting down.")
                 shutdown = True
                 shutdown_event.set()
@@ -575,22 +1263,35 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 
         if not lock.acquire():
             logger.warning(f"Lock {lock.key} already held, skipping task {task.id}")
-            # The stream entry is being discarded, so clear only this task's
-            # coordination markers. Otherwise a matching pending marker can
-            # strand the PR/issue until TTL even though the task was ACKed.
-            try:
-                _clear_pending_task_for_task(redis, task)
-                _clear_task_attempt_reservation(redis, task)
-            except Exception:
-                logger.warning(
-                    "Failed to clear skipped task coordination state for "
-                    f"{task.resource_type} #{task.resource_id}",
-                    exc_info=True,
-                )
-            try:
-                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
-            except Exception:
-                logger.error(f"Failed to ACK skipped task {task.id}", exc_info=True)
+            # Discarding an unrecorded entry would silently lose work. Publish
+            # a transient result so the orchestrator owns retry/coordination,
+            # then ACK through the same terminal boundary as executed tasks.
+            skipped_result = _task_result(
+                task,
+                config,
+                ResultStatus.FAILED,
+                task.branch,
+                (
+                    f"{TRANSIENT_SUMMARY_PREFIX}Another worker held the resource lock; "
+                    "this task was not executed."
+                ),
+                0,
+            )
+            handoff = _handoff_result_until_terminal(
+                redis,
+                skipped_result,
+                task,
+                logger,
+                current_stream,
+                entry_id,
+                abort_event=terminal_abort_event,
+            )
+            if config.ephemeral:
+                if handoff.terminal:
+                    _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
+                logger.info("Ephemeral mode: lock-contention task handled, shutting down.")
+                shutdown = True
+                shutdown_event.set()
             continue
 
         logger.info(f"Acquired lock {lock.key}")
@@ -601,13 +1302,22 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         delivery_count = redis.xpending_count_raw(current_stream, CONSUMER_GROUP, entry_id)
         if delivery_count >= MAX_DELIVERY_COUNT:
             lock.release()
-            _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
+            dead_letter_terminal = _dead_letter_task(
+                redis,
+                current_stream,
+                entry_id,
+                task,
+                delivery_count,
+                logger,
+                abort_event=terminal_abort_event,
+            )
             if config.ephemeral:
                 # Ephemeral workers must exit after encountering any task,
                 # including dead-lettered ones.  Without this the worker
                 # would loop indefinitely on an empty queue until the pool
                 # manager's SIGTERM timeout fires, wasting a VM slot.
-                _signal_ephemeral_done(redis, config, logger, shutdown_event)
+                if dead_letter_terminal:
+                    _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
                 logger.info("Ephemeral mode: dead-lettered task, shutting down.")
                 shutdown = True
                 shutdown_event.set()
@@ -629,7 +1339,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # a SIGTERM immediately wakes retry-backoff sleeps inside run_claude.
         # Before PR #98 the abort_event was shutdown_event directly; after that
         # refactor it became lock_lost alone, losing the SIGTERM fast-exit path.
-        abort_event = _make_abort_event(lock_lost, shutdown_event)
+        abort_event = _make_abort_event(lock_lost, terminal_abort_event)
         try:
             result = _execute_task(
                 task,
@@ -652,7 +1362,13 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # Normal path: stop heartbeat and release lock
             heartbeat.stop()
             # safe no-op if lock already expired — release() verifies owner token via Lua
-            lock.release()
+            lock_released = lock.release()
+            if not lock_released:
+                lock_lost.set()
+                logger.warning(
+                    "Could not confirm release ownership for lock %s; treating result as stale",
+                    lock.key,
+                )
             if lock_lost.is_set():
                 logger.warning(f"Lock {lock.key} was lost during task execution; task aborted")
                 result = _task_result(
@@ -672,54 +1388,36 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             # already set by the heartbeat callback.
             lock_lost.set()
 
-        # Publish result with retry + dead-letter fallback; ACK only on success.
-        published = _publish_result_with_retry(
+        # Retain every worker until publication and source acknowledgement are
+        # both terminal. Publication is never repeated merely because XACK
+        # failed; shutdown preserves the PEL entry for recovery.
+        handoff = _handoff_result_until_terminal(
             redis,
             result,
             task,
             logger,
             current_stream,
             entry_id,
-            abort_event=shutdown_event,
+            abort_event=terminal_abort_event,
         )
+        publish_outcome = handoff.publish_outcome
 
-        # No ephemeral worker may exit normally while the only copy of its
-        # result is still in its local PEL. Keep retrying until Redis accepts
-        # it; an explicit shutdown leaves the entry recoverable.
-        while config.ephemeral and not published:
-            logger.error(
-                "Result publish failed for ephemeral task %s; retaining worker and retrying",
-                task.id,
-            )
-            if shutdown_event.wait(timeout=_EPHEMERAL_RESULT_RETRY_SECONDS):
-                break
-            published = _publish_result_with_retry(
-                redis,
-                result,
-                task,
-                logger,
-                current_stream,
-                entry_id,
-                abort_event=shutdown_event,
-            )
-
-        if published:
-            logger.info(f"Published result for task {task.id}: {result.status.value}")
-
-            try:
-                redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
-            except Exception:
+        if handoff.terminal:
+            if publish_outcome is ResultPublishOutcome.PUBLISHED:
+                logger.info(f"Published result for task {task.id}: {result.status.value}")
+            else:
                 logger.error(
-                    f"Failed to ACK task {task.id} (will be redelivered)",
-                    exc_info=True,
+                    "Result for task %s was durably dead-lettered for manual recovery",
+                    task.id,
                 )
 
         # Ephemeral mode: signal pool manager and exit after one task.
-        # Exit regardless of publish success.  If result publication failed,
-        # leave the stream entry unACKed and coordination markers intact so the
-        # pool manager can publish a recovery result before destroying the VM.
+        # Exit after one task. If neither result nor recovery payload became
+        # durable, leave the stream entry unACKed and coordination markers
+        # intact so the pool manager can publish a recovery result before
+        # destroying the VM.
         if config.ephemeral:
-            if not published:
+            if not handoff.terminal:
                 if config.pool_managed:
                     logger.error(
                         "Pool-managed task %s is still unACKed after shutdown; "
@@ -732,21 +1430,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                         "restart with the same worker id to resume recovery",
                         task.id,
                     )
-            if published:
-                _signal_ephemeral_done(redis, config, logger, shutdown_event)
+            if handoff.terminal:
+                _signal_ephemeral_done(redis, config, logger, terminal_abort_event)
             logger.info("Ephemeral mode: task complete, shutting down.")
             shutdown = True
             shutdown_event.set()  # Must mirror handle_signal; abort_event watches this
-        elif not published:
-            try:
-                _clear_pending_task_for_task(redis, task)
-                _clear_task_attempt_reservation(redis, task)
-            except Exception:
-                logger.warning(
-                    "Failed to clear pending task marker for "
-                    f"{task.resource_type} #{task.resource_id} after publish failure",
-                    exc_info=True,
-                )
+        elif not handoff.terminal:
             continue
 
     logger.info("Worker shut down cleanly.")
@@ -755,8 +1444,8 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
 def _pending_task_id_for_task(redis: RedisClient, task: Task) -> str | None:
     """Return the task_id currently recorded in the pending marker for ``task``.
 
-    Routed by ``task.key_prefix`` to mirror ``_clear_pending_task_for_task`` so
-    multi-project markers are read from the correct namespace. Returns None when
+    Routed by ``task.key_prefix`` so multi-project markers are read from the
+    correct namespace. Returns None when
     no marker is present. Absence alone is not proof of completion because the
     marker can expire or be lost while the stream entry remains pending.
     """
@@ -774,14 +1463,18 @@ def _drain_pending_tasks_raw(
     fq_stream: str,
     config: WorkerConfig,
     logger: logging.Logger,
-) -> bool:
+    abort_event: threading.Event | None = None,
+) -> tuple[bool, int]:
     """Drain pending tasks from a fully-qualified stream name.
 
     Uses raw (un-prefixed) Redis operations since the stream name is
     already fully qualified (e.g. ``orcest:tasks:claude``).
     """
+    abort = abort_event if abort_event is not None else threading.Event()
     drained = 0
     while True:
+        if abort.is_set():
+            return False, drained
         result = redis.xreadgroup_multi(
             streams={fq_stream: "0"},
             group=CONSUMER_GROUP,
@@ -792,18 +1485,45 @@ def _drain_pending_tasks_raw(
         if not result:
             break
         for stream_name, entry_id, fields in result:
+            if abort.is_set():
+                return False, drained
             drained += 1
             task: Task | None = None
             recovery_result_published = False
+            recovery_dead_lettered = False
             should_publish_recovery = False
-            marker_matches_task = False
+            source_acked = False
             try:
                 task = Task.from_dict(fields)
                 logger.warning(
                     f"Recovering pending task {task.id} ({task.type.value} "
-                    f"for {task.resource_type} #{task.resource_id}) — "
-                    f"publishing FAILED result"
+                    f"for {task.resource_type} #{task.resource_id})"
                 )
+                result_stream = (
+                    f"{task.key_prefix}:{RESULTS_STREAM}"
+                    if task.key_prefix
+                    else _fully_qualified_stream(redis, RESULTS_STREAM)
+                )
+                credential_recovery = _restore_credential_checkpoint(
+                    redis,
+                    task,
+                    result_stream,
+                    fq_stream,
+                    entry_id,
+                    logger,
+                )
+                if credential_recovery is CredentialRecoveryOutcome.BLOCKED:
+                    return False, drained
+                if credential_recovery is CredentialRecoveryOutcome.RECOVERED:
+                    _delete_handoff_marker_best_effort(
+                        redis,
+                        _fully_qualified_stream(redis, DEAD_LETTER_STREAM),
+                        fq_stream,
+                        entry_id,
+                        f"{_CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX}{task.id}",
+                        logger,
+                    )
+                    continue
                 # Dedup/staleness guard (M4-conc): only publish a recovery
                 # FAILED unless the pending marker points at a DIFFERENT task.
                 # A missing marker is ambiguous (it can expire or be lost while
@@ -811,19 +1531,11 @@ def _drain_pending_tasks_raw(
                 # A newer task id is authoritative and suppresses this stale
                 # replay. Marker read errors likewise publish recovery.
                 #
-                # ``marker_matches_task`` also gates the attempt-reservation
-                # clear below (Case B): when the marker points at a NEWER task,
-                # that newer task owns the reservation now, so the suppressed
-                # stale duplicate must NOT delete it (for issues the clear is an
-                # unconditional DELETE of the attempts key — it would wipe the
-                # newer in-flight task's counter).
                 should_publish_recovery = True
-                marker_matches_task = True
                 try:
                     current_pending_id = _pending_task_id_for_task(redis, task)
                     if current_pending_id is not None and current_pending_id != task.id:
                         should_publish_recovery = False
-                        marker_matches_task = False
                         logger.info(
                             "Skipping duplicate recovery result for %s #%d: "
                             "pending marker no longer matches task %s (now %r); "
@@ -853,63 +1565,127 @@ def _drain_pending_tasks_raw(
                         ),
                         0,
                     )
-                    try:
-                        # Publish result to the correct project's results stream
-                        if task.key_prefix:
-                            fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                            redis.xadd_capped_raw(
-                                fq_results, task_result.to_dict(), maxlen=_STREAM_MAXLEN
-                            )
-                        else:
-                            redis.xadd_capped(
-                                RESULTS_STREAM, task_result.to_dict(), maxlen=_STREAM_MAXLEN
-                            )
+                    recovery_dead_lettered_state = _stream_handoff_state(
+                        redis,
+                        _fully_qualified_stream(redis, DEAD_LETTER_STREAM),
+                        fq_stream,
+                        entry_id,
+                        task.id,
+                        logger,
+                    )
+                    if recovery_dead_lettered_state is None:
+                        return False, drained
+                    recovery_dead_lettered = recovery_dead_lettered_state
+                    already_published = _stream_handoff_state(
+                        redis,
+                        result_stream,
+                        fq_stream,
+                        entry_id,
+                        task.id,
+                        logger,
+                    )
+                    if already_published is None:
+                        return False, drained
+                    if already_published or recovery_dead_lettered:
                         recovery_result_published = True
-                    except Exception:
-                        logger.error(
-                            f"Failed to publish recovery result for task {task.id}",
-                            exc_info=True,
-                        )
+                    else:
+                        try:
+                            # Publish result to the correct project's results stream
+                            if task.key_prefix:
+                                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
+                                _atomic_xadd_capped_with_marker(
+                                    redis,
+                                    fq_results,
+                                    fq_stream,
+                                    entry_id,
+                                    task.id,
+                                    task_result.to_dict(),
+                                    raw_target=True,
+                                    logical_target=RESULTS_STREAM,
+                                )
+                            else:
+                                _atomic_xadd_capped_with_marker(
+                                    redis,
+                                    _fully_qualified_stream(redis, RESULTS_STREAM),
+                                    fq_stream,
+                                    entry_id,
+                                    task.id,
+                                    task_result.to_dict(),
+                                    raw_target=False,
+                                    logical_target=RESULTS_STREAM,
+                                )
+                            recovery_result_published = True
+                        except Exception:
+                            logger.error(
+                                f"Failed to publish recovery result for task {task.id}",
+                                exc_info=True,
+                            )
             except (KeyError, ValueError) as e:
                 logger.error(
-                    f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
+                    f"Malformed pending entry {entry_id}: {e}; dead-lettering safely",
                     exc_info=True,
                 )
+                source_acked = _handoff_dead_letter_fields_until_terminal(
+                    redis,
+                    fq_stream,
+                    entry_id,
+                    _safe_raw_dead_letter_fields(
+                        fields,
+                        fq_stream,
+                        entry_id,
+                        f"Malformed pending task payload: {e}",
+                    ),
+                    fields.get("id", f"malformed:{entry_id}"),
+                    logger,
+                    abort,
+                    retry=False,
+                    coordination=_malformed_coordination_identity(fields, logger),
+                )
+                if not source_acked:
+                    return False, drained
             # Do not ACK a valid task until its recovery result is durable (or
             # a different pending task proves this entry stale). Otherwise a
             # Redis outage can erase the only recoverable handoff.
             should_ack = task is None or recovery_result_published or not should_publish_recovery
-            if should_ack:
+            if task is not None and recovery_dead_lettered:
+                try:
+                    if not _cleanup_coordination_once(redis, _task_coordination_identity(task)):
+                        return False, drained
+                except Exception:
+                    logger.warning(
+                        "Startup DLQ coordination cleanup failed for task %s",
+                        task.id,
+                        exc_info=True,
+                    )
+                    return False, drained
+            if should_ack and not source_acked:
                 try:
                     redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
+                    source_acked = True
                 except Exception:
                     logger.error(
                         f"Failed to ACK pending entry {entry_id}",
                         exc_info=True,
                     )
-            if task is not None and should_ack:
-                try:
-                    # ``_clear_pending_task_for_task`` is CAS-guarded (only
-                    # deletes when the marker still equals task.id), so it is a
-                    # safe no-op when the marker points at a newer task.
-                    _clear_pending_task_for_task(redis, task)
-                    # Clear the attempt reservation only when no result was
-                    # published and the marker still points at THIS task. When
-                    # the marker points at a newer task
-                    # (``marker_matches_task`` is False), that newer in-flight
-                    # task owns the reservation now; clearing it here would wipe
-                    # its counter (M4-conc Case B) — the issue clear is an
-                    # unconditional DELETE with no SHA guard. When the marker is
-                    # gone the original result already cleared/managed the
-                    # reservation via the orchestrator, so there is nothing this
-                    # path needs to clear either.
-                    if not recovery_result_published and marker_matches_task:
-                        _clear_task_attempt_reservation(redis, task)
-                except Exception:
-                    logger.warning(
-                        "Failed to clear pending task marker for "
-                        f"{task.resource_type} #{task.resource_id} during drain",
-                        exc_info=True,
+                    return False, drained
+            if source_acked and task is not None:
+                if recovery_result_published:
+                    _delete_handoff_marker_best_effort(
+                        redis,
+                        result_stream,
+                        fq_stream,
+                        entry_id,
+                        task.id,
+                        logger,
+                    )
+                if recovery_dead_lettered:
+                    _delete_handoff_marker_best_effort(
+                        redis,
+                        _fully_qualified_stream(redis, DEAD_LETTER_STREAM),
+                        fq_stream,
+                        entry_id,
+                        task.id,
+                        logger,
                     )
             if task is not None and should_publish_recovery and not recovery_result_published:
                 # Preserve the PEL entry, but stop this drain pass. Reading ID
@@ -920,10 +1696,10 @@ def _drain_pending_tasks_raw(
                     "the PEL entry will be retried on the next worker restart",
                     task.id,
                 )
-                return False
+                return False, drained
     if drained:
         logger.info(f"Drained {drained} pending task(s) from {fq_stream}")
-    return True
+    return True, drained
 
 
 def _dead_letter_task(
@@ -933,66 +1709,41 @@ def _dead_letter_task(
     task: Task,
     delivery_count: int,
     logger: logging.Logger,
-) -> None:
+    abort_event: threading.Event | None = None,
+) -> bool:
     """Route a task that has exceeded MAX_DELIVERY_COUNT to the dead-letter stream.
 
-    Publishes the task payload to DEAD_LETTER_STREAM with metadata explaining
-    why it was dead-lettered, then ACKs the original entry so the main stream
-    does not stall.  ACK happens even if the dead-letter publish fails so the
-    worker can make progress.
-
-    Also clears the pending-task marker so the orchestrator can re-enqueue
-    work for this resource immediately rather than waiting for marker TTL
-    expiry (~95 min).
-
-    At-least-once delivery caveat: if ``xadd_capped`` succeeds but the
-    subsequent ``xack`` fails, the entry remains in the PEL.  The next time
-    it is reclaimed its delivery count will still exceed MAX_DELIVERY_COUNT,
-    causing ``_dead_letter_task`` to fire again and produce a duplicate entry
-    in DEAD_LETTER_STREAM.  Consumers of that stream must therefore
-    de-duplicate on ``original_entry_id``.
+    The dead-letter write is the durability boundary. Once it succeeds, only
+    XACK is retried, preventing an ACK outage from creating repeated DLQ rows.
+    Coordination is released only after ACK succeeds and this task's pending
+    marker is atomically cleared. Returns whether the complete handoff is
+    terminal; shutdown preserves the source PEL entry on any incomplete step.
     """
-    try:
-        # Use safe projection so credentials never land in the dead-letter stream
-        # (systematic redaction layer, Task 2 / security review).
-        dl_fields = {
-            **task.to_safe_dict(),
-            "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
-            "tasks_stream": tasks_stream,
-            "original_entry_id": entry_id,
-            "delivery_count": str(delivery_count),
-        }
-        redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
-        logger.error(
-            f"Task {task.id} ({task.type.value} for {task.resource_type} "
-            f"#{task.resource_id}) exceeded max delivery count "
-            f"({MAX_DELIVERY_COUNT}); routed to {DEAD_LETTER_STREAM!r}"
-        )
-    except Exception:
-        logger.error(
-            f"Failed to publish dead-letter entry for task {task.id}; ACKing anyway",
-            exc_info=True,
-        )
-    try:
-        redis.xack_raw(tasks_stream, CONSUMER_GROUP, entry_id)
-    except Exception:
-        logger.error(
-            f"Failed to ACK dead-lettered task {task.id} (entry {entry_id})",
-            exc_info=True,
-        )
-    # Clear the pending-task marker so the orchestrator can re-enqueue
-    # promptly.  Dead-lettered tasks never produce a result on RESULTS_STREAM,
-    # so the orchestrator's normal _handle_result path never fires; without
-    # this the marker lingers until TTL expiry (~95 min with defaults).
-    try:
-        _clear_pending_task_for_task(redis, task)
-        _clear_task_attempt_reservation(redis, task)
-    except Exception:
-        logger.warning(
-            "Failed to clear pending task marker for "
-            f"{task.resource_type} #{task.resource_id} during dead-letter",
-            exc_info=True,
-        )
+    dl_fields = {
+        **task.to_safe_dict(),
+        "dead_letter_reason": f"Exceeded max delivery count ({MAX_DELIVERY_COUNT})",
+        "tasks_stream": tasks_stream,
+        "original_entry_id": entry_id,
+        "delivery_count": str(delivery_count),
+    }
+    terminal = _handoff_dead_letter_fields_until_terminal(
+        redis,
+        tasks_stream,
+        entry_id,
+        dl_fields,
+        task.id,
+        logger,
+        abort_event,
+        coordination=_task_coordination_identity(task),
+    )
+    if not terminal:
+        return False
+    logger.error(
+        f"Task {task.id} ({task.type.value} for {task.resource_type} "
+        f"#{task.resource_id}) exceeded max delivery count "
+        f"({MAX_DELIVERY_COUNT}); routed to {DEAD_LETTER_STREAM!r}"
+    )
+    return True
 
 
 def _publish_result_with_retry(
@@ -1003,7 +1754,7 @@ def _publish_result_with_retry(
     tasks_stream: str,
     entry_id: str,
     abort_event: threading.Event | None = None,
-) -> bool:
+) -> ResultPublishOutcome:
     """Publish a task result to RESULTS_STREAM with exponential backoff retry.
 
     Attempts up to _RESULT_PUBLISH_RETRIES times, sleeping _RESULT_PUBLISH_BACKOFF
@@ -1012,49 +1763,173 @@ def _publish_result_with_retry(
     entry includes ``tasks_stream`` and ``original_entry_id`` so that
     ``orcest dead-letters --replay`` can re-enqueue it.
 
-    Returns True if the result was successfully published to RESULTS_STREAM,
-    False if all attempts fail (dead-letter write may or may not have succeeded)
-    or if ``abort_event`` is set during a backoff wait (no dead-letter written).
+    Returns a distinct outcome for a primary result publish, a durable
+    dead-letter fallback, total publish loss, or an aborted backoff. Callers
+    may ACK the source task only when ``outcome.durable`` is true.
     """
     last_exc: Exception | None = None
+    result_target_stream = (
+        f"{task.key_prefix}:{RESULTS_STREAM}"
+        if task.key_prefix
+        else _fully_qualified_stream(redis, RESULTS_STREAM)
+    )
+    result_fields: dict[str, str] | None = None
+    credential_checkpoint = None
     # Callers that omit abort_event get a fresh, never-set Event, which means
     # _abort.wait() will block for the full real backoff duration on each retry.
     _abort = abort_event if abort_event is not None else threading.Event()
     for attempt in range(_RESULT_PUBLISH_RETRIES):
         if attempt > 0:
             if _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1]):
-                return False
+                return ResultPublishOutcome.ABORTED
         try:
-            if result.credential_update and result.credential_update_minted_at <= 0:
-                # Use one trusted Redis clock/sequence for every worker VM.
-                # Independent filesystem mtimes can reorder rotating refresh
-                # tokens when VM clocks differ.
-                result.credential_update_minted_at = redis.next_monotonic_version(
-                    _CREDENTIAL_UPDATE_VERSION_KEY
-                )
             result_fields = result.to_dict()
             if not result_fields.get("repo"):
                 result_fields["repo"] = task.repo
-            # Publish to the correct project's results stream
-            if task.key_prefix:
-                fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                redis.xadd_capped_raw(fq_results, result_fields, maxlen=_STREAM_MAXLEN)
+            if result.credential_update:
+                if credential_checkpoint is None:
+                    checkpoint_status, credential_checkpoint = _load_private_credential_checkpoint(
+                        redis,
+                        result_target_stream,
+                        tasks_stream,
+                        entry_id,
+                        task,
+                        logger,
+                    )
+                    if checkpoint_status is CredentialCheckpointStatus.BLOCKED:
+                        logger.error(
+                            "Private credential state is blocked for task %s; "
+                            "refusing retries or public diagnostics",
+                            task.id,
+                        )
+                        return ResultPublishOutcome.BLOCKED
+                    if checkpoint_status is CredentialCheckpointStatus.ABSENT:
+                        credential_checkpoint = _store_private_credential_checkpoint(
+                            redis,
+                            result_target_stream,
+                            tasks_stream,
+                            entry_id,
+                            task.id,
+                            result_fields,
+                        )
+                assert credential_checkpoint is not None
+                credential_checkpoint = _version_credential_checkpoint(
+                    redis,
+                    credential_checkpoint,
+                    result_target_stream,
+                    tasks_stream,
+                    entry_id,
+                    task.id,
+                )
+                result_fields = credential_checkpoint.result_fields
+                result.credential_update_minted_at = TaskResult.from_dict(
+                    result_fields
+                ).credential_update_minted_at
+                terminal_outcome = _terminal_credential_handoff_once(
+                    redis,
+                    credential_checkpoint,
+                    result_target_stream,
+                    tasks_stream,
+                    entry_id,
+                    task.id,
+                    maxlen=_STREAM_MAXLEN,
+                )
+                if terminal_outcome is not CredentialTerminalOutcome.COMPLETE:
+                    logger.error(
+                        "Credential terminal handoff is blocked for task %s (%s); "
+                        "refusing to recreate or republish private state",
+                        task.id,
+                        terminal_outcome.value,
+                    )
+                    return ResultPublishOutcome.BLOCKED
             else:
-                redis.xadd_capped(RESULTS_STREAM, result_fields, maxlen=_STREAM_MAXLEN)
-            return True
+                # Ordinary results retain the bounded publish marker followed
+                # by a separately retried source ACK.
+                _atomic_xadd_capped_with_marker(
+                    redis,
+                    result_target_stream,
+                    tasks_stream,
+                    entry_id,
+                    task.id,
+                    result_fields,
+                    raw_target=bool(task.key_prefix),
+                    logical_target=RESULTS_STREAM,
+                )
+            return ResultPublishOutcome.PUBLISHED
         except Exception as exc:
             last_exc = exc
+            if (
+                result.credential_update
+                and result_fields is not None
+                and credential_checkpoint is None
+            ):
+                try:
+                    status, _checkpoint = _load_private_credential_checkpoint(
+                        redis,
+                        result_target_stream,
+                        tasks_stream,
+                        entry_id,
+                        task,
+                        logger,
+                    )
+                    if status is CredentialCheckpointStatus.ABSENT:
+                        _store_credential_checkpoint(
+                            redis,
+                            result_target_stream,
+                            tasks_stream,
+                            entry_id,
+                            task.id,
+                            result_fields,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist private credential recovery checkpoint for task %s",
+                        task.id,
+                        exc_info=True,
+                    )
             logger.warning(
                 f"Result publish attempt {attempt + 1}/{_RESULT_PUBLISH_RETRIES} "
                 f"failed for task {result.task_id}: {exc}"
             )
 
+    if result.credential_update:
+        if result_fields is None:
+            logger.error(
+                "Credential-update result for task %s could not be checkpointed; "
+                "retaining source without public recovery",
+                task.id,
+            )
+            return ResultPublishOutcome.LOST
     # All retries exhausted — send to dead-letter stream for manual recovery.
     logger.error(
         f"All {_RESULT_PUBLISH_RETRIES} result publish attempts failed for task "
         f"{result.task_id}; writing to {DEAD_LETTER_STREAM!r}",
         exc_info=last_exc,
     )
+    dead_letter_stream = _fully_qualified_stream(redis, DEAD_LETTER_STREAM)
+    # A redacted diagnostic cannot replay a rotated credential. Keep its
+    # idempotency marker separate from the terminal DLQ identity inspected by
+    # startup recovery, so a restart still publishes a primary recovery result
+    # before ACKing the source task.
+    dead_letter_handoff_id = (
+        f"{_CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX}{task.id}" if result.credential_update else task.id
+    )
+    existing_dead_letter = _stream_handoff_state(
+        redis,
+        dead_letter_stream,
+        tasks_stream,
+        entry_id,
+        dead_letter_handoff_id,
+        logger,
+    )
+    if existing_dead_letter is True:
+        return (
+            ResultPublishOutcome.LOST
+            if result.credential_update
+            else ResultPublishOutcome.DEAD_LETTERED
+        )
+    if existing_dead_letter is None:
+        return ResultPublishOutcome.LOST
     try:
         # Use safe projections so credentials never land in the dead-letter
         # stream (a persistent, human-inspected recovery stream). The task
@@ -1072,18 +1947,35 @@ def _publish_result_with_retry(
             "tasks_stream": tasks_stream,
             "original_entry_id": entry_id,
         }
-        redis.xadd_capped(DEAD_LETTER_STREAM, dl_fields, maxlen=_STREAM_MAXLEN)
+        _atomic_xadd_capped_with_marker(
+            redis,
+            dead_letter_stream,
+            tasks_stream,
+            entry_id,
+            dead_letter_handoff_id,
+            dl_fields,
+            raw_target=False,
+            logical_target=DEAD_LETTER_STREAM,
+        )
         logger.error(
             f"Result for task {result.task_id} written to dead-letter stream "
             f"{DEAD_LETTER_STREAM!r} for manual recovery"
         )
+        if result.credential_update:
+            logger.error(
+                "Task %s carries a credential rotation; redacted diagnostics are not a "
+                "terminal handoff, so the source remains pending",
+                result.task_id,
+            )
+            return ResultPublishOutcome.LOST
+        return ResultPublishOutcome.DEAD_LETTERED
     except Exception:
         logger.error(
             f"Failed to write result for task {result.task_id} to dead-letter stream; "
             "result is permanently lost",
             exc_info=True,
         )
-    return False
+    return ResultPublishOutcome.LOST
 
 
 def _task_result(

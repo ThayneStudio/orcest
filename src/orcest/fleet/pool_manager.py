@@ -28,8 +28,17 @@ from orcest.shared.coordination import (
     make_pending_task_key,
     parse_pending_task_metadata,
 )
+from orcest.shared.credential_handoff import (
+    CredentialRecoveryOutcome,
+    handoff_marker_key,
+    publish_handoff_once,
+    recover_credential_checkpoint,
+    safe_dead_letter_fields,
+    source_entry_pending_state,
+)
 from orcest.shared.models import (
     CONSUMER_GROUP,
+    DEAD_LETTER_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -1010,12 +1019,17 @@ class PoolManager:
                     elapsed,
                     max_duration,
                 )
-                # Reap coordination FIRST: clear the pending marker, release the
-                # PEL slot, and publish a transient-FAILED result so the
-                # orchestrator re-enqueues instead of waiting out the ~4.6h
-                # marker TTL. Redis read/publish failures are not a commit point:
-                # keep the active marker and retry next pass instead of destroying
-                # a VM whose pending entries were not recovered.
+                # Fence the worker before inspecting its PEL or private recovery
+                # state. Otherwise it can publish a late success/rotation while
+                # the reaper concurrently publishes failure and ACKs its source.
+                # A stopped VM also bounds billing while Redis recovery retries.
+                if not self._stop_vm(vm_id):
+                    logger.warning(
+                        "VM %d exceeded max task duration but could not be stopped; "
+                        "preserving Redis state for retry",
+                        vm_id,
+                    )
+                    continue
                 try:
                     coordinated = self._coordinate_reaped_vm(vm_id)
                 except Exception:
@@ -1029,13 +1043,11 @@ class PoolManager:
                 if not coordinated:
                     logger.warning(
                         "VM %d exceeded max task duration but Redis recovery is incomplete; "
-                        "stopping VM to cap billing, preserving Redis state for retry",
+                        "leaving the fenced VM stopped and preserving Redis state for retry",
                         vm_id,
                     )
-                    self._stop_vm(vm_id)
                     continue
-                # _destroy_vm handles all exceptions internally.
-                self._destroy_vm(vm_id)
+                self._destroy_stopped_vm(vm_id)
 
     def _reconcile_orphans(self) -> None:
         """Detect and clean up orphaned VMs not tracked in Redis.
@@ -1487,12 +1499,88 @@ class PoolManager:
                     task = Task.from_dict(fields)
                 except (KeyError, ValueError):
                     logger.warning(
-                        "Reaped VM %d: malformed pending entry %s on %s; ACKing to release it",
+                        "Reaped VM %d: malformed pending entry %s on %s; "
+                        "routing redacted diagnostics before ACK",
                         vm_id,
                         entry_id,
                         fq_stream,
                     )
-                    self._safe_xack(fq_stream, entry_id)
+                    malformed_id = fields.get("id") or f"malformed:{entry_id}"
+                    try:
+                        publish_handoff_once(
+                            self._redis,
+                            self._fq_task_stream(DEAD_LETTER_STREAM),
+                            fq_stream,
+                            entry_id,
+                            malformed_id,
+                            safe_dead_letter_fields(
+                                fields,
+                                fq_stream,
+                                entry_id,
+                                "Malformed task payload",
+                            ),
+                            maxlen=_RESULT_MAXLEN,
+                            marker_ttl_seconds=None,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Reaped VM %d: failed to publish redacted malformed-task "
+                            "diagnostics for entry %s on %s",
+                            vm_id,
+                            entry_id,
+                            fq_stream,
+                            exc_info=True,
+                        )
+                        unrecovered_entries = True
+                        continue
+                    if not self._safe_xack(fq_stream, entry_id):
+                        unrecovered_entries = True
+                    else:
+                        try:
+                            self._redis.client.delete(
+                                handoff_marker_key(
+                                    self._fq_task_stream(DEAD_LETTER_STREAM),
+                                    fq_stream,
+                                    entry_id,
+                                    malformed_id,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Reaped malformed entry %s: failed to delete completed "
+                                "nonsecret handoff receipt",
+                                entry_id,
+                                exc_info=True,
+                            )
+                    continue
+                result_stream = (
+                    f"{task.key_prefix}:{_RESULTS_STREAM}"
+                    if task.key_prefix
+                    else self._fq_task_stream(_RESULTS_STREAM)
+                )
+                credential_recovery = recover_credential_checkpoint(
+                    self._redis,
+                    task,
+                    result_stream,
+                    fq_stream,
+                    entry_id,
+                    self._fq_task_stream(DEAD_LETTER_STREAM),
+                    logger,
+                    maxlen=_RESULT_MAXLEN,
+                )
+                if credential_recovery is CredentialRecoveryOutcome.BLOCKED:
+                    logger.error(
+                        "Reaped VM %d: private credential recovery for task %s is "
+                        "incomplete; refusing generic failure/ACK",
+                        vm_id,
+                        task.id,
+                    )
+                    unrecovered_entries = True
+                    continue
+                if credential_recovery is CredentialRecoveryOutcome.RECOVERED:
+                    # The exact credential result and source XACK committed
+                    # together.  Its orchestrator pending marker intentionally
+                    # remains for normal result consumption.
                     continue
                 already_resolved = self._task_already_resolved(task)
                 if already_resolved is None:
@@ -1505,13 +1593,15 @@ class PoolManager:
                         vm_id,
                         task.id,
                     )
-                    self._safe_xack(fq_stream, entry_id)
+                    if not self._safe_xack(fq_stream, entry_id):
+                        unrecovered_entries = True
                     continue
                 if not self._publish_reaped_failure(task):
                     unrecovered_entries = True
                     continue
                 self._clear_reaped_pending_marker(task)
-                self._safe_xack(fq_stream, entry_id)
+                if not self._safe_xack(fq_stream, entry_id):
+                    unrecovered_entries = True
             if unrecovered_entries:
                 logger.warning(
                     "Reaped VM %d: leaving consumer %s on %s because one or more "
@@ -1753,13 +1843,28 @@ class PoolManager:
             return False
         return True
 
-    def _safe_xack(self, fq_stream: str, entry_id: str) -> None:
+    def _safe_xack(self, fq_stream: str, entry_id: str) -> bool:
         try:
             self._redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
+            return True
         except Exception:
+            pending = source_entry_pending_state(self._redis, fq_stream, entry_id)
+            if pending is False:
+                logger.warning(
+                    "ACK response was ambiguous for reaped entry %s on %s, but exact "
+                    "XPENDING confirms it is terminal",
+                    entry_id,
+                    fq_stream,
+                )
+                return True
             logger.warning(
-                "Failed to ACK reaped entry %s on %s", entry_id, fq_stream, exc_info=True
+                "Failed to ACK reaped entry %s on %s; exact pending state is %s",
+                entry_id,
+                fq_stream,
+                "present" if pending else "unknown",
+                exc_info=True,
             )
+            return False
 
     # ── orphan-PEL sweeper (H3-conc) ─────────────────────────
 

@@ -133,6 +133,7 @@ class RedisClient:
         count: int = 1,
         block_ms: int | None = 5000,
         pending: bool = False,
+        pending_start_id: str = "0",
     ) -> list[tuple[str, dict[str, str]]]:
         """Read entries from a consumer group.
 
@@ -149,9 +150,13 @@ class RedisClient:
                 ``0`` means block indefinitely.
                 A positive integer means block for that many milliseconds.
             pending: If True, read pending entries (delivered but not ACKed)
-                instead of new ones. Uses ID ``"0"`` instead of ``">"``.
+                instead of new ones.
+            pending_start_id: When ``pending`` is true, return entries with IDs
+                greater than this ID. Advancing this cursor lets callers make one
+                bounded pass over a consumer's PEL even when earlier entries must
+                remain unacknowledged. Ignored when reading new entries.
         """
-        entry_id = "0" if pending else ">"
+        entry_id = pending_start_id if pending else ">"
         result = cast(
             list[tuple[str, list[tuple[str, dict[str, str]]]]],
             self._client.xreadgroup(
