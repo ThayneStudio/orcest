@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+ARG ORCEST_BUILD_REVISION=unknown
+ENV ORCEST_BUILD_REVISION=${ORCEST_BUILD_REVISION}
+LABEL org.opencontainers.image.revision=${ORCEST_BUILD_REVISION}
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \

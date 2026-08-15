@@ -3,14 +3,16 @@ import os from "os";
 import path from "path";
 import type { Server } from "http";
 import type { AddressInfo } from "net";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, type WebSocketServer } from "ws";
 import {
   broadcastSnapshotMessage,
   closeWebSocketServer,
   createDashboardServer,
+  dashboardBuildRevision,
   dashboardTaskOutputConnectionOptions,
   dashboardPortFromEnv,
+  dashboardRevisionFromEnv,
   startDashboardServer,
   type DashboardServerInstance,
 } from "./index.js";
@@ -20,6 +22,7 @@ import type { DashboardMessage } from "./types.js";
 const originalToken = process.env.DASHBOARD_TOKEN;
 const originalAllowedOrigins = process.env.DASHBOARD_ALLOWED_ORIGINS;
 const originalRedisPrefixes = process.env.DASHBOARD_REDIS_PREFIXES;
+const originalBuildRevision = process.env.ORCEST_BUILD_REVISION;
 
 type TestServer = {
   instance: DashboardServerInstance;
@@ -123,6 +126,36 @@ describe("dashboardPortFromEnv", () => {
       );
     } finally {
       await instance.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dashboardRevisionFromEnv", () => {
+  it("accepts only exact clean hexadecimal revisions", () => {
+    expect(dashboardRevisionFromEnv(" ABCDEF123 ")).toBe("abcdef123");
+    expect(dashboardRevisionFromEnv("abcdef123-dirty")).toBe("unknown");
+    expect(dashboardRevisionFromEnv("latest")).toBe("unknown");
+  });
+
+  it("prefers the immutable image revision file over runtime environment", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "orcest-dashboard-revision-"));
+    const revisionPath = path.join(root, "revision");
+    fs.writeFileSync(revisionPath, `${"a".repeat(40)}\n`);
+    try {
+      expect(dashboardBuildRevision(revisionPath, "b".repeat(40))).toBe("a".repeat(40));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an image revision file exists but is invalid", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "orcest-dashboard-revision-"));
+    const revisionPath = path.join(root, "revision");
+    fs.writeFileSync(revisionPath, "unknown\n");
+    try {
+      expect(dashboardBuildRevision(revisionPath, "b".repeat(40))).toBe("unknown");
+    } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -234,6 +267,10 @@ async function flushPromises(): Promise<void> {
   await Promise.resolve();
 }
 
+beforeEach(() => {
+  delete process.env.ORCEST_BUILD_REVISION;
+});
+
 afterEach(() => {
   if (originalToken === undefined) delete process.env.DASHBOARD_TOKEN;
   else process.env.DASHBOARD_TOKEN = originalToken;
@@ -241,6 +278,8 @@ afterEach(() => {
   else process.env.DASHBOARD_ALLOWED_ORIGINS = originalAllowedOrigins;
   if (originalRedisPrefixes === undefined) delete process.env.DASHBOARD_REDIS_PREFIXES;
   else process.env.DASHBOARD_REDIS_PREFIXES = originalRedisPrefixes;
+  if (originalBuildRevision === undefined) delete process.env.ORCEST_BUILD_REVISION;
+  else process.env.ORCEST_BUILD_REVISION = originalBuildRevision;
 });
 
 describe("dashboard HTTP integration", () => {
@@ -278,11 +317,11 @@ describe("dashboard HTTP integration", () => {
 
     try {
       await expect(fetch(`${baseUrl}/api/health`).then((res) => res.json()))
-        .resolves.toEqual({ ok: true });
+        .resolves.toEqual({ ok: true, revision: "unknown" });
       expect(testServer.healthCheck).not.toHaveBeenCalled();
 
       await expect(fetch(`${baseUrl}/api/ready`).then((res) => res.json()))
-        .resolves.toEqual({ ok: true, redis_ok: true });
+        .resolves.toEqual({ ok: true, redis_ok: true, revision: "unknown" });
       expect(testServer.healthCheck).toHaveBeenCalledTimes(1);
 
       const unauthorized = await fetch(`${baseUrl}/api/workers`);
@@ -404,11 +443,15 @@ describe("dashboard HTTP integration", () => {
     try {
       const health = await fetch(`${baseUrl}/api/health`);
       expect(health.status).toBe(200);
-      await expect(health.json()).resolves.toEqual({ ok: true });
+      await expect(health.json()).resolves.toEqual({ ok: true, revision: "unknown" });
 
       const ready = await fetch(`${baseUrl}/api/ready`);
       expect(ready.status).toBe(503);
-      await expect(ready.json()).resolves.toEqual({ ok: false, redis_ok: false });
+      await expect(ready.json()).resolves.toEqual({
+        ok: false,
+        redis_ok: false,
+        revision: "unknown",
+      });
     } finally {
       await instance.close();
       fs.rmSync(root, { recursive: true, force: true });
@@ -549,7 +592,11 @@ describe("dashboard HTTP integration", () => {
     try {
       const ready = await fetch(`http://127.0.0.1:${port}/api/ready`);
       expect(ready.status).toBe(503);
-      await expect(ready.json()).resolves.toEqual({ ok: false, redis_ok: false });
+      await expect(ready.json()).resolves.toEqual({
+        ok: false,
+        redis_ok: false,
+        revision: "unknown",
+      });
       expect(healthCheck).toHaveBeenCalledTimes(1);
       expect(logError).toHaveBeenCalledWith(
         "Dashboard readiness check failed:",

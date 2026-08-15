@@ -688,6 +688,21 @@ class TestDashboardAuthFailsClosed:
         assert "- DASHBOARD_LOCK_TTL_SECONDS" in text
         assert "- ORCEST_LOCK_TTL_SECONDS" in text
 
+    def test_dashboard_revision_is_baked_into_image_not_runtime_environment(self):
+        repo_root = self._repo_root()
+        compose_text = (repo_root / "docker-compose.dashboard.yml").read_text()
+        dockerfile_text = (repo_root / "dashboard" / "Dockerfile").read_text()
+        deploy_text = (
+            repo_root / "dashboard" / "scripts" / "deploy-compose-dashboard.sh"
+        ).read_text()
+
+        assert "- ORCEST_BUILD_REVISION=" not in compose_text
+        assert "ENV ORCEST_BUILD_REVISION=" not in dockerfile_text
+        assert '> /app/.orcest-revision' in dockerfile_text
+        assert 'previous_revision=""' in deploy_text
+        assert 'org.opencontainers.image.revision' in deploy_text
+        assert 'DASHBOARD_EXPECTED_REVISION="$previous_revision" check_published' in deploy_text
+
     def test_deploy_dashboard_wires_required_env_files(self):
         """The dashboard compose deploy target must pass Redis auth and require
         a dashboard token before starting the fail-closed service."""
@@ -2156,6 +2171,7 @@ exit 0
         env["DASHBOARD_ENV_FILE"] = str(env_file)
         env["DASHBOARD_NODE_IMAGE"] = "fake-node"
         env["DASHBOARD_EXPECTED_ASSETS"] = "dist/assets/index-test.js dist/assets/index-test.css"
+        env["DASHBOARD_EXPECTED_REVISION"] = "a" * 40
 
         result = subprocess.run(
             ["sh", "dashboard/scripts/check-published.sh"],
@@ -2176,6 +2192,7 @@ exit 0
         assert "<DASHBOARD_ALLOW_DEGRADED=true>" in args
         assert "<DASHBOARD_STRICT_DEGRADED=1>" in args
         assert "<DASHBOARD_ALLOW_UNPINNED_ASSETS=1>" in args
+        assert f"<DASHBOARD_EXPECTED_REVISION={'a' * 40}>" in args
 
     def test_remote_deploy_shell_quotes_embedded_single_quotes(self):
         """The remote deploy helper must preserve single-quoted grep regexes

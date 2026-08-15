@@ -1,7 +1,10 @@
 services:
   orchestrator:
     image: ${ORCEST_IMAGE:-orcest:latest}
-    build: .
+    build:
+      context: .
+      args:
+        ORCEST_BUILD_REVISION: ${ORCEST_BUILD_REVISION:-unknown}
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
       # Verbatim per-task trace archive. When ORCEST_TRACE_HOST_PATH is unset

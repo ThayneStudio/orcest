@@ -53,6 +53,15 @@ def _write_project_files_from_config(
         write_project_files,
     )
 
+    mismatches = cfg.provider_stream_mismatches().get(project.name, [])
+    if mismatches:
+        providers = ", ".join(mismatches)
+        raise ValueError(
+            f"project {project.name!r} configures provider stream(s) {providers}, "
+            f"but the managed pool consumes only tasks:{cfg.pool.worker_backend}; "
+            "configure matching specialized workers or remove those providers"
+        )
+
     org = cfg.resolve_org(project)
     env_content = generate_env_file(
         github_token=org.github_token,
@@ -468,6 +477,10 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
             " -q --no-cache-dir -r /tmp/orcest-template-source/requirements.lock; "
             "sudo -u orcest -H /opt/orcest/venv/bin/python -m pip install"
             " -q --no-cache-dir --no-deps /tmp/orcest-template-source; "
+            "revision=$(/opt/orcest/venv/bin/orcest revision --short); "
+            'case "$revision" in unknown|*-dirty) exit 42;; esac; '
+            "printf '%s\\n' \"$revision\" | sudo tee /etc/orcest/source-revision >/dev/null; "
+            "sudo chmod 0644 /etc/orcest/source-revision; "
             f"sudo rm -rf {shlex.quote(remote_tarball)} /tmp/orcest-template-source"
         )
         result = _ssh_run(host, user, install_cmd, timeout=300)
@@ -958,6 +971,12 @@ def onboard(repo: str, name: str | None, config: str) -> None:
     )
     cfg.projects.append(project)
 
+    try:
+        _validate_provider_stream_routing(cfg, console)
+    except SystemExit:
+        cfg.projects = [p for p in cfg.projects if p.name != project_name]
+        raise
+
     console.print(f"  Project: {project_name}")
     console.print(f"  Repo: {repo}")
 
@@ -1090,6 +1109,9 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
         sys.exit(1)
 
     ssh_target = cfg.ssh_target()
+
+    _validate_provider_stream_routing(cfg, console)
+    _validate_deploy_source_revision(console)
 
     # Project configs and workers must change backend as one operation. The
     # authorization bit is set only by this process's coordinated deploy path;
@@ -2771,6 +2793,8 @@ def start(ctx: click.Context, config: str) -> None:
 
     ssh_target = cfg.ssh_target()
 
+    _validate_provider_stream_routing(cfg, console)
+
     # Direct `fleet start` may restart an unchanged pool, but it may not turn
     # an edited local backend into a partial transition. Coordinated deploy
     # supplies an in-process authorization only after draining old workers and
@@ -2914,6 +2938,45 @@ def _preflight_backend_transition(
     )
 
 
+def _validate_provider_stream_routing(cfg: FleetConfig, console: Console) -> None:
+    """Fail before mutation when the single managed pool cannot claim tasks."""
+    try:
+        mismatches = cfg.provider_stream_mismatches()
+    except KeyError as exc:
+        console.print(f"[red]Could not validate provider stream routing:[/red] {exc}")
+        raise SystemExit(1) from exc
+    if not mismatches:
+        return
+
+    backend = cfg.pool.worker_backend.strip() or "claude"
+    console.print(
+        "[red]Fleet provider routing is unsafe: the managed worker pool consumes "
+        f"only tasks:{backend} and tasks:issue:{backend}.[/red]"
+    )
+    for project, providers in sorted(mismatches.items()):
+        console.print(f"  - {project}: unconsumed provider stream(s): {', '.join(providers)}")
+    console.print(
+        "  Configure matching specialized workers outside this single-pool fleet, "
+        "or remove the mismatched providers before deploy."
+    )
+    raise SystemExit(1)
+
+
+def _validate_deploy_source_revision(console: Console) -> None:
+    """Reject unattested source before any remote update mutation."""
+    from orcest.fleet.orchestrator import _resolve_deploy_revision
+    from orcest.revision import revision_is_attested
+
+    deploy_revision = _resolve_deploy_revision()
+    if revision_is_attested(deploy_revision):
+        return
+    console.print(
+        "[red]Deployment source revision is "
+        f"{deploy_revision!r}; commit every source file before updating.[/red]"
+    )
+    raise SystemExit(1)
+
+
 def _validate_backend_transition(
     cfg: FleetConfig,
     config: str,
@@ -2971,6 +3034,8 @@ def _preflight_deploy_config(
 ) -> None:
     """Validate every static deploy prerequisite before stopping the fleet."""
     from orcest.fleet.config import load_config
+    from orcest.fleet.orchestrator import _resolve_deploy_revision
+    from orcest.revision import revision_is_attested
 
     try:
         cfg = load_config(config)
@@ -2992,6 +3057,25 @@ def _preflight_deploy_config(
         problems.append("pool.vm_id_start is required to allocate workers")
     if rebuild_template and rng is None:
         problems.append("pool.template_vmid_range is required by --rebuild-template")
+
+    deploy_revision = _resolve_deploy_revision()
+    if not revision_is_attested(deploy_revision):
+        problems.append(
+            f"deployment source revision is {deploy_revision!r}; commit every source file "
+            "before deploying"
+        )
+
+    try:
+        routing_mismatches = cfg.provider_stream_mismatches()
+    except KeyError as exc:
+        problems.append(f"provider stream routing could not be validated: {exc}")
+    else:
+        backend = cfg.pool.worker_backend.strip() or "claude"
+        for project, providers in sorted(routing_mismatches.items()):
+            problems.append(
+                f"project {project} publishes to unconsumed provider stream(s) "
+                f"{', '.join(providers)}; managed workers consume only tasks:{backend}"
+            )
 
     if problems:
         console.print("[red]Deploy preflight failed before any services were stopped:[/red]")

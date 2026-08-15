@@ -105,6 +105,46 @@ class TestFleetConfigHelpers:
         with pytest.raises(KeyError, match="not registered"):
             cfg.resolve_org(cfg.projects[0])
 
+    def test_provider_stream_mismatches_accepts_single_matching_backend(self):
+        cfg = FleetConfig(
+            orgs={
+                "Org": OrgEntry(
+                    provider_credentials={"grok": ["secret-1", "secret-2"]},
+                )
+            },
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(worker_backend="grok", worker_runner_type="grok"),
+        )
+
+        assert cfg.provider_stream_mismatches() == {}
+
+    def test_provider_stream_mismatches_reports_stranded_provider_streams(self):
+        cfg = FleetConfig(
+            orgs={
+                "Org": OrgEntry(
+                    claude_oauth_tokens=["claude-secret"],
+                    provider_credentials={"grok": ["grok-secret"], "codex": ["codex-secret"]},
+                )
+            },
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(worker_backend="claude"),
+        )
+
+        assert cfg.provider_stream_mismatches() == {"p": ["codex", "grok"]}
+
+    def test_provider_stream_mismatches_maps_legacy_claude_to_clauder_pool(self):
+        cfg = FleetConfig(
+            orgs={"Org": OrgEntry(claude_oauth_tokens=["legacy-secret"])},
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                worker_backend="clauder",
+                worker_runner_type="claude",
+                worker_runner_mode="interactive",
+            ),
+        )
+
+        assert cfg.provider_stream_mismatches() == {}
+
     def test_ssh_target(self):
         cfg = FleetConfig(orchestrator=OrchestratorConfig(host="1.2.3.4", user="admin"))
         assert cfg.ssh_target() == "admin@1.2.3.4"

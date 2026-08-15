@@ -2,6 +2,14 @@
 
 **Status:** Part of Task 10 (Rollout & Documentation) for the overall multi-provider implementation plan.
 
+> **Fleet-managed routing constraint:** the managed pool is homogeneous and
+> consumes only `tasks:<pool.worker_backend>`. Fleet commands now reject a
+> project whose org credentials would publish to any other provider stream.
+> Mixed-provider projects require independently operated, specialized worker
+> groups for every stream; the current fleet manager does not create those
+> groups. Do not add mixed `provider_credentials` to a managed fleet and assume
+> the single pool will consume them.
+
 ## Critical Boundary (Reinforced)
 
 All rollout steps and documentation adhere to the **Provider Registration & Invocation Boundary (Option A)**:
@@ -33,10 +41,11 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
    - Legacy `claude_tokens` paths continue to work via synthesis into `ProviderEntry(provider="claude", ...)` — zero breaking change for existing single-claude projects.
    - `orcest status --once` will now surface the new per-provider tables (exhausted_skip, rebake_required_failures).
 
-3. **Mixed Operation (Claude + New Providers During Transition)**
+3. **Mixed Operation With Explicit Worker Groups (Not One Managed Pool)**
 
    - Existing projects using only `claude_tokens` (or synthesized providers) continue to round-robin exactly as before on any worker that has "claude" in its registry.
-   - A single project may now declare a mixed `providers:` list, e.g.:
+   - A single project may declare a mixed `providers:` list only when an
+     operator has provisioned a consumer group for every resulting stream, e.g.:
 
      ```yaml
      providers:
@@ -49,7 +58,10 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
      ```
 
    - The pool selects across heterogeneous entries; exhaustion of one provider's credential (e.g. grok rate limit) only skips that entry for its cooldown window — other providers remain usable.
-   - Task publishing emits the chosen provider's lean data; the receiving worker's early dispatch either runs it or cleanly fails it.
+   - Task publishing emits the chosen provider's lean data; the receiving
+     worker's early dispatch either runs it or cleanly fails it. The built-in
+     fleet manager will fail preflight for this configuration because its one
+     homogeneous pool cannot provide the required stream coverage.
 
 4. **Introduce the First Non-Claude Provider**
 
@@ -57,7 +69,9 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
    - Ensure the credential is either:
      - Inline in YAML (discouraged for secrets), or
      - Omitted (`credential: ""` or absent) so that `config.py` `_parse_provider_entry` falls back to the conventional env var (`XAI_API_KEY`, `GROK_API_KEY`, etc.) present in the orchestrator process environment.
-   - For fleet-managed orchestrators: extend your `fleet.yaml` `orgs.<name>` entry with `provider_credentials` (see below) so `generate_env_file` emits the required vars into the project's `.env`.
+   - For fleet-managed orchestrators, the provider name must equal
+     `pool.worker_backend`. A different or additional `provider_credentials`
+     entry is rejected until that stream has an external worker group.
    - Rebake workers that will handle the new provider (install the CLI in `setup-worker.sh` + one-line registry entry).
    - Test with a dedicated throwaway project or by temporarily adding the provider to an existing project's list.
 
@@ -74,7 +88,9 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
 6. **Cutover & Steady State**
 
    - Rebake every worker template so the desired provider CLIs + registry entries are present.
-   - (Optional) Run specialized worker groups: some workers with `backend: claude` in `worker.yaml`, others with `backend: grok` (they consume `tasks:grok` etc.).
+   - Run specialized worker groups outside the current fleet manager: some
+     workers with `backend: claude` in `worker.yaml`, others with `backend: grok`
+     (they consume `tasks:grok` etc.). Every published provider must have one.
    - A general-purpose worker image that has multiple registry entries can in principle consume from any stream it is pointed at (the dispatch inside the loop is provider-agnostic once the task arrives).
    - Monitor:
      - `orcest status --once` (provider health cards + counters)
@@ -93,6 +109,10 @@ orgs:
     provider_credentials:
       grok: ["xai-..."]   # list; first used for the env var in generated .env
 ```
+
+This example is valid only when `pool.worker_backend: grok` and the project does
+not also synthesize `claude`, or when a separate external `tasks:grok` worker
+group exists. The fleet preflight intentionally rejects uncovered streams.
 
 `generate_env_file(...)` (and the caller in `fleet/cli.py`) emits:
 

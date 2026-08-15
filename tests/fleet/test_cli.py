@@ -43,6 +43,7 @@ def _no_pending_workers_by_default(mocker):
     mocker.patch("orcest.fleet.orchestrator.set_workers_draining")
     mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
     mocker.patch("orcest.fleet.cli._wait_for_worker_drain_quiescence")
+    mocker.patch("orcest.fleet.orchestrator._resolve_deploy_revision", return_value="a" * 40)
 
 
 def _save(cfg, path):
@@ -608,7 +609,6 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
             "Org": OrgEntry(
                 github_token="ghp_fake",
                 claude_oauth_tokens=["sk-claude"],
-                provider_credentials={"grok": ["grok-json"]},
             )
         },
         projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
@@ -634,14 +634,14 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "key_prefix": "alpha",
         "project_name": "alpha",
         "claude_tokens": ["sk-claude"],
-        "provider_credentials": {"grok": ["grok-json"]},
+        "provider_credentials": {},
         "trace_archive_host_path": "/mnt/orcest/traces",
         "redis_password": "redis-pw",
     }
     assert gen_config.call_args.kwargs == {
         "repo": "Org/alpha",
         "key_prefix": "alpha",
-        "extra_providers": ["grok"],
+        "extra_providers": [],
         "default_runner": "clauder",
         "trace_archive_enabled": True,
     }
@@ -665,6 +665,26 @@ def test_update_refuses_uncoordinated_worker_backend_change(runner, cfg_path, mo
     assert result.exit_code != 0
     assert "uncoordinated worker backend change" in result.output
     upload.assert_not_called()
+
+
+def test_update_rejects_dirty_revision_before_upload(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator._resolve_deploy_revision",
+        return_value=f"{'b' * 40}-dirty",
+    )
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+    build = mocker.patch("orcest.fleet.orchestrator.build_image")
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "commit every source file before updating" in result.output
+    upload.assert_not_called()
+    build.assert_not_called()
 
 
 def test_update_has_no_user_callable_backend_change_bypass(runner, cfg_path, mocker):
@@ -1204,6 +1224,8 @@ def test_install_source_on_worker_template_uses_local_tarball(mocker, tmp_path):
     install_cmd = ssh.call_args.args[2]
     assert "/tmp/orcest-template-source/requirements.lock" in install_cmd
     assert "--no-deps /tmp/orcest-template-source" in install_cmd
+    assert "/opt/orcest/venv/bin/orcest revision --short" in install_cmd
+    assert "/etc/orcest/source-revision" in install_cmd
     assert "github.com/ThayneStudio/orcest.git" not in install_cmd
     assert not tarball.exists()
 
@@ -2641,6 +2663,63 @@ def test_deploy_missing_proxmox_credentials_fails_before_stop(runner, cfg_path, 
     assert "Proxmox API credentials are not configured" in result.output
     stop_pool.assert_not_called()
     upload.assert_not_called()
+
+
+def test_deploy_rejects_provider_stream_without_managed_worker_before_stop(
+    runner, cfg_path, mocker
+):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        orgs={
+            "Org": OrgEntry(
+                claude_oauth_tokens=["claude-secret"],
+                provider_credentials={"grok": ["grok-secret"]},
+            )
+        },
+        projects=[ProjectEntry(name="project", repo="Org/project")],
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="claude"),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "unconsumed provider stream(s) grok" in result.output
+    assert "workers consume only tasks:claude" in result.output
+    stop_pool.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_deploy_rejects_dirty_revision_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator._resolve_deploy_revision",
+        return_value=f"{'b' * 40}-dirty",
+    )
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "deployment source revision" in result.output
+    assert "commit every source file" in result.output
+    stop_pool.assert_not_called()
 
 
 def test_deploy_requires_worker_range_before_stop(runner, cfg_path, mocker):

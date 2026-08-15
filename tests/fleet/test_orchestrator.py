@@ -849,6 +849,19 @@ class TestUploadSource:
             f"Dockerfile COPY to resolve; got {members!r}"
         )
 
+    def test_exact_revision_is_baked_into_source_archive(self, mocker):
+        revision = "a" * 40
+        mocker.patch(
+            "orcest.fleet.orchestrator._resolve_deploy_revision",
+            return_value=revision,
+        )
+
+        members, _, files = self._run_upload(mocker)
+
+        assert ".orcest-revision" in members
+        assert files[".orcest-revision"] == f"{revision}\n"
+        assert f"BUILD_REVISION = {revision!r}" in files["src/orcest/_build_revision.py"]
+
     def test_root_lock_not_only_the_source_tree_copy(self, mocker):
         """The lock the Dockerfile COPYs is the one at the context root, not the
         one nested under src/orcest/fleet/deploy/. Guard that the root copy is
@@ -881,6 +894,7 @@ class TestUploadSource:
             "docker-compose.pool.yml",
         ):
             assert expected in cleanup
+        assert ".orcest-revision" in cleanup
 
     def test_forced_source_root_packages_that_source(self, mocker, tmp_path):
         source_root = tmp_path / "source"
@@ -905,6 +919,39 @@ class TestUploadSource:
         assert files["src/orcest/__init__.py"] == 'SENTINEL = "from-forced-source-root"\n'
         assert files["pyproject.toml"] == "[project]\nname = 'forced-orcest'\n"
         assert files["requirements.lock"] == "redis==5.0.0\n"
+
+
+def test_build_image_requires_and_propagates_exact_revision(mocker):
+    from orcest.fleet.orchestrator import build_image
+
+    ssh = mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+
+    build_image("user@host")
+
+    command = ssh.call_args.args[1]
+    assert "cat .orcest-revision" in command
+    assert "^[0-9a-f]{7,64}$" in command
+    assert 'ORCEST_BUILD_REVISION="$revision" docker compose build --no-cache' in command
+
+
+def test_source_root_is_discovered_from_current_working_directory(monkeypatch, tmp_path):
+    from orcest.fleet.orchestrator import _resolve_source_root
+
+    root = tmp_path / "release"
+    nested = root / "operator" / "work"
+    deploy_dir = root / "src" / "orcest" / "fleet" / "deploy"
+    deploy_dir.mkdir(parents=True)
+    nested.mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'orcest'\n")
+    (root / "requirements.lock").write_text("redis==5.0.0\n")
+    (root / "src" / "orcest" / "__init__.py").write_text("")
+    (deploy_dir / "Dockerfile").write_text("FROM scratch\n")
+    monkeypatch.chdir(nested)
+
+    assert _resolve_source_root() == root
 
 
 class TestCleanPendingTasks:

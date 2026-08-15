@@ -8,6 +8,11 @@
 - You have a working `claude` setup (the reference provider).
 - You understand that workers are immutable pre-baked images.
 - See `docs/rollout-multi-provider.md` for full rollout order.
+- The built-in fleet manager operates one homogeneous worker pool. Before adding
+  a provider to a fleet-managed project, set `pool.worker_backend` to that same
+  provider and remove other provider credentials, or provision a specialized
+  worker group outside the fleet manager. Uncovered streams are rejected by
+  fleet preflight.
 
 ## Step-by-Step
 
@@ -83,7 +88,8 @@
 
    The credential can come from the YAML or from env vars (see `_PROVIDER_ENV_CANDIDATES` + generic fallbacks in `shared/config.py`): `GEMINI_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, etc.
 
-   For fleet-managed deployments, put the credential(s) under the org in your `fleet.yaml`:
+   For fleet-managed deployments, put the credential(s) under the org in your
+   `fleet.yaml` only when the managed pool consumes the same provider stream:
 
    ```yaml
    orgs:
@@ -95,6 +101,10 @@
    ```
 
    `generate_env_file` will emit the appropriate `GOOGLE_API_KEY=...` (or whatever canonical name) into the project's `.env`.
+
+   A project with both legacy `claude_oauth_tokens` and `gemini` credentials
+   publishes to two streams and is rejected by the current fleet manager unless
+   an external worker group covers the second stream.
 
 7. **Test, including skew**
 

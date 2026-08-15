@@ -514,6 +514,8 @@ Notes:
   `ORCEST_REDIS_PASSWORD` would break the restarted orchestrators.
 - See [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md)
   for the per-provider rollout recipe.
+- For major releases, follow the checked-in
+  [`deployment, rollback, and health-watch runbook`](docs/operations/reliability-milestone-rollout.md).
 
 ## Observability
 
@@ -524,6 +526,9 @@ Notes:
 - **`orcest fleet pool-status`** — target size, active template VMID
   (from the Redis pointer, with the config value as fallback), and
   idle/active worker counts from Proxmox.
+- **`orcest rollout-health`** — read-only, machine-readable deployment gates for
+  exact revision, Redis, queue/pending state, dead-letter/provider-counter
+  growth, pool size, and private credential-recovery residue.
 - **Dashboard container** on the orchestrator VM — the live task view.
 - **Container logs on the orchestrator VM:**
   ```bash

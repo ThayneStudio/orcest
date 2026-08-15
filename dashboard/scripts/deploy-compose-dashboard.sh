@@ -28,6 +28,22 @@ compose_restore_tmp=""
 compose_state_tmp=""
 signal_handler_active=0
 
+build_revision="${ORCEST_BUILD_REVISION:-}"
+expected_revision="${DASHBOARD_EXPECTED_REVISION:-}"
+if [ -n "$build_revision" ] || [ -n "$expected_revision" ]; then
+  if ! printf '%s\n' "$build_revision" | grep -Eq '^[0-9a-f]{7,64}$'; then
+    echo "ORCEST_BUILD_REVISION must be an exact clean Git revision" >&2
+    exit 2
+  fi
+  expected_revision="${expected_revision:-$build_revision}"
+  if [ "$expected_revision" != "$build_revision" ]; then
+    echo "DASHBOARD_EXPECTED_REVISION must match ORCEST_BUILD_REVISION" >&2
+    exit 2
+  fi
+  export ORCEST_BUILD_REVISION
+  export DASHBOARD_EXPECTED_REVISION="$expected_revision"
+fi
+
 compose_env_value() {
   file="$1"
   key="$2"
@@ -440,11 +456,16 @@ previous_container="$("$@" ps -q dashboard 2>/dev/null || true)"
 previous_image_id=""
 previous_image_name=""
 previous_assets=""
+previous_revision=""
 
 if [ -n "$previous_container" ]; then
   previous_image_id="$(docker inspect -f '{{.Image}}' "$previous_container" 2>/dev/null || true)"
   previous_image_name="$(docker inspect -f '{{.Config.Image}}' "$previous_container" 2>/dev/null || true)"
   previous_assets="$(collect_assets "$@" 2>/dev/null || true)"
+  inspected_revision="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$previous_image_id" 2>/dev/null || true)"
+  if printf '%s\n' "$inspected_revision" | grep -Eq '^[0-9a-f]{7,64}$'; then
+    previous_revision="$inspected_revision"
+  fi
 fi
 
 if [ -n "$previous_image_id" ]; then
@@ -537,7 +558,7 @@ rollback_dashboard() {
     return 1
   fi
   if [ -n "$previous_assets" ]; then
-    if check_published "$previous_assets" "$@"; then
+    if DASHBOARD_EXPECTED_REVISION="$previous_revision" check_published "$previous_assets" "$@"; then
       echo "Dashboard rollback published readiness verified"
       restore_candidate_compose || return $?
       return 0
@@ -549,7 +570,7 @@ rollback_dashboard() {
   fi
 
   echo "Dashboard rollback restarted the previous image; previous asset list was unavailable; checking readiness without asset pin" >&2
-  if check_published_unpinned "$@"; then
+  if DASHBOARD_EXPECTED_REVISION="$previous_revision" check_published_unpinned "$@"; then
     echo "Dashboard rollback readiness verified without asset pin"
     restore_candidate_compose || return $?
     return 0
