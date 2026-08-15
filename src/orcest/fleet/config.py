@@ -20,6 +20,27 @@ import yaml
 SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 
+def normalize_worker_runner_for_backend(
+    worker_backend: str,
+    worker_runner_type: str,
+    worker_runner_mode: str,
+) -> tuple[str, str, str]:
+    """Normalize and validate worker runner settings for a pool backend."""
+    backend = worker_backend.strip() or "claude"
+    runner_type = worker_runner_type.strip() or "claude"
+    runner_mode = worker_runner_mode.strip()
+    if backend == "clauder":
+        if runner_type != "claude":
+            raise ValueError("pool.worker_backend 'clauder' requires worker_runner_type 'claude'")
+        if not runner_mode:
+            runner_mode = "interactive"
+        elif runner_mode != "interactive":
+            raise ValueError(
+                "pool.worker_backend 'clauder' requires worker_runner_mode 'interactive'"
+            )
+    return backend, runner_type, runner_mode
+
+
 def validate_project_name(name: str) -> bool:
     """Return True if *name* is a valid project name (safe for use in shell commands)."""
     return bool(SAFE_NAME_RE.match(name)) and len(name) <= 64
@@ -114,6 +135,9 @@ class PoolConfig:
     worker_memory: int = 16384  # MB per worker VM
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
+    worker_backend: str = "claude"
+    worker_runner_type: str = "claude"
+    worker_runner_mode: str = ""
     # Force-kill threshold for an active worker VM. MUST exceed the worker's
     # RunnerConfig.timeout (default 5400s) plus a grace window, otherwise the
     # pool reaps HEALTHY long-running tasks before they can finish. Default =
@@ -135,6 +159,28 @@ class PoolConfig:
     # against. Defaults to Ubuntu's UEC Image Automatic Signing Key
     # (cdimage@ubuntu.com) -- the same key provision/create-vm.sh pins.
     expected_image_gpg_key: str = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+
+    def __post_init__(self) -> None:
+        (
+            self.worker_backend,
+            self.worker_runner_type,
+            self.worker_runner_mode,
+        ) = normalize_worker_runner_for_backend(
+            self.worker_backend,
+            self.worker_runner_type,
+            self.worker_runner_mode,
+        )
+
+    def contains_worker_vmid(self, vm_id: int) -> bool:
+        """Return whether *vm_id* is inside the configured worker range.
+
+        Destructive lifecycle operations must fail closed when the range is
+        unconfigured.  ``vm_id_end == 0`` intentionally retains the legacy
+        open-ended range semantics above ``vm_id_start``.
+        """
+        if self.vm_id_start <= 0 or vm_id < self.vm_id_start:
+            return False
+        return self.vm_id_end <= 0 or vm_id <= self.vm_id_end
 
     def template_range(self) -> tuple[int, int] | None:
         """Return ``(start, end)`` template VMID range, or ``None`` if not configured.
@@ -327,6 +373,9 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_memory=pl.get("worker_memory", 16384),
         worker_cores=pl.get("worker_cores", 8),
         worker_disk_size=pl.get("worker_disk_size", 30),
+        worker_backend=str(pl.get("worker_backend", "claude") or "claude"),
+        worker_runner_type=str(pl.get("worker_runner_type", "claude") or "claude"),
+        worker_runner_mode=str(pl.get("worker_runner_mode", "") or ""),
         max_task_duration=pl.get("max_task_duration", 7200),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
@@ -406,6 +455,9 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "worker_memory": config.pool.worker_memory,
             "worker_cores": config.pool.worker_cores,
             "worker_disk_size": config.pool.worker_disk_size,
+            "worker_backend": config.pool.worker_backend,
+            "worker_runner_type": config.pool.worker_runner_type,
+            "worker_runner_mode": config.pool.worker_runner_mode,
             "max_task_duration": config.pool.max_task_duration,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,

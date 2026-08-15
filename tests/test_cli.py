@@ -297,6 +297,26 @@ def test_work_runner_override(mocker, runner):
     assert mock_config.backend == "noop"
 
 
+def test_pool_manage_accepts_template_range_without_legacy_id(mocker, runner):
+    """Range-mode blue/green pools are valid pool-manager configurations."""
+    from orcest.fleet.config import FleetConfig, PoolConfig, ProxmoxConfig
+
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(api_token_id="id", api_token_secret="secret"),
+        pool=PoolConfig(template_vm_id=0, template_vmid_range=[9000, 9009]),
+    )
+    mocker.patch("orcest.fleet.config.load_config", return_value=cfg)
+    mocker.patch("orcest.fleet.proxmox_api.ProxmoxClient")
+    redis_cls = mocker.patch("orcest.shared.redis_client.RedisClient")
+    redis_cls.return_value.health_check.return_value = True
+    manager_cls = mocker.patch("orcest.fleet.pool_manager.PoolManager")
+
+    result = runner.invoke(main, ["pool-manage", "--interval", "0.1"])
+
+    assert result.exit_code == 0, result.output
+    manager_cls.return_value.run.assert_called_once_with(interval=0.1)
+
+
 # ---------------------------------------------------------------------------
 # _status_once dead-letter integration
 # ---------------------------------------------------------------------------

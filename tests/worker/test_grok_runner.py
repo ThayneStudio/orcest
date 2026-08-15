@@ -250,13 +250,56 @@ def test_prepare_credential_blob_writes_auth_json(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_prepare_credential_blob_without_refresh_token_is_ignored(tmp_path) -> None:
+    blob = json.dumps({"key": "access-token-only"})
+    home = tmp_path / "home"
+    home.mkdir()
+    stale_auth = home / ".grok" / "auth.json"
+    stale_auth.parent.mkdir()
+    stale_auth.write_text(json.dumps({"refresh_token": "old"}))
+    ctx = GrokRunner().prepare_credential(blob, tmp_path / "wd", home, "XAI_API_KEY")
+
+    assert ctx.extra_env == {}
+    assert ctx.watch_path is None
+    assert not (home / ".grok" / "auth.json").exists()
+
+
+@pytest.mark.unit
 def test_prepare_credential_plain_key_uses_env_var(tmp_path) -> None:
     home = tmp_path / "home"
     home.mkdir()
+    stale_auth = home / ".grok" / "auth.json"
+    stale_auth.parent.mkdir()
+    stale_auth.write_text(json.dumps({"refresh_token": "old"}))
     ctx = GrokRunner().prepare_credential("xai-abc123", tmp_path / "wd", home, "XAI_API_KEY")
     assert ctx.extra_env == {"XAI_API_KEY": "xai-abc123"}
     assert ctx.watch_path is None
     assert not (home / ".grok" / "auth.json").exists()
+
+
+@pytest.mark.unit
+def test_prepare_credential_plain_key_fails_if_stale_auth_cannot_be_removed(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    stale_auth = home / ".grok" / "auth.json"
+    stale_auth.parent.mkdir()
+    stale_auth.write_text(json.dumps({"refresh_token": "old"}))
+
+    original_unlink = Path.unlink
+
+    def fail_auth_unlink(path: Path, *args, **kwargs):
+        if path == stale_auth:
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_auth_unlink)
+
+    with pytest.raises(RuntimeError, match="Failed to remove stale Grok auth file"):
+        GrokRunner().prepare_credential("xai-abc123", tmp_path / "wd", home, "XAI_API_KEY")
+
+    assert stale_auth.exists()
 
 
 @pytest.mark.unit
@@ -286,6 +329,14 @@ def test_extract_credential_update_rejects_corrupt_blob(tmp_path) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text('{"key":"tok","refresh_to')  # truncated JSON
     assert GrokRunner().extract_credential_update(auth, '{"key":"old"}') is None
+
+
+@pytest.mark.unit
+def test_extract_credential_update_rejects_blob_without_refresh_token(tmp_path) -> None:
+    auth = tmp_path / "auth.json"
+    original = json.dumps({"key": "old-token", "refresh_token": "rt"})
+    auth.write_text(json.dumps({"key": "new-token"}))
+    assert GrokRunner().extract_credential_update(auth, original) is None
 
 
 @pytest.mark.unit

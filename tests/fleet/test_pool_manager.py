@@ -15,6 +15,11 @@ pytestmark = pytest.mark.unit
 # ── Fixtures ─────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _no_drain_wait(monkeypatch):
+    monkeypatch.setattr("orcest.fleet.pool_manager._DRAIN_QUIESCE_SECONDS", 0)
+
+
 def _make_config(
     pool_size: int = 4,
     template_vm_id: int = 9000,
@@ -137,6 +142,47 @@ class TestWorkerIdConversion:
             assert PoolManager._worker_id_to_vm_id(worker_id) == vm_id
 
 
+class TestTaskStreams:
+    def test_discovers_backend_task_streams_from_redis(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = [
+            "tasks:grok",
+            "tasks:issue:codex",
+            "tasks:issue",
+            "tasks:issue:grok:extra",
+            "pool:done:orcest-worker-300",
+        ]
+
+        assert manager._task_streams() == (
+            "orcest:tasks:claude",
+            "orcest:tasks:grok",
+            "orcest:tasks:issue:claude",
+            "orcest:tasks:issue:codex",
+        )
+
+    def test_task_streams_keep_claude_default_when_discovery_fails(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.scan_iter.side_effect = ConnectionError("Redis down")
+
+        assert manager._task_streams() == (
+            "orcest:tasks:claude",
+            "orcest:tasks:issue:claude",
+        )
+
+    def test_task_streams_seed_configured_backend_when_discovery_fails(self):
+        config = _make_config()
+        config.pool.worker_backend = "clauder"
+        manager, _proxmox, redis = _make_manager(config=config)
+        redis.scan_iter.side_effect = ConnectionError("Redis down")
+
+        assert manager._task_streams() == (
+            "orcest:tasks:claude",
+            "orcest:tasks:clauder",
+            "orcest:tasks:issue:claude",
+            "orcest:tasks:issue:clauder",
+        )
+
+
 # ── _check_done_workers ─────────────────────────────────────
 
 
@@ -162,6 +208,34 @@ class TestCheckDoneWorkers:
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
         redis.delete.assert_any_call("pool:done:orcest-worker-300")
+
+    def test_done_worker_coordinates_recovery_before_destroy(self):
+        manager, proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = ["pool:done:orcest-worker-300"]
+
+        with patch.object(manager, "_coordinate_reaped_vm", return_value=True) as coordinate:
+            destroyed = manager._check_done_workers()
+
+        assert destroyed == [300]
+        coordinate.assert_called_once_with(300)
+        proxmox.destroy_vm.assert_called_once_with(300)
+        redis.delete.assert_any_call("pool:done:orcest-worker-300")
+
+    def test_done_worker_recovery_failure_stops_vm_and_leaves_done_key(self):
+        manager, proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = ["pool:done:orcest-worker-300"]
+
+        with patch.object(manager, "_coordinate_reaped_vm", return_value=False) as coordinate:
+            destroyed = manager._check_done_workers()
+
+        assert destroyed == []
+        coordinate.assert_called_once_with(300)
+        proxmox.stop_vm.assert_called_once_with(300)
+        proxmox.destroy_vm.assert_not_called()
+        redis.delete.assert_not_called()
+        # Completion is a durable handoff; only successful VM destruction may
+        # delete it, and a failed pass must not add an expiry.
+        redis.expire.assert_not_called()
 
     def test_destroys_multiple_done_workers(self):
         manager, proxmox, redis = _make_manager()
@@ -207,7 +281,8 @@ class TestCheckDoneWorkers:
 
         manager._check_done_workers()
 
-        pipe.srem.assert_called_once_with("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
         pipe.execute.assert_called_once()
 
@@ -254,7 +329,8 @@ class TestDestroyVm:
 
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
-        pipe.srem.assert_called_once_with("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
         pipe.execute.assert_called_once()
 
@@ -279,7 +355,8 @@ class TestDestroyVm:
         manager._destroy_vm(300)
 
         # Redis cleanup still happens
-        pipe.srem.assert_called_once()
+        pipe.srem.assert_any_call("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once()
         pipe.execute.assert_called_once()
 
@@ -292,7 +369,8 @@ class TestDestroyVm:
 
         manager._destroy_vm(300)
 
-        pipe.srem.assert_called_once_with("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:idle", "300")
+        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
         pipe.execute.assert_called_once()
 
@@ -601,6 +679,25 @@ class TestCloneRedisPassword:
         kwargs = render.call_args.kwargs
         assert kwargs.get("redis_password") == "pool-secret-pw"
 
+    def test_clone_passes_worker_backend_and_runner_mode(self, monkeypatch):
+        monkeypatch.delenv("ORCEST_REDIS_PASSWORD", raising=False)
+        config = _make_config()
+        config.pool.worker_backend = "clauder"
+        config.pool.worker_runner_type = "claude"
+        config.pool.worker_runner_mode = "interactive"
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            render.return_value = "#cloud-config\n"
+            manager._clone_and_boot()
+
+        render.assert_called_once()
+        kwargs = render.call_args.kwargs
+        assert kwargs.get("worker_backend") == "clauder"
+        assert kwargs.get("worker_runner_type") == "claude"
+        assert kwargs.get("worker_runner_mode") == "interactive"
+
     def test_clone_omits_password_when_env_unset(self, monkeypatch):
         """Backward compat: with no ORCEST_REDIS_PASSWORD in the pool-manager env
         the clone is rendered without a password (empty string), preserving the
@@ -683,6 +780,23 @@ class TestResolveTemplateValidation:
         assert proxmox.clone_vm.call_args[1]["template_id"] == 9001
         # Pointer repointed so the recovery survives a restart.
         redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9001", ttl=86400 * 365)
+
+    def test_missing_pointer_range_mode_discovers_live_template(self):
+        """Range-only startup can recover from a missing Redis template pointer."""
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = None
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9004, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9005, "name": "orcest-worker-template", "template": False},
+        ]
+
+        manager._clone_and_boot()
+
+        proxmox.vm_exists.assert_not_called()
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args[1]["template_id"] == 9004
+        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9004", ttl=86400 * 365)
 
     def test_missing_template_no_replacement_returns_none(self):
         """With no live template anywhere, no clone is attempted."""
@@ -1212,10 +1326,253 @@ class TestHealthCheckReapCoordination:
         assert published.task_id == task.id
         assert published.status == ResultStatus.FAILED
         assert published.summary.startswith("[transient] ")
+        assert published.repo == task.repo
         assert published.resource_id == 42
         # 4) The consumer's PEL slot was released (consumer deleted / no pending).
         consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
         assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reaped_vm_recovers_backend_stream_discovered_from_redis(self, fake_redis_client):
+        import time as _time
+
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.models import CONSUMER_GROUP, ResultStatus, Task, TaskResult, TaskType
+
+        rc = fake_redis_client
+        manager, proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:grok", CONSUMER_GROUP)
+        rc.xadd("tasks:grok", task.to_dict())
+        claimed = rc.xreadgroup(
+            group=CONSUMER_GROUP, consumer=worker_id, stream="tasks:grok", block_ms=None
+        )
+        assert len(claimed) == 1
+        rc.hset("pool:active", "305", str(_time.time() - 99999))
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+        assert get_pending_task(rc, "owner/repo", "pr", 42) is None
+        results = rc.xrevrange("results", count=10)
+        assert len(results) == 1
+        published = TaskResult.from_dict(results[0][1])
+        assert published.task_id == task.id
+        assert published.status == ResultStatus.FAILED
+        assert published.summary.startswith("[transient] ")
+        consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:grok", CONSUMER_GROUP)}
+        assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reaped_vm_publish_failure_does_not_clear_or_ack(
+        self, fake_redis_client, monkeypatch
+    ):
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.models import CONSUMER_GROUP, Task, TaskType
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", task.to_dict())
+        claimed = rc.xreadgroup(
+            group=CONSUMER_GROUP, consumer=worker_id, stream="tasks:claude", block_ms=None
+        )
+        assert len(claimed) == 1
+
+        def fail_publish(*args, **kwargs):
+            raise ConnectionError("Redis down")
+
+        monkeypatch.setattr(rc, "xadd_capped_raw", fail_publish)
+
+        manager._coordinate_reaped_vm(305)
+
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        assert rc.xrevrange("results", count=10) == []
+        consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
+        assert consumers[worker_id]["pending"] == 1
+
+    def test_reaped_vm_does_not_publish_failure_when_result_already_exists(
+        self, fake_redis_client
+    ):
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.models import CONSUMER_GROUP, ResultStatus, Task, TaskResult, TaskType
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="test",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", task.to_dict())
+        claimed = rc.xreadgroup(
+            group=CONSUMER_GROUP, consumer=worker_id, stream="tasks:claude", block_ms=None
+        )
+        assert len(claimed) == 1
+        rc.xadd(
+            "results",
+            TaskResult(
+                task_id=task.id,
+                worker_id=worker_id,
+                status=ResultStatus.COMPLETED,
+                branch=task.branch,
+                summary="already published",
+                duration_seconds=5,
+                resource_type=task.resource_type,
+                resource_id=task.resource_id,
+                repo=task.repo,
+            ).to_dict(),
+        )
+
+        recovered = manager._coordinate_reaped_vm(305)
+
+        assert recovered is True
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        results = [TaskResult.from_dict(fields) for _, fields in rc.xrevrange("results", count=10)]
+        assert [result.status for result in results] == [ResultStatus.COMPLETED]
+        consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
+        assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reaped_unkeyed_task_checks_default_prefixed_results_for_duplicates(
+        self, fake_redis_client
+    ):
+        from orcest.shared.coordination import get_pending_task, set_pending_task
+        from orcest.shared.models import CONSUMER_GROUP, ResultStatus, Task, TaskResult, TaskType
+
+        rc = fake_redis_client
+        manager, _proxmox = self._build(rc)
+        worker_id = "orcest-worker-305"
+        task = Task.create(
+            task_type=TaskType.FIX_CI,
+            repo="owner/repo",
+            token="ghp_x",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+            branch="fix-branch",
+            key_prefix="",
+        )
+        assert set_pending_task(rc, "owner/repo", "pr", 42, task.id) is True
+        rc.ensure_consumer_group("tasks:claude", CONSUMER_GROUP)
+        rc.xadd("tasks:claude", task.to_dict())
+        claimed = rc.xreadgroup(
+            group=CONSUMER_GROUP, consumer=worker_id, stream="tasks:claude", block_ms=None
+        )
+        assert len(claimed) == 1
+        rc.xadd(
+            "results",
+            TaskResult(
+                task_id=task.id,
+                worker_id=worker_id,
+                status=ResultStatus.COMPLETED,
+                branch=task.branch,
+                summary="already published",
+                duration_seconds=5,
+                resource_type=task.resource_type,
+                resource_id=task.resource_id,
+                repo=task.repo,
+            ).to_dict(),
+        )
+
+        recovered = manager._coordinate_reaped_vm(305)
+
+        assert recovered is True
+        assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
+        results = [TaskResult.from_dict(fields) for _, fields in rc.xrevrange("results", count=10)]
+        assert [result.status for result in results] == [ResultStatus.COMPLETED]
+        assert rc.client.xrevrange("results", count=10) == []
+        consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
+        assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
+
+    def test_reaped_vm_xpending_failure_does_not_delete_consumer(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
+        redis.client.xpending_range.side_effect = ConnectionError("Redis down")
+
+        recovered = manager._coordinate_reaped_vm(305)
+
+        assert recovered is False
+        redis.client.xgroup_delconsumer.assert_not_called()
+        redis.xack_raw.assert_not_called()
+
+    def test_reaped_vm_xrange_failure_does_not_ack_as_malformed(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
+        redis.client.xpending_range.return_value = [{"message_id": "1-0"}]
+        redis.client.xrange.side_effect = ConnectionError("Redis down")
+
+        recovered = manager._coordinate_reaped_vm(305)
+
+        assert recovered is False
+        redis.xack_raw.assert_not_called()
+        redis.client.xgroup_delconsumer.assert_not_called()
+
+    def test_read_consumer_pending_pages_beyond_first_batch(self):
+        from orcest.shared.models import CONSUMER_GROUP
+
+        manager, _proxmox, redis = _make_manager()
+        redis.xinfo_groups_raw.return_value = [{"name": CONSUMER_GROUP, "pending": 101}]
+        redis.client.xpending_range.side_effect = [
+            [{"message_id": f"{entry_id}-0"} for entry_id in range(1, 101)],
+            [{"message_id": "101-0"}],
+        ]
+        redis.client.xrange.side_effect = (
+            lambda _stream, min, max: [(min, {"id": str(min), "repo": "owner/repo"})]
+        )
+
+        entries = manager._read_consumer_pending(
+            "orcest:tasks:grok",
+            "orcest-worker-305",
+        )
+
+        assert entries is not None
+        assert len(entries) == 101
+        assert redis.client.xpending_range.call_args_list[0].kwargs["min"] == "-"
+        assert redis.client.xpending_range.call_args_list[1].kwargs["min"] == "(100-0"
+
+    def test_health_check_preserves_state_when_recovery_incomplete(self, fake_redis_client):
+        import time as _time
+
+        rc = fake_redis_client
+        manager, proxmox = self._build(rc)
+        rc.hset("pool:active", "305", str(_time.time() - 99999))
+
+        with patch.object(manager, "_coordinate_reaped_vm", return_value=False):
+            manager._health_check()
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_not_called()
+        assert rc.hgetall("pool:active").get("305") is not None
 
     def test_reap_with_no_pending_entry_still_destroys(self, fake_redis_client):
         # A VM over-duration but with an empty PEL (e.g. already ACKed) must
@@ -1579,7 +1936,7 @@ class TestReconcileStaleRedis:
 
 
 class TestSweepOrphanPel:
-    def test_deletes_consumer_for_dead_vmid(self):
+    def test_recovers_pending_consumer_for_dead_vmid(self):
         manager, proxmox, redis = _make_manager()
         redis.smembers.side_effect = None
         redis.smembers.return_value = set()  # nothing idle
@@ -1588,10 +1945,27 @@ class TestSweepOrphanPel:
         redis.xinfo_consumers_raw.return_value = [
             {"name": "orcest-worker-305", "pending": 2},
         ]
-        manager._sweep_orphan_pel()
-        # delconsumer_raw called for the dead consumer on each task stream.
-        assert redis.delconsumer_raw.call_count == 2  # two task streams
-        redis.delconsumer_raw.assert_any_call("orcest:tasks:claude", "workers", "orcest-worker-305")
+        with patch.object(manager, "_coordinate_reaped_vm", return_value=True) as recover:
+            manager._sweep_orphan_pel()
+
+        recover.assert_called_once_with(305)
+        redis.delconsumer_raw.assert_not_called()
+
+    def test_leaves_consumer_when_dead_vmid_recovery_is_incomplete(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 2},
+        ]
+
+        with patch.object(manager, "_coordinate_reaped_vm", return_value=False) as recover:
+            manager._sweep_orphan_pel()
+
+        recover.assert_called_once_with(305)
+        redis.delconsumer_raw.assert_not_called()
 
     def test_keeps_consumer_for_live_idle_vmid(self):
         manager, proxmox, redis = _make_manager()
@@ -1617,7 +1991,7 @@ class TestSweepOrphanPel:
         manager._sweep_orphan_pel()
         redis.delconsumer_raw.assert_not_called()
 
-    def test_skips_consumer_with_zero_pending(self):
+    def test_deletes_empty_consumer_for_dead_vmid(self):
         manager, proxmox, redis = _make_manager()
         redis.smembers.side_effect = None
         redis.smembers.return_value = set()
@@ -1627,6 +2001,22 @@ class TestSweepOrphanPel:
             {"name": "orcest-worker-305", "pending": 0},
         ]
         manager._sweep_orphan_pel()
+        assert redis.delconsumer_raw.call_count == 2  # two task streams
+        redis.delconsumer_raw.assert_any_call("orcest:tasks:claude", "workers", "orcest-worker-305")
+
+    def test_skips_sweep_when_proxmox_listing_fails(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.side_effect = RuntimeError("pve unavailable")
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 2},
+        ]
+
+        manager._sweep_orphan_pel()
+
+        redis.xinfo_consumers_raw.assert_not_called()
         redis.delconsumer_raw.assert_not_called()
 
 

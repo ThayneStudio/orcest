@@ -1023,8 +1023,11 @@ def pool_manage(config: str, interval: float) -> None:
     console = Console()
     cfg = load_config(config)
 
-    if not cfg.pool.template_vm_id:
-        console.print("[red]Error: pool.template_vm_id not configured in fleet config.[/red]")
+    if not cfg.pool.template_vm_id and cfg.pool.template_range() is None:
+        console.print(
+            "[red]Error: neither pool.template_vm_id nor "
+            "pool.template_vmid_range is configured in fleet config.[/red]"
+        )
         raise SystemExit(1)
 
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:

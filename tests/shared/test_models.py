@@ -8,6 +8,8 @@ from orcest.shared.models import (
     Task,
     TaskResult,
     TaskType,
+    is_claude_provider,
+    task_stream_name,
 )
 
 
@@ -37,15 +39,36 @@ def _make_task_result(**overrides) -> TaskResult:
         "duration_seconds": 120,
         "resource_type": "pr",
         "resource_id": 42,
+        "repo": "acme/widget",
     }
     defaults.update(overrides)
     return TaskResult(**defaults)
+
+
+def test_task_stream_name_builds_provider_specific_streams():
+    assert task_stream_name("claude") == "tasks:claude"
+    assert task_stream_name("clauder") == "tasks:clauder"
+    assert task_stream_name("grok", issue=True) == "tasks:issue:grok"
+
+
+def test_task_stream_name_rejects_empty_provider():
+    with pytest.raises(ValueError, match="provider"):
+        task_stream_name(" ")
 
 
 def test_task_create_generates_unique_ids():
     t1 = _make_task()
     t2 = _make_task()
     assert t1.id != t2.id
+
+
+def test_clauder_is_a_claude_backed_provider_alias():
+    task = _make_task(provider="clauder", claude_token="claude-oauth-token")
+
+    assert is_claude_provider("clauder") is True
+    assert task.provider == "clauder"
+    assert task.credential == "claude-oauth-token"
+    assert task.claude_token == "claude-oauth-token"
 
 
 def test_task_to_dict_values_are_strings():
@@ -105,6 +128,31 @@ def test_task_result_credential_update_round_trip():
     assert rebuilt.credential_update == '{"key":"rotated","refresh_token":"rt"}'
 
 
+def test_task_result_credential_update_timestamp_round_trip():
+    original = _make_task_result(
+        credential_update='{"refresh_token":"rt"}',
+        credential_update_minted_at=123.5,
+    )
+    rebuilt = TaskResult.from_dict(original.to_dict())
+    assert rebuilt.credential_update_minted_at == 123.5
+
+
+def test_task_result_repo_does_not_shift_historic_positional_arguments():
+    result = TaskResult(
+        "task-1",
+        "worker-1",
+        ResultStatus.COMPLETED,
+        None,
+        "done",
+        5,
+        "pr",
+        42,
+        123,
+    )
+    assert result.rate_limit_resets_at == 123
+    assert result.repo == ""
+
+
 def test_task_result_credential_update_absent_by_default():
     d = _make_task_result().to_dict()
     assert "credential_update" not in d
@@ -138,6 +186,7 @@ def test_task_result_to_dict_from_dict_round_trip():
     assert rebuilt.duration_seconds == original.duration_seconds
     assert rebuilt.resource_type == original.resource_type
     assert rebuilt.resource_id == original.resource_id
+    assert rebuilt.repo == original.repo
     assert rebuilt.snapshot_head_sha == "abc123"
     assert rebuilt.decision_reason == "changes_requested"
     assert rebuilt.snapshot_review_thread_ids == ["thread-1"]
@@ -196,6 +245,16 @@ def test_task_result_branch_none_roundtrip():
 
     rebuilt = TaskResult.from_dict(d)
     assert rebuilt.branch is None
+
+
+def test_task_result_from_dict_legacy_repo_defaults_empty():
+    result = _make_task_result()
+    d = result.to_dict()
+    del d["repo"]
+
+    rebuilt = TaskResult.from_dict(d)
+
+    assert rebuilt.repo == ""
 
 
 def test_task_result_needs_human_round_trip():

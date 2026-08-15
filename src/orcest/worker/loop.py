@@ -37,6 +37,7 @@ from orcest.shared.models import (
     ResultStatus,
     Task,
     TaskResult,
+    is_claude_provider,
 )
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
@@ -56,6 +57,7 @@ MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at mos
 _STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB across 4 workers)
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
+_EPHEMERAL_RESULT_RETRY_SECONDS = 5
 if len(_RESULT_PUBLISH_BACKOFF) != _RESULT_PUBLISH_RETRIES - 1:
     raise ValueError(
         "_RESULT_PUBLISH_BACKOFF must have exactly _RESULT_PUBLISH_RETRIES - 1 entries"
@@ -73,6 +75,9 @@ if len(_STARTUP_PING_BACKOFF) != _STARTUP_PING_RETRIES - 1:
 _FAILURE_CONCLUSIONS = frozenset(
     {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
 )
+_POOL_DRAINING_KEY = "pool:draining"
+_DRAIN_RESTART_EXIT_CODE = 75
+_CREDENTIAL_UPDATE_VERSION_KEY = "providers:credential_update_version"
 _CI_DECISIONS = frozenset({"ci_failure"})
 _REVIEW_DECISIONS = frozenset({"changes_requested", "followup_threads"})
 
@@ -86,13 +91,23 @@ def _runner_for_task(task: Task, config: WorkerConfig, fallback: Runner) -> Runn
         the pre-instantiated fallback. Avoids per-task instantiation and
         preserves the contract that tests inject a runner via the fallback.
       - When the provider differs and is registered in PROVIDER_REGISTRY
-        with a ``runner_cls``, instantiate that class fresh.
+        with a ``runner_cls``, instantiate that class fresh. Claude keeps the
+        worker's explicit ``runner.extra.mode=interactive`` selection in this
+        branch so provider dispatch cannot accidentally fall back to ``-p``.
       - Otherwise (unknown provider, or registered without a ``runner_cls``),
         fall back. The early-reject in the main loop already filters
         genuinely unknown providers before dispatch.
     """
     if task.provider == config.runner.type:
         return fallback
+    if is_claude_provider(task.provider) and config.runner.extra.get("mode") == "interactive":
+        from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
+
+        return ClaudeInteractiveRunner(
+            max_retries=config.runner.max_retries,
+            retry_backoff=config.runner.retry_backoff,
+            model=config.runner.model,
+        )
     recipe = PROVIDER_REGISTRY.get(task.provider)
     if recipe is None or recipe.runner_cls is None:
         return fallback
@@ -325,6 +340,40 @@ def _early_reject_unsupported_provider(
     logger.info(f"Early graceful reject for task {task.id} (provider={provider})")
 
 
+def _signal_ephemeral_done(
+    redis: RedisClient,
+    config: WorkerConfig,
+    logger: logging.Logger,
+    shutdown_event: threading.Event,
+) -> bool:
+    """Signal pool completion, retrying durably for pool-managed clones."""
+    attempt = 0
+    while True:
+        try:
+            key = f"pool:done:{config.worker_id}"
+            if config.pool_managed:
+                # The pool manager is the acknowledgement boundary: it
+                # deletes this durable handoff only after the VM is destroyed.
+                redis.set_value(key, "1")
+            else:
+                # Standalone ephemeral workers have no pool manager to clean
+                # an unbounded marker, so retain the legacy diagnostic TTL.
+                redis.set_ex(key, "1", ttl=300)
+            return True
+        except Exception:
+            attempt += 1
+            if not config.pool_managed:
+                logger.warning("Failed to set pool:done key", exc_info=True)
+                return False
+            logger.warning(
+                "Failed to hand task completion to pool manager (attempt %d); retrying",
+                attempt,
+                exc_info=True,
+            )
+            if shutdown_event.wait(timeout=min(30, 2 ** min(attempt - 1, 5))):
+                return False
+
+
 def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) -> None:
     """Main worker entry point. Blocks indefinitely.
 
@@ -365,8 +414,12 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     redis.ensure_consumer_group(issue_stream, CONSUMER_GROUP)
 
     # Drain pending tasks from previous worker lifecycle.
-    _drain_pending_tasks_raw(redis, pr_fq, config, logger)
-    _drain_pending_tasks_raw(redis, issue_fq, config, logger)
+    if not _drain_pending_tasks_raw(redis, pr_fq, config, logger):
+        logger.error("Pending PR-task recovery is not durable; exiting for a backed-off retry")
+        raise SystemExit(1)
+    if not _drain_pending_tasks_raw(redis, issue_fq, config, logger):
+        logger.error("Pending issue-task recovery is not durable; exiting for a backed-off retry")
+        raise SystemExit(1)
 
     # Graceful shutdown
     shutdown = False
@@ -382,13 +435,30 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     signal.signal(signal.SIGINT, handle_signal)
 
     workspace = Workspace(config.workspace_dir)
+    runner_mode = config.runner.extra.get("mode", "default")
 
     logger.info(
         f"Worker {config.worker_id} started (backend={config.backend}, "
-        f"runner={config.runner.type}, streams={pr_fq},{issue_fq}). Waiting for tasks..."
+        f"runner={config.runner.type}, runner_mode={runner_mode}, "
+        f"streams={pr_fq},{issue_fq}). Waiting for tasks..."
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
+        try:
+            if redis.sismember(_POOL_DRAINING_KEY, config.worker_id) is True:
+                logger.info(
+                    "Worker %s is draining; exiting with restartable status before claiming work",
+                    config.worker_id,
+                )
+                # The template unit uses Restart=on-failure. A non-zero drain
+                # exit keeps the worker recoverable if the pool manager aborts
+                # after quiescing it; on a successful drain the VM is stopped
+                # before systemd's RestartSec elapses.
+                raise SystemExit(_DRAIN_RESTART_EXIT_CODE)
+        except Exception:
+            # Redis reads immediately below remain authoritative. A transient
+            # drain-key failure should not crash a healthy worker.
+            logger.debug("Failed to check worker drain state", exc_info=True)
         # PR tasks have priority — non-blocking check first
         pr_entries = redis.xreadgroup(
             group=CONSUMER_GROUP,
@@ -469,10 +539,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         if delivery_count >= MAX_DELIVERY_COUNT:
             _dead_letter_task(redis, current_stream, entry_id, task, delivery_count, logger)
             if config.ephemeral:
-                try:
-                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
-                except Exception:
-                    logger.warning("Failed to set pool:done key", exc_info=True)
+                _signal_ephemeral_done(redis, config, logger, shutdown_event)
                 logger.info("Ephemeral mode: dead-lettered task, shutting down.")
                 shutdown = True
                 shutdown_event.set()
@@ -540,10 +607,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 # including dead-lettered ones.  Without this the worker
                 # would loop indefinitely on an empty queue until the pool
                 # manager's SIGTERM timeout fires, wasting a VM slot.
-                try:
-                    redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
-                except Exception:
-                    logger.warning("Failed to set pool:done key", exc_info=True)
+                _signal_ephemeral_done(redis, config, logger, shutdown_event)
                 logger.info("Ephemeral mode: dead-lettered task, shutting down.")
                 shutdown = True
                 shutdown_event.set()
@@ -619,6 +683,26 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             abort_event=shutdown_event,
         )
 
+        # No ephemeral worker may exit normally while the only copy of its
+        # result is still in its local PEL. Keep retrying until Redis accepts
+        # it; an explicit shutdown leaves the entry recoverable.
+        while config.ephemeral and not published:
+            logger.error(
+                "Result publish failed for ephemeral task %s; retaining worker and retrying",
+                task.id,
+            )
+            if shutdown_event.wait(timeout=_EPHEMERAL_RESULT_RETRY_SECONDS):
+                break
+            published = _publish_result_with_retry(
+                redis,
+                result,
+                task,
+                logger,
+                current_stream,
+                entry_id,
+                abort_event=shutdown_event,
+            )
+
         if published:
             logger.info(f"Published result for task {task.id}: {result.status.value}")
 
@@ -631,37 +715,25 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 )
 
         # Ephemeral mode: signal pool manager and exit after one task.
-        # Exit regardless of publish success — the VM will be destroyed.
+        # Exit regardless of publish success.  If result publication failed,
+        # leave the stream entry unACKed and coordination markers intact so the
+        # pool manager can publish a recovery result before destroying the VM.
         if config.ephemeral:
-            # In ephemeral mode, if result publish failed the entry is still
-            # unACKed.  ACK it now to prevent a permanently orphaned PEL entry
-            # (the VM will be destroyed, so no future drain will ever claim it).
             if not published:
-                try:
-                    redis.xack_raw(current_stream, CONSUMER_GROUP, entry_id)
-                except Exception:
+                if config.pool_managed:
                     logger.error(
-                        f"Failed to ACK task {task.id} on ephemeral exit "
-                        "(PEL entry will be orphaned)",
-                        exc_info=True,
+                        "Pool-managed task %s is still unACKed after shutdown; "
+                        "leaving VM for reaper recovery",
+                        task.id,
                     )
-                # Clear pending-task marker so the orchestrator can re-enqueue.
-                # When publish succeeded this was already done above; when it
-                # failed the marker would otherwise linger until TTL expiry
-                # (~95 min) since the VM is about to be destroyed.
-                try:
-                    _clear_pending_task_for_task(redis, task)
-                    _clear_task_attempt_reservation(redis, task)
-                except Exception:
-                    logger.warning(
-                        "Failed to clear pending task marker for "
-                        f"{task.resource_type} #{task.resource_id} on ephemeral exit",
-                        exc_info=True,
+                else:
+                    logger.error(
+                        "Standalone ephemeral task %s remains unACKed after shutdown; "
+                        "restart with the same worker id to resume recovery",
+                        task.id,
                     )
-            try:
-                redis.set_ex(f"pool:done:{config.worker_id}", "1", ttl=300)
-            except Exception:
-                logger.warning("Failed to set pool:done key", exc_info=True)
+            if published:
+                _signal_ephemeral_done(redis, config, logger, shutdown_event)
             logger.info("Ephemeral mode: task complete, shutting down.")
             shutdown = True
             shutdown_event.set()  # Must mirror handle_signal; abort_event watches this
@@ -685,8 +757,8 @@ def _pending_task_id_for_task(redis: RedisClient, task: Task) -> str | None:
 
     Routed by ``task.key_prefix`` to mirror ``_clear_pending_task_for_task`` so
     multi-project markers are read from the correct namespace. Returns None when
-    no marker is present (the orchestrator clears the marker on every result, so
-    its absence means the original result was already processed).
+    no marker is present. Absence alone is not proof of completion because the
+    marker can expire or be lost while the stream entry remains pending.
     """
     base_key = make_pending_task_key(task.repo, task.resource_type, task.resource_id)
     if task.key_prefix:
@@ -702,7 +774,7 @@ def _drain_pending_tasks_raw(
     fq_stream: str,
     config: WorkerConfig,
     logger: logging.Logger,
-) -> None:
+) -> bool:
     """Drain pending tasks from a fully-qualified stream name.
 
     Uses raw (un-prefixed) Redis operations since the stream name is
@@ -723,6 +795,8 @@ def _drain_pending_tasks_raw(
             drained += 1
             task: Task | None = None
             recovery_result_published = False
+            should_publish_recovery = False
+            marker_matches_task = False
             try:
                 task = Task.from_dict(fields)
                 logger.warning(
@@ -731,17 +805,11 @@ def _drain_pending_tasks_raw(
                     f"publishing FAILED result"
                 )
                 # Dedup/staleness guard (M4-conc): only publish a recovery
-                # FAILED when the pending marker STILL points at this task.
-                # If the marker is gone or points at a newer task, the original
-                # result already reached the orchestrator (which clears the
-                # marker on every result), so a second result here would be a
-                # duplicate. For PRs the orchestrator's snapshot staleness check
-                # would drop it, but ISSUE results have no such guard, so a
-                # replayed FAILED could clear attempts / re-trigger an already
-                # implemented issue. Suppress it; still ACK below. Fail open: if
-                # the marker read raises, treat the marker as matching (publish
-                # anyway, and clear the reservation if that publish fails) to
-                # preserve restart-recovery behavior.
+                # FAILED unless the pending marker points at a DIFFERENT task.
+                # A missing marker is ambiguous (it can expire or be lost while
+                # work remains in the PEL), so fail safe by publishing recovery.
+                # A newer task id is authoritative and suppresses this stale
+                # replay. Marker read errors likewise publish recovery.
                 #
                 # ``marker_matches_task`` also gates the attempt-reservation
                 # clear below (Case B): when the marker points at a NEWER task,
@@ -753,7 +821,7 @@ def _drain_pending_tasks_raw(
                 marker_matches_task = True
                 try:
                     current_pending_id = _pending_task_id_for_task(redis, task)
-                    if current_pending_id != task.id:
+                    if current_pending_id is not None and current_pending_id != task.id:
                         should_publish_recovery = False
                         marker_matches_task = False
                         logger.info(
@@ -807,22 +875,27 @@ def _drain_pending_tasks_raw(
                     f"Malformed pending entry {entry_id}: {e}; ACKing to discard",
                     exc_info=True,
                 )
-            try:
-                redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
-            except Exception:
-                logger.error(
-                    f"Failed to ACK pending entry {entry_id}",
-                    exc_info=True,
-                )
-            if task is not None:
+            # Do not ACK a valid task until its recovery result is durable (or
+            # a different pending task proves this entry stale). Otherwise a
+            # Redis outage can erase the only recoverable handoff.
+            should_ack = task is None or recovery_result_published or not should_publish_recovery
+            if should_ack:
+                try:
+                    redis.xack_raw(fq_stream, CONSUMER_GROUP, entry_id)
+                except Exception:
+                    logger.error(
+                        f"Failed to ACK pending entry {entry_id}",
+                        exc_info=True,
+                    )
+            if task is not None and should_ack:
                 try:
                     # ``_clear_pending_task_for_task`` is CAS-guarded (only
                     # deletes when the marker still equals task.id), so it is a
                     # safe no-op when the marker points at a newer task.
                     _clear_pending_task_for_task(redis, task)
-                    # Clear the attempt reservation only when no result reached
-                    # the orchestrator AND the pending marker still points at
-                    # THIS task. When the marker points at a newer task
+                    # Clear the attempt reservation only when no result was
+                    # published and the marker still points at THIS task. When
+                    # the marker points at a newer task
                     # (``marker_matches_task`` is False), that newer in-flight
                     # task owns the reservation now; clearing it here would wipe
                     # its counter (M4-conc Case B) — the issue clear is an
@@ -838,8 +911,19 @@ def _drain_pending_tasks_raw(
                         f"{task.resource_type} #{task.resource_id} during drain",
                         exc_info=True,
                     )
+            if task is not None and should_publish_recovery and not recovery_result_published:
+                # Preserve the PEL entry, but stop this drain pass. Reading ID
+                # 0 again would return the same entry immediately and hammer a
+                # degraded/wrong-type results stream in a tight loop.
+                logger.warning(
+                    "Stopping pending-task drain after recovery publication failed for %s; "
+                    "the PEL entry will be retried on the next worker restart",
+                    task.id,
+                )
+                return False
     if drained:
         logger.info(f"Drained {drained} pending task(s) from {fq_stream}")
+    return True
 
 
 def _dead_letter_task(
@@ -941,12 +1025,22 @@ def _publish_result_with_retry(
             if _abort.wait(timeout=_RESULT_PUBLISH_BACKOFF[attempt - 1]):
                 return False
         try:
+            if result.credential_update and result.credential_update_minted_at <= 0:
+                # Use one trusted Redis clock/sequence for every worker VM.
+                # Independent filesystem mtimes can reorder rotating refresh
+                # tokens when VM clocks differ.
+                result.credential_update_minted_at = redis.next_monotonic_version(
+                    _CREDENTIAL_UPDATE_VERSION_KEY
+                )
+            result_fields = result.to_dict()
+            if not result_fields.get("repo"):
+                result_fields["repo"] = task.repo
             # Publish to the correct project's results stream
             if task.key_prefix:
                 fq_results = f"{task.key_prefix}:{RESULTS_STREAM}"
-                redis.xadd_capped_raw(fq_results, result.to_dict(), maxlen=_STREAM_MAXLEN)
+                redis.xadd_capped_raw(fq_results, result_fields, maxlen=_STREAM_MAXLEN)
             else:
-                redis.xadd_capped(RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN)
+                redis.xadd_capped(RESULTS_STREAM, result_fields, maxlen=_STREAM_MAXLEN)
             return True
         except Exception as exc:
             last_exc = exc
@@ -966,9 +1060,12 @@ def _publish_result_with_retry(
         # stream (a persistent, human-inspected recovery stream). The task
         # carries the provider credential; the result may carry a rotated
         # OAuth blob (credential_update) — both are redacted here.
+        result_fields = result.to_safe_dict()
+        if not result_fields.get("repo"):
+            result_fields["repo"] = task.repo
         dl_fields = {
             **task.to_safe_dict(),
-            **result.to_safe_dict(),
+            **result_fields,
             "dead_letter_reason": (
                 f"Result publish failed after {_RESULT_PUBLISH_RETRIES} attempts"
             ),
@@ -1000,6 +1097,7 @@ def _task_result(
     needs_human: bool = False,
     needs_human_reason: str = "",
     credential_update: str = "",
+    credential_update_minted_at: float = 0.0,
 ) -> TaskResult:
     return TaskResult(
         task_id=task.id,
@@ -1007,6 +1105,7 @@ def _task_result(
         status=status,
         resource_type=task.resource_type,
         resource_id=task.resource_id,
+        repo=task.repo,
         branch=branch,
         summary=summary,
         duration_seconds=duration_seconds,
@@ -1019,6 +1118,7 @@ def _task_result(
         needs_human=needs_human,
         needs_human_reason=needs_human_reason,
         credential_update=credential_update,
+        credential_update_minted_at=credential_update_minted_at,
     )
 
 
@@ -1158,6 +1258,25 @@ def _validate_pr_task_snapshot(task: Task, logger: logging.Logger) -> tuple[bool
     return False, ""
 
 
+def _task_output_stream(task: Task, config: WorkerConfig) -> tuple[str, bool]:
+    stream = f"output:{config.worker_id}"
+    if task.key_prefix:
+        return f"{task.key_prefix}:{stream}", True
+    return stream, False
+
+
+def _publish_task_output(
+    redis: RedisClient,
+    stream: str,
+    raw_stream: bool,
+    fields: dict[str, str],
+) -> None:
+    if raw_stream:
+        redis.xadd_capped_raw(stream, fields, maxlen=_STREAM_MAXLEN)
+    else:
+        redis.xadd_capped(stream, fields, maxlen=_STREAM_MAXLEN)
+
+
 def _execute_task(
     task: Task,
     config: WorkerConfig,
@@ -1169,19 +1288,20 @@ def _execute_task(
 ) -> TaskResult:
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
-    output_stream = f"output:{config.worker_id}"
+    output_stream, output_stream_is_raw = _task_output_stream(task, config)
 
     def publish_task_end(status: ResultStatus) -> None:
         try:
-            redis.xadd_capped(
+            _publish_task_output(
+                redis,
                 output_stream,
+                output_stream_is_raw,
                 {
                     "type": "task_end",
                     "task_id": task.id,
                     "status": status.value,
                     "worker_id": config.worker_id,
                 },
-                maxlen=_STREAM_MAXLEN,
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
@@ -1192,8 +1312,10 @@ def _execute_task(
         # let the trace archiver materialize a .meta.json sidecar without
         # cross-referencing the results stream.
         try:
-            redis.xadd_capped(
+            _publish_task_output(
+                redis,
                 output_stream,
+                output_stream_is_raw,
                 {
                     "type": "task_start",
                     "task_id": task.id,
@@ -1205,7 +1327,6 @@ def _execute_task(
                     "worker_id": config.worker_id,
                     "branch": task.branch or "",
                 },
-                maxlen=_STREAM_MAXLEN,
             )
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
@@ -1259,7 +1380,12 @@ def _execute_task(
         def on_output(line: str) -> None:
             nonlocal output_errors
             try:
-                redis.xadd_capped(output_stream, {"line": line}, maxlen=_STREAM_MAXLEN)
+                _publish_task_output(
+                    redis,
+                    output_stream,
+                    output_stream_is_raw,
+                    {"line": line, "task_id": task.id},
+                )
             except Exception:
                 # Non-critical: don't kill the task over a streaming failure.
                 # Log at error #1, #10, #100, … (powers of ten) so operators
@@ -1280,10 +1406,11 @@ def _execute_task(
             # Failures here are silent: streaming visibility is non-critical and we
             # never want a flaky Redis to break task execution.
             try:
-                redis.xadd_capped(
+                _publish_task_output(
+                    redis,
                     output_stream,
-                    {"line": line, "stream": "stderr"},
-                    maxlen=_STREAM_MAXLEN,
+                    output_stream_is_raw,
+                    {"line": line, "stream": "stderr", "task_id": task.id},
                 )
             except Exception:
                 pass
@@ -1349,6 +1476,7 @@ def _execute_task(
             needs_human=runner_result.needs_human,
             needs_human_reason=runner_result.needs_human_reason,
             credential_update=runner_result.credential_update or "",
+            credential_update_minted_at=runner_result.credential_update_minted_at,
         )
 
     except Exception as e:

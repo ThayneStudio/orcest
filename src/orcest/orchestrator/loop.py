@@ -66,6 +66,8 @@ from orcest.shared.models import (
     ResultStatus,
     Task,
     TaskResult,
+    is_claude_provider,
+    task_stream_name,
 )
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient
@@ -77,9 +79,12 @@ RESULTS_GROUP = "orchestrator"
 # Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.
 # exhausted_skip incremented on full pool exhaustion (per provider in the pool).
 # rebake_required_failures incremented on clean "rebake worker image" FAILED results.
+# credential_refresh_failures incremented when an OAuth provider reports an unusable
+# refreshed credential blob, e.g. Grok JSON without a refresh_token.
 _PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"  # aggregate for compat
 _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
+_CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _USAGE_EXHAUSTED_RESULT_KEY = "tokens:usage_exhausted_result"
 _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 # Credential write-back: rotated OAuth blobs (Grok/Codex) keyed by provider
@@ -88,12 +93,129 @@ _USAGE_EXHAUSTED_RESULT_TTL_SECONDS = 24 * 3600  # 24 hours
 # Legacy project-prefixed identity fields are still read/written for rollback.
 _CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
 _SHARED_CREDENTIAL_OVERRIDES_KEY = "providers:credential_overrides"
+_TASK_PROVIDER_ACCOUNTS_KEY = "providers:task_accounts"
+_TASK_PROVIDER_ACCOUNT_PREFIX = "providers:task_account:"
 
-# Round-robin pointer over projects deciding which single project bypasses the
-# shared issue-stream backpressure gate each poll cycle (M5 fairness). The
-# orchestrator is single-instance, so a plain INCR on the shared client is a
-# cheap, restart-tolerant counter; no TTL needed.
+# Shared project heartbeats used to choose one deterministic issue-discovery
+# bypass across the one-container-per-project deployment topology.
+_ISSUE_DISCOVERY_PROJECTS_KEY = "issue_discovery:projects"
 _ISSUE_DISCOVERY_CYCLE_SEQ_KEY = "issue_discovery:cycle_seq"
+_ISSUE_DISCOVERY_TURN_KEY = "issue_discovery:turn"
+
+
+class _RetryableResultError(RuntimeError):
+    """Result handling failed before its durable side effects committed."""
+
+
+def _configured_task_providers(
+    config: OrchestratorConfig,
+    token_pools: dict[str, ProviderPool] | None = None,
+) -> list[str]:
+    """Return provider names whose task streams this orchestrator may touch."""
+    providers: list[str] = []
+
+    def add(provider: str) -> None:
+        normalized = str(provider or "").strip()
+        if normalized and normalized not in providers:
+            providers.append(normalized)
+
+    add(config.default_runner)
+    for entry in getattr(config, "providers", []) or []:
+        add(entry.provider)
+    for project in config.projects:
+        if project.providers:
+            for entry in project.providers:
+                add(entry.provider)
+        elif project.claude_tokens:
+            add("claude")
+    for pool in (token_pools or {}).values():
+        for provider in pool.provider_names:
+            add(provider)
+    return providers
+
+
+def _configured_task_streams(
+    config: OrchestratorConfig,
+    *,
+    issue: bool = False,
+    token_pools: dict[str, ProviderPool] | None = None,
+) -> list[str]:
+    return [
+        task_stream_name(provider, issue=issue)
+        for provider in _configured_task_providers(config, token_pools=token_pools)
+    ]
+
+
+def _published_provider_for_entry(entry: ProviderEntry, default_runner: str) -> str:
+    """Return the provider stream a selected credential should publish to."""
+    if (
+        entry.provider == "claude"
+        and entry.source == "legacy_claude_tokens"
+        and is_claude_provider(default_runner)
+    ):
+        return default_runner
+    return entry.provider
+
+
+def _unclaimed_task_count(
+    redis: RedisClient,
+    streams: list[str],
+    group: str,
+    logger: logging.Logger,
+) -> int:
+    total = 0
+    for stream in streams:
+        try:
+            total += redis.stream_unread_count(stream, group)
+        except Exception:
+            logger.debug("Failed to count unread task entries on %s", stream, exc_info=True)
+    return total
+
+
+def _issue_discovery_priority(
+    task_redis: RedisClient,
+    projects: list[ProjectConfig],
+    interval_seconds: int,
+    logger: logging.Logger,
+) -> str | None:
+    """Return the shared project identity holding the leased next turn."""
+    if not projects:
+        return None
+    now = time.time()
+    identities = [project.key_prefix or project.repo for project in projects]
+    try:
+        for identity in identities:
+            task_redis.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, identity, str(now))
+        heartbeats = task_redis.hgetall(_ISSUE_DISCOVERY_PROJECTS_KEY)
+        stale_after = max(3, int(interval_seconds) * 3)
+        live: list[str] = []
+        stale: list[str] = []
+        for identity, raw_timestamp in heartbeats.items():
+            try:
+                is_live = now - float(raw_timestamp) <= stale_after
+            except (TypeError, ValueError):
+                is_live = False
+            (live if is_live else stale).append(identity)
+        if stale:
+            task_redis.hdel(_ISSUE_DISCOVERY_PROJECTS_KEY, *stale)
+        if not live:
+            return None
+        live.sort()
+        if len(projects) > 1:
+            # A legacy process polling every project owns this entire cycle;
+            # advancing once per call is itself the acknowledgement that the
+            # selected project will be visited below.
+            sequence = task_redis.incr(_ISSUE_DISCOVERY_CYCLE_SEQ_KEY)
+            return live[(sequence - 1) % len(live)]
+        return task_redis.claim_round_robin_turn(
+            _ISSUE_DISCOVERY_TURN_KEY,
+            _ISSUE_DISCOVERY_CYCLE_SEQ_KEY,
+            live,
+            max(1, int(interval_seconds)),
+        )
+    except Exception:
+        logger.debug("Failed to coordinate shared issue-discovery turn", exc_info=True)
+        return None
 
 
 def _legacy_credential_override_key(key: str) -> str:
@@ -112,7 +234,7 @@ def _persist_credential_override(
     minted_at: float,
     logger: logging.Logger,
     shared_redis: RedisClient | None = None,
-) -> None:
+) -> bool:
     """Persist a rotated credential blob.
 
     ``key`` is the account key returned by ProviderPool. The shared store uses
@@ -120,24 +242,64 @@ def _persist_credential_override(
     identity-shaped field for rollback compatibility.
     """
     payload = json.dumps({"blob": blob, "minted_at": minted_at})
+    shared_stored = True
     if shared_redis is not None:
         try:
-            shared_redis.hset(_SHARED_CREDENTIAL_OVERRIDES_KEY, key, payload)
-        except Exception:
-            logger.warning(
-                "Failed to persist shared credential override for account %s",
+            shared_stored = shared_redis.hset_json_if_newer(
+                _SHARED_CREDENTIAL_OVERRIDES_KEY,
                 key,
-                exc_info=True,
+                payload,
+                minted_at,
             )
+        except Exception as exc:
+            # Shared Redis is the canonical cross-project copy. The result must
+            # remain pending so this exact rotation can be retried; merely
+            # caching it in this process would lose it on restart and leave
+            # sibling project orchestrators on an invalidated refresh token.
+            raise _RetryableResultError(
+                f"failed to persist shared credential override for account {key}"
+            ) from exc
     try:
-        redis.hset(
+        redis.hset_json_if_newer(
             _CREDENTIAL_OVERRIDES_KEY,
             _legacy_credential_override_key(key),
             payload,
+            minted_at,
         )
-    except Exception:
+    except Exception as exc:
+        if shared_redis is None:
+            raise _RetryableResultError(
+                f"failed to persist credential override for account {key}"
+            ) from exc
         logger.warning(
             "Failed to persist credential override for account %s", key, exc_info=True
+        )
+    return shared_stored
+
+
+def _refresh_shared_credential_override(
+    redis: RedisClient,
+    pool: "ProviderPool",
+    account: str,
+    logger: logging.Logger,
+) -> None:
+    """Refresh one account from the canonical shared override hash."""
+    try:
+        raw = redis.hget(_SHARED_CREDENTIAL_OVERRIDES_KEY, account)
+        if not raw:
+            return
+        obj = json.loads(raw)
+        blob = str(obj.get("blob", ""))
+        minted_at = float(obj.get("minted_at", 0))
+        if _credential_override_is_usable(account, blob):
+            pool.seed_credential_override(account, blob, minted_at)
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        logger.warning("Ignoring malformed shared credential override for %s", account)
+    except Exception:
+        logger.warning(
+            "Failed to refresh shared credential override for %s",
+            account,
+            exc_info=True,
         )
 
 
@@ -163,11 +325,147 @@ def _load_credential_overrides(
         for key, raw in stored.items():
             try:
                 obj = json.loads(raw)
-                pool.seed_credential_override(
-                    key, str(obj.get("blob", "")), float(obj.get("minted_at", 0))
-                )
+                blob = str(obj.get("blob", ""))
+                if _credential_override_is_usable(key, blob):
+                    pool.seed_credential_override(
+                        key, blob, float(obj.get("minted_at", 0))
+                    )
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
+
+
+def _persist_task_provider_account(
+    redis: RedisClient,
+    task_id: str,
+    entry: ProviderEntry,
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> None:
+    """Persist non-secret task -> provider account mapping for restart recovery."""
+    try:
+        # One expiring key per task makes value+TTL atomic and prevents active
+        # projects from extending orphaned mappings in a shared hash forever.
+        redis.set_ex(
+            f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task_id}",
+            entry.account_key(),
+            ttl=max(1, int(ttl_seconds)),
+        )
+    except Exception:
+        logger.debug(
+            "Failed to persist provider account mapping for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _load_task_provider_account(
+    redis: RedisClient,
+    task_id: str,
+    logger: logging.Logger,
+) -> str | None:
+    try:
+        account = redis.get(f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task_id}")
+        if not account:
+            # Rolling-upgrade compatibility for tasks published before the
+            # per-task key migration.
+            account = redis.hget(_TASK_PROVIDER_ACCOUNTS_KEY, task_id)
+    except Exception:
+        logger.debug(
+            "Failed to load provider account mapping for task %s",
+            task_id,
+            exc_info=True,
+        )
+        return None
+    if account and ":" in account:
+        return account
+    return None
+
+
+def _clear_task_provider_account(
+    redis: RedisClient,
+    task_id: str,
+    logger: logging.Logger,
+) -> None:
+    try:
+        redis.delete(f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task_id}")
+        # Also clear a legacy hash field when completing an in-flight task
+        # published by an older orchestrator.
+        redis.hdel(_TASK_PROVIDER_ACCOUNTS_KEY, task_id)
+    except Exception:
+        logger.debug(
+            "Failed to clear provider account mapping for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _increment_provider_counter(
+    redis: RedisClient,
+    provider: str,
+    metric: str,
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> None:
+    provider = provider.strip()
+    metric = metric.strip()
+    if not provider or not metric:
+        return
+    key = f"providers:{provider}:{metric}"
+    try:
+        count = redis.incr(key)
+        if count == 1:
+            redis.expire(key, ttl_seconds)
+    except Exception:
+        logger.debug(
+            "Failed to increment provider counter %s for provider %s",
+            metric,
+            provider,
+            exc_info=True,
+        )
+
+
+def _record_credential_refresh_failure_if_needed(
+    redis: RedisClient,
+    account: str | None,
+    blob: str,
+    logger: logging.Logger,
+) -> None:
+    if not account or _credential_override_is_usable(account, blob):
+        return
+    provider, _sep, _credential_hash = account.partition(":")
+    _increment_provider_counter(
+        redis,
+        provider,
+        "credential_refresh_failures",
+        _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS,
+        logger,
+    )
+
+
+def _credential_override_is_usable(key: str, blob: str) -> bool:
+    """Reject Grok OAuth blobs that no longer contain a refresh token."""
+    if not key.startswith("grok:"):
+        return True
+    stripped = blob.strip()
+    if not stripped.startswith("{"):
+        return True
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return _json_has_refresh_token(parsed)
+
+
+def _json_has_refresh_token(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "refresh_token" and isinstance(nested, str) and nested.strip():
+                return True
+            if isinstance(nested, (dict, list)) and _json_has_refresh_token(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_json_has_refresh_token(item) for item in value)
+    return False
 
 
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
@@ -408,7 +706,10 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
 
 
 def _mark_usage_exhausted_token(
-    result: TaskResult, token_pool: ProviderPool | None, logger: logging.Logger
+    result: TaskResult,
+    token_pool: ProviderPool | None,
+    logger: logging.Logger,
+    account_key: str | None = None,
 ) -> None:
     """Generalized for ProviderPool: mark the entry for the task exhausted.
 
@@ -421,14 +722,16 @@ def _mark_usage_exhausted_token(
         return
     entry = token_pool.get_task_entry(result.task_id)
     # Support legacy MagicMock tests and old registration paths that only
-    # implement the token shim: if get_task_entry gave a non-real object or None,
+    # implement the token shim: if get_task_entry gave no real ProviderEntry,
     # fall back.
-    if entry is None or not hasattr(entry, "provider") or not hasattr(entry, "identity"):
+    if not isinstance(entry, ProviderEntry):
         cred = token_pool.get_task_token(result.task_id)
         if cred:
             entry = ProviderEntry(provider="claude", credential=cred, model=None)
-    ident = entry.identity() if entry and hasattr(entry, "identity") else "?"
-    prov = entry.provider if entry and hasattr(entry, "provider") else "?"
+        else:
+            entry = None
+    ident = entry.identity() if entry else account_key or "?"
+    prov = entry.provider if entry else (account_key.partition(":")[0] if account_key else "?")
     logger.info(
         "USAGE_EXHAUSTED observed for provider %s (id=%s, task=%s) — will mark exhausted",
         prov,
@@ -441,12 +744,14 @@ def _mark_usage_exhausted_token(
 
         cooldown_until = datetime.fromtimestamp(result.rate_limit_resets_at, tz=timezone.utc)
         logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
-    elif entry and prov == "claude" and hasattr(entry, "credential") and entry.credential:
+    elif entry and is_claude_provider(prov) and hasattr(entry, "credential") and entry.credential:
         try:
             cooldown_until = get_token_reset_time(entry.credential)
         except Exception as e:
             logger.warning("Failed to query token reset time: %s", e)
-    token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
+    marked = token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
+    if marked is not True and account_key:
+        token_pool.mark_account_exhausted(account_key, cooldown_until=cooldown_until)
 
 
 # Maximum number of merge retries for transient network errors before
@@ -706,8 +1011,8 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     # Ensure consumer groups for shared task streams (so workers don't race)
     for stream in (
-        f"tasks:{config.default_runner}",
-        f"tasks:issue:{config.default_runner}",
+        _configured_task_streams(config)
+        + _configured_task_streams(config, issue=True)
     ):
         task_redis.ensure_consumer_group(stream, CONSUMER_GROUP)
 
@@ -725,7 +1030,12 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         entries = list(project.providers) if project.providers else []
         if not entries and project.claude_tokens:
             entries = [
-                ProviderEntry(provider="claude", credential=t, model=None)
+                ProviderEntry(
+                    provider="claude",
+                    credential=t,
+                    model=None,
+                    source="legacy_claude_tokens",
+                )
                 for t in project.claude_tokens
             ]
         if entries:
@@ -737,7 +1047,15 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
                 if ident not in seen:
                     seen[ident] = e
                     unique.append(e)
-            token_pools[project.key_prefix] = ProviderPool(unique)
+            try:
+                token_pools[project.key_prefix] = ProviderPool(unique)
+            except ValueError as exc:
+                logger.error(
+                    "Project %s: provider pool disabled: %s",
+                    project.repo,
+                    exc,
+                )
+                continue
             logger.info(
                 "Project %s: provider pool with %d entries (providers=%s)",
                 project.repo,
@@ -862,8 +1180,8 @@ def _poll_cycle(
     # PEL is empty), so un-ACKed / undelivered work is never dropped -- it does
     # NOT trim by raw last-delivered-id while entries are still in flight.
     for _task_stream in (
-        f"tasks:{config.default_runner}",
-        f"tasks:issue:{config.default_runner}",
+        _configured_task_streams(config, token_pools=token_pools)
+        + _configured_task_streams(config, issue=True, token_pools=token_pools)
     ):
         try:
             task_redis.xtrim_acked_entries(_task_stream, CONSUMER_GROUP)
@@ -872,28 +1190,22 @@ def _poll_cycle(
 
     # Step 2: Poll each project.
     #
-    # Issue discovery is gated on the SHARED issue stream. To stop one busy
-    # project from starving all others' issue discovery indefinitely (M5),
-    # rotate a single "issue-priority" slot round-robin across projects each
-    # cycle: that one project bypasses the shared-stream backpressure gate so
-    # every project eventually gets a discovery turn even while the queue is
-    # backed up. Single-instance orchestrator -> a plain shared-client INCR is a
-    # cheap, restart-tolerant rotation pointer.
-    n_projects = len(project_clients)
-    priority_idx = -1
-    if n_projects:
-        try:
-            cycle_seq = redis.incr(_ISSUE_DISCOVERY_CYCLE_SEQ_KEY)
-            priority_idx = (cycle_seq - 1) % n_projects
-        except Exception:
-            # Fairness rotation is best-effort; never break the poll cycle.
-            logger.debug("Failed to advance issue-discovery rotation pointer", exc_info=True)
+    # Coordinate the bypass through shared task Redis. Production runs one
+    # orchestrator container per project, so an in-process list/counter cannot
+    # provide global fairness. A durable leased round-robin turn makes every
+    # stable live project eligible eventually, independent of process phase.
+    priority_identity = _issue_discovery_priority(
+        task_redis,
+        [project for project, _project_redis in project_clients],
+        config.polling.interval,
+        logger,
+    )
 
     total_enqueued = 0
     total_merged = 0
     total_prs = 0
     total_issues = 0
-    for i, (project, project_redis) in enumerate(project_clients):
+    for project, project_redis in project_clients:
         try:
             pool = token_pools.get(project.key_prefix)
             enqueued, merged, prs_checked, issues_checked = _poll_project(
@@ -904,7 +1216,7 @@ def _poll_cycle(
                 logger,
                 pending_task_ttl,
                 token_pool=pool,
-                force_issue_discovery=(i == priority_idx),
+                force_issue_discovery=(project.key_prefix or project.repo) == priority_identity,
             )
             total_enqueued += enqueued
             total_merged += merged
@@ -976,6 +1288,13 @@ def _poll_project(
             # *list* is the signal; a [""] degenerate token still flows through
             # the legacy single-token path below so existing fixtures keep
             # working.
+            if project.providers:
+                logger.error(
+                    "Project %s has providers configured but no usable provider pool; "
+                    "skipping task publish until provider credentials are fixed.",
+                    project.repo,
+                )
+                return None
             if not project.claude_tokens and not project.providers:
                 logger.error(
                     "Project %s has no providers and no claude_tokens configured; "
@@ -985,7 +1304,12 @@ def _poll_project(
                     project.repo,
                 )
                 return None
-            return ProviderEntry(provider="claude", credential=cred, model=None)
+            return ProviderEntry(
+                provider="claude",
+                credential=cred,
+                model=None,
+                source="legacy_claude_tokens",
+            )
 
         entry = token_pool.next_entry()
         if entry is None:
@@ -1023,6 +1347,10 @@ def _poll_project(
         """
         if token_pool is not None:
             token_pool.register_task(task_id, entry)
+            if isinstance(entry, ProviderEntry):
+                _persist_task_provider_account(
+                    project_redis, task_id, entry, pending_task_ttl, logger
+                )
 
     def _try_publish(
         entry: ProviderEntry,
@@ -1038,27 +1366,38 @@ def _poll_project(
         task_id = str(uuid.uuid4())
         _register_task(task_id, entry)
         # Use the latest written-back credential blob if the CLI rotated it
-        # (OAuth-blob providers). Falls back to the original config credential.
+        # (OAuth-blob providers). Refresh this account from shared Redis at
+        # handoff time because each project orchestrator has its own local pool.
+        if token_pool is not None:
+            _refresh_shared_credential_override(
+                task_redis,
+                token_pool,
+                entry.account_key(),
+                logger,
+            )
         cred = (
             token_pool.effective_credential(entry) if token_pool is not None else entry.credential
         )
+        published_provider = _published_provider_for_entry(entry, config.default_runner)
         try:
             res = publish_fn(
                 **publish_kwargs,
-                claude_token=cred if entry.provider == "claude" else "",
+                claude_token=cred if is_claude_provider(published_provider) else "",
                 key_prefix=key_prefix,
                 task_redis=task_redis,
-                provider=entry.provider,
+                provider=published_provider,
                 credential=cred,
                 model=entry.model,
                 task_id=task_id,
             )
             if res is None and token_pool is not None:
                 token_pool.task_completed(task_id)
+                _clear_task_provider_account(project_redis, task_id, logger)
             return res
         except Exception:
             if token_pool is not None:
                 token_pool.task_completed(task_id)
+                _clear_task_provider_account(project_redis, task_id, logger)
             raise
 
     labels = config.labels
@@ -1089,8 +1428,20 @@ def _poll_project(
     # Pre-compute unclaimed issue tasks for gating issue discovery. Tasks that
     # are claimed and in flight don't block — they're consuming worker capacity,
     # not buffer space. Only undelivered (lag) entries justify deferral.
-    issue_tasks_stream = f"tasks:issue:{config.default_runner}"
-    unclaimed_issue_tasks = task_redis.stream_unread_count(issue_tasks_stream, CONSUMER_GROUP)
+    issue_task_streams = _configured_task_streams(config, issue=True)
+    if token_pool is not None:
+        seen_issue_streams = set(issue_task_streams)
+        for provider in token_pool.provider_names:
+            stream = task_stream_name(provider, issue=True)
+            if stream not in seen_issue_streams:
+                issue_task_streams.append(stream)
+                seen_issue_streams.add(stream)
+    unclaimed_issue_tasks = _unclaimed_task_count(
+        task_redis,
+        issue_task_streams,
+        CONSUMER_GROUP,
+        logger,
+    )
 
     enqueued = 0
     merged = 0
@@ -1874,6 +2225,15 @@ def _consume_results_for_project(
                     shared_credential_redis=shared_credential_redis,
                 )
                 logger.info(f"Recovered pending result {entry_id}")
+            except _RetryableResultError as exc:
+                logger.warning(
+                    "Deferring pending result %s until durable side effects recover: %s",
+                    entry_id,
+                    exc,
+                )
+                # Leave it in the PEL and stop this pass. Immediately reading
+                # pending ID 0 again would hot-loop on the same entry.
+                return
             except Exception as e:
                 logger.error(
                     f"Failed to process pending result {entry_id}: {e}",
@@ -1913,6 +2273,15 @@ def _consume_results_for_project(
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
                 )
+            except _RetryableResultError as exc:
+                logger.warning(
+                    "Leaving result entry %s pending until durable side effects recover: %s",
+                    entry_id,
+                    exc,
+                )
+                # Continue through any remaining new entries, but do not ACK
+                # this one; the next poll's pending phase will retry it.
+                continue
             except Exception as e:
                 logger.error(
                     "Failed to process result entry %s: %s",
@@ -1961,27 +2330,78 @@ def _handle_result(
         result.duration_seconds,
     )
 
+    def _release_provider_task_tracking() -> None:
+        if token_pool is not None:
+            token_pool.task_completed(result.task_id)
+        _clear_task_provider_account(redis, result.task_id, logger)
+
+    def _load_usage_exhausted_account() -> str | None:
+        if token_pool is None:
+            return None
+        return _load_task_provider_account(redis, result.task_id, logger)
+
     # Credential write-back: capture a rotated OAuth blob BEFORE any staleness
     # or exhaustion handling pops the task->identity mapping. Valid regardless
     # of task staleness (the token rotation is real either way).
     if result.credential_update and token_pool is not None:
-        minted_at = time.time()
-        account = token_pool.apply_credential_update(
-            result.task_id, result.credential_update, minted_at
-        )
-        if account is not None:
-            _persist_credential_override(
+        # New workers obtain this ordering value from the shared Redis clock
+        # and a monotonic sequence. Legacy payloads fall back to consume time
+        # for wire compatibility.
+        minted_at = result.credential_update_minted_at or time.time()
+        credential_update_account: str | None = None
+        task_entry = token_pool.get_task_entry(result.task_id)
+        if task_entry is not None:
+            credential_update_account = task_entry.account_key()
+        if credential_update_account is None:
+            credential_update_account = _load_task_provider_account(
+                redis, result.task_id, logger
+            )
+        if credential_update_account and token_pool.credential_update_is_usable(
+            credential_update_account, result.credential_update
+        ):
+            # Apply locally, but persist independently of whether this local
+            # CAS changed state. A prior attempt may have applied the update
+            # and then failed the canonical shared write.
+            token_pool.apply_credential_update_for_account(
+                credential_update_account,
+                result.credential_update,
+                minted_at,
+            )
+            shared_stored = _persist_credential_override(
                 redis,
-                account,
+                credential_update_account,
                 result.credential_update,
                 minted_at,
                 logger,
                 shared_redis=shared_credential_redis,
             )
-            logger.info(
-                "Captured refreshed credential for provider account %s (task %s)",
-                account,
-                result.task_id,
+            if shared_credential_redis is not None:
+                # Whether our CAS won or lost, seed the local pool from the
+                # canonical winner before this process publishes another task.
+                _refresh_shared_credential_override(
+                    shared_credential_redis,
+                    token_pool,
+                    credential_update_account,
+                    logger,
+                )
+            if shared_stored:
+                logger.info(
+                    "Captured refreshed credential for provider account %s (task %s)",
+                    credential_update_account,
+                    result.task_id,
+                )
+            else:
+                logger.info(
+                    "Ignored stale credential refresh for provider account %s (task %s)",
+                    credential_update_account,
+                    result.task_id,
+                )
+        else:
+            _record_credential_refresh_failure_if_needed(
+                redis,
+                credential_update_account,
+                result.credential_update,
+                logger,
             )
 
     repo = project.repo
@@ -2007,9 +2427,13 @@ def _handle_result(
                 current_task_id,
             )
             if result.status == ResultStatus.USAGE_EXHAUSTED:
-                _mark_usage_exhausted_token(result, token_pool, logger)
-            if token_pool is not None:
-                token_pool.task_completed(result.task_id)
+                _mark_usage_exhausted_token(
+                    result,
+                    token_pool,
+                    logger,
+                    account_key=_load_usage_exhausted_account(),
+                )
+            _release_provider_task_tracking()
             return
     except Exception as e:
         logger.error(
@@ -2040,9 +2464,13 @@ def _handle_result(
                     exc_info=True,
                 )
         if result.status == ResultStatus.USAGE_EXHAUSTED:
-            _mark_usage_exhausted_token(result, token_pool, logger)
-        if token_pool is not None:
-            token_pool.task_completed(result.task_id)
+            _mark_usage_exhausted_token(
+                result,
+                token_pool,
+                logger,
+                account_key=_load_usage_exhausted_account(),
+            )
+        _release_provider_task_tracking()
         return
 
     # Select the right GitHub functions based on resource type
@@ -2118,7 +2546,12 @@ def _handle_result(
         # Mark the exhausted token in the pool so it's skipped in future rounds.
         # Use the resets_at timestamp from the stream-json rate_limit_event if
         # available; fall back to querying the usage endpoint; final fallback 30 min.
-        _mark_usage_exhausted_token(result, token_pool, logger)
+        _mark_usage_exhausted_token(
+            result,
+            token_pool,
+            logger,
+            account_key=_load_usage_exhausted_account(),
+        )
         usage_cooldown_ttl = _usage_exhausted_cooldown_ttl_seconds(result)
         # PR-specific cooldown: clear per-SHA attempts so PR can be re-enqueued
         # after the cooldown expires.  Issues don't have per-SHA counters.
@@ -2310,8 +2743,7 @@ def _handle_result(
             # An ordinary (transient or otherwise) fix-attempt failure is
             # retried automatically -- stay silent to avoid accumulating
             # comment noise across attempts.
-            if token_pool is not None:
-                token_pool.task_completed(result.task_id)
+            _release_provider_task_tracking()
             return
         elif result.status == ResultStatus.FAILED:
             # needs_human is True: the worker's agent explicitly asked for a
@@ -2375,6 +2807,6 @@ def _handle_result(
     # ProviderPool._task_identities does NOT leak for any non-USAGE_EXHAUSTED,
     # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED, BLOCKED,
     # transient, etc.). mark_exhausted already pops the mapping for exhausted
-    # results, so task_completed is a no-op there (safe to call).
-    if token_pool is not None:
-        token_pool.task_completed(result.task_id)
+    # results, so task_completed is a no-op there (safe to call). The durable
+    # task -> account mapping is cleared at the same boundary.
+    _release_provider_task_tracking()

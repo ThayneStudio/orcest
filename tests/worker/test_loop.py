@@ -32,6 +32,7 @@ from orcest.worker.loop import (
     _make_abort_event,
     _publish_result_with_retry,
     _runner_for_task,
+    _signal_ephemeral_done,
     run_worker,
 )
 from orcest.worker.runner import PROVIDER_REGISTRY, ProviderRecipe, RunnerResult
@@ -755,7 +756,42 @@ class TestExecuteTask:
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
         mock_redis.xadd_capped.assert_any_call(
-            stream, {"line": '{"role": "assistant"}\n'}, maxlen=_STREAM_MAXLEN
+            stream,
+            {"line": '{"role": "assistant"}\n', "task_id": sample_task.id},
+            maxlen=_STREAM_MAXLEN,
+        )
+
+    def test_stderr_callback_publishes_task_id_to_redis(
+        self, local_worker_config, sample_task, mock_workspace
+    ):
+        """on_stderr callback tags stderr lines with task_id."""
+        mock_runner = MagicMock()
+
+        def run_with_stderr(**kwargs):
+            on_stderr = kwargs.get("on_stderr")
+            if on_stderr:
+                on_stderr("warning\n")
+            return _success_runner_result()
+
+        mock_runner.run.side_effect = run_with_stderr
+
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            sample_task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.COMPLETED
+        mock_redis.xadd_capped.assert_any_call(
+            f"output:{local_worker_config.worker_id}",
+            {"line": "warning\n", "stream": "stderr", "task_id": sample_task.id},
+            maxlen=_STREAM_MAXLEN,
         )
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
@@ -792,6 +828,85 @@ class TestExecuteTask:
         assert last_call_args[1]["type"] == "task_end"
         assert last_call_args[1]["task_id"] == sample_task.id
         assert last_call_args[1]["status"] == "completed"
+
+    def test_project_prefixed_task_output_uses_project_stream(
+        self, local_worker_config, mock_workspace
+    ):
+        """Project-scoped tasks publish output under task.key_prefix so the
+        dashboard can use the same prefix it gets from locks and results."""
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="pr",
+            resource_id=42,
+            prompt="Fix the failing CI checks",
+            branch="fix-ci",
+            snapshot_head_sha="abc123",
+            key_prefix="projectA",
+        )
+        mock_runner = MagicMock()
+
+        def run_with_output(**kwargs):
+            kwargs["on_output"]("line one\n")
+            kwargs["on_stderr"]("warning\n")
+            return _success_runner_result()
+
+        mock_runner.run.side_effect = run_with_output
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped_raw.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.COMPLETED
+        stream = f"projectA:output:{local_worker_config.worker_id}"
+        mock_redis.xadd_capped_raw.assert_any_call(
+            stream,
+            {
+                "type": "task_start",
+                "task_id": task.id,
+                "resource": "pr #42",
+                "repo": task.repo,
+                "resource_type": "pr",
+                "resource_id": "42",
+                "provider": local_worker_config.runner.type,
+                "worker_id": local_worker_config.worker_id,
+                "branch": "fix-ci",
+            },
+            maxlen=_STREAM_MAXLEN,
+        )
+        mock_redis.xadd_capped_raw.assert_any_call(
+            stream,
+            {"line": "line one\n", "task_id": task.id},
+            maxlen=_STREAM_MAXLEN,
+        )
+        mock_redis.xadd_capped_raw.assert_any_call(
+            stream,
+            {"line": "warning\n", "stream": "stderr", "task_id": task.id},
+            maxlen=_STREAM_MAXLEN,
+        )
+        mock_redis.xadd_capped_raw.assert_any_call(
+            stream,
+            {
+                "type": "task_end",
+                "task_id": task.id,
+                "status": "completed",
+                "worker_id": local_worker_config.worker_id,
+            },
+            maxlen=_STREAM_MAXLEN,
+        )
+        output_calls = [
+            call for call in mock_redis.xadd_capped.call_args_list
+            if call[0] and call[0][0] == f"output:{local_worker_config.worker_id}"
+        ]
+        assert output_calls == []
 
     def test_worker_runner_exception_returns_failed(
         self, local_worker_config, sample_task, mock_workspace
@@ -1038,6 +1153,21 @@ class TestExecuteTask:
 
 
 @pytest.mark.unit
+def test_pool_managed_done_handoff_retries_until_redis_accepts(worker_config):
+    worker_config.ephemeral = True
+    worker_config.pool_managed = True
+    redis = MagicMock()
+    redis.set_value.side_effect = [ConnectionError("down"), None]
+    event = MagicMock()
+    event.wait.return_value = False
+
+    assert _signal_ephemeral_done(
+        redis, worker_config, logging.getLogger("test"), event
+    ) is True
+    assert redis.set_value.call_count == 2
+    redis.set_ex.assert_not_called()
+
+
 class TestRunWorker:
     """Integration-level tests for the run_worker main loop.
 
@@ -1291,6 +1421,7 @@ class TestRunWorker:
         assert parsed.status == ResultStatus.COMPLETED
         assert parsed.task_id == sample_task.id
         assert parsed.worker_id == worker_config.worker_id
+        assert parsed.repo == sample_task.repo
         assert parsed.resource_id == sample_task.resource_id
 
     def test_worker_leaves_pending_marker_after_success(self, mocker, worker_config, sample_task):
@@ -1483,12 +1614,10 @@ class TestRunWorker:
         # The pending-task marker must be cleared so the orchestrator can re-enqueue
         mock_clear.assert_called()
 
-    def test_worker_drain_clears_pending_marker_even_on_publish_failure(
+    def test_worker_drain_preserves_pending_entry_on_publish_failure(
         self, mocker, worker_config, sample_task
     ):
-        """When the recovery result publish fails during drain, the pending-task
-        marker must still be cleared so the orchestrator can re-enqueue the task
-        instead of waiting for the marker's TTL to expire (~95 min)."""
+        """A failed recovery publish leaves the PEL entry and markers intact."""
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
@@ -1531,13 +1660,33 @@ class TestRunWorker:
 
         mock_redis.xreadgroup.side_effect = xreadgroup_side_effect
 
-        run_worker(worker_config)
+        with pytest.raises(SystemExit) as exc_info:
+            run_worker(worker_config)
 
         # Runner should NOT have been called (pending tasks are not re-executed)
+        assert exc_info.value.code == 1
         mocks["runner"].run.assert_not_called()
-        # The pending-task marker must still be cleared despite publish failure
-        mock_clear.assert_called()
-        mock_attempts.assert_called()
+        mock_redis.xack_raw.assert_not_called()
+        mock_clear.assert_not_called()
+        mock_attempts.assert_not_called()
+        # The failed PEL entry is not reread in a tight loop, and the worker
+        # exits before claiming any new work.
+        assert drain_call_count == 1
+
+    def test_worker_drain_lease_exits_with_restartable_status(
+        self, mocker, worker_config
+    ):
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_redis.xreadgroup_multi.return_value = []
+        mock_redis.sismember.return_value = True
+
+        with pytest.raises(SystemExit) as exc_info:
+            run_worker(worker_config)
+
+        assert exc_info.value.code == 75
+        mocks["runner"].run.assert_not_called()
+        mock_redis.xreadgroup.assert_not_called()
 
     def test_abort_event_fires_on_sigterm(self, mocker, worker_config, sample_task):
         """The abort_event passed to _execute_task is set when SIGTERM fires,
@@ -1836,27 +1985,23 @@ class TestRunWorker:
         # Worker still exited (runner was called once, no hang)
         mocks["runner"].run.assert_called_once()
 
-    def test_ephemeral_worker_exits_even_on_publish_failure(
+    def test_standalone_ephemeral_worker_retries_result_before_exit(
         self, mocker, worker_config, sample_task
     ):
-        """Ephemeral worker still exits and sets pool:done even when result publish fails.
-
-        When the result cannot be published, the ephemeral exit path ACKs the
-        entry and clears the pending-task marker to prevent an orphaned PEL
-        entry and a stale marker blocking re-enqueue (the VM will be destroyed
-        so no future drain will ever claim it).
-        """
+        """Standalone --once stays alive until its result handoff is durable."""
         worker_config.ephemeral = True
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
-        # Make result publish fail (xadd_capped raises on every attempt)
-        mock_redis.xadd_capped.side_effect = ConnectionError("Redis unavailable")
-        mocker.patch("orcest.worker.loop.time.sleep")  # avoid real sleeps during retries
+        publish = mocker.patch(
+            "orcest.worker.loop._publish_result_with_retry",
+            side_effect=[False, True],
+        )
+        mocker.patch("orcest.worker.loop._EPHEMERAL_RESULT_RETRY_SECONDS", 0)
         mock_clear = mocker.patch("orcest.worker.loop._clear_pending_task_for_task")
+        mock_clear_attempt = mocker.patch("orcest.worker.loop._clear_task_attempt_reservation")
 
         task_fields = sample_task.to_dict()
-        expected_fq_stream = f"{worker_config.redis.key_prefix}:tasks:{worker_config.backend}"
 
         mock_redis.xreadgroup_multi.return_value = []
         mock_redis.xreadgroup.return_value = [("entry-1", task_fields)]
@@ -1868,10 +2013,12 @@ class TestRunWorker:
         # pool:done key was still set despite publish failure
         mock_redis.set_ex.assert_called_once()
         assert "pool:done:" in mock_redis.set_ex.call_args[0][0]
-        # Entry was ACKed on the ephemeral exit path to prevent orphaned PEL
-        mock_redis.xack_raw.assert_called_once_with(expected_fq_stream, CONSUMER_GROUP, "entry-1")
-        # Pending-task marker was cleared so orchestrator can re-enqueue
-        mock_clear.assert_called()
+        assert publish.call_count == 2
+        mock_redis.xack_raw.assert_called_once_with(
+            "orcest:tasks:claude", CONSUMER_GROUP, "entry-1"
+        )
+        mock_clear.assert_not_called()
+        mock_clear_attempt.assert_not_called()
 
     def test_ephemeral_worker_exits_on_runner_failure(self, mocker, worker_config, sample_task):
         """Ephemeral worker exits and sets pool:done even when the runner fails."""
@@ -2172,6 +2319,7 @@ class TestDeadLetterTask:
                 dl2 = call[0][1]
                 break
         assert dl2 is not None, "DL path2 exercised"
+        assert dl2["repo"] == task.repo
         for f in REDACTED_FIELDS:
             assert dl2.get(f) == "[REDACTED]", f"redact {f} path2"
         assert secret not in str(dl2)
@@ -2256,6 +2404,7 @@ class TestPublishResultWithRetry:
             status=ResultStatus.COMPLETED,
             resource_type=task.resource_type,
             resource_id=task.resource_id,
+            repo=task.repo,
             branch=task.branch,
             summary="done",
             duration_seconds=1,
@@ -2319,6 +2468,42 @@ class TestPublishResultWithRetry:
         mock_redis.xadd_capped.assert_called_once_with(
             RESULTS_STREAM, result.to_dict(), maxlen=_STREAM_MAXLEN
         )
+
+    def test_successful_publish_backfills_missing_repo(self, sample_task):
+        """Results published by the helper carry task.repo even for partial callers."""
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+        result = self._make_result(sample_task)
+        result.repo = ""
+
+        ok = _publish_result_with_retry(
+            mock_redis, result, sample_task, logging.getLogger("test"), "tasks:claude", "1-1"
+        )
+
+        assert ok is True
+        published = mock_redis.xadd_capped.call_args[0][1]
+        assert published["repo"] == sample_task.repo
+
+    def test_credential_update_gets_shared_monotonic_version(self, sample_task):
+        mock_redis = MagicMock()
+        mock_redis.next_monotonic_version.return_value = 1_800_000_000_000_001.0
+        mock_redis.xadd_capped.return_value = "1-0"
+        result = self._make_result(sample_task)
+        result.credential_update = '{"refresh_token":"rotated"}'
+
+        ok = _publish_result_with_retry(
+            mock_redis,
+            result,
+            sample_task,
+            logging.getLogger("test"),
+            "tasks:claude",
+            "1-1",
+        )
+
+        assert ok is True
+        mock_redis.next_monotonic_version.assert_called_once()
+        published = mock_redis.xadd_capped.call_args.args[1]
+        assert float(published["credential_update_minted_at"]) == 1_800_000_000_000_001.0
 
     def test_retries_and_succeeds_on_second_attempt(self, sample_task):
         """Returns True when the first attempt fails and the second succeeds."""
@@ -2679,17 +2864,8 @@ def test_drain_pending_tasks_preserves_snapshot_metadata(local_worker_config):
 
 
 @pytest.mark.unit
-def test_drain_skips_duplicate_recovery_result_for_completed_issue(local_worker_config):
-    """Regression for M4-conc: a drained PEL entry whose pending marker is gone
-    (original result already processed by the orchestrator, which clears the
-    marker on every result) must NOT produce a duplicate recovery FAILED.
-
-    Without the dedup guard, the drain path republishes a [transient] FAILED for
-    an already-completed ISSUE; the orchestrator has no snapshot-staleness check
-    for issues, so the duplicate clears issue attempts / re-triggers work on an
-    already-implemented issue. The entry must still be ACKed and the attempt
-    reservation cleared, just no second result.
-    """
+def test_drain_missing_marker_publishes_recovery_result(local_worker_config):
+    """A missing marker alone cannot prove a PEL task completed successfully."""
     task = Task.create(
         task_type=TaskType.IMPLEMENT_ISSUE,
         repo="owner/repo",
@@ -2705,7 +2881,7 @@ def test_drain_skips_duplicate_recovery_result_for_completed_issue(local_worker_
         [("tasks:issue:claude", "1-0", task.to_dict())],
         [],
     ]
-    # Pending marker absent => original result already processed by orchestrator.
+    # Pending marker absent could mean expiry/loss while the PEL still owns work.
     mock_redis.get.return_value = None
     mock_redis.get_raw.return_value = None
     mock_redis.xadd_capped.return_value = "1-0"
@@ -2718,15 +2894,12 @@ def test_drain_skips_duplicate_recovery_result_for_completed_issue(local_worker_
         logging.getLogger("test"),
     )
 
-    # No recovery result should be published to the results stream.
+    # Recovery result is the commit point before the PEL entry is ACKed.
     results_calls = [
         c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
     ]
-    assert results_calls == [], (
-        "drain published a duplicate recovery result for an already-completed "
-        "issue whose pending marker was already cleared"
-    )
-    # The orphaned PEL entry must still be ACKed so it is not redelivered.
+    assert len(results_calls) == 1
+    assert TaskResult.from_dict(results_calls[0][0][1]).task_id == task.id
     mock_redis.xack_raw.assert_any_call("tasks:issue:claude", CONSUMER_GROUP, "1-0")
 
 
@@ -3047,8 +3220,10 @@ class TestMultiProjectRouting:
 
         assert ok is True
         # Must publish to the project-namespaced results stream via raw
+        expected_fields = result.to_dict()
+        expected_fields["repo"] = task.repo
         mock_redis.xadd_capped_raw.assert_called_once_with(
-            "projectA:results", result.to_dict(), maxlen=_STREAM_MAXLEN
+            "projectA:results", expected_fields, maxlen=_STREAM_MAXLEN
         )
         # Must NOT use the default-prefix xadd_capped for the results stream
         results_calls = [
@@ -3273,6 +3448,59 @@ class TestRunnerForTask:
         assert isinstance(runner, ClaudeRunner)
         assert runner is not fallback
         # RunnerConfig.model flows through to the freshly-instantiated runner.
+        assert runner.model == "some-test-model"
+
+    def test_claude_provider_dispatch_honors_interactive_mode(self, sample_task, tmp_path):
+        """A Claude task reached through provider dispatch keeps interactive mode."""
+        from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
+
+        config = WorkerConfig(
+            worker_id="test-worker",
+            backend="claude",
+            redis=RedisConfig(host="localhost", port=6379),
+            workspace_dir=str(tmp_path / "workspaces"),
+            runner=RunnerConfig(
+                type="noop",
+                timeout=10,
+                max_retries=1,
+                retry_backoff=0,
+                model="some-test-model",
+                extra={"mode": "interactive"},
+            ),
+        )
+        fallback = MagicMock()
+
+        runner = _runner_for_task(sample_task, config, fallback)
+
+        assert isinstance(runner, ClaudeInteractiveRunner)
+        assert runner is not fallback
+        assert runner.model == "some-test-model"
+
+    def test_clauder_provider_dispatch_honors_interactive_mode(self, sample_task, tmp_path):
+        """A clauder task uses the PTY Claude runner for isolated interactive pools."""
+        from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
+
+        sample_task.provider = "clauder"
+        config = WorkerConfig(
+            worker_id="test-worker",
+            backend="clauder",
+            redis=RedisConfig(host="localhost", port=6379),
+            workspace_dir=str(tmp_path / "workspaces"),
+            runner=RunnerConfig(
+                type="claude",
+                timeout=10,
+                max_retries=1,
+                retry_backoff=0,
+                model="some-test-model",
+                extra={"mode": "interactive"},
+            ),
+        )
+        fallback = MagicMock()
+
+        runner = _runner_for_task(sample_task, config, fallback)
+
+        assert isinstance(runner, ClaudeInteractiveRunner)
+        assert runner is not fallback
         assert runner.model == "some-test-model"
 
     def test_codex_provider_dispatches_to_codex_runner(

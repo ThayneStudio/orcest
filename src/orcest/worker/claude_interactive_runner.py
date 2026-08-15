@@ -31,6 +31,45 @@ _ANSI_RE = re.compile(
     r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
 )
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_USAGE_ERROR_LINE_RE = re.compile(
+    r"^\s*(?:error:|api error:|claude(?: code)? error:|rate limit|usage limit|quota|"
+    r"billing limit|token limit)",
+    re.IGNORECASE,
+)
+
+
+def _is_interactive_usage_exhausted(
+    terminal_output: str,
+    submitted_prompt: str = "",
+) -> bool:
+    """Detect usage exhaustion in Claude's PTY stream without scanning prose.
+
+    The PTY combines stdout, stderr, prompt echo, and assistant text. Reusing
+    the stderr-oriented Claude detector on the full transcript can falsely
+    bench credentials when normal text happens to contain words like "usage"
+    and "limit". Only CLI-looking error/status lines are eligible here.
+    """
+    text = _CONTROL_RE.sub("", _ANSI_RE.sub("", terminal_output)).replace("\r", "\n")
+    prompt_lines = {
+        re.sub(r"\s+", " ", line).strip()
+        for line in submitted_prompt.splitlines()
+        if line.strip()
+    }
+
+    def is_prompt_echo(line: str) -> bool:
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if normalized in prompt_lines:
+            return True
+        # Common TUI input prefixes are presentation, not trusted CLI output.
+        without_prefix = normalized.lstrip(">❯│┃ ")
+        return without_prefix in prompt_lines
+
+    return any(
+        not is_prompt_echo(line)
+        and _USAGE_ERROR_LINE_RE.search(line)
+        and _is_usage_exhausted(line)
+        for line in text.splitlines()
+    )
 
 
 class ClaudeInteractiveRunner:
@@ -101,8 +140,18 @@ class ClaudeInteractiveRunner:
                     logger.warning(
                         "on_output callback raised; continuing",
                         exc_info=True,
-                    )
+            )
         return True
+
+    def _drain_available_output(
+        self,
+        master_fd: int,
+        terminal_output: list[str],
+        on_output: Callable[[str], None] | None,
+        logger: logging.Logger | None,
+    ) -> None:
+        while self._read_available(master_fd, terminal_output, on_output, logger):
+            pass
 
     def _drain_startup_output(
         self,
@@ -111,7 +160,7 @@ class ClaudeInteractiveRunner:
         terminal_output: list[str],
         on_output: Callable[[str], None] | None,
         logger: logging.Logger | None,
-        startup_delay: float = 2.0,
+        startup_delay: float = 3.0,
     ) -> None:
         deadline = time.monotonic() + startup_delay
         while proc.poll() is None and time.monotonic() < deadline:
@@ -126,6 +175,54 @@ class ClaudeInteractiveRunner:
         except OSError:
             return None
         return text or None
+
+    def _write_all(
+        self,
+        fd: int,
+        data: bytes,
+        abort_event: threading.Event | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+        written = 0
+        deadline = time.monotonic() + timeout
+        try:
+            while written < len(data):
+                if abort_event is not None and abort_event.is_set():
+                    raise OSError("aborted while writing prompt")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out writing prompt to Claude PTY")
+                _, writable, _ = select.select([], [fd], [], min(0.1, remaining))
+                if not writable:
+                    continue
+                try:
+                    chunk = os.write(fd, data[written:written + 65536])
+                except (BlockingIOError, InterruptedError):
+                    continue
+                if chunk <= 0:
+                    raise OSError("Claude PTY accepted no prompt bytes")
+                written += chunk
+        finally:
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+            except OSError:
+                pass
+
+    def _send_prompt(
+        self,
+        master_fd: int,
+        prompt: str,
+        logger: logging.Logger | None,
+        abort_event: threading.Event | None = None,
+    ) -> None:
+        # Bracketed paste keeps multi-line prompts intact in terminal UIs, then
+        # the final carriage return submits the completed prompt.
+        payload = f"\x1b[200~{prompt}\x1b[201~\r".encode("utf-8")
+        self._write_all(master_fd, payload, abort_event=abort_event)
+        if logger:
+            logger.info("Sent prompt to interactive Claude over PTY")
 
     def _looks_like_workspace_trust_prompt(self, text: str) -> bool:
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
@@ -149,12 +246,39 @@ class ClaudeInteractiveRunner:
     def _looks_like_mcp_server_prompt(self, text: str) -> bool:
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
         normalized = re.sub(r"\s+", "", stripped).lower()
-        return (
+        has_new_mcp_prompt = (
             "newmcpserverfoundinthisproject" in normalized
-            and "usethismcpserver" in normalized
-            and "continuewithoutusingthismcpserver" in normalized
+            or "newmcpserversfoundinthisproject" in normalized
+            or "newmcpserverfound" in normalized
+            or "newmcpserversfound" in normalized
+        )
+        has_use_option = (
+            "usethismcpserver" in normalized
+            or "usethesemcpservers" in normalized
+        )
+        has_decline_option = (
+            "continuewithoutusingthismcpserver" in normalized
+            or "continuewithoutusingthesemcpservers" in normalized
+        )
+        return (
+            has_new_mcp_prompt
+            and has_use_option
+            and has_decline_option
             and "entertoconfirm" in normalized
         )
+
+    def _looks_like_main_input_prompt(self, text: str) -> bool:
+        """Return True only for Claude's actual interactive input marker."""
+        if (
+            self._looks_like_workspace_trust_prompt(text)
+            or self._looks_like_bypass_permissions_prompt(text)
+            or self._looks_like_mcp_server_prompt(text)
+        ):
+            return False
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text)).replace("\r", "\n")
+        # Claude Code renders its main composer with the distinctive ❯ glyph.
+        # Setup menus use numbered selections and must never satisfy this gate.
+        return any(line.strip().startswith("❯") for line in stripped.splitlines())
 
     def _confirm_workspace_trust_if_needed(
         self,
@@ -251,14 +375,13 @@ class ClaudeInteractiveRunner:
         result_path = result_dir / f"claude-interactive-result-{uuid.uuid4().hex}.txt"
         full_prompt = self._prompt_with_result_contract(prompt, result_path)
         effective_model = model or self.model
-        cmd = self.build_argv(binary, effective_model) + [full_prompt]
+        cmd = self.build_argv(binary, effective_model)
         abort = abort_event if abort_event is not None else threading.Event()
 
         for attempt in range(1, self.max_retries + 1):
             proc: subprocess.Popen[bytes] | None = None
             master_fd = -1
             slave_fd = -1
-            start = time.monotonic()
             terminal_output: list[str] = []
             try:
                 master_fd, slave_fd = pty.openpty()
@@ -285,30 +408,11 @@ class ClaudeInteractiveRunner:
                 workspace_trust_confirmed = False
                 bypass_permissions_confirmed = False
                 mcp_server_confirmed = False
-                self._drain_startup_output(
-                    master_fd,
-                    proc,
-                    terminal_output,
-                    on_output,
-                    logger,
-                )
-                workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
-                    master_fd,
-                    terminal_output,
-                    workspace_trust_confirmed,
-                    logger,
-                )
-                bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
-                    master_fd,
-                    terminal_output,
-                    bypass_permissions_confirmed,
-                    logger,
-                )
-                mcp_server_confirmed = self._confirm_mcp_server_if_needed(
-                    master_fd,
-                    terminal_output,
-                    mcp_server_confirmed,
-                    logger,
+                prompt_sent = False
+                setup_output_index = 0
+                start: float | None = None
+                startup_deadline = time.monotonic() + max(
+                    10.0, min(float(timeout), 120.0)
                 )
 
                 while True:
@@ -325,10 +429,19 @@ class ClaudeInteractiveRunner:
                             transient=True,
                         )
 
-                    if time.monotonic() - start >= timeout:
+                    now = time.monotonic()
+                    if not prompt_sent and now >= startup_deadline:
+                        _kill_process_tree(proc)  # type: ignore[arg-type]
+                        return RunnerResult(
+                            success=False,
+                            summary="Timed out waiting for interactive Claude input prompt",
+                            transient=True,
+                        )
+
+                    if prompt_sent and start is not None and now - start >= timeout:
                         combined = "".join(terminal_output)
                         _kill_process_tree(proc)  # type: ignore[arg-type]
-                        if _is_usage_exhausted(combined):
+                        if _is_interactive_usage_exhausted(combined, full_prompt):
                             return RunnerResult(
                                 success=False,
                                 summary="Claude usage limit reached",
@@ -341,6 +454,12 @@ class ClaudeInteractiveRunner:
                         )
 
                     if proc.poll() is not None:
+                        self._drain_available_output(
+                            master_fd,
+                            terminal_output,
+                            on_output,
+                            logger,
+                        )
                         summary = self._read_result(result_path)
                         if summary is not None:
                             return self._result_from_summary(summary)
@@ -351,27 +470,54 @@ class ClaudeInteractiveRunner:
                         continue
                     if not self._read_available(master_fd, terminal_output, on_output, logger):
                         break
-                    workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
-                        master_fd,
-                        terminal_output,
-                        workspace_trust_confirmed,
-                        logger,
-                    )
-                    bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
-                        master_fd,
-                        terminal_output,
-                        bypass_permissions_confirmed,
-                        logger,
-                    )
-                    mcp_server_confirmed = self._confirm_mcp_server_if_needed(
-                        master_fd,
-                        terminal_output,
-                        mcp_server_confirmed,
-                        logger,
-                    )
+                    if not prompt_sent:
+                        confirmed_setup = False
+                        previous = workspace_trust_confirmed
+                        workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
+                            master_fd,
+                            terminal_output,
+                            workspace_trust_confirmed,
+                            logger,
+                        )
+                        if workspace_trust_confirmed and not previous:
+                            confirmed_setup = True
+                        previous = bypass_permissions_confirmed
+                        bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
+                            master_fd,
+                            terminal_output,
+                            bypass_permissions_confirmed,
+                            logger,
+                        )
+                        if bypass_permissions_confirmed and not previous:
+                            confirmed_setup = True
+                        previous = mcp_server_confirmed
+                        mcp_server_confirmed = self._confirm_mcp_server_if_needed(
+                            master_fd,
+                            terminal_output,
+                            mcp_server_confirmed,
+                            logger,
+                        )
+                        if mcp_server_confirmed and not previous:
+                            confirmed_setup = True
+                        if confirmed_setup:
+                            # Do not let a setup menu's rendering count as the
+                            # later main prompt. Wait for new output after the
+                            # confirmation response.
+                            setup_output_index = len(terminal_output)
+                        elif self._looks_like_main_input_prompt(
+                            "".join(terminal_output[setup_output_index:])
+                        ):
+                            self._send_prompt(
+                                master_fd,
+                                full_prompt,
+                                logger,
+                                abort_event=abort,
+                            )
+                            prompt_sent = True
+                            start = time.monotonic()
 
                 combined = "".join(terminal_output)
-                if _is_usage_exhausted(combined):
+                if _is_interactive_usage_exhausted(combined, full_prompt):
                     return RunnerResult(
                         success=False,
                         summary="Claude usage limit reached",
@@ -389,6 +535,23 @@ class ClaudeInteractiveRunner:
                 return RunnerResult(
                     success=False,
                     summary=f"Interactive Claude exited before writing {result_path}",
+                    transient=True,
+                )
+            except TimeoutError as exc:
+                if proc is not None:
+                    _kill_process_tree(proc)  # type: ignore[arg-type]
+                if attempt < self.max_retries:
+                    abort.wait(timeout=self.retry_backoff)
+                    if abort.is_set():
+                        return RunnerResult(
+                            success=False,
+                            summary="Aborted: lock lost",
+                            transient=True,
+                        )
+                    continue
+                return RunnerResult(
+                    success=False,
+                    summary=f"Failed to write prompt: {exc}",
                     transient=True,
                 )
             except (OSError, ValueError) as exc:

@@ -179,11 +179,15 @@ The `Makefile` provides the canonical developer targets:
 | Target                               | What it does                                                                                              |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `make test-unit`                     | Runs only tests marked `unit` (uses `fakeredis` / mocks; no external services required).                  |
-| `make test`                          | Starts Redis via `docker compose -f docker-compose.redis.yml up -d redis`, runs the full suite, then tears it down. Exits with the pytest return code. |
+| `make test`                          | Starts Redis, runs pytest, then `make test-dashboard` if pytest passes, tears Redis down, and exits with the first failing phase. |
 | `make lint`                          | `ruff check src/ tests/`                                                                                  |
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
 | `make redis-up` / `make redis-down`  | Manage the test Redis container directly.                                                                 |
 | `make lock`                          | Regenerate `requirements.lock` via `pip-compile`.                                                         |
+| `make test-dashboard`                | Runs dashboard install, audit, typecheck, tests, and build in the pinned Node Docker image.                |
+| `make build-dashboard`               | Builds the dashboard in the pinned Node Docker image.                                                      |
+| `make smoke-dashboard-compose`       | Builds the dashboard Compose stack with an authenticated Redis container and verifies `/api/ready`.        |
+| `make dev-dashboard`                 | Runs the dashboard dev server in the pinned Node Docker image at `http://127.0.0.1:5173/?token=dev-dashboard-token` unless `DASHBOARD_TOKEN` is set. Redis defaults to `host.docker.internal:6379`; override `DASHBOARD_DEV_REDIS_HOST` / `DASHBOARD_DEV_REDIS_PORT` when needed. `REDIS_PASSWORD` or `ORCEST_REDIS_PASSWORD` is forwarded into the container for authenticated Redis. Set `DASHBOARD_REDIS_PREFIXES=orcest,project-a` to restrict dashboard scans in shared Redis; add `unprefixed` to include legacy unprefixed keys. |
 
 Pytest markers in use (declared in `pyproject.toml`): `unit`,
 `integration`, `stress`. The default `--timeout=60` is applied to every
@@ -281,6 +285,7 @@ variables in this order (see `_PROVIDER_ENV_CANDIDATES` in
 | Provider | Env vars (first non-empty wins)                                  |
 | -------- | ---------------------------------------------------------------- |
 | `claude` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                   |
+| `clauder` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                  |
 | `grok`   | `XAI_API_KEY`, `GROK_API_KEY`, `XAI_API_TOKEN`                   |
 | `codex`  | `CODEX_API_KEY`, `OPENAI_API_KEY`                                |
 | *any*    | falls back to `<PROVIDER>_TOKEN`, `<PROVIDER>_API_KEY`, `<PROVIDER>_KEY` |
@@ -310,7 +315,7 @@ Top-level keys (from `WorkerConfig`):
 | Variable                                                 | Required when                                            |
 | -------------------------------------------------------- | -------------------------------------------------------- |
 | `GITHUB_TOKEN`                                           | `github.token` is empty in YAML.                         |
-| `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)       | A `claude` provider entry has no inline `credential`.    |
+| `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)       | A `claude` or `clauder` provider entry has no inline `credential`. |
 | `XAI_API_KEY` / `GROK_API_KEY` / `XAI_API_TOKEN`         | A `grok` provider entry has no inline `credential`.     |
 | `CODEX_API_KEY` (or `OPENAI_API_KEY`)                    | A `codex` provider entry has no inline `credential`.    |
 | `ORCEST_REDIS_*`                                         | Used by `orcest pool-manage` inside the Compose stack.   |
@@ -374,8 +379,12 @@ classes of compute:
     — a single host-network container that talks to the Proxmox API and
     reconciles the warm worker pool against `pool.size` in fleet
     config.
-  - **Dashboard** container
-    (`src/orcest/fleet/deploy/docker-compose.dashboard.yml`).
+  - **Dashboard** container (`docker-compose.dashboard.yml`). It joins the
+    shared `orcest` network and is deployed with `/opt/orcest/.redis.env`
+    plus a dashboard token from `DASHBOARD_TOKEN` or `/opt/orcest/.dashboard.env`.
+    `DASHBOARD_REDIS_PREFIXES` can limit the prefixes visible to the
+    dashboard when the Redis DB is shared; unset keeps all prefixed and
+    unprefixed Orcest keys visible.
 - **Worker VMs** — ephemeral Proxmox linked-clones of a baked template.
   Each worker takes a single task from Redis, runs it, and is destroyed
   by the pool manager on completion (or after `pool.max_task_duration`).
@@ -401,7 +410,7 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 | `start`                                                          | Start (or restart) the pool manager.                                                                       |
 | `stop [--drain-active]`                                          | Stop the pool manager and destroy idle (or all) worker VMs; clean Redis pool state.                        |
 | `update`                                                         | Upload fresh source, rebuild the orchestrator Docker image, restart Redis + pool manager + every project stack. |
-| `deploy [--rebuild-template]`                                    | Full deploy in order: `pip install` CLI → `stop` → `update` → optional `create-template` → `start`.        |
+| `deploy [--rebuild-template] [--drain-active]`                   | Full deploy in order: `pip install` CLI → `stop` → `update` → optional pointer-safe `rebake` → `start`.    |
 | `pool-status`                                                    | Show pool config, the active template VMID (Redis pointer), and idle/active VM counts.                     |
 | `status`                                                         | Show orchestrator host reachability, orgs, per-project stack status, and pool summary.                     |
 | `rebake [--image-url …]`                                         | Bake a fresh template at the next free VMID from `pool.template_vmid_range` and atomically swap the Redis pointer. |
@@ -436,28 +445,52 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 
 ## Deploying code changes
 
-Orcest has **three deploy layers**, and which target you hit depends on
+Orcest has **four deploy layers**, and which target you hit depends on
 which directory you changed:
 
 | Layer                   | What it ships                                                                                       | When to use it                                                                                          |
 | ----------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | Host CLI                | `pip install` of orcest on the Proxmox host                                                         | Changes to `src/orcest/cli.py` or `src/orcest/fleet/*` — anything you run as `orcest …` from the Proxmox host. |
-| Orchestrator containers | `orcest fleet update` (uploads source, rebuilds the `orcest` Docker image, restarts Redis + pool manager + every project stack) | Changes to `src/orcest/orchestrator/*` or `src/orcest/shared/*`. Right (and only) step for orchestrator-only features like the issue-dependency cascade. |
+| Orchestrator containers | `orcest fleet update` (uploads source, rebuilds the `orcest` Docker image, regenerates project `.env` / `orchestrator.yaml`, restarts Redis + project stacks, then refreshes the pool manager) | Changes to `src/orcest/orchestrator/*`, `src/orcest/shared/*`, generated project config, or worker stream routing such as `default_runner`. |
 | Worker template         | `orcest fleet rebake` (builds a new template VM, atomically swaps the Redis pointer)                | Changes to `src/orcest/worker/*`, additions to `PROVIDER_REGISTRY`, or any `provision/setup-worker.sh` change. |
+| Dashboard container     | `make deploy-dashboard` or `make deploy-dashboard-remote` (syncs when remote, builds/restarts `docker-compose.dashboard.yml`, and waits for `/api/ready`) | Changes to `dashboard/*` or `docker-compose.dashboard.yml`. Run locally with `deploy-dashboard-remote`, or from the host that owns the dashboard container with `deploy-dashboard`. |
 
 Notes:
 
 - `orcest fleet deploy` chains layers 1, 2, and (with
   `--rebuild-template`) 3 in one command — that is the safe default
   when you do not know which layers your change touches.
+- During `deploy --rebuild-template`, the pool manager stays stopped
+  until the new template pointer has been swapped, so fresh clones use
+  the rebaked template.
+- `orcest fleet rebake` only swaps the active template pointer. Existing
+  idle/active worker VMs are not replaced until they are drained,
+  stopped, or the pool needs more capacity. For an immediate worker
+  cutoff, use `orcest fleet deploy --rebuild-template --drain-active`
+  or explicitly `stop --drain-active`, `rebake`, then `start`.
+- To isolate interactive Claude Code from the legacy `claude -p` worker,
+  configure the pool clones with `pool.worker_backend: clauder`,
+  `pool.worker_runner_type: claude`, and
+  `pool.worker_runner_mode: interactive`, and publish tasks with
+  `default_runner: clauder` or an explicit `provider: clauder`.
+  The `claude` backend remains available for deployments that still run
+  the legacy prompt-mode worker.
+- For the pve-test dashboard path, deploy from this repo with:
+  ```bash
+  make deploy-dashboard-remote \
+    DASHBOARD_REMOTE=orcest@10.20.1.129 \
+    DASHBOARD_REMOTE_RSYNC_SHELL='ssh -o BatchMode=yes root@10.20.1.18 ssh -T -o BatchMode=yes' \
+    DASHBOARD_REMOTE_EXEC='ssh -o BatchMode=yes root@10.20.1.18 ssh -T -o BatchMode=yes orcest@10.20.1.129'
+  ```
 - A `pip install` on the Proxmox host updates the host CLI but **does
   not** touch the orchestrator container or worker template. Skipping
   `fleet update` is the most common cause of "I deployed my fix and it
   is not running."
-- `fleet update` currently does **not** regenerate per-project
-  `.env` / `orchestrator.yaml`. New top-level fleet config keys only
-  take effect for existing projects after they are re-onboarded; the
-  command surfaces a warning when it detects this gap.
+- `fleet update` regenerates per-project `.env` and
+  `orchestrator.yaml` from `/etc/orcest/config.yaml` before restarting
+  project stacks. It refuses to rewrite project files if the shared
+  Redis password cannot be read, because dropping
+  `ORCEST_REDIS_PASSWORD` would break the restarted orchestrators.
 - See [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md)
   for the per-provider rollout recipe.
 

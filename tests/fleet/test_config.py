@@ -179,6 +179,9 @@ class TestConfigPersistence:
                 worker_memory=32768,
                 worker_cores=16,
                 worker_disk_size=100,
+                worker_backend="clauder",
+                worker_runner_type="claude",
+                worker_runner_mode="interactive",
                 max_task_duration=7200,
             ),
         )
@@ -189,7 +192,36 @@ class TestConfigPersistence:
         assert loaded.pool.worker_memory == 32768
         assert loaded.pool.worker_cores == 16
         assert loaded.pool.worker_disk_size == 100
+        assert loaded.pool.worker_backend == "clauder"
+        assert loaded.pool.worker_runner_type == "claude"
+        assert loaded.pool.worker_runner_mode == "interactive"
         assert loaded.pool.max_task_duration == 7200
+
+    def test_clauder_backend_defaults_to_interactive_runner_mode(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"worker_backend": "clauder"}}))
+
+        cfg = load_config(path)
+
+        assert cfg.pool.worker_backend == "clauder"
+        assert cfg.pool.worker_runner_type == "claude"
+        assert cfg.pool.worker_runner_mode == "interactive"
+
+    def test_clauder_backend_rejects_non_interactive_runner_mode(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump(
+                {
+                    "pool": {
+                        "worker_backend": "clauder",
+                        "worker_runner_mode": "batch",
+                    }
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
+            load_config(path)
 
     def test_round_trip_proxmox_verify_ssl(self, tmp_path):
         """H2-infra: proxmox.verify_ssl must persist through save/load so an
