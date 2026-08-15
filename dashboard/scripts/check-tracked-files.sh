@@ -12,9 +12,22 @@ Makefile
 tests/test_dashboard.py
 "
 
-untracked="$(git ls-files --others --exclude-standard -- $CHECKED_PATHS || true)"
+git_query_failed() {
+  printf 'Dashboard verification could not inspect %s.\n' "$1" >&2
+  exit 1
+}
+
+if ! untracked="$(git ls-files --others --exclude-standard -- $CHECKED_PATHS)"; then
+  git_query_failed "untracked files"
+fi
+
+if ! ignored_untracked="$(
+  git ls-files --others --ignored --exclude-standard -- dashboard
+)"; then
+  git_query_failed "ignored untracked dashboard files"
+fi
 ignored_untracked_copied="$(
-  git ls-files --others --ignored --exclude-standard -- dashboard 2>/dev/null |
+  printf '%s\n' "$ignored_untracked" |
     awk '
       function copy_excluded(path, rel) {
         rel = path
@@ -31,8 +44,18 @@ ignored_untracked_copied="$(
       !copy_excluded($0) { print }
     '
 )"
-intent_to_add="$(git status --porcelain=v1 -- $CHECKED_PATHS | awk 'substr($0,1,2) == " A" { print substr($0,4) }')"
-unstaged="$(git diff --name-only -- $CHECKED_PATHS || true)"
+
+if ! status_output="$(git status --porcelain=v1 -- $CHECKED_PATHS)"; then
+  git_query_failed "dashboard worktree status"
+fi
+intent_to_add="$(
+  printf '%s\n' "$status_output" |
+    awk 'substr($0,1,2) == " A" { print substr($0,4) }'
+)"
+
+if ! unstaged="$(git diff --name-only -- $CHECKED_PATHS)"; then
+  git_query_failed "unstaged dashboard changes"
+fi
 if [ -z "$untracked" ] && [ -z "$ignored_untracked_copied" ] && [ -z "$intent_to_add" ] && [ -z "$unstaged" ]; then
   exit 0
 fi

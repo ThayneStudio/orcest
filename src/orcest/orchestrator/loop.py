@@ -2338,7 +2338,11 @@ def _consume_results_for_project(
     processed after a restart.
     """
     logger = logger.getChild(project.repo)
-    # Phase 1: Drain pending (unACKed) entries from previous runs
+    # Phase 1: Make one ordered pass over pending (unACKed) entries from
+    # previous runs. The explicit cursor is important: a retryable failure must
+    # remain in the PEL, but restarting at ID 0 would return that same entry on
+    # every read and permanently starve later pending results.
+    pending_cursor = "0"
     while True:
         entries = redis.xreadgroup(
             group=RESULTS_GROUP,
@@ -2347,9 +2351,11 @@ def _consume_results_for_project(
             count=10,
             block_ms=None,
             pending=True,
+            pending_start_id=pending_cursor,
         )
         if not entries:
             break
+        next_pending_cursor = entries[-1][0]
         for entry_id, fields in entries:
             try:
                 result = TaskResult.from_dict(fields)
@@ -2370,9 +2376,9 @@ def _consume_results_for_project(
                     entry_id,
                     exc,
                 )
-                # Leave it in the PEL and stop this pass. Immediately reading
-                # pending ID 0 again would hot-loop on the same entry.
-                return
+                # Leave it in the PEL, but keep advancing through this pass so
+                # one permanently failing result cannot starve later entries.
+                continue
             except Exception as e:
                 logger.error(
                     f"Failed to process pending result {entry_id}: {e}",
@@ -2385,6 +2391,16 @@ def _consume_results_for_project(
                     f"Failed to ACK pending result {entry_id}: {ack_err}",
                     exc_info=True,
                 )
+        if next_pending_cursor == pending_cursor:
+            # Redis IDs are exclusive cursors here, so this should never happen.
+            # Fail closed against a buggy proxy/client response instead of
+            # hot-looping forever; new entries can still progress in Phase 2.
+            logger.error(
+                "Pending result cursor did not advance beyond %s; ending this PEL pass",
+                pending_cursor,
+            )
+            break
+        pending_cursor = next_pending_cursor
 
     # Phase 2: Read new entries
     while True:

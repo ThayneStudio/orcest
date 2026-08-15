@@ -11,6 +11,7 @@ import {
   createDashboardServer,
   dashboardTaskOutputConnectionOptions,
   dashboardPortFromEnv,
+  startDashboardServer,
   type DashboardServerInstance,
 } from "./index.js";
 import { WorkerDiscoveryPartialError } from "./workers.js";
@@ -90,6 +91,40 @@ describe("dashboardPortFromEnv", () => {
     expect(dashboardPortFromEnv("8080abc")).toBe(8080);
     expect(dashboardPortFromEnv("1.5")).toBe(8080);
     expect(dashboardPortFromEnv("65536")).toBe(8080);
+  });
+
+  it("logs the actual bound port when configured with an ephemeral port", async () => {
+    const root = createDistRoot();
+    const logInfo = vi.fn();
+    const instance = startDashboardServer({
+      port: 0,
+      cwd: root,
+      snapshotRefreshIntervalMs: 60_000,
+      deps: {
+        healthCheck: vi.fn(),
+        discoverWorkers: vi.fn(),
+        buildDashboardMessage: vi.fn(),
+        redisQuit: vi.fn().mockResolvedValue(undefined),
+        logInfo,
+        logError: vi.fn(),
+      },
+    });
+
+    try {
+      await new Promise<void>((resolve) => instance.server.once("listening", resolve));
+      const address = instance.server.address() as AddressInfo;
+
+      expect(address.port).toBeGreaterThan(0);
+      expect(logInfo).toHaveBeenCalledWith(
+        `Orcest dashboard listening on http://127.0.0.1:${address.port}`,
+      );
+      expect(logInfo).not.toHaveBeenCalledWith(
+        "Orcest dashboard listening on http://127.0.0.1:0",
+      );
+    } finally {
+      await instance.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

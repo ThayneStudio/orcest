@@ -104,6 +104,30 @@ def test_xreadgroup_empty_returns_empty_list(fake_redis_client):
     assert result == []
 
 
+def test_xreadgroup_pending_uses_explicit_start_id(fake_redis_client, mocker):
+    """Pending reads can advance past an unACKed entry without losing it."""
+    read = mocker.patch.object(fake_redis_client.client, "xreadgroup", return_value=[])
+
+    result = fake_redis_client.xreadgroup(
+        group="test-group",
+        consumer="c1",
+        stream="test-stream",
+        count=10,
+        block_ms=None,
+        pending=True,
+        pending_start_id="123-4",
+    )
+
+    assert result == []
+    read.assert_called_once_with(
+        groupname="test-group",
+        consumername="c1",
+        streams={fake_redis_client._prefixed("test-stream"): "123-4"},
+        count=10,
+        block=None,
+    )
+
+
 def test_close_is_idempotent(fake_redis_client):
     """Calling close() twice raises no error."""
     fake_redis_client.close()

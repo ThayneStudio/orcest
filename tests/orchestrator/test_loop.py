@@ -4581,6 +4581,129 @@ def test_retryable_result_is_left_pending_until_next_consume(
     redis.xack.assert_called_once_with(RESULTS_STREAM, RESULTS_GROUP, "1-0")
 
 
+def test_retryable_pending_results_do_not_starve_entries_beyond_batch(
+    orchestrator_config,
+    mocker,
+):
+    """A full batch of poison results cannot hide later PEL entries."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    poison_entries = [
+        (
+            f"{index}-0",
+            _make_task_result(
+                status=ResultStatus.COMPLETED,
+                task_id=f"poison-{index}",
+            ).to_dict(),
+        )
+        for index in range(1, 13)
+    ]
+    healthy_entries = [
+        (
+            f"{index}-0",
+            _make_task_result(
+                status=ResultStatus.COMPLETED,
+                task_id=f"healthy-{index}",
+            ).to_dict(),
+        )
+        for index in range(13, 15)
+    ]
+    redis.xreadgroup.side_effect = [
+        poison_entries[:10],
+        poison_entries[10:] + healthy_entries,
+        [],
+        [],
+    ]
+
+    handled: list[str] = []
+
+    def handle_result(project, labels, redis_client, result, logger, **kwargs):
+        handled.append(result.task_id)
+        if result.task_id.startswith("poison-"):
+            raise _RetryableResultError("permanent GitHub failure")
+
+    mocker.patch(
+        "orcest.orchestrator.loop._handle_result",
+        side_effect=handle_result,
+    )
+
+    _consume_results(orchestrator_config, redis, logging.getLogger("test"))
+
+    assert handled == [
+        *(f"poison-{index}" for index in range(1, 13)),
+        "healthy-13",
+        "healthy-14",
+    ]
+    redis.xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, "13-0")
+    redis.xack.assert_any_call(RESULTS_STREAM, RESULTS_GROUP, "14-0")
+    assert redis.xack.call_count == 2
+    pending_calls = [
+        call for call in redis.xreadgroup.call_args_list if call.kwargs.get("pending") is True
+    ]
+    assert [call.kwargs["pending_start_id"] for call in pending_calls] == [
+        "0",
+        "10-0",
+        "14-0",
+    ]
+
+
+def test_permanent_pending_failure_retries_without_blocking_later_work(
+    orchestrator_config,
+    mocker,
+):
+    """Each poll retries poison PEL entries while healthy old and new work progresses."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    poison = (
+        "1-0",
+        _make_task_result(
+            status=ResultStatus.COMPLETED,
+            task_id="permanent-poison",
+        ).to_dict(),
+    )
+    following = (
+        "2-0",
+        _make_task_result(
+            status=ResultStatus.COMPLETED,
+            task_id="following-pending",
+        ).to_dict(),
+    )
+    new_entry = (
+        "3-0",
+        _make_task_result(
+            status=ResultStatus.COMPLETED,
+            task_id="following-new",
+        ).to_dict(),
+    )
+    attempts: dict[str, int] = {}
+
+    def handle_result(project, labels, redis_client, result, logger, **kwargs):
+        attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
+        if result.task_id == "permanent-poison":
+            raise _RetryableResultError("still unavailable")
+
+    mocker.patch(
+        "orcest.orchestrator.loop._handle_result",
+        side_effect=handle_result,
+    )
+
+    redis.xreadgroup.side_effect = [[poison, following], [], []]
+    _consume_results(orchestrator_config, redis, logging.getLogger("test"))
+
+    redis.xreadgroup.side_effect = [[poison], [], [new_entry], []]
+    _consume_results(orchestrator_config, redis, logging.getLogger("test"))
+
+    assert attempts == {
+        "permanent-poison": 2,
+        "following-pending": 1,
+        "following-new": 1,
+    }
+    acked_ids = [call.args[2] for call in redis.xack.call_args_list]
+    assert acked_ids == ["2-0", "3-0"]
+
+
 def test_rejected_grok_credential_update_increments_provider_health_counter(
     fake_redis_client,
     mocker,

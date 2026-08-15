@@ -571,7 +571,11 @@ export function startDashboardServer(
     // The container binds 0.0.0.0 internally, but the port is published on
     // host loopback only by docker-compose.dashboard.yml. Other containers on
     // the compose network can still reach the internal listener.
-    logInfo(`Orcest dashboard listening on http://127.0.0.1:${instance.port}`);
+    const address = instance.server.address();
+    const boundPort = typeof address === "object" && address !== null
+      ? address.port
+      : instance.port;
+    logInfo(`Orcest dashboard listening on http://127.0.0.1:${boundPort}`);
   });
 
   return instance;
