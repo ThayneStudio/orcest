@@ -4,7 +4,11 @@ import { fileURLToPath, pathToFileURL } from "url";
 import type { Duplex } from "stream";
 import express, { type Express } from "express";
 import { WebSocketServer, WebSocket } from "ws";
-import { healthCheck, quitRedis } from "./redis.js";
+import {
+  assertValidDashboardRedisPrefixes,
+  healthCheck,
+  quitRedis,
+} from "./redis.js";
 import { authCookieHeader, isAuthorized } from "./auth.js";
 import { buildDashboardMessage } from "./message.js";
 import {
@@ -183,6 +187,7 @@ export function createDashboardServer(
   options: DashboardServerOptions = {},
 ): DashboardServerInstance {
   assertValidDashboardAllowedOrigins();
+  assertValidDashboardRedisPrefixes();
   const port = options.port ?? dashboardPortFromEnv();
   const pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL;
   const snapshotRefreshIntervalMs =

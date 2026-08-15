@@ -1119,6 +1119,7 @@ def _task_result(
         needs_human_reason=needs_human_reason,
         credential_update=credential_update,
         credential_update_minted_at=credential_update_minted_at,
+        provider_account=task.provider_account,
     )
 
 

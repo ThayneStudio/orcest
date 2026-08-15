@@ -21,6 +21,7 @@ PY
 )}"
 env_file="$(mktemp)"
 compose_file="$(mktemp)"
+compose_state_file="$(mktemp)"
 network_created=0
 
 cleanup() {
@@ -31,7 +32,7 @@ cleanup() {
   if [ "$network_created" = "1" ]; then
     docker network rm "$network_name" >/dev/null 2>&1 || true
   fi
-  rm -f "$env_file" "$compose_file"
+  rm -f "$env_file" "$compose_file" "$compose_state_file"
 }
 
 trap cleanup EXIT INT TERM
@@ -71,7 +72,7 @@ verify_seeded_snapshot_contract() {
     return 1
   fi
 
-  if ! docker run --rm --network "container:$container" \
+  if ! docker run --rm -i --network "container:$container" \
     -e DASHBOARD_TOKEN="$token" \
     "$node_image" node --input-type=module <<'NODE'
 const response = await fetch("http://127.0.0.1:8080/api/snapshot", {
@@ -171,6 +172,8 @@ if DASHBOARD_NODE_VERSION="$node_version" \
   DASHBOARD_BASE_URL="http://127.0.0.1:$host_port" \
   DASHBOARD_VERIFY_HOST_PUBLISHED=1 \
   DASHBOARD_ENV_FILE="$env_file" \
+  DASHBOARD_COMPOSE_FILE="$compose_file" \
+  DASHBOARD_COMPOSE_STATE_FILE="$compose_state_file" \
   sh dashboard/scripts/deploy-compose-dashboard.sh $compose
 then
   if verify_seeded_snapshot_contract; then

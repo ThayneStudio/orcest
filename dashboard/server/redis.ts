@@ -87,7 +87,7 @@ export async function scanKeysMany(patterns: string[]): Promise<string[]> {
 export function dashboardRedisPrefixes(
   raw = process.env.DASHBOARD_REDIS_PREFIXES,
 ): string[] | null {
-  if (raw === undefined || raw.trim() === "") return null;
+  if (raw === undefined) return null;
 
   const prefixes: string[] = [];
   const seen = new Set<string>();
@@ -100,7 +100,16 @@ export function dashboardRedisPrefixes(
     prefixes.push(normalized);
   }
 
-  return prefixes.length > 0 ? prefixes : null;
+  if (prefixes.length === 0) {
+    throw new Error(
+      "DASHBOARD_REDIS_PREFIXES must contain at least one prefix or the 'unprefixed' value",
+    );
+  }
+  return prefixes;
+}
+
+export function assertValidDashboardRedisPrefixes(): void {
+  dashboardRedisPrefixes();
 }
 
 function escapeRedisGlob(value: string): string {

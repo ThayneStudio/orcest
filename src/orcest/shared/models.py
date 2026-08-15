@@ -115,6 +115,10 @@ class Task:
     snapshot_failed_checks: list[str] | None = None
     snapshot_review_thread_ids: list[str] | None = None
     snapshot_review_thread_fingerprints: list[str] | None = None
+    # Stable, non-secret provider account selected by the orchestrator. This is
+    # anchored to the configured credential even when ``credential`` carries a
+    # later OAuth rotation.
+    provider_account: str = ""
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD.
@@ -155,6 +159,7 @@ class Task:
             "provider": self.provider,
             "credential": self.credential,
             "model": self.model or "",
+            "provider_account": self.provider_account,
         }
 
     @classmethod
@@ -206,6 +211,7 @@ class Task:
             provider=provider_in,
             credential=credential_in,
             model=model_in,
+            provider_account=data.get("provider_account", ""),
         )
 
     @classmethod
@@ -234,6 +240,7 @@ class Task:
         # pre-generate id, register_task(id, entry), pass here so create uses it;
         # on publish failure/None paths, caller calls task_completed to rollback.
         task_id: str | None = None,
+        provider_account: str = "",
     ) -> "Task":
         """Factory with auto-generated ID and timestamp.
 
@@ -270,6 +277,7 @@ class Task:
             provider=provider,
             credential=effective_credential,
             model=model,
+            provider_account=provider_account,
         )
 
     def to_safe_dict(self) -> dict[str, str]:
@@ -336,6 +344,11 @@ class TaskResult:
     # positional constructor keep the same argument mapping.
     repo: str = ""  # "owner/repo"; optional for legacy result payloads
     credential_update_minted_at: float = 0.0
+    # Non-secret provider-account identity (provider + credential hash). New
+    # workers include it so credential write-back survives an orchestrator
+    # restart without persisting the credential itself outside the task/result
+    # streams. Optional for rolling compatibility with older workers.
+    provider_account: str = ""
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -366,6 +379,8 @@ class TaskResult:
             d["credential_update"] = self.credential_update
             if self.credential_update_minted_at:
                 d["credential_update_minted_at"] = str(self.credential_update_minted_at)
+        if self.provider_account:
+            d["provider_account"] = self.provider_account
         return d
 
     def to_safe_dict(self) -> dict[str, str]:
@@ -400,6 +415,7 @@ class TaskResult:
             needs_human_reason=data.get("needs_human_reason", ""),
             credential_update=data.get("credential_update", ""),
             credential_update_minted_at=float(data.get("credential_update_minted_at", "0")),
+            provider_account=data.get("provider_account", ""),
         )
 
 

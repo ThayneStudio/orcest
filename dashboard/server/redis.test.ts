@@ -147,6 +147,20 @@ describe("dashboard Redis key patterns", () => {
     expect(dashboardRedisKeyPatterns(["tasks:*"])).toEqual(["orcest:tasks:*"]);
   });
 
+  it.each(["", "   ", ",", " , , "])(
+    "rejects a configured allowlist with no usable entries (%j)",
+    async (configured) => {
+      process.env.DASHBOARD_REDIS_PREFIXES = configured;
+      const { dashboardRedisKeyPatterns, dashboardRedisPrefixes } =
+        await importRedisModule();
+
+      expect(() => dashboardRedisPrefixes()).toThrow(/must contain at least one prefix/);
+      expect(() => dashboardRedisKeyPatterns(["tasks:*"])).toThrow(
+        /must contain at least one prefix/,
+      );
+    },
+  );
+
   it("escapes Redis glob metacharacters in configured prefixes", async () => {
     process.env.DASHBOARD_REDIS_PREFIXES = "project[1], literal*";
     const { dashboardRedisKeyPatterns } = await importRedisModule();

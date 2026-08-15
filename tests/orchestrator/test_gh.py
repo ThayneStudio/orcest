@@ -28,6 +28,7 @@ from orcest.orchestrator.gh import (
     get_pr,
     get_pr_diff,
     get_unresolved_review_threads,
+    has_issue_comment_marker,
     list_labeled_issues,
     list_open_prs,
     merge_pr,
@@ -305,6 +306,26 @@ def test_remove_label_reraises_other_errors(mocker):
 # ---------------------------------------------------------------------------
 # post_comment
 # ---------------------------------------------------------------------------
+
+
+def test_has_issue_comment_marker_searches_all_issue_comments(mocker):
+    marker = "<!-- orcest-result:abc123 -->"
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=f"an older comment\n{marker}\na newer comment",
+    )
+
+    assert has_issue_comment_marker(REPO, 3, marker, TOKEN)
+    mock_run.assert_called_once_with(
+        [
+            "api",
+            f"repos/{REPO}/issues/3/comments",
+            "--paginate",
+            "--jq",
+            ".[].body",
+        ],
+        TOKEN,
+    )
 
 
 def test_post_comment_uses_body_file(mocker):

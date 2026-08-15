@@ -52,26 +52,77 @@ def _make_redis(idle_set: set[str] | None = None) -> MagicMock:
     """
     mock = MagicMock()
     mock._idle_set: set[str] = set(idle_set or set())
+    mock._sets: dict[str, set[str]] = {
+        "pool:provisioning": set(),
+        "pool:ambiguous-clones": set(),
+    }
 
-    def _sadd(key: str, value: str) -> int:
+    def _sadd(key: str, *values: str) -> int:
         if key == "pool:idle":
-            mock._idle_set.add(value)
-        return 1
+            before = len(mock._idle_set)
+            mock._idle_set.update(values)
+            return len(mock._idle_set) - before
+        target = mock._sets.setdefault(key, set())
+        before = len(target)
+        target.update(values)
+        return len(target) - before
+
+    def _srem(key: str, *values: str) -> int:
+        target = mock._idle_set if key == "pool:idle" else mock._sets.setdefault(key, set())
+        before = len(target)
+        target.difference_update(values)
+        return before - len(target)
+
+    def _sismember(key: str, value: str) -> bool:
+        target = mock._idle_set if key == "pool:idle" else mock._sets.setdefault(key, set())
+        return value in target
 
     def _smembers(key: str) -> set[str]:
         if key == "pool:idle":
             return set(mock._idle_set)
-        return set()
+        return set(mock._sets.setdefault(key, set()))
+
+    def _client_type(_key: str) -> str:
+        return "stream"
+
+    def _delete(key: str) -> int:
+        if key in mock._sets:
+            existed = bool(mock._sets[key])
+            mock._sets[key].clear()
+            return int(existed)
+        return 1
 
     mock.scan_iter.return_value = []
     mock.hgetall.return_value = {}
     mock.smembers.side_effect = _smembers
     mock.scard.return_value = 0
     mock.hlen.return_value = 0
+    mock.exists.return_value = False
     mock.xinfo_groups_raw.return_value = []
     mock.xinfo_consumers_raw.return_value = []
     mock.sadd.side_effect = _sadd
-    mock.pipeline.return_value = MagicMock()
+    mock.srem.side_effect = _srem
+    mock.sismember.side_effect = _sismember
+    mock.delete.side_effect = _delete
+    mock.client.type.side_effect = _client_type
+    pipe = MagicMock()
+    processed_calls = 0
+
+    def _execute_pipeline() -> list[int]:
+        nonlocal processed_calls
+        calls = pipe.method_calls[processed_calls:]
+        processed_calls = len(pipe.method_calls)
+        for call in calls:
+            if call.args and call[0] == "sadd":
+                _sadd(*call.args)
+            elif call.args and call[0] == "srem":
+                _srem(*call.args)
+            elif call.args and call[0] == "delete":
+                _delete(str(call.args[0]))
+        return [1] * len(calls)
+
+    pipe.execute.side_effect = _execute_pipeline
+    mock.pipeline.return_value = pipe
     # Template pointer defaults to unset; PoolManager._resolve_template_vmid
     # then falls back to pool.template_vm_id from config (the legacy path).
     mock.get.return_value = None
@@ -83,7 +134,9 @@ def _make_proxmox() -> MagicMock:
     mock = MagicMock()
     mock.get_vm_ip.return_value = "10.20.0.50"
     mock.get_vm_status.return_value = "stopped"
-    mock.list_vms.return_value = []
+    mock.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+    ]
     # Default: the configured template exists (validated before cloning).
     mock.vm_exists.return_value = True
     return mock
@@ -181,6 +234,30 @@ class TestTaskStreams:
             "orcest:tasks:issue:claude",
             "orcest:tasks:issue:clauder",
         )
+
+    def test_dynamic_non_stream_task_key_is_ignored(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = ["tasks:metadata", "tasks:grok"]
+
+        def redis_type(key: str) -> str:
+            return "hash" if key == "orcest:tasks:metadata" else "stream"
+
+        redis.client.type.side_effect = redis_type
+
+        streams, complete = manager._task_streams_with_discovery_status()
+
+        assert complete is True
+        assert "orcest:tasks:metadata" not in streams
+        assert "orcest:tasks:grok" in streams
+
+    def test_dynamic_type_failure_marks_discovery_incomplete(self):
+        manager, _proxmox, redis = _make_manager()
+        redis.scan_iter.return_value = ["tasks:metadata"]
+        redis.client.type.side_effect = RuntimeError("Redis unavailable")
+
+        _streams, complete = manager._task_streams_with_discovery_status()
+
+        assert complete is False
 
 
 # ── _check_done_workers ─────────────────────────────────────
@@ -284,6 +361,7 @@ class TestCheckDoneWorkers:
         pipe.srem.assert_any_call("pool:idle", "300")
         pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
+        pipe.delete.assert_called_once_with("pool:done:orcest-worker-300")
         pipe.execute.assert_called_once()
 
     def test_destroy_failure_does_not_block_remaining_done_workers(self):
@@ -308,12 +386,12 @@ class TestCheckDoneWorkers:
 
         destroyed = manager._check_done_workers()
 
-        # Both VMs are reported as destroyed (pipeline failure in _destroy_vm
-        # is caught internally and does not prevent the VM from being counted)
-        assert sorted(destroyed) == [300, 301]
-        # Both done keys should be deleted regardless of destroy success
-        redis.delete.assert_any_call("pool:done:orcest-worker-300")
-        redis.delete.assert_any_call("pool:done:orcest-worker-301")
+        # Both Proxmox operations are attempted, but the first VM is not
+        # reported as a completed lifecycle transition because its durable
+        # generation-marker cleanup could not be verified.
+        assert destroyed == [301]
+        assert proxmox.destroy_vm.call_count == 2
+        redis.delete.assert_called_once_with("pool:done:orcest-worker-301")
 
 
 # ── _destroy_vm ──────────────────────────────────────────────
@@ -332,6 +410,7 @@ class TestDestroyVm:
         pipe.srem.assert_any_call("pool:idle", "300")
         pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
+        pipe.delete.assert_called_once_with("pool:done:orcest-worker-300")
         pipe.execute.assert_called_once()
 
     def test_cleans_redis_even_if_stop_fails(self):
@@ -346,33 +425,29 @@ class TestDestroyVm:
         proxmox.destroy_vm.assert_called_once_with(300)
         pipe.execute.assert_called_once()
 
-    def test_cleans_redis_even_if_destroy_fails(self):
+    def test_retains_redis_state_if_destroy_fails(self):
         manager, proxmox, redis = _make_manager()
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
         proxmox.destroy_vm.side_effect = Exception("API error")
 
-        manager._destroy_vm(300)
+        destroyed = manager._destroy_vm(300)
 
-        # Redis cleanup still happens
-        pipe.srem.assert_any_call("pool:idle", "300")
-        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
-        pipe.hdel.assert_called_once()
-        pipe.execute.assert_called_once()
+        assert destroyed is False
+        pipe.execute.assert_not_called()
+        redis.delete.assert_not_called()
 
-    def test_cleans_redis_even_if_both_proxmox_calls_fail(self):
+    def test_retains_redis_state_if_both_proxmox_calls_fail(self):
         manager, proxmox, redis = _make_manager()
         pipe = MagicMock()
         redis.pipeline.return_value = pipe
         proxmox.stop_vm.side_effect = Exception("stop failed")
         proxmox.destroy_vm.side_effect = Exception("destroy failed")
 
-        manager._destroy_vm(300)
+        destroyed = manager._destroy_vm(300)
 
-        pipe.srem.assert_any_call("pool:idle", "300")
-        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
-        pipe.hdel.assert_called_once_with("pool:active", "300")
-        pipe.execute.assert_called_once()
+        assert destroyed is False
+        pipe.execute.assert_not_called()
 
     def test_redis_pipeline_failure_does_not_raise(self):
         """If the Redis pipeline itself fails, _destroy_vm should not raise."""
@@ -382,13 +457,23 @@ class TestDestroyVm:
         pipe.execute.side_effect = ConnectionError("Redis connection lost")
 
         # Should not raise
-        manager._destroy_vm(300)
+        destroyed = manager._destroy_vm(300)
 
+        assert destroyed is False
         # Proxmox calls still happen
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
         # Pipeline was attempted
         pipe.execute.assert_called_once()
+
+    def test_marker_verification_failure_is_not_reported_as_success(self):
+        manager, proxmox, redis = _make_manager()
+        redis.exists.return_value = True
+
+        destroyed = manager._destroy_vm(300)
+
+        assert destroyed is False
+        proxmox.destroy_vm.assert_called_once_with(300)
 
 
 class TestDestroyVmRangeGuard:
@@ -485,7 +570,8 @@ class TestCloneAndBoot:
         )
         proxmox.start_vm.assert_called_once_with(300)
         proxmox.get_vm_ip.assert_called_once_with(300)
-        redis.sadd.assert_called_once_with("pool:idle", "300")
+        redis.pipeline.return_value.sadd.assert_called_with("pool:idle", "300")
+        redis.sadd.assert_any_call("pool:provisioning", "300")
 
     def test_no_template_configured(self):
         config = _make_config(template_vm_id=0)
@@ -498,9 +584,11 @@ class TestCloneAndBoot:
 
     def test_redis_pointer_overrides_config_template(self):
         """When the Redis pointer is set, its VMID is used (not the config one)."""
-        manager, proxmox, redis = _make_manager()
-        # Config says template_vm_id=9000, but the active pointer is 9005.
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
         redis.get.return_value = "9005"
+        proxmox.list_vms.return_value = [
+            {"vmid": 9005, "name": "orcest-worker-template", "template": True},
+        ]
         proxmox.get_vm_ip.return_value = "10.20.0.50"
 
         manager._clone_and_boot()
@@ -519,24 +607,40 @@ class TestCloneAndBoot:
         _, kwargs = proxmox.clone_vm.call_args
         assert kwargs["template_id"] == 9000
         # And the pointer is initialised so future cycles read from Redis.
-        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9000", ttl=86400 * 365)
+        redis.set_value.assert_called_once_with("pool:current_template_vmid", "9000")
+        redis.set_ex.assert_not_called()
 
-    def test_invalid_pointer_falls_back_to_config(self):
-        """A non-integer Redis pointer is ignored; config fallback wins."""
+    def test_invalid_pointer_fails_closed(self):
         manager, proxmox, redis = _make_manager()
         redis.get.return_value = "not-a-number"
-        proxmox.get_vm_ip.return_value = "10.20.0.50"
 
-        manager._clone_and_boot()
+        with pytest.raises(RuntimeError, match="invalid Redis pointer"):
+            manager._clone_and_boot()
 
-        _, kwargs = proxmox.clone_vm.call_args
-        assert kwargs["template_id"] == 9000
+        proxmox.clone_vm.assert_not_called()
+
+    def test_template_pointer_read_failure_fails_closed(self):
+        manager, proxmox, redis = _make_manager()
+        redis.get.side_effect = ConnectionError("Redis down")
+
+        with pytest.raises(RuntimeError, match="pointer read failed"):
+            manager._clone_and_boot()
+
+        proxmox.clone_vm.assert_not_called()
 
     def test_pointer_change_picked_up_next_cycle(self):
         """Subsequent _clone_and_boot calls re-read the pointer (no caching)."""
-        manager, proxmox, redis = _make_manager()
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
         proxmox.get_vm_ip.return_value = "10.20.0.50"
         redis.get.side_effect = ["9005", "9006"]
+        template_9005 = {"vmid": 9005, "name": "template-a", "template": True}
+        template_9006 = {"vmid": 9006, "name": "template-b", "template": True}
+        proxmox.list_vms.side_effect = [
+            [template_9005],
+            [template_9005],
+            [template_9006],
+            [template_9006],
+        ]
 
         manager._clone_and_boot()
         first = proxmox.clone_vm.call_args[1]["template_id"]
@@ -545,6 +649,35 @@ class TestCloneAndBoot:
 
         assert first == 9005
         assert second == 9006
+
+    def test_clears_and_verifies_old_generation_before_clone(self):
+        manager, proxmox, redis = _make_manager()
+        pipe = redis.pipeline.return_value
+
+        manager._clone_and_boot()
+
+        pipe.delete.assert_any_call("pool:done:orcest-worker-300")
+        pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
+        redis.exists.assert_any_call("pool:done:orcest-worker-300")
+        redis.sismember.assert_any_call("pool:draining", "orcest-worker-300")
+        proxmox.clone_vm.assert_called_once()
+
+    def test_refuses_clone_when_old_generation_cleanup_cannot_be_verified(self):
+        manager, proxmox, redis = _make_manager()
+        redis.exists.return_value = True
+
+        with pytest.raises(RuntimeError, match="Refusing to reuse VMID 300"):
+            manager._clone_and_boot()
+
+        proxmox.clone_vm.assert_not_called()
+
+    def test_refuses_allocation_when_proxmox_inventory_is_unavailable(self):
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.side_effect = RuntimeError("API unavailable")
+
+        assert manager._clone_and_boot() is None
+
+        proxmox.clone_vm.assert_not_called()
 
     def test_vm_no_ip_destroys(self):
         manager, proxmox, redis = _make_manager()
@@ -574,26 +707,32 @@ class TestCloneAndBoot:
         proxmox.destroy_vm.assert_called_once_with(300)
         proxmox.start_vm.assert_not_called()
 
-    def test_clone_failure_returns_none_and_cleans_up(self):
-        """Clone failure returns None and attempts best-effort cleanup."""
+    def test_clone_failure_quarantines_without_name_based_cleanup(self):
         manager, proxmox, redis = _make_manager()
         proxmox.clone_vm.side_effect = RuntimeError("clone failed")
 
         vm_id = manager._clone_and_boot()
 
         assert vm_id is None
-        # Best-effort cleanup: attempts to destroy the potentially-created VM
-        proxmox.destroy_vm.assert_called_once_with(300)
+        proxmox.destroy_vm.assert_not_called()
+        assert redis.sismember("pool:ambiguous-clones", "300")
 
-    def test_clone_failure_cleanup_ignores_destroy_error(self):
-        """If clone fails and cleanup destroy also fails, no exception escapes."""
+    def test_clone_failure_does_not_destroy_foreign_vmid(self):
         manager, proxmox, redis = _make_manager()
         proxmox.clone_vm.side_effect = RuntimeError("clone failed")
-        proxmox.destroy_vm.side_effect = RuntimeError("VM does not exist")
+
+        assert manager._clone_and_boot() is None
+
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_clone_failure_never_calls_destroy_even_for_expected_name(self):
+        manager, proxmox, redis = _make_manager()
+        proxmox.clone_vm.side_effect = RuntimeError("clone failed")
 
         vm_id = manager._clone_and_boot()
 
         assert vm_id is None
+        proxmox.destroy_vm.assert_not_called()
 
     def test_start_vm_failure_destroys_clone(self):
         """If start_vm raises, the cloned VM should be destroyed."""
@@ -608,7 +747,7 @@ class TestCloneAndBoot:
         proxmox.clone_vm.assert_called_once()
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_called_once_with(300)
-        redis.sadd.assert_not_called()
+        redis.pipeline.return_value.sadd.assert_not_called()
 
     def test_uses_linked_clone(self):
         manager, proxmox, redis = _make_manager()
@@ -638,20 +777,20 @@ class TestCloneAndBoot:
 
         manager._clone_and_boot()
 
-        redis.sadd.assert_not_called()
+        redis.pipeline.return_value.sadd.assert_not_called()
 
-    def test_sadd_failure_destroys_vm(self):
-        """If sadd to idle pool fails, the VM should be destroyed to avoid orphan."""
+    def test_idle_commit_failure_destroys_vm(self):
+        """If the idle-pool commit fails, the VM is destroyed to avoid an orphan."""
         manager, proxmox, redis = _make_manager()
         proxmox.get_vm_ip.return_value = "10.20.0.50"
-        redis.sadd.side_effect = ConnectionError("Redis down")
         pipe = MagicMock()
+        pipe.execute.side_effect = [[], ConnectionError("Redis down"), []]
         redis.pipeline.return_value = pipe
 
         vm_id = manager._clone_and_boot()
 
         assert vm_id is None
-        # VM was cloned and booted successfully, but sadd failed
+        # VM was cloned and booted successfully, but the idle commit failed.
         proxmox.clone_vm.assert_called_once()
         proxmox.start_vm.assert_called_once_with(300)
         # _destroy_vm should have been called to clean up
@@ -732,6 +871,82 @@ class TestCloneRedisPassword:
         assert "e2e-pw" in env_file["content"]
 
 
+class TestProvisioningRecovery:
+    def test_failed_post_clone_cleanup_is_retried_by_normal_reconcile(self):
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.set_vm_network.side_effect = RuntimeError("network provisioning failed")
+        proxmox.destroy_vm.side_effect = [RuntimeError("destroy unavailable"), None]
+
+        assert manager._clone_and_boot() is None
+        assert redis.sismember("pool:provisioning", "300")
+
+        proxmox.set_vm_network.side_effect = None
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+        manager.reconcile()
+
+        assert proxmox.destroy_vm.call_count == 2
+        assert not redis.sismember("pool:provisioning", "300")
+
+    def test_absent_ambiguous_clone_is_released(self):
+        manager, proxmox, redis = _make_manager()
+        redis.sadd("pool:ambiguous-clones", "300")
+
+        assert manager._reconcile_ambiguous_clones() is True
+
+        assert not redis.sismember("pool:ambiguous-clones", "300")
+        proxmox.destroy_vm.assert_not_called()
+        assert manager._next_vm_id() == 300
+
+    def test_present_ambiguous_clone_stays_quarantined(self, caplog):
+        manager, proxmox, redis = _make_manager()
+        redis.sadd("pool:ambiguous-clones", "300")
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        assert manager._reconcile_ambiguous_clones() is False
+
+        assert redis.sismember("pool:ambiguous-clones", "300")
+        proxmox.destroy_vm.assert_not_called()
+        assert "operator" in caplog.text.lower() or "inspect" in caplog.text.lower()
+
+    def test_present_ambiguity_suppresses_refill(self):
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.sadd("pool:ambiguous-clones", "300")
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        manager.reconcile()
+
+        proxmox.clone_vm.assert_not_called()
+        assert redis.sismember("pool:ambiguous-clones", "300")
+
+    def test_ambiguity_does_not_block_owned_cleanup_retry(self):
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.sadd("pool:ambiguous-clones", "300")
+        redis.sadd("pool:provisioning", "301")
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+            {"vmid": 301, "name": "orcest-worker-301", "template": False},
+        ]
+
+        manager.reconcile()
+
+        proxmox.destroy_vm.assert_called_once_with(301)
+        proxmox.clone_vm.assert_not_called()
+        assert redis.sismember("pool:ambiguous-clones", "300")
+
+
 def _make_range_config(template_vmid_range: list[int] | None = None) -> FleetConfig:
     """Build a config with a template VMID range (blue/green template mode)."""
     return FleetConfig(
@@ -753,14 +968,16 @@ class TestResolveTemplateValidation:
         """When the pointer names a live template it is used as-is."""
         manager, proxmox, redis = _make_manager(config=_make_range_config())
         redis.get.return_value = "9005"
-        proxmox.vm_exists.return_value = True
+        proxmox.list_vms.return_value = [
+            {"vmid": 9005, "name": "orcest-worker-template", "template": True},
+        ]
 
         manager._clone_and_boot()
 
         proxmox.clone_vm.assert_called_once()
         assert proxmox.clone_vm.call_args[1]["template_id"] == 9005
         # No recovery needed → the template pointer is not rewritten.
-        redis.set_ex.assert_not_called()
+        redis.set_value.assert_not_called()
 
     def test_missing_template_recovers_and_repoints(self):
         """A dangling pointer falls back to a live in-range template and repoints."""
@@ -768,25 +985,24 @@ class TestResolveTemplateValidation:
         redis.get.return_value = "9002"  # pointer names a destroyed template
         proxmox.vm_exists.return_value = False
         proxmox.list_vms.return_value = [
-            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
             {"vmid": 9001, "name": "orcest-worker-template", "template": True},
             {"vmid": 300, "name": "orcest-worker-300", "template": False},
         ]
 
         manager._clone_and_boot()
 
-        # Cloned from the newest live template (9001), not the missing 9002.
+        # The sole unambiguous live template is safe to recover.
         proxmox.clone_vm.assert_called_once()
         assert proxmox.clone_vm.call_args[1]["template_id"] == 9001
-        # Pointer repointed so the recovery survives a restart.
-        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9001", ttl=86400 * 365)
+        # The pointer is durable for as long as the template remains valid.
+        redis.set_value.assert_called_once_with("pool:current_template_vmid", "9001")
+        redis.set_ex.assert_not_called()
 
     def test_missing_pointer_range_mode_discovers_live_template(self):
         """Range-only startup can recover from a missing Redis template pointer."""
         manager, proxmox, redis = _make_manager(config=_make_range_config())
         redis.get.return_value = None
         proxmox.list_vms.return_value = [
-            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
             {"vmid": 9004, "name": "orcest-worker-template", "template": True},
             {"vmid": 9005, "name": "orcest-worker-template", "template": False},
         ]
@@ -796,7 +1012,20 @@ class TestResolveTemplateValidation:
         proxmox.vm_exists.assert_not_called()
         proxmox.clone_vm.assert_called_once()
         assert proxmox.clone_vm.call_args[1]["template_id"] == 9004
-        redis.set_ex.assert_called_once_with("pool:current_template_vmid", "9004", ttl=86400 * 365)
+        redis.set_value.assert_called_once_with("pool:current_template_vmid", "9004")
+
+    def test_missing_pointer_with_multiple_templates_fails_closed(self):
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = None
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 9004, "name": "orcest-worker-template", "template": True},
+        ]
+
+        assert manager._clone_and_boot() is None
+
+        proxmox.clone_vm.assert_not_called()
+        redis.set_value.assert_not_called()
 
     def test_missing_template_no_replacement_returns_none(self):
         """With no live template anywhere, no clone is attempted."""
@@ -812,16 +1041,36 @@ class TestResolveTemplateValidation:
         assert vm_id is None
         proxmox.clone_vm.assert_not_called()
 
-    def test_transient_existence_error_uses_candidate(self):
-        """A transient Proxmox error must not be mistaken for a missing template."""
+    def test_inventory_error_fails_closed(self):
         manager, proxmox, redis = _make_manager(config=_make_range_config())
         redis.get.return_value = "9005"
-        proxmox.vm_exists.side_effect = RuntimeError("API timeout")
+        proxmox.list_vms.side_effect = RuntimeError("API timeout")
 
-        manager._clone_and_boot()
+        assert manager._clone_and_boot() is None
 
-        proxmox.clone_vm.assert_called_once()
-        assert proxmox.clone_vm.call_args[1]["template_id"] == 9005
+        proxmox.clone_vm.assert_not_called()
+
+    def test_existing_non_template_pointer_is_rejected(self):
+        manager, proxmox, redis = _make_manager(config=_make_range_config())
+        redis.get.return_value = "9005"
+        proxmox.list_vms.return_value = [
+            {"vmid": 9005, "name": "ordinary-vm", "template": False},
+        ]
+
+        assert manager._clone_and_boot() is None
+
+        proxmox.clone_vm.assert_not_called()
+
+    def test_template_pointer_outside_configured_authority_is_rejected(self):
+        manager, proxmox, redis = _make_manager(config=_make_range_config([9000, 9003]))
+        redis.get.return_value = "9010"
+        proxmox.list_vms.return_value = [
+            {"vmid": 9010, "name": "foreign-template", "template": True},
+        ]
+
+        assert manager._clone_and_boot() is None
+
+        proxmox.clone_vm.assert_not_called()
 
     def test_replacement_ignores_non_template_and_out_of_range(self):
         """Recovery only picks Proxmox templates inside the configured range."""
@@ -910,6 +1159,19 @@ class TestDetectActiveWorkers:
         # Should not raise
         manager._detect_active_workers()
 
+    @pytest.mark.parametrize("pending", ["not-an-int", -1, None, 1.5, True])
+    def test_malformed_pending_value_marks_discovery_incomplete(self, pending):
+        manager, _proxmox, redis = _make_manager()
+        redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-300", "pending": pending},
+        ]
+
+        names, complete = manager._consumers_with_pending_status()
+
+        assert names == set()
+        assert complete is False
+
     def test_non_integer_idle_member_skipped(self):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"not-a-number", "300"}
@@ -987,8 +1249,7 @@ class TestFillPool:
 
         proxmox.clone_vm.assert_not_called()
 
-    def test_clone_failure_continues(self):
-        """One clone failure should not prevent subsequent clones."""
+    def test_clone_failure_stops_refill_until_reconciled(self):
         config = _make_config(pool_size=3)
         manager, proxmox, redis = _make_manager(config=config)
         redis.scard.return_value = 0
@@ -1002,11 +1263,9 @@ class TestFillPool:
 
         manager._fill_pool()
 
-        # Called 3 times, first failed, last 2 proceeded
-        assert proxmox.clone_vm.call_count == 3
-        assert proxmox.start_vm.call_count == 2
-        # Best-effort cleanup: failed clone triggers destroy_vm for VM 300
-        proxmox.destroy_vm.assert_called_once_with(300)
+        assert proxmox.clone_vm.call_count == 1
+        proxmox.start_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
 
     def test_uses_correct_redis_keys(self):
         config = _make_config(pool_size=4)
@@ -1662,6 +1921,17 @@ class TestReconcileOrphans:
         # Should not raise
         manager._reconcile_orphans()
 
+    def test_corrupt_template_pointer_aborts_orphan_cleanup(self):
+        manager, proxmox, redis = _make_manager()
+        redis.get.return_value = "corrupt"
+        proxmox.list_vms.return_value = [
+            {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        ]
+
+        manager._reconcile_orphans()
+
+        proxmox.destroy_vm.assert_not_called()
+
     def test_destroy_failure_does_not_block_other_orphans(self):
         """If destroying one orphan fails, the rest are still processed."""
         manager, proxmox, redis = _make_manager()
@@ -1752,14 +2022,19 @@ class TestReconcileOrphans:
         proxmox.stop_vm.assert_not_called()
         proxmox.destroy_vm.assert_not_called()
 
-    def test_active_pointer_protected_outside_range(self):
-        """Bug 1: the active Redis pointer is honoured even without a range."""
+    def test_invalid_pointer_does_not_override_proxmox_template_protection(self):
+        """An unauthorized pointer is rejected, but real templates remain protected."""
         config = _make_config(template_vm_id=9000, vm_id_start=300)
         manager, proxmox, redis = _make_manager(config=config)
         # Active pointer was swapped to 9001 (no range configured).
         redis.get.return_value = "9001"
         proxmox.list_vms.return_value = [
-            {"vmid": 9001, "name": "orcest-worker-template", "status": "stopped"},
+            {
+                "vmid": 9001,
+                "name": "orcest-worker-template",
+                "status": "stopped",
+                "template": True,
+            },
         ]
         redis._idle_set = set()
         redis.hgetall.return_value = {}
@@ -2026,6 +2301,10 @@ class TestReconcile:
         with (
             patch.object(manager, "_check_done_workers", return_value=[]) as mock_done,
             patch.object(manager, "_detect_active_workers") as mock_detect,
+            patch.object(
+                manager, "_reconcile_ambiguous_clones", return_value=True
+            ) as mock_ambiguous,
+            patch.object(manager, "_retry_provisioning_cleanups", return_value=True) as mock_retry,
             patch.object(manager, "_fill_pool") as mock_fill,
             patch.object(manager, "_health_check") as mock_health,
             patch.object(manager, "_reconcile_stale_redis") as mock_stale,
@@ -2035,6 +2314,8 @@ class TestReconcile:
 
         mock_done.assert_called_once()
         mock_detect.assert_called_once()
+        mock_ambiguous.assert_called_once()
+        mock_retry.assert_called_once()
         mock_fill.assert_called_once()
         mock_health.assert_called_once()
         mock_stale.assert_called_once()
@@ -2064,6 +2345,16 @@ class TestReconcile:
             ),
             patch.object(
                 manager,
+                "_reconcile_ambiguous_clones",
+                side_effect=lambda: call_order.append("reconcile_ambiguous") or True,
+            ),
+            patch.object(
+                manager,
+                "_retry_provisioning_cleanups",
+                side_effect=lambda: call_order.append("retry_provisioning") or True,
+            ),
+            patch.object(
+                manager,
                 "_fill_pool",
                 side_effect=lambda: call_order.append("fill_pool"),
             ),
@@ -2088,6 +2379,8 @@ class TestReconcile:
         assert call_order == [
             "check_done",
             "detect_active",
+            "reconcile_ambiguous",
+            "retry_provisioning",
             "fill_pool",
             "health_check",
             "reconcile_stale",

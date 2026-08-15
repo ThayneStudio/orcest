@@ -7,6 +7,7 @@ Code's interactive billing path while preserving Orcest's Runner contract.
 
 from __future__ import annotations
 
+import codecs
 import errno
 import fcntl
 import logging
@@ -34,6 +35,25 @@ _USAGE_ERROR_LINE_RE = re.compile(
     r"billing limit|token limit)",
     re.IGNORECASE,
 )
+
+
+class _PtyOutputDecoder:
+    """Stateful UTF-8 decoder for PTY reads that may split code points."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._finished = False
+
+    def decode(self, chunk: bytes) -> str:
+        if self._finished:
+            return ""
+        return self._decoder.decode(chunk, final=False)
+
+    def finish(self) -> str:
+        if self._finished:
+            return ""
+        self._finished = True
+        return self._decoder.decode(b"", final=True)
 
 
 def _is_interactive_usage_exhausted(
@@ -112,6 +132,7 @@ class ClaudeInteractiveRunner:
         terminal_output: list[str],
         on_output: Callable[[str], None] | None,
         logger: logging.Logger | None,
+        decoder: _PtyOutputDecoder,
     ) -> bool:
         readable, _, _ = select.select([master_fd], [], [], 0)
         if not readable:
@@ -124,7 +145,19 @@ class ClaudeInteractiveRunner:
             raise
         if not chunk:
             return False
-        text = chunk.decode("utf-8", errors="replace")
+        text = decoder.decode(chunk)
+        if not text:
+            return True
+        self._record_output(text, terminal_output, on_output, logger)
+        return True
+
+    def _record_output(
+        self,
+        text: str,
+        terminal_output: list[str],
+        on_output: Callable[[str], None] | None,
+        logger: logging.Logger | None,
+    ) -> None:
         terminal_output.append(text)
         if on_output is not None:
             try:
@@ -135,7 +168,17 @@ class ClaudeInteractiveRunner:
                         "on_output callback raised; continuing",
                         exc_info=True,
                     )
-        return True
+
+    def _finish_output_decoder(
+        self,
+        decoder: _PtyOutputDecoder,
+        terminal_output: list[str],
+        on_output: Callable[[str], None] | None,
+        logger: logging.Logger | None,
+    ) -> None:
+        text = decoder.finish()
+        if text:
+            self._record_output(text, terminal_output, on_output, logger)
 
     def _drain_available_output(
         self,
@@ -143,8 +186,9 @@ class ClaudeInteractiveRunner:
         terminal_output: list[str],
         on_output: Callable[[str], None] | None,
         logger: logging.Logger | None,
+        decoder: _PtyOutputDecoder,
     ) -> None:
-        while self._read_available(master_fd, terminal_output, on_output, logger):
+        while self._read_available(master_fd, terminal_output, on_output, logger, decoder):
             pass
 
     def _drain_startup_output(
@@ -154,6 +198,7 @@ class ClaudeInteractiveRunner:
         terminal_output: list[str],
         on_output: Callable[[str], None] | None,
         logger: logging.Logger | None,
+        decoder: _PtyOutputDecoder,
         startup_delay: float = 3.0,
     ) -> None:
         deadline = time.monotonic() + startup_delay
@@ -161,7 +206,7 @@ class ClaudeInteractiveRunner:
             timeout = max(0.0, min(0.1, deadline - time.monotonic()))
             readable, _, _ = select.select([master_fd], [], [], timeout)
             if readable:
-                self._read_available(master_fd, terminal_output, on_output, logger)
+                self._read_available(master_fd, terminal_output, on_output, logger, decoder)
 
     def _read_result(self, result_path: Path) -> str | None:
         try:
@@ -210,11 +255,17 @@ class ClaudeInteractiveRunner:
         prompt: str,
         logger: logging.Logger | None,
         abort_event: threading.Event | None = None,
+        timeout: float = 10.0,
     ) -> None:
         # Bracketed paste keeps multi-line prompts intact in terminal UIs, then
         # the final carriage return submits the completed prompt.
         payload = f"\x1b[200~{prompt}\x1b[201~\r".encode("utf-8")
-        self._write_all(master_fd, payload, abort_event=abort_event)
+        self._write_all(
+            master_fd,
+            payload,
+            abort_event=abort_event,
+            timeout=timeout,
+        )
         if logger:
             logger.info("Sent prompt to interactive Claude over PTY")
 
@@ -370,10 +421,13 @@ class ClaudeInteractiveRunner:
         abort = abort_event if abort_event is not None else threading.Event()
 
         for attempt in range(1, self.max_retries + 1):
+            attempt_start = time.monotonic()
+            attempt_deadline = attempt_start + max(0.0, float(timeout))
             proc: subprocess.Popen[bytes] | None = None
             master_fd = -1
             slave_fd = -1
             terminal_output: list[str] = []
+            decoder = _PtyOutputDecoder()
             try:
                 master_fd, slave_fd = pty.openpty()
                 self._set_window_size(slave_fd)
@@ -401,8 +455,6 @@ class ClaudeInteractiveRunner:
                 mcp_server_confirmed = False
                 prompt_sent = False
                 setup_output_index = 0
-                start: float | None = None
-                startup_deadline = time.monotonic() + max(10.0, min(float(timeout), 120.0))
 
                 while True:
                     summary = self._read_result(result_path)
@@ -419,22 +471,33 @@ class ClaudeInteractiveRunner:
                         )
 
                     now = time.monotonic()
-                    if not prompt_sent and now >= startup_deadline:
+                    if now >= attempt_deadline:
                         _kill_process_tree(proc)  # type: ignore[arg-type]
-                        return RunnerResult(
-                            success=False,
-                            summary="Timed out waiting for interactive Claude input prompt",
-                            transient=True,
+                        self._drain_available_output(
+                            master_fd,
+                            terminal_output,
+                            on_output,
+                            logger,
+                            decoder,
                         )
-
-                    if prompt_sent and start is not None and now - start >= timeout:
+                        self._finish_output_decoder(
+                            decoder,
+                            terminal_output,
+                            on_output,
+                            logger,
+                        )
                         combined = "".join(terminal_output)
-                        _kill_process_tree(proc)  # type: ignore[arg-type]
                         if _is_interactive_usage_exhausted(combined, full_prompt):
                             return RunnerResult(
                                 success=False,
                                 summary="Claude usage limit reached",
                                 usage_exhausted=True,
+                            )
+                        if not prompt_sent:
+                            return RunnerResult(
+                                success=False,
+                                summary="Timed out waiting for interactive Claude input prompt",
+                                transient=True,
                             )
                         return RunnerResult(
                             success=False,
@@ -448,6 +511,13 @@ class ClaudeInteractiveRunner:
                             terminal_output,
                             on_output,
                             logger,
+                            decoder,
+                        )
+                        self._finish_output_decoder(
+                            decoder,
+                            terminal_output,
+                            on_output,
+                            logger,
                         )
                         summary = self._read_result(result_path)
                         if summary is not None:
@@ -457,9 +527,25 @@ class ClaudeInteractiveRunner:
                     readable, _, _ = select.select([master_fd], [], [], 0.25)
                     if not readable:
                         continue
-                    if not self._read_available(master_fd, terminal_output, on_output, logger):
+                    if not self._read_available(
+                        master_fd,
+                        terminal_output,
+                        on_output,
+                        logger,
+                        decoder,
+                    ):
                         break
                     if not prompt_sent:
+                        if _is_interactive_usage_exhausted(
+                            "".join(terminal_output),
+                            full_prompt,
+                        ):
+                            _kill_process_tree(proc)  # type: ignore[arg-type]
+                            return RunnerResult(
+                                success=False,
+                                summary="Claude usage limit reached",
+                                usage_exhausted=True,
+                            )
                         confirmed_setup = False
                         previous = workspace_trust_confirmed
                         workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
@@ -501,10 +587,16 @@ class ClaudeInteractiveRunner:
                                 full_prompt,
                                 logger,
                                 abort_event=abort,
+                                timeout=max(0.0, attempt_deadline - time.monotonic()),
                             )
                             prompt_sent = True
-                            start = time.monotonic()
 
+                self._finish_output_decoder(
+                    decoder,
+                    terminal_output,
+                    on_output,
+                    logger,
+                )
                 combined = "".join(terminal_output)
                 if _is_interactive_usage_exhausted(combined, full_prompt):
                     return RunnerResult(
@@ -563,3 +655,9 @@ class ClaudeInteractiveRunner:
                             os.close(fd)
                         except OSError:
                             pass
+
+        return RunnerResult(
+            success=False,
+            summary="Interactive Claude exhausted retries without a result",
+            transient=True,
+        )

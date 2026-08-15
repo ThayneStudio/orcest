@@ -162,6 +162,7 @@ def gh_mock(mocker):
         "add_label",
         "remove_label",
         "post_comment",
+        "has_issue_comment_marker",
         "get_unresolved_review_threads",
         "resolve_review_thread",
         "merge_pr",
@@ -176,6 +177,7 @@ def gh_mock(mocker):
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
+    ns.has_issue_comment_marker.return_value = False
     return ns
 
 

@@ -23,6 +23,7 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 
+from orcest.shared.models import is_claude_provider
 from orcest.shared.providers import ProviderEntry
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,38 @@ class ProviderPool:
         with self._lock:
             ident = self._task_identities.get(task_id)
             return self._identity_to_entry.get(ident) if ident else None
+
+    def has_account(self, account_key: str) -> bool:
+        """Return whether *account_key* identifies a configured pool account."""
+        if not account_key:
+            return False
+        with self._lock:
+            return account_key in set(self._identity_to_account.values())
+
+    def account_for_credential(self, provider: str, credential: str) -> str | None:
+        """Resolve an original or current effective credential to one account.
+
+        Used only by the rolling-upgrade backfill for retained tasks that lack
+        the explicit ``provider_account`` protocol field. Multiple matching
+        accounts are ambiguous and therefore return ``None``.
+        """
+        if not provider or not credential:
+            return None
+        with self._lock:
+            matches: set[str] = set()
+            for entry in self._entries:
+                same_provider = entry.provider == provider or (
+                    is_claude_provider(entry.provider) and is_claude_provider(provider)
+                )
+                if not same_provider:
+                    continue
+                account = entry.account_key()
+                override = self._credential_overrides.get(account)
+                if entry.credential == credential or (
+                    override is not None and override[0] == credential
+                ):
+                    matches.add(account)
+            return next(iter(matches)) if len(matches) == 1 else None
 
     # ------------------------------------------------------------------
     # Credential write-back (OAuth-blob providers: Grok, Codex)

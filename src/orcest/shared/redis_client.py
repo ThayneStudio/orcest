@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import types
-from typing import Any
+from typing import Any, cast
 
 import redis
 
@@ -470,10 +470,13 @@ class RedisClient:
 
     def next_monotonic_version(self, key: str) -> float:
         """Return a Redis-clock-backed, strictly increasing version."""
-        result = self._client.eval(
-            _MONOTONIC_VERSION_SCRIPT,
-            1,
-            self._prefixed(key),
+        result = cast(
+            Any,
+            self._client.eval(
+                _MONOTONIC_VERSION_SCRIPT,
+                1,
+                self._prefixed(key),
+            ),
         )
         return float(result)
 
@@ -617,6 +620,24 @@ class RedisClient:
         result: int = self._client.xlen(self._prefixed(stream))  # type: ignore[assignment]
         return result
 
+    def xrange(
+        self,
+        stream: str,
+        min_id: str = "-",
+        max_id: str = "+",
+        count: int | None = None,
+    ) -> list[tuple[str, dict[str, str]]]:
+        """XRANGE over a prefixed stream with typed string fields."""
+        return cast(
+            list[tuple[str, dict[str, str]]],
+            self._client.xrange(
+                self._prefixed(stream),
+                min=min_id,
+                max=max_id,
+                count=count,
+            ),
+        )
+
     def xtrim_minid(self, stream: str, minid: str) -> int:
         """XTRIM stream MINID minid. Removes entries older than minid.
 
@@ -731,7 +752,8 @@ class RedisClient:
         PEL state. Returns 0 if the consumer or group does not exist.
         """
         try:
-            return int(self._client.xgroup_delconsumer(fq_stream, group, consumer))
+            result = cast(Any, self._client.xgroup_delconsumer(fq_stream, group, consumer))
+            return int(result)
         except redis.ResponseError:
             return 0
 
@@ -753,13 +775,16 @@ class RedisClient:
         returned. Returns ``("0-0", [])`` on error or empty PEL.
         """
         try:
-            result = self._client.xautoclaim(
-                fq_stream,
-                group,
-                consumer,
-                min_idle_time=min_idle_ms,
-                start_id=start_id,
-                count=count,
+            result = cast(
+                Any,
+                self._client.xautoclaim(
+                    fq_stream,
+                    group,
+                    consumer,
+                    min_idle_time=min_idle_ms,
+                    start_id=start_id,
+                    count=count,
+                ),
             )
         except redis.ResponseError:
             return "0-0", []

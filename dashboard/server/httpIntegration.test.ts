@@ -18,6 +18,7 @@ import type { DashboardMessage } from "./types.js";
 
 const originalToken = process.env.DASHBOARD_TOKEN;
 const originalAllowedOrigins = process.env.DASHBOARD_ALLOWED_ORIGINS;
+const originalRedisPrefixes = process.env.DASHBOARD_REDIS_PREFIXES;
 
 type TestServer = {
   instance: DashboardServerInstance;
@@ -203,6 +204,8 @@ afterEach(() => {
   else process.env.DASHBOARD_TOKEN = originalToken;
   if (originalAllowedOrigins === undefined) delete process.env.DASHBOARD_ALLOWED_ORIGINS;
   else process.env.DASHBOARD_ALLOWED_ORIGINS = originalAllowedOrigins;
+  if (originalRedisPrefixes === undefined) delete process.env.DASHBOARD_REDIS_PREFIXES;
+  else process.env.DASHBOARD_REDIS_PREFIXES = originalRedisPrefixes;
 });
 
 describe("dashboard HTTP integration", () => {
@@ -221,6 +224,17 @@ describe("dashboard HTTP integration", () => {
       },
     })).toThrow(/Invalid DASHBOARD_ALLOWED_ORIGINS entries: pve-test\.lab\.prefixa\.net/);
   });
+
+  it.each(["", "   ", " , , "])(
+    "fails fast when DASHBOARD_REDIS_PREFIXES has no usable entries (%j)",
+    (configured) => {
+      process.env.DASHBOARD_REDIS_PREFIXES = configured;
+
+      expect(() => createDashboardServer({ port: 0 })).toThrow(
+        /DASHBOARD_REDIS_PREFIXES must contain at least one prefix/,
+      );
+    },
+  );
 
   it("keeps health unauthenticated and protects API/static routes with the dashboard cookie", async () => {
     process.env.DASHBOARD_TOKEN = "s3cret";

@@ -162,16 +162,16 @@ def test_verify_returns_false_when_key_expired(fake_redis_client):
 
 
 def test_compute_pending_task_ttl_uses_runner_values():
-    """compute_pending_task_ttl returns timeout × max_retries + 300."""
-    rc = RunnerConfig(timeout=1800, max_retries=3)
-    assert compute_pending_task_ttl(rc) == 1800 * 3 + 300
+    """TTL covers every attempt, each retry backoff, and the safety buffer."""
+    rc = RunnerConfig(timeout=1800, max_retries=3, retry_backoff=20)
+    assert compute_pending_task_ttl(rc) == 1800 * 3 + 20 * 2 + 300
 
 
 def test_compute_pending_task_ttl_reflects_non_default_values():
     """Non-default timeout/max_retries produce a larger TTL than the default constant."""
-    rc = RunnerConfig(timeout=3600, max_retries=5)
+    rc = RunnerConfig(timeout=3600, max_retries=5, retry_backoff=15)
     ttl = compute_pending_task_ttl(rc)
-    assert ttl == 3600 * 5 + 300
+    assert ttl == 3600 * 5 + 15 * 4 + 300
     assert ttl > compute_pending_task_ttl(RunnerConfig())
 
 

@@ -51,7 +51,7 @@ if ! docker exec "$cid" node scripts/check-bundle-runtime.mjs; then
 fi
 
 for _attempt in $(seq 1 60); do
-  if docker exec \
+  if docker exec -i \
     -e DASHBOARD_SMOKE_TOKEN="$token" \
     -e DASHBOARD_EXPECTED_ASSETS="$expected_assets" \
     "$cid" node <<'NODE'

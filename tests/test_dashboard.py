@@ -754,8 +754,21 @@ class TestDashboardAuthFailsClosed:
         )
         assert "DASHBOARD_DEPLOY_LOCK_HELD=1 but dashboard deploy lock is missing" in deploy_text
         assert "release_deploy_lock()" in deploy_text
+        assert "restore_candidate_compose()" in deploy_text
+        assert "activate_rollback_compose()" in deploy_text
+        assert "refresh_compose_state()" in deploy_text
+        assert deploy_text.index("validate_compose_state_paths || exit 1") < deploy_text.index(
+            'previous_container="'
+        )
+        assert deploy_text.index("candidate_tag_replaced=1") < deploy_text.index(
+            'DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard'
+        )
+        assert deploy_text.index("if ! refresh_compose_state") < deploy_text.index(
+            'echo "Dashboard published readiness verified"'
+        )
         assert "handle_signal()" in deploy_text
         assert "Dashboard deploy interrupted after candidate start; rolling back" in deploy_text
+        assert "Dashboard deploy interrupted before candidate start" in deploy_text
         assert 'docker tag "$previous_image_id" "$rollback_image"' in deploy_text
         assert "restorable_image_name()" in deploy_text
         assert "restore_rollback_image_tag()" in deploy_text
@@ -822,12 +835,166 @@ class TestDashboardAuthFailsClosed:
         assert '--network "$network_name"' in smoke_text
         assert "--network orcest" not in smoke_text
         assert 'DASHBOARD_IMAGE="$smoke_image"' in smoke_text
+        assert 'DASHBOARD_COMPOSE_STATE_FILE="$compose_state_file"' in smoke_text
         assert 'docker image rm "$smoke_image"' in smoke_text
         smoke_image = self._repo_root() / "dashboard" / "scripts" / "smoke-image.sh"
-        assert "node scripts/check-bundle-runtime.mjs" in smoke_image.read_text()
+        smoke_image_text = smoke_image.read_text()
+        assert "node scripts/check-bundle-runtime.mjs" in smoke_image_text
+        assert "if docker exec -i \\" in smoke_image_text
+        assert 'docker run --rm -i --network "container:$container"' in smoke_text
         asset_text = asset_script.read_text()
         assert "exec -T dashboard sh -lc" in asset_text
         assert "tr '\\n' ' ' <\"$asset_file\"" in asset_text
+
+        make_text = makefile.read_text()
+        assert "DASHBOARD_REMOTE_COMPOSE_STATE_FILE ?=" in make_text
+        assert "Could not seed dashboard last-known-good Compose state" in make_text
+        assert make_text.index(
+            "Could not seed dashboard last-known-good Compose state"
+        ) < make_text.index("rsync -az --delete")
+
+    def test_dashboard_image_smoke_forwards_embedded_node_program(self, tmp_path):
+        """The image smoke must keep Docker stdin open so its HTTP/auth/asset
+        assertions execute inside the container instead of Node receiving EOF."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        marker = tmp_path / "node-program.js"
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+case "${1:-}" in
+  run)
+    printf '%s\n' smoke-container
+    ;;
+  exec)
+    interactive=0
+    bundle=0
+    assets=0
+    for arg do
+      [ "$arg" = "-i" ] && interactive=1
+      [ "$arg" = "scripts/check-bundle-runtime.mjs" ] && bundle=1
+      [ "$arg" = "sh" ] && assets=1
+    done
+    if [ "$assets" = "1" ]; then
+      printf '%s\n' dist/assets/index-smoke.js dist/assets/index-smoke.css
+    elif [ "$bundle" = "0" ] && [ "$interactive" = "1" ]; then
+      cat > "$STDIN_MARKER"
+    fi
+    ;;
+  logs|rm)
+    ;;
+esac
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["STDIN_MARKER"] = str(marker)
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/smoke-image.sh", "dashboard:test"],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        program = marker.read_text()
+        assert "async function main()" in program
+        assert 'const deepLinkPath = "/work/results"' in program
+
+    def test_dashboard_compose_smoke_forwards_seeded_snapshot_program(self, tmp_path):
+        """The Compose smoke must execute its seeded Redis contract program,
+        not accept a successful Node process that received an empty stdin."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        marker = tmp_path / "node-programs.js"
+        up_marker = tmp_path / "dashboard-up"
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+has_arg() {
+  expected="$1"
+  shift
+  for arg do
+    [ "$arg" = "$expected" ] && return 0
+  done
+  return 1
+}
+if [ "${1:-}" = "compose" ]; then
+  action=""
+  for arg do
+    case "$arg" in ps|build|up|exec|logs|down|rm) action="$arg"; break ;; esac
+  done
+  case "$action" in
+    ps) [ -f "$UP_MARKER" ] && printf '%s\n' dashboard-container ;;
+    up) : > "$UP_MARKER" ;;
+    exec|build|logs|down|rm) ;;
+  esac
+  exit 0
+fi
+case "${1:-}" in
+  network|rm)
+    exit 0
+    ;;
+  exec)
+    exit 0
+    ;;
+  inspect)
+    case "${3:-}" in
+      "{{.Image}}") printf '%s\n' sha256:candidate ;;
+      "{{.Config.Image}}") printf '%s\n' dashboard:test ;;
+    esac
+    exit 0
+    ;;
+  image)
+    [ "${2:-}" = "inspect" ] && printf '%s\n' sha256:candidate
+    exit 0
+    ;;
+  run)
+    if has_arg --input-type=module "$@"; then
+      if has_arg -i "$@"; then
+        cat >> "$STDIN_MARKER"
+        printf '\n' >> "$STDIN_MARKER"
+      fi
+      exit 0
+    fi
+    if has_arg scripts/check-bundle-runtime.mjs "$@"; then
+      exit 0
+    fi
+    if has_arg sh "$@"; then
+      printf '%s\n' dist/assets/index-smoke.js dist/assets/index-smoke.css
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["STDIN_MARKER"] = str(marker)
+        env["UP_MARKER"] = str(up_marker)
+        env["DASHBOARD_SMOKE_IMAGE"] = "dashboard:test"
+        env["DASHBOARD_SMOKE_NODE_IMAGE"] = "node:test"
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/smoke-compose.sh"],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        programs = marker.read_text()
+        assert "non-stream tasks:metadata appeared in queue_depths" in programs
+        assert 'queueDepths["tasks:claude"] !== 1' in programs
 
     def test_dashboard_deploy_refuses_concurrent_lock(self, tmp_path):
         """Concurrent dashboard deploys must not race image tags or rollback
@@ -878,6 +1045,42 @@ exit 99
         assert "Refusing to run a concurrent dashboard deploy" in result.stderr
         assert not calls.exists()
         assert lock_dir.exists()
+
+    def test_dashboard_deploy_validates_compose_state_before_mutation(self, tmp_path):
+        """An invalid state path must fail before Compose or Docker can inspect,
+        build, tag, or start anything."""
+        compose_file = tmp_path / "docker-compose.yml"
+        compose_file.write_text("services: {}\n")
+        state_target = tmp_path / "state-target.yml"
+        state_target.write_text("services: {}\n")
+        state_link = tmp_path / "compose-state.yml"
+        state_link.symlink_to(state_target)
+        compose_calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        for name, calls in (("compose", compose_calls), ("docker", docker_calls)):
+            command = fake_bin / name
+            command.write_text(f"#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {calls}\nexit 99\n")
+            command.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["DASHBOARD_COMPOSE_FILE"] = str(compose_file)
+        env["DASHBOARD_COMPOSE_STATE_FILE"] = str(state_link)
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(tmp_path / "deploy.lock")
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(fake_bin / "compose")],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "state file must be a regular file, not a symlink" in result.stderr
+        assert not compose_calls.exists()
+        assert not docker_calls.exists()
 
     def test_dashboard_deploy_validates_candidate_before_live_start(
         self,
@@ -1281,6 +1484,195 @@ exit 0
         assert "up -d --no-build --force-recreate dashboard" in calls_text
         assert "exec -T dashboard" in calls_text
         assert "rm -sf dashboard" in calls_text
+
+    def test_dashboard_deploy_signal_before_start_restores_previous_image_tag(
+        self,
+        tmp_path,
+    ):
+        """A deferred signal returned by foreground Compose build must restore
+        the tag that build replaced, even though no candidate container ran."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        compose_file = tmp_path / "docker-compose.yml"
+        compose_file.write_text("services:\n  dashboard:\n    image: dashboard:test\n")
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\n' "$*" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps) printf '%s\n' previous-container ;;
+  exec) printf '%s\n' dist/assets/index-previous.js dist/assets/index-previous.css ;;
+  build) kill -TERM "$PPID" ;;
+  up) echo "candidate must not start" >&2; exit 99 ;;
+esac
+exit 0
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+  inspect)
+    case "$3" in
+      "{{.Image}}") printf '%s\n' sha256:previous ;;
+      "{{.Config.Image}}") printf '%s\n' dashboard:test ;;
+    esac
+    ;;
+  image)
+    if [ "${2:-}" = "inspect" ]; then
+      printf '%s\n' sha256:candidate
+    fi
+    ;;
+  tag)
+    ;;
+  run) ;;
+esac
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["DASHBOARD_IMAGE"] = "dashboard:test"
+        env["DASHBOARD_NODE_IMAGE"] = "node:test"
+        env["DASHBOARD_COMPOSE_FILE"] = str(compose_file)
+        env["DASHBOARD_COMPOSE_STATE_FILE"] = str(tmp_path / "compose-state.yml")
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(tmp_path / "deploy.lock")
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 143
+        assert "interrupted before candidate start" in result.stderr
+        assert "up " not in calls.read_text()
+        docker_text = docker_calls.read_text()
+        assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
+        assert any(
+            line.startswith("tag orcest-dashboard:rollback-") and line.endswith(" dashboard:test")
+            for line in docker_text.splitlines()
+        )
+
+    def test_dashboard_rollback_uses_known_good_compose_and_restores_candidate_file(
+        self,
+        tmp_path,
+    ):
+        """A candidate config that cannot start must be rolled back with the
+        persisted stable config, without replacing the synced candidate file."""
+        calls = tmp_path / "compose-calls.log"
+        docker_calls = tmp_path / "docker-calls.log"
+        failed_marker = tmp_path / "candidate-failed"
+        rollback_signal_marker = tmp_path / "rollback-signaled"
+        compose_file = tmp_path / "docker-compose.yml"
+        compose_state = tmp_path / "compose-state.yml"
+        candidate_config = "services:\n  dashboard:\n    x-release: candidate\n"
+        stable_config = "services:\n  dashboard:\n    x-release: stable\n"
+        compose_file.write_text(candidate_config)
+        compose_state.write_text(stable_config)
+        compose = tmp_path / "compose"
+        compose.write_text(
+            """#!/usr/bin/env sh
+set -eu
+release=$(sed -n 's/.*x-release: //p' "$DASHBOARD_COMPOSE_FILE")
+printf '%s|%s|DASHBOARD_IMAGE=%s\n' "$1" "$release" "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+case "$1" in
+  ps) printf '%s\n' previous-container ;;
+  exec) printf '%s\n' dist/assets/index-previous.js dist/assets/index-previous.css ;;
+  build|logs) ;;
+  up)
+    if [ "$release" = "candidate" ] && [ ! -e "$FAILED_MARKER" ]; then
+      : > "$FAILED_MARKER"
+      exit 1
+    fi
+    if [ "$release" = "stable" ] && [ ! -e "$ROLLBACK_SIGNAL_MARKER" ]; then
+      : > "$ROLLBACK_SIGNAL_MARKER"
+      kill -TERM "$PPID"
+    fi
+    ;;
+esac
+exit 0
+"""
+        )
+        compose.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text(
+            """#!/usr/bin/env sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_CALLS"
+case "$1" in
+  inspect)
+    case "$3" in
+      "{{.Image}}") printf '%s\n' sha256:previous ;;
+      "{{.Config.Image}}") printf '%s\n' dashboard:test ;;
+    esac
+    ;;
+  image)
+    [ "${2:-}" = "inspect" ] && printf '%s\n' sha256:candidate
+    ;;
+  tag|rm)
+    ;;
+  run)
+    for arg do
+      [ "$arg" = "scripts/check-bundle-runtime.mjs" ] && exit 0
+      if [ "$arg" = "sh" ]; then
+        printf '%s\n' dist/assets/index-candidate.js dist/assets/index-candidate.css
+        exit 0
+      fi
+    done
+    ;;
+esac
+exit 0
+"""
+        )
+        docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["COMPOSE_CALLS"] = str(calls)
+        env["DOCKER_CALLS"] = str(docker_calls)
+        env["FAILED_MARKER"] = str(failed_marker)
+        env["ROLLBACK_SIGNAL_MARKER"] = str(rollback_signal_marker)
+        env["DASHBOARD_IMAGE"] = "dashboard:test"
+        env["DASHBOARD_NODE_IMAGE"] = "node:test"
+        env["DASHBOARD_COMPOSE_FILE"] = str(compose_file)
+        env["DASHBOARD_COMPOSE_STATE_FILE"] = str(compose_state)
+        env["DASHBOARD_DEPLOY_LOCK_DIR"] = str(tmp_path / "deploy.lock")
+        result = subprocess.run(
+            ["sh", "dashboard/scripts/deploy-compose-dashboard.sh", str(compose)],
+            cwd=self._repo_root(),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 143
+        assert "using last-known-good Compose configuration" in result.stderr
+        assert "interrupted after candidate start" in result.stderr
+        up_calls = [line for line in calls.read_text().splitlines() if line.startswith("up|")]
+        assert up_calls == [
+            "up|candidate|DASHBOARD_IMAGE=dashboard:test",
+            "up|stable|DASHBOARD_IMAGE=dashboard:test",
+            "up|stable|DASHBOARD_IMAGE=dashboard:test",
+        ]
+        assert compose_file.read_text() == candidate_config
+        assert compose_state.read_text() == stable_config
+        assert not list(tmp_path.glob("docker-compose.yml.*"))
 
     def test_dashboard_deploy_signal_rolls_back_live_candidate(self, tmp_path):
         """If a deploy is interrupted after the candidate may be live, the trap
@@ -1900,6 +2292,52 @@ exit 0
                 f"Refusing unsafe DASHBOARD_REMOTE_ORCEST_DIR={normalized_root}" in combined_output
             )
             assert "dashboard.example.invalid sh" not in combined_output
+
+    def test_remote_sync_rejects_compose_state_inside_deleted_dashboard_tree(self):
+        """The last-known-good state must survive rsync --delete, so it cannot
+        be configured inside the synchronized dashboard source directory."""
+        for unsafe_state in [
+            "/opt/orcest/dashboard",
+            "/opt/orcest/dashboard/compose-state.yml",
+        ]:
+            result = subprocess.run(
+                [
+                    "make",
+                    "check-dashboard-remote-paths",
+                    "DASHBOARD_REMOTE=dashboard.example.invalid",
+                    f"DASHBOARD_REMOTE_COMPOSE_STATE_FILE={unsafe_state}",
+                ],
+                cwd=self._repo_root(),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            assert result.returncode != 0
+            combined_output = result.stdout + result.stderr
+            assert "must be outside DASHBOARD_REMOTE_DIR" in combined_output
+            assert "dashboard.example.invalid sh" not in combined_output
+
+    def test_remote_sync_rejects_relative_compose_state_path(self):
+        """The state file is used from multiple remote working directories, so
+        require one unambiguous absolute location."""
+        result = subprocess.run(
+            [
+                "make",
+                "check-dashboard-remote-paths",
+                "DASHBOARD_REMOTE=dashboard.example.invalid",
+                "DASHBOARD_REMOTE_COMPOSE_STATE_FILE=dashboard/.compose-state.yml",
+            ],
+            cwd=self._repo_root(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        combined_output = result.stdout + result.stderr
+        assert "must be an absolute path outside DASHBOARD_REMOTE_DIR" in combined_output
+        assert "dashboard.example.invalid sh" not in combined_output
 
     def test_remote_sync_preserves_excluded_target_files(self):
         """Remote sync should delete stale tracked files without deleting target

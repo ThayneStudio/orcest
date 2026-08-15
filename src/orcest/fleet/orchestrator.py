@@ -61,8 +61,39 @@ _REDIS_CONTAINER = "orcest-redis-redis-1"
 # real redis-cli exit status back through ``sh``/``docker exec``.
 _REDIS_CLI_PREFIX = (
     f"sudo docker exec {_REDIS_CONTAINER} "
-    'sh -c \'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning "$@"\' redis-cli'
+    'sh -c \'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning -e "$@"\' redis-cli'
 )
+
+# Older redis-cli builds, wrappers, and test doubles can still report a Redis
+# command error in output while returning zero.  Every fleet lifecycle read is
+# a safety boundary, so reject recognizable server errors defensively instead
+# of parsing them as an empty set/hash or a legitimate value.
+_REDIS_ERROR_LINE_RE = re.compile(
+    r"(?im)^\s*(?:\(error\)\s*)?"
+    r"(?:AUTH failed:|ERR\b|NOAUTH\b|WRONGPASS\b|WRONGTYPE\b|NOGROUP\b|"
+    r"LOADING\b|READONLY\b|MISCONF\b)"
+)
+
+
+def _redis_cli_failure(result: subprocess.CompletedProcess[str]) -> str | None:
+    """Return a Redis/transport diagnostic when *result* is not trustworthy."""
+    for output in (result.stderr or "", result.stdout or ""):
+        match = _REDIS_ERROR_LINE_RE.search(output)
+        if match is not None:
+            return output[match.start() :].splitlines()[0].strip()
+    if result.returncode != 0:
+        return (result.stderr or result.stdout or f"exit status {result.returncode}").strip()
+    return None
+
+
+def _require_redis_cli_success(
+    result: subprocess.CompletedProcess[str],
+    context: str,
+) -> None:
+    """Raise when a redis-cli invocation failed or emitted a server error."""
+    failure = _redis_cli_failure(result)
+    if failure is not None:
+        raise RuntimeError(f"{context}: {failure}")
 
 
 def _ssh(ssh_target: str, cmd: str) -> subprocess.CompletedProcess[str]:
@@ -478,8 +509,7 @@ def get_pool_redis_members(
     """
     # Read idle set
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:idle")
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to read pool idle set: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to read pool idle set")
     idle: set[str] = set()
     for line in result.stdout.strip().splitlines():
         stripped = line.strip()
@@ -488,10 +518,13 @@ def get_pool_redis_members(
 
     # Read active hash (returns alternating key, value lines)
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw HGETALL orcest:pool:active")
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to read pool active hash: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to read pool active hash")
     active: dict[str, str] = {}
     lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+    if len(lines) % 2 != 0:
+        raise RuntimeError(
+            "Failed to read pool active hash: redis-cli returned an odd number of HGETALL fields"
+        )
     for i in range(0, len(lines) - 1, 2):
         active[lines[i]] = lines[i + 1]
 
@@ -501,20 +534,48 @@ def get_pool_redis_members(
 def _parse_xinfo_consumers_with_pending(stdout: str) -> set[str]:
     """Parse ``redis-cli --raw XINFO CONSUMERS`` output for busy consumers."""
     lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    if len(lines) % 2 != 0:
+        raise RuntimeError("Malformed XINFO CONSUMERS output: incomplete field/value pair")
     consumers: set[str] = set()
     current_name: str | None = None
+    current_pending_seen = False
     for i in range(0, len(lines) - 1, 2):
         field = lines[i]
         value = lines[i + 1]
         if field == "name":
+            if current_name is not None and not current_pending_seen:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: consumer {current_name!r} "
+                    "has no pending count"
+                )
+            if not value:
+                raise RuntimeError("Malformed XINFO CONSUMERS output: empty consumer name")
             current_name = value
-        elif field == "pending" and current_name:
+            current_pending_seen = False
+        elif field == "pending":
+            if current_name is None or current_pending_seen:
+                raise RuntimeError(
+                    "Malformed XINFO CONSUMERS output: pending count has no unique consumer"
+                )
             try:
                 pending = int(value)
-            except ValueError:
-                pending = 0
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: invalid pending count {value!r}"
+                ) from exc
+            if pending < 0:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: invalid pending count {value!r}"
+                )
+            current_pending_seen = True
             if pending > 0:
                 consumers.add(current_name)
+    if current_name is None and lines:
+        raise RuntimeError("Malformed XINFO CONSUMERS output: no consumer name")
+    if current_name is not None and not current_pending_seen:
+        raise RuntimeError(
+            f"Malformed XINFO CONSUMERS output: consumer {current_name!r} has no pending count"
+        )
     return consumers
 
 
@@ -537,23 +598,39 @@ def get_workers_with_pending_tasks(
             ssh_target,
             f"{_REDIS_CLI_PREFIX} --raw --scan --pattern {shlex.quote(pattern)}",
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to scan task streams: {result.stderr.strip()}")
+        _require_redis_cli_success(result, "Failed to scan task streams")
         streams.update(ln.strip() for ln in result.stdout.splitlines() if ln.strip())
 
     busy: set[str] = set()
     for stream_name in sorted(streams):
         result = _ssh(
             ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw TYPE {shlex.quote(stream_name)}",
+        )
+        _require_redis_cli_success(
+            result,
+            f"Failed to inspect Redis type for task-stream candidate {stream_name}",
+        )
+        redis_type = result.stdout.strip()
+        if redis_type not in {"none", "string", "list", "set", "zset", "hash", "stream"}:
+            raise RuntimeError(
+                f"Failed to inspect Redis type for task-stream candidate {stream_name}: "
+                f"unexpected TYPE output {redis_type!r}"
+            )
+        if redis_type != "stream":
+            continue
+        result = _ssh(
+            ssh_target,
             f"{_REDIS_CLI_PREFIX} --raw XINFO CONSUMERS {shlex.quote(stream_name)} workers",
         )
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            lower = stderr.lower()
+        failure = _redis_cli_failure(result)
+        if failure is not None:
+            diagnostic = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+            lower = diagnostic.lower()
             if "nogroup" in lower or "no such key" in lower:
                 continue
             raise RuntimeError(
-                f"Failed to inspect task-stream consumers for {stream_name}: {stderr}"
+                f"Failed to inspect task-stream consumers for {stream_name}: {failure}"
             )
         busy.update(_parse_xinfo_consumers_with_pending(result.stdout))
     return busy
@@ -566,8 +643,7 @@ def get_current_template_vmid(ssh_target: str) -> int | None:
     orchestrator VM. Returns ``None`` for missing/empty/non-integer values.
     """
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_vmid")
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to read template pointer: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to read template pointer")
     raw = result.stdout.strip()
     if not raw:
         return None
@@ -587,22 +663,48 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
         ssh_target,
         f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to set template pointer: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to set template pointer")
 
 
 def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
-    """Remove VM IDs from pool:idle and pool:active in Redis."""
+    """Remove destroyed VM generations and verify lifecycle markers are gone."""
     if not vm_ids:
         return
     cmds: list[str] = []
     for vm_id in vm_ids:
         quoted = shlex.quote(vm_id)
+        worker_id = shlex.quote(f"orcest-worker-{vm_id}")
         cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:idle {quoted}")
         cmds.append(f"{_REDIS_CLI_PREFIX} HDEL orcest:pool:active {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:draining {worker_id}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:provisioning {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:ambiguous-clones {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} DEL orcest:pool:done:{worker_id}")
     result = _ssh(ssh_target, " && ".join(cmds))
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to clean pool Redis state: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to clean pool Redis state")
+
+    # A stale durable done key or drain membership can target a later clone
+    # after Proxmox reuses the same VMID. Verify both generation markers rather
+    # than trusting a successful-looking cleanup response.
+    for vm_id in vm_ids:
+        worker_id = shlex.quote(f"orcest-worker-{vm_id}")
+        verify = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw EXISTS orcest:pool:done:{worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:draining {worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:provisioning {vm_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:ambiguous-clones {vm_id}",
+        )
+        _require_redis_cli_success(
+            verify,
+            f"Failed to verify pool Redis cleanup for VM {vm_id}",
+        )
+        states = [line.strip() for line in verify.stdout.splitlines() if line.strip()]
+        if states != ["0", "0", "0", "0"]:
+            raise RuntimeError(
+                f"Failed to verify pool Redis cleanup for VM {vm_id}: "
+                f"expected lifecycle markers to be absent, got {states!r}"
+            )
 
 
 def set_workers_draining(
@@ -620,9 +722,10 @@ def set_workers_draining(
         ssh_target,
         f"{_REDIS_CLI_PREFIX} {command} orcest:pool:draining {members}",
     )
-    if result.returncode != 0:
+    failure = _redis_cli_failure(result)
+    if failure is not None:
         action = "mark" if draining else "clear"
-        raise RuntimeError(f"Failed to {action} worker drain state: {result.stderr.strip()}")
+        raise RuntimeError(f"Failed to {action} worker drain state: {failure}")
 
 
 def clean_pending_tasks(ssh_target: str) -> int:
@@ -631,15 +734,13 @@ def clean_pending_tasks(ssh_target: str) -> int:
         ssh_target,
         f"{_REDIS_CLI_PREFIX} --scan --pattern 'orcest:pending:*'",
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to scan pending task markers: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to scan pending task markers")
     keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
     if not keys:
         return 0
     quoted = " ".join(shlex.quote(k) for k in keys)
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to delete pending task markers: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to delete pending task markers")
     return len(keys)
 
 

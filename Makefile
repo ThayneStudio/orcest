@@ -15,6 +15,8 @@ DASHBOARD_REMOTE ?=
 DASHBOARD_REMOTE_DIR ?= /opt/orcest/dashboard
 DASHBOARD_REMOTE_ORCEST_DIR ?= /opt/orcest
 DASHBOARD_REMOTE_DEPLOY_LOCK_DIR ?= $(DASHBOARD_REMOTE_ORCEST_DIR)/.dashboard-deploy.lock
+DASHBOARD_COMPOSE_STATE_FILE ?= $(CURDIR)/.dashboard-compose.last-known-good.yml
+DASHBOARD_REMOTE_COMPOSE_STATE_FILE ?= $(DASHBOARD_REMOTE_ORCEST_DIR)/.dashboard-compose.last-known-good.yml
 DASHBOARD_REMOTE_RSYNC_SHELL ?= ssh -o BatchMode=yes
 DASHBOARD_REMOTE_EXEC ?= ssh -o BatchMode=yes $(DASHBOARD_REMOTE)
 DASHBOARD_REMOTE_COMPOSE ?= docker compose --env-file .redis.env --env-file .dashboard.env -f docker-compose.dashboard.yml
@@ -30,6 +32,7 @@ DASHBOARD_SHELL_QUOTE = '$(subst ','\'',$(1))'
 DASHBOARD_REMOTE_DIR_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_DIR))
 DASHBOARD_REMOTE_ORCEST_DIR_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_ORCEST_DIR))
 DASHBOARD_REMOTE_DEPLOY_LOCK_DIR_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_DEPLOY_LOCK_DIR))
+DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_COMPOSE_STATE_FILE))
 DASHBOARD_NODE_VERSION_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_VERSION))
 DASHBOARD_NODE_IMAGE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_IMAGE))
 
@@ -104,7 +107,7 @@ dev-dashboard:
 		-e REDIS_PASSWORD="$$redis_password" \
 		-e ORCEST_REDIS_PASSWORD="$$redis_password" \
 		-e DASHBOARD_TOKEN="$$token" \
-		-e DASHBOARD_REDIS_PREFIXES="$${DASHBOARD_REDIS_PREFIXES:-}" \
+		-e DASHBOARD_REDIS_PREFIXES \
 		-p 127.0.0.1:$(DASHBOARD_DEV_API_HOST_PORT):8080 \
 		-p 127.0.0.1:$(DASHBOARD_DEV_VITE_HOST_PORT):5173 \
 		-v "$(CURDIR)/dashboard:/app" \
@@ -115,6 +118,7 @@ check-dashboard-remote-paths: check-dashboard-tracked
 	@test -n $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE)) || { echo "Set DASHBOARD_REMOTE=user@host"; exit 1; }
 	@remote_dir=$$(printf '%s' $(DASHBOARD_REMOTE_DIR_SH) | sed 's:/*$$::'); \
 	orcest_dir=$$(printf '%s' $(DASHBOARD_REMOTE_ORCEST_DIR_SH) | sed 's:/*$$::'); \
+	state_file=$$(printf '%s' $(DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH) | sed 's:/*$$::'); \
 	expected_dir="$$orcest_dir/dashboard"; \
 	case "$$orcest_dir" in ""|"/"|"/opt"|"/var"|"/usr"|"/home"|"/root"|"/etc"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/dev"|"/proc"|"/sys"|"/run"|"/tmp"|"/boot"|"/mnt"|"/media"|".."|*"/.."|*"/../"*|"../"*|"."|"./"*) \
 		echo "Refusing unsafe DASHBOARD_REMOTE_ORCEST_DIR=$$orcest_dir"; \
@@ -140,6 +144,26 @@ check-dashboard-remote-paths: check-dashboard-tracked
 	if [ "$$remote_dir" != "$$expected_dir" ]; then \
 		echo "DASHBOARD_REMOTE_DIR must be $$expected_dir because docker-compose.dashboard.yml builds ./dashboard"; \
 		exit 1; \
+	fi; \
+	case "$$state_file" in /*) ;; \
+		*) \
+			echo "DASHBOARD_REMOTE_COMPOSE_STATE_FILE must be an absolute path outside DASHBOARD_REMOTE_DIR"; \
+			exit 1; \
+			;; \
+	esac; \
+	case "$$state_file" in ""|"."|".."|*"/.."|*"/../"*|"../"*) \
+		echo "Refusing unsafe DASHBOARD_REMOTE_COMPOSE_STATE_FILE=$$state_file"; \
+		exit 1; \
+		;; \
+	esac; \
+	case "$$state_file" in "$$remote_dir"|"$$remote_dir"/*) \
+		echo "DASHBOARD_REMOTE_COMPOSE_STATE_FILE must be outside DASHBOARD_REMOTE_DIR because dashboard sync uses rsync --delete"; \
+		exit 1; \
+		;; \
+	esac; \
+	if [ "$$state_file" = "$$orcest_dir" ]; then \
+		echo "Refusing unsafe DASHBOARD_REMOTE_COMPOSE_STATE_FILE=$$state_file"; \
+		exit 1; \
 	fi
 
 preflight-dashboard-remote: check-dashboard-remote-paths
@@ -159,6 +183,7 @@ sync-dashboard-remote: check-dashboard-remote-paths
 sync-dashboard-remote-unlocked: preflight-dashboard-remote
 	$(call DASHBOARD_RUN_REMOTE,docker compose version >/dev/null; network_name=$$(awk 'function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$$/, "", s); return s } function unquote(s, q, body, end) { s=trim(s); q=substr(s, 1, 1); if (q == "\"" || q == sprintf("%c", 39)) { body=substr(s, 2); end=index(body, q); return end > 0 ? substr(body, 1, end - 1) : body } sub(/[[:space:]]+#.*$$/, "", s); return trim(s) } /^[[:space:]]*(#|$$)/ { next } /^[[:space:]]*ORCEST_DOCKER_NETWORK[[:space:]]*=/ { value=$$0; sub(/^[[:space:]]*ORCEST_DOCKER_NETWORK[[:space:]]*=[[:space:]]*/, "", value); found=1; result=unquote(value) } END { if (found) print result }' $(DASHBOARD_REMOTE_ORCEST_DIR_SH)/.redis.env $(DASHBOARD_REMOTE_ORCEST_DIR_SH)/.dashboard.env 2>/dev/null); network_name="$${ORCEST_DOCKER_NETWORK:-$${network_name:-orcest}}"; docker network inspect "$$network_name" >/dev/null || { echo "Missing external Docker network '$$network_name'; deploy Redis/network before dashboard"; exit 1; })
 	$(call DASHBOARD_RUN_REMOTE,orcest_dir=$$(printf '%s' $(DASHBOARD_REMOTE_ORCEST_DIR_SH) | sed 's:/*$$::'); remote_dir=$$(printf '%s' $(DASHBOARD_REMOTE_DIR_SH) | sed 's:/*$$::'); mkdir -p "$$orcest_dir" "$$remote_dir"; test -d "$$orcest_dir" && test -w "$$orcest_dir" && test -d "$$remote_dir" && test -w "$$remote_dir" || { echo "Remote dashboard directories are not writable: $$orcest_dir $$remote_dir"; exit 1; }; test ! -L "$$orcest_dir" && test ! -L "$$remote_dir" || { echo "Remote dashboard directories must not be symlinks: $$orcest_dir $$remote_dir"; exit 1; }; orcest_physical=$$(cd "$$orcest_dir" && pwd -P); remote_physical=$$(cd "$$remote_dir" && pwd -P); { [ "$$orcest_physical" = "$$orcest_dir" ] && [ "$$remote_physical" = "$$remote_dir" ]; } || { echo "Remote dashboard directories must resolve to configured paths: $$orcest_dir $$remote_dir"; exit 1; })
+	$(call DASHBOARD_RUN_REMOTE,compose_file=$(DASHBOARD_REMOTE_ORCEST_DIR_SH)/docker-compose.dashboard.yml; state_file=$(DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH); if [ -e "$$state_file" ] && { [ ! -f "$$state_file" ] || [ -L "$$state_file" ]; }; then echo "Dashboard Compose state file must be a regular file, not a symlink: $$state_file" >&2; exit 1; fi; if [ ! -e "$$state_file" ] && [ -r "$$compose_file" ]; then state_tmp=$$(mktemp "$${state_file}.tmp.XXXXXX"); cp -p "$$compose_file" "$$state_tmp" && mv "$$state_tmp" "$$state_file" || { rm -f "$$state_tmp"; echo "Could not seed dashboard last-known-good Compose state" >&2; exit 1; }; fi)
 	rsync -az --delete $(DASHBOARD_RSYNC_EXCLUDES) -e $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_RSYNC_SHELL)) $(call DASHBOARD_SHELL_QUOTE,$(CURDIR)/dashboard/) $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE):$(DASHBOARD_REMOTE_DIR)/)
 	rsync -az -e $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE_RSYNC_SHELL)) $(call DASHBOARD_SHELL_QUOTE,$(CURDIR)/docker-compose.dashboard.yml) $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_REMOTE):$(DASHBOARD_REMOTE_ORCEST_DIR)/docker-compose.dashboard.yml)
 
@@ -177,7 +202,7 @@ deploy-dashboard: check-dashboard-tracked
 	published_env_file=""; \
 	if [ -r "$(DASHBOARD_ENV)" ]; then published_env_file="$(DASHBOARD_ENV)"; fi; \
 	set -- docker compose "$$@" -f docker-compose.dashboard.yml; \
-	DASHBOARD_NODE_VERSION="$(DASHBOARD_NODE_VERSION)" DASHBOARD_NODE_IMAGE="$(DASHBOARD_NODE_IMAGE)" DASHBOARD_BASE_URL="http://127.0.0.1:8080" DASHBOARD_ENV_FILE="$$published_env_file" sh dashboard/scripts/deploy-compose-dashboard.sh "$$@"
+	DASHBOARD_NODE_VERSION="$(DASHBOARD_NODE_VERSION)" DASHBOARD_NODE_IMAGE="$(DASHBOARD_NODE_IMAGE)" DASHBOARD_BASE_URL="http://127.0.0.1:8080" DASHBOARD_ENV_FILE="$$published_env_file" DASHBOARD_COMPOSE_FILE="$(CURDIR)/docker-compose.dashboard.yml" DASHBOARD_COMPOSE_STATE_FILE="$(DASHBOARD_COMPOSE_STATE_FILE)" sh dashboard/scripts/deploy-compose-dashboard.sh "$$@"
 
 deploy-dashboard-remote: check-dashboard-remote-paths
 	@set -eu; \
@@ -189,4 +214,4 @@ deploy-dashboard-remote: check-dashboard-remote-paths
 	$(call DASHBOARD_RUN_REMOTE,lock_dir=$(DASHBOARD_REMOTE_DEPLOY_LOCK_DIR_SH); unsafe=0; [ -n "$$lock_dir" ] || unsafe=1; [ "$$lock_dir" != "/" ] || unsafe=1; [ "$$lock_dir" != "." ] || unsafe=1; [ "$$lock_dir" != ".." ] || unsafe=1; if expr "$$lock_dir" : "\\.\\./" >/dev/null; then unsafe=1; fi; if expr "$$lock_dir" : ".*/\\.\\." >/dev/null; then unsafe=1; fi; if [ "$$unsafe" = "1" ]; then echo "Unsafe DASHBOARD_REMOTE_DEPLOY_LOCK_DIR: $$lock_dir" >&2; exit 2; fi; if mkdir "$$lock_dir" 2>/dev/null; then { printf "%s\n" "pid=$$$$"; printf "%s\n" "started_at_epoch=$$(date +%s 2>/dev/null || true)"; printf "%s\n" "target=deploy-dashboard-remote"; } >"$$lock_dir/info" || true; elif [ ! -d "$$lock_dir" ]; then echo "Dashboard deploy lock could not be created: $$lock_dir" >&2; exit 1; else echo "Dashboard deploy lock is already held: $$lock_dir" >&2; if [ -r "$$lock_dir/info" ]; then sed 's/^/  /' "$$lock_dir/info" >&2 || true; fi; echo "Refusing to run a concurrent dashboard sync/deploy; remove the lock only after confirming no deploy is active." >&2; exit 1; fi); \
 	remote_lock_acquired=1; \
 	make sync-dashboard-remote-unlocked; \
-	$(call DASHBOARD_RUN_REMOTE,cd $(DASHBOARD_REMOTE_ORCEST_DIR_SH) && $(DASHBOARD_REMOTE_PUBLISHED_ENV)DASHBOARD_DEPLOY_LOCK_HELD=1 DASHBOARD_DEPLOY_LOCK_DIR=$(DASHBOARD_REMOTE_DEPLOY_LOCK_DIR_SH) DASHBOARD_NODE_VERSION=$(DASHBOARD_NODE_VERSION_SH) DASHBOARD_NODE_IMAGE=$(DASHBOARD_NODE_IMAGE_SH) DASHBOARD_BASE_URL='http://127.0.0.1:8080' DASHBOARD_ENV_FILE='.dashboard.env' sh dashboard/scripts/deploy-compose-dashboard.sh $(DASHBOARD_REMOTE_COMPOSE))
+	$(call DASHBOARD_RUN_REMOTE,cd $(DASHBOARD_REMOTE_ORCEST_DIR_SH) && $(DASHBOARD_REMOTE_PUBLISHED_ENV)DASHBOARD_DEPLOY_LOCK_HELD=1 DASHBOARD_DEPLOY_LOCK_DIR=$(DASHBOARD_REMOTE_DEPLOY_LOCK_DIR_SH) DASHBOARD_NODE_VERSION=$(DASHBOARD_NODE_VERSION_SH) DASHBOARD_NODE_IMAGE=$(DASHBOARD_NODE_IMAGE_SH) DASHBOARD_BASE_URL='http://127.0.0.1:8080' DASHBOARD_ENV_FILE='.dashboard.env' DASHBOARD_COMPOSE_FILE='docker-compose.dashboard.yml' DASHBOARD_COMPOSE_STATE_FILE=$(DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH) sh dashboard/scripts/deploy-compose-dashboard.sh $(DASHBOARD_REMOTE_COMPOSE))

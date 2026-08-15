@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 
 from orcest.worker.claude_interactive_runner import (
     ClaudeInteractiveRunner,
     _is_interactive_usage_exhausted,
+    _PtyOutputDecoder,
 )
 
 
@@ -37,6 +39,43 @@ def test_usage_detector_ignores_submitted_prompt_echo() -> None:
 
     assert _is_interactive_usage_exhausted(terminal, prompt) is False
     assert _is_interactive_usage_exhausted(terminal + "Error: quota exceeded\n", prompt) is True
+
+
+def test_pty_decoder_preserves_utf8_codepoint_split_across_reads(monkeypatch) -> None:
+    runner = ClaudeInteractiveRunner()
+    decoder = _PtyOutputDecoder()
+    terminal_output: list[str] = []
+    callback_output: list[str] = []
+    encoded = "❯ ".encode("utf-8")
+    chunks = iter([encoded[:1], encoded[1:2], encoded[2:]])
+
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner.select.select",
+        lambda *args, **kwargs: ([123], [], []),
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner.os.read",
+        lambda *args, **kwargs: next(chunks),
+    )
+
+    for _ in range(3):
+        assert runner._read_available(
+            123,
+            terminal_output,
+            callback_output.append,
+            None,
+            decoder,
+        )
+
+    runner._finish_output_decoder(
+        decoder,
+        terminal_output,
+        callback_output.append,
+        None,
+    )
+    assert "".join(terminal_output) == "❯ "
+    assert "".join(callback_output) == "❯ "
+    assert "�" not in "".join(terminal_output)
 
 
 def test_workspace_trust_prompt_detector_handles_tui_output() -> None:
@@ -585,6 +624,90 @@ raise SystemExit(1)
     assert result.summary == "Claude usage limit reached"
 
 
+def test_run_classifies_usage_limit_while_waiting_for_startup_prompt(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import time
+print("Error: usage limit reached for this billing period", flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    started = time.monotonic()
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=5,
+        credential="claude-token",
+    )
+
+    assert time.monotonic() - started < 3
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert result.summary == "Claude usage limit reached"
+
+
+def test_startup_wait_consumes_the_attempt_timeout(tmp_path, monkeypatch) -> None:
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import time
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    started = time.monotonic()
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=1,
+        credential="claude-token",
+    )
+
+    assert time.monotonic() - started < 3
+    assert result.success is False
+    assert result.transient is True
+    assert result.summary == "Timed out waiting for interactive Claude input prompt"
+
+
+def test_prompt_write_uses_only_remaining_attempt_budget(monkeypatch) -> None:
+    runner = ClaudeInteractiveRunner()
+    captured: dict[str, float] = {}
+
+    def capture_write(
+        fd: int,
+        data: bytes,
+        abort_event=None,
+        timeout: float = 10.0,
+    ) -> None:
+        del fd, data, abort_event
+        captured["timeout"] = timeout
+
+    monkeypatch.setattr(runner, "_write_all", capture_write)
+
+    runner._send_prompt(123, "prompt", None, timeout=0.25)
+
+    assert captured["timeout"] == 0.25
+
+
 def test_run_does_not_classify_plain_terminal_text_as_usage_limit(
     tmp_path,
     monkeypatch,
@@ -637,7 +760,10 @@ time.sleep(30)
     work_dir.mkdir()
     runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
 
+    captured: dict[str, float] = {}
+
     def fail_send_prompt(*args, **kwargs) -> None:
+        captured["timeout"] = kwargs["timeout"]
         raise TimeoutError("timed out writing prompt to Claude PTY")
 
     monkeypatch.setattr(runner, "_send_prompt", fail_send_prompt)
@@ -653,3 +779,4 @@ time.sleep(30)
     assert result.success is False
     assert result.transient is True
     assert result.summary == "Failed to write prompt: timed out writing prompt to Claude PTY"
+    assert 0 < captured["timeout"] <= 3
