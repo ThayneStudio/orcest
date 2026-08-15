@@ -152,17 +152,20 @@ class RedisClient:
                 instead of new ones. Uses ID ``"0"`` instead of ``">"``.
         """
         entry_id = "0" if pending else ">"
-        result = self._client.xreadgroup(
-            groupname=group,
-            consumername=consumer,
-            streams={self._prefixed(stream): entry_id},
-            count=count,
-            block=block_ms,
+        result = cast(
+            list[tuple[str, list[tuple[str, dict[str, str]]]]],
+            self._client.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={self._prefixed(stream): entry_id},
+                count=count,
+                block=block_ms,
+            ),
         )
         if not result:
             return []
         # result shape: [[stream_name, [(id, fields), ...]]]
-        return result[0][1]  # type: ignore[index]
+        return result[0][1]
 
     def xreadgroup_multi(
         self,
@@ -195,17 +198,20 @@ class RedisClient:
         """
         if not streams:
             return []
-        result = self._client.xreadgroup(
-            groupname=group,
-            consumername=consumer,
-            streams=streams,  # type: ignore[arg-type]
-            count=count,
-            block=block,
+        result = cast(
+            list[tuple[str, list[tuple[str, dict[str, str]]]]],
+            self._client.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams=streams,  # type: ignore[arg-type]
+                count=count,
+                block=block,
+            ),
         )
         if not result:
             return []
         entries: list[tuple[str, str, dict[str, str]]] = []
-        for stream_name, stream_entries in result:  # type: ignore[union-attr]
+        for stream_name, stream_entries in result:
             for entry_id, fields in stream_entries:
                 entries.append((stream_name, entry_id, fields))
         return entries
@@ -255,7 +261,14 @@ class RedisClient:
         if count < 1:
             raise ValueError(f"count must be positive, got {count}")
         try:
-            result = self._client.xread({self._prefixed(stream): last_id}, count=count, block=None)
+            result = cast(
+                list[tuple[str, list[tuple[str, dict[str, str]]]]],
+                self._client.xread(
+                    {self._prefixed(stream): last_id},
+                    count=count,
+                    block=None,
+                ),
+            )
         except (
             redis.ConnectionError,
             redis.TimeoutError,
@@ -271,7 +284,7 @@ class RedisClient:
             return []
         if not result:
             return []
-        return result[0][1]  # type: ignore[index]
+        return result[0][1]
 
     def stream_unread_count(self, stream: str, group: str) -> int:
         """Get the number of stream entries not yet delivered to any consumer.
