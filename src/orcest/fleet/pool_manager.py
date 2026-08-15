@@ -304,8 +304,7 @@ class PoolManager:
                 pending_consumers, pending_complete = self._consumers_with_pending_status()
                 if not pending_complete:
                     logger.warning(
-                        "Leaving drained VM %d stopped: post-stop pending-state "
-                        "inspection failed",
+                        "Leaving drained VM %d stopped: post-stop pending-state inspection failed",
                         vm_id,
                     )
                     self._restore_worker_after_failed_drain(

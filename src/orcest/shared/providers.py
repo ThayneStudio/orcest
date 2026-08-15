@@ -55,9 +55,7 @@ class ProviderEntry:
             "claude": "CLAUDE_CODE_OAUTH_TOKEN",
             "clauder": "CLAUDE_CODE_OAUTH_TOKEN",
             "grok": "XAI_API_KEY",
-        }.get(
-            self.provider, f"{self.provider.upper()}_TOKEN"
-        )
+        }.get(self.provider, f"{self.provider.upper()}_TOKEN")
 
     def _credential_hash(self) -> str:
         return hashlib.sha256(self.credential.encode()).hexdigest()[:12]

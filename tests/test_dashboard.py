@@ -672,9 +672,7 @@ class TestDashboardAuthFailsClosed:
         assert "127.0.0.1:8080:8080" in text, (
             "dashboard port must bind to loopback (127.0.0.1:8080:8080)"
         )
-        assert '"8080:8080"' not in text, (
-            "dashboard port must not be published on all interfaces"
-        )
+        assert '"8080:8080"' not in text, "dashboard port must not be published on all interfaces"
 
     def test_compose_requires_dashboard_token(self):
         """Direct docker compose usage must fail before starting a tokenless
@@ -700,7 +698,7 @@ class TestDashboardAuthFailsClosed:
         assert 'set -- "$$@" --env-file "$(DASHBOARD_ENV)"' in text
         assert "DASHBOARD_TOKEN" in text
         assert "dashboard/scripts/deploy-compose-dashboard.sh" in text
-        assert "DASHBOARD_ENV_FILE=\"$$published_env_file\"" in text
+        assert 'DASHBOARD_ENV_FILE="$$published_env_file"' in text
         assert "DASHBOARD_REMOTE_COMPOSE" in text
         assert "/api/ready" in text
         assert "DASHBOARD_AUDIT_LEVEL ?= moderate" in text
@@ -734,50 +732,65 @@ class TestDashboardAuthFailsClosed:
         deploy_script = self._repo_root() / "dashboard" / "scripts" / "deploy-compose-dashboard.sh"
         asset_script = self._repo_root() / "dashboard" / "scripts" / "list-published-assets.sh"
 
-        assert "ls -1 dist/assets/index-*.js dist/assets/index-*.css' | tr" not in makefile.read_text()
+        assert (
+            "ls -1 dist/assets/index-*.js dist/assets/index-*.css' | tr" not in makefile.read_text()
+        )
         assert "deploy-compose-dashboard.sh $compose" in smoke_compose.read_text()
         deploy_text = deploy_script.read_text()
         assert 'dashboard_image="${DASHBOARD_IMAGE:-orcest-dashboard:latest}"' in deploy_text
         assert 'dashboard_image="$(env_file_value DASHBOARD_IMAGE)"' in deploy_text
-        assert 'rollback_image="${DASHBOARD_ROLLBACK_IMAGE:-orcest-dashboard:rollback-$$}"' in deploy_text
-        assert 'deploy_lock_dir="${DASHBOARD_DEPLOY_LOCK_DIR:-.dashboard-deploy.lock}"' in deploy_text
+        assert (
+            'rollback_image="${DASHBOARD_ROLLBACK_IMAGE:-orcest-dashboard:rollback-$$}"'
+            in deploy_text
+        )
+        assert (
+            'deploy_lock_dir="${DASHBOARD_DEPLOY_LOCK_DIR:-.dashboard-deploy.lock}"' in deploy_text
+        )
         assert 'deploy_lock_held="${DASHBOARD_DEPLOY_LOCK_HELD:-0}"' in deploy_text
         assert "acquire_deploy_lock()" in deploy_text
         assert 'acquire_deploy_lock "$@"' in deploy_text
-        assert deploy_text.index('acquire_deploy_lock "$@"') < deploy_text.index('previous_container=')
-        assert 'DASHBOARD_DEPLOY_LOCK_HELD=1 but dashboard deploy lock is missing' in deploy_text
+        assert deploy_text.index('acquire_deploy_lock "$@"') < deploy_text.index(
+            "previous_container="
+        )
+        assert "DASHBOARD_DEPLOY_LOCK_HELD=1 but dashboard deploy lock is missing" in deploy_text
         assert "release_deploy_lock()" in deploy_text
         assert "handle_signal()" in deploy_text
         assert "Dashboard deploy interrupted after candidate start; rolling back" in deploy_text
         assert 'docker tag "$previous_image_id" "$rollback_image"' in deploy_text
-        assert 'restorable_image_name()' in deploy_text
-        assert 'restore_rollback_image_tag()' in deploy_text
-        assert 'restore_previous_image_tag()' in deploy_text
+        assert "restorable_image_name()" in deploy_text
+        assert "restore_rollback_image_tag()" in deploy_text
+        assert "restore_previous_image_tag()" in deploy_text
         assert 'DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard' in deploy_text
         assert '"$@" images -q dashboard' not in deploy_text
         assert 'candidate_image="$dashboard_image"' in deploy_text
-        assert 'docker image inspect -f \'{{.Id}}\' "$candidate_image"' in deploy_text
+        assert "docker image inspect -f '{{.Id}}' \"$candidate_image\"" in deploy_text
         assert 'check_candidate_bundle_runtime "$candidate_image"' in deploy_text
         assert 'collect_candidate_assets "$candidate_image"' in deploy_text
         assert "candidate_may_be_live=1" in deploy_text
         assert '"$@" up -d --no-build --force-recreate dashboard' in deploy_text
         assert 'rollback_compose_image="$rollback_image"' in deploy_text
-        assert 'restore_previous_image_tag' in deploy_text
+        assert "restore_previous_image_tag" in deploy_text
         assert 'restore_rollback_image_tag "$previous_image_name"' in deploy_text
         assert 'rollback_compose_image="$dashboard_image"' in deploy_text
         assert 'rollback_compose_image="$previous_image_name"' in deploy_text
-        assert 'DASHBOARD_IMAGE="$rollback_compose_image" "$@" up -d --no-build --force-recreate dashboard' in deploy_text
-        assert 'running_image_id' in deploy_text
-        assert 'did not match candidate image' in deploy_text
+        assert (
+            'DASHBOARD_IMAGE="$rollback_compose_image" "$@" up -d --no-build '
+            "--force-recreate dashboard" in deploy_text
+        )
+        assert "running_image_id" in deploy_text
+        assert "did not match candidate image" in deploy_text
         assert 'rollback_dashboard "$@" || true' in deploy_text
         assert 'check_bundle_runtime "$@"' in deploy_text
-        assert 'node scripts/check-bundle-runtime.mjs' in deploy_text
-        assert 'Dashboard bundle runtime check failed' in deploy_text
+        assert "node scripts/check-bundle-runtime.mjs" in deploy_text
+        assert "Dashboard bundle runtime check failed" in deploy_text
         assert "published_dashboard_network()" in deploy_text
         assert "printf 'container:%s\\n' \"$container\"" in deploy_text
         assert 'DASHBOARD_PUBLISHED_DOCKER_NETWORK="$published_network"' in deploy_text
         assert "DASHBOARD_VERIFY_HOST_PUBLISHED" in deploy_text
-        assert 'host_published_network="${DASHBOARD_HOST_PUBLISHED_DOCKER_NETWORK:-host}"' in deploy_text
+        assert (
+            'host_published_network="${DASHBOARD_HOST_PUBLISHED_DOCKER_NETWORK:-host}"'
+            in deploy_text
+        )
         assert 'if truthy "$verify_host_published"; then' in deploy_text
         assert 'DASHBOARD_PUBLISHED_DOCKER_NETWORK="$host_published_network"' in deploy_text
         assert "sh dashboard/scripts/check-published.sh || return $?" in deploy_text
@@ -793,7 +806,7 @@ class TestDashboardAuthFailsClosed:
         assert 'compose_file="$(mktemp)"' in smoke_text
         assert '-f "$compose_file"' in smoke_text
         assert 'context: "$repo_root/dashboard"' in smoke_text
-        assert '-f docker-compose.dashboard.yml -f' not in smoke_text
+        assert "-f docker-compose.dashboard.yml -f" not in smoke_text
         assert "image: $smoke_image" in smoke_text
         assert 'network_name="${DASHBOARD_SMOKE_NETWORK:-${project}-network}"' in smoke_text
         assert "ORCEST_DOCKER_NETWORK=$network_name" in smoke_text
@@ -813,8 +826,8 @@ class TestDashboardAuthFailsClosed:
         smoke_image = self._repo_root() / "dashboard" / "scripts" / "smoke-image.sh"
         assert "node scripts/check-bundle-runtime.mjs" in smoke_image.read_text()
         asset_text = asset_script.read_text()
-        assert 'exec -T dashboard sh -lc' in asset_text
-        assert 'tr \'\\n\' \' \' <"$asset_file"' in asset_text
+        assert "exec -T dashboard sh -lc" in asset_text
+        assert "tr '\\n' ' ' <\"$asset_file\"" in asset_text
 
     def test_dashboard_deploy_refuses_concurrent_lock(self, tmp_path):
         """Concurrent dashboard deploys must not race image tags or rollback
@@ -883,12 +896,12 @@ case "$1" in
   ps)
     exit 0
     ;;
-	  build)
-	    exit 0
-	    ;;
-	  up)
-	    echo "live service should not be started before candidate validation" >&2
-	    exit 99
+    build)
+      exit 0
+      ;;
+    up)
+      echo "live service should not be started before candidate validation" >&2
+      exit 99
     ;;
 esac
 exit 1
@@ -902,14 +915,14 @@ exit 1
         docker.write_text(
             """#!/usr/bin/env sh
 set -eu
-	printf '%s\\n' "$*" >> "$DOCKER_CALLS"
-	if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-	  printf '%s\\n' sha256:candidate
-	  exit 0
-	fi
-	if [ "${1:-}" = "run" ]; then
-	  exit 1
-	fi
+  printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+  if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+    printf '%s\\n' sha256:candidate
+    exit 0
+  fi
+  if [ "${1:-}" = "run" ]; then
+    exit 1
+  fi
 exit 0
 """
         )
@@ -948,7 +961,9 @@ exit 0
         assert "up " not in calls.read_text()
         docker_text = docker_calls.read_text()
         assert "image inspect -f {{.Id}} orcest-dashboard:latest" in docker_text
-        assert "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        assert (
+            "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        )
         assert "image rm orcest-dashboard:latest" in docker_text
         assert not lock_dir.exists()
 
@@ -970,12 +985,12 @@ case "$1" in
     printf '%s\n' previous-container
     exit 0
     ;;
-	  build)
-	    exit 0
-	    ;;
-	  up)
-	    exit 1
-	    ;;
+    build)
+      exit 0
+      ;;
+    up)
+      exit 1
+      ;;
   logs|rm)
     exit 0
     ;;
@@ -1004,21 +1019,22 @@ case "$1" in
     esac
     exit 0
     ;;
-	  image)
-	    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ] && [ "${5:-}" = "orcest-dashboard:latest" ]; then
-	      printf '%s\\n' sha256:candidate
-	      exit 0
-	    fi
-	    ;;
-	  run)
-	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
-	      exit 0
-	    fi
-	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
-	      printf '%s\\n' dist/assets/index-candidate.js dist/assets/index-candidate.css
-	      exit 0
-	    fi
-	    ;;
+    image)
+      if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ] &&
+        [ "${5:-}" = "orcest-dashboard:latest" ]; then
+        printf '%s\\n' sha256:candidate
+        exit 0
+      fi
+      ;;
+    run)
+      if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+        exit 0
+      fi
+      if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+        printf '%s\\n' dist/assets/index-candidate.js dist/assets/index-candidate.css
+        exit 0
+      fi
+      ;;
   tag)
     exit 0
     ;;
@@ -1052,10 +1068,14 @@ exit 1
         assert "up -d --no-build --force-recreate dashboard" in calls_text
         docker_text = docker_calls.read_text()
         assert "image inspect -f {{.Id}} orcest-dashboard:latest" in docker_text
-        assert "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        assert (
+            "run --rm orcest-dashboard:latest node scripts/check-bundle-runtime.mjs" in docker_text
+        )
         assert "run --rm orcest-dashboard:latest sh -lc" in docker_text
         assert "image inspect custom-previous:old" not in docker_text
-        assert "run --rm custom-previous:old node scripts/check-bundle-runtime.mjs" not in docker_text
+        assert (
+            "run --rm custom-previous:old node scripts/check-bundle-runtime.mjs" not in docker_text
+        )
         assert "tag sha256:previous orcest-dashboard:rollback-" in docker_text
         assert "up -d --no-build --force-recreate dashboard" in calls_text
 
@@ -1145,14 +1165,19 @@ exit 1
         package = json.loads((repo_root / "dashboard" / "package.json").read_text())
         package_lock = json.loads((repo_root / "dashboard" / "package-lock.json").read_text())
         dockerfile = (repo_root / "dashboard" / "Dockerfile").read_text()
-        runtime_script = (repo_root / "dashboard" / "scripts" / "check-bundle-runtime.mjs").read_text()
+        runtime_script = (
+            repo_root / "dashboard" / "scripts" / "check-bundle-runtime.mjs"
+        ).read_text()
 
         assert package["scripts"]["check:bundle-runtime"] == "node scripts/check-bundle-runtime.mjs"
         assert "happy-dom" in package["dependencies"]
         assert "happy-dom" not in package["devDependencies"]
         assert "happy-dom" in package_lock["packages"][""]["dependencies"]
         assert "dev" not in package_lock["packages"]["node_modules/happy-dom"]
-        assert "COPY --from=builder /app/scripts/check-bundle-runtime.mjs ./scripts/check-bundle-runtime.mjs" in dockerfile
+        assert (
+            "COPY --from=builder /app/scripts/check-bundle-runtime.mjs "
+            "./scripts/check-bundle-runtime.mjs" in dockerfile
+        )
         assert "new Window" in runtime_script
         assert "class SmokeWebSocket" in runtime_script
         assert "Dashboard bundle runtime verified" in runtime_script
@@ -1164,23 +1189,23 @@ exit 1
         compose = tmp_path / "compose"
         compose.write_text(
             """#!/usr/bin/env sh
-	set -eu
-	printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
-	printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
-	case "$1" in
-	  ps)
-	    if [ -f "$COMPOSE_CALLS.up" ]; then
-	      printf '%s\\n' candidate-container
-	    fi
-	    exit 0
-	    ;;
-	  build)
-	    exit 0
-	    ;;
-	  up)
-	    : > "$COMPOSE_CALLS.up"
-	    exit 0
-	    ;;
+  set -eu
+  printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+  printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+  case "$1" in
+    ps)
+      if [ -f "$COMPOSE_CALLS.up" ]; then
+        printf '%s\\n' candidate-container
+      fi
+      exit 0
+      ;;
+    build)
+      exit 0
+      ;;
+    up)
+      : > "$COMPOSE_CALLS.up"
+      exit 0
+      ;;
   exec)
     printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
     exit 0
@@ -1200,22 +1225,22 @@ exit 1
         docker.write_text(
             """#!/usr/bin/env sh
 set -eu
-	if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-	  printf '%s\\n' sha256:candidate
-	  exit 0
-	fi
-	if [ "${1:-}" = "inspect" ] && [ "${3:-}" = "{{.Image}}" ]; then
-	  printf '%s\\n' sha256:candidate
-	  exit 0
-	fi
-	if [ "${1:-}" = "run" ]; then
-	  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
-	    exit 0
-	  fi
-	  if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
-	    printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
-	    exit 0
-	  fi
+  if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+    printf '%s\\n' sha256:candidate
+    exit 0
+  fi
+  if [ "${1:-}" = "inspect" ] && [ "${3:-}" = "{{.Image}}" ]; then
+    printf '%s\\n' sha256:candidate
+    exit 0
+  fi
+  if [ "${1:-}" = "run" ]; then
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+      exit 0
+    fi
+    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+      printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+      exit 0
+    fi
   exit 1
 fi
 exit 0
@@ -1320,7 +1345,8 @@ case "$1" in
     [ "${2:-}" = "rm" ] && exit 0
     ;;
   inspect)
-    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
+    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] &&
+      [ "${4:-}" = "candidate-container" ]; then
       printf '%s\\n' sha256:candidate
       exit 0
     fi
@@ -1393,27 +1419,27 @@ exit 1
         compose = tmp_path / "compose"
         compose.write_text(
             """#!/usr/bin/env sh
-	set -eu
-	printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
-	printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
-	case "$1" in
-	  ps)
-	    if [ -f "$COMPOSE_CALLS.candidate" ]; then
-	      printf '%s\\n' candidate-container
-	    else
-	      printf '%s\\n' previous-container
-	    fi
-	    exit 0
-	    ;;
-	  build)
-	    exit 0
-	    ;;
-	  up|logs)
-	    if [ "$1" = "up" ]; then
-	      : > "$COMPOSE_CALLS.candidate"
-	    fi
-	    exit 0
-	    ;;
+  set -eu
+  printf '%s\\n' "$*" >> "$COMPOSE_CALLS"
+  printf 'DASHBOARD_IMAGE=%s\\n' "${DASHBOARD_IMAGE:-}" >> "$COMPOSE_CALLS"
+  case "$1" in
+    ps)
+      if [ -f "$COMPOSE_CALLS.candidate" ]; then
+        printf '%s\\n' candidate-container
+      else
+        printf '%s\\n' previous-container
+      fi
+      exit 0
+      ;;
+    build)
+      exit 0
+      ;;
+    up|logs)
+      if [ "$1" = "up" ]; then
+        : > "$COMPOSE_CALLS.candidate"
+      fi
+      exit 0
+      ;;
   exec)
     exit 1
     ;;
@@ -1431,21 +1457,22 @@ exit 1
 set -eu
 printf '%s\\n' "$*" >> "$DOCKER_CALLS"
 case "$1" in
-	  image)
-	    if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ]; then
-	      printf '%s\\n' sha256:candidate
-	      exit 0
-	    fi
-	    [ "${2:-}" = "inspect" ] && exit 0
-	    ;;
-	  inspect)
-	    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
-	      printf '%s\\n' sha256:candidate
-	      exit 0
-	    fi
-	    case "$3" in
-	      "{{.Image}}")
-	        printf '%s\\n' sha256:previous
+    image)
+      if [ "${2:-}" = "inspect" ] && [ "${3:-}" = "-f" ]; then
+        printf '%s\\n' sha256:candidate
+        exit 0
+      fi
+      [ "${2:-}" = "inspect" ] && exit 0
+      ;;
+    inspect)
+      if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] &&
+        [ "${4:-}" = "candidate-container" ]; then
+        printf '%s\\n' sha256:candidate
+        exit 0
+      fi
+      case "$3" in
+        "{{.Image}}")
+          printf '%s\\n' sha256:previous
         ;;
       "{{.Config.Image}}")
         printf '%s\\n' orcest-dashboard:latest
@@ -1453,22 +1480,22 @@ case "$1" in
     esac
     exit 0
     ;;
-	  tag)
-	    exit 0
-	    ;;
-	  run)
-	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
-	      exit 0
-	    fi
-	    if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
-	      printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
-	      exit 0
-	    fi
-	    if [ "${3:-}" = "fake-node" ]; then
-	      exit 0
-	    fi
-	    exit 0
-	    ;;
+    tag)
+      exit 0
+      ;;
+    run)
+      if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "node" ]; then
+        exit 0
+      fi
+      if [ "${3:-}" = "orcest-dashboard:latest" ] && [ "${4:-}" = "sh" ]; then
+        printf '%s\\n' dist/assets/index-new.js dist/assets/index-new.css
+        exit 0
+      fi
+      if [ "${3:-}" = "fake-node" ]; then
+        exit 0
+      fi
+      exit 0
+      ;;
 esac
 exit 1
 """
@@ -1566,7 +1593,8 @@ case "$1" in
     [ "${2:-}" = "rm" ] && exit 0
     ;;
   inspect)
-    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] && [ "${4:-}" = "candidate-container" ]; then
+    if [ "${2:-}" = "-f" ] && [ "${3:-}" = "{{.Image}}" ] &&
+      [ "${4:-}" = "candidate-container" ]; then
       printf '%s\\n' sha256:candidate
       exit 0
     fi
@@ -1636,15 +1664,15 @@ exit 1
         assert 'allow_degraded="${DASHBOARD_ALLOW_DEGRADED:-0}"' not in text
         assert 'allow_degraded="$(env_file_value DASHBOARD_ALLOW_DEGRADED)"' in text
         assert 'strict_degraded="$(env_file_value DASHBOARD_STRICT_DEGRADED)"' in text
-        assert 'DASHBOARD_ALLOW_DEGRADED=$allow_degraded' in text
-        assert 'DASHBOARD_STRICT_DEGRADED=$strict_degraded' in text
+        assert "DASHBOARD_ALLOW_DEGRADED=$allow_degraded" in text
+        assert "DASHBOARD_STRICT_DEGRADED=$strict_degraded" in text
         assert '-e DASHBOARD_ALLOW_DEGRADED="$allow_degraded"' not in text
-        assert 'message.snapshot.redis_ok !== true' in text
-        assert 'snapshot websocket reported Redis unavailable' in text
-        assert 'message.snapshot.degraded_sections' in text
-        assert 'strictDegraded && !allowDegraded' in text
-        assert 'Warning: ${degradedMessage}' in text
-        assert 'snapshot reported degraded sections' in text
+        assert "message.snapshot.redis_ok !== true" in text
+        assert "snapshot websocket reported Redis unavailable" in text
+        assert "message.snapshot.degraded_sections" in text
+        assert "strictDegraded && !allowDegraded" in text
+        assert "Warning: ${degradedMessage}" in text
+        assert "snapshot reported degraded sections" in text
 
     def test_published_readiness_requires_expected_assets_by_default(self):
         """Standalone published readiness must not silently downgrade to a
@@ -1653,18 +1681,18 @@ exit 1
         text = check_script.read_text()
         assert 'allow_unpinned_assets="${DASHBOARD_ALLOW_UNPINNED_ASSETS:-0}"' not in text
         assert 'allow_unpinned_assets="$(env_file_value DASHBOARD_ALLOW_UNPINNED_ASSETS)"' in text
-        assert 'DASHBOARD_ALLOW_UNPINNED_ASSETS=$allow_unpinned_assets' in text
+        assert "DASHBOARD_ALLOW_UNPINNED_ASSETS=$allow_unpinned_assets" in text
         assert '-e DASHBOARD_ALLOW_UNPINNED_ASSETS="$allow_unpinned_assets"' not in text
-        assert 'const allowUnpinnedAssets = ' in text
-        assert 'if (allowUnpinnedAssets) return;' in text
-        assert 'DASHBOARD_EXPECTED_ASSETS must include a ${kind} asset' in text
-        assert 'DASHBOARD_ALLOW_UNPINNED_ASSETS=1 for readiness-only checks' in text
-        assert 'await expectStatus(jsPath, 401);' in text
-        assert 'await expectStatus(cssPath, 401);' in text
+        assert "const allowUnpinnedAssets = " in text
+        assert "if (allowUnpinnedAssets) return;" in text
+        assert "DASHBOARD_EXPECTED_ASSETS must include a ${kind} asset" in text
+        assert "DASHBOARD_ALLOW_UNPINNED_ASSETS=1 for readiness-only checks" in text
+        assert "await expectStatus(jsPath, 401);" in text
+        assert "await expectStatus(cssPath, 401);" in text
         assert 'const deepLinkPath = "/work/results";' in text
         assert 'assetPathsFromHtml(deepLinkText, ".js", deepLinkPath)' in text
         assert 'fetchAsset(deepLinkJsPath, deepLinkPath, cookieHeaders, "javascript", "JS")' in text
-        assert 'dashboard deep-link HTML did not reference both JS and CSS assets' in text
+        assert "dashboard deep-link HTML did not reference both JS and CSS assets" in text
 
     def test_published_readiness_env_file_knobs_are_not_clobbered_by_defaults(self):
         """Env-file readiness knobs should survive unless the caller
@@ -1675,11 +1703,14 @@ exit 1
         assert 'interval_ms="${DASHBOARD_READY_INTERVAL_MS:-1000}"' not in text
         assert 'ready_attempts="$(env_file_value DASHBOARD_READY_ATTEMPTS)"' in text
         assert 'ready_interval_ms="$(env_file_value DASHBOARD_READY_INTERVAL_MS)"' in text
-        assert 'published_docker_network="$(env_file_value DASHBOARD_PUBLISHED_DOCKER_NETWORK)"' in text
+        assert (
+            'published_docker_network="$(env_file_value DASHBOARD_PUBLISHED_DOCKER_NETWORK)"'
+            in text
+        )
         assert 'published_docker_network="${published_docker_network:-host}"' in text
         assert 'set -- "$@" --network "$published_docker_network"' in text
-        assert 'DASHBOARD_READY_ATTEMPTS=$ready_attempts' in text
-        assert 'DASHBOARD_READY_INTERVAL_MS=$ready_interval_ms' in text
+        assert "DASHBOARD_READY_ATTEMPTS=$ready_attempts" in text
+        assert "DASHBOARD_READY_INTERVAL_MS=$ready_interval_ms" in text
         assert '-e DASHBOARD_READY_ATTEMPTS="$attempts"' not in text
         assert '-e DASHBOARD_READY_INTERVAL_MS="$interval_ms"' not in text
 
@@ -1688,16 +1719,18 @@ exit 1
         passing env-file values into the Docker smoke container."""
         env_file = tmp_path / ".dashboard.env"
         env_file.write_text(
-            "\n".join([
-                'DASHBOARD_TOKEN="secret-token" # comment',
-                "DASHBOARD_READY_ATTEMPTS = '2' # comment",
-                "DASHBOARD_READY_INTERVAL_MS=250 # comment",
-                'DASHBOARD_ALLOW_DEGRADED="true" # comment',
-                "DASHBOARD_STRICT_DEGRADED='1' # comment",
-                "DASHBOARD_ALLOW_UNPINNED_ASSETS='1' # comment",
-                "DASHBOARD_PUBLISHED_DOCKER_NETWORK='container:dashboard-1' # comment",
-                "",
-            ])
+            "\n".join(
+                [
+                    'DASHBOARD_TOKEN="secret-token" # comment',
+                    "DASHBOARD_READY_ATTEMPTS = '2' # comment",
+                    "DASHBOARD_READY_INTERVAL_MS=250 # comment",
+                    'DASHBOARD_ALLOW_DEGRADED="true" # comment',
+                    "DASHBOARD_STRICT_DEGRADED='1' # comment",
+                    "DASHBOARD_ALLOW_UNPINNED_ASSETS='1' # comment",
+                    "DASHBOARD_PUBLISHED_DOCKER_NETWORK='container:dashboard-1' # comment",
+                    "",
+                ]
+            )
         )
         docker_calls = tmp_path / "docker-calls.log"
         fake_bin = tmp_path / "bin"
@@ -1864,8 +1897,7 @@ exit 0
             combined_output = result.stdout + result.stderr
             normalized_root = unsafe_root.rstrip("/")
             assert (
-                f"Refusing unsafe DASHBOARD_REMOTE_ORCEST_DIR={normalized_root}"
-                in combined_output
+                f"Refusing unsafe DASHBOARD_REMOTE_ORCEST_DIR={normalized_root}" in combined_output
             )
             assert "dashboard.example.invalid sh" not in combined_output
 
@@ -1890,7 +1922,7 @@ exit 0
         assert "$(DASHBOARD_REMOTE_EXEC) sh -eu" in text
         assert 'test ! -L "$$orcest_dir" && test ! -L "$$remote_dir"' in text
         assert "Remote dashboard directories must not be symlinks" in text
-        assert 'pwd -P' in text
+        assert "pwd -P" in text
         assert "Remote dashboard directories must resolve to configured paths" in text
 
     def test_remote_sync_inspects_configured_docker_network(self):
@@ -1987,7 +2019,10 @@ exit 0
         text = makefile.read_text()
         assert "DASHBOARD_NPM_ENV =" in text
         assert "NPM_CONFIG_UPDATE_NOTIFIER=false" in text
-        assert 'docker run --rm -i -e HOME=/tmp $(DASHBOARD_NPM_ENV) -w /app $(DASHBOARD_NODE_IMAGE)' in text
+        assert (
+            "docker run --rm -i -e HOME=/tmp $(DASHBOARD_NPM_ENV) -w /app $(DASHBOARD_NODE_IMAGE)"
+            in text
+        )
         assert "tar -C /app -xf - && $(1)" in text
         assert '-v "$$tmpdir:/app"' not in text
 
@@ -2076,9 +2111,7 @@ exit 0
         ignored_file.write_text("ignored but copied\n")
 
         try:
-            result = self._run_dashboard_guard(
-                env={"GIT_CONFIG_GLOBAL": str(gitconfig)}
-            )
+            result = self._run_dashboard_guard(env={"GIT_CONFIG_GLOBAL": str(gitconfig)})
         finally:
             ignored_file.unlink(missing_ok=True)
 

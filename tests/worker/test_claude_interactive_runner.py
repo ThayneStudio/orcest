@@ -95,9 +95,12 @@ def test_main_input_prompt_detector_rejects_setup_menus() -> None:
     runner = ClaudeInteractiveRunner()
 
     assert runner._looks_like_main_input_prompt("Claude Code\n❯ ") is True
-    assert runner._looks_like_main_input_prompt(
-        "Quick safety check\n> 1. Yes, I trust this folder\nEnter to confirm"
-    ) is False
+    assert (
+        runner._looks_like_main_input_prompt(
+            "Quick safety check\n> 1. Yes, I trust this folder\nEnter to confirm"
+        )
+        is False
+    )
 
 
 def test_run_provides_controlling_tty_and_reads_result(tmp_path, monkeypatch) -> None:
@@ -333,9 +336,7 @@ raise SystemExit(1)
     assert result.summary == "delayed trust prompt confirmed"
 
 
-def test_run_waits_for_main_prompt_across_sequential_setup_menus(
-    tmp_path, monkeypatch
-) -> None:
+def test_run_waits_for_main_prompt_across_sequential_setup_menus(tmp_path, monkeypatch) -> None:
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
         """#!/usr/bin/env python3

@@ -380,8 +380,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
-            pl.get("expected_image_gpg_key", "")
-            or "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+            pl.get("expected_image_gpg_key", "") or "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
         ),
     )
     # Surface VMID-range overlap at load time rather than at clone time:

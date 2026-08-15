@@ -903,7 +903,8 @@ class TestExecuteTask:
             maxlen=_STREAM_MAXLEN,
         )
         output_calls = [
-            call for call in mock_redis.xadd_capped.call_args_list
+            call
+            for call in mock_redis.xadd_capped.call_args_list
             if call[0] and call[0][0] == f"output:{local_worker_config.worker_id}"
         ]
         assert output_calls == []
@@ -1161,9 +1162,7 @@ def test_pool_managed_done_handoff_retries_until_redis_accepts(worker_config):
     event = MagicMock()
     event.wait.return_value = False
 
-    assert _signal_ephemeral_done(
-        redis, worker_config, logging.getLogger("test"), event
-    ) is True
+    assert _signal_ephemeral_done(redis, worker_config, logging.getLogger("test"), event) is True
     assert redis.set_value.call_count == 2
     redis.set_ex.assert_not_called()
 
@@ -1673,9 +1672,7 @@ class TestRunWorker:
         # exits before claiming any new work.
         assert drain_call_count == 1
 
-    def test_worker_drain_lease_exits_with_restartable_status(
-        self, mocker, worker_config
-    ):
+    def test_worker_drain_lease_exits_with_restartable_status(self, mocker, worker_config):
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mock_redis.xreadgroup_multi.return_value = []
@@ -2895,9 +2892,7 @@ def test_drain_missing_marker_publishes_recovery_result(local_worker_config):
     )
 
     # Recovery result is the commit point before the PEL entry is ACKed.
-    results_calls = [
-        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
-    ]
+    results_calls = [c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM]
     assert len(results_calls) == 1
     assert TaskResult.from_dict(results_calls[0][0][1]).task_id == task.id
     mock_redis.xack_raw.assert_any_call("tasks:issue:claude", CONSUMER_GROUP, "1-0")
@@ -2958,12 +2953,8 @@ def test_drain_superseded_duplicate_does_not_clear_newer_issue_reservation(local
     )
 
     # No recovery result published (the marker no longer matches the stale task).
-    results_calls = [
-        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
-    ]
-    assert results_calls == [], (
-        "drain published a recovery result for a superseded stale duplicate"
-    )
+    results_calls = [c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM]
+    assert results_calls == [], "drain published a recovery result for a superseded stale duplicate"
     # The orphaned PEL entry must still be ACKed so it is not redelivered.
     mock_redis.xack_raw.assert_any_call("tasks:issue:claude", CONSUMER_GROUP, "1-0")
     # CRITICAL: the suppressed stale duplicate must NOT delete the NEWER task's
@@ -3019,9 +3010,7 @@ def test_drain_publishes_recovery_result_when_marker_still_matches(local_worker_
         logging.getLogger("test"),
     )
 
-    results_calls = [
-        c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
-    ]
+    results_calls = [c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM]
     assert len(results_calls) == 1, "genuine restart recovery result must still be published"
     parsed = TaskResult.from_dict(results_calls[0][0][1])
     assert parsed.status == ResultStatus.FAILED

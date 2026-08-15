@@ -27,9 +27,7 @@ from orcest.worker._runner_base import _build_env, _check_needs_human, _kill_pro
 from orcest.worker.claude_runner import _is_usage_exhausted
 from orcest.worker.runner import RunnerResult, get_provider_recipe
 
-_ANSI_RE = re.compile(
-    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
-)
+_ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _USAGE_ERROR_LINE_RE = re.compile(
     r"^\s*(?:error:|api error:|claude(?: code)? error:|rate limit|usage limit|quota|"
@@ -51,9 +49,7 @@ def _is_interactive_usage_exhausted(
     """
     text = _CONTROL_RE.sub("", _ANSI_RE.sub("", terminal_output)).replace("\r", "\n")
     prompt_lines = {
-        re.sub(r"\s+", " ", line).strip()
-        for line in submitted_prompt.splitlines()
-        if line.strip()
+        re.sub(r"\s+", " ", line).strip() for line in submitted_prompt.splitlines() if line.strip()
     }
 
     def is_prompt_echo(line: str) -> bool:
@@ -65,9 +61,7 @@ def _is_interactive_usage_exhausted(
         return without_prefix in prompt_lines
 
     return any(
-        not is_prompt_echo(line)
-        and _USAGE_ERROR_LINE_RE.search(line)
-        and _is_usage_exhausted(line)
+        not is_prompt_echo(line) and _USAGE_ERROR_LINE_RE.search(line) and _is_usage_exhausted(line)
         for line in text.splitlines()
     )
 
@@ -140,7 +134,7 @@ class ClaudeInteractiveRunner:
                     logger.warning(
                         "on_output callback raised; continuing",
                         exc_info=True,
-            )
+                    )
         return True
 
     def _drain_available_output(
@@ -198,7 +192,7 @@ class ClaudeInteractiveRunner:
                 if not writable:
                     continue
                 try:
-                    chunk = os.write(fd, data[written:written + 65536])
+                    chunk = os.write(fd, data[written : written + 65536])
                 except (BlockingIOError, InterruptedError):
                     continue
                 if chunk <= 0:
@@ -252,10 +246,7 @@ class ClaudeInteractiveRunner:
             or "newmcpserverfound" in normalized
             or "newmcpserversfound" in normalized
         )
-        has_use_option = (
-            "usethismcpserver" in normalized
-            or "usethesemcpservers" in normalized
-        )
+        has_use_option = "usethismcpserver" in normalized or "usethesemcpservers" in normalized
         has_decline_option = (
             "continuewithoutusingthismcpserver" in normalized
             or "continuewithoutusingthesemcpservers" in normalized
@@ -411,9 +402,7 @@ class ClaudeInteractiveRunner:
                 prompt_sent = False
                 setup_output_index = 0
                 start: float | None = None
-                startup_deadline = time.monotonic() + max(
-                    10.0, min(float(timeout), 120.0)
-                )
+                startup_deadline = time.monotonic() + max(10.0, min(float(timeout), 120.0))
 
                 while True:
                     summary = self._read_result(result_path)

@@ -80,9 +80,7 @@ class ProviderPool:
         # every model-entry that shares its credential. See ProviderEntry.account_key.
         self._cooldowns: dict[str, datetime] = {}  # account_key -> UTC expiry
         self._task_identities: dict[str, str] = {}  # task_id -> identity
-        self._identity_to_entry: dict[str, ProviderEntry] = {
-            e.identity(): e for e in self._entries
-        }
+        self._identity_to_entry: dict[str, ProviderEntry] = {e.identity(): e for e in self._entries}
         self._identity_to_account: dict[str, str] = {
             e.identity(): e.account_key() for e in self._entries
         }

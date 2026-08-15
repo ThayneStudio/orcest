@@ -550,11 +550,14 @@ def test_apply_credential_update_for_account_rejects_unknown_account():
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])
 
-    assert pool.apply_credential_update_for_account(
-        "grok:unknown-account",
-        '{"access_token":"new-access","refresh_token":"new-refresh"}',
-        minted_at=100.0,
-    ) is None
+    assert (
+        pool.apply_credential_update_for_account(
+            "grok:unknown-account",
+            '{"access_token":"new-access","refresh_token":"new-refresh"}',
+            minted_at=100.0,
+        )
+        is None
+    )
     assert pool.effective_credential(entry) == "orig"
 
 

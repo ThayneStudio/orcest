@@ -672,9 +672,7 @@ def test_task_key_prefix_null_falls_back_to_redis_key_prefix(tmp_path: Path):
     """
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "redis:\n  key_prefix: myproj\n"
-        "task_key_prefix: null\n"
+        "github:\n  repo: acme/widgets\nredis:\n  key_prefix: myproj\ntask_key_prefix: null\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -688,9 +686,7 @@ def test_task_key_prefix_empty_string_falls_back_to_redis_key_prefix(tmp_path: P
     back to redis.key_prefix (unchanged behavior)."""
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "redis:\n  key_prefix: myproj\n"
-        'task_key_prefix: ""\n'
+        'github:\n  repo: acme/widgets\nredis:\n  key_prefix: myproj\ntask_key_prefix: ""\n'
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -717,9 +713,7 @@ def test_task_key_prefix_env_overrides_yaml(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("ORCEST_TASK_KEY_PREFIX", "env-tasks")
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "redis:\n  key_prefix: myproj\n"
-        "task_key_prefix: yaml-tasks\n"
+        "github:\n  repo: acme/widgets\nredis:\n  key_prefix: myproj\ntask_key_prefix: yaml-tasks\n"
     )
 
     config = load_orchestrator_config(cfg_file)
@@ -1128,11 +1122,7 @@ def test_load_orchestrator_config_clauder_provider_prefers_generated_env(
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "legacy-claude-env")
 
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "github:\n  repo: acme/widgets\n"
-        "providers:\n"
-        "  - provider: clauder\n"
-    )
+    cfg_file.write_text("github:\n  repo: acme/widgets\nproviders:\n  - provider: clauder\n")
 
     config = load_orchestrator_config(cfg_file)
 

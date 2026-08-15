@@ -190,17 +190,11 @@ def test_onboard_passes_pool_backend_as_generated_default_runner(runner, cfg_pat
     assert gen_config.call_args.kwargs["default_runner"] == "clauder"
 
 
-def test_onboard_refuses_project_when_deployed_pool_backend_differs(
-    runner, cfg_path, mocker
-):
+def test_onboard_refuses_project_when_deployed_pool_backend_differs(runner, cfg_path, mocker):
     cfg = FleetConfig(
         orchestrator=OrchestratorConfig(host="10.20.0.23"),
         pool=PoolConfig(worker_backend="clauder"),
-        orgs={
-            "ThayneStudio": OrgEntry(
-                github_token="ghp_fake", claude_oauth_tokens=["sk-fake"]
-            )
-        },
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
     )
     _save(cfg, cfg_path)
     mocker.patch(
@@ -209,9 +203,7 @@ def test_onboard_refuses_project_when_deployed_pool_backend_differs(
     )
     write_files = mocker.patch("orcest.fleet.orchestrator.write_project_files")
 
-    result = runner.invoke(
-        fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path]
-    )
+    result = runner.invoke(fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path])
 
     assert result.exit_code != 0
     assert "uncoordinated worker backend change" in result.output
@@ -516,9 +508,7 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     assert data["orchestrator"]["host"] == "10.20.0.99"
 
 
-def test_create_orchestrator_starts_pool_manager_for_template_range_only(
-    runner, cfg_path, mocker
-):
+def test_create_orchestrator_starts_pool_manager_for_template_range_only(runner, cfg_path, mocker):
     cfg = FleetConfig(
         proxmox=ProxmoxConfig(
             endpoint="https://10.20.0.1:8006",

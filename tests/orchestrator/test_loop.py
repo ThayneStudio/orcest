@@ -3878,25 +3878,29 @@ def test_shared_credential_override_rejects_out_of_order_rotation(fake_redis_cli
     shared = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
     logger = logging.getLogger("test")
 
-    assert _persist_credential_override(
-        fake_redis_client,
-        entry.account_key(),
-        "newer",
-        200.0,
-        logger,
-        shared_redis=shared,
-    ) is True
-    assert _persist_credential_override(
-        fake_redis_client,
-        entry.account_key(),
-        "older",
-        100.0,
-        logger,
-        shared_redis=shared,
-    ) is False
-    stored = json.loads(
-        shared.hget(_SHARED_CREDENTIAL_OVERRIDES_KEY, entry.account_key()) or "{}"
+    assert (
+        _persist_credential_override(
+            fake_redis_client,
+            entry.account_key(),
+            "newer",
+            200.0,
+            logger,
+            shared_redis=shared,
+        )
+        is True
     )
+    assert (
+        _persist_credential_override(
+            fake_redis_client,
+            entry.account_key(),
+            "older",
+            100.0,
+            logger,
+            shared_redis=shared,
+        )
+        is False
+    )
+    stored = json.loads(shared.hget(_SHARED_CREDENTIAL_OVERRIDES_KEY, entry.account_key()) or "{}")
     assert stored == {"blob": "newer", "minted_at": 200.0}
 
 
@@ -4166,9 +4170,7 @@ def test_rejected_grok_credential_update_increments_provider_health_counter(
     assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, task_id) is None
 
 
-def test_usage_exhausted_uses_persisted_task_account_after_restart(
-    fake_redis_client, gh_mock
-):
+def test_usage_exhausted_uses_persisted_task_account_after_restart(fake_redis_client, gh_mock):
     import logging
 
     from orcest.orchestrator.provider_pool import ProviderPool
@@ -4231,7 +4233,7 @@ def test_poll_cycle_no_credentials_does_not_publish_credentialless_task(
                 repo="acme/uncredentialed",
                 token="gh-token",
                 claude_tokens=[],  # no claude token
-                providers=[],      # no providers
+                providers=[],  # no providers
                 key_prefix="uncred",
             ),
         ],
@@ -4336,12 +4338,16 @@ def test_busy_project_does_not_permanently_starve_other_project_issue_discovery(
         labels=LabelConfig(),
         projects=[
             ProjectConfig(
-                repo="acme/busy", token="t-busy",
-                claude_tokens=["c-busy"], key_prefix="busy",
+                repo="acme/busy",
+                token="t-busy",
+                claude_tokens=["c-busy"],
+                key_prefix="busy",
             ),
             ProjectConfig(
-                repo="acme/quiet", token="t-quiet",
-                claude_tokens=["c-quiet"], key_prefix="quiet",
+                repo="acme/quiet",
+                token="t-quiet",
+                claude_tokens=["c-quiet"],
+                key_prefix="quiet",
             ),
         ],
     )
@@ -4426,12 +4432,8 @@ def test_distributed_issue_priority_advances_after_lease_expiry(
     _issue_discovery_priority(fake_redis_client, [quiet], 60, logger)
     first = _issue_discovery_priority(fake_redis_client, [busy], 60, logger)
     fake_redis_client.delete(_ISSUE_DISCOVERY_TURN_KEY)
-    second_from_busy = _issue_discovery_priority(
-        fake_redis_client, [busy], 60, logger
-    )
-    second_from_quiet = _issue_discovery_priority(
-        fake_redis_client, [quiet], 60, logger
-    )
+    second_from_busy = _issue_discovery_priority(fake_redis_client, [busy], 60, logger)
+    second_from_quiet = _issue_discovery_priority(fake_redis_client, [quiet], 60, logger)
 
     assert first == "busy"
     assert second_from_busy == second_from_quiet == "quiet"
