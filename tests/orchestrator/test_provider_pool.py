@@ -546,6 +546,17 @@ def test_apply_credential_update_for_account_handles_restarted_task_mapping():
     assert pool.effective_credential(entry) == rotated
 
 
+def test_account_for_credential_keeps_original_anchor_after_rotation():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    rotated = '{"access_token":"new-access","refresh_token":"new-refresh"}'
+    pool.seed_credential_override(entry.account_key(), rotated, minted_at=100.0)
+
+    assert pool.account_for_credential(entry.provider, entry.credential) == entry.account_key()
+    assert pool.account_for_credential(entry.provider, rotated) == entry.account_key()
+    assert pool.account_for_credential(entry.provider, "unknown-rotation") is None
+
+
 def test_apply_credential_update_for_account_rejects_unknown_account():
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])

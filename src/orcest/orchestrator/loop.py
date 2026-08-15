@@ -336,20 +336,137 @@ def _persist_task_provider_account(
     logger: logging.Logger,
 ) -> None:
     """Persist non-secret task -> provider account mapping for restart recovery."""
+    _persist_task_provider_account_key(
+        redis,
+        task_id,
+        entry.account_key(),
+        ttl_seconds,
+        logger,
+    )
+
+
+def _persist_task_provider_account_key(
+    redis: RedisClient,
+    task_id: str,
+    account_key: str,
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> bool:
+    """Persist a validated, non-secret task -> account mapping."""
     try:
         # One expiring key per task makes value+TTL atomic and prevents active
         # projects from extending orphaned mappings in a shared hash forever.
         redis.set_ex(
             f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task_id}",
-            entry.account_key(),
+            account_key,
             ttl=max(1, int(ttl_seconds)),
         )
+        return True
     except Exception:
         logger.debug(
             "Failed to persist provider account mapping for task %s",
             task_id,
             exc_info=True,
         )
+        return False
+
+
+def _backfill_retained_task_provider_accounts(
+    task_redis: RedisClient,
+    task_streams: list[str],
+    project_clients: list[tuple[ProjectConfig, RedisClient]],
+    token_pools: dict[str, ProviderPool],
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> int:
+    """Materialize account mappings for tasks published by older orchestrators.
+
+    Releases before the per-task mapping protocol only retained the provider and
+    credential in the task stream. During a rolling upgrade, scan those retained
+    entries before result consumption or ACK trimming, derive the same non-secret
+    account key used by ProviderPool, validate it against exactly one configured
+    project pool, and persist only that account key.
+
+    Redis scan/read failures propagate so startup fails closed and retries while
+    the old task entries remain available. Malformed, unknown, or ambiguously
+    routed task entries are skipped without persisting a mapping.
+    """
+    routes: dict[tuple[str, str], tuple[RedisClient, ProviderPool]] = {}
+    ambiguous_routes: set[tuple[str, str]] = set()
+    for project, project_redis in project_clients:
+        pool = token_pools.get(project.key_prefix)
+        if pool is None:
+            continue
+        route_key = (project.key_prefix, project.repo)
+        if route_key in routes or route_key in ambiguous_routes:
+            # A duplicate route is ambiguous; fail closed for its tasks.
+            routes.pop(route_key, None)
+            ambiguous_routes.add(route_key)
+            continue
+        routes[route_key] = (project_redis, pool)
+
+    backfilled = 0
+    for stream in dict.fromkeys(task_streams):
+        next_min = "-"
+        while True:
+            entries = task_redis.xrange(stream, min_id=next_min, count=250)
+            if not entries:
+                break
+            for _entry_id, fields in entries:
+                try:
+                    task = Task.from_dict(fields)
+                except (KeyError, TypeError, ValueError):
+                    logger.warning(
+                        "Skipping malformed retained task while backfilling provider accounts"
+                    )
+                    continue
+
+                route = routes.get((task.key_prefix, task.repo))
+                if route is None:
+                    continue
+                project_redis, pool = route
+                credential = task.credential or (
+                    task.claude_token if is_claude_provider(task.provider) else ""
+                )
+                if not credential:
+                    continue
+                if task.provider_account:
+                    account_key = (
+                        task.provider_account if pool.has_account(task.provider_account) else None
+                    )
+                else:
+                    account_key = pool.account_for_credential(task.provider, credential)
+                if account_key is None:
+                    # Config changed, the retained payload contains an older
+                    # unknown rotation, or more than one account matches. Never
+                    # guess which configured credential should be updated.
+                    continue
+                mapping_key = f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task.id}"
+                if project_redis.get(mapping_key):
+                    continue
+                stored = _persist_task_provider_account_key(
+                    project_redis,
+                    task.id,
+                    account_key,
+                    ttl_seconds,
+                    logger,
+                )
+                if not stored:
+                    raise _RetryableResultError(
+                        f"failed to backfill provider account for task {task.id}"
+                    )
+                backfilled += 1
+
+            if len(entries) < 250:
+                break
+            next_min = f"({entries[-1][0]}"
+
+    if backfilled:
+        logger.info(
+            "Backfilled provider-account mappings for %d retained task(s)",
+            backfilled,
+        )
+    return backfilled
 
 
 def _load_task_provider_account(
@@ -465,6 +582,7 @@ def _json_has_refresh_token(value: object) -> bool:
 _USAGE_EXHAUSTED_COOLDOWN_SECONDS = 1800
 _USAGE_EXHAUSTED_PROCESSED_TTL_SECONDS = 24 * 3600
 _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS = 24 * 3600
+_RESULT_SIDE_EFFECTS_PROCESSED_TTL_SECONDS = 30 * 24 * 3600
 _REVIEW_RERUN_FAILURE_COOLDOWN_SECONDS = 15 * 60
 _REVIEW_RERUN_FAILURE_TTL_SECONDS = 7 * 24 * 3600
 _MAX_REVIEW_RERUN_FAILURES = 3
@@ -501,6 +619,16 @@ def _make_usage_exhausted_processed_key(task_id: str) -> str:
 def _make_transient_failure_processed_key(task_id: str) -> str:
     """Redis key tracking transient-failure accounting already done for a task."""
     return f"result:{task_id}:transient_failure_processed"
+
+
+def _make_result_side_effects_processed_key(task_id: str) -> str:
+    """Redis checkpoint written after required result side effects succeed."""
+    return f"result:{task_id}:side_effects_processed"
+
+
+def _make_terminal_failure_processed_key(task_id: str) -> str:
+    """Redis guard preventing retry-driven total-attempt overcounting."""
+    return f"result:{task_id}:terminal_failure_processed"
 
 
 def _usage_exhausted_cooldown_ttl_seconds(result: TaskResult) -> int:
@@ -611,21 +739,16 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
 
     try:
         pr_data = gh.get_pr(project.repo, result.resource_id, project.token)
-    except Exception:
-        logger.warning(
-            "Failed to validate result snapshot for PR #%d; dropping result side-effects",
-            result.resource_id,
-            exc_info=True,
-        )
-        return True
+    except Exception as exc:
+        raise _RetryableResultError(
+            f"failed to validate result snapshot for PR #{result.resource_id}: {exc}"
+        ) from exc
 
     current_sha = str(pr_data.get("headRefOid") or "")
     if not current_sha:
-        logger.info(
-            "Dropping result for PR #%d: GitHub response did not include headRefOid",
-            result.resource_id,
+        raise _RetryableResultError(
+            f"GitHub snapshot response for PR #{result.resource_id} omitted headRefOid"
         )
-        return True
     if current_sha and current_sha != result.snapshot_head_sha:
         logger.info(
             "Dropping stale result for PR #%d: result SHA %s, current SHA %s",
@@ -636,9 +759,14 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
         return True
 
     if result.decision_reason == "ci_failure" and result.snapshot_failed_checks:
-        checks = pr_data.get("statusCheckRollup") or gh.get_ci_status(
-            project.repo, result.resource_id, project.token
-        )
+        try:
+            checks = pr_data.get("statusCheckRollup") or gh.get_ci_status(
+                project.repo, result.resource_id, project.token
+            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to validate check snapshot for PR #{result.resource_id}: {exc}"
+            ) from exc
         if not _snapshot_failed_checks_still_failing(checks, result.snapshot_failed_checks):
             logger.info(
                 "Dropping stale CI result for PR #%d: captured failed checks are no longer failing",
@@ -653,14 +781,10 @@ def _is_pr_result_stale(project: ProjectConfig, result: TaskResult, logger: logg
             threads = gh.get_unresolved_review_threads(
                 project.repo, result.resource_id, project.token
             )
-        except Exception:
-            logger.warning(
-                "Failed to validate review-thread snapshot for PR #%d; "
-                "dropping result side-effects",
-                result.resource_id,
-                exc_info=True,
-            )
-            return True
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to validate review-thread snapshot for PR #{result.resource_id}: {exc}"
+            ) from exc
         if result.snapshot_review_thread_fingerprints:
             if not set(result.snapshot_review_thread_fingerprints).issubset(
                 _review_thread_fingerprints(threads)
@@ -1062,6 +1186,32 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         if pool is not None:
             _load_credential_overrides(project_redis, pool, logger, shared_redis=task_redis)
 
+    pending_task_ttl = compute_pending_task_ttl(config.runner)
+
+    # Rolling-upgrade bridge: releases before the per-task account mapping
+    # protocol can still have work in the shared task streams. Materialize the
+    # non-secret mappings before any result is consumed or ACKed and before any
+    # acknowledged task entry can be trimmed. Overrides are loaded first so a
+    # retained task carrying the current rotated blob can still be matched to
+    # its original configured account anchor.
+    try:
+        _backfill_retained_task_provider_accounts(
+            task_redis,
+            _configured_task_streams(config, token_pools=token_pools)
+            + _configured_task_streams(config, issue=True, token_pools=token_pools),
+            project_clients,
+            token_pools,
+            pending_task_ttl,
+            logger,
+        )
+    except Exception as exc:
+        logger.error(
+            "Could not backfill retained task provider accounts; refusing to start: %s",
+            exc,
+            exc_info=True,
+        )
+        sys.exit(1)
+
     # Graceful shutdown
     shutdown = False
 
@@ -1072,8 +1222,6 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
-
-    pending_task_ttl = compute_pending_task_ttl(config.runner)
 
     # Trace archiver: tails output:* streams to per-task files on
     # config.trace_archive_path. Start silently disables when path is unset,
@@ -1379,6 +1527,7 @@ def _poll_project(
                 credential=cred,
                 model=entry.model,
                 task_id=task_id,
+                provider_account=entry.account_key(),
             )
             if res is None and token_pool is not None:
                 token_pool.task_completed(task_id)
@@ -2325,10 +2474,39 @@ def _handle_result(
             token_pool.task_completed(result.task_id)
         _clear_task_provider_account(redis, result.task_id, logger)
 
-    def _load_usage_exhausted_account() -> str | None:
+    def _resolve_provider_account() -> str | None:
         if token_pool is None:
             return None
-        return _load_task_provider_account(redis, result.task_id, logger)
+        candidates: list[str] = []
+        task_entry = token_pool.get_task_entry(result.task_id)
+        if task_entry is not None:
+            candidates.append(task_entry.account_key())
+        persisted_account = _load_task_provider_account(redis, result.task_id, logger)
+        if persisted_account:
+            candidates.append(persisted_account)
+        if result.provider_account:
+            candidates.append(result.provider_account)
+
+        if not candidates:
+            return None
+        if any(not token_pool.has_account(account) for account in candidates):
+            logger.warning(
+                "Ignoring provider account metadata for task %s because it does not "
+                "match a configured account",
+                result.task_id,
+            )
+            return None
+        unique = set(candidates)
+        if len(unique) != 1:
+            logger.warning(
+                "Ignoring ambiguous provider account metadata for task %s",
+                result.task_id,
+            )
+            return None
+        return candidates[0]
+
+    def _load_usage_exhausted_account() -> str | None:
+        return _resolve_provider_account()
 
     # Credential write-back: capture a rotated OAuth blob BEFORE any staleness
     # or exhaustion handling pops the task->identity mapping. Valid regardless
@@ -2338,13 +2516,13 @@ def _handle_result(
         # and a monotonic sequence. Legacy payloads fall back to consume time
         # for wire compatibility.
         minted_at = result.credential_update_minted_at or time.time()
-        credential_update_account: str | None = None
-        task_entry = token_pool.get_task_entry(result.task_id)
-        if task_entry is not None:
-            credential_update_account = task_entry.account_key()
+        credential_update_account = _resolve_provider_account()
         if credential_update_account is None:
-            credential_update_account = _load_task_provider_account(redis, result.task_id, logger)
-        if credential_update_account and token_pool.credential_update_is_usable(
+            raise _RetryableResultError(
+                "credential update has no unambiguous configured provider account "
+                f"for task {result.task_id}"
+            )
+        if token_pool.credential_update_is_usable(
             credential_update_account, result.credential_update
         ):
             # Apply locally, but persist independently of whether this local
@@ -2398,6 +2576,35 @@ def _handle_result(
     is_issue = result.resource_type == "issue"
     resource_label = "issue" if is_issue else "PR"
     resource_type = result.resource_type or ("issue" if is_issue else "pr")
+    side_effects_key = _make_result_side_effects_processed_key(result.task_id)
+
+    def _clear_pending_result_marker() -> None:
+        try:
+            clear_pending_task_if_matches(
+                redis,
+                repo,
+                resource_type,
+                resource_id,
+                result.task_id,
+            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to clear pending task marker for {resource_label} #{resource_id}: {exc}"
+            ) from exc
+
+    def _commit_result_side_effects() -> None:
+        try:
+            redis.set_ex(
+                side_effects_key,
+                "1",
+                _RESULT_SIDE_EFFECTS_PROCESSED_TTL_SECONDS,
+            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to checkpoint result side effects for task {result.task_id}: {exc}"
+            ) from exc
+        _clear_pending_result_marker()
+        _release_provider_task_tracking()
 
     # Guard against stale task IDs. GitHub snapshot validation below is the
     # authoritative staleness check for PR tasks; the pending marker is only
@@ -2423,34 +2630,19 @@ def _handle_result(
                 )
             _release_provider_task_tracking()
             return
-    except Exception as e:
-        logger.error(
-            "Failed to check pending task ID for %s #%d: %s; proceeding with result processing",
-            resource_label,
-            resource_id,
-            e,
-            exc_info=True,
-        )
+    except Exception as exc:
+        raise _RetryableResultError(
+            f"failed to check pending task ID for {resource_label} #{resource_id}: {exc}"
+        ) from exc
 
     if result.status == ResultStatus.STALE or _is_pr_result_stale(project, result, logger):
-        try:
-            clear_pending_task_if_matches(redis, repo, resource_type, resource_id, result.task_id)
-        except Exception:
-            logger.warning(
-                "Failed to clear stale pending task marker for %s #%d",
-                resource_label,
-                resource_id,
-                exc_info=True,
-            )
         if not is_issue:
             try:
                 clear_attempts_if_head_sha(redis, repo, resource_id, result.snapshot_head_sha)
-            except Exception:
-                logger.warning(
-                    "Failed to clear attempt reservation for stale PR result #%d",
-                    resource_id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to clear attempt reservation for stale PR #{resource_id}: {exc}"
+                ) from exc
         if result.status == ResultStatus.USAGE_EXHAUSTED:
             _mark_usage_exhausted_token(
                 result,
@@ -2458,23 +2650,27 @@ def _handle_result(
                 logger,
                 account_key=_load_usage_exhausted_account(),
             )
+        # Keep discovery locked until all correctness-required stale cleanup
+        # succeeds. Clearing the pending marker first could enqueue a newer
+        # task while this result is still awaiting retry.
+        _clear_pending_result_marker()
+        _release_provider_task_tracking()
+        return
+
+    try:
+        side_effects_already_processed = redis.exists(side_effects_key)
+    except Exception as exc:
+        raise _RetryableResultError(
+            f"failed to inspect result side-effect checkpoint for task {result.task_id}: {exc}"
+        ) from exc
+    if side_effects_already_processed:
+        _clear_pending_result_marker()
         _release_provider_task_tracking()
         return
 
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
-
-    # Clear the pending-task marker so the orchestrator can enqueue again
-    # if needed. This applies to ALL result statuses — the task is no longer
-    # pending regardless of whether it succeeded or failed.
-    try:
-        clear_pending_task_if_matches(redis, repo, resource_type, resource_id, result.task_id)
-    except Exception as e:
-        logger.error(
-            f"Failed to clear pending task marker for {resource_label} #{resource_id}: {e}",
-            exc_info=True,
-        )
 
     # Completed issue tasks are resolved by removing the ready label below, so
     # their attempt counter can be cleared. Completed PR tasks are intentionally
@@ -2488,31 +2684,28 @@ def _handle_result(
         if is_issue:
             try:
                 clear_issue_attempts(redis, repo, resource_id)
-            except Exception as e:
-                logger.error(
-                    f"Failed to clear attempt counter for {resource_label} #{resource_id}: {e}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to clear attempt counter for issue #{resource_id}: {exc}"
+                ) from exc
         else:
             try:
                 clear_backoff(redis, repo, resource_id)
                 clear_transient_failure_count(redis, repo, resource_id)
-            except Exception as e:
-                logger.error(
-                    f"Failed to clear transient backoff state for PR #{resource_id}: {e}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to clear transient backoff state for PR #{resource_id}: {exc}"
+                ) from exc
 
         # Remove orcest:ready label from completed issues so they are not
         # re-discovered on the next poll cycle.
         if is_issue:
             try:
                 gh.remove_issue_label(repo, resource_id, labels.ready, token)
-            except Exception as e:
-                logger.error(
-                    f"Failed to remove ready label from issue #{resource_id}: {e}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to remove ready label from issue #{resource_id}: {exc}"
+                ) from exc
     elif result.status == ResultStatus.USAGE_EXHAUSTED:
         usage_accounting_processed = False
         try:
@@ -2544,7 +2737,6 @@ def _handle_result(
         # PR-specific cooldown: clear per-SHA attempts so PR can be re-enqueued
         # after the cooldown expires.  Issues don't have per-SHA counters.
         if not is_issue:
-            cooldown_set = False
             try:
                 set_usage_exhausted_cooldown(
                     redis,
@@ -2552,25 +2744,21 @@ def _handle_result(
                     resource_id,
                     ttl_seconds=usage_cooldown_ttl,
                 )
-                cooldown_set = True
-            except Exception as e:
-                logger.error(
-                    f"Failed to set usage-exhausted cooldown for PR #{resource_id}: {e}",
-                    exc_info=True,
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to set usage-exhausted cooldown for PR #{resource_id}: {exc}"
+                ) from exc
+            try:
+                clear_attempts(redis, repo, resource_id)
+                logger.info(
+                    "PR #%d: cleared per-SHA attempt counter after USAGE_EXHAUSTED",
+                    resource_id,
                 )
-            if cooldown_set:
-                try:
-                    clear_attempts(redis, repo, resource_id)
-                    logger.info(
-                        "PR #%d: cleared per-SHA attempt counter after USAGE_EXHAUSTED",
-                        resource_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to clear per-SHA attempt counter for PR #{resource_id} "
-                        f"after USAGE_EXHAUSTED: {e}",
-                        exc_info=True,
-                    )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to clear per-SHA attempts after usage exhaustion for "
+                    f"PR #{resource_id}: {exc}"
+                ) from exc
         else:
             try:
                 set_issue_usage_exhausted_cooldown(
@@ -2579,23 +2767,21 @@ def _handle_result(
                     resource_id,
                     ttl_seconds=usage_cooldown_ttl,
                 )
-            except Exception as e:
-                logger.error(
-                    f"Failed to set usage-exhausted cooldown for issue #{resource_id}: {e}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to set usage-exhausted cooldown for issue #{resource_id}: {exc}"
+                ) from exc
             try:
                 clear_issue_attempts(redis, repo, resource_id)
                 logger.info(
                     "Issue #%d: cleared attempt counter after USAGE_EXHAUSTED",
                     resource_id,
                 )
-            except Exception as e:
-                logger.error(
-                    f"Failed to clear issue attempt counter for issue #{resource_id} "
-                    f"after USAGE_EXHAUSTED: {e}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to clear attempts after usage exhaustion for issue "
+                    f"#{resource_id}: {exc}"
+                ) from exc
 
     # Task 8: per-provider rebake_required_failures counter for "clean rebake" style
     # permanent failures (worker image missing the provider CLI). Uses only the
@@ -2630,15 +2816,16 @@ def _handle_result(
     )
 
     if is_transient:
-        transient_accounting_processed = False
         try:
             transient_accounting_processed = redis.set_nx_ex(
                 _make_transient_failure_processed_key(result.task_id),
                 "1",
                 _TRANSIENT_FAILURE_PROCESSED_TTL_SECONDS,
             )
-        except Exception:
-            logger.debug("Failed to mark transient failure as processed", exc_info=True)
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to reserve transient-failure accounting for task {result.task_id}: {exc}"
+            ) from exc
 
         try:
             if not transient_accounting_processed:
@@ -2646,9 +2833,7 @@ def _handle_result(
                     "Skipping duplicate transient cleanup for task %s",
                     result.task_id,
                 )
-            elif is_issue:
-                clear_issue_attempts(redis, repo, resource_id)
-            else:
+            elif not is_issue:
                 head_sha = result.snapshot_head_sha
                 try:
                     attempt_data: dict[str, str] = redis.hgetall(
@@ -2677,13 +2862,17 @@ def _handle_result(
                         backoff_step,
                         head_sha=head_sha,
                     )
+            # Cleanup is deliberately outside the accounting guard. If an
+            # earlier attempt reserved accounting and then failed this durable
+            # cleanup, the pending result must retry the idempotent delete.
+            if is_issue:
+                clear_issue_attempts(redis, repo, resource_id)
+            else:
                 clear_attempts(redis, repo, resource_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to clear attempts for transient failure on "
-                f"{resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed transient-failure cleanup for {resource_label} #{resource_id}: {exc}"
+            ) from exc
 
     # Manage labels based on result status.
     #
@@ -2697,30 +2886,32 @@ def _handle_result(
         # The total-attempt counter only paces the retry cadence (see the
         # SKIP_MAX_TOTAL_ATTEMPTS handler); it never escalates.
         try:
-            increment_total_attempts(redis, repo, resource_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to increment total-attempt counter for PR #{resource_id}: {e}",
-                exc_info=True,
-            )
+            if redis.set_nx_ex(
+                _make_terminal_failure_processed_key(result.task_id),
+                "1",
+                _RESULT_SIDE_EFFECTS_PROCESSED_TTL_SECONDS,
+            ):
+                increment_total_attempts(redis, repo, resource_id)
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed terminal-failure accounting for PR #{resource_id}: {exc}"
+            ) from exc
     if needs_human:
         try:
             _add_label(repo, resource_id, labels.needs_human, token)
             labeled = True
-        except Exception as e:
-            logger.error(
-                f"Failed to add needs-human label on {resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to add needs-human label on {resource_label} #{resource_id}: {exc}"
+            ) from exc
     elif result.status == ResultStatus.BLOCKED:
         try:
             _add_label(repo, resource_id, labels.blocked, token)
             labeled = True
-        except Exception as e:
-            logger.error(
-                f"Failed to add blocked label on {resource_label} #{resource_id}: {e}",
-                exc_info=True,
-            )
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to add blocked label on {resource_label} #{resource_id}: {exc}"
+            ) from exc
 
     # Only post comments for non-success statuses (failures, blocked, etc.)
     # Success is silent to avoid comment noise on PRs/issues.
@@ -2731,7 +2922,7 @@ def _handle_result(
             # An ordinary (transient or otherwise) fix-attempt failure is
             # retried automatically -- stay silent to avoid accumulating
             # comment noise across attempts.
-            _release_provider_task_tracking()
+            _commit_result_side_effects()
             return
         elif result.status == ResultStatus.FAILED:
             # needs_human is True: the worker's agent explicitly asked for a
@@ -2780,13 +2971,22 @@ def _handle_result(
                 f"Summary: {safe_summary}"
             )
 
+        comment_marker = (
+            f"<!-- orcest-result:{uuid.uuid5(uuid.NAMESPACE_URL, result.task_id).hex} -->"
+        )
         try:
-            _post_comment(repo, resource_id, body, token)
-        except Exception as e:
-            logger.error(
-                f"Failed to post comment on {resource_label} #{resource_id}: {e}",
-                exc_info=True,
+            comment_exists = gh.has_issue_comment_marker(
+                repo,
+                resource_id,
+                comment_marker,
+                token,
             )
+            if not comment_exists:
+                _post_comment(repo, resource_id, f"{body}\n\n{comment_marker}", token)
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to post comment on {resource_label} #{resource_id}: {exc}"
+            ) from exc
 
         logger.info("Result comment: %s...", body[:100])
 
@@ -2797,4 +2997,4 @@ def _handle_result(
     # transient, etc.). mark_exhausted already pops the mapping for exhausted
     # results, so task_completed is a no-op there (safe to call). The durable
     # task -> account mapping is cleared at the same boundary.
-    _release_provider_task_tracking()
+    _commit_result_side_effects()

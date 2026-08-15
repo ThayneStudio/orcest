@@ -383,8 +383,10 @@ classes of compute:
     shared `orcest` network and is deployed with `/opt/orcest/.redis.env`
     plus a dashboard token from `DASHBOARD_TOKEN` or `/opt/orcest/.dashboard.env`.
     `DASHBOARD_REDIS_PREFIXES` can limit the prefixes visible to the
-    dashboard when the Redis DB is shared; unset keeps all prefixed and
-    unprefixed Orcest keys visible.
+    dashboard when the Redis DB is shared. Only an absent/unset variable keeps
+    all prefixed and unprefixed Orcest keys visible. If the variable is present,
+    it must contain at least one prefix (or `unprefixed`); empty, whitespace-only,
+    and separator-only values fail startup instead of silently widening access.
 - **Worker VMs** — ephemeral Proxmox linked-clones of a baked template.
   Each worker takes a single task from Redis, runs it, and is destroyed
   by the pool manager on completion (or after `pool.max_task_duration`).
@@ -410,7 +412,7 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 | `start`                                                          | Start (or restart) the pool manager.                                                                       |
 | `stop [--drain-active]`                                          | Stop the pool manager and destroy idle (or all) worker VMs; clean Redis pool state.                        |
 | `update`                                                         | Upload fresh source, rebuild the orchestrator Docker image, restart Redis + pool manager + every project stack. |
-| `deploy [--rebuild-template] [--drain-active]`                   | Full deploy in order: `pip install` CLI → `stop` → `update` → optional pointer-safe `rebake` → `start`.    |
+| `deploy [--rebuild-template] [--drain-active]`                   | Coordinated fleet deploy: `stop` → `update` → optional pointer-safe `rebake` → `start`; it does not update the host CLI. |
 | `pool-status`                                                    | Show pool config, the active template VMID (Redis pointer), and idle/active VM counts.                     |
 | `status`                                                         | Show orchestrator host reachability, orgs, per-project stack status, and pool summary.                     |
 | `rebake [--image-url …]`                                         | Bake a fresh template at the next free VMID from `pool.template_vmid_range` and atomically swap the Redis pointer. |
@@ -457,9 +459,10 @@ which directory you changed:
 
 Notes:
 
-- `orcest fleet deploy` chains layers 1, 2, and (with
-  `--rebuild-template`) 3 in one command — that is the safe default
-  when you do not know which layers your change touches.
+- `orcest fleet deploy` coordinates layer 2 and (with
+  `--rebuild-template`) layer 3, including stopping and restarting the worker
+  pool. It does **not** install a new host CLI; update layer 1 separately before
+  invoking it when `src/orcest/fleet/*` changed.
 - During `deploy --rebuild-template`, the pool manager stays stopped
   until the new template pointer has been swapped, so fresh clones use
   the rebaked template.
@@ -468,6 +471,24 @@ Notes:
   stopped, or the pool needs more capacity. For an immediate worker
   cutoff, use `orcest fleet deploy --rebuild-template --drain-active`
   or explicitly `stop --drain-active`, `rebake`, then `start`.
+- The active template pointer is durable. If it is missing or dangling, the
+  pool manager recovers it automatically only when exactly one live template
+  exists in `pool.template_vmid_range`. With multiple candidates, restore
+  `orcest:pool:current_template_vmid` explicitly or run a coordinated rebake;
+  VMID order does not identify the newest generation.
+- Done and drain markers are durable lifecycle handoffs. Worker destruction and
+  VMID reuse clear and verify them; a failed verification is reported as an
+  incomplete stop/allocation instead of risking the next VM generation.
+  `stop --drain-active` also requires Proxmox credentials up front and changes
+  no fleet state when that preflight fails.
+- Dashboard deploys keep the last readiness-verified Compose configuration
+  in `.dashboard-compose.last-known-good.yml` beside the Compose file (outside
+  the rsync-deleted `dashboard/` tree). If a candidate image or configuration
+  fails, rollback recreates the previous image with that known-good
+  configuration. Override the local or remote state path with
+  `DASHBOARD_COMPOSE_STATE_FILE` or `DASHBOARD_REMOTE_COMPOSE_STATE_FILE`.
+  The remote state file must remain outside `DASHBOARD_REMOTE_DIR`, whose
+  contents are replaced with `rsync --delete` during synchronization.
 - To isolate interactive Claude Code from the legacy `claude -p` worker,
   configure the pool clones with `pool.worker_backend: clauder`,
   `pool.worker_runner_type: claude`, and

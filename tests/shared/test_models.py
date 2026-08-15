@@ -85,6 +85,7 @@ def test_task_to_dict_from_dict_round_trip():
         snapshot_failed_checks=["tests"],
         snapshot_review_thread_ids=["thread-1"],
         snapshot_review_thread_fingerprints=["thread-1:fingerprint"],
+        provider_account="grok:0123456789ab",
     )
     rebuilt = Task.from_dict(original.to_dict())
 
@@ -101,6 +102,7 @@ def test_task_to_dict_from_dict_round_trip():
     assert rebuilt.snapshot_failed_checks == ["tests"]
     assert rebuilt.snapshot_review_thread_ids == ["thread-1"]
     assert rebuilt.snapshot_review_thread_fingerprints == ["thread-1:fingerprint"]
+    assert rebuilt.provider_account == "grok:0123456789ab"
     # Datetime round-trip through isoformat loses sub-microsecond
     # precision but should be equal within a second.
     assert abs((rebuilt.created_at - original.created_at).total_seconds()) < 1
@@ -135,6 +137,18 @@ def test_task_result_credential_update_timestamp_round_trip():
     )
     rebuilt = TaskResult.from_dict(original.to_dict())
     assert rebuilt.credential_update_minted_at == 123.5
+
+
+def test_task_result_provider_account_round_trip_is_non_secret_metadata():
+    original = _make_task_result(
+        provider_account="grok:0123456789ab",
+    )
+
+    wire = original.to_dict()
+    rebuilt = TaskResult.from_dict(wire)
+
+    assert wire["provider_account"] == "grok:0123456789ab"
+    assert rebuilt.provider_account == "grok:0123456789ab"
 
 
 def test_task_result_repo_does_not_shift_historic_positional_arguments():

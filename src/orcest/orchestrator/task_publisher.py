@@ -535,6 +535,7 @@ def publish_fix_task(
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -630,6 +631,7 @@ def publish_fix_task(
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -664,6 +666,7 @@ def publish_followup_task(
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -715,6 +718,7 @@ def publish_followup_task(
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -751,6 +755,7 @@ def publish_rebase_task(
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -790,6 +795,7 @@ def publish_rebase_task(
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -825,6 +831,7 @@ def publish_issue_task(
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -856,6 +863,7 @@ def publish_issue_task(
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_issue_and_notify(

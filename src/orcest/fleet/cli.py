@@ -2451,6 +2451,12 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
         console.print("[red]Orchestrator host not set.[/red]")
         console.print("  Run: orcest fleet create-orchestrator")
         sys.exit(1)
+    if drain_active and (not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret):
+        console.print(
+            "[red]Cannot drain worker VMs: Proxmox API credentials are not configured.[/red]"
+        )
+        console.print("  No fleet state was changed; configure credentials and retry.")
+        raise SystemExit(1)
 
     ssh_target = cfg.ssh_target()
 
@@ -2505,6 +2511,12 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
 
     # Step 3: Destroy worker VMs
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        if drain_active:
+            console.print(
+                "[red]Cannot drain worker VMs: Proxmox API credentials are not configured.[/red]"
+            )
+            console.print("  No worker VM was destroyed; configure credentials and retry.")
+            raise SystemExit(1)
         console.print(
             "[yellow]Proxmox API credentials not configured — skipping VM destruction.[/yellow]"
         )
@@ -2571,6 +2583,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
 
     destroyed: list[str] = []
     skipped: list[str] = list(range_skipped)
+    destroy_failures: list[str] = []
     recovery_failures: list[str] = []
 
     def restart_stopped_worker(vm_id: int, reason: str) -> bool:
@@ -2637,7 +2650,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
                         stopped = False
                 if not stopped:
                     console.print("[yellow]failed to confirm stopped; leaving VM intact[/yellow]")
-                    skipped.append(vm_id_str)
+                    destroy_failures.append(vm_id_str)
                     continue
                 if not drain_active:
                     try:
@@ -2658,7 +2671,9 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
                 destroyed.append(vm_id_str)
             except Exception as exc:
                 console.print(f"[yellow]failed[/yellow]: {exc}")
-                skipped.append(vm_id_str)
+                destroy_failures.append(vm_id_str)
+                if not drain_active and stopped:
+                    restart_stopped_worker(vm_id, "destruction failed")
     finally:
         if draining_worker_ids:
             try:
@@ -2667,28 +2682,43 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
                 console.print(f"  [yellow]warning[/yellow]: failed to clear drain leases: {exc}")
 
     # Step 4: Clean Redis
+    pool_cleanup_failed = False
     if destroyed:
         console.print("  Cleaning Redis state...", end=" ")
         try:
             clean_pool_redis(ssh_target, destroyed)
             console.print("[green]ok[/green]")
         except Exception as exc:
-            console.print(f"[yellow]warning[/yellow]: {exc}")
+            pool_cleanup_failed = True
+            console.print(f"[red]failed[/red]: {exc}")
 
     if destroyed:
         console.print("  Pending task markers left intact for stream recovery or TTL expiry.")
 
     console.print(f"\n  Destroyed {len(destroyed)} VMs", end="")
     if skipped:
-        console.print(f", left {len(skipped)} active", end="")
+        console.print(f", intentionally left {len(skipped)} busy or protected", end="")
+    if destroy_failures:
+        console.print(f", failed to destroy {len(destroy_failures)}", end="")
     console.print(".")
-    if drain_active and skipped:
+    if drain_active and (skipped or destroy_failures):
         console.print("[red]Drain incomplete: one or more worker VMs were not destroyed.[/red]")
         raise SystemExit(1)
     if recovery_failures:
         console.print(
             "[red]Stop incomplete: one or more stopped workers could not be "
             "restarted for pending-task recovery.[/red]"
+        )
+        raise SystemExit(1)
+    if destroy_failures:
+        console.print(
+            "[red]Stop incomplete: one or more eligible worker VMs could not be destroyed.[/red]"
+        )
+        raise SystemExit(1)
+    if pool_cleanup_failed:
+        console.print(
+            "[red]Stop incomplete: worker VMs were destroyed, but durable Redis "
+            "done/drain markers were not verified as cleared. Refusing to report success.[/red]"
         )
         raise SystemExit(1)
 
@@ -2816,8 +2846,12 @@ def deploy(ctx: click.Context, rebuild_template: bool, drain_active: bool, confi
     """
     console = Console()
 
-    if rebuild_template:
-        _preflight_rebuild_template_config(config, console)
+    _preflight_deploy_config(
+        config,
+        console,
+        rebuild_template=rebuild_template,
+        drain_active=drain_active,
+    )
     _preflight_backend_transition(
         config,
         console,
@@ -2928,8 +2962,14 @@ def _validate_backend_transition(
         raise SystemExit(1)
 
 
-def _preflight_rebuild_template_config(config: str, console: Console) -> None:
-    """Validate rebake-only config before deploy stops the running fleet."""
+def _preflight_deploy_config(
+    config: str,
+    console: Console,
+    *,
+    rebuild_template: bool,
+    drain_active: bool,
+) -> None:
+    """Validate every static deploy prerequisite before stopping the fleet."""
     from orcest.fleet.config import load_config
 
     try:
@@ -2939,12 +2979,24 @@ def _preflight_rebuild_template_config(config: str, console: Console) -> None:
         console.print(f"[red]Invalid pool.template_vmid_range:[/red] {exc}")
         raise SystemExit(1) from exc
 
-    if rng is None:
-        console.print(
-            "[red]Cannot deploy --rebuild-template without pool.template_vmid_range.[/red]\n"
-            "  Add e.g. 'template_vmid_range: [9000, 9009]' to the fleet config, "
-            "or run deploy without --rebuild-template for the legacy single-template flow."
-        )
+    problems: list[str] = []
+    if not cfg.orchestrator.host:
+        problems.append("orchestrator.host is not configured")
+    if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
+        problems.append("Proxmox API credentials are not configured")
+    if cfg.proxmox.is_localhost():
+        problems.append("Proxmox endpoint is localhost and is unreachable from the pool manager")
+    if not cfg.pool.template_vm_id and rng is None:
+        problems.append("no worker template or template VMID range is configured")
+    if cfg.pool.vm_id_start <= 0:
+        problems.append("pool.vm_id_start is required to allocate workers")
+    if rebuild_template and rng is None:
+        problems.append("pool.template_vmid_range is required by --rebuild-template")
+
+    if problems:
+        console.print("[red]Deploy preflight failed before any services were stopped:[/red]")
+        for problem in problems:
+            console.print(f"  - {problem}")
         raise SystemExit(1)
 
 

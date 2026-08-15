@@ -404,6 +404,22 @@ class TestGetPoolRedisMembers:
         assert idle == {"300", "301"}
         assert active == {"302": "1000.0", "303": "2000.0"}
 
+    def test_rejects_odd_hgetall_output(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            side_effect=[
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="300\n", stderr=""),
+                subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="302\n1000.0\n303\n", stderr=""
+                ),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="odd number"):
+            get_pool_redis_members("user@host")
+
     def test_handles_empty(self, mocker):
         from orcest.fleet.orchestrator import get_pool_redis_members
 
@@ -425,6 +441,27 @@ class TestGetPoolRedisMembers:
                 returncode=1,
                 stdout="",
                 stderr="NOAUTH Authentication required.",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to read pool idle set"):
+            get_pool_redis_members("user@host")
+
+    @pytest.mark.parametrize(
+        "diagnostic",
+        [
+            "NOAUTH Authentication required.",
+            "(error) WRONGTYPE Operation against a key holding the wrong kind of value",
+            "ERR invalid command",
+        ],
+    )
+    def test_raises_on_redis_error_output_even_with_zero_exit(self, mocker, diagnostic):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{diagnostic}\n", stderr=""
             ),
         )
 
@@ -459,15 +496,23 @@ class TestCleanPoolRedis:
     def test_builds_correct_commands(self, mocker):
         from orcest.fleet.orchestrator import clean_pool_redis
 
+        def ssh_side_effect(_target, command):
+            stdout = "0\n0\n0\n0\n" if "EXISTS" in command else ""
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
         ssh = mocker.patch(
             "orcest.fleet.orchestrator._ssh",
-            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            side_effect=ssh_side_effect,
         )
         clean_pool_redis("user@host", ["300", "301"])
-        ssh.assert_called_once()
-        cmd = ssh.call_args[0][1]
+        assert ssh.call_count == 3
+        cmd = ssh.call_args_list[0][0][1]
         assert "SREM orcest:pool:idle" in cmd
         assert "HDEL orcest:pool:active" in cmd
+        assert "SREM orcest:pool:draining orcest-worker-300" in cmd
+        assert "SREM orcest:pool:provisioning 300" in cmd
+        assert "SREM orcest:pool:ambiguous-clones 300" in cmd
+        assert "DEL orcest:pool:done:orcest-worker-300" in cmd
         assert "300" in cmd
         assert "301" in cmd
 
@@ -492,6 +537,22 @@ class TestCleanPoolRedis:
         )
 
         with pytest.raises(RuntimeError, match="Failed to clean pool Redis state"):
+            clean_pool_redis("user@host", ["300"])
+
+    def test_marker_verification_failure_raises(self, mocker):
+        from orcest.fleet.orchestrator import clean_pool_redis
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            side_effect=[
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="1\n0\n0\n0\n", stderr=""
+                ),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="expected lifecycle markers to be absent"):
             clean_pool_redis("user@host", ["300"])
 
 
@@ -542,10 +603,19 @@ class TestRedisCliRoutedThroughDockerExec:
     def test_clean_pool_redis_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import clean_pool_redis
 
-        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        def ssh_side_effect(_target, command):
+            if "EXISTS" in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="0\n0\n0\n0\n", stderr=""
+                )
+            return self._ok()
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         clean_pool_redis("user@host", ["300"])
-        cmd = ssh.call_args[0][1]
-        assert cmd.count("docker exec orcest-redis-redis-1") == 2
+        cleanup_cmd = ssh.call_args_list[0][0][1]
+        verify_cmd = ssh.call_args_list[1][0][1]
+        assert cleanup_cmd.count("docker exec orcest-redis-redis-1") == 6
+        assert verify_cmd.count("docker exec orcest-redis-redis-1") == 4
 
     def test_clean_pending_tasks_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import clean_pending_tasks
@@ -580,6 +650,10 @@ class TestRedisCliRoutedThroughDockerExec:
                     stdout="orcest:tasks:claude\norcest:tasks:issue:claude\n",
                     stderr="",
                 )
+            if " TYPE " in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="stream\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
@@ -611,6 +685,10 @@ class TestRedisCliRoutedThroughDockerExec:
                 )
             if "--scan" in command and "'*:tasks:*'" in command:
                 return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            if " TYPE " in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="stream\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
@@ -651,16 +729,70 @@ class TestRedisCliRoutedThroughDockerExec:
                 )
             if "--scan" in command and "'*:tasks:*'" in command:
                 return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            if " TYPE " in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="stream\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 args=[],
-                returncode=1,
-                stdout="",
-                stderr="NOGROUP No such consumer group 'workers'",
+                returncode=0,
+                stdout="NOGROUP No such consumer group 'workers'\n",
+                stderr="",
             )
 
         mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
 
         assert get_workers_with_pending_tasks("user@host") == set()
+
+    def test_get_workers_skips_non_stream_task_metadata(self, mocker):
+        from orcest.fleet.orchestrator import get_workers_with_pending_tasks
+
+        def ssh_side_effect(_target, command):
+            if "--scan" in command and "'tasks:*'" in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="tasks:metadata\ntasks:claude\n", stderr=""
+                )
+            if "--scan" in command:
+                return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            if "TYPE tasks:metadata" in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="hash\n", stderr=""
+                )
+            if " TYPE " in command:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="stream\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="name\norcest-worker-300\npending\n1\nidle\n2\n",
+                stderr="",
+            )
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        assert get_workers_with_pending_tasks("user@host") == {"orcest-worker-300"}
+        assert not any(
+            "XINFO CONSUMERS tasks:metadata" in call.args[1] for call in ssh.call_args_list
+        )
+
+
+class TestPendingConsumerParser:
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "name\nworker\npending\nnot-an-int\n",
+            "name\nworker\npending\n-1\n",
+            "name\nworker\npending\n",
+            "name\nworker\n",
+            "pending\n1\n",
+        ],
+    )
+    def test_malformed_pending_values_fail_closed(self, stdout):
+        from orcest.fleet.orchestrator import _parse_xinfo_consumers_with_pending
+
+        with pytest.raises(RuntimeError, match="Malformed XINFO"):
+            _parse_xinfo_consumers_with_pending(stdout)
 
 
 class TestUploadSource:
@@ -990,6 +1122,7 @@ class TestRedisCliAuthenticates:
         # redis-cli must receive -a <password> and suppress the auth warning.
         assert "-a " in _REDIS_CLI_PREFIX
         assert "--no-auth-warning" in _REDIS_CLI_PREFIX
+        assert " -e " in _REDIS_CLI_PREFIX
 
     def test_prefix_reads_password_from_container_env(self):
         """The password must come from the container's own env (delivered via
@@ -1012,10 +1145,11 @@ class TestRedisCliAuthenticates:
             set_current_template_vmid,
         )
 
-        ssh = mocker.patch(
-            "orcest.fleet.orchestrator._ssh",
-            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
-        )
+        def ssh_side_effect(_target, command):
+            stdout = "0\n0\n0\n0\n" if "EXISTS" in command else ""
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         set_current_template_vmid("user@host", 9001)
         assert "ORCEST_REDIS_PASSWORD" in ssh.call_args[0][1]
         assert "SET orcest:pool:current_template_vmid" in ssh.call_args[0][1]
@@ -1027,9 +1161,11 @@ class TestRedisCliAuthenticates:
 
         ssh.reset_mock()
         clean_pool_redis("user@host", ["300"])
-        cmd = ssh.call_args[0][1]
-        # Two authenticated invocations (SREM + HDEL) joined by &&.
-        assert cmd.count("--no-auth-warning") == 2
+        cleanup_cmd = ssh.call_args_list[0][0][1]
+        verify_cmd = ssh.call_args_list[1][0][1]
+        # Six cleanup operations plus four verification reads are authenticated.
+        assert cleanup_cmd.count("--no-auth-warning") == 6
+        assert verify_cmd.count("--no-auth-warning") == 4
 
     def test_raw_flag_preserved(self, mocker):
         """--raw is still appended for line-per-value parsing."""

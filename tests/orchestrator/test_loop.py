@@ -49,6 +49,7 @@ from orcest.orchestrator.pr_ops import (
 from orcest.shared.config import OrchestratorConfig, ProjectConfig
 from orcest.shared.coordination import (
     clear_backoff,
+    clear_pending_task_if_matches,
     get_backoff_head_sha,
     get_backoff_step,
     get_pending_task,
@@ -2130,9 +2131,9 @@ def test_handle_result_needs_human_label_failure(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
+    mocker,
 ):
-    """A needs-human result where add_label raises -- comment falls back to the
-    'add it manually' variant; no crash."""
+    """A failed required label leaves the result pending and preserves its lock."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(
@@ -2141,24 +2142,54 @@ def test_handle_result_needs_human_label_failure(
         needs_human=True,
         needs_human_reason="ambiguous requirement",
     )
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    set_pending_task(
+        fake_redis_client,
+        orchestrator_config.github.repo,
+        "pr",
+        90,
+        result.task_id,
+    )
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
-    gh_mock.add_label.side_effect = RuntimeError("label API down")
+    gh_mock.add_label.side_effect = [RuntimeError("label API down"), None]
 
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
+    pending = fake_redis_client.client.xpending(
+        fake_redis_client._prefixed(RESULTS_STREAM),
+        RESULTS_GROUP,
+    )
+    assert pending["pending"] == 1
+    assert get_pending_task(fake_redis_client, orchestrator_config.github.repo, "pr", 90) == (
+        result.task_id
+    )
+    gh_mock.post_comment.assert_not_called()
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    pending = fake_redis_client.client.xpending(
+        fake_redis_client._prefixed(RESULTS_STREAM),
+        RESULTS_GROUP,
+    )
+    assert pending["pending"] == 0
+    assert get_pending_task(fake_redis_client, orchestrator_config.github.repo, "pr", 90) is None
+    assert gh_mock.add_label.call_count == 2
     gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert "add it manually" in comment_body
 
 
 def test_handle_result_post_comment_failure(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
+    mocker,
 ):
-    """When post_comment raises for a needs-human result, it is logged (no crash)."""
+    """An ambiguous comment failure retries without posting a duplicate."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     result = _make_task_result(
@@ -2167,14 +2198,243 @@ def test_handle_result_post_comment_failure(
         needs_human=True,
         needs_human_reason="needs a product decision",
     )
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    set_pending_task(
+        fake_redis_client,
+        orchestrator_config.github.repo,
+        "pr",
+        91,
+        result.task_id,
+    )
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     gh_mock.post_comment.side_effect = RuntimeError("GitHub API down")
+    # The first query precedes a post that reaches GitHub but loses its response.
+    # On retry the deterministic hidden marker proves the comment already exists.
+    gh_mock.has_issue_comment_marker.side_effect = [False, True]
 
     logger = logging.getLogger("test")
-    # Should not raise -- post_comment failure is caught and logged
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
+    pending = fake_redis_client.client.xpending(
+        fake_redis_client._prefixed(RESULTS_STREAM),
+        RESULTS_GROUP,
+    )
+    assert pending["pending"] == 1
+    assert get_pending_task(fake_redis_client, orchestrator_config.github.repo, "pr", 91) == (
+        result.task_id
+    )
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logger)
+
+    pending = fake_redis_client.client.xpending(
+        fake_redis_client._prefixed(RESULTS_STREAM),
+        RESULTS_GROUP,
+    )
+    assert pending["pending"] == 0
+    assert get_pending_task(fake_redis_client, orchestrator_config.github.repo, "pr", 91) is None
+    assert gh_mock.add_label.call_count == 2
+    gh_mock.post_comment.assert_called_once()
+
+
+def test_completed_issue_label_failure_stays_pending_then_retries(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+    mocker,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 92
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="completed-issue-label-retry",
+        branch="",
+    )
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    gh_mock.remove_issue_label.side_effect = [RuntimeError("GitHub down"), None]
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) == result.task_id
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 1
+    )
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert gh_mock.remove_issue_label.call_count == 2
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 0
+    )
+
+
+def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+    mocker,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    pr_number = 93
+    result = _make_task_result(
+        status=ResultStatus.BLOCKED,
+        pr_number=pr_number,
+        task_id="pending-clear-retry",
+    )
+    set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    real_clear = clear_pending_task_if_matches
+    clear_calls = 0
+
+    def flaky_clear(*args, **kwargs):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise ConnectionError("Redis unavailable")
+        return real_clear(*args, **kwargs)
+
+    mocker.patch(
+        "orcest.orchestrator.loop.clear_pending_task_if_matches",
+        side_effect=flaky_clear,
+    )
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == result.task_id
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 1
+    )
+    gh_mock.add_label.assert_called_once()
+    gh_mock.post_comment.assert_called_once()
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) is None
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 0
+    )
+    # The durable side-effect checkpoint bypasses already-completed GitHub work.
+    gh_mock.add_label.assert_called_once()
+    gh_mock.post_comment.assert_called_once()
+
+
+def test_blocked_label_failure_stays_pending_then_retries(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+    mocker,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    pr_number = 94
+    result = _make_task_result(
+        status=ResultStatus.BLOCKED,
+        pr_number=pr_number,
+        task_id="blocked-label-retry",
+    )
+    set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    gh_mock.add_label.side_effect = [RuntimeError("GitHub down"), None]
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == result.task_id
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 1
+    )
+    gh_mock.post_comment.assert_not_called()
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) is None
+    assert gh_mock.add_label.call_count == 2
+    gh_mock.post_comment.assert_called_once()
+
+
+def test_usage_attempt_cleanup_failure_stays_pending_then_retries(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+    mocker,
+):
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    pr_number = 95
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=pr_number,
+        task_id="usage-cleanup-retry",
+    )
+    set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    clear_mock = mocker.patch(
+        "orcest.orchestrator.loop.clear_attempts",
+        side_effect=[ConnectionError("Redis down"), None],
+    )
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == result.task_id
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 1
+    )
+    gh_mock.post_comment.assert_not_called()
+
+    mocker.patch.object(
+        fake_redis_client,
+        "xreadgroup",
+        side_effect=[[(entry_id, result.to_dict())], [], []],
+    )
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) is None
+    assert clear_mock.call_count == 2
     gh_mock.post_comment.assert_called_once()
 
 
@@ -2728,7 +2988,7 @@ def test_handle_result_uses_ci_status_fallback_for_snapshot_validation(
     gh_mock.post_comment.assert_called_once()
 
 
-def test_handle_result_validation_failure_drops_side_effects(
+def test_handle_result_validation_failure_leaves_result_pending(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
@@ -2756,6 +3016,12 @@ def test_handle_result_validation_failure_drops_side_effects(
 
     gh_mock.add_label.assert_not_called()
     gh_mock.post_comment.assert_not_called()
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 1
+    )
 
 
 def test_handle_result_snapshotless_pr_result_drops_side_effects(
@@ -3797,6 +4063,7 @@ def test_full_multi_provider_flow_exhaust_one_continue_on_other(
     # provider/credential/model surface passed to publish_fix_task.
     # This proves "exhaust one provider, the system continues on the other".
     publish_spy.assert_called_once()
+    assert publish_spy.call_args.kwargs["provider_account"] == c.account_key()
 
     # To also cover the full-exhaustion + per-provider counter path for mixed,
     # exhaust the remaining claude and run another cycle: now selection returns
@@ -3955,7 +4222,7 @@ def test_credential_override_load_ignores_grok_blob_without_refresh_token(fake_r
     assert pool.effective_credential(entry) == "config-blob"
 
 
-def test_credential_update_uses_persisted_task_account_after_restart(fake_redis_client):
+def test_credential_update_uses_persisted_task_account_after_restart(fake_redis_client, mocker):
     import logging
 
     from orcest.orchestrator.provider_pool import ProviderPool
@@ -3975,6 +4242,10 @@ def test_credential_update_uses_persisted_task_account_after_restart(fake_redis_
         pr_number=77,
     )
     result.credential_update = rotated
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
 
     _handle_result(
         ProjectConfig(
@@ -3995,6 +4266,184 @@ def test_credential_update_uses_persisted_task_account_after_restart(fake_redis_
     assert pool.effective_credential(entry) == rotated
     assert shared_redis.hgetall(_SHARED_CREDENTIAL_OVERRIDES_KEY)
     assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, task_id) is None
+
+
+def test_pre_upgrade_retained_task_backfills_account_before_result(
+    fake_redis_client,
+    gh_mock,
+):
+    """A task published by 6fb2edd has no account field or Redis mapping.
+
+    Startup reconstructs its non-secret account from the retained task entry,
+    ignores unrelated ``tasks:*`` non-stream keys, and a fresh pool can then
+    persist a rotated credential from an old-worker result.
+    """
+    from orcest.orchestrator.loop import _backfill_retained_task_provider_accounts
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig, ProjectConfig
+    from orcest.shared.models import Task, TaskType
+    from orcest.shared.providers import ProviderEntry
+
+    original = '{"access_token":"old","refresh_token":"old-refresh"}'
+    rotated = '{"access_token":"new","refresh_token":"new-refresh"}'
+    entry = ProviderEntry(provider="grok", credential=original)
+    project = ProjectConfig(
+        repo="owner/testrepo",
+        token="fake-token",
+        claude_tokens=[],
+        key_prefix="test",
+        providers=[entry],
+    )
+    task_id = "pre-upgrade-in-flight-task"
+    legacy_task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo=project.repo,
+        token=project.token,
+        resource_type="pr",
+        resource_id=82,
+        prompt="fix it",
+        branch="fix/82",
+        key_prefix=project.key_prefix,
+        provider="grok",
+        credential=original,
+        task_id=task_id,
+    )
+    task_redis = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
+    legacy_fields = legacy_task.to_dict()
+    legacy_fields.pop("provider_account")
+    task_redis.xadd("tasks:grok", legacy_fields)
+    task_redis.set_value("tasks:metadata", "dashboard-smoke-key")
+    mapping_key = f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task_id}"
+    assert fake_redis_client.get(mapping_key) is None
+    assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, task_id) is None
+
+    pool = ProviderPool([entry])
+    count = _backfill_retained_task_provider_accounts(
+        task_redis,
+        ["tasks:grok", "tasks:issue:grok"],
+        [(project, fake_redis_client)],
+        {project.key_prefix: pool},
+        ttl_seconds=300,
+        logger=logging.getLogger("test"),
+    )
+
+    assert count == 1
+    assert fake_redis_client.get(mapping_key) == entry.account_key()
+    assert original not in (fake_redis_client.get(mapping_key) or "")
+
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id=task_id,
+        pr_number=82,
+    )
+    result.credential_update = rotated
+    assert result.provider_account == ""  # old-worker wire payload
+
+    _handle_result(
+        project,
+        LabelConfig(),
+        fake_redis_client,
+        result,
+        logging.getLogger("test"),
+        token_pool=pool,
+        shared_credential_redis=task_redis,
+    )
+
+    stored = json.loads(
+        task_redis.hget(_SHARED_CREDENTIAL_OVERRIDES_KEY, entry.account_key()) or "{}"
+    )
+    assert stored["blob"] == rotated
+    assert pool.effective_credential(entry) == rotated
+
+
+def test_pre_upgrade_backfill_matches_current_rotation_to_original_account(
+    fake_redis_client,
+):
+    from orcest.orchestrator.loop import _backfill_retained_task_provider_accounts
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.models import Task, TaskType
+    from orcest.shared.providers import ProviderEntry
+
+    original = '{"access_token":"original","refresh_token":"original-refresh"}'
+    current = '{"access_token":"current","refresh_token":"current-refresh"}'
+    entry = ProviderEntry(provider="grok", credential=original)
+    project = ProjectConfig(
+        repo="owner/testrepo",
+        token="fake-token",
+        claude_tokens=[],
+        key_prefix="test",
+        providers=[entry],
+    )
+    pool = ProviderPool([entry])
+    pool.seed_credential_override(entry.account_key(), current, minted_at=100.0)
+    task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo=project.repo,
+        token=project.token,
+        resource_type="pr",
+        resource_id=83,
+        prompt="fix it",
+        key_prefix=project.key_prefix,
+        provider="grok",
+        credential=current,
+        task_id="legacy-task-after-prior-rotation",
+    )
+    task_redis = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
+    legacy_fields = task.to_dict()
+    legacy_fields.pop("provider_account")
+    task_redis.xadd("tasks:grok", legacy_fields)
+
+    count = _backfill_retained_task_provider_accounts(
+        task_redis,
+        ["tasks:grok"],
+        [(project, fake_redis_client)],
+        {project.key_prefix: pool},
+        ttl_seconds=300,
+        logger=logging.getLogger("test"),
+    )
+
+    assert count == 1
+    assert fake_redis_client.get(f"{_TASK_PROVIDER_ACCOUNT_PREFIX}{task.id}") == entry.account_key()
+    assert entry.account_key() != ProviderEntry("grok", current).account_key()
+
+
+def test_credential_update_without_validated_account_remains_retryable(
+    fake_redis_client,
+):
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(
+        provider="grok",
+        credential='{"access_token":"old","refresh_token":"old-refresh"}',
+    )
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id="unmapped-pre-upgrade-task",
+        pr_number=84,
+    )
+    result.credential_update = '{"access_token":"new","refresh_token":"new-refresh"}'
+
+    with pytest.raises(_RetryableResultError, match="no unambiguous"):
+        _handle_result(
+            ProjectConfig(
+                repo="owner/testrepo",
+                token="fake-token",
+                claude_tokens=[],
+                key_prefix="test",
+                providers=[entry],
+            ),
+            LabelConfig(),
+            fake_redis_client,
+            result,
+            logging.getLogger("test"),
+            token_pool=ProviderPool([entry]),
+            shared_credential_redis=RedisClient.from_client(
+                fake_redis_client.client,
+                key_prefix="shared",
+            ),
+        )
 
 
 def test_task_provider_account_uses_atomic_per_task_ttl(fake_redis_client):
@@ -4029,6 +4478,7 @@ def test_task_provider_account_uses_atomic_per_task_ttl(fake_redis_client):
 
 def test_shared_credential_write_failure_retries_after_local_apply(
     fake_redis_client,
+    mocker,
 ):
     from unittest.mock import MagicMock
 
@@ -4053,6 +4503,10 @@ def test_shared_credential_write_failure_retries_after_local_apply(
     )
     result.credential_update = rotated
     result.credential_update_minted_at = 1_800_000_000_000_001.0
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
     shared = MagicMock()
     shared.hset_json_if_newer.side_effect = [ConnectionError("down"), True]
     shared.hget.return_value = json.dumps(
@@ -4129,6 +4583,7 @@ def test_retryable_result_is_left_pending_until_next_consume(
 
 def test_rejected_grok_credential_update_increments_provider_health_counter(
     fake_redis_client,
+    mocker,
 ):
     import logging
 
@@ -4147,6 +4602,10 @@ def test_rejected_grok_credential_update_increments_provider_health_counter(
         pr_number=79,
     )
     result.credential_update = '{"access_token":"new-access","expires_at":123}'
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
 
     _handle_result(
         ProjectConfig(

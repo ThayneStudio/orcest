@@ -681,7 +681,9 @@ def test_update_has_no_user_callable_backend_change_bypass(runner, cfg_path, moc
     )
 
     assert result.exit_code != 0
-    assert "No such option: --allow-backend-change" in result.output
+    # Click's punctuation/quoting around unknown options varies by version.
+    assert "No such option" in result.output
+    assert "--allow-backend-change" in result.output
     upload.assert_not_called()
 
 
@@ -2028,6 +2030,26 @@ def test_set_pool_size_negative(runner, cfg_path):
 # ── fleet stop ──────────────────────────────────────────────
 
 
+def test_stop_drain_active_missing_credentials_has_no_side_effects(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(endpoint="https://10.20.0.1:8006"),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(
+        fleet,
+        ["stop", "--drain-active", "--yes", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    assert "credentials are not configured" in result.output
+    assert "No fleet state was changed" in result.output
+    stop_pool.assert_not_called()
+
+
 def test_stop_destroys_idle_vms(runner, cfg_path, mocker):
     """stop destroys idle worker VMs and cleans Redis."""
     cfg = _proxmox_cfg(
@@ -2052,6 +2074,59 @@ def test_stop_destroys_idle_vms(runner, cfg_path, mocker):
     assert result.exit_code == 0
     assert mock_px.destroy_vm.call_count == 2
     mock_clean.assert_called_once()
+
+
+def test_stop_fails_when_destroyed_worker_markers_cannot_be_cleaned(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.clean_pool_redis",
+        side_effect=RuntimeError("marker verification failed"),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "durable Redis done/drain markers" in result.output
+    assert "not verified as cleared" in result.output
+    mock_px.destroy_vm.assert_called_once_with(300)
+
+
+def test_stop_destroy_failure_restarts_worker_and_exits_nonzero(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mock_px.destroy_vm.side_effect = RuntimeError("destroy failed")
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "failed to destroy 1" in result.output
+    assert "Stop incomplete" in result.output
+    mock_px.start_vm.assert_called_once_with(300)
 
 
 def test_stop_refuses_named_worker_outside_configured_vmid_range(runner, cfg_path, mocker):
@@ -2549,6 +2624,45 @@ def test_start_rejects_localhost_endpoint(runner, cfg_path):
 # ── deploy tests ───────────────────────────────────────────
 
 
+def test_deploy_missing_proxmox_credentials_fails_before_stop(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(endpoint="https://10.20.0.1:8006"),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "Deploy preflight failed before any services were stopped" in result.output
+    assert "Proxmox API credentials are not configured" in result.output
+    stop_pool.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_deploy_requires_worker_range_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=0),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "pool.vm_id_start is required" in result.output
+    stop_pool.assert_not_called()
+
+
 def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
     """deploy runs stop, update, and start in order without self-upgrading."""
     cfg = _proxmox_cfg(
@@ -2558,7 +2672,7 @@ def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
             api_token_secret="secret",
         ),
         orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
     )
     _save(cfg, cfg_path)
 
@@ -2601,7 +2715,7 @@ def test_deploy_defers_pool_manager_until_after_project_restart(runner, cfg_path
             api_token_secret="secret",
         ),
         orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000, worker_backend="clauder"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="clauder"),
         orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
         projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
     )
@@ -2783,6 +2897,7 @@ def test_deploy_drain_active_forwards_to_stop(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
     mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    mocker.patch("orcest.fleet.cli._ensure_orchestrator_ssh")
 
     result = runner.invoke(fleet, ["deploy", "--drain-active", "--config", cfg_path])
 

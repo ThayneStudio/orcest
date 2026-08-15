@@ -33,6 +33,7 @@ from orcest.worker.loop import (
     _publish_result_with_retry,
     _runner_for_task,
     _signal_ephemeral_done,
+    _task_result,
     run_worker,
 )
 from orcest.worker.runner import PROVIDER_REGISTRY, ProviderRecipe, RunnerResult
@@ -2388,6 +2389,31 @@ class TestDeadLetterTask:
 # ---------------------------------------------------------------------------
 # Tests for _publish_result_with_retry
 # ---------------------------------------------------------------------------
+
+
+def test_task_result_copies_stable_provider_account_from_task(local_worker_config):
+    task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo="owner/repo",
+        token="github-token",
+        resource_type="pr",
+        resource_id=42,
+        prompt="fix it",
+        provider="grok",
+        credential='{"access_token":"rotated","refresh_token":"rotated-refresh"}',
+        provider_account="grok:originalhash",
+    )
+
+    result = _task_result(
+        task,
+        local_worker_config,
+        ResultStatus.COMPLETED,
+        branch=None,
+        summary="done",
+        duration_seconds=1,
+    )
+
+    assert result.provider_account == "grok:originalhash"
 
 
 @pytest.mark.unit

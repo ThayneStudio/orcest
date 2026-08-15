@@ -535,6 +535,27 @@ def post_comment(repo: str, number: int, body: str, token: str) -> None:
         )
 
 
+def has_issue_comment_marker(repo: str, number: int, marker: str, token: str) -> bool:
+    """Return whether any PR/issue conversation comment contains *marker*.
+
+    Pull-request conversation comments use the issues comments REST endpoint,
+    so this provides one idempotency check for both resource types. ``--paginate``
+    prevents an older result comment from falling off the first page.
+    """
+    _validate_repo(repo)
+    output = _run_gh(
+        [
+            "api",
+            f"repos/{repo}/issues/{number}/comments",
+            "--paginate",
+            "--jq",
+            ".[].body",
+        ],
+        token,
+    )
+    return marker in output
+
+
 _VALID_MERGE_METHODS = {"squash", "merge", "rebase"}
 
 

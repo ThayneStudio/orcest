@@ -14,10 +14,19 @@ container_base_url="${DASHBOARD_PUBLISHED_CONTAINER_BASE_URL:-http://127.0.0.1:8
 host_published_network="${DASHBOARD_HOST_PUBLISHED_DOCKER_NETWORK:-host}"
 env_file="${DASHBOARD_ENV_FILE:-}"
 deploy_lock_dir="${DASHBOARD_DEPLOY_LOCK_DIR:-.dashboard-deploy.lock}"
+compose_file="${DASHBOARD_COMPOSE_FILE:-docker-compose.dashboard.yml}"
+compose_state_file="${DASHBOARD_COMPOSE_STATE_FILE:-.dashboard-compose.last-known-good.yml}"
 deploy_lock_acquired=0
 deploy_lock_held="${DASHBOARD_DEPLOY_LOCK_HELD:-0}"
 rollback_image_pinned=0
 candidate_may_be_live=0
+candidate_tag_replaced=0
+compose_config_swapped=0
+compose_candidate_backup=""
+compose_rollback_tmp=""
+compose_restore_tmp=""
+compose_state_tmp=""
+signal_handler_active=0
 
 compose_env_value() {
   file="$1"
@@ -203,6 +212,118 @@ cleanup_rollback_image() {
   fi
 }
 
+validate_compose_state_paths() {
+  if [ -z "$compose_file" ] || [ -z "$compose_state_file" ]; then
+    echo "DASHBOARD_COMPOSE_FILE and DASHBOARD_COMPOSE_STATE_FILE must be non-empty" >&2
+    return 1
+  fi
+  if [ "$compose_file" = "$compose_state_file" ]; then
+    echo "DASHBOARD_COMPOSE_STATE_FILE must differ from DASHBOARD_COMPOSE_FILE" >&2
+    return 1
+  fi
+  if [ ! -f "$compose_file" ] || [ ! -r "$compose_file" ] || [ -L "$compose_file" ]; then
+    echo "Dashboard Compose file must be a readable regular file, not a symlink: $compose_file" >&2
+    return 1
+  fi
+  if [ -e "$compose_state_file" ] &&
+    { [ ! -f "$compose_state_file" ] || [ -L "$compose_state_file" ]; }
+  then
+    echo "Dashboard Compose state file must be a regular file, not a symlink: $compose_state_file" >&2
+    return 1
+  fi
+}
+
+restore_candidate_compose() {
+  if [ "$compose_config_swapped" != "1" ]; then
+    return 0
+  fi
+  pause_deploy_signals
+  compose_restore_tmp="$(mktemp "${compose_file}.restore.XXXXXX")" || {
+    resume_deploy_signals
+    return 1
+  }
+  if cp -p "$compose_candidate_backup" "$compose_restore_tmp" &&
+    mv "$compose_restore_tmp" "$compose_file"
+  then
+    rm -f "$compose_candidate_backup"
+    compose_candidate_backup=""
+    compose_restore_tmp=""
+    compose_config_swapped=0
+    resume_deploy_signals
+    return 0
+  fi
+  rm -f "$compose_restore_tmp"
+  compose_restore_tmp=""
+  resume_deploy_signals
+  echo "Dashboard deploy could not restore candidate Compose file $compose_file" >&2
+  return 1
+}
+
+activate_rollback_compose() {
+  if [ "$compose_config_swapped" = "1" ]; then
+    return 0
+  fi
+  if [ -z "$previous_container" ] || [ ! -s "$compose_state_file" ]; then
+    return 0
+  fi
+  validate_compose_state_paths || return $?
+  pause_deploy_signals
+  compose_candidate_backup="$(mktemp "${compose_file}.candidate.XXXXXX")" || {
+    resume_deploy_signals
+    return 1
+  }
+  if ! cp -p "$compose_file" "$compose_candidate_backup"; then
+    rm -f "$compose_candidate_backup"
+    compose_candidate_backup=""
+    resume_deploy_signals
+    return 1
+  fi
+  compose_rollback_tmp="$(mktemp "${compose_file}.rollback.XXXXXX")" || {
+    rm -f "$compose_candidate_backup"
+    compose_candidate_backup=""
+    resume_deploy_signals
+    return 1
+  }
+  if ! cp -p "$compose_state_file" "$compose_rollback_tmp" ||
+    ! mv "$compose_rollback_tmp" "$compose_file"
+  then
+    rm -f "$compose_rollback_tmp" "$compose_candidate_backup"
+    compose_rollback_tmp=""
+    compose_candidate_backup=""
+    resume_deploy_signals
+    echo "Dashboard deploy could not activate last-known-good Compose configuration" >&2
+    return 1
+  fi
+  compose_rollback_tmp=""
+  compose_config_swapped=1
+  resume_deploy_signals
+  echo "Dashboard rollback is using last-known-good Compose configuration" >&2
+}
+
+refresh_compose_state() {
+  validate_compose_state_paths || return $?
+  pause_deploy_signals
+  compose_state_tmp="$(mktemp "${compose_state_file}.tmp.XXXXXX")" || {
+    resume_deploy_signals
+    return 1
+  }
+  if cp -p "$compose_file" "$compose_state_tmp" &&
+    mv "$compose_state_tmp" "$compose_state_file"
+  then
+    compose_state_tmp=""
+    candidate_may_be_live=0
+    candidate_tag_replaced=0
+    resume_deploy_signals
+    echo "Dashboard last-known-good Compose configuration refreshed"
+    return 0
+  fi
+  rm -f "$compose_state_tmp"
+  compose_state_tmp=""
+  resume_deploy_signals
+  echo "Dashboard deploy could not refresh Compose state file $compose_state_file" >&2
+  return 1
+}
+
 validate_deploy_lock_dir() {
   case "$deploy_lock_dir" in
     ""|"/"|"."|".."|"/."|"/.."|../*|*/..|*/../*)
@@ -257,7 +378,24 @@ release_deploy_lock() {
   fi
 }
 
+pause_deploy_signals() {
+  if [ "$signal_handler_active" = "0" ]; then
+    trap '' INT TERM
+  fi
+}
+
+resume_deploy_signals() {
+  if [ "$signal_handler_active" = "0" ]; then
+    trap 'handle_signal 130 "$@"' INT
+    trap 'handle_signal 143 "$@"' TERM
+  fi
+}
+
 cleanup() {
+  restore_candidate_compose || true
+  [ -z "$compose_rollback_tmp" ] || rm -f "$compose_rollback_tmp"
+  [ -z "$compose_restore_tmp" ] || rm -f "$compose_restore_tmp"
+  [ -z "$compose_state_tmp" ] || rm -f "$compose_state_tmp"
   cleanup_rollback_image
   release_deploy_lock
 }
@@ -266,18 +404,22 @@ handle_signal() {
   code="$1"
   shift
   trap - EXIT INT TERM
+  signal_handler_active=1
   if [ "$candidate_may_be_live" = "1" ]; then
     echo "Dashboard deploy interrupted after candidate start; rolling back" >&2
     rollback_dashboard "$@" || true
     candidate_may_be_live=0
+  elif [ "$candidate_tag_replaced" = "1" ]; then
+    echo "Dashboard deploy interrupted before candidate start; restoring previous image tag" >&2
+    restore_previous_image_tag || true
+    candidate_tag_replaced=0
   fi
   cleanup
   exit "$code"
 }
 
 trap cleanup EXIT
-trap 'handle_signal 130 "$@"' INT
-trap 'handle_signal 143 "$@"' TERM
+resume_deploy_signals
 
 if [ "$deploy_lock_held" = "1" ]; then
   validate_deploy_lock_dir
@@ -288,6 +430,11 @@ if [ "$deploy_lock_held" = "1" ]; then
 else
   acquire_deploy_lock "$@"
 fi
+
+# Validate every persistent path before Compose can build an image or replace a
+# live container. This also rejects state-file symlinks before rollback state is
+# pinned or refreshed.
+validate_compose_state_paths || exit 1
 
 previous_container="$("$@" ps -q dashboard 2>/dev/null || true)"
 previous_image_id=""
@@ -342,17 +489,25 @@ restore_previous_image_tag() {
 
 fail_before_live_start() {
   restore_previous_image_tag || true
+  candidate_tag_replaced=0
   exit 1
 }
 
 rollback_dashboard() {
+  if ! activate_rollback_compose; then
+    echo "Dashboard rollback could not activate the previous Compose configuration" >&2
+    return 1
+  fi
+
   if [ "$rollback_image_pinned" != "1" ]; then
     echo "No previous dashboard image is available for rollback; removing failed dashboard service" >&2
     if "$@" rm -sf dashboard; then
       echo "Removed failed dashboard service" >&2
+      restore_candidate_compose || return $?
       return 0
     fi
     echo "Failed dashboard service could not be removed" >&2
+    restore_candidate_compose || true
     return 1
   fi
 
@@ -361,8 +516,10 @@ rollback_dashboard() {
   if [ "$previous_image_name" = "$dashboard_image" ]; then
     if ! restore_previous_image_tag; then
       echo "Dashboard rollback could not restore the previous image tag" >&2
+      restore_candidate_compose || true
       return 1
     fi
+    candidate_tag_replaced=0
     rollback_compose_image="$dashboard_image"
   else
     docker image rm "$dashboard_image" >/dev/null 2>&1 || true
@@ -376,28 +533,38 @@ rollback_dashboard() {
   fi
   if ! DASHBOARD_IMAGE="$rollback_compose_image" "$@" up -d --no-build --force-recreate dashboard; then
     echo "Dashboard rollback could not restart the previous image" >&2
+    restore_candidate_compose || true
     return 1
   fi
   if [ -n "$previous_assets" ]; then
     if check_published "$previous_assets" "$@"; then
       echo "Dashboard rollback published readiness verified"
+      restore_candidate_compose || return $?
       return 0
     fi
     "$@" logs --tail=100 dashboard || true
     echo "Dashboard rollback did not become published-ready" >&2
+    restore_candidate_compose || true
     return 1
   fi
 
   echo "Dashboard rollback restarted the previous image; previous asset list was unavailable; checking readiness without asset pin" >&2
   if check_published_unpinned "$@"; then
     echo "Dashboard rollback readiness verified without asset pin"
+    restore_candidate_compose || return $?
     return 0
   fi
   "$@" logs --tail=100 dashboard || true
   echo "Dashboard rollback did not become readiness-ready without asset pin" >&2
+  restore_candidate_compose || true
   return 1
 }
 
+# Compose build can replace the service tag before its foreground process
+# returns. Arm restoration first so a deferred INT/TERM at that boundary sees
+# the candidate transaction as active. Restoration is idempotent whether the
+# build changed the tag or failed before doing so.
+candidate_tag_replaced=1
 if ! DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard; then
   echo "Dashboard compose build failed" >&2
   fail_before_live_start
@@ -447,7 +614,11 @@ fi
 
 echo "Waiting for dashboard published readiness..."
 if check_published "$expected_assets" "$@"; then
-  candidate_may_be_live=0
+  if ! refresh_compose_state; then
+    echo "Dashboard candidate was ready but its Compose configuration could not be committed" >&2
+    rollback_dashboard "$@" || true
+    exit 1
+  fi
   echo "Dashboard published readiness verified"
   exit 0
 fi

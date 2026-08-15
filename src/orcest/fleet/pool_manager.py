@@ -16,6 +16,7 @@ import os
 import signal
 import threading
 import time
+from typing import Any, cast
 
 import redis
 
@@ -43,6 +44,8 @@ _POOL_IDLE_KEY = "pool:idle"
 _POOL_ACTIVE_KEY = "pool:active"
 _POOL_DRAINING_KEY = "pool:draining"
 _POOL_DONE_PREFIX = "pool:done:"
+_POOL_PROVISIONING_KEY = "pool:provisioning"
+_POOL_AMBIGUOUS_CLONES_KEY = "pool:ambiguous-clones"
 # Workers can block on the issue stream for up to five seconds. A drain lease
 # must be visible for longer than that before the final PEL check.
 _DRAIN_QUIESCE_SECONDS = 5.25
@@ -98,6 +101,11 @@ class PoolManager:
         # De-spam flag: True once the "no valid template" error has been
         # logged, cleared again as soon as a valid template is resolved.
         self._template_recovery_failed = False
+        # Redis is the durable source of truth. These sets bridge transient
+        # Redis failures within this process after Proxmox has confirmed clone
+        # success, and keep test doubles/inventory lag from reusing an ID.
+        self._owned_provisioning_vmids: set[int] = set()
+        self._allocated_vmids: set[int] = set()
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -108,7 +116,10 @@ class PoolManager:
         try:
             self._check_done_workers()
             self._detect_active_workers()
-            self._fill_pool()
+            ambiguity_clear = self._reconcile_ambiguous_clones()
+            provisioning_clear = self._retry_provisioning_cleanups()
+            if ambiguity_clear and provisioning_clear:
+                self._fill_pool()
             self._health_check()
             self._reconcile_stale_redis()
             self._sweep_orphan_pel()
@@ -228,9 +239,14 @@ class PoolManager:
             )
             for _ in range(deficit):
                 try:
-                    self._clone_and_boot()
+                    if self._clone_and_boot() is None:
+                        # A failed clone may have an ambiguous outcome or an
+                        # owned VM awaiting cleanup. Do not fan out more clone
+                        # attempts until the next reconciliation resolves it.
+                        break
                 except Exception:
                     logger.error("Failed to clone and boot VM", exc_info=True)
+                    break
         elif deficit < 0 and int(idle_count) > 0:
             # Excess VMs — destroy idle ones (never kill active workers).
             excess = min(-deficit, int(idle_count))
@@ -420,23 +436,42 @@ class PoolManager:
             destroyed = False
             logger.error("Failed to destroy VM %d", vm_id, exc_info=True)
 
-        # Remove from all tracking sets regardless of Proxmox errors.
-        # If this pipeline fails, the stale Redis entry will be cleaned up
-        # by _reconcile_stale_redis on the next reconciliation pass.
+        if not destroyed:
+            # Retain tracking and lifecycle markers so the same generation is
+            # retried. Clearing them after a failed Proxmox destroy can make the
+            # still-live VM look reusable.
+            return False
+
+        # Destruction is not complete until durable generation markers are gone.
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.srem(_POOL_IDLE_KEY, str(vm_id))
             pipe.hdel(_POOL_ACTIVE_KEY, str(vm_id))
-            pipe.srem(_POOL_DRAINING_KEY, self._vm_id_to_worker_id(vm_id))
+            pipe.srem(_POOL_DRAINING_KEY, worker_id)
+            pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
+            pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            pipe.delete(done_key)
             pipe.execute()
+            if (
+                self._redis.exists(done_key)
+                or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
+                or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
+                or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            ):
+                raise RuntimeError("lifecycle markers remain after cleanup")
         except Exception:
             logger.error(
-                "Failed to clean Redis tracking for VM %d; stale entry will be "
-                "reconciled on next pass",
+                "VM %d was destroyed but Redis generation cleanup was not verified; "
+                "refusing to report lifecycle success",
                 vm_id,
                 exc_info=True,
             )
-        return destroyed
+            return False
+        self._owned_provisioning_vmids.discard(vm_id)
+        self._allocated_vmids.discard(vm_id)
+        return True
 
     def _read_template_pointer(self) -> int | None:
         """Return the configured template VMID without checking it exists.
@@ -451,26 +486,26 @@ class PoolManager:
         """
         try:
             raw = self._redis.get(_POOL_CURRENT_TEMPLATE_KEY)
-        except Exception:
-            logger.warning(
-                "Failed to read template pointer from Redis; falling back to config",
-                exc_info=True,
-            )
-            raw = None
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot safely resolve the active template: Redis pointer read failed"
+            ) from exc
 
         if raw:
             try:
                 return int(raw)
-            except (TypeError, ValueError):
-                logger.warning("Invalid template pointer %r in Redis; falling back to config", raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot safely resolve the active template: invalid Redis pointer {raw!r}"
+                ) from exc
 
         fallback = self._pool.template_vm_id
         if not fallback:
             return None
-        # Initialise pointer from config so future reads come from Redis.
-        # Best-effort: if Redis is down we still return the fallback ID.
+        # Initialise the missing pointer from config so future reads come from
+        # Redis. The candidate is still validated against Proxmox below.
         try:
-            self._redis.set_ex(_POOL_CURRENT_TEMPLATE_KEY, str(fallback), ttl=86400 * 365)
+            self._redis.set_value(_POOL_CURRENT_TEMPLATE_KEY, str(fallback))
         except Exception:
             logger.warning("Failed to initialise template pointer in Redis", exc_info=True)
         return fallback
@@ -479,8 +514,9 @@ class PoolManager:
         """Return the VMID of a worker template that actually exists in Proxmox.
 
         Reads the configured template VMID (Redis pointer, then config) and
-        validates it exists. A dangling pointer — e.g. the template was
-        garbage-collected while the pointer still named it — would otherwise
+        validates it is an actual Proxmox template in the configured template
+        range (or the explicit legacy template VMID). A dangling or unsafe
+        pointer would otherwise
         make every clone fail with ``unable to find configuration file`` and
         drive an endless clone-retry storm.
 
@@ -506,19 +542,24 @@ class PoolManager:
             return replacement
 
         try:
-            exists = self._proxmox.vm_exists(candidate)
+            all_vms = self._proxmox.list_vms()
         except Exception:
-            # Transient Proxmox error — do not mistake it for a missing
-            # template. Use the candidate; the clone will surface any real
-            # failure and be retried next cycle.
             logger.warning(
-                "Could not verify template VM %d exists; using it anyway",
+                "Could not verify template VM %d against Proxmox inventory; refusing to clone",
                 candidate,
                 exc_info=True,
             )
-            return candidate
+            return None
 
-        if exists:
+        candidate_info = next(
+            (vm for vm in all_vms if str(vm.get("vmid", "")) == str(candidate)),
+            None,
+        )
+        if (
+            self._is_configured_template_id(candidate)
+            and candidate_info is not None
+            and self._is_proxmox_template(candidate_info)
+        ):
             self._template_recovery_failed = False
             return candidate
 
@@ -526,7 +567,7 @@ class PoolManager:
         if replacement is None:
             if not self._template_recovery_failed:
                 logger.error(
-                    "Active template VM %d does not exist in Proxmox and no "
+                    "Active template VM %d is not a valid configured Proxmox template and no "
                     "replacement template was found — the pool cannot grow "
                     "until a template is baked (run 'orcest fleet rebake')",
                     candidate,
@@ -535,7 +576,7 @@ class PoolManager:
             return None
 
         logger.error(
-            "Active template VM %d does not exist in Proxmox; recovering by "
+            "Active template VM %d is not a valid configured Proxmox template; recovering by "
             "repointing the active template to live template VM %d",
             candidate,
             replacement,
@@ -548,8 +589,10 @@ class PoolManager:
         """Find a live worker template to recover a dangling template pointer.
 
         Searches Proxmox for template VMs inside ``template_vmid_range`` (or
-        matching the single-VMID config fallback). Prefers the highest VMID,
-        which is the most recently baked template.
+        matching the single-VMID config fallback). Recovery is allowed only
+        when exactly one candidate exists. Rebake allocates the lowest free
+        VMID, so numeric order is not generation order; choosing among multiple
+        candidates could silently roll the worker pool backward.
         """
         try:
             rng = self._pool.template_range()
@@ -587,12 +630,29 @@ class PoolManager:
 
         if not candidates:
             return None
-        return max(candidates)
+        if len(candidates) > 1:
+            logger.error(
+                "Cannot recover the active template pointer: multiple live candidates %s "
+                "exist. Restore pool:current_template_vmid explicitly or run a coordinated "
+                "rebake; numeric VMID order does not identify the newest generation.",
+                sorted(candidates),
+            )
+            return None
+        return candidates[0]
+
+    def _is_configured_template_id(self, vm_id: int) -> bool:
+        """Return whether *vm_id* is authorized to be used as a template."""
+        try:
+            rng = self._pool.template_range()
+        except ValueError:
+            rng = None
+        in_range = rng is not None and rng[0] <= vm_id <= rng[1]
+        return in_range or bool(self._pool.template_vm_id == vm_id and vm_id != 0)
 
     def _repoint_template_pointer(self, vm_id: int) -> None:
         """Repoint the Redis template pointer so a recovery survives restarts."""
         try:
-            self._redis.set_ex(_POOL_CURRENT_TEMPLATE_KEY, str(vm_id), ttl=86400 * 365)
+            self._redis.set_value(_POOL_CURRENT_TEMPLATE_KEY, str(vm_id))
         except Exception:
             logger.warning(
                 "Failed to repoint template pointer to VM %d in Redis",
@@ -624,6 +684,18 @@ class PoolManager:
         new_id = self._next_vm_id()
         name = self._vm_id_to_worker_id(new_id)
 
+        # VMIDs are intentionally reused. A durable done key or drain member
+        # from the prior generation would make the next reconciliation destroy
+        # (or immediately stop) this fresh clone, so lifecycle cleanup is a
+        # required allocation commit point rather than best-effort hygiene.
+        self._prepare_worker_generation(new_id)
+
+        # Reserve the VMID as ambiguous before the API call. If clone_vm raises,
+        # its outcome is unknowable: the request may have failed before create,
+        # timed out after create, or raced another owner. The durable quarantine
+        # prevents both reuse and orphan cleanup from guessing based on a name.
+        self._reserve_clone_attempt(new_id)
+
         logger.info("Cloning VM %d from template %d (name=%s)", new_id, template_id, name)
 
         try:
@@ -634,14 +706,29 @@ class PoolManager:
                 linked=True,
             )
         except Exception:
-            logger.error("Failed to clone VM %d, attempting cleanup", new_id, exc_info=True)
-            # clone_vm may have partially created the VM before failing
-            # (e.g. Proxmox task timeout after clone completed).  Best-effort
-            # cleanup to avoid orphaned VMs in Proxmox.
-            try:
-                self._proxmox.destroy_vm(new_id)
-            except Exception:
-                pass  # VM may not exist; either way, nothing more we can do
+            logger.error(
+                "Clone outcome for VM %d is ambiguous; quarantining the VMID for operator review",
+                new_id,
+                exc_info=True,
+            )
+            return None
+
+        # clone_vm returned successfully, so ownership is now proven. Record it
+        # durably before any provisioning step that may require cleanup.
+        self._owned_provisioning_vmids.add(new_id)
+        self._allocated_vmids.add(new_id)
+        try:
+            self._redis.sadd(_POOL_PROVISIONING_KEY, str(new_id))
+            if not self._redis.sismember(_POOL_PROVISIONING_KEY, str(new_id)):
+                raise RuntimeError("provisioning marker was not persisted")
+            self._redis.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(new_id))
+        except Exception:
+            logger.error(
+                "Failed to durably record ownership of clone VM %d; destroying",
+                new_id,
+                exc_info=True,
+            )
+            self._destroy_vm(new_id)
             return None
 
         # Assign a deterministic MAC so DHCP leases are recycled when
@@ -698,7 +785,11 @@ class PoolManager:
 
         logger.info("VM %d booted with IP %s, adding to idle pool", new_id, ip)
         try:
-            self._redis.sadd(_POOL_IDLE_KEY, str(new_id))
+            pipe = self._redis.pipeline()
+            pipe.sadd(_POOL_IDLE_KEY, str(new_id))
+            pipe.srem(_POOL_PROVISIONING_KEY, str(new_id))
+            pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(new_id))
+            pipe.execute()
         except Exception:
             logger.error(
                 "Failed to add VM %d to idle pool in Redis, destroying to avoid orphan",
@@ -708,7 +799,176 @@ class PoolManager:
             self._destroy_vm(new_id)
             return None
 
+        self._owned_provisioning_vmids.discard(new_id)
         return new_id
+
+    def _prepare_worker_generation(self, vm_id: int) -> None:
+        """Clear and verify durable lifecycle state before reusing *vm_id*."""
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
+        try:
+            pipe = self._redis.pipeline()
+            pipe.delete(done_key)
+            pipe.srem(_POOL_DRAINING_KEY, worker_id)
+            pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
+            pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            pipe.execute()
+            if (
+                self._redis.exists(done_key)
+                or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
+                or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
+                or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            ):
+                raise RuntimeError("lifecycle markers remain after cleanup")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing to reuse VMID {vm_id}: could not clear stale lifecycle markers"
+            ) from exc
+
+    def _reserve_clone_attempt(self, vm_id: int) -> None:
+        """Durably quarantine a VMID before invoking the non-idempotent clone API."""
+        try:
+            self._redis.sadd(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            if not self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id)):
+                raise RuntimeError("ambiguous-clone marker was not persisted")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing to clone VMID {vm_id}: could not persist clone-attempt quarantine"
+            ) from exc
+
+    def _retry_provisioning_cleanups(self) -> bool:
+        """Retry cleanup of every clone known to have passed clone_vm().
+
+        The Redis set makes cleanup retryable across process restarts. An
+        in-memory mirror covers a transient Redis failure after clone success
+        without ever upgrading an ambiguous clone result into owned state.
+        Returns ``False`` while any cleanup remains so the pool does not create
+        more VMs on top of an unresolved provisioning failure.
+        """
+        try:
+            pending = {
+                int(member)
+                for member in self._redis.smembers(_POOL_PROVISIONING_KEY)
+                if str(member).lstrip("-").isdigit()
+            }
+        except Exception:
+            logger.error("Failed to read durable provisioning cleanup state", exc_info=True)
+            return False
+        pending.update(self._owned_provisioning_vmids)
+        if not pending:
+            return True
+
+        try:
+            inventory = self._proxmox.list_vms()
+        except Exception:
+            logger.error("Failed to list VMs for provisioning cleanup retry", exc_info=True)
+            return False
+        existing = {
+            int(vm["vmid"]): vm
+            for vm in inventory
+            if vm.get("vmid") is not None and str(vm.get("vmid")).lstrip("-").isdigit()
+        }
+
+        complete = True
+        for vm_id in sorted(pending):
+            if not self._is_destroyable_vm_id(vm_id):
+                logger.error(
+                    "Refusing provisioning cleanup for VM %d outside the worker range",
+                    vm_id,
+                )
+                complete = False
+                continue
+            vm_info = existing.get(vm_id)
+            if vm_info is None:
+                if not self._clear_destroyed_worker_state(vm_id):
+                    complete = False
+                continue
+            if self._is_proxmox_template(vm_info):
+                logger.error(
+                    "Refusing to destroy template VM %d during provisioning cleanup", vm_id
+                )
+                complete = False
+                continue
+            if not self._destroy_vm(vm_id):
+                complete = False
+        return complete
+
+    def _reconcile_ambiguous_clones(self) -> bool:
+        """Release quarantined VMIDs only when inventory proves no VM exists.
+
+        A present VM remains quarantined because a clone exception cannot prove
+        who created it. This is deliberately operator-resolved; an absent VMID
+        can be released automatically from an authoritative inventory snapshot.
+        """
+        try:
+            raw_members = self._redis.smembers(_POOL_AMBIGUOUS_CLONES_KEY)
+            ambiguous = {int(member) for member in raw_members if str(member).lstrip("-").isdigit()}
+        except Exception:
+            logger.error("Failed to read ambiguous clone quarantine state", exc_info=True)
+            return False
+        if not ambiguous:
+            return True
+        try:
+            existing = {
+                int(vm["vmid"])
+                for vm in self._proxmox.list_vms()
+                if vm.get("vmid") is not None and str(vm.get("vmid")).lstrip("-").isdigit()
+            }
+        except Exception:
+            logger.error("Failed to verify ambiguous clone VMIDs against Proxmox", exc_info=True)
+            return False
+
+        complete = True
+        for vm_id in sorted(ambiguous):
+            if vm_id in existing:
+                logger.error(
+                    "Clone outcome for VM %d remains ambiguous; leaving it quarantined. "
+                    "Inspect the VM in Proxmox, then remove it or explicitly clear Redis "
+                    "member %s from %s",
+                    vm_id,
+                    vm_id,
+                    _POOL_AMBIGUOUS_CLONES_KEY,
+                )
+                complete = False
+                continue
+            try:
+                self._redis.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+                if self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id)):
+                    raise RuntimeError("quarantine marker remains")
+                self._allocated_vmids.discard(vm_id)
+            except Exception:
+                logger.error(
+                    "Failed to release absent ambiguous clone VMID %d", vm_id, exc_info=True
+                )
+                complete = False
+        return complete
+
+    def _clear_destroyed_worker_state(self, vm_id: int) -> bool:
+        """Clear lifecycle state after inventory proves the VM is absent."""
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
+        try:
+            pipe = self._redis.pipeline()
+            pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+            pipe.hdel(_POOL_ACTIVE_KEY, str(vm_id))
+            pipe.srem(_POOL_DRAINING_KEY, worker_id)
+            pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
+            pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            pipe.delete(done_key)
+            pipe.execute()
+            if (
+                self._redis.exists(done_key)
+                or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
+                or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
+                or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            ):
+                raise RuntimeError("lifecycle markers remain after cleanup")
+        except Exception:
+            logger.error("Failed to clear destroyed worker state for VM %d", vm_id, exc_info=True)
+            return False
+        self._owned_provisioning_vmids.discard(vm_id)
+        self._allocated_vmids.discard(vm_id)
+        return True
 
     def _health_check(self) -> None:
         """Force-destroy VMs that exceeded max_task_duration."""
@@ -798,10 +1058,16 @@ class PoolManager:
             logger.warning("Failed to list VMs for orphan reconciliation", exc_info=True)
             return
 
-        idle_members = self._redis.smembers(_POOL_IDLE_KEY)
-        active_members = set(self._redis.hgetall(_POOL_ACTIVE_KEY).keys())
+        try:
+            idle_members = self._redis.smembers(_POOL_IDLE_KEY)
+            active_members = set(self._redis.hgetall(_POOL_ACTIVE_KEY).keys())
+            provisioning_members = self._redis.smembers(_POOL_PROVISIONING_KEY)
+            ambiguous_members = self._redis.smembers(_POOL_AMBIGUOUS_CLONES_KEY)
+        except Exception:
+            logger.warning("Failed to read Redis state for orphan reconciliation", exc_info=True)
+            return
         tracked_vm_ids: set[int] = set()
-        for member in idle_members | active_members:
+        for member in idle_members | active_members | provisioning_members | ambiguous_members:
             try:
                 tracked_vm_ids.add(int(member))
             except (ValueError, TypeError):
@@ -812,6 +1078,12 @@ class PoolManager:
             if vm_id is None:
                 continue
             vm_id = int(vm_id)
+
+            # Redis tracking (including the pre-clone ambiguity quarantine)
+            # is authoritative here. In particular, never turn an ambiguous
+            # clone result into ownership by inspecting its deterministic name.
+            if vm_id in tracked_vm_ids:
+                continue
 
             # Defence in depth: never destroy a Proxmox template, period.
             # Proxmox marks templates with ``template: 1`` in the API; this
@@ -825,17 +1097,23 @@ class PoolManager:
             # awaiting GC). Old templates with live linked clones must not be
             # touched here; they get cleaned up by `orcest fleet gc-templates`
             # once their clones churn out.
-            if self._is_template_vmid(vm_id):
-                continue
-
-            if vm_id not in tracked_vm_ids:
-                logger.warning(
-                    "Orphaned VM %d (%s) found in Proxmox but not tracked in Redis, destroying",
-                    vm_id,
-                    vm_info.get("name", "unknown"),
+            try:
+                if self._is_template_vmid(vm_id):
+                    continue
+            except Exception:
+                logger.error(
+                    "Template identity is unavailable; refusing orphan destruction",
+                    exc_info=True,
                 )
-                # _destroy_vm handles all exceptions internally.
-                self._destroy_vm(vm_id)
+                return
+
+            logger.warning(
+                "Orphaned VM %d (%s) found in Proxmox but not tracked in Redis, destroying",
+                vm_id,
+                vm_info.get("name", "unknown"),
+            )
+            # _destroy_vm handles all exceptions internally.
+            self._destroy_vm(vm_id)
 
     def _reconcile_stale_redis(self) -> None:
         """Remove Redis pool entries whose VMs no longer exist in Proxmox.
@@ -963,8 +1241,23 @@ class PoolManager:
         }
         try:
             for key in self._redis.scan_iter(match="tasks:*"):
-                if self._is_task_stream_key(key):
-                    streams.add(self._fq_task_stream(key))
+                if not self._is_task_stream_key(key):
+                    continue
+                fq_key = self._fq_task_stream(key)
+                raw_type = self._redis.client.type(fq_key)
+                key_type = raw_type.decode() if isinstance(raw_type, bytes) else str(raw_type)
+                if key_type not in {
+                    "none",
+                    "string",
+                    "list",
+                    "set",
+                    "zset",
+                    "hash",
+                    "stream",
+                }:
+                    raise RuntimeError(f"unexpected Redis TYPE output {key_type!r}")
+                if key_type == "stream":
+                    streams.add(fq_key)
         except Exception:
             logger.warning("Failed to discover task streams from Redis", exc_info=True)
             return tuple(sorted(streams)), False
@@ -1020,8 +1313,26 @@ class PoolManager:
                     complete = False
                     continue
                 for consumer in consumers:
-                    if consumer.get("pending", 0) > 0:
-                        names.add(str(consumer.get("name", "")))
+                    pending_raw = consumer.get("pending")
+                    if isinstance(pending_raw, bool) or not isinstance(
+                        pending_raw, (int, str, bytes)
+                    ):
+                        complete = False
+                        continue
+                    try:
+                        pending = int(pending_raw)
+                    except (TypeError, ValueError):
+                        complete = False
+                        continue
+                    if pending < 0:
+                        complete = False
+                        continue
+                    if pending > 0:
+                        name = str(consumer.get("name", ""))
+                        if not name:
+                            complete = False
+                            continue
+                        names.add(name)
         return names, complete
 
     def _is_template_vmid(self, vm_id: int) -> bool:
@@ -1091,8 +1402,10 @@ class PoolManager:
                 vm_id = vm.get("vmid")
                 if vm_id is not None:
                     existing.add(int(vm_id))
-        except Exception:
-            logger.warning("Failed to list VMs for ID allocation", exc_info=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot allocate a worker VMID while the Proxmox VM inventory is unavailable"
+            ) from exc
 
         # Also include IDs tracked in Redis (may not yet be visible in Proxmox)
         for member in self._redis.smembers(_POOL_IDLE_KEY):
@@ -1105,6 +1418,13 @@ class PoolManager:
                 existing.add(int(member))
             except (ValueError, TypeError):
                 pass
+        for key in (_POOL_PROVISIONING_KEY, _POOL_AMBIGUOUS_CLONES_KEY):
+            for member in self._redis.smembers(key):
+                try:
+                    existing.add(int(member))
+                except (ValueError, TypeError):
+                    pass
+        existing.update(self._allocated_vmids)
 
         candidate = start
         while candidate in existing:
@@ -1242,17 +1562,20 @@ class PoolManager:
         ):
             return []
 
-        pending: list[dict[str, object]] = []
+        pending: list[dict[str, Any]] = []
         start_id = "-"
         while True:
             try:
-                batch = self._redis.client.xpending_range(
-                    fq_stream,
-                    CONSUMER_GROUP,
-                    min=start_id,
-                    max="+",
-                    count=_PENDING_READ_BATCH_SIZE,
-                    consumername=consumer,
+                batch = cast(
+                    Any,
+                    self._redis.client.xpending_range(
+                        fq_stream,
+                        CONSUMER_GROUP,
+                        min=start_id,
+                        max="+",
+                        count=_PENDING_READ_BATCH_SIZE,
+                        consumername=consumer,
+                    ),
                 )
             except redis.ResponseError as exc:
                 if _is_missing_stream_or_group_error(exc):
@@ -1288,11 +1611,15 @@ class PoolManager:
 
         out: list[tuple[str, dict[str, str]]] = []
         for p in pending:
-            entry_id = p.get("message_id")
-            if entry_id is None:
+            raw_entry_id = p.get("message_id")
+            if raw_entry_id is None:
                 continue
+            entry_id = str(raw_entry_id)
             try:
-                rng = self._redis.client.xrange(fq_stream, min=entry_id, max=entry_id)
+                rng = cast(
+                    Any,
+                    self._redis.client.xrange(fq_stream, min=entry_id, max=entry_id),
+                )
             except Exception:
                 logger.warning(
                     "Failed to read pending entry %s for consumer %s on %s",
@@ -1302,7 +1629,10 @@ class PoolManager:
                     exc_info=True,
                 )
                 return None
-            fields = rng[0][1] if rng else {}
+            raw_fields = rng[0][1] if rng else {}
+            if not isinstance(raw_fields, dict):
+                return None
+            fields = {str(key): str(value) for key, value in raw_fields.items()}
             out.append((entry_id, fields))
         return out
 
@@ -1346,7 +1676,10 @@ class PoolManager:
         try:
             if task.key_prefix:
                 fq_results = f"{task.key_prefix}:{_RESULTS_STREAM}"
-                entries = self._redis.client.xrevrange(fq_results, count=_RESULT_MAXLEN)
+                entries = cast(
+                    Any,
+                    self._redis.client.xrevrange(fq_results, count=_RESULT_MAXLEN),
+                )
             else:
                 entries = self._redis.xrevrange(_RESULTS_STREAM, count=_RESULT_MAXLEN)
         except Exception:
