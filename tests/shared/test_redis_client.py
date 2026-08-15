@@ -942,6 +942,8 @@ def test_xautoclaim_raw_empty_pel_returns_empty(fake_redis_client):
     rc.client.xgroup_create(fq, "workers", id="0")
     cursor, claimed = rc.xautoclaim_raw(fq, "workers", "sweeper", min_idle_ms=0)
     assert claimed == []
+
+
 # Tests for xtrim_acked_entries (M1-conc)
 # ---------------------------------------------------------------------------
 
@@ -1004,9 +1006,7 @@ def test_xtrim_acked_entries_missing_stream_returns_zero(fake_redis_client):
     assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0
 
 
-def test_xtrim_acked_entries_retries_when_claim_changes_watched_stream(
-    fake_redis_client, mocker
-):
+def test_xtrim_acked_entries_retries_when_claim_changes_watched_stream(fake_redis_client, mocker):
     first = MagicMock()
     first.xpending.return_value = {
         "pending": 0,
@@ -1014,9 +1014,7 @@ def test_xtrim_acked_entries_retries_when_claim_changes_watched_stream(
         "max": None,
         "consumers": [],
     }
-    first.xinfo_groups.return_value = [
-        {"name": "workers", "last-delivered-id": "10-0"}
-    ]
+    first.xinfo_groups.return_value = [{"name": "workers", "last-delivered-id": "10-0"}]
     first.execute.side_effect = _redis.WatchError()
 
     second = MagicMock()
@@ -1035,20 +1033,14 @@ def test_xtrim_acked_entries_retries_when_claim_changes_watched_stream(
 
     assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0
     first.xtrim.assert_called_once()
-    second.xtrim.assert_called_once_with(
-        "test:tasks:claude", minid="10-0", approximate=False
-    )
+    second.xtrim.assert_called_once_with("test:tasks:claude", minid="10-0", approximate=False)
 
 
 def test_round_robin_turn_is_stable_then_advances(fake_redis_client):
     identities = ["alpha", "beta"]
 
-    first = fake_redis_client.claim_round_robin_turn(
-        "turn", "sequence", identities, ttl_seconds=60
-    )
-    same = fake_redis_client.claim_round_robin_turn(
-        "turn", "sequence", identities, ttl_seconds=60
-    )
+    first = fake_redis_client.claim_round_robin_turn("turn", "sequence", identities, ttl_seconds=60)
+    same = fake_redis_client.claim_round_robin_turn("turn", "sequence", identities, ttl_seconds=60)
     fake_redis_client.delete("turn")
     second = fake_redis_client.claim_round_robin_turn(
         "turn", "sequence", identities, ttl_seconds=60

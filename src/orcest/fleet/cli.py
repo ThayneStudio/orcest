@@ -1098,9 +1098,7 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
         cfg,
         config,
         console,
-        allow_backend_change=bool(
-            ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)
-        ),
+        allow_backend_change=bool(ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)),
     )
 
     console.print("\n[bold]Updating fleet[/bold]\n")
@@ -2142,9 +2140,7 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
-        redis_set_cmd = (
-            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid}"
-        )
+        redis_set_cmd = f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid}"
         console.print(
             "  [yellow]New template VM "
             f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
@@ -2549,9 +2545,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
             safe_worker_vms.append(vm)
         else:
             range_skipped.append(str(vm_id))
-            console.print(
-                f"  Refusing to destroy VM {vm_id}: outside configured worker VMID range"
-            )
+            console.print(f"  Refusing to destroy VM {vm_id}: outside configured worker VMID range")
     worker_vms = safe_worker_vms
 
     draining_worker_ids: list[str] = []
@@ -2584,9 +2578,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
         try:
             px.start_vm(vm_id)
         except Exception as exc:
-            console.print(
-                f"[red]{reason}; failed to restart VM {vm_id}: {exc}[/red]"
-            )
+            console.print(f"[red]{reason}; failed to restart VM {vm_id}: {exc}[/red]")
             recovery_failures.append(str(vm_id))
             return False
         console.print(f"[yellow]{reason}; restarted VM for task recovery[/yellow]")
@@ -2607,9 +2599,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
                 try:
                     fresh_busy = get_workers_with_pending_tasks(ssh_target)
                 except Exception as exc:
-                    console.print(
-                        f"  Leaving VM {vm_id}: final pending-task check failed: {exc}"
-                    )
+                    console.print(f"  Leaving VM {vm_id}: final pending-task check failed: {exc}")
                     skipped.append(vm_id_str)
                     continue
                 has_pending = worker_id in fresh_busy or vm_id_str in fresh_busy
@@ -2693,9 +2683,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
         console.print(f", left {len(skipped)} active", end="")
     console.print(".")
     if drain_active and skipped:
-        console.print(
-            "[red]Drain incomplete: one or more worker VMs were not destroyed.[/red]"
-        )
+        console.print("[red]Drain incomplete: one or more worker VMs were not destroyed.[/red]")
         raise SystemExit(1)
     if recovery_failures:
         console.print(
@@ -2761,9 +2749,7 @@ def start(ctx: click.Context, config: str) -> None:
         cfg,
         config,
         console,
-        allow_backend_change=bool(
-            ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)
-        ),
+        allow_backend_change=bool(ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)),
     )
 
     # Ensure orchestrator can SSH to Proxmox host (for cloud-init snippets)
@@ -2882,6 +2868,7 @@ def _preflight_backend_transition(
 ) -> None:
     """Reject backend changes before deploy stops any running services."""
     from orcest.fleet.config import load_config
+
     cfg = load_config(config)
     if not cfg.orchestrator.host:
         return
@@ -2926,8 +2913,7 @@ def _validate_backend_transition(
             f"({deployed_backend} -> {desired_backend}).[/red]"
         )
         console.print(
-            "  Run: orcest fleet deploy --rebuild-template --drain-active "
-            f"--config {config}"
+            f"  Run: orcest fleet deploy --rebuild-template --drain-active --config {config}"
         )
         raise SystemExit(1)
     if (

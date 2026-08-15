@@ -31,6 +31,7 @@ def _validate_env_value(value: str, name: str) -> None:
     if "'" in value:
         raise ValueError(f"{name} must not contain single quotes")
 
+
 _BASE_PACKAGES: list[str] = [
     "qemu-guest-agent",
     "curl",
@@ -114,7 +115,9 @@ REQUIRED_PROVIDER_BINARIES: tuple[str, ...] = ("claude", "grok", "codex")
 # providers write at RUNTIME under ProtectHome=read-only/ProtectSystem=strict,
 # else those writes EROFS. Single line (a systemd directive cannot wrap); kept
 # as a constant so the unit f-strings stay under the line-length limit.
-_WORKER_READ_WRITE_PATHS = "/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok"  # noqa: E501
+_WORKER_READ_WRITE_PATHS = (
+    "/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok"  # noqa: E501
+)
 
 
 def _template_versions_write_file() -> dict:

@@ -1374,9 +1374,7 @@ class TestHealthCheckReapCoordination:
         consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:grok", CONSUMER_GROUP)}
         assert consumers.get(worker_id, {"pending": 0})["pending"] == 0
 
-    def test_reaped_vm_publish_failure_does_not_clear_or_ack(
-        self, fake_redis_client, monkeypatch
-    ):
+    def test_reaped_vm_publish_failure_does_not_clear_or_ack(self, fake_redis_client, monkeypatch):
         from orcest.shared.coordination import get_pending_task, set_pending_task
         from orcest.shared.models import CONSUMER_GROUP, Task, TaskType
 
@@ -1413,9 +1411,7 @@ class TestHealthCheckReapCoordination:
         consumers = {c["name"]: c for c in rc.xinfo_consumers("tasks:claude", CONSUMER_GROUP)}
         assert consumers[worker_id]["pending"] == 1
 
-    def test_reaped_vm_does_not_publish_failure_when_result_already_exists(
-        self, fake_redis_client
-    ):
+    def test_reaped_vm_does_not_publish_failure_when_result_already_exists(self, fake_redis_client):
         from orcest.shared.coordination import get_pending_task, set_pending_task
         from orcest.shared.models import CONSUMER_GROUP, ResultStatus, Task, TaskResult, TaskType
 
@@ -1546,9 +1542,9 @@ class TestHealthCheckReapCoordination:
             [{"message_id": f"{entry_id}-0"} for entry_id in range(1, 101)],
             [{"message_id": "101-0"}],
         ]
-        redis.client.xrange.side_effect = (
-            lambda _stream, min, max: [(min, {"id": str(min), "repo": "owner/repo"})]
-        )
+        redis.client.xrange.side_effect = lambda _stream, min, max: [
+            (min, {"id": str(min), "repo": "owner/repo"})
+        ]
 
         entries = manager._read_consumer_pending(
             "orcest:tasks:grok",

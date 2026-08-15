@@ -406,8 +406,7 @@ def get_deployed_pool_backend(ssh_target: str) -> str | None:
         if "no such file" in error or "not found" in error:
             return None
         raise RuntimeError(
-            f"Could not read deployed fleet config on {ssh_target}: "
-            f"{result.stderr.strip()}"
+            f"Could not read deployed fleet config on {ssh_target}: {result.stderr.strip()}"
         )
 
     try:
@@ -623,9 +622,7 @@ def set_workers_draining(
     )
     if result.returncode != 0:
         action = "mark" if draining else "clear"
-        raise RuntimeError(
-            f"Failed to {action} worker drain state: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to {action} worker drain state: {result.stderr.strip()}")
 
 
 def clean_pending_tasks(ssh_target: str) -> int:

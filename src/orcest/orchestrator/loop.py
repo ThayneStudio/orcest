@@ -271,9 +271,7 @@ def _persist_credential_override(
             raise _RetryableResultError(
                 f"failed to persist credential override for account {key}"
             ) from exc
-        logger.warning(
-            "Failed to persist credential override for account %s", key, exc_info=True
-        )
+        logger.warning("Failed to persist credential override for account %s", key, exc_info=True)
     return shared_stored
 
 
@@ -315,9 +313,7 @@ def _load_credential_overrides(
         stores.append(("shared", shared_redis, _SHARED_CREDENTIAL_OVERRIDES_KEY))
     stores.append(("project", redis, _CREDENTIAL_OVERRIDES_KEY))
     try:
-        stored_by_scope = [
-            (scope, client.hgetall(key)) for scope, client, key in stores
-        ]
+        stored_by_scope = [(scope, client.hgetall(key)) for scope, client, key in stores]
     except Exception:
         logger.warning("Failed to load credential overrides", exc_info=True)
         return
@@ -327,9 +323,7 @@ def _load_credential_overrides(
                 obj = json.loads(raw)
                 blob = str(obj.get("blob", ""))
                 if _credential_override_is_usable(key, blob):
-                    pool.seed_credential_override(
-                        key, blob, float(obj.get("minted_at", 0))
-                    )
+                    pool.seed_credential_override(key, blob, float(obj.get("minted_at", 0)))
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
 
@@ -1010,10 +1004,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     project_clients = _build_project_clients(config, redis)
 
     # Ensure consumer groups for shared task streams (so workers don't race)
-    for stream in (
-        _configured_task_streams(config)
-        + _configured_task_streams(config, issue=True)
-    ):
+    for stream in _configured_task_streams(config) + _configured_task_streams(config, issue=True):
         task_redis.ensure_consumer_group(stream, CONSUMER_GROUP)
 
     # Ensure consumer group for results stream (per-project)
@@ -1179,10 +1170,9 @@ def _poll_cycle(
     # trims only up to the LOWEST still-pending id (or last-delivered-id when the
     # PEL is empty), so un-ACKed / undelivered work is never dropped -- it does
     # NOT trim by raw last-delivered-id while entries are still in flight.
-    for _task_stream in (
-        _configured_task_streams(config, token_pools=token_pools)
-        + _configured_task_streams(config, issue=True, token_pools=token_pools)
-    ):
+    for _task_stream in _configured_task_streams(
+        config, token_pools=token_pools
+    ) + _configured_task_streams(config, issue=True, token_pools=token_pools):
         try:
             task_redis.xtrim_acked_entries(_task_stream, CONSUMER_GROUP)
         except Exception:
@@ -2353,9 +2343,7 @@ def _handle_result(
         if task_entry is not None:
             credential_update_account = task_entry.account_key()
         if credential_update_account is None:
-            credential_update_account = _load_task_provider_account(
-                redis, result.task_id, logger
-            )
+            credential_update_account = _load_task_provider_account(redis, result.task_id, logger)
         if credential_update_account and token_pool.credential_update_is_usable(
             credential_update_account, result.credential_update
         ):

@@ -399,9 +399,7 @@ class TaskResult:
             needs_human=data.get("needs_human", "") == "1",
             needs_human_reason=data.get("needs_human_reason", ""),
             credential_update=data.get("credential_update", ""),
-            credential_update_minted_at=float(
-                data.get("credential_update_minted_at", "0")
-            ),
+            credential_update_minted_at=float(data.get("credential_update_minted_at", "0")),
         )
 
 
