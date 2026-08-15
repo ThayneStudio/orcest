@@ -26,12 +26,15 @@ treated as an ``XAI_API_KEY`` for the API-key path.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
 
 from orcest.worker._runner_base import CredentialContext, _BaseCliRunner
+
+logger = logging.getLogger(__name__)
 
 # Rate-limit / quota signals (→ usage exhaustion). Deliberately NOT matching
 # 403 "no credits/licenses" (a permanent billing/config problem, not a
@@ -80,6 +83,30 @@ def _grok_error_text(stdout: str, stderr: str) -> str:
     ``error`` event messages from stdout plus raw stderr."""
     msgs = [str(e.get("message", "")) for e in _iter_events(stdout) if e.get("type") == "error"]
     return "\n".join(msgs) + "\n" + stderr
+
+
+def _has_refresh_token(value: object) -> bool:
+    """Return true when an OAuth blob still contains a usable refresh token."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "refresh_token" and isinstance(nested, str) and nested.strip():
+                return True
+            if isinstance(nested, (dict, list)) and _has_refresh_token(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_has_refresh_token(item) for item in value)
+    return False
+
+
+def _remove_stale_grok_auth(home_dir: Path) -> None:
+    auth_path = home_dir / ".grok" / "auth.json"
+    try:
+        auth_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.error("Failed to remove stale Grok auth file %s", auth_path, exc_info=True)
+        raise RuntimeError(f"Failed to remove stale Grok auth file {auth_path}: {exc}") from exc
 
 
 class GrokRunner(_BaseCliRunner):
@@ -146,11 +173,15 @@ class GrokRunner(_BaseCliRunner):
             # OAuth-blob mode: write ~/.grok/auth.json so grok authenticates
             # unattended from the SuperGrok session. No XAI_API_KEY injected.
             try:
-                json.loads(blob)
+                parsed = json.loads(blob)
             except (json.JSONDecodeError, ValueError):
                 # Looks like JSON but isn't valid — fall through to API-key path
                 # rather than write a corrupt auth file.
+                _remove_stale_grok_auth(home_dir)
                 blob = ""
+            if blob and not _has_refresh_token(parsed):
+                _remove_stale_grok_auth(home_dir)
+                return CredentialContext()
             if blob:
                 grok_dir = home_dir / ".grok"
                 grok_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +195,9 @@ class GrokRunner(_BaseCliRunner):
                 return CredentialContext(extra_env={}, watch_path=auth_path)
         if credential:
             # API-key path (funded xAI API team): inject XAI_API_KEY.
+            _remove_stale_grok_auth(home_dir)
             return CredentialContext(extra_env={env_var_name: credential})
+        _remove_stale_grok_auth(home_dir)
         return CredentialContext()
 
     def extract_credential_update(self, watch_path: Path, original: str) -> str | None:
@@ -179,7 +212,9 @@ class GrokRunner(_BaseCliRunner):
         # never propagate an invalid blob — it would be persisted to Redis and
         # brick the credential for every subsequent task until cleared by hand.
         try:
-            json.loads(current)
+            parsed = json.loads(current)
         except (json.JSONDecodeError, ValueError):
+            return None
+        if not _has_refresh_token(parsed):
             return None
         return current

@@ -23,6 +23,7 @@ from orcest.orchestrator.task_publisher import (
     publish_fix_task,
     publish_followup_task,
     publish_issue_task,
+    publish_rebase_task,
     rerun_all_transient_ci,
 )
 from orcest.shared.models import Task, TaskType
@@ -104,6 +105,83 @@ def test_publish_adds_to_stream(gh_mock, fake_redis_client):
     assert fields["id"] == task.id
     assert fields["repo"] == "test-org/test-repo"
     assert fields["resource_id"] == "7"
+
+
+def test_publish_routes_pr_task_to_selected_provider_stream(gh_mock, fake_redis_client):
+    """Provider-selected tasks publish to the matching worker backend stream."""
+    _setup_gh_defaults(gh_mock)
+    pr_state = _make_pr_state(number=17)
+
+    task = publish_fix_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+        provider="grok",
+        credential='{"refresh_token":"grok-refresh"}',
+        model="grok-4",
+    )
+
+    grok_entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:grok"))
+    claude_entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:claude"))
+    assert len(grok_entries) == 1
+    assert len(claude_entries) == 0
+
+    _entry_id, fields = grok_entries[0]
+    assert fields["id"] == task.id
+    assert fields["provider"] == "grok"
+    assert fields["model"] == "grok-4"
+
+
+def test_publish_pr_tasks_use_default_runner_when_provider_omitted(
+    gh_mock,
+    fake_redis_client,
+):
+    """Omitted provider should inherit default_runner for all PR task types."""
+    _setup_gh_defaults(gh_mock)
+
+    fix_task = publish_fix_task(
+        pr_state=_make_pr_state(number=18),
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="clauder",
+    )
+    followup_task = publish_followup_task(
+        pr_state=_make_pr_state(number=19, review_threads=_make_sample_threads()),
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="clauder",
+    )
+    rebase_task = publish_rebase_task(
+        pr_state=_make_pr_state(number=20),
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="clauder",
+        merge_error="merge conflict",
+    )
+
+    clauder_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:clauder")
+    )
+    claude_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:claude")
+    )
+    assert len(clauder_entries) == 3
+    assert len(claude_entries) == 0
+    assert [fix_task.provider, followup_task.provider, rebase_task.provider] == [
+        "clauder",
+        "clauder",
+        "clauder",
+    ]
+    assert [fields["provider"] for _entry_id, fields in clauder_entries] == [
+        "clauder",
+        "clauder",
+        "clauder",
+    ]
 
 
 def test_publish_ci_snapshot_includes_target_url_identity(gh_mock, fake_redis_client):
@@ -1631,6 +1709,70 @@ def test_issue_task_redis_receives_xadd(gh_mock, fake_redis_server):
     project_entries = project_fake.xrange("project-b:tasks:issue:claude")
     assert len(shared_entries) == 1
     assert len(project_entries) == 0
+
+
+def test_issue_task_routes_to_selected_provider_stream(gh_mock, fake_redis_client):
+    issue_state = IssueState(
+        number=18,
+        title="Add provider routing",
+        body="Implement provider-specific queues",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    task = publish_issue_task(
+        issue_state=issue_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+        provider="grok",
+        credential='{"refresh_token":"grok-refresh"}',
+    )
+
+    grok_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:issue:grok")
+    )
+    claude_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:issue:claude")
+    )
+    assert len(grok_entries) == 1
+    assert len(claude_entries) == 0
+
+    _entry_id, fields = grok_entries[0]
+    assert fields["id"] == task.id
+    assert fields["provider"] == "grok"
+
+
+def test_issue_task_uses_default_runner_when_provider_omitted(gh_mock, fake_redis_client):
+    issue_state = IssueState(
+        number=19,
+        title="Use default runner",
+        body="Route omitted provider to the configured default runner.",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    task = publish_issue_task(
+        issue_state=issue_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="clauder",
+    )
+
+    clauder_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:issue:clauder")
+    )
+    claude_entries = fake_redis_client.client.xrange(
+        fake_redis_client._prefixed("tasks:issue:claude")
+    )
+    assert len(clauder_entries) == 1
+    assert len(claude_entries) == 0
+
+    _entry_id, fields = clauder_entries[0]
+    assert fields["id"] == task.id
+    assert fields["provider"] == "clauder"
 
 
 def test_transient_attempt_counter_never_exceeds_budget(gh_mock, fake_redis_client):

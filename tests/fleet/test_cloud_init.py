@@ -161,12 +161,11 @@ class TestTemplateUserdata:
         assert eth0["dhcp4"] is True
         assert eth0["dhcp-identifier"] == "mac"
 
-    def test_creates_venv_and_installs_orcest(self):
+    def test_creates_venv_without_fetching_orcest_from_github(self):
         data = yaml.safe_load(render_template_userdata())
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "python3 -m venv /opt/orcest/venv" in runcmd
-        assert "pip install" in runcmd
-        assert "orcest.git" in runcmd
+        assert "github.com/ThayneStudio/orcest.git" not in runcmd
 
     def test_ssh_key_injection(self):
         data = yaml.safe_load(render_template_userdata(ssh_public_key="ssh-ed25519 BBBB"))
@@ -255,8 +254,41 @@ class TestCloneUserdata:
         assert cfg["redis"]["key_prefix"] == "myprefix"
         assert cfg["worker_id"] == "w-99"
         assert cfg["ephemeral"] is True
+        assert cfg["pool_managed"] is True
         assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude"}
+
+    def test_worker_yaml_can_use_isolated_clauder_backend(self):
+        output = self._render(
+            worker_backend="clauder",
+            worker_runner_type="claude",
+            worker_runner_mode="interactive",
+        )
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "clauder"
         assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_defaults_clauder_backend_to_interactive_mode(self):
+        output = self._render(worker_backend="clauder")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "clauder"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_rejects_non_interactive_clauder_mode(self):
+        with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
+            self._render(worker_backend="clauder", worker_runner_mode="batch")
+
+    def test_worker_yaml_can_disable_interactive_mode_for_legacy_claude(self):
+        output = self._render(worker_runner_mode="")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude"}
 
     def test_systemd_unit_written(self):
         data = yaml.safe_load(self._render())
@@ -269,6 +301,12 @@ class TestCloneUserdata:
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "systemctl daemon-reload" in runcmd
         assert "systemctl enable --now orcest-worker" in runcmd
+
+    def test_clone_does_not_reinstall_orcest_from_github(self):
+        data = yaml.safe_load(self._render())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "github.com/ThayneStudio/orcest.git" not in runcmd
+        assert "pip install" not in runcmd
 
     def test_no_package_installation(self):
         data = yaml.safe_load(self._render())

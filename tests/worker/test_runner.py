@@ -131,6 +131,15 @@ def test_provider_registry_claude_has_runner_cls() -> None:
 
 
 @pytest.mark.unit
+def test_provider_registry_clauder_alias_has_runner_cls() -> None:
+    """The clauder entry is a distinct queue/provider alias for the Claude CLI."""
+    recipe = PROVIDER_REGISTRY["clauder"]
+    assert recipe.binary == "claude"
+    assert recipe.env_var == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert recipe.runner_cls is ClaudeRunner
+
+
+@pytest.mark.unit
 def test_provider_registry_contains_noop() -> None:
     """The noop registry entry is present and shaped for in-process dispatch.
 

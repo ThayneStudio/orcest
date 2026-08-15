@@ -1,6 +1,7 @@
 """Tests for orcest.shared.redis_client using fakeredis."""
 
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 import redis as _redis
@@ -883,7 +884,7 @@ def test_scan_iter_no_matches(fake_redis_client):
 # ---------------------------------------------------------------------------
 
 
-def test_delconsumer_raw_returns_pending_count_and_releases_entries(fake_redis_client):
+def test_delconsumer_raw_returns_pending_count(fake_redis_client):
     """H3-conc: delconsumer_raw removes a consumer and reports its PEL size."""
     rc = fake_redis_client
     fq = rc._prefixed("tasks:claude")
@@ -902,9 +903,6 @@ def test_delconsumer_raw_returns_pending_count_and_releases_entries(fake_redis_c
     assert reclaimed == 2
     names = [c["name"] for c in rc.client.xinfo_consumers(fq, "workers")]
     assert "orcest-worker-305" not in names
-    # Entries are still in the group's global PEL (recoverable), not lost.
-    pel = rc.client.xpending(fq, "workers")
-    assert pel["pending"] == 2
 
 
 def test_delconsumer_raw_missing_group_returns_zero(fake_redis_client):
@@ -997,11 +995,72 @@ def test_xtrim_acked_entries_reclaims_fully_drained_stream(fake_redis_client):
     fake_redis_client.xack(stream, group, fake_redis_client.xrevrange(stream, count=10)[1][0])
     fake_redis_client.xack(stream, group, id2)
     removed = fake_redis_client.xtrim_acked_entries(stream, group)
-    # At least the trailing ACKed entries are reclaimed; nothing un-ACKed remains.
-    assert removed >= 1
-    assert fake_redis_client.xlen(stream) <= 1
+    assert removed == 2
+    assert fake_redis_client.xlen(stream) == 0
 
 
 def test_xtrim_acked_entries_missing_stream_returns_zero(fake_redis_client):
     """M1-conc: no stream / no group -> safe no-op, never raises."""
     assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0
+
+
+def test_xtrim_acked_entries_retries_when_claim_changes_watched_stream(
+    fake_redis_client, mocker
+):
+    first = MagicMock()
+    first.xpending.return_value = {
+        "pending": 0,
+        "min": None,
+        "max": None,
+        "consumers": [],
+    }
+    first.xinfo_groups.return_value = [
+        {"name": "workers", "last-delivered-id": "10-0"}
+    ]
+    first.execute.side_effect = _redis.WatchError()
+
+    second = MagicMock()
+    second.xpending.return_value = {
+        "pending": 1,
+        "min": "10-0",
+        "max": "10-0",
+        "consumers": [],
+    }
+    second.execute.return_value = [0]
+    mocker.patch.object(
+        fake_redis_client.client,
+        "pipeline",
+        side_effect=[first, second],
+    )
+
+    assert fake_redis_client.xtrim_acked_entries("tasks:claude", "workers") == 0
+    first.xtrim.assert_called_once()
+    second.xtrim.assert_called_once_with(
+        "test:tasks:claude", minid="10-0", approximate=False
+    )
+
+
+def test_round_robin_turn_is_stable_then_advances(fake_redis_client):
+    identities = ["alpha", "beta"]
+
+    first = fake_redis_client.claim_round_robin_turn(
+        "turn", "sequence", identities, ttl_seconds=60
+    )
+    same = fake_redis_client.claim_round_robin_turn(
+        "turn", "sequence", identities, ttl_seconds=60
+    )
+    fake_redis_client.delete("turn")
+    second = fake_redis_client.claim_round_robin_turn(
+        "turn", "sequence", identities, ttl_seconds=60
+    )
+
+    assert first == same == "alpha"
+    assert second == "beta"
+
+
+def test_next_monotonic_version_uses_shared_redis_clock(fake_redis_client):
+    first = fake_redis_client.next_monotonic_version("credential-version")
+    second = fake_redis_client.next_monotonic_version("credential-version")
+
+    assert first > 1_000_000_000_000_000
+    assert second > first

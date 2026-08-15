@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+from pathlib import Path
 
 import yaml
 
@@ -60,7 +61,7 @@ _REDIS_CONTAINER = "orcest-redis-redis-1"
 # real redis-cli exit status back through ``sh``/``docker exec``.
 _REDIS_CLI_PREFIX = (
     f"sudo docker exec {_REDIS_CONTAINER} "
-    "sh -c 'exec redis-cli -a \"$ORCEST_REDIS_PASSWORD\" --no-auth-warning \"$@\"' redis-cli"
+    'sh -c \'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning "$@"\' redis-cli'
 )
 
 
@@ -98,6 +99,14 @@ def build_image(ssh_target: str) -> None:
 
 
 _DOCKER_IMAGE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$")
+_DEPLOY_FILES = (
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.redis.yml",
+    "docker-compose.pool.yml",
+    "pyproject.toml",
+    "requirements.lock",
+)
 
 
 def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
@@ -108,68 +117,18 @@ def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
     return result.returncode == 0
 
 
-def upload_source(ssh_target: str) -> None:
+def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = None) -> None:
     """Create a source tarball locally and upload+extract it on the orchestrator.
 
-    Assembles a Docker build context from the installed package:
-    deploy files (Dockerfile, compose files, pyproject.toml) from package data,
-    and source code from the installed orcest package.
+    Assembles a Docker build context from the active source checkout when
+    available, falling back to the installed package only when no checkout is
+    present. ``ORCEST_SOURCE_ROOT`` can be set to force a specific checkout.
 
     Extracts to /opt/orcest/ on the orchestrator VM.
     """
-    import shutil
-
     logger.info("Uploading source to %s", ssh_target)
-
-    # Locate the deploy files bundled as package data
-    fleet_dir = os.path.dirname(os.path.abspath(__file__))
-    deploy_dir = os.path.join(fleet_dir, "deploy")
-
-    # Locate the installed orcest package source
-    orcest_pkg_dir = os.path.dirname(fleet_dir)  # .../site-packages/orcest/
-
-    # Assemble build context in a temp directory
-    staging = tempfile.mkdtemp(prefix="orcest-upload-")
+    tarball_path = create_source_tarball(source_root=source_root)
     try:
-        # Copy deploy files (Dockerfile, compose files, pyproject.toml,
-        # requirements.lock) to the staging root. ``requirements.lock`` MUST be
-        # staged at the context root because the deploy Dockerfile does
-        # ``COPY requirements.lock .`` (reading the context root, not src/);
-        # without it the image build fails at that COPY. The lock ships as
-        # package data under deploy/ (see pyproject ``orcest.fleet`` package-data
-        # ``deploy/*``), so deploy_dir/requirements.lock is the canonical,
-        # pip-install-safe source mirroring the repo-root lock.
-        deploy_files = (
-            "Dockerfile",
-            "docker-compose.yml",
-            "docker-compose.redis.yml",
-            "docker-compose.pool.yml",
-            "pyproject.toml",
-            "requirements.lock",
-        )
-        for fname in deploy_files:
-            src_path = os.path.join(deploy_dir, fname)
-            if not os.path.exists(src_path):
-                raise RuntimeError(f"Missing deploy file: {src_path}")
-            shutil.copy2(src_path, os.path.join(staging, fname))
-
-        # Copy orcest source to staging/src/orcest/
-        dest_src = os.path.join(staging, "src", "orcest")
-        shutil.copytree(orcest_pkg_dir, dest_src, ignore=shutil.ignore_patterns("__pycache__"))
-
-        # Create tarball
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tarball_path = tmp.name
-
-        tar_result = subprocess.run(
-            ["tar", "czf", tarball_path, *deploy_files, "src/"],
-            cwd=staging,
-            capture_output=True,
-            text=True,
-        )
-        if tar_result.returncode != 0:
-            raise RuntimeError(f"Failed to create tarball: {tar_result.stderr.strip()}")
-
         # SCP to orchestrator
         result = _scp(tarball_path, ssh_target, "/tmp/orcest-source.tar.gz")
         if result.returncode != 0:
@@ -185,8 +144,9 @@ def upload_source(ssh_target: str) -> None:
             )
         clean_result = _ssh(
             ssh_target,
-            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose*.yml"
-            " pyproject.toml requirements.lock",
+            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose.yml"
+            " docker-compose.redis.yml docker-compose.pool.yml pyproject.toml"
+            " requirements.lock",
         )
         if clean_result.returncode != 0:
             raise RuntimeError(
@@ -203,12 +163,105 @@ def upload_source(ssh_target: str) -> None:
 
         logger.info("Source uploaded and extracted on %s", ssh_target)
     finally:
+        try:
+            os.unlink(tarball_path)
+        except OSError:
+            pass
+
+
+def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> str:
+    """Package the active Orcest source tree into a deploy build-context tarball.
+
+    The returned path is owned by the caller and must be deleted after use.
+    """
+    import shutil
+
+    layout = _resolve_source_layout(source_root)
+    staging = tempfile.mkdtemp(prefix="orcest-source-")
+    try:
+        for fname, src_path in layout.deploy_files.items():
+            if not src_path.exists():
+                raise RuntimeError(f"Missing deploy file: {src_path}")
+            shutil.copy2(src_path, Path(staging) / fname)
+
+        dest_src = Path(staging) / "src" / "orcest"
+        shutil.copytree(
+            layout.package_dir,
+            dest_src,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tarball_path = tmp.name
+
+        tar_result = subprocess.run(
+            ["tar", "czf", tarball_path, *_DEPLOY_FILES, "src/"],
+            cwd=staging,
+            capture_output=True,
+            text=True,
+        )
+        if tar_result.returncode != 0:
+            raise RuntimeError(f"Failed to create tarball: {tar_result.stderr.strip()}")
+        return tarball_path
+    finally:
         shutil.rmtree(staging, ignore_errors=True)
-        if "tarball_path" in locals():
-            try:
-                os.unlink(tarball_path)
-            except OSError:
-                pass
+
+
+class _SourceLayout:
+    def __init__(self, package_dir: Path, deploy_files: dict[str, Path]) -> None:
+        self.package_dir = package_dir
+        self.deploy_files = deploy_files
+
+
+def _resolve_source_layout(source_root: str | os.PathLike[str] | None = None) -> _SourceLayout:
+    root = _resolve_source_root(source_root)
+    if root is not None:
+        deploy_dir = root / "src" / "orcest" / "fleet" / "deploy"
+        return _SourceLayout(
+            package_dir=root / "src" / "orcest",
+            deploy_files={
+                "Dockerfile": deploy_dir / "Dockerfile",
+                "docker-compose.yml": deploy_dir / "docker-compose.yml",
+                "docker-compose.redis.yml": deploy_dir / "docker-compose.redis.yml",
+                "docker-compose.pool.yml": deploy_dir / "docker-compose.pool.yml",
+                "pyproject.toml": root / "pyproject.toml",
+                "requirements.lock": root / "requirements.lock",
+            },
+        )
+
+    fleet_dir = Path(__file__).resolve().parent
+    deploy_dir = fleet_dir / "deploy"
+    package_dir = fleet_dir.parent
+    return _SourceLayout(
+        package_dir=package_dir,
+        deploy_files={fname: deploy_dir / fname for fname in _DEPLOY_FILES},
+    )
+
+
+def _resolve_source_root(source_root: str | os.PathLike[str] | None = None) -> Path | None:
+    forced = source_root or os.environ.get("ORCEST_SOURCE_ROOT")
+    if forced:
+        root = Path(forced).expanduser().resolve()
+        if not _is_source_root(root):
+            raise RuntimeError(
+                f"ORCEST source root is invalid: {root} "
+                "(expected pyproject.toml and src/orcest/fleet/deploy/)"
+            )
+        return root
+
+    for candidate in Path(__file__).resolve().parents:
+        if _is_source_root(candidate):
+            return candidate
+    return None
+
+
+def _is_source_root(path: Path) -> bool:
+    return (
+        (path / "pyproject.toml").is_file()
+        and (path / "requirements.lock").is_file()
+        and (path / "src" / "orcest" / "__init__.py").is_file()
+        and (path / "src" / "orcest" / "fleet" / "deploy" / "Dockerfile").is_file()
+    )
 
 
 def ensure_redis_password(ssh_target: str) -> str:
@@ -340,6 +393,36 @@ def upload_fleet_config(
     logger.info("Fleet config uploaded to %s:%s", ssh_target, remote_dest)
 
 
+def get_deployed_pool_backend(ssh_target: str) -> str | None:
+    """Return the worker backend in the currently deployed fleet config.
+
+    ``None`` means this is a first deployment and no remote fleet config exists.
+    Other read or parse failures are surfaced so callers cannot unknowingly
+    perform a backend transition with a stale worker template.
+    """
+    result = _ssh(ssh_target, "sudo cat /etc/orcest/config.yaml")
+    if result.returncode != 0:
+        error = (result.stderr or "").strip().lower()
+        if "no such file" in error or "not found" in error:
+            return None
+        raise RuntimeError(
+            f"Could not read deployed fleet config on {ssh_target}: "
+            f"{result.stderr.strip()}"
+        )
+
+    try:
+        data = yaml.safe_load(result.stdout) or {}
+    except yaml.YAMLError as exc:
+        raise RuntimeError("Deployed fleet config is not valid YAML") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Deployed fleet config must contain a YAML mapping")
+    pool = data.get("pool") or {}
+    if not isinstance(pool, dict):
+        raise RuntimeError("Deployed fleet config pool section must be a mapping")
+    backend = str(pool.get("worker_backend") or "claude").strip()
+    return backend or "claude"
+
+
 def ensure_pool_manager(
     ssh_target: str,
     fleet_config_path: str = "/etc/orcest/config.yaml",
@@ -396,22 +479,85 @@ def get_pool_redis_members(
     """
     # Read idle set
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:idle")
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to read pool idle set: {result.stderr.strip()}")
     idle: set[str] = set()
-    if result.returncode == 0:
-        for line in result.stdout.strip().splitlines():
-            stripped = line.strip()
-            if stripped:
-                idle.add(stripped)
+    for line in result.stdout.strip().splitlines():
+        stripped = line.strip()
+        if stripped:
+            idle.add(stripped)
 
     # Read active hash (returns alternating key, value lines)
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw HGETALL orcest:pool:active")
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to read pool active hash: {result.stderr.strip()}")
     active: dict[str, str] = {}
-    if result.returncode == 0:
-        lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
-        for i in range(0, len(lines) - 1, 2):
-            active[lines[i]] = lines[i + 1]
+    lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+    for i in range(0, len(lines) - 1, 2):
+        active[lines[i]] = lines[i + 1]
 
     return idle, active
+
+
+def _parse_xinfo_consumers_with_pending(stdout: str) -> set[str]:
+    """Parse ``redis-cli --raw XINFO CONSUMERS`` output for busy consumers."""
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    consumers: set[str] = set()
+    current_name: str | None = None
+    for i in range(0, len(lines) - 1, 2):
+        field = lines[i]
+        value = lines[i + 1]
+        if field == "name":
+            current_name = value
+        elif field == "pending" and current_name:
+            try:
+                pending = int(value)
+            except ValueError:
+                pending = 0
+            if pending > 0:
+                consumers.add(current_name)
+    return consumers
+
+
+def get_workers_with_pending_tasks(
+    ssh_target: str,
+    *,
+    task_stream_pattern: str | None = None,
+) -> set[str]:
+    """Return worker consumer names with pending task-stream entries.
+
+    The fleet CLI uses this as a last-moment safety check before destroying
+    VMs. It mirrors the pool manager's PEL guard but uses the existing
+    orchestrator-VM ``redis-cli`` path instead of requiring Redis access from
+    the host where the CLI runs.
+    """
+    patterns = [task_stream_pattern] if task_stream_pattern else ["tasks:*", "*:tasks:*"]
+    streams: set[str] = set()
+    for pattern in patterns:
+        result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw --scan --pattern {shlex.quote(pattern)}",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to scan task streams: {result.stderr.strip()}")
+        streams.update(ln.strip() for ln in result.stdout.splitlines() if ln.strip())
+
+    busy: set[str] = set()
+    for stream_name in sorted(streams):
+        result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw XINFO CONSUMERS {shlex.quote(stream_name)} workers",
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            lower = stderr.lower()
+            if "nogroup" in lower or "no such key" in lower:
+                continue
+            raise RuntimeError(
+                f"Failed to inspect task-stream consumers for {stream_name}: {stderr}"
+            )
+        busy.update(_parse_xinfo_consumers_with_pending(result.stdout))
+    return busy
 
 
 def get_current_template_vmid(ssh_target: str) -> int | None:
@@ -455,7 +601,31 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
         quoted = shlex.quote(vm_id)
         cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:idle {quoted}")
         cmds.append(f"{_REDIS_CLI_PREFIX} HDEL orcest:pool:active {quoted}")
-    _ssh(ssh_target, " && ".join(cmds))
+    result = _ssh(ssh_target, " && ".join(cmds))
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to clean pool Redis state: {result.stderr.strip()}")
+
+
+def set_workers_draining(
+    ssh_target: str,
+    worker_ids: list[str],
+    *,
+    draining: bool,
+) -> None:
+    """Add or remove worker consumer IDs from the shared drain set."""
+    if not worker_ids:
+        return
+    command = "SADD" if draining else "SREM"
+    members = " ".join(shlex.quote(worker_id) for worker_id in worker_ids)
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} {command} orcest:pool:draining {members}",
+    )
+    if result.returncode != 0:
+        action = "mark" if draining else "clear"
+        raise RuntimeError(
+            f"Failed to {action} worker drain state: {result.stderr.strip()}"
+        )
 
 
 def clean_pending_tasks(ssh_target: str) -> int:
@@ -464,11 +634,15 @@ def clean_pending_tasks(ssh_target: str) -> int:
         ssh_target,
         f"{_REDIS_CLI_PREFIX} --scan --pattern 'orcest:pending:*'",
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to scan pending task markers: {result.stderr.strip()}")
     keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
     if not keys:
         return 0
     quoted = " ".join(shlex.quote(k) for k in keys)
-    _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to delete pending task markers: {result.stderr.strip()}")
     return len(keys)
 
 
@@ -735,6 +909,7 @@ def generate_orchestrator_config(
     key_prefix: str,
     task_key_prefix: str = "orcest",
     extra_providers: list[str] | None = None,
+    default_runner: str | None = None,
     trace_archive_enabled: bool = False,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
@@ -744,13 +919,16 @@ def generate_orchestrator_config(
     ``task_key_prefix`` is the shared prefix used for the task stream
     that workers read from.
 
-    ``extra_providers`` lists non-claude provider names the org has
-    credentials for (e.g. ["grok"]). Each is emitted as a declarative
+    ``extra_providers`` lists additional provider names the org has
+    credentials for (e.g. ["grok", "clauder"]). Each is emitted as a declarative
     ``providers:`` entry with an empty credential, so the orchestrator
     resolves the value from the generated ``.env`` via the env-var fallback
     (``_PROVIDER_ENV_CANDIDATES`` in shared/config.py — e.g. XAI_API_KEY for
-    grok). Claude is intentionally omitted: it is synthesized from
+    grok). Legacy ``claude`` is intentionally omitted: it is synthesized from
     CLAUDE_CODE_OAUTH_TOKENS by the legacy path and coexists with this list.
+    ``default_runner`` lets fleet deployment align the generated orchestrator
+    with the configured worker pool backend, so a pool consuming ``tasks:clauder``
+    receives Claude-backed work even when the org only uses legacy Claude tokens.
     """
     config: dict = {
         "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
@@ -758,6 +936,11 @@ def generate_orchestrator_config(
         "github": {"repo": repo},
     }
     providers = [p for p in sorted(extra_providers or []) if p and p != "claude"]
+    normalized_default_runner = (default_runner or "").strip()
+    if not normalized_default_runner and "clauder" in providers:
+        normalized_default_runner = "clauder"
+    if normalized_default_runner and normalized_default_runner != "claude":
+        config["default_runner"] = normalized_default_runner
     if providers:
         config["providers"] = [{"provider": p, "credential": "", "model": ""} for p in providers]
     if trace_archive_enabled:

@@ -72,6 +72,7 @@ def simulate_worker(
                 status=ResultStatus.COMPLETED,
                 resource_type=task.resource_type,
                 resource_id=task.resource_id,
+                repo=task.repo,
                 branch=task.branch,
                 summary="no-op",
                 duration_seconds=0,

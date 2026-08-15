@@ -19,6 +19,11 @@ PROVIDER_REGISTRY["claude"] = ProviderRecipe(
     env_var="CLAUDE_CODE_OAUTH_TOKEN",
     runner_cls=ClaudeRunner,
 )
+PROVIDER_REGISTRY["clauder"] = ProviderRecipe(
+    binary="claude",
+    env_var="CLAUDE_CODE_OAUTH_TOKEN",
+    runner_cls=ClaudeRunner,
+)
 
 # Grok (xAI Grok Build). Primary auth is the SuperGrok OAuth blob written to
 # ~/.grok/auth.json by GrokRunner.prepare_credential (Path B); env_var is the

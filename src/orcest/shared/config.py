@@ -130,6 +130,7 @@ class WorkerConfig:
     ephemeral: bool = False  # When True, process one task and exit
     providers: list[ProviderEntry] = field(default_factory=list)
     # Optional provider declarations (for future multi-provider worker support)
+    pool_managed: bool = False  # Require durable pool-manager completion handoff
 
 
 def _safe_int(value: Any, field_name: str) -> int:
@@ -198,6 +199,7 @@ def _safe_bool(value: Any, field_name: str) -> bool:
 _PROVIDER_ENV_CANDIDATES: dict[str, list[str]] = {
     "grok": ["XAI_API_KEY", "GROK_API_KEY", "XAI_API_TOKEN"],
     "claude": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    "clauder": ["CLAUDER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
     # codex exec specifically reads CODEX_API_KEY (NOT OPENAI_API_KEY) for
     # headless API auth; OPENAI_API_KEY is kept as a last-resort fallback
     # for env-resolution only (the worker still injects CODEX_API_KEY since
@@ -333,7 +335,12 @@ def _with_legacy_claude_synthesis(
     result = list(providers)
     existing_accounts = {e.account_key() for e in result}
     for t in claude_tokens:
-        synth = ProviderEntry(provider="claude", credential=t, model=None)
+        synth = ProviderEntry(
+            provider="claude",
+            credential=t,
+            model=None,
+            source="legacy_claude_tokens",
+        )
         acct = synth.account_key()
         if acct not in existing_accounts:
             result.append(synth)
@@ -744,6 +751,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     # Ephemeral mode — process one task and exit (default False)
     ephemeral_raw = raw.get("ephemeral", False)
     ephemeral = _safe_bool(ephemeral_raw, "ephemeral")
+    pool_managed = _safe_bool(raw.get("pool_managed", False), "pool_managed")
 
     # providers list (new multi-provider support; parsed for completeness).
     # Uses shared helper which dedups intra-list duplicates (first wins).
@@ -756,6 +764,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         backend=backend,
         runner=runner_config,
         ephemeral=ephemeral,
+        pool_managed=pool_managed,
         providers=worker_providers,
     )
 

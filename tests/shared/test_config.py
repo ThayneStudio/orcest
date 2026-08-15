@@ -33,6 +33,7 @@ _ENV_VARS_TO_CLEAR = [
     "ORCEST_TASK_KEY_PREFIX",
     "XAI_API_KEY",
     "GROK_API_KEY",
+    "CLAUDER_API_KEY",
     "ANTHROPIC_API_KEY",
 ]
 
@@ -471,6 +472,15 @@ def test_worker_ephemeral_true_from_yaml(tmp_path: Path):
     config = load_worker_config(cfg_file)
 
     assert config.ephemeral is True
+
+
+def test_worker_pool_managed_true_from_yaml(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("worker_id: worker-0\npool_managed: true\n")
+
+    config = load_worker_config(str(cfg_file))
+
+    assert config.pool_managed is True
 
 
 def test_worker_ephemeral_quoted_string_raises(tmp_path: Path):
@@ -981,6 +991,7 @@ def test_load_orchestrator_config_legacy_claude_synthesizes_provider_entries(tmp
     assert e.cli_binary is None
     assert e.env_var is None
     assert e.extras == {}
+    assert e.source == "legacy_claude_tokens"
 
 
 def test_legacy_claude_token_not_double_registered_when_account_already_a_provider(
@@ -1012,6 +1023,7 @@ def test_legacy_claude_token_not_double_registered_when_account_already_a_provid
     only = claude_entries[0]
     assert only.credential == "shared-acct"
     assert only.model == "opus"
+    assert only.source == ""
     # And the single entry's account is unique across the whole providers list.
     account_keys = [e.account_key() for e in proj.providers]
     assert len(account_keys) == len(set(account_keys))
@@ -1082,6 +1094,51 @@ def test_load_orchestrator_config_providers_mixed_with_env_claude(tmp_path: Path
     assert grok_e.credential == "grok-from-env"
     assert grok_e.model == "grok-3"
     assert grok_e.cli_binary is None  # not specified, per design
+
+
+def test_load_orchestrator_config_clauder_provider_uses_claude_env_fallback(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The isolated clauder provider reuses Claude Code credential env names."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-single-env")
+
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: clauder\n"
+        "    model: claude-sonnet\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    entry = config.projects[0].providers[0]
+    assert entry.provider == "clauder"
+    assert entry.credential == "claude-single-env"
+    assert entry.model == "claude-sonnet"
+
+
+def test_load_orchestrator_config_clauder_provider_prefers_generated_env(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Generated fleet .env files emit CLAUDER_API_KEY for provider_credentials.clauder."""
+    monkeypatch.setenv("CLAUDER_API_KEY", "clauder-generated-env")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "legacy-claude-env")
+
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: clauder\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    entry = config.projects[0].providers[0]
+    assert entry.provider == "clauder"
+    assert entry.credential == "clauder-generated-env"
 
 
 def test_load_orchestrator_config_providers_rich_fields_explicit(tmp_path: Path):

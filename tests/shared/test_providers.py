@@ -39,6 +39,17 @@ def test_account_key_is_model_independent_but_identity_is_not():
     assert other.account_key() != opus.account_key()
 
 
+def test_claude_provider_aliases_share_account_key():
+    cred = "shared-claude-oauth-token"
+    legacy = ProviderEntry("claude", cred)
+    interactive = ProviderEntry("clauder", cred)
+
+    assert legacy.identity() != interactive.identity()
+    assert legacy.account_key() == interactive.account_key()
+    assert legacy.account_key().startswith("claude:")
+    assert interactive.effective_env_var == "CLAUDE_CODE_OAUTH_TOKEN"
+
+
 def test_provider_entry_rich_fields_and_redaction():
     e = ProviderEntry(
         provider="grok",

@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from orcest.fleet.config import normalize_worker_runner_for_backend
+
 # ── Shared building blocks ──────────────────────────────────
 
 
@@ -447,10 +449,10 @@ def render_template_userdata(
             *_guest_agent_runcmd(),
             *_worker_workspace_runcmd(),
             *_worker_tooling_runcmd(),
-            # Create Python virtualenv and pre-install orcest
+            # Create Python virtualenv. The fleet CLI installs the active
+            # source tarball into this venv after cloud-init finishes and
+            # before converting the VM to a template.
             "sudo -u orcest python3 -m venv /opt/orcest/venv",
-            "sudo -u orcest /opt/orcest/venv/bin/pip install -q"
-            " 'git+https://github.com/ThayneStudio/orcest.git'",
         ],
     )
     return _render(cloud_config)
@@ -465,6 +467,9 @@ def render_clone_userdata(
     worker_id: str,
     key_prefix: str = "orcest",
     redis_password: str = "",
+    worker_backend: str = "claude",
+    worker_runner_type: str = "claude",
+    worker_runner_mode: str = "",
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
 
@@ -481,19 +486,32 @@ def render_clone_userdata(
             password-protected Redis. ``build_redis_config`` reads it from the
             env var ONLY (never worker.yaml), and the systemd unit loads
             ``/opt/orcest/.env`` via ``EnvironmentFile=-``.
+        worker_backend: Task backend stream this clone should consume.
+        worker_runner_type: Runner implementation type to instantiate.
+        worker_runner_mode: Optional runner mode; ``interactive`` selects the
+            PTY Claude runner, while an empty string leaves legacy runner
+            defaults in place.
     """
+    normalized_backend, normalized_runner_type, normalized_runner_mode = (
+        normalize_worker_runner_for_backend(
+            worker_backend,
+            worker_runner_type,
+            worker_runner_mode,
+        )
+    )
     redis_section: dict = {"host": redis_host, "port": 6379, "key_prefix": key_prefix}
+    runner_section: dict[str, Any] = {"type": normalized_runner_type}
+    if normalized_runner_mode:
+        runner_section["extra"] = {"mode": normalized_runner_mode}
     worker_yaml = yaml.dump(
         {
             "redis": redis_section,
             "worker_id": worker_id,
             "workspace_dir": "/opt/orcest/workspaces",
-            "backend": "claude",
-            "runner": {
-                "type": "claude",
-                "extra": {"mode": "interactive"},
-            },
+            "backend": normalized_backend,
+            "runner": runner_section,
             "ephemeral": True,
+            "pool_managed": True,
         },
         default_flow_style=False,
     )
@@ -545,11 +563,10 @@ def render_clone_userdata(
         "hostname": worker_id,
         "write_files": clone_write_files,
         "runcmd": [
-            # Reinstall orcest from latest commit before starting the worker.
-            # The template may have an older version baked in. --force-reinstall
-            # is needed because the version number (0.1.0) doesn't change.
-            "sudo -u orcest /opt/orcest/venv/bin/pip install -q --no-cache-dir"
-            " --force-reinstall 'git+https://github.com/ThayneStudio/orcest.git'",
+            # Orcest itself is installed during template bake from the same
+            # source tarball used for orchestrator deploys. Clones must not
+            # fetch GitHub at boot; that can silently run a different revision
+            # from the deployed orchestrator/pool-manager.
             # Ensure every /home/orcest ReadWritePaths target exists BEFORE the
             # unit is enabled. A warm template baked before .codex/.grok were
             # added would otherwise be missing them, and under

@@ -1,6 +1,7 @@
 """Tests for orcest.fleet.orchestrator pure functions."""
 
 import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
@@ -10,11 +11,32 @@ from orcest.fleet.orchestrator import (
     clean_pending_tasks,
     generate_env_file,
     generate_orchestrator_config,
+    get_deployed_pool_backend,
     image_exists,
     upload_fleet_config,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_get_deployed_pool_backend_defaults_legacy_config_to_claude(mocker):
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess([], 0, stdout="pool: {}\n", stderr=""),
+    )
+
+    assert get_deployed_pool_backend("user@host") == "claude"
+
+
+def test_get_deployed_pool_backend_reads_configured_backend(mocker):
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout="pool:\n  worker_backend: clauder\n", stderr=""
+        ),
+    )
+
+    assert get_deployed_pool_backend("user@host") == "clauder"
 
 
 class TestValidateProjectName:
@@ -145,6 +167,16 @@ class TestGenerateEnvFile:
                 redis_password="pw'injected",
             )
 
+    def test_generate_env_file_emits_clauder_api_key(self):
+        env = generate_env_file(
+            github_token="t",
+            key_prefix="p",
+            project_name="p",
+            provider_credentials={"clauder": ["clauder-oauth-token"]},
+        )
+
+        assert "CLAUDER_API_KEY='clauder-oauth-token'" in env
+
 
 class TestGenerateOrchestratorConfig:
     def test_basic_structure(self):
@@ -187,6 +219,22 @@ class TestGenerateOrchestratorConfig:
         )
         provs = [p["provider"] for p in data["providers"]]
         assert provs == ["grok"]
+
+    def test_clauder_becomes_generated_default_runner(self):
+        """A clauder pool should publish Claude-backed work to tasks:clauder."""
+        data = yaml.safe_load(
+            generate_orchestrator_config(repo="O/r", key_prefix="p", extra_providers=["clauder"])
+        )
+        assert data["default_runner"] == "clauder"
+        assert data["providers"] == [{"provider": "clauder", "credential": "", "model": ""}]
+
+    def test_default_runner_can_follow_pool_backend_without_provider_credentials(self):
+        data = yaml.safe_load(
+            generate_orchestrator_config(repo="O/r", key_prefix="p", default_runner="clauder")
+        )
+
+        assert data["default_runner"] == "clauder"
+        assert "providers" not in data
 
 
 class TestImageExists:
@@ -367,6 +415,45 @@ class TestGetPoolRedisMembers:
         assert idle == set()
         assert active == {}
 
+    def test_raises_when_idle_read_fails(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="NOAUTH Authentication required.",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to read pool idle set"):
+            get_pool_redis_members("user@host")
+
+    def test_raises_when_active_read_fails(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_redis_members
+
+        def ssh_side_effect(target, cmd):
+            if "SMEMBERS" in cmd:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="300\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="redis unavailable",
+            )
+
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        with pytest.raises(RuntimeError, match="Failed to read pool active hash"):
+            get_pool_redis_members("user@host")
+
 
 class TestCleanPoolRedis:
     def test_builds_correct_commands(self, mocker):
@@ -390,6 +477,22 @@ class TestCleanPoolRedis:
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh")
         clean_pool_redis("user@host", [])
         ssh.assert_not_called()
+
+    def test_failure_raises(self, mocker):
+        from orcest.fleet.orchestrator import clean_pool_redis
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="redis unavailable",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to clean pool Redis state"):
+            clean_pool_redis("user@host", ["300"])
 
 
 class TestRedisCliRoutedThroughDockerExec:
@@ -466,6 +569,99 @@ class TestRedisCliRoutedThroughDockerExec:
         for call in ssh.call_args_list:
             assert "docker exec orcest-redis-redis-1" in call[0][1]
 
+    def test_get_workers_with_pending_tasks_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_workers_with_pending_tasks
+
+        def ssh_side_effect(target, command):
+            if "--scan" in command:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="orcest:tasks:claude\norcest:tasks:issue:claude\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "name\norcest-worker-300\npending\n1\nidle\n42\n"
+                    "name\norcest-worker-301\npending\n0\nidle\n10\n"
+                ),
+                stderr="",
+            )
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        result = get_workers_with_pending_tasks("user@host")
+
+        assert result == {"orcest-worker-300"}
+        for call in ssh.call_args_list:
+            assert "docker exec orcest-redis-redis-1" in call[0][1]
+
+    def test_get_workers_with_pending_tasks_scans_unprefixed_streams(self, mocker):
+        from orcest.fleet.orchestrator import get_workers_with_pending_tasks
+
+        def ssh_side_effect(target, command):
+            if "--scan" in command and "'tasks:*'" in command:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="tasks:claude\ntasks:issue:claude\n",
+                    stderr="",
+                )
+            if "--scan" in command and "'*:tasks:*'" in command:
+                return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="name\norcest-worker-300\npending\n1\nidle\n42\n",
+                stderr="",
+            )
+
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        assert get_workers_with_pending_tasks("user@host") == {"orcest-worker-300"}
+
+    def test_get_workers_with_pending_tasks_scan_failure_raises(self, mocker):
+        from orcest.fleet.orchestrator import get_workers_with_pending_tasks
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="redis unavailable",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to scan task streams"):
+            get_workers_with_pending_tasks("user@host")
+
+    def test_get_workers_with_pending_tasks_ignores_missing_group(self, mocker):
+        from orcest.fleet.orchestrator import get_workers_with_pending_tasks
+
+        def ssh_side_effect(target, command):
+            if "--scan" in command and "'tasks:*'" in command:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="orcest:tasks:claude\n",
+                    stderr="",
+                )
+            if "--scan" in command and "'*:tasks:*'" in command:
+                return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="NOGROUP No such consumer group 'workers'",
+            )
+
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        assert get_workers_with_pending_tasks("user@host") == set()
+
 
 class TestUploadSource:
     """M1-infra: the deploy build context must stage requirements.lock at its
@@ -482,16 +678,16 @@ class TestUploadSource:
     def _ok(self, *a, **kw):
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-    def _run_upload(self, mocker):
+    def _run_upload(self, mocker, source_root=None):
         """Drive upload_source with _ssh/_scp mocked; capture the tarball
         members (the tarball still exists when _scp is invoked) and every
-        _ssh command string. Returns (tar_members, ssh_cmds)."""
+        _ssh command string. Returns (tar_members, ssh_cmds, file_contents)."""
         import tarfile
 
         from orcest.fleet import orchestrator as orch
 
         ssh_cmds: list[str] = []
-        captured: dict[str, list[str]] = {}
+        captured: dict[str, object] = {}
 
         def ssh_side_effect(target, cmd):
             ssh_cmds.append(cmd)
@@ -501,15 +697,20 @@ class TestUploadSource:
             # The tarball is the build context; record its members.
             with tarfile.open(src, "r:gz") as tf:
                 captured["members"] = tf.getnames()
+                captured["files"] = {
+                    member: tf.extractfile(member).read().decode(errors="replace")
+                    for member in tf.getnames()
+                    if tf.getmember(member).isfile()
+                }
             return self._ok()
 
         mocker.patch.object(orch, "_ssh", side_effect=ssh_side_effect)
         mocker.patch.object(orch, "_scp", side_effect=scp_side_effect)
-        orch.upload_source("user@host")
-        return captured.get("members", []), ssh_cmds
+        orch.upload_source("user@host", source_root=source_root)
+        return captured.get("members", []), ssh_cmds, captured.get("files", {})
 
     def test_requirements_lock_staged_at_context_root(self, mocker):
-        members, _ = self._run_upload(mocker)
+        members, _, _ = self._run_upload(mocker)
         # tar was created with cwd=staging, so root-level files appear bare.
         assert "requirements.lock" in members, (
             "requirements.lock must be at the deploy context root for the "
@@ -520,7 +721,7 @@ class TestUploadSource:
         """The lock the Dockerfile COPYs is the one at the context root, not the
         one nested under src/orcest/fleet/deploy/. Guard that the root copy is
         present even though a nested copy also rides along in src/."""
-        members, _ = self._run_upload(mocker)
+        members, _, _ = self._run_upload(mocker)
         nested = [
             m for m in members if m.endswith("requirements.lock") and m != "requirements.lock"
         ]
@@ -532,13 +733,46 @@ class TestUploadSource:
             assert m.startswith("src/"), f"unexpected non-root lock copy: {m!r}"
 
     def test_cleanup_rm_removes_stale_requirements_lock(self, mocker):
-        _, ssh_cmds = self._run_upload(mocker)
+        _, ssh_cmds, _ = self._run_upload(mocker)
         rm_cmds = [c for c in ssh_cmds if c.startswith("cd /opt/orcest && rm -rf")]
         assert rm_cmds, f"expected a stale-file cleanup rm; ssh cmds were {ssh_cmds!r}"
         assert any("requirements.lock" in c for c in rm_cmds), (
             "stale-file cleanup must remove a previously-deployed "
             f"requirements.lock; got {rm_cmds!r}"
         )
+        cleanup = "\n".join(rm_cmds)
+        assert "docker-compose*.yml" not in cleanup
+        assert "docker-compose.dashboard.yml" not in cleanup
+        for expected in (
+            "docker-compose.yml",
+            "docker-compose.redis.yml",
+            "docker-compose.pool.yml",
+        ):
+            assert expected in cleanup
+
+    def test_forced_source_root_packages_that_source(self, mocker, tmp_path):
+        source_root = tmp_path / "source"
+        deploy_dir = source_root / "src" / "orcest" / "fleet" / "deploy"
+        deploy_dir.mkdir(parents=True)
+        (source_root / "src" / "orcest" / "__init__.py").write_text(
+            'SENTINEL = "from-forced-source-root"\n'
+        )
+        for fname in (
+            "Dockerfile",
+            "docker-compose.yml",
+            "docker-compose.redis.yml",
+            "docker-compose.pool.yml",
+        ):
+            (deploy_dir / fname).write_text(f"{fname} from deploy dir\n")
+        (source_root / "pyproject.toml").write_text("[project]\nname = 'forced-orcest'\n")
+        (source_root / "requirements.lock").write_text("redis==5.0.0\n")
+
+        members, _, files = self._run_upload(mocker, source_root=source_root)
+
+        assert "src/orcest/__init__.py" in members
+        assert files["src/orcest/__init__.py"] == 'SENTINEL = "from-forced-source-root"\n'
+        assert files["pyproject.toml"] == "[project]\nname = 'forced-orcest'\n"
+        assert files["requirements.lock"] == "redis==5.0.0\n"
 
 
 class TestCleanPendingTasks:
@@ -581,6 +815,45 @@ class TestCleanPendingTasks:
         )
         count = clean_pending_tasks("user@host")
         assert count == 0
+
+    def test_scan_failure_raises(self, mocker):
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="redis unavailable",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to scan pending task markers"):
+            clean_pending_tasks("user@host")
+
+    def test_delete_failure_raises(self, mocker):
+        call_count = 0
+
+        def ssh_side_effect(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="orcest:pending:foo\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="redis unavailable",
+            )
+
+        mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
+
+        with pytest.raises(RuntimeError, match="Failed to delete pending task markers"):
+            clean_pending_tasks("user@host")
 
 
 # ── C1: Redis password mint + wiring ────────────────────────
@@ -700,6 +973,10 @@ class TestRedisStackEnvFile:
         # The project env (carrying the pw) and the redis env are both supplied.
         assert "projects/myproj/.env" in cmd
         assert REDIS_ENV_PATH in cmd
+
+    def test_orchestrator_compose_passes_clauder_api_key(self):
+        compose = Path("src/orcest/fleet/deploy/docker-compose.yml").read_text()
+        assert "- CLAUDER_API_KEY" in compose
 
 
 class TestRedisCliAuthenticates:

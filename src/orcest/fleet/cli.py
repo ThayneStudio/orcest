@@ -8,6 +8,7 @@ Docker Compose, driven by a single config file.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ from rich.table import Table
 from orcest.fleet.config import DEFAULT_CONFIG_PATH
 
 if TYPE_CHECKING:
-    from orcest.fleet.config import FleetConfig
+    from orcest.fleet.config import FleetConfig, ProjectEntry
     from orcest.fleet.proxmox_api import ProxmoxClient
 
 _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -30,6 +31,46 @@ _REPO_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 _DEFAULT_CLOUD_IMAGE_URL = (
     "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 )
+_DRAIN_QUIESCE_SECONDS = 5.25
+_COORDINATED_BACKEND_CHANGE_META_KEY = "orcest_coordinated_backend_change"
+
+
+def _wait_for_worker_drain_quiescence() -> None:
+    """Wait until workers blocked in XREADGROUP have observed drain leases."""
+    time.sleep(_DRAIN_QUIESCE_SECONDS)
+
+
+def _write_project_files_from_config(
+    cfg: FleetConfig,
+    ssh_target: str,
+    project: ProjectEntry,
+    redis_password: str,
+) -> None:
+    """Regenerate and upload one project's orchestrator config from fleet config."""
+    from orcest.fleet.orchestrator import (
+        generate_env_file,
+        generate_orchestrator_config,
+        write_project_files,
+    )
+
+    org = cfg.resolve_org(project)
+    env_content = generate_env_file(
+        github_token=org.github_token,
+        key_prefix=project.name,
+        project_name=project.name,
+        claude_tokens=org.claude_oauth_tokens,
+        provider_credentials=getattr(org, "provider_credentials", None),
+        trace_archive_host_path=cfg.trace_archive_host_path,
+        redis_password=redis_password,
+    )
+    config_yaml = generate_orchestrator_config(
+        repo=project.repo,
+        key_prefix=project.name,
+        extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
+        default_runner=cfg.pool.worker_backend,
+        trace_archive_enabled=bool(cfg.trace_archive_host_path),
+    )
+    write_project_files(ssh_target, project.name, env_content, config_yaml)
 
 
 def _next_free_vmid() -> int | None:
@@ -386,6 +427,63 @@ def _ssh_run(host: str, user: str, cmd: str, timeout: int = 60) -> subprocess.Co
         text=True,
         timeout=timeout,
     )
+
+
+def _scp_to_vm(
+    host: str,
+    user: str,
+    local_path: str,
+    remote_path: str,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Copy a local file to a VM over SCP."""
+    ssh_target = f"{user}@{host}"
+    return subprocess.run(
+        ["scp", *_SSH_OPTS, local_path, f"{ssh_target}:{remote_path}"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _install_source_on_worker_template(host: str, user: str, console: Console) -> bool:
+    """Install the active Orcest source into the worker template venv."""
+    from orcest.fleet.orchestrator import create_source_tarball
+
+    tarball_path = create_source_tarball()
+    remote_tarball = "/tmp/orcest-source.tar.gz"
+    try:
+        copy = _scp_to_vm(host, user, tarball_path, remote_tarball)
+        if copy.returncode != 0:
+            console.print(f"[red]failed[/red]: {copy.stderr.strip()}")
+            return False
+
+        install_cmd = (
+            "set -e; "
+            "sudo rm -rf /tmp/orcest-template-source; "
+            "sudo mkdir -p /tmp/orcest-template-source; "
+            f"sudo tar xzf {shlex.quote(remote_tarball)} -C /tmp/orcest-template-source; "
+            "sudo chown -R orcest:orcest /tmp/orcest-template-source; "
+            "sudo -u orcest -H /opt/orcest/venv/bin/python -m pip install"
+            " -q --no-cache-dir -r /tmp/orcest-template-source/requirements.lock; "
+            "sudo -u orcest -H /opt/orcest/venv/bin/python -m pip install"
+            " -q --no-cache-dir --no-deps /tmp/orcest-template-source; "
+            f"sudo rm -rf {shlex.quote(remote_tarball)} /tmp/orcest-template-source"
+        )
+        result = _ssh_run(host, user, install_cmd, timeout=300)
+        if result.returncode != 0:
+            console.print(f"[red]failed[/red]: {result.stderr.strip()}")
+            return False
+        console.print("[green]ok[/green]")
+        return True
+    except subprocess.TimeoutExpired:
+        console.print("[red]timed out[/red]")
+        return False
+    finally:
+        try:
+            Path(tarball_path).unlink()
+        except OSError:
+            pass
 
 
 def _verify_provider_clis(host: str, user: str, console: Console) -> bool:
@@ -756,8 +854,13 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
     cfg.orchestrator.host = orch_ip
     save_config(cfg, config)
 
-    # Step 9: Start pool manager (if template and Proxmox creds are configured)
-    if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
+    # Step 9: Start pool manager (if a legacy template or template range and
+    # Proxmox credentials are configured).
+    if (
+        (cfg.pool.template_vm_id or cfg.pool.template_range() is not None)
+        and cfg.proxmox.api_token_id
+        and cfg.proxmox.api_token_secret
+    ):
         if cfg.proxmox.is_localhost():
             console.print("  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]")
             console.print(
@@ -838,6 +941,16 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         console.print(f"[red]Project '{project_name}' already exists in fleet config.[/red]")
         sys.exit(1)
 
+    # A newly onboarded project must publish to the backend already consumed
+    # by the deployed pool. Merely editing the local fleet config does not
+    # coordinate a worker-template transition.
+    _validate_backend_transition(
+        cfg,
+        config,
+        console,
+        allow_backend_change=False,
+    )
+
     # Add project to config
     project = ProjectEntry(
         name=project_name,
@@ -852,12 +965,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
     ssh_target = cfg.ssh_target()
     console.print("\n  Deploying orchestrator stack...")
     try:
-        from orcest.fleet.orchestrator import (
-            ensure_redis_password,
-            generate_env_file,
-            generate_orchestrator_config,
-            write_project_files,
-        )
+        from orcest.fleet.orchestrator import ensure_redis_password
 
         # C1: mint/persist the Redis AUTH password BEFORE generating the .env
         # (so it carries ORCEST_REDIS_PASSWORD) and BEFORE ensure_redis_stack
@@ -865,22 +973,7 @@ def onboard(repo: str, name: str | None, config: str) -> None:
         # existing password, so re-onboarding never rotates it.
         redis_password = ensure_redis_password(ssh_target)
 
-        env_content = generate_env_file(
-            github_token=org.github_token,
-            key_prefix=project_name,
-            project_name=project_name,
-            claude_tokens=org.claude_oauth_tokens,
-            provider_credentials=getattr(org, "provider_credentials", None),
-            trace_archive_host_path=cfg.trace_archive_host_path,
-            redis_password=redis_password,
-        )
-        config_yaml = generate_orchestrator_config(
-            repo=repo,
-            key_prefix=project_name,
-            extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
-            trace_archive_enabled=bool(cfg.trace_archive_host_path),
-        )
-        write_project_files(ssh_target, project_name, env_content, config_yaml)
+        _write_project_files_from_config(cfg, ssh_target, project, redis_password)
         console.print("  Project files written [green]ok[/green]")
     except Exception as exc:
         console.print(f"  Writing project files [red]failed[/red]: {exc}")
@@ -973,7 +1066,14 @@ def destroy(project_name: str, config: str, yes: bool) -> None:
     help="Fleet config path.",
     show_default=True,
 )
-def update(config: str) -> None:
+@click.option(
+    "--skip-pool-manager",
+    is_flag=True,
+    hidden=True,
+    help="Do not start/update the pool manager during this update.",
+)
+@click.pass_context
+def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
     """Update the fleet: rebuild Docker image and restart stacks.
 
     Uploads fresh source to the orchestrator, rebuilds the Docker image,
@@ -990,6 +1090,18 @@ def update(config: str) -> None:
         sys.exit(1)
 
     ssh_target = cfg.ssh_target()
+
+    # Project configs and workers must change backend as one operation. The
+    # authorization bit is set only by this process's coordinated deploy path;
+    # there is deliberately no user-callable update flag that can bypass it.
+    _validate_backend_transition(
+        cfg,
+        config,
+        console,
+        allow_backend_change=bool(
+            ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)
+        ),
+    )
 
     console.print("\n[bold]Updating fleet[/bold]\n")
 
@@ -1010,6 +1122,8 @@ def update(config: str) -> None:
 
     failures: list[str] = []
 
+    redis_password: str | None = None
+
     # Step 2: Update shared Redis stack
     console.print("  Updating shared Redis stack...", end=" ")
     try:
@@ -1018,15 +1132,58 @@ def update(config: str) -> None:
         # C1: ensure the password exists (idempotent; reuses an existing one) so
         # the --env-file'd stack restarts with --requirepass populated rather
         # than empty.
-        ensure_redis_password(ssh_target)
+        redis_password = ensure_redis_password(ssh_target)
         ensure_redis_stack(ssh_target)
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed: {exc}[/red]")
         failures.append(f"shared Redis stack: {exc}")
 
-    # Step 3: Update pool manager (if template and Proxmox creds are configured)
-    if cfg.pool.template_vm_id and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
+    # Step 3: Regenerate project files and restart all project stacks before
+    # workers are allowed to pull from the possibly-renamed task streams.
+    from orcest.fleet.orchestrator import restart_stack
+
+    for project in cfg.projects:
+        if redis_password is None:
+            console.print(
+                f"  Updating project files for '{project.name}'... "
+                "[yellow]skipped: Redis password unavailable[/yellow]"
+            )
+            failures.append(f"project files {project.name}: Redis password unavailable")
+            continue
+
+        console.print(f"  Updating project files for '{project.name}'...", end=" ")
+        try:
+            _write_project_files_from_config(cfg, ssh_target, project, redis_password)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[red]failed: {exc}[/red]")
+            failures.append(f"project files {project.name}: {exc}")
+            continue
+
+        console.print(f"  Restarting stack for '{project.name}'...", end=" ")
+        try:
+            restart_stack(ssh_target, project.name)
+            console.print("[green]ok[/green]")
+        except Exception as exc:
+            console.print(f"[red]failed: {exc}[/red]")
+            failures.append(f"project stack {project.name}: {exc}")
+
+    if failures:
+        console.print(f"\n[bold red]Fleet update FAILED ({len(failures)} step(s)):[/bold red]")
+        for f in failures:
+            console.print(f"  - {f}")
+        sys.exit(1)
+
+    # Step 4: Update pool manager only after project stacks are publishing with
+    # regenerated configs. Deploy defers this to its final start step.
+    if skip_pool_manager:
+        console.print("  Skipping pool manager update until final start step")
+    elif (
+        (cfg.pool.template_vm_id or cfg.pool.template_range() is not None)
+        and cfg.proxmox.api_token_id
+        and cfg.proxmox.api_token_secret
+    ):
         if cfg.proxmox.is_localhost():
             console.print("  [yellow]Skipping pool manager: proxmox.endpoint is localhost[/yellow]")
             console.print(
@@ -1046,18 +1203,6 @@ def update(config: str) -> None:
                 console.print(f"[red]failed: {exc}[/red]")
                 failures.append(f"pool manager: {exc}")
 
-    # Step 4: Restart all project stacks
-    from orcest.fleet.orchestrator import restart_stack
-
-    for project in cfg.projects:
-        console.print(f"  Restarting stack for '{project.name}'...", end=" ")
-        try:
-            restart_stack(ssh_target, project.name)
-            console.print("[green]ok[/green]")
-        except Exception as exc:
-            console.print(f"[red]failed: {exc}[/red]")
-            failures.append(f"project stack {project.name}: {exc}")
-
     if failures:
         console.print(f"\n[bold red]Fleet update FAILED ({len(failures)} step(s)):[/bold red]")
         for f in failures:
@@ -1065,19 +1210,6 @@ def update(config: str) -> None:
         sys.exit(1)
 
     console.print("\n[bold]Fleet update complete.[/bold]")
-
-    # Surface the known config-regen gap: fleet update only rebuilds the
-    # image and restarts containers; it does NOT regenerate per-project
-    # .env / orchestrator.yaml files. New top-level fleet settings (like
-    # trace_archive_host_path) won't take effect on existing projects until
-    # they're re-onboarded or their config files are regenerated manually.
-    if cfg.trace_archive_host_path:
-        console.print(
-            "\n[yellow]Note:[/yellow] trace_archive_host_path is set in fleet config, "
-            "but `fleet update` does not regenerate per-project .env / orchestrator.yaml. "
-            "Re-onboard each project (or run a generate_env_file/generate_orchestrator_config "
-            "sweep) for the archiver to actually run."
-        )
 
 
 @fleet.command()
@@ -1227,9 +1359,7 @@ def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) 
     pinned = (cfg.pool.expected_image_sha256 or "").strip().lower()
     if pinned:
         if not re.fullmatch(r"[0-9a-f]{64}", pinned):
-            raise RuntimeError(
-                f"pool.expected_image_sha256 must be 64 hex chars, got {pinned!r}"
-            )
+            raise RuntimeError(f"pool.expected_image_sha256 must be 64 hex chars, got {pinned!r}")
         console.print("  Image checksum: [green]pinned (config)[/green]")
         return pinned
 
@@ -1653,6 +1783,15 @@ def _create_template_at_vmid(
         _cleanup_vm()
         sys.exit(1)
 
+    # Step 6c: overwrite the bootstrap install with the same source tree used
+    # for orchestrator deploys. Pool clones do not fetch GitHub at boot; they
+    # inherit this verified template install.
+    console.print("  Installing current orcest source into template...", end=" ")
+    if not _install_source_on_worker_template(vm_ip, cfg.orchestrator.user, console):
+        console.print("[red]Source install failed. Template creation aborted.[/red]")
+        _cleanup_vm()
+        sys.exit(1)
+
     # Step 7: Clean cloud-init state so clones run fresh cloud-init
     # (clones get per-VM cloud-init userdata from the pool manager)
     console.print("  Cleaning cloud-init state...", end=" ")
@@ -1960,7 +2099,7 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
     untouched, so the active template is unchanged.
     """
     from orcest.fleet.config import load_config
-    from orcest.fleet.orchestrator import set_current_template_vmid
+    from orcest.fleet.orchestrator import _REDIS_CLI_PREFIX, set_current_template_vmid
 
     console = Console()
     cfg = load_config(config)
@@ -2003,18 +2142,21 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
+        redis_set_cmd = (
+            f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid}"
+        )
         console.print(
             "  [yellow]New template VM "
             f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
             "  Set it manually with:"
-            f" ssh {cfg.ssh_target()} 'sudo docker exec orcest-redis-redis-1 redis-cli"
-            f" SET orcest:pool:current_template_vmid {new_vmid}'"
+            f" ssh {cfg.ssh_target()} {shlex.quote(redis_set_cmd)}"
         )
         sys.exit(1)
 
     console.print(
         f"\n[bold]Rebake complete.[/bold] Active template is now VM {new_vmid}.\n"
-        "  Pool manager will clone from the new template within ~30s."
+        "  New clones will use this template. Existing pool VMs are not replaced until\n"
+        "  they are drained/stopped or the pool needs additional capacity."
     )
 
 
@@ -2298,9 +2440,11 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
 
     from orcest.fleet.config import load_config
     from orcest.fleet.orchestrator import (
-        clean_pending_tasks,
         clean_pool_redis,
+        get_current_template_vmid,
         get_pool_redis_members,
+        get_workers_with_pending_tasks,
+        set_workers_draining,
         stop_pool_manager,
     )
 
@@ -2320,16 +2464,48 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
         stop_pool_manager(ssh_target)
         console.print("[green]ok[/green]")
     except RuntimeError as exc:
-        console.print(f"[yellow]warning[/yellow]: {exc}")
+        console.print(f"[red]failed[/red]: {exc}")
+        console.print(
+            "  Refusing to destroy worker VMs while the pool manager may still be running."
+        )
+        sys.exit(1)
 
     # Step 2: Read Redis state
     console.print("  Reading pool state...", end=" ")
+    idle_ids: set[str]
+    active_ids: dict[str, str]
     try:
         idle_ids, active_ids = get_pool_redis_members(ssh_target)
-        console.print(f"[green]ok[/green] ({len(idle_ids)} idle, {len(active_ids)} active)")
     except Exception as exc:
+        if not drain_active:
+            console.print(f"[red]failed[/red]: {exc}")
+            console.print(
+                "  Refusing to destroy worker VMs without Redis pool state; "
+                "rerun with --drain-active only if interrupting active workers is intended."
+            )
+            sys.exit(1)
         console.print(f"[yellow]warning[/yellow]: {exc}")
+        console.print("  Continuing because --drain-active was requested.")
         idle_ids, active_ids = set(), {}
+
+    busy_consumers: set[str]
+    try:
+        busy_consumers = get_workers_with_pending_tasks(ssh_target)
+        console.print(
+            f"[green]ok[/green] ({len(idle_ids)} idle, {len(active_ids)} active,"
+            f" {len(busy_consumers)} pending)"
+        )
+    except Exception as exc:
+        if not drain_active:
+            console.print(f"[red]failed[/red]: {exc}")
+            console.print(
+                "  Refusing to destroy worker VMs without Redis pending-consumer state; "
+                "rerun with --drain-active only if interrupting active workers is intended."
+            )
+            sys.exit(1)
+        busy_consumers = set()
+        console.print(f"[yellow]warning[/yellow]: {exc}")
+        console.print("  Continuing because --drain-active was requested.")
 
     # Step 3: Destroy worker VMs
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
@@ -2341,39 +2517,164 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
 
     px = _create_proxmox_client(cfg)
     worker_vms = px.list_vms(name_prefix="orcest-worker-")
-    # Exclude the template itself
-    worker_vms = [v for v in worker_vms if int(v.get("vmid", 0)) != cfg.pool.template_vm_id]
+    protected_template_vmids = set()
+    if cfg.pool.template_vm_id:
+        protected_template_vmids.add(cfg.pool.template_vm_id)
+    template_range = cfg.pool.template_range()
+    if template_range:
+        protected_template_vmids.update(range(template_range[0], template_range[1] + 1))
+        try:
+            active_template = get_current_template_vmid(ssh_target)
+            if active_template:
+                protected_template_vmids.add(active_template)
+        except Exception as exc:
+            console.print(
+                f"[yellow]warning[/yellow]: could not read active template pointer: {exc}"
+            )
+
+    worker_vms = [
+        v
+        for v in worker_vms
+        if not v.get("template") and int(v.get("vmid", 0)) not in protected_template_vmids
+    ]
+
+    # Destructive lifecycle operations must never rely on a name prefix alone.
+    # A finite or open-ended worker VMID range is the authority that proves the
+    # VM belongs to this pool.
+    safe_worker_vms: list[dict] = []
+    range_skipped: list[str] = []
+    for vm in worker_vms:
+        vm_id = int(vm.get("vmid", 0))
+        if cfg.pool.contains_worker_vmid(vm_id):
+            safe_worker_vms.append(vm)
+        else:
+            range_skipped.append(str(vm_id))
+            console.print(
+                f"  Refusing to destroy VM {vm_id}: outside configured worker VMID range"
+            )
+    worker_vms = safe_worker_vms
+
+    draining_worker_ids: list[str] = []
+    if not drain_active:
+        for vm in worker_vms:
+            vm_id = int(vm["vmid"])
+            vm_id_str = str(vm_id)
+            worker_id = f"orcest-worker-{vm_id}"
+            if (
+                vm_id_str in active_ids
+                or worker_id in busy_consumers
+                or vm_id_str in busy_consumers
+            ):
+                continue
+            draining_worker_ids.append(worker_id)
+        if draining_worker_ids:
+            try:
+                set_workers_draining(ssh_target, draining_worker_ids, draining=True)
+                _wait_for_worker_drain_quiescence()
+            except Exception as exc:
+                console.print(f"[red]failed to establish worker drain leases[/red]: {exc}")
+                sys.exit(1)
 
     destroyed: list[str] = []
-    skipped: list[str] = []
-    for vm in worker_vms:
-        vm_id = int(vm["vmid"])
-        vm_id_str = str(vm_id)
-        is_idle = vm_id_str in idle_ids
-        is_active = vm_id_str in active_ids
+    skipped: list[str] = list(range_skipped)
+    recovery_failures: list[str] = []
 
-        if is_active and not drain_active:
-            console.print(f"  Leaving active VM {vm_id} ({vm.get('name', '')})")
-            skipped.append(vm_id_str)
-            continue
-
-        label = "active" if is_active else ("idle" if is_idle else "orphan")
-        console.print(f"  Destroying {label} VM {vm_id}...", end=" ")
+    def restart_stopped_worker(vm_id: int, reason: str) -> bool:
+        """Re-establish worker recovery after an aborted destruction commit."""
         try:
-            try:
-                px.stop_vm(vm_id)
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    if px.get_vm_status(vm_id) == "stopped":
-                        break
-                    time.sleep(1)
-            except Exception:
-                pass
-            px.destroy_vm(vm_id)
-            console.print("[green]ok[/green]")
-            destroyed.append(vm_id_str)
+            px.start_vm(vm_id)
         except Exception as exc:
-            console.print(f"[yellow]failed[/yellow]: {exc}")
+            console.print(
+                f"[red]{reason}; failed to restart VM {vm_id}: {exc}[/red]"
+            )
+            recovery_failures.append(str(vm_id))
+            return False
+        console.print(f"[yellow]{reason}; restarted VM for task recovery[/yellow]")
+        return True
+
+    try:
+        for vm in worker_vms:
+            vm_id = int(vm["vmid"])
+            vm_id_str = str(vm_id)
+            worker_id = f"orcest-worker-{vm_id}"
+            is_idle = vm_id_str in idle_ids
+            is_active = vm_id_str in active_ids
+            has_pending = worker_id in busy_consumers or vm_id_str in busy_consumers
+
+            if not drain_active and not is_active and not has_pending:
+                # The drain lease prevents new reads; this final fresh PEL read
+                # catches a claim that won immediately before the lease landed.
+                try:
+                    fresh_busy = get_workers_with_pending_tasks(ssh_target)
+                except Exception as exc:
+                    console.print(
+                        f"  Leaving VM {vm_id}: final pending-task check failed: {exc}"
+                    )
+                    skipped.append(vm_id_str)
+                    continue
+                has_pending = worker_id in fresh_busy or vm_id_str in fresh_busy
+
+            if has_pending and not drain_active:
+                console.print(f"  Leaving VM {vm_id} ({vm.get('name', '')}) with pending task")
+                skipped.append(vm_id_str)
+                continue
+
+            if is_active and not drain_active:
+                console.print(f"  Leaving active VM {vm_id} ({vm.get('name', '')})")
+                skipped.append(vm_id_str)
+                continue
+
+            label = (
+                "active"
+                if is_active
+                else ("busy" if has_pending else ("idle" if is_idle else "orphan"))
+            )
+            console.print(f"  Destroying {label} VM {vm_id}...", end=" ")
+            try:
+                stopped = False
+                try:
+                    px.stop_vm(vm_id)
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        if px.get_vm_status(vm_id) == "stopped":
+                            stopped = True
+                            break
+                        time.sleep(1)
+                except Exception:
+                    try:
+                        stopped = px.get_vm_status(vm_id) == "stopped"
+                    except Exception:
+                        stopped = False
+                if not stopped:
+                    console.print("[yellow]failed to confirm stopped; leaving VM intact[/yellow]")
+                    skipped.append(vm_id_str)
+                    continue
+                if not drain_active:
+                    try:
+                        post_stop_busy = get_workers_with_pending_tasks(ssh_target)
+                    except Exception as exc:
+                        restart_stopped_worker(
+                            vm_id,
+                            f"post-stop pending-task check failed: {exc}",
+                        )
+                        skipped.append(vm_id_str)
+                        continue
+                    if worker_id in post_stop_busy or vm_id_str in post_stop_busy:
+                        restart_stopped_worker(vm_id, "late task claim detected")
+                        skipped.append(vm_id_str)
+                        continue
+                px.destroy_vm(vm_id)
+                console.print("[green]ok[/green]")
+                destroyed.append(vm_id_str)
+            except Exception as exc:
+                console.print(f"[yellow]failed[/yellow]: {exc}")
+                skipped.append(vm_id_str)
+    finally:
+        if draining_worker_ids:
+            try:
+                set_workers_draining(ssh_target, draining_worker_ids, draining=False)
+            except Exception as exc:
+                console.print(f"  [yellow]warning[/yellow]: failed to clear drain leases: {exc}")
 
     # Step 4: Clean Redis
     if destroyed:
@@ -2384,18 +2685,24 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
         except Exception as exc:
             console.print(f"[yellow]warning[/yellow]: {exc}")
 
-    # Step 5: Clean pending task markers
-    console.print("  Cleaning pending tasks...", end=" ")
-    try:
-        count = clean_pending_tasks(ssh_target)
-        console.print(f"[green]ok[/green] ({count} cleared)")
-    except Exception as exc:
-        console.print(f"[yellow]warning[/yellow]: {exc}")
+    if destroyed:
+        console.print("  Pending task markers left intact for stream recovery or TTL expiry.")
 
     console.print(f"\n  Destroyed {len(destroyed)} VMs", end="")
     if skipped:
         console.print(f", left {len(skipped)} active", end="")
     console.print(".")
+    if drain_active and skipped:
+        console.print(
+            "[red]Drain incomplete: one or more worker VMs were not destroyed.[/red]"
+        )
+        raise SystemExit(1)
+    if recovery_failures:
+        console.print(
+            "[red]Stop incomplete: one or more stopped workers could not be "
+            "restarted for pending-task recovery.[/red]"
+        )
+        raise SystemExit(1)
 
 
 @fleet.command()
@@ -2405,7 +2712,8 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
     help="Fleet config path.",
     show_default=True,
 )
-def start(config: str) -> None:
+@click.pass_context
+def start(ctx: click.Context, config: str) -> None:
     """Start the pool manager.
 
     Uploads the current fleet config and starts the pool manager, which
@@ -2426,9 +2734,9 @@ def start(config: str) -> None:
         console.print("  Run: orcest fleet create-orchestrator")
         sys.exit(1)
 
-    if not cfg.pool.template_vm_id:
+    if not cfg.pool.template_vm_id and cfg.pool.template_range() is None:
         console.print("[red]No worker template configured.[/red]")
-        console.print("  Run: orcest fleet create-template")
+        console.print("  Run: orcest fleet create-template or configure pool.template_vmid_range")
         sys.exit(1)
 
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
@@ -2444,6 +2752,19 @@ def start(config: str) -> None:
         sys.exit(1)
 
     ssh_target = cfg.ssh_target()
+
+    # Direct `fleet start` may restart an unchanged pool, but it may not turn
+    # an edited local backend into a partial transition. Coordinated deploy
+    # supplies an in-process authorization only after draining old workers and
+    # regenerating every project publisher config.
+    _validate_backend_transition(
+        cfg,
+        config,
+        console,
+        allow_backend_change=bool(
+            ctx.meta.get(_COORDINATED_BACKEND_CHANGE_META_KEY, False)
+        ),
+    )
 
     # Ensure orchestrator can SSH to Proxmox host (for cloud-init snippets)
     from urllib.parse import urlparse
@@ -2482,7 +2803,7 @@ def start(config: str) -> None:
 @click.option(
     "--rebuild-template",
     is_flag=True,
-    help="Also recreate the worker template VM.",
+    help="Also rebake the worker template VM and atomically swap the active pointer.",
 )
 @click.option(
     "--drain-active",
@@ -2497,76 +2818,152 @@ def start(config: str) -> None:
 )
 @click.pass_context
 def deploy(ctx: click.Context, rebuild_template: bool, drain_active: bool, config: str) -> None:
-    """Full deploy: upgrade CLI, rebuild images, restart fleet.
+    """Full deploy: rebuild images, restart fleet, and optionally rebake workers.
 
     Runs the full deployment sequence in order:
 
     \b
-      1. Upgrade CLI (pip install from GitHub)
-      2. Stop fleet (stop pool manager, destroy workers, clean Redis)
-      3. Update orchestrator (upload source, rebuild Docker image, restart stacks)
-      4. Rebuild template (only with --rebuild-template)
-      5. Start fleet (start pool manager, begin cloning workers)
+      1. Stop fleet (stop pool manager, destroy workers, clean pool Redis)
+      2. Update orchestrator (upload source, rebuild Docker image, restart stacks)
+      3. Rebake template and swap active pointer (only with --rebuild-template)
+      4. Start fleet (start pool manager, begin cloning workers)
     """
     console = Console()
 
-    total = 5 if rebuild_template else 4
-    step = 0
-
-    # Step 1: Upgrade CLI
-    step += 1
-    console.print(f"\n[bold]Step {step}/{total}: Upgrading CLI[/bold]\n")
-    _upgrade_cli(console)
-
-    # Step 2: Stop fleet
-    step += 1
-    console.print(f"\n[bold]Step {step}/{total}: Stopping fleet[/bold]\n")
-    ctx.invoke(stop, drain_active=drain_active, yes=True, config=config)
-
-    # Step 3: Update orchestrator
-    step += 1
-    console.print(f"\n[bold]Step {step}/{total}: Updating orchestrator[/bold]\n")
-    ctx.invoke(update, config=config)
-
-    # Step 4: Rebuild template (optional)
     if rebuild_template:
-        step += 1
-        console.print(f"\n[bold]Step {step}/{total}: Rebuilding template[/bold]\n")
-        ctx.invoke(create_template, config=config)
+        _preflight_rebuild_template_config(config, console)
+    _preflight_backend_transition(
+        config,
+        console,
+        allow_backend_change=rebuild_template and drain_active,
+    )
 
-    # Step 5: Start fleet
-    step += 1
-    console.print(f"\n[bold]Step {step}/{total}: Starting fleet[/bold]\n")
-    ctx.invoke(start, config=config)
+    total = 4 if rebuild_template else 3
+    step = 0
+    coordinated_backend_change = rebuild_template and drain_active
+    if coordinated_backend_change:
+        ctx.meta[_COORDINATED_BACKEND_CHANGE_META_KEY] = True
+    try:
+        # Step 1: Stop fleet
+        step += 1
+        console.print(f"\n[bold]Step {step}/{total}: Stopping fleet[/bold]\n")
+        ctx.invoke(stop, drain_active=drain_active, yes=True, config=config)
+
+        # Step 2: Update orchestrator
+        step += 1
+        console.print(f"\n[bold]Step {step}/{total}: Updating orchestrator[/bold]\n")
+        ctx.invoke(
+            update,
+            config=config,
+            skip_pool_manager=True,
+        )
+
+        # Step 3: Rebake template (optional)
+        if rebuild_template:
+            step += 1
+            console.print(f"\n[bold]Step {step}/{total}: Rebaking template[/bold]\n")
+            ctx.invoke(rebake, config=config)
+
+        # Step 4: Start fleet
+        step += 1
+        console.print(f"\n[bold]Step {step}/{total}: Starting fleet[/bold]\n")
+        ctx.invoke(start, config=config)
+    finally:
+        ctx.meta.pop(_COORDINATED_BACKEND_CHANGE_META_KEY, None)
 
     console.print("\n[bold green]Deploy complete.[/bold green]")
 
 
-def _upgrade_cli(console: Console) -> None:
-    """Upgrade the orcest CLI from GitHub."""
-    import subprocess
-
-    console.print("  Installing latest version...", end=" ")
-    # --break-system-packages: the deploy host runs orcest as a system-wide
-    # install (not a venv), so PEP 668's externally-managed-environment guard
-    # blocks the upgrade unless we opt out. Pip ignores the flag in venvs.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "--no-cache-dir",
-            "--force-reinstall",
-            "--break-system-packages",
-            "git+https://github.com/ThayneStudio/orcest.git",
-        ],
-        capture_output=True,
-        text=True,
+def _preflight_backend_transition(
+    config: str,
+    console: Console,
+    *,
+    allow_backend_change: bool,
+) -> None:
+    """Reject backend changes before deploy stops any running services."""
+    from orcest.fleet.config import load_config
+    cfg = load_config(config)
+    if not cfg.orchestrator.host:
+        return
+    _validate_backend_transition(
+        cfg,
+        config,
+        console,
+        allow_backend_change=allow_backend_change,
     )
-    if result.returncode != 0:
-        console.print("[red]failed[/red]")
-        console.print(f"    {result.stderr.strip()}")
+
+
+def _validate_backend_transition(
+    cfg: FleetConfig,
+    config: str,
+    console: Console,
+    *,
+    allow_backend_change: bool,
+) -> None:
+    """Fail closed when local and deployed worker backends differ.
+
+    ``allow_backend_change`` is supplied only by the coordinated deploy call
+    chain. Public ``update``, ``start``, and ``onboard`` entry points always
+    pass ``False``.
+    """
+    from orcest.fleet.orchestrator import get_deployed_pool_backend
+
+    if not cfg.orchestrator.host:
+        return
+    try:
+        deployed_backend = get_deployed_pool_backend(cfg.ssh_target())
+    except Exception as exc:
+        console.print(f"[red]Could not verify deployed worker backend:[/red] {exc}")
+        raise SystemExit(1) from exc
+    desired_backend = cfg.pool.worker_backend
+    if (
+        deployed_backend is not None
+        and deployed_backend != desired_backend
+        and not allow_backend_change
+    ):
+        console.print(
+            "[red]Refusing an uncoordinated worker backend change "
+            f"({deployed_backend} -> {desired_backend}).[/red]"
+        )
+        console.print(
+            "  Run: orcest fleet deploy --rebuild-template --drain-active "
+            f"--config {config}"
+        )
         raise SystemExit(1)
-    console.print("[green]ok[/green]")
+    if (
+        deployed_backend is not None
+        and deployed_backend != desired_backend
+        and cfg.pool.vm_id_start <= 0
+    ):
+        console.print(
+            "[red]Backend transition requires a configured pool.vm_id_start so "
+            "all old workers can be drained safely.[/red]"
+        )
+        raise SystemExit(1)
+
+
+def _preflight_rebuild_template_config(config: str, console: Console) -> None:
+    """Validate rebake-only config before deploy stops the running fleet."""
+    from orcest.fleet.config import load_config
+
+    try:
+        cfg = load_config(config)
+        rng = cfg.pool.template_range()
+    except ValueError as exc:
+        console.print(f"[red]Invalid pool.template_vmid_range:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    if rng is None:
+        console.print(
+            "[red]Cannot deploy --rebuild-template without pool.template_vmid_range.[/red]\n"
+            "  Add e.g. 'template_vmid_range: [9000, 9009]' to the fleet config, "
+            "or run deploy without --rebuild-template for the legacy single-template flow."
+        )
+        raise SystemExit(1)
+
+
+def _upgrade_cli(console: Console) -> None:
+    """Deprecated: deploys use the currently installed CLI/source tree."""
+    console.print(
+        "  [yellow]CLI self-upgrade is disabled; install the desired source before deploy.[/yellow]"
+    )

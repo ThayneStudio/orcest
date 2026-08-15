@@ -108,6 +108,7 @@ class RunnerResult:
     # worker surfaces the rotated blob here so the orchestrator can persist it.
     # None for the common case (env-var credentials never rotate in place).
     credential_update: str | None = None
+    credential_update_minted_at: float = 0.0
 
 
 class Runner(Protocol):

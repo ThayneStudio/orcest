@@ -6,6 +6,7 @@ stream operations with simplified return types.
 
 from __future__ import annotations
 
+import json
 import logging
 import types
 from typing import Any
@@ -15,6 +16,41 @@ import redis
 from orcest.shared.config import RedisConfig
 
 logger = logging.getLogger(__name__)
+
+
+_ROUND_ROBIN_TURN_SCRIPT = r"""
+local current = redis.call("GET", KEYS[1])
+if current then
+    for i = 3, #ARGV do
+        if ARGV[i] == current then
+            return current
+        end
+    end
+end
+
+local count = tonumber(ARGV[2])
+if not count or count <= 0 then
+    return false
+end
+local sequence = redis.call("INCR", KEYS[2])
+local index = ((sequence - 1) % count) + 3
+local selected = ARGV[index]
+redis.call("SET", KEYS[1], selected, "EX", ARGV[1])
+return selected
+"""
+
+
+_MONOTONIC_VERSION_SCRIPT = r"""
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local now = redis.call("TIME")
+local candidate = tonumber(now[1]) * 1000000 + tonumber(now[2])
+if candidate <= current then
+    candidate = current + 1
+end
+local encoded = string.format("%.0f", candidate)
+redis.call("SET", KEYS[1], encoded)
+return encoded
+"""
 
 
 class RedisClient:
@@ -407,6 +443,10 @@ class RedisClient:
         """SET key value EX ttl."""
         self._client.set(self._prefixed(key), value, ex=ttl)
 
+    def set_value(self, key: str, value: str | int) -> None:
+        """SET key value without expiry."""
+        self._client.set(self._prefixed(key), value)
+
     def get(self, key: str) -> str | None:
         """GET key."""
         val = self._client.get(self._prefixed(key))
@@ -427,6 +467,15 @@ class RedisClient:
         """INCR key."""
         result: int = self._client.incr(self._prefixed(key))  # type: ignore[assignment]
         return result
+
+    def next_monotonic_version(self, key: str) -> float:
+        """Return a Redis-clock-backed, strictly increasing version."""
+        result = self._client.eval(
+            _MONOTONIC_VERSION_SCRIPT,
+            1,
+            self._prefixed(key),
+        )
+        return float(result)
 
     def expire(self, key: str, seconds: int) -> bool:
         """EXPIRE key seconds."""
@@ -451,6 +500,43 @@ class RedisClient:
         """HSET key field value."""
         result: int = self._client.hset(self._prefixed(key), field, value)  # type: ignore[assignment]
         return result
+
+    def hset_json_if_newer(
+        self,
+        key: str,
+        field: str,
+        value: str,
+        minted_at: float,
+    ) -> bool:
+        """Atomically HSET a JSON value when its timestamp is newer.
+
+        The stored JSON object is expected to contain ``minted_at``. WATCH is
+        used instead of a read-then-write sequence so concurrent per-project
+        orchestrators cannot let an older OAuth rotation overwrite a newer one.
+        """
+        fq_key = self._prefixed(key)
+        while True:
+            pipe = self._client.pipeline()
+            try:
+                pipe.watch(fq_key)
+                current = pipe.hget(fq_key, field)
+                if current:
+                    try:
+                        current_obj = json.loads(str(current))
+                        current_minted_at = float(current_obj.get("minted_at", 0))
+                    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+                        current_minted_at = 0.0
+                    if current_minted_at >= minted_at:
+                        pipe.unwatch()
+                        return False
+                pipe.multi()
+                pipe.hset(fq_key, field, value)
+                pipe.execute()
+                return True
+            except redis.WatchError:
+                continue
+            finally:
+                pipe.reset()
 
     def hgetall_raw(self, fq_key: str) -> dict[str, str]:
         """HGETALL on a fully-qualified key name."""
@@ -489,6 +575,10 @@ class RedisClient:
         """SCARD key."""
         result: int = self._client.scard(self._prefixed(key))  # type: ignore[assignment]
         return result
+
+    def sismember(self, key: str, member: str) -> bool:
+        """SISMEMBER key member."""
+        return bool(self._client.sismember(self._prefixed(key), member))
 
     # ------------------------------------------------------------------
     # Additional hash operations (auto-prefix)
@@ -532,7 +622,9 @@ class RedisClient:
 
         Returns the number of entries removed.
         """
-        result: int = self._client.xtrim(self._prefixed(stream), minid=minid)  # type: ignore[assignment]
+        result: int = self._client.xtrim(  # type: ignore[assignment]
+            self._prefixed(stream), minid=minid, approximate=False
+        )
         return result
 
     def xtrim_acked_entries(self, stream: str, group: str) -> int:
@@ -546,40 +638,73 @@ class RedisClient:
         the number of entries removed (0 if the stream/group is missing, empty,
         or there is nothing safe to trim).
         """
-        try:
-            summary = self._client.xpending(self._prefixed(stream), group)
-        except redis.ResponseError:
-            # Real Redis: NOGROUP when the stream or group does not exist.
-            return 0
-        except (IndexError, KeyError):
-            # fakeredis returns a malformed/empty summary for a missing
-            # stream+group that redis-py's parser chokes on (IndexError);
-            # treat the same as "nothing to trim".
-            return 0
-        minid: str | None = None
-        # redis-py returns a dict for the XPENDING summary form.
-        if isinstance(summary, dict) and summary.get("pending"):
-            minid = summary.get("min")
-        if not minid or minid == "0-0":
-            # PEL empty (or only sentinel): everything delivered is ACKed, so it
-            # is safe to trim up to last-delivered-id. Undelivered entries have
-            # larger ids and are untouched by MINID.
+        fq_stream = self._prefixed(stream)
+        while True:
+            pipe = self._client.pipeline()
             try:
-                groups = self._client.xinfo_groups(self._prefixed(stream))
+                # WATCH covers consumer-group/Pending Entries List mutations:
+                # XREADGROUP and XACK are stream-key writes. If a claim lands
+                # between either metadata read and XTRIM, EXEC aborts and the
+                # safe boundary is recomputed.
+                pipe.watch(fq_stream)
+                summary = pipe.xpending(fq_stream, group)
+                minid: str | None = None
+                if isinstance(summary, dict) and summary.get("pending"):
+                    minid = summary.get("min")
+                if not minid or minid == "0-0":
+                    groups = pipe.xinfo_groups(fq_stream)
+                    last_delivered = None
+                    if isinstance(groups, list):
+                        for info in groups:
+                            if info.get("name") == group:
+                                last_delivered = info.get("last-delivered-id")
+                                break
+                    if not last_delivered or last_delivered == "0-0":
+                        pipe.unwatch()
+                        return 0
+                    milliseconds, sequence = str(last_delivered).split("-", 1)
+                    minid = f"{milliseconds}-{int(sequence) + 1}"
+                pipe.multi()
+                pipe.xtrim(fq_stream, minid=minid, approximate=False)
+                result = pipe.execute()
+                return int(result[0] if result else 0)
+            except redis.WatchError:
+                continue
             except redis.ResponseError:
+                # NOGROUP / missing stream means there is nothing safe to trim.
                 return 0
-            if not isinstance(groups, list):
+            except (IndexError, KeyError):
+                # fakeredis can expose malformed missing-group metadata.
                 return 0
-            last_delivered = None
-            for g in groups:
-                if g.get("name") == group:
-                    last_delivered = g.get("last-delivered-id")
-                    break
-            if not last_delivered or last_delivered == "0-0":
-                return 0
-            minid = last_delivered
-        result: int = self._client.xtrim(self._prefixed(stream), minid=minid)  # type: ignore[assignment]
-        return result
+            finally:
+                pipe.reset()
+
+    def claim_round_robin_turn(
+        self,
+        turn_key: str,
+        sequence_key: str,
+        live_identities: list[str],
+        ttl_seconds: int,
+    ) -> str | None:
+        """Atomically claim/read a leased round-robin turn.
+
+        All callers see the same selected identity until the lease expires.
+        The first caller after expiry advances the durable sequence exactly
+        once, so stable live identities receive eventual service independent
+        of process timing or wall-clock bucket parity.
+        """
+        if not live_identities:
+            return None
+        result = self._client.eval(
+            _ROUND_ROBIN_TURN_SCRIPT,
+            2,
+            self._prefixed(turn_key),
+            self._prefixed(sequence_key),
+            str(max(1, int(ttl_seconds))),
+            str(len(live_identities)),
+            *live_identities,
+        )
+        return str(result) if result else None
 
     def xinfo_groups(self, stream: str) -> list[dict[str, Any]]:
         """XINFO GROUPS stream."""
@@ -600,8 +725,10 @@ class RedisClient:
         """XGROUP DELCONSUMER on a fully-qualified stream name.
 
         Returns the number of pending entries that belonged to *consumer*
-        (those entries are returned to the group's global PEL). Returns 0 if
-        the consumer or group does not exist.
+        before Redis removed it. Pending entries are not made claimable by this
+        command, so callers must not use it to clean up a consumer with pending
+        work unless they intentionally want Redis to discard that consumer's
+        PEL state. Returns 0 if the consumer or group does not exist.
         """
         try:
             return int(self._client.xgroup_delconsumer(fq_stream, group, consumer))
