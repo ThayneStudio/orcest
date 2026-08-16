@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from orcest.fleet.config import FleetConfig, PoolConfig, ProxmoxConfig
+from orcest.fleet.config import FleetConfig, PoolConfig, ProxmoxConfig, WorkerProfileConfig
 from orcest.fleet.pool_manager import PoolManager
 
 pytestmark = pytest.mark.unit
@@ -361,7 +361,8 @@ class TestCheckDoneWorkers:
         pipe.srem.assert_any_call("pool:idle", "300")
         pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
-        pipe.delete.assert_called_once_with("pool:done:orcest-worker-300")
+        pipe.delete.assert_any_call("pool:done:orcest-worker-300")
+        pipe.delete.assert_any_call("workers:heartbeat:orcest-worker-300")
         pipe.execute.assert_called_once()
 
     def test_destroy_failure_does_not_block_remaining_done_workers(self):
@@ -410,7 +411,8 @@ class TestDestroyVm:
         pipe.srem.assert_any_call("pool:idle", "300")
         pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         pipe.hdel.assert_called_once_with("pool:active", "300")
-        pipe.delete.assert_called_once_with("pool:done:orcest-worker-300")
+        pipe.delete.assert_any_call("pool:done:orcest-worker-300")
+        pipe.delete.assert_any_call("workers:heartbeat:orcest-worker-300")
         pipe.execute.assert_called_once()
 
     def test_cleans_redis_even_if_stop_fails(self):
@@ -1367,6 +1369,102 @@ class TestFillPool:
 
         # Both idle VMs hold a pending task -> none drained.
         proxmox.destroy_vm.assert_not_called()
+
+    @staticmethod
+    def _mixed_config(size: int = 4) -> FleetConfig:
+        return FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(
+                size=size,
+                template_vm_id=9000,
+                vm_id_start=300,
+                vm_id_end=399,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="clauder"),
+                    WorkerProfileConfig(backend="codex"),
+                    WorkerProfileConfig(backend="grok"),
+                ],
+            ),
+        )
+
+    def test_profiled_fill_creates_exact_round_robin_slots(self):
+        manager, proxmox, redis = _make_manager(config=self._mixed_config())
+        redis._idle_set = set()
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            manager._fill_pool()
+
+        assert [call.kwargs["new_id"] for call in proxmox.clone_vm.call_args_list] == [
+            300,
+            301,
+            302,
+            303,
+        ]
+        assert [call.kwargs["worker_backend"] for call in render.call_args_list] == [
+            "clauder",
+            "codex",
+            "grok",
+            "clauder",
+        ]
+        assert [call.kwargs["worker_runner_type"] for call in render.call_args_list] == [
+            "claude",
+            "codex",
+            "grok",
+            "claude",
+        ]
+
+    def test_profiled_scale_down_drains_only_slots_outside_target(self):
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=1))
+        redis._idle_set = {"300", "301", "302"}
+
+        manager._fill_pool()
+
+        assert [call.args[0] for call in proxmox.destroy_vm.call_args_list] == [301, 302]
+        proxmox.clone_vm.assert_not_called()
+
+    def test_profiled_fill_replaces_missing_slot_while_active_extra_finishes(self):
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=2))
+        redis._idle_set = {"300"}
+        redis.hgetall.return_value = {"302": "1000.0"}
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 302, "name": "orcest-worker-302", "template": False},
+        ]
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            manager._fill_pool()
+
+        proxmox.clone_vm.assert_called_once_with(
+            template_id=9000,
+            new_id=301,
+            name="orcest-worker-301",
+            linked=True,
+        )
+        assert render.call_args.kwargs["worker_backend"] == "codex"
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_profiled_missing_middle_slot_preserves_profile(self):
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=3))
+        redis._idle_set = {"300", "302"}
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            manager._fill_pool()
+
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args.kwargs["new_id"] == 301
+        assert render.call_args.kwargs["worker_backend"] == "codex"
+
+    def test_preferred_worker_vmid_must_be_free_and_in_range(self):
+        manager, proxmox, _redis = _make_manager(config=self._mixed_config(size=3))
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 301, "name": "orcest-worker-301", "template": False},
+        ]
+
+        with pytest.raises(RuntimeError, match="already in use"):
+            manager._next_vm_id(preferred=301)
+        with pytest.raises(RuntimeError, match="outside the configured pool range"):
+            manager._next_vm_id(preferred=299)
 
 
 # ── _health_check ────────────────────────────────────────────
@@ -2491,6 +2589,19 @@ class TestReconcileStaleRedis:
         manager._reconcile_stale_redis()
 
         redis.hdel.assert_called_once_with("pool:active", "301")
+
+    def test_stale_exact_slot_releases_process_local_allocation(self):
+        """An externally deleted mixed-profile slot can be allocated again."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.return_value = []
+        redis._idle_set = {"300"}
+        redis.hgetall.return_value = {}
+        manager._allocated_vmids.add(300)
+
+        manager._reconcile_stale_redis()
+
+        assert 300 not in manager._allocated_vmids
+        assert manager._next_vm_id(preferred=300) == 300
 
     def test_mixed_stale_and_valid(self):
         """Only stale entries are removed; valid entries are left alone."""

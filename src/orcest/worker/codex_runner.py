@@ -32,6 +32,7 @@ falls back to the ``CODEX_API_KEY`` env-var path for funded-API users.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Iterator
@@ -39,6 +40,8 @@ from pathlib import Path
 from typing import ClassVar
 
 from orcest.worker._runner_base import CredentialContext, _BaseCliRunner
+
+logger = logging.getLogger(__name__)
 
 # Rate-limit / quota signals → usage exhaustion. The canonical codex-exec
 # message is "exceeded retry limit, last status: 429 Too Many Requests".
@@ -57,6 +60,29 @@ _CODEX_OVERLOAD_RE = re.compile(
     r"|\boverloaded\b|\bservice unavailable\b|status\s+5[0-9][0-9]\b)",
     re.IGNORECASE,
 )
+
+
+def _has_refresh_token(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(
+            (key == "refresh_token" and isinstance(nested, str) and bool(nested.strip()))
+            or (isinstance(nested, (dict, list)) and _has_refresh_token(nested))
+            for key, nested in value.items()
+        )
+    if isinstance(value, list):
+        return any(_has_refresh_token(item) for item in value)
+    return False
+
+
+def _remove_stale_codex_auth(home_dir: Path) -> None:
+    auth_path = home_dir / ".codex" / "auth.json"
+    try:
+        auth_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.error("Failed to remove stale Codex auth file %s", auth_path, exc_info=True)
+        raise RuntimeError(f"Failed to remove stale Codex auth file {auth_path}: {exc}") from exc
 
 
 def _iter_events(stdout: str) -> Iterator[dict]:
@@ -188,11 +214,15 @@ class CodexRunner(_BaseCliRunner):
             # OAuth-blob mode: write ~/.codex/auth.json so codex authenticates
             # unattended from the ChatGPT session. No CODEX_API_KEY injected.
             try:
-                json.loads(blob)
+                parsed = json.loads(blob)
             except (json.JSONDecodeError, ValueError):
                 # Looks like JSON but isn't valid — fall through to API-key
                 # path rather than write a corrupt auth file.
+                _remove_stale_codex_auth(home_dir)
                 blob = ""
+            if blob and not _has_refresh_token(parsed):
+                _remove_stale_codex_auth(home_dir)
+                return CredentialContext()
             if blob:
                 codex_dir = home_dir / ".codex"
                 codex_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +239,9 @@ class CodexRunner(_BaseCliRunner):
             # API-key path (funded OpenAI API): inject CODEX_API_KEY. Note:
             # OPENAI_API_KEY is intentionally NOT used here — ``codex exec``
             # only honors CODEX_API_KEY for non-interactive auth.
+            _remove_stale_codex_auth(home_dir)
             return CredentialContext(extra_env={env_var_name: credential})
+        _remove_stale_codex_auth(home_dir)
         return CredentialContext()
 
     def extract_credential_update(self, watch_path: Path, original: str) -> str | None:
@@ -224,7 +256,9 @@ class CodexRunner(_BaseCliRunner):
         # never propagate an invalid blob — it would be persisted to Redis
         # and brick the credential for every subsequent task until cleared.
         try:
-            json.loads(current)
+            parsed = json.loads(current)
         except (json.JSONDecodeError, ValueError):
+            return None
+        if not _has_refresh_token(parsed):
             return None
         return current

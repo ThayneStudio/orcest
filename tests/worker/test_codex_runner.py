@@ -229,6 +229,58 @@ def test_prepare_credential_plain_key_uses_codex_api_key_env(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_prepare_credential_plain_key_removes_stale_oauth_file(tmp_path) -> None:
+    home = tmp_path / "home"
+    stale_auth = home / ".codex" / "auth.json"
+    stale_auth.parent.mkdir(parents=True)
+    stale_auth.write_text(json.dumps({"tokens": {"refresh_token": "old"}}))
+
+    ctx = CodexRunner().prepare_credential("sk-new", tmp_path / "wd", home, "CODEX_API_KEY")
+
+    assert ctx.extra_env == {"CODEX_API_KEY": "sk-new"}
+    assert not stale_auth.exists()
+
+
+@pytest.mark.unit
+def test_prepare_credential_fails_closed_if_stale_auth_cannot_be_removed(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    stale_auth = home / ".codex" / "auth.json"
+    stale_auth.parent.mkdir(parents=True)
+    stale_auth.write_text(json.dumps({"tokens": {"refresh_token": "old"}}))
+    original_unlink = Path.unlink
+
+    def fail_auth_unlink(path: Path, *args, **kwargs):
+        if path == stale_auth:
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_auth_unlink)
+
+    with pytest.raises(RuntimeError, match="Failed to remove stale Codex auth file"):
+        CodexRunner().prepare_credential("sk-new", tmp_path / "wd", home, "CODEX_API_KEY")
+
+
+@pytest.mark.unit
+def test_prepare_credential_oauth_without_refresh_token_removes_stale_file(tmp_path) -> None:
+    home = tmp_path / "home"
+    stale_auth = home / ".codex" / "auth.json"
+    stale_auth.parent.mkdir(parents=True)
+    stale_auth.write_text(json.dumps({"tokens": {"refresh_token": "old"}}))
+
+    ctx = CodexRunner().prepare_credential(
+        json.dumps({"tokens": {"access_token": "access-only"}}),
+        tmp_path / "wd",
+        home,
+        "CODEX_API_KEY",
+    )
+
+    assert ctx == CredentialContext()
+    assert not stale_auth.exists()
+
+
+@pytest.mark.unit
 def test_prepare_credential_invalid_json_blob_falls_back_to_api_key(tmp_path) -> None:
     """Looks like JSON but isn't valid → don't write a corrupt auth.json;
     fall back to the API-key path (better to fail loudly on bad config than
@@ -253,10 +305,26 @@ def test_prepare_credential_empty_is_noop(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_prepare_credential_empty_removes_stale_oauth_file(tmp_path) -> None:
+    home = tmp_path / "home"
+    stale_auth = home / ".codex" / "auth.json"
+    stale_auth.parent.mkdir(parents=True)
+    stale_auth.write_text(json.dumps({"tokens": {"refresh_token": "old"}}))
+
+    CodexRunner().prepare_credential("", tmp_path / "wd", home, "CODEX_API_KEY")
+
+    assert not stale_auth.exists()
+
+
+@pytest.mark.unit
 def test_extract_credential_update_detects_refresh(tmp_path) -> None:
     auth = tmp_path / "auth.json"
-    original = json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "old"}})
-    refreshed = json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "new"}})
+    original = json.dumps(
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "old", "refresh_token": "rt"}}
+    )
+    refreshed = json.dumps(
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "new", "refresh_token": "rt"}}
+    )
     auth.write_text(refreshed)
     assert CodexRunner().extract_credential_update(auth, original) == refreshed
 
@@ -279,6 +347,13 @@ def test_extract_credential_update_rejects_corrupt_blob(tmp_path) -> None:
     assert (
         CodexRunner().extract_credential_update(auth, '{"tokens":{"access_token":"old"}}') is None
     )
+
+
+@pytest.mark.unit
+def test_extract_credential_update_rejects_blob_without_refresh_token(tmp_path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"tokens": {"access_token": "new"}}))
+    assert CodexRunner().extract_credential_update(auth, "original") is None
 
 
 @pytest.mark.unit

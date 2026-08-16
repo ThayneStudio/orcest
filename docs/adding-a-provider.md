@@ -1,6 +1,7 @@
 # Adding a New Provider (Runbook)
 
-**Goal:** Extend Orcest to a new coding agent (e.g. "gemini", "codex", future "grok" real binary) while obeying the **Provider Registration & Invocation Boundary**.
+**Goal:** Extend Orcest to a new coding agent (for example, Gemini) while
+obeying the **Provider Registration & Invocation Boundary**.
 
 **Never** add execution knowledge (binaries, flags, env var names for invocation) to the orchestrator. The orchestrator only registers names + credentials + models and round-robins them.
 
@@ -8,10 +9,9 @@
 - You have a working `claude` setup (the reference provider).
 - You understand that workers are immutable pre-baked images.
 - See `docs/rollout-multi-provider.md` for full rollout order.
-- The built-in fleet manager operates one homogeneous worker pool. Before adding
-  a provider to a fleet-managed project, set `pool.worker_backend` to that same
-  provider and remove other provider credentials, or provision a specialized
-  worker group outside the fleet manager. Uncovered streams are rejected by
+- The built-in fleet manager supports an ordered list of dedicated worker
+  profiles. Add enough `pool.worker_profiles` entries to cover every provider
+  stream a fleet-managed project can publish; uncovered streams are rejected by
   fleet preflight.
 
 ## Step-by-Step
@@ -20,18 +20,22 @@
 
    Lowercase string, stable, used as the key in `Task.provider` and the stream name (`tasks:<name>`). Examples: `grok`, `gemini`.
 
-2. **One-line addition to the worker registry (src/orcest/worker/runner.py)**
+2. **Implement the provider runner and register it worker-side**
 
    ```python
-   PROVIDER_REGISTRY: dict[str, ProviderRecipe] = {
-       "claude": ProviderRecipe(binary="claude", env_var="CLAUDE_CODE_OAUTH_TOKEN"),
-       "grok": ProviderRecipe(binary="grok", env_var="XAI_API_KEY"),
-       # NEW:
-       "gemini": ProviderRecipe(binary="gemini", env_var="GOOGLE_API_KEY"),
-   }
+   # src/orcest/worker/__init__.py (after importing GeminiRunner)
+   PROVIDER_REGISTRY["gemini"] = ProviderRecipe(
+       binary="gemini",
+       env_var="GOOGLE_API_KEY",
+       runner_cls=GeminiRunner,
+   )
    ```
 
-   `ProviderRecipe` is a tiny dataclass (binary, env_var). This line is the **single source of truth** for dispatch. The orchestrator never imports or reads this table.
+   Implement `GeminiRunner` as a `_BaseCliRunner` subclass in
+   `src/orcest/worker/gemini_runner.py`, including its argv, output parsing,
+   exhaustion/overload classification, auth-prompt detection, and credential
+   preparation. The registry entry is the worker-image source of truth for
+   dispatch. The orchestrator never imports or reads this table.
 
 3. **Add the CLI install step in provision/setup-worker.sh**
 
@@ -49,20 +53,13 @@
 
    Update the "Grok CLI not present" style message if you want a different wording.
 
-4. **Runner / parsing (usually zero changes)**
+4. **Runner / parsing**
 
-   The generic path in `claude_runner.py` (invoked for any provider) builds:
-
-       <binary> --print --verbose --output-format stream-json \
-                 --dangerously-skip-permissions -p "<prompt>"
-
-   and parses stdout for summary + rate_limit_event objects, stderr for exhaustion signals.
-
-   Only if your new provider uses completely different flags or output (not stream-json), you may:
-   - Extend the registry recipe with more fields (still worker-only), or
-   - Add a thin `<name>_runner.py` selected inside `create_runner` by worker config (not per-task).
-
-   In the common case, reuse the existing path.
+   Provider CLIs have distinct flags and event schemas, so each supported
+   provider owns a small runner subclass. Reuse `_BaseCliRunner` for process,
+   timeout, retry, credential isolation, and streaming mechanics; keep only the
+   provider-specific argv/parsing/auth hooks in the new class. Add fixtures for
+   every event type and failure classification supported by the pinned CLI.
 
 5. **Rebake the worker image**
 
@@ -100,15 +97,21 @@
          gemini: ["AIza..."]
    ```
 
-   `generate_env_file` will emit the appropriate `GOOGLE_API_KEY=...` (or whatever canonical name) into the project's `.env`.
+   Fleet credential generation emits the generic provider variable
+   `GEMINI_API_KEY=...` into the project's `.env`. Docker Compose only forwards
+   variables explicitly named in its `environment:` list, so add
+   `GEMINI_API_KEY` to both the repository-root `docker-compose.yml` and
+   `src/orcest/fleet/deploy/docker-compose.yml`. The worker registry can still
+   map the credential carried in each task to the CLI's required
+   `GOOGLE_API_KEY` at execution time.
 
-   A project with both legacy `claude_oauth_tokens` and `gemini` credentials
-   publishes to two streams and is rejected by the current fleet manager unless
-   an external worker group covers the second stream.
+   Add a dedicated `gemini` entry to `pool.worker_profiles`. Fleet preflight
+   rejects the project until every provider it can publish has at least one
+   scheduled slot.
 
 7. **Test, including skew**
 
-   - Add the provider to a test project's config.
+   - Add the provider to a test project's config and worker profile layout.
    - Publish a task for it.
    - Happy path on a correctly rebaked worker: runs, reports result, exhaustion tracked under `providers:gemini:...`.
    - Skew path (task reaches a worker without the entry or binary): permanent FAILED, summary contains "rebake worker image to include gemini CLI", no secret leak, coordination cleaned up.
@@ -117,15 +120,23 @@
 
 ## What Never Changes on the Orchestrator Side
 - No new Python files or conditionals for the new provider.
-- No knowledge of its binary or CLI contract leaks into `orchestrator/`, `fleet/`, `shared/providers.py` (except the tiny default env-var guess for convenience in parsing), or task publishing.
+- No knowledge of its binary or CLI contract leaks into `orchestrator/`,
+  `fleet/`, `shared/providers.py` (except the generic env-var guess used to load
+  fleet credentials), or task publishing. A fleet-managed provider does require
+  its generic `<PROVIDER>_API_KEY` passthrough to be listed in both Compose
+  files.
 - The `Task` wire format stays lean.
 
 ## Cleanup / Iteration
-- Once the real CLI for the provider is stable, replace any placeholder in setup-worker.sh.
-- Update example files and this runbook with the exact command line the generic runner will use.
-- If many providers, consider making the worker's `backend` config allow a list (future work); today you typically run separate worker groups per primary stream.
+- Pin the real CLI version and its installer/package integrity metadata in
+  `setup-worker.sh` and the cloud-init template.
+- Update example files and this runbook with the exact command line and output
+  contract the provider-specific runner will use.
+- Keep each worker dedicated to one backend stream; scale capacity by repeating
+  that backend in `pool.worker_profiles`.
 
-This process has been exercised for the initial "grok" enablement (Task 7) and is the template for all future providers.
+This process is exercised by the built-in Claude/Clauder, Codex, and Grok
+runners and is the template for future providers.
 
 Cross-references:
 - `provision/setup-worker.sh` (the actual install + verification code + the Grok example comments)

@@ -944,7 +944,7 @@ class TestWorkerIsolation:
         entries are ACKed only after their respective results are durable.
         """
         redis = real_redis_client
-        tasks_stream = "tasks:claude"
+        tasks_stream = "tasks:noop"
         results_stream = RESULTS_STREAM
 
         redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
@@ -1004,7 +1004,7 @@ class TestWorkerIsolation:
             ),
             worker_id="skip-test-worker",
             workspace_dir="/tmp/orcest-test-isolation",
-            backend="claude",
+            backend="noop",
             runner=RunnerConfig(
                 type="noop",
                 timeout=10,

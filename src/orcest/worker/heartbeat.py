@@ -24,6 +24,7 @@ class Heartbeat:
         interval: float | None = None,
         logger: logging.Logger | None = None,
         on_lock_lost: Callable[[], None] | None = None,
+        on_refreshed: Callable[[], None] | None = None,
     ):
         """
         Args:
@@ -33,11 +34,13 @@ class Heartbeat:
             logger: Optional logger.
             on_lock_lost: Optional callback invoked when lock refresh fails.
                           Called once from the heartbeat thread before it stops.
+            on_refreshed: Optional best-effort callback after a successful refresh.
         """
         self.lock = lock
         self.interval = lock.ttl / 3 if interval is None else interval
         self.logger = logger
         self._on_lock_lost = on_lock_lost
+        self._on_refreshed = on_refreshed
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -98,6 +101,15 @@ class Heartbeat:
                         self.logger.warning(
                             f"Heartbeat: failed to refresh {self.lock.key} (lock lost?)"
                         )
+                if refreshed and self._on_refreshed is not None:
+                    try:
+                        self._on_refreshed()
+                    except Exception:
+                        if self.logger:
+                            self.logger.warning(
+                                "Heartbeat: post-refresh callback failed",
+                                exc_info=True,
+                            )
             if not refreshed:
                 if self._on_lock_lost is not None:
                     self._on_lock_lost()

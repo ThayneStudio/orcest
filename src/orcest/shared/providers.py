@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
+from orcest.shared.models import require_valid_provider_name
+
 _CLAUDE_ACCOUNT_PROVIDERS = frozenset({"claude", "clauder"})
 
 
@@ -22,6 +24,9 @@ class ProviderEntry:
     env_var: str | None = None
     extras: dict[str, str] = field(default_factory=dict)
     source: str = field(default="", compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        require_valid_provider_name(self.provider)
 
     # WORKER-SIDE ONLY ---------------------------------------------------
     # The two properties below encode *execution mechanics* (which binary to
