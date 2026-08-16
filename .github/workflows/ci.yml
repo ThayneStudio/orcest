@@ -105,8 +105,14 @@ jobs:
         run: make check-dashboard-clean-copy
       - name: Test dashboard Make target
         run: make test-dashboard
+      # Advisory only: `npm audit` hits the live registry, so a new transitive
+      # advisory (or a registry outage) must not fail a PR that changed no code.
+      # Failures stay visible as a red annotation on this step alone.
+      - name: Audit dashboard dependencies (non-blocking)
+        continue-on-error: true
+        run: make audit-dashboard
       - name: Dry-run dashboard Make wrappers
-        run: make -n test-dashboard build-dashboard smoke-dashboard-compose deploy-dashboard-remote DASHBOARD_REMOTE=dashboard.example.invalid
+        run: make -n test-dashboard audit-dashboard build-dashboard smoke-dashboard-compose deploy-dashboard-remote DASHBOARD_REMOTE=dashboard.example.invalid
 
   integration:
     runs-on: [self-hosted, linux]

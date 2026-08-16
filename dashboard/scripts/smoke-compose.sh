@@ -72,8 +72,11 @@ verify_seeded_snapshot_contract() {
     return 1
   fi
 
-  if ! docker run --rm -i --network "container:$container" \
-    -e DASHBOARD_TOKEN="$token" \
+  # Name-only `-e DASHBOARD_TOKEN` plus a command-scoped assignment: the token
+  # reaches the container through the Docker client's environment instead of the
+  # host `docker` argv, which any local user can read via `ps aux`.
+  if ! DASHBOARD_TOKEN="$token" docker run --rm -i --network "container:$container" \
+    -e DASHBOARD_TOKEN \
     "$node_image" node --input-type=module <<'NODE'
 const response = await fetch("http://127.0.0.1:8080/api/snapshot", {
   headers: { Authorization: `Bearer ${process.env.DASHBOARD_TOKEN || ""}` },

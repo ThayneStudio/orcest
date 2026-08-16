@@ -1,4 +1,4 @@
-.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
 DASHBOARD_ENV ?= /opt/orcest/.dashboard.env
@@ -64,7 +64,15 @@ check-dashboard-clean-copy: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,test -f package.json && test -f scripts/check-node-version.mjs && test ! -e node_modules && test ! -e dist && test ! -e build && touch .clean-copy-write-check && rm .clean-copy-write-check && npm run check:node)
 
 test-dashboard: check-dashboard-tracked
-	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL) && npm exec tsc -- -p tsconfig.json --noEmit --pretty false && npm test && npm run build && npm run check:bundle-runtime)
+	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm exec tsc -- -p tsconfig.json --noEmit --pretty false && npm test && npm run build && npm run check:bundle-runtime)
+
+# Dependency audit, deliberately OUTSIDE the correctness chain above. `npm audit`
+# queries the live registry, so a brand-new advisory against a transitive dev
+# dependency — or a registry outage — would otherwise turn every PR red without
+# a code change, and would do so BEFORE typecheck/tests/build ever ran. CI runs
+# this as its own non-blocking step so the signal stays visible.
+audit-dashboard: check-dashboard-tracked
+	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL))
 
 # All tests — starts Redis, runs everything, stops Redis
 test: redis-up

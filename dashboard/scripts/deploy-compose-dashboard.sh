@@ -21,6 +21,8 @@ deploy_lock_held="${DASHBOARD_DEPLOY_LOCK_HELD:-0}"
 rollback_image_pinned=0
 candidate_may_be_live=0
 candidate_tag_replaced=0
+candidate_build_completed=0
+pre_build_image_id=""
 compose_config_swapped=0
 compose_candidate_backup=""
 compose_rollback_tmp=""
@@ -452,7 +454,14 @@ fi
 # pinned or refreshed.
 validate_compose_state_paths || exit 1
 
-previous_container="$("$@" ps -q dashboard 2>/dev/null || true)"
+# Compose v2 `ps -q` lists RUNNING containers only. A stopped/exited/crashed
+# dashboard is the most common reason to redeploy, and without the `ps -aq`
+# fallback below that case pins no rollback image at all — the deploy would then
+# have nothing to restore if the candidate fails.
+previous_container="$("$@" ps -q dashboard 2>/dev/null | sed -n '1p' || true)"
+if [ -z "$previous_container" ]; then
+  previous_container="$("$@" ps -aq dashboard 2>/dev/null | sed -n '1p' || true)"
+fi
 previous_image_id=""
 previous_image_name=""
 previous_assets=""
@@ -477,11 +486,32 @@ if [ -n "$previous_image_id" ]; then
   fi
 fi
 
+# What the service tag resolves to before Compose can rebuild it. Used to prove
+# whether a later failure is cleaning up an image THIS run created, or is about
+# to delete the operator's last-good image.
+pre_build_image_id="$(docker image inspect -f '{{.Id}}' "$dashboard_image" 2>/dev/null || true)"
+
 restorable_image_name() {
   case "$1" in
     ""|sha256:*|*@*) return 1 ;;
     *) return 0 ;;
   esac
+}
+
+# Drop the service tag only when this deploy actually produced the image behind
+# it. A build that failed (transient `npm ci`, registry blip, ...) never touches
+# the tag, so removing it would destroy the last-good image and leave the
+# operator with nothing to `up -d --no-build` back to.
+remove_candidate_image_tag() {
+  if [ "$candidate_build_completed" != "1" ]; then
+    current_image_id="$(docker image inspect -f '{{.Id}}' "$dashboard_image" 2>/dev/null || true)"
+    if [ -n "$current_image_id" ] && [ "$current_image_id" = "$pre_build_image_id" ]; then
+      echo "Dashboard build did not replace $dashboard_image; keeping the existing image" >&2
+      return 0
+    fi
+  fi
+  docker image rm "$dashboard_image" >/dev/null 2>&1 || true
+  return 0
 }
 
 restore_rollback_image_tag() {
@@ -500,11 +530,11 @@ restore_previous_image_tag() {
       restore_rollback_image_tag "$dashboard_image"
       return $?
     fi
-    docker image rm "$dashboard_image" >/dev/null 2>&1 || true
+    remove_candidate_image_tag
     return 0
   fi
 
-  docker image rm "$dashboard_image" >/dev/null 2>&1 || true
+  remove_candidate_image_tag
   return 0
 }
 
@@ -543,7 +573,7 @@ rollback_dashboard() {
     candidate_tag_replaced=0
     rollback_compose_image="$dashboard_image"
   else
-    docker image rm "$dashboard_image" >/dev/null 2>&1 || true
+    remove_candidate_image_tag
     if restorable_image_name "$previous_image_name"; then
       if restore_rollback_image_tag "$previous_image_name"; then
         rollback_compose_image="$previous_image_name"
@@ -584,12 +614,16 @@ rollback_dashboard() {
 # Compose build can replace the service tag before its foreground process
 # returns. Arm restoration first so a deferred INT/TERM at that boundary sees
 # the candidate transaction as active. Restoration is idempotent whether the
-# build changed the tag or failed before doing so.
+# build changed the tag or failed before doing so: when no rollback image is
+# pinned it deletes the service tag only if this run replaced it (see
+# remove_candidate_image_tag), so a failed build leaves the last-good image
+# intact.
 candidate_tag_replaced=1
 if ! DASHBOARD_NODE_VERSION="$node_version" "$@" build dashboard; then
   echo "Dashboard compose build failed" >&2
   fail_before_live_start
 fi
+candidate_build_completed=1
 
 candidate_image="$dashboard_image"
 candidate_image_id="$(docker image inspect -f '{{.Id}}' "$candidate_image" 2>/dev/null || true)"
