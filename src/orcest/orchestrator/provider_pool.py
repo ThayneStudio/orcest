@@ -433,6 +433,13 @@ class ProviderPool:
         if account is None:
             return
         with self._lock:
+            provider, _separator, _credential_hash = account.partition(":")
+            if not _provider_credential_is_usable(provider, blob):
+                logger.warning(
+                    "Ignoring unusable persisted credential override for provider %s",
+                    provider,
+                )
+                return
             existing = self._credential_overrides.get(account)
             if existing is not None and existing[1] >= minted_at:
                 return
@@ -465,8 +472,8 @@ class ProviderPool:
 
 
 def _provider_credential_is_usable(provider: str, blob: str) -> bool:
-    """Reject Grok OAuth JSON blobs that no longer contain a refresh token."""
-    if provider != "grok":
+    """Reject OAuth JSON blobs that no longer contain a refresh token."""
+    if provider not in {"grok", "codex"}:
         return True
     stripped = blob.strip()
     if not stripped.startswith("{"):

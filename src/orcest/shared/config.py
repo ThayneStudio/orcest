@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from orcest.shared.models import require_valid_provider_name
 from orcest.shared.providers import ProviderEntry
 
 
@@ -725,12 +726,23 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
         "workspace_dir",
     )
 
-    # Runner (construct first so backend can default from runner.type)
+    # Runner. An explicitly configured backend supplies the runner default so
+    # a minimal standalone ``backend: codex`` / ``backend: grok`` config is
+    # valid just like a fleet-generated config. With no backend, preserve the
+    # legacy behavior where the backend defaults from an explicit runner.type.
     runner_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "runner").items()}
     runner_extra_raw = _safe_dict(runner_raw, "extra")
     _runner_defaults = RunnerConfig()
+    explicit_backend = raw.get("backend")
+    if "type" in runner_raw:
+        runner_type_default = runner_raw["type"]
+    elif explicit_backend is not None:
+        normalized_backend = _safe_str(explicit_backend, "backend")
+        runner_type_default = "claude" if normalized_backend == "clauder" else normalized_backend
+    else:
+        runner_type_default = _runner_defaults.type
     runner_config = RunnerConfig(
-        type=_safe_str(runner_raw.get("type", _runner_defaults.type), "runner.type"),
+        type=_safe_str(runner_type_default, "runner.type"),
         timeout=_safe_int(runner_raw.get("timeout", _runner_defaults.timeout), "runner.timeout"),
         max_retries=_safe_int(
             runner_raw.get("max_retries", _runner_defaults.max_retries), "runner.max_retries"
@@ -746,7 +758,22 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
     )
 
     # Backend — default from runner.type when not explicitly set
-    backend = _safe_str(raw.get("backend", runner_config.type), "backend")
+    backend = _safe_str(
+        explicit_backend if explicit_backend is not None else runner_config.type, "backend"
+    )
+    require_valid_provider_name(backend)
+    if backend == "clauder":
+        if runner_config.type != "claude":
+            raise ValueError("backend 'clauder' requires runner.type 'claude'")
+        runner_mode = runner_config.extra.get("mode", "")
+        if not runner_mode:
+            runner_config.extra["mode"] = "interactive"
+        elif runner_mode != "interactive":
+            raise ValueError("backend 'clauder' requires runner.extra.mode 'interactive'")
+    elif runner_config.type != backend:
+        raise ValueError(f"backend {backend!r} requires matching runner.type {backend!r}")
+    if backend not in {"claude", "clauder"} and runner_config.extra.get("mode"):
+        raise ValueError(f"backend {backend!r} does not support runner.extra.mode")
 
     # Ephemeral mode — process one task and exit (default False)
     ephemeral_raw = raw.get("ephemeral", False)

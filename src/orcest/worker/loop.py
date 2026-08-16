@@ -23,6 +23,7 @@ import redis as redis_py
 import yaml
 
 from orcest.orchestrator import gh
+from orcest.revision import get_build_revision
 from orcest.shared.config import WorkerConfig
 from orcest.shared.coordination import (
     RedisLock,
@@ -53,6 +54,7 @@ from orcest.shared.models import (
     Task,
     TaskResult,
     is_claude_provider,
+    task_stream_name,
 )
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
@@ -68,11 +70,33 @@ from orcest.worker.workspace import Workspace, WorkspaceError
 RESULTS_STREAM = "results"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
+WORKER_LIVENESS_TTL = 150  # Covers two 60s task-heartbeat refresh intervals plus jitter.
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
 _STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB across 4 workers)
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 _EPHEMERAL_RESULT_RETRY_SECONDS = 5
+
+
+def _refresh_worker_liveness(
+    redis: RedisClient, config: WorkerConfig, logger: logging.Logger
+) -> None:
+    """Publish an expiring, non-secret worker process/backend/revision heartbeat."""
+    payload = json.dumps(
+        {"backend": config.backend, "revision": get_build_revision()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        redis.set_ex(
+            f"workers:heartbeat:{config.worker_id}",
+            payload,
+            ttl=WORKER_LIVENESS_TTL,
+        )
+    except redis_py.RedisError:
+        logger.warning("Failed to publish worker liveness heartbeat", exc_info=True)
+
+
 _SOURCE_ACK_RETRY_BASE_SECONDS = 1
 _HANDOFF_MARKER_TTL_SECONDS = 30 * 24 * 3600
 _HANDOFF_FINGERPRINT_FIELD = "orcest_handoff_fingerprint"
@@ -920,6 +944,7 @@ def _early_reject_unsupported_provider(
     current_stream: str,
     entry_id: str,
     abort_event: threading.Event | None = None,
+    summary: str | None = None,
 ) -> ResultHandoff:
     """Publish a clean permanent FAILED for an unknown/missing provider.
 
@@ -932,13 +957,13 @@ def _early_reject_unsupported_provider(
     payload is durable in Redis. Primary-result coordination remains for the
     orchestrator consumer; DLQ coordination is cleared here.
     """
-    summary = f"Rebake worker image to include {provider} CLI"
+    failure_summary = summary or f"Rebake worker image to include {provider} CLI"
     result = _task_result(
         task,
         config,
         ResultStatus.FAILED,
         task.branch,
-        summary,
+        failure_summary,
         0,
     )
     handoff = _handoff_result_until_terminal(
@@ -1009,8 +1034,8 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     runner = create_runner(config.runner)
 
     # Shared task stream names (all projects publish to the same streams)
-    pr_stream = f"tasks:{config.backend}"
-    issue_stream = f"tasks:issue:{config.backend}"
+    pr_stream = task_stream_name(config.backend)
+    issue_stream = task_stream_name(config.backend, issue=True)
     # Fully-qualified names for raw Redis operations
     if config.redis.key_prefix:
         pr_fq = f"{config.redis.key_prefix}:{pr_stream}"
@@ -1089,6 +1114,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
+        _refresh_worker_liveness(redis, config, logger)
         try:
             if redis.sismember(_POOL_DRAINING_KEY, config.worker_id) is True:
                 logger.info(
@@ -1172,14 +1198,16 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # This guarantees old worker images fail cleanly (non-transient FAILED)
         # when they encounter a task for a provider they do not have baked in.
         # The registry + binary check are strictly local to the worker image.
-        unsupported = get_unsupported_reason(task.provider)
-        if unsupported:
+        routing_mismatch = task.provider != config.backend
+        unsupported = None if routing_mismatch else get_unsupported_reason(task.provider)
+        if routing_mismatch or unsupported:
             logger.warning(
-                "Task %s for provider=%s is unsupported on this worker image (%s); "
+                "Task %s for provider=%s cannot run on backend=%s (%s); "
                 "early graceful reject (permanent FAILED, no runner reached)",
                 task.id,
                 task.provider,
-                unsupported,
+                config.backend,
+                "provider/backend stream mismatch" if routing_mismatch else unsupported,
             )
             handoff = _early_reject_unsupported_provider(
                 task,
@@ -1190,6 +1218,11 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 current_stream,
                 entry_id,
                 abort_event=terminal_abort_event,
+                summary=(
+                    "Task provider does not match the dedicated worker backend"
+                    if routing_mismatch
+                    else None
+                ),
             )
 
             if config.ephemeral:
@@ -1332,6 +1365,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             interval=HEARTBEAT_INTERVAL,
             logger=logger,
             on_lock_lost=lock_lost.set,
+            on_refreshed=lambda: _refresh_worker_liveness(redis, config, logger),
         )
         heartbeat.start()
 
@@ -1438,6 +1472,10 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         elif not handoff.terminal:
             continue
 
+    try:
+        redis.delete(f"workers:heartbeat:{config.worker_id}")
+    except redis_py.RedisError:
+        logger.debug("Failed to clear worker liveness heartbeat", exc_info=True)
     logger.info("Worker shut down cleanly.")
 
 

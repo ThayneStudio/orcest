@@ -9,6 +9,7 @@ import pytest
 from orcest.shared.config import RunnerConfig
 from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
 from orcest.worker.claude_runner import ClaudeRunner
+from orcest.worker.codex_runner import CodexRunner
 from orcest.worker.grok_runner import GrokRunner
 from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.runner import (
@@ -34,6 +35,15 @@ def test_create_runner_claude_interactive_mode() -> None:
     config = RunnerConfig(type="claude", extra={"mode": "interactive"})
     runner = create_runner(config)
     assert isinstance(runner, ClaudeInteractiveRunner)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("runner_type", "runner_class"),
+    [("codex", CodexRunner), ("grok", GrokRunner)],
+)
+def test_create_runner_provider_registry_types(runner_type, runner_class) -> None:
+    assert isinstance(create_runner(RunnerConfig(type=runner_type)), runner_class)
 
 
 @pytest.mark.unit

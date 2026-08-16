@@ -56,6 +56,19 @@ def test_task_stream_name_rejects_empty_provider():
         task_stream_name(" ")
 
 
+@pytest.mark.parametrize(
+    "provider", ["issue:grok", "GROK", "grok name", "grok\nname", "my-provider", "my.provider"]
+)
+def test_task_stream_name_rejects_unsafe_provider(provider):
+    with pytest.raises(ValueError, match="Invalid provider name"):
+        task_stream_name(provider)
+
+
+def test_task_create_rejects_unsafe_provider():
+    with pytest.raises(ValueError, match="Invalid provider name"):
+        _make_task(provider="issue:grok")
+
+
 def test_task_create_generates_unique_ids():
     t1 = _make_task()
     t2 = _make_task()

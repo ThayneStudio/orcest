@@ -8,13 +8,20 @@ Do not merge or deploy the release until the draft PR has the required reviews,
 all required checks are green, and a staging rehearsal of this runbook has been
 recorded on the PR.
 
+For the current `pve-test` environment, follow
+[`pve-test-mixed-provider-rehearsal.md`](pve-test-mixed-provider-rehearsal.md).
+That staging overlay is authoritative where it differs from this generic
+production runbook, particularly for commit handoff, the credential-preserving
+candidate config, the retained legacy backlog, project discovery, publisher
+fencing, and the no-side-effect forced rollback.
+
 ## Release invariants
 
 - Deploy one exact, clean commit. Record it as `RELEASE_SHA`; never deploy a
   branch name, `latest`, `unknown`, or a dirty checkout.
-- A fleet-managed pool consumes exactly one provider stream,
-  `tasks:<pool.worker_backend>`. Fleet preflight rejects any project whose org
-  credentials would publish to a different stream.
+- A fleet-managed worker consumes exactly one provider stream. The pool may
+  schedule an ordered `worker_profiles` mix; fleet preflight rejects any project
+  provider without a live target slot.
 - Freeze new intake, but keep orchestrators running until they have consumed and
   acknowledged all worker results. Then prove queues, pending entries, active
   workers, and private credential-recovery state are empty before replacement.
@@ -43,12 +50,44 @@ unset ORCEST_BUILD_REVISION
 export RELEASE_SHA="$(git rev-parse HEAD)"
 export RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-${RELEASE_SHA}"
 export EXPECTED_POOL_SIZE=REPLACE_WITH_CONFIGURED_POOL_SIZE
+export EXPECTED_VMID_START=REPLACE_WITH_CONFIGURED_WORKER_VMID_START
 export BACKUP_DIR="$(cd .. && pwd)/orcest-release-evidence/${RELEASE_ID}"
 export REMOTE_BACKUP_DIR="/opt/orcest-backups/${RELEASE_ID}"
 release_orcest() {
-  PYTHONPATH="$PWD/src" python3 -c 'from orcest.cli import main; main()' "$@"
+  PYTHONPATH="$ORCEST_SOURCE_ROOT/src" \
+    python3 -c 'from orcest.cli import main; main()' "$@"
 }
+mapfile -t PROJECTS < <(PYTHONPATH="$ORCEST_SOURCE_ROOT/src" \
+  python3 - "$FLEET_CONFIG" <<'PY'
+import sys
+from orcest.fleet.config import load_config
+for project in load_config(sys.argv[1]).projects:
+    print(project.name)
+PY
+)
+test "${#PROJECTS[@]}" -gt 0
 ```
+
+Run commands in the environment that owns the resource. The release checkout
+and `orcest fleet ...` commands must run on the Proxmox host (or another host
+with API access plus the same protected fleet config); `qm ...` commands must
+run on the Proxmox host; Docker/Redis commands must run on the orchestrator
+host. For the current disposable staging topology these roles are:
+
+```text
+operator workstation
+  -> root@pve-test.lab.prefixa.net       (Proxmox and candidate fleet CLI)
+       -> orcest@10.20.1.129             (Docker, Redis, and project stacks)
+```
+
+Do not copy a credential-bearing config into the source checkout. Stage the
+candidate source separately on the Proxmox host and keep `/etc/orcest/config.yaml`
+root-owned with mode `0600`.
+
+Every post-deploy `--expected-backend` flag represents one consecutive worker
+slot beginning at `EXPECTED_VMID_START`; pass them in VMID order. The candidate
+2/1/1 layout is `clauder`, `codex`, `grok`, `clauder`. The health check rejects
+missing, excess, unexpected, or misplaced live workers.
 
 Replace placeholders before use. Keep secrets in existing protected env files;
 never paste them into a PR, terminal transcript, or health report.
@@ -102,12 +141,24 @@ checkout and save its JSON outside the checkout. The `checker_revision` gate
 attests this diagnostic program; it does not attest any deployed runtime.
 Runtime attestation is a separate required gate below.
 
+Do not pass `--expected-backend` before cutover: the old workers predate the
+revision heartbeat protocol. These pre-cutover samples intentionally gate only
+Redis/data quiescence and aggregate pool size; exact backend/VMID attestation
+begins after the candidate workers start.
+
 ```bash
 set -eu
 install -d -m 0700 "$BACKUP_DIR"
 sudo install -m 0600 -o "$(id -un)" -g "$(id -gn)" \
   "$FLEET_CONFIG" "$BACKUP_DIR/fleet-config.candidate.yaml"
-for project in PROJECT_A PROJECT_B; do
+ssh "$ORCHESTRATOR_HOST" 'sudo cat /etc/orcest/config.yaml' \
+  >"$BACKUP_DIR/fleet-config.deployed-old.yaml"
+chmod 0600 "$BACKUP_DIR/fleet-config.deployed-old.yaml"
+sha256sum \
+  "$BACKUP_DIR/fleet-config.candidate.yaml" \
+  "$BACKUP_DIR/fleet-config.deployed-old.yaml" \
+  >"$BACKUP_DIR/fleet-configs.sha256"
+for project in "${PROJECTS[@]}"; do
   release_orcest rollout-health "ORCHESTRATOR_IP:6379" \
     --prefix "$project" \
     --expected-revision "$RELEASE_SHA" \
@@ -168,7 +219,7 @@ Poll every project until the gate passes twice, one minute apart:
 
 ```bash
 set -eu
-for project in PROJECT_A PROJECT_B; do
+for project in "${PROJECTS[@]}"; do
   release_orcest rollout-health "ORCHESTRATOR_IP:6379" \
     --prefix "$project" \
     --expected-revision "$RELEASE_SHA" \
@@ -182,22 +233,25 @@ This requires queue depth `0`, pending plus lag `0`, active pool workers `0`, an
 no private credential checkpoints or recovery intents. If it does not converge,
 stop and diagnose; do not destroy active workers.
 
+If a legacy homogeneous staging pool has backlog on provider streams it cannot
+consume, stop this generic flow. Do not delete, trim, ACK, replay, or allow new
+workers to consume those entries before approval. Use the checked
+`task-streams quarantine/restore` fence and `--keep-orchestrators-paused` flow
+in the `pve-test` overlay. Production cutover requires the full quiescence gate;
+there is no implicit backlog exception.
+
 Only after the second pass, stop every project orchestrator and immediately run
 the same quiescence gate one more time. No task or result work may appear after
 the consumers stop:
 
 ```bash
 set -eu
-ssh "$ORCHESTRATOR_HOST" '
-  set -eu
-  cd /opt/orcest
-  for project in PROJECT_A PROJECT_B; do
-    docker compose -p "orcest-${project}" \
-      --env-file .redis.env --env-file "projects/${project}/.env" \
-      stop orchestrator
-  done
-'
-for project in PROJECT_A PROJECT_B; do
+for project in "${PROJECTS[@]}"; do
+  ssh "$ORCHESTRATOR_HOST" \
+    "cd /opt/orcest && docker compose -p orcest-${project} \
+     --env-file .redis.env --env-file projects/${project}/.env stop orchestrator"
+done
+for project in "${PROJECTS[@]}"; do
   release_orcest rollout-health "ORCHESTRATOR_IP:6379" \
     --prefix "$project" \
     --expected-revision "$RELEASE_SHA" \
@@ -228,15 +282,27 @@ docker tag orcest-dashboard:latest "orcest-dashboard:rollback-${RELEASE_ID}"
 docker image inspect orcest:latest >"$BACKUP_DIR/orcest-image.inspect.json"
 docker image inspect orcest-dashboard:latest \
   >"$BACKUP_DIR/dashboard-image.inspect.json"
+docker exec orcest-redis-redis-1 sh -c \
+  'redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw GET orcest:pool:current_template_vmid' \
+  >"$BACKUP_DIR/old-template-vmid"
+grep -Eq '^[0-9]+$' "$BACKUP_DIR/old-template-vmid"
 sudo cp -p /etc/orcest/config.yaml "$BACKUP_DIR/fleet-config.deployed-old.yaml"
+sudo /opt/orcest/venv/bin/python -c \
+  'import sys,yaml; print(int((yaml.safe_load(open(sys.argv[1])) or {}).get("pool", {}).get("size", 4)))' \
+  /etc/orcest/config.yaml >"$BACKUP_DIR/old-pool-size"
+grep -Eq '^[0-9]+$' "$BACKUP_DIR/old-pool-size"
 sudo tar -C /opt -czf "$BACKUP_DIR/orcest-deployment.tgz" orcest
 sudo chown "$(id -un):$(id -gn)" \
   "$BACKUP_DIR/fleet-config.deployed-old.yaml" \
+  "$BACKUP_DIR/old-template-vmid" \
+  "$BACKUP_DIR/old-pool-size" \
   "$BACKUP_DIR/orcest-deployment.tgz"
 (cd "$BACKUP_DIR" && \
   sha256sum orcest-deployment.tgz >orcest-deployment.tgz.sha256 && \
   sha256sum \
     fleet-config.deployed-old.yaml \
+    old-template-vmid \
+    old-pool-size \
     orcest-deployment.tgz \
     orcest-image.inspect.json \
     dashboard-image.inspect.json \
@@ -277,6 +343,7 @@ record:
 ```bash
 for artifact in \
   fleet-config.deployed-old.yaml \
+  old-template-vmid old-pool-size \
   orcest-deployment.tgz orcest-deployment.tgz.sha256 \
   redis-data.tgz redis-data.tgz.sha256 \
   orcest-image.inspect.json dashboard-image.inspect.json \
@@ -326,7 +393,10 @@ test "$resolved_source_revision" = "$RELEASE_SHA"
 ```
 
 Then run the coordinated deployment. The prior quiescence gate makes
-`--drain-active` non-disruptive; it also permits a backend/template transition:
+`--drain-active` non-disruptive; it also permits a backend/template transition.
+The command stops all project orchestrators first, keeps them stopped while the
+pool is rebuilt, waits for the exact VMID/backend/revision heartbeat layout, and
+only then resumes publishers:
 
 ```bash
 candidate_orcest fleet deploy \
@@ -341,7 +411,12 @@ the old template intact. Confirm the image and every project container:
 
 ```bash
 ssh "$ORCHESTRATOR_HOST" 'docker image inspect orcest:latest --format "{{index .Config.Labels \"org.opencontainers.image.revision\"}}"'
-ssh "$ORCHESTRATOR_HOST" 'cd /opt/orcest && for project in PROJECT_A PROJECT_B; do docker compose -p "orcest-${project}" --env-file .redis.env --env-file "projects/${project}/.env" exec -T orchestrator orcest revision --short; done'
+for project in "${PROJECTS[@]}"; do
+  ssh "$ORCHESTRATOR_HOST" \
+    "cd /opt/orcest && docker compose -p orcest-${project} \
+     --env-file .redis.env --env-file projects/${project}/.env \
+     exec -T orchestrator orcest revision --short"
+done
 ```
 
 Every line must equal `RELEASE_SHA`. Use `orcest fleet pool-status` to select an
@@ -374,7 +449,7 @@ worker revisions:
 
 ```bash
 attest_release() {
-  for project in PROJECT_A PROJECT_B; do
+  for project in "${PROJECTS[@]}"; do
     actual="$(ssh "$ORCHESTRATOR_HOST" \
       "cd /opt/orcest && docker compose -p orcest-${project} \
        --env-file .redis.env --env-file projects/${project}/.env \
@@ -414,44 +489,53 @@ gate below separately requires the exact target size.
 ## 6. Canary and sustained-health watch
 
 The coordinated deploy has restarted all project orchestrators, but the
-upstream ready-label automation remains paused. Apply `orcest:ready` to one
-low-risk canary task for one project. Record its published task ID before it
-completes, and choose a canary whose expected GitHub side effect contains a
-unique, non-secret marker:
+upstream ready-label automation remains paused. Run sequential low-risk
+canaries in a dedicated throwaway repository until the recorded provider set is
+exactly `clauder`, `codex`, and `grok`. Record each task ID, source stream,
+worker ID, and result status using the safe projection below. Record candidate
+revision separately with `attest_release`, and bracket the canary cycle with
+operator UTC timestamps. Each canary's expected GitHub side effect must contain
+a unique, non-secret marker:
 
 ```bash
 set -eu
+date -u +%Y-%m-%dT%H:%M:%SZ >"$BACKUP_DIR/canary-started-at"
+attest_release
 export CANARY_PROJECT=PROJECT_A
-export CANARY_TASK_ID=REPLACE_WITH_PUBLISHED_TASK_UUID
-export CANARY_MARKER=REPLACE_WITH_UNIQUE_EXPECTED_COMMENT_MARKER
-test -n "$CANARY_TASK_ID"
+export CLAUDER_CANARY_TASK_ID=REPLACE_WITH_PUBLISHED_TASK_UUID
+export CODEX_CANARY_TASK_ID=REPLACE_WITH_PUBLISHED_TASK_UUID
+export GROK_CANARY_TASK_ID=REPLACE_WITH_PUBLISHED_TASK_UUID
+export CLAUDER_CANARY_MARKER=REPLACE_WITH_UNIQUE_EXPECTED_COMMENT_MARKER
+export CODEX_CANARY_MARKER=REPLACE_WITH_UNIQUE_EXPECTED_COMMENT_MARKER
+export GROK_CANARY_MARKER=REPLACE_WITH_UNIQUE_EXPECTED_COMMENT_MARKER
+test -n "$CLAUDER_CANARY_TASK_ID"
+test -n "$CODEX_CANARY_TASK_ID"
+test -n "$GROK_CANARY_TASK_ID"
 ```
 
-After completion, prove the project result stream contains exactly one terminal
-record for that task and that it completed successfully:
+After all three complete, use the checked-in safe projector to prove each task
+appeared exactly once on its expected shared provider stream and has exactly one
+completed project result. It emits only provider/task/stream/worker IDs and
+status; task credentials, GitHub tokens, credential updates, prompts, and
+summaries are never returned:
 
 ```bash
-CANARY_PROJECT="$CANARY_PROJECT" CANARY_TASK_ID="$CANARY_TASK_ID" \
-ORCEST_REDIS_PASSWORD="$ORCEST_REDIS_PASSWORD" python3 - <<'PY' || exit 1
-import os
-import redis
-
-client = redis.Redis(
-    host="ORCHESTRATOR_IP",
-    port=6379,
-    password=os.environ["ORCEST_REDIS_PASSWORD"],
-    decode_responses=True,
-)
-stream = f"{os.environ['CANARY_PROJECT']}:results"
-matches = [fields for _, fields in client.xrange(stream) if fields.get("task_id") == os.environ["CANARY_TASK_ID"]]
-assert len(matches) == 1, f"expected one result, found {len(matches)}"
-assert matches[0].get("status") == "completed", matches[0].get("status")
-PY
+candidate_orcest canary-evidence ORCHESTRATOR_IP:6379 \
+  --prefix "$CANARY_PROJECT" \
+  --canary "clauder=$CLAUDER_CANARY_TASK_ID" \
+  --canary "codex=$CODEX_CANARY_TASK_ID" \
+  --canary "grok=$GROK_CANARY_TASK_ID" \
+  >"$BACKUP_DIR/canary-provider-evidence.json"
+jq -e \
+  '.ok == true and ([.canaries[].provider] | sort) == ["clauder","codex","grok"]' \
+  "$BACKUP_DIR/canary-provider-evidence.json"
+attest_release
+date -u +%Y-%m-%dT%H:%M:%SZ >"$BACKUP_DIR/canary-completed-at"
 ```
 
-Query the canary issue/PR through `gh api` and require exactly one comment or
-other terminal side effect containing `CANARY_MARKER`; save the JSON as release
-evidence. Then rerun that project's health command with its saved baselines to
+Query the three canary issues/PRs through `gh api` and require exactly one
+comment or other terminal side effect containing each provider's unique marker;
+save the JSON as release evidence. Then rerun that project's health command with its saved baselines to
 prove result PEL/lag, private checkpoints, recovery intents, DLQ, and provider
 failure counters are clean. Only then release held work one project at a time:
 
@@ -460,22 +544,34 @@ gh api repos/OWNER/REPO/issues/NUMBER/comments --paginate --jq '.[]' \
   >"$BACKUP_DIR/canary-comments.pages.json" || exit 1
 jq -s '.' "$BACKUP_DIR/canary-comments.pages.json" \
   >"$BACKUP_DIR/canary-comments.json" || exit 1
-jq -e --arg marker "$CANARY_MARKER" \
-  '[.[] | select(.body | contains($marker))] | length == 1' \
-  "$BACKUP_DIR/canary-comments.json" || exit 1
+for marker in \
+  "$CLAUDER_CANARY_MARKER" "$CODEX_CANARY_MARKER" "$GROK_CANARY_MARKER"
+do
+  jq -e --arg marker "$marker" \
+    '[.[] | select(.body | contains($marker))] | length == 1' \
+    "$BACKUP_DIR/canary-comments.json" || exit 1
+done
 
 baseline="$BACKUP_DIR/baseline-${CANARY_PROJECT}.json"
 release_orcest rollout-health ORCHESTRATOR_IP:6379 \
   --prefix "$CANARY_PROJECT" \
   --expected-revision "$RELEASE_SHA" \
   --expected-pool-size "$EXPECTED_POOL_SIZE" \
+  --expected-vmid-start "$EXPECTED_VMID_START" \
+  --expected-backend clauder \
+  --expected-backend codex \
+  --expected-backend grok \
+  --expected-backend clauder \
   --baseline-dead-letters "$(jq -r '.metrics.dead_letters' "$baseline")" \
   --baseline-exhausted-skips "$(jq -r '.metrics.provider_exhausted_skips' "$baseline")" \
   --baseline-rebake-failures "$(jq -r '.metrics.provider_rebake_failures' "$baseline")" \
   --max-private-recovery 0 || exit 1
 ```
 
-For each project, derive the three baseline counters from its saved JSON. Run
+The dead-letter stream is shared under the task prefix, so each per-project
+sample intentionally observes the same DLQ baseline; provider counters and
+result state remain project-scoped. For each project, derive the three baseline
+counters from its saved JSON. Run
 the following one-minute sampling loop for the 60-minute active watch; keep the
 JSON so the observer can verify queue, pending, and lag trends rather than only
 the final value:
@@ -485,7 +581,7 @@ set -eu
 for sample in $(seq 1 60); do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   attest_release || exit 1
-  for project in PROJECT_A PROJECT_B; do
+  for project in "${PROJECTS[@]}"; do
     output="$BACKUP_DIR/watch-${timestamp}-${project}.json"
     baseline="$BACKUP_DIR/baseline-${project}.json"
     baseline_dlq="$(jq -r '.metrics.dead_letters' "$baseline")"
@@ -495,6 +591,11 @@ for sample in $(seq 1 60); do
       --prefix "$project" \
       --expected-revision "$RELEASE_SHA" \
       --expected-pool-size "$EXPECTED_POOL_SIZE" \
+      --expected-vmid-start "$EXPECTED_VMID_START" \
+      --expected-backend clauder \
+      --expected-backend codex \
+      --expected-backend grok \
+      --expected-backend clauder \
       --baseline-dead-letters "$baseline_dlq" \
       --baseline-exhausted-skips "$baseline_exhausted" \
       --baseline-rebake-failures "$baseline_rebake" \
@@ -504,7 +605,10 @@ for sample in $(seq 1 60); do
       queue_depth, pending, lag, result_work, dead_letters,
       private_credential_checkpoints, credential_recovery_intents,
       provider_exhausted_skips, provider_rebake_failures,
-      pool_idle, pool_active, inspection_errors
+      pool_idle, pool_active, backend_consumers, backend_heartbeats,
+      expected_backend_counts, worker_revision_mismatches, missing_worker_backends,
+      unexpected_worker_backends, expected_worker_layout,
+      worker_layout_mismatches, inspection_errors
     })}' "$output"
   done
   sleep 60
@@ -520,6 +624,7 @@ Also watch `orcest fleet status`, `orcest fleet pool-status`, dashboard
 - any private checkpoint or recovery intent surviving a polling interval;
 - queue depth or pending/lag that grows for three consecutive samples;
 - pool size not returning to target within 10 minutes;
+- any expected worker slot losing its revision heartbeat or correlated PR/issue consumers;
 - duplicate terminal results, credential leakage, or a stuck task.
 
 After 15 clean minutes, re-enable the ready-label automation. After 60 clean
@@ -541,7 +646,8 @@ while a private credential checkpoint or recovery intent exists.
 On the operator host, restore the captured canonical fleet configuration:
 
 ```bash
-sudo cp -p "$BACKUP_DIR/fleet-config.deployed-old.yaml" "$FLEET_CONFIG"
+sudo install -m 0600 -o root -g root \
+  "$BACKUP_DIR/fleet-config.deployed-old.yaml" "$FLEET_CONFIG"
 ```
 
 On the orchestrator host, validate the deployment archive, preserve the failed
@@ -582,7 +688,8 @@ if printf '%s\n' "$recorded_dashboard_revision" | grep -Eq '^[0-9a-f]{7,64}$'; t
 fi
 sudo mv /opt/orcest "/opt/orcest.failed-${RELEASE_ID}"
 sudo tar -C /opt -xzf "$REMOTE_BACKUP_DIR/orcest-deployment.tgz"
-sudo cp -p "$REMOTE_BACKUP_DIR/fleet-config.deployed-old.yaml" /etc/orcest/config.yaml
+sudo install -m 0600 -o root -g root \
+  "$REMOTE_BACKUP_DIR/fleet-config.deployed-old.yaml" /etc/orcest/config.yaml
 docker tag "orcest:rollback-${RELEASE_ID}" orcest:latest
 docker tag "orcest-dashboard:rollback-${RELEASE_ID}" orcest-dashboard:latest
 ```
@@ -595,16 +702,26 @@ before it can clone any worker:
 ```bash
 set -eu
 cd /opt/orcest
-export OLD_TEMPLATE_VMID=REPLACE_WITH_RECORDED_VMID
+export OLD_TEMPLATE_VMID="$(tr -d '\n' <"$REMOTE_BACKUP_DIR/old-template-vmid")"
+case "$OLD_TEMPLATE_VMID" in ""|*[!0-9]*) exit 2 ;; esac
+export OLD_POOL_SIZE="$(tr -d '\n' <"$REMOTE_BACKUP_DIR/old-pool-size")"
+case "$OLD_POOL_SIZE" in ""|*[!0-9]*) exit 2 ;; esac
+PROJECT_NAMES="$(python3 - <<'PY'
+import yaml
+for project in (yaml.safe_load(open('/etc/orcest/config.yaml')) or {}).get('projects', []):
+    print(project['name'])
+PY
+)"
+test -n "$PROJECT_NAMES"
 docker compose --env-file .redis.env -f docker-compose.redis.yml \
   -p orcest-redis up -d --no-build --force-recreate redis
 docker exec orcest-redis-redis-1 sh -c \
   'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning SET orcest:pool:current_template_vmid '"$OLD_TEMPLATE_VMID"
 
-for project in PROJECT_A PROJECT_B; do
+for project in $PROJECT_NAMES; do
   ORCEST_IMAGE=orcest:latest docker compose -p "orcest-${project}" \
     --env-file .redis.env --env-file "projects/${project}/.env" \
-    up -d --no-build --force-recreate orchestrator
+    create --no-build --force-recreate orchestrator
 done
 DASHBOARD_IMAGE=orcest-dashboard:latest docker compose \
   --env-file .redis.env --env-file .dashboard.env \
@@ -629,10 +746,10 @@ test "$old_orcest_id" = \
   "$(jq -r '.[0].Id' "$REMOTE_BACKUP_DIR/orcest-image.inspect.json")"
 test "$old_dashboard_id" = \
   "$(jq -r '.[0].Id' "$REMOTE_BACKUP_DIR/dashboard-image.inspect.json")"
-for project in PROJECT_A PROJECT_B; do
+for project in $PROJECT_NAMES; do
   cid="$(docker compose -p "orcest-${project}" \
     --env-file .redis.env --env-file "projects/${project}/.env" \
-    ps -q orchestrator)"
+    ps -aq orchestrator)"
   test "$(docker inspect -f '{{.Image}}' "$cid")" = "$old_orcest_id"
 done
 dashboard_cid="$(docker compose --env-file .redis.env --env-file .dashboard.env \
@@ -644,11 +761,79 @@ test "$(docker inspect -f '{{.Image}}' "$pool_cid")" = "$old_orcest_id"
 test "$(docker exec orcest-redis-redis-1 sh -c \
   'redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw GET orcest:pool:current_template_vmid')" \
   = "$OLD_TEMPLATE_VMID"
-curl -fsS http://127.0.0.1:8080/api/ready | jq -e \
-  '.ok == true and .redis_ok == true' >/dev/null
+deadline=$((SECONDS + 120))
+until curl -fsS http://127.0.0.1:8080/api/ready | jq -e \
+  '.ok == true and .redis_ok == true' >/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 2
+done
 docker compose --env-file .redis.env -f docker-compose.pool.yml \
   -p orcest-pool start pool-manager
+
+deadline=$((SECONDS + 600))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  idle="$(docker exec orcest-redis-redis-1 sh -c \
+    'redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw SCARD orcest:pool:idle')"
+  active="$(docker exec orcest-redis-redis-1 sh -c \
+    'redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw HLEN orcest:pool:active')"
+  [ $((idle + active)) -eq "$OLD_POOL_SIZE" ] && break
+  sleep 5
+done
+[ $((idle + active)) -eq "$OLD_POOL_SIZE" ] || exit 1
+
+exit
 ```
+
+On the Proxmox host, reload recorded values rather than relying on variables
+from the orchestrator shell. Redis capacity is not sufficient proof: every
+tracked guest must also have a running worker service and a registered consumer
+on the restored backend stream.
+
+```bash
+set -eu
+export OLD_POOL_SIZE="$(ssh "$ORCHESTRATOR_HOST" \
+  "cat /opt/orcest-backups/${RELEASE_ID}/old-pool-size")"
+export OLD_WORKER_BACKEND="$(ssh "$ORCHESTRATOR_HOST" \
+  "python3 -c 'import yaml; print((yaml.safe_load(open(\"/etc/orcest/config.yaml\")) or {}).get(\"pool\", {}).get(\"worker_backend\", \"claude\"))'")"
+rolled_back_vmids="$(
+  ssh "$ORCHESTRATOR_HOST" \
+    "docker exec orcest-redis-redis-1 sh -c 'redis-cli -a \"\$ORCEST_REDIS_PASSWORD\" --no-auth-warning --raw SMEMBERS orcest:pool:idle'"
+)"
+test "$(printf '%s\n' "$rolled_back_vmids" | sed '/^$/d' | wc -l)" \
+  -eq "$OLD_POOL_SIZE"
+for vmid in $rolled_back_vmids; do
+  qm guest exec "$vmid" -- systemctl is-active --quiet orcest-worker | \
+    jq -e '.exitcode == 0' >/dev/null
+  ssh "$ORCHESTRATOR_HOST" \
+    "docker exec orcest-redis-redis-1 sh -c 'redis-cli -a \"\$ORCEST_REDIS_PASSWORD\" --no-auth-warning --raw XINFO CONSUMERS orcest:tasks:${OLD_WORKER_BACKEND} workers'" | \
+    grep -Fx "orcest-worker-${vmid}" >/dev/null
+done
+
+# Start orchestrators remotely only after every Proxmox check passes.
+for project in "${PROJECTS[@]}"; do
+  ssh "$ORCHESTRATOR_HOST" \
+    "cd /opt/orcest && docker compose -p orcest-${project} \
+     --env-file .redis.env --env-file projects/${project}/.env start orchestrator"
+done
+
+deadline=$((SECONDS + 120))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  all_running=1
+  for project in "${PROJECTS[@]}"; do
+    ssh "$ORCHESTRATOR_HOST" \
+      "cd /opt/orcest && test \"\$(docker compose -p orcest-${project} \
+       --env-file .redis.env --env-file projects/${project}/.env \
+       ps --status running -q orchestrator | wc -l)\" -eq 1" || all_running=0
+  done
+  [ "$all_running" -eq 1 ] && break
+  sleep 2
+done
+[ "$all_running" -eq 1 ]
+```
+
+The old worker pool reaches its recorded capacity and every guest worker
+service is active before orchestrators resume, so rollback does not publish
+into a workerless interval.
 
 If an old image has a clean revision label, compare it with the recorded
 `OLD_RELEASE_SHA`; for an older unlabeled image, the captured image ID is
@@ -661,6 +846,12 @@ candidate checker, not the rolled-back services. Verify old runtime image IDs
 and the old template pointer separately as above. The production host CLI was
 never replaced; retain the isolated candidate venv through diagnosis, then
 resume intake one project at a time.
+
+For a mixed-to-homogeneous worker rollback, do not start the old pool manager
+against the mixed live VMs. Keep the candidate CLI/pool manager long enough to
+drain every mixed worker, restore the captured scalar `worker_backend` config
+and old template pointer, and only then start the old pool manager. The old
+manager counts aggregate capacity and cannot preserve a mixed layout.
 
 ## 8. Redis data rollback (last resort)
 
@@ -758,6 +949,6 @@ retain the timestamped `redis-data.failed-*.tgz` with the incident record.
 - [ ] Deployment/config archive and Redis-volume archive checksummed
 - [ ] Prior images and prior worker template retained
 - [ ] Orchestrator, worker, and dashboard revisions equal `RELEASE_SHA`
-- [ ] Canary succeeded without counter growth or private residue
+- [ ] All-provider canary cycle succeeded without counter growth or private residue
 - [ ] 15-minute initial and 60-minute sustained watch passed
 - [ ] 24-hour automated observation and final verdict passed

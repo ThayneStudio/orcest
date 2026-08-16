@@ -39,6 +39,15 @@ if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
 
+# Install the version whose JSON event protocol is covered by CodexRunner's
+# parser fixtures. Authentication is injected per task; no credential is baked.
+CODEX_VERSION="0.131.0"
+installed_codex_version="$(codex --version 2>/dev/null | awk '{print $NF}' || true)"
+if [ "${installed_codex_version}" != "${CODEX_VERSION}" ]; then
+    echo "Installing Codex CLI ${CODEX_VERSION}..."
+    sudo npm install -g "@openai/codex@${CODEX_VERSION}"
+fi
+
 # Grok (xAI Grok Build) CLI — provider "grok".
 # ----------------------------------------------------------------
 # Execution + auth contract lives worker-side in
@@ -66,7 +75,8 @@ GROK_VERSION="0.1.216"
 # Either way we download to a file first rather than piping a (possibly
 # partial) download straight into bash.
 GROK_INSTALLER_SHA256="${GROK_INSTALLER_SHA256:-}"
-if ! command -v grok &>/dev/null; then
+installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then
     echo "Installing Grok CLI ${GROK_VERSION}..."
     _grok_installer="$(mktemp)"
     if curl -fsSL https://x.ai/cli/install.sh -o "${_grok_installer}"; then
@@ -95,11 +105,15 @@ if ! command -v grok &>/dev/null; then
         sudo chmod 755 /usr/local/bin/grok
     fi
 fi
-if command -v grok &>/dev/null; then
+installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ "${installed_grok_version}" = "${GROK_VERSION}" ]; then
     echo "Grok CLI present: $(grok --version 2>/dev/null | head -1)"
 else
-    echo "WARNING: Grok CLI install failed — Grok tasks will be cleanly rejected"
-    echo "  with a permanent FAILED + rebake instruction until the binary is present."
+    echo "WARNING: pinned Grok CLI ${GROK_VERSION} is unavailable"
+    echo "  Grok tasks must remain disabled until the worker image is successfully rebaked."
+    # setup-worker owns this system path. Never leave a known-incompatible
+    # binary available to the systemd worker after a fail-closed install.
+    sudo rm -f /usr/local/bin/grok
 fi
 
 # Install Docker Engine
@@ -192,7 +206,7 @@ fi
 # Verify dependencies
 echo ""
 echo "Verifying installation..."
-for cmd in python3 node claude gh git docker go; do
+for cmd in python3 node claude codex gh git docker go; do
     if command -v "$cmd" &>/dev/null; then
         echo "  $cmd: ok"
     else

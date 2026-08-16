@@ -7,6 +7,7 @@ host (where ``orcest fleet`` commands run) to the orchestrator VM.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -116,6 +117,19 @@ def _scp(src: str, dest_target: str, dest_path: str) -> subprocess.CompletedProc
     )
 
 
+def _remote_private_tmp(ssh_target: str, template: str) -> str:
+    """Create a unique 0600 temporary file owned by the deploy SSH user."""
+    if not re.fullmatch(r"/tmp/[a-zA-Z0-9._-]+\.XXXXXX", template):
+        raise ValueError("Unsafe remote temporary-file template")
+    result = _ssh(ssh_target, f"umask 077 && mktemp {shlex.quote(template)}")
+    if result.returncode != 0:
+        raise RuntimeError("Failed to allocate a private remote temporary file")
+    path = result.stdout.strip()
+    if not re.fullmatch(r"/tmp/[a-zA-Z0-9._-]+", path):
+        raise RuntimeError("Remote mktemp returned an unsafe path")
+    return path
+
+
 def build_image(ssh_target: str) -> None:
     """Build the orcest:latest Docker image on the orchestrator VM.
 
@@ -166,9 +180,12 @@ def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = 
     """
     logger.info("Uploading source to %s", ssh_target)
     tarball_path = create_source_tarball(source_root=source_root)
+    remote_tarball: str | None = None
     try:
-        # SCP to orchestrator
-        result = _scp(tarball_path, ssh_target, "/tmp/orcest-source.tar.gz")
+        # Use a unique, mode-0600 destination so concurrent deploy attempts
+        # cannot overwrite or remove each other's candidate source archive.
+        remote_tarball = _remote_private_tmp(ssh_target, "/tmp/orcest-source.XXXXXX")
+        result = _scp(tarball_path, ssh_target, remote_tarball)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload tarball: {result.stderr.strip()}")
 
@@ -190,17 +207,19 @@ def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = 
             raise RuntimeError(
                 f"Failed to clean /opt/orcest on {ssh_target}: {clean_result.stderr.strip()}"
             )
-        result = _ssh(ssh_target, "tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/")
+        result = _ssh(
+            ssh_target,
+            f"tar xzf {shlex.quote(remote_tarball)} -C /opt/orcest/",
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to extract tarball on {ssh_target}: {result.stderr.strip()}"
             )
 
-        # Clean up remote tarball
-        _ssh(ssh_target, "rm -f /tmp/orcest-source.tar.gz")
-
         logger.info("Source uploaded and extracted on %s", ssh_target)
     finally:
+        if remote_tarball is not None:
+            _ssh(ssh_target, f"rm -f {shlex.quote(remote_tarball)}")
         try:
             os.unlink(tarball_path)
         except OSError:
@@ -446,37 +465,33 @@ def upload_fleet_config(
         raise FileNotFoundError(f"Fleet config not found: {local_config_path}")
 
     remote_dest = "/etc/orcest/config.yaml"
-    # SCP as the orcest user to a writable location, then sudo mv into place.
-    remote_tmp = "/tmp/.orcest-config.yaml.tmp"
 
     # Ensure target directory exists on the orchestrator VM
     result = _ssh(ssh_target, "sudo mkdir -p /etc/orcest")
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}")
 
-    result = _scp(local_config_path, ssh_target, remote_tmp)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
+    remote_tmp = _remote_private_tmp(ssh_target, "/tmp/orcest-config.XXXXXX")
+    try:
+        result = _scp(local_config_path, ssh_target, remote_tmp)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
 
-    result = _ssh(
-        ssh_target,
-        f"sudo mv {shlex.quote(remote_tmp)} {shlex.quote(remote_dest)}"
-        f" && sudo chmod 600 {shlex.quote(remote_dest)}",
-    )
-    if result.returncode != 0:
+        result = _ssh(
+            ssh_target,
+            f"sudo install -m 600 -o root -g root {shlex.quote(remote_tmp)} "
+            f"{shlex.quote(remote_dest)}",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to install fleet config: {result.stderr.strip()}")
+    finally:
         _ssh(ssh_target, f"rm -f {shlex.quote(remote_tmp)}")
-        raise RuntimeError(f"Failed to install fleet config: {result.stderr.strip()}")
 
     logger.info("Fleet config uploaded to %s:%s", ssh_target, remote_dest)
 
 
-def get_deployed_pool_backend(ssh_target: str) -> str | None:
-    """Return the worker backend in the currently deployed fleet config.
-
-    ``None`` means this is a first deployment and no remote fleet config exists.
-    Other read or parse failures are surfaced so callers cannot unknowingly
-    perform a backend transition with a stale worker template.
-    """
+def _get_deployed_pool_config(ssh_target: str) -> dict | None:
+    """Read and validate the deployed pool mapping, or return None when absent."""
     result = _ssh(ssh_target, "sudo cat /etc/orcest/config.yaml")
     if result.returncode != 0:
         error = (result.stderr or "").strip().lower()
@@ -495,8 +510,92 @@ def get_deployed_pool_backend(ssh_target: str) -> str | None:
     pool = data.get("pool") or {}
     if not isinstance(pool, dict):
         raise RuntimeError("Deployed fleet config pool section must be a mapping")
+    return pool
+
+
+def get_deployed_pool_vmid_range(ssh_target: str) -> tuple[int, int] | None:
+    """Return the deployed worker VMID range, or None on a first deployment."""
+    pool = _get_deployed_pool_config(ssh_target)
+    if pool is None:
+        return None
+    try:
+        return int(pool.get("vm_id_start", 0) or 0), int(pool.get("vm_id_end", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Deployed pool worker VMID range must contain integers") from exc
+
+
+def get_deployed_pool_backend(ssh_target: str) -> str | None:
+    """Return the worker-layout signature in the deployed fleet config.
+
+    ``None`` means this is a first deployment and no remote fleet config exists.
+    Other read or parse failures are surfaced so callers cannot unknowingly
+    perform a backend transition with stale workers. Legacy single-backend
+    configurations return the backend name exactly; heterogeneous layouts
+    return their ordered backend/runner/mode signature.
+    """
+    pool = _get_deployed_pool_config(ssh_target)
+    if pool is None:
+        return None
+    raw_profiles = pool.get("worker_profiles") or []
+    if raw_profiles:
+        if not isinstance(raw_profiles, list):
+            raise RuntimeError("Deployed pool.worker_profiles must be a list")
+        from orcest.fleet.config import WorkerProfileConfig
+
+        profiles: list[WorkerProfileConfig] = []
+        for index, raw_profile in enumerate(raw_profiles):
+            if isinstance(raw_profile, str):
+                if not raw_profile.strip():
+                    raise RuntimeError(
+                        f"Deployed pool.worker_profiles[{index}] backend must not be empty"
+                    )
+                profiles.append(WorkerProfileConfig(backend=raw_profile))
+                continue
+            if not isinstance(raw_profile, dict):
+                raise RuntimeError(
+                    f"Deployed pool.worker_profiles[{index}] must be a string or mapping"
+                )
+            backend = str(raw_profile.get("backend", "") or "")
+            if not backend.strip():
+                raise RuntimeError(
+                    f"Deployed pool.worker_profiles[{index}].backend must not be empty"
+                )
+            profiles.append(
+                WorkerProfileConfig(
+                    backend=backend,
+                    runner_type=str(raw_profile.get("runner_type", "") or ""),
+                    runner_mode=str(raw_profile.get("runner_mode", "") or ""),
+                )
+            )
+        profile_signature = ",".join(
+            f"{profile.backend}:{profile.runner_type}:{profile.runner_mode}" for profile in profiles
+        )
+        try:
+            vm_id_start = int(pool.get("vm_id_start", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Deployed pool.vm_id_start must be an integer") from exc
+        try:
+            vm_id_end = int(pool.get("vm_id_end", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Deployed pool.vm_id_end must be an integer") from exc
+        return f"vm_id_start={vm_id_start};vm_id_end={vm_id_end};profiles={profile_signature}"
     backend = str(pool.get("worker_backend") or "claude").strip()
-    return backend or "claude"
+    from orcest.fleet.config import WorkerProfileConfig
+
+    profile = WorkerProfileConfig(
+        backend=backend or "claude",
+        runner_type=str(pool.get("worker_runner_type") or ""),
+        runner_mode=str(pool.get("worker_runner_mode") or ""),
+    )
+    try:
+        vm_id_start = int(pool.get("vm_id_start", 0) or 0)
+        vm_id_end = int(pool.get("vm_id_end", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Deployed pool worker VMID range must contain integers") from exc
+    return (
+        f"vm_id_start={vm_id_start};vm_id_end={vm_id_end};backend={profile.backend};"
+        f"runner={profile.runner_type};mode={profile.runner_mode}"
+    )
 
 
 def ensure_pool_manager(
@@ -726,6 +825,7 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
         cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:provisioning {quoted}")
         cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:ambiguous-clones {quoted}")
         cmds.append(f"{_REDIS_CLI_PREFIX} DEL orcest:pool:done:{worker_id}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} DEL orcest:workers:heartbeat:{worker_id}")
     result = _ssh(ssh_target, " && ".join(cmds))
     _require_redis_cli_success(result, "Failed to clean pool Redis state")
 
@@ -737,6 +837,7 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
         verify = _ssh(
             ssh_target,
             f"{_REDIS_CLI_PREFIX} --raw EXISTS orcest:pool:done:{worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw EXISTS orcest:workers:heartbeat:{worker_id}"
             f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:draining {worker_id}"
             f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:provisioning {vm_id}"
             f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:ambiguous-clones {vm_id}",
@@ -746,7 +847,7 @@ def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
             f"Failed to verify pool Redis cleanup for VM {vm_id}",
         )
         states = [line.strip() for line in verify.stdout.splitlines() if line.strip()]
-        if states != ["0", "0", "0", "0"]:
+        if states != ["0", "0", "0", "0", "0"]:
             raise RuntimeError(
                 f"Failed to verify pool Redis cleanup for VM {vm_id}: "
                 f"expected lifecycle markers to be absent, got {states!r}"
@@ -772,6 +873,44 @@ def set_workers_draining(
     if failure is not None:
         action = "mark" if draining else "clear"
         raise RuntimeError(f"Failed to {action} worker drain state: {failure}")
+
+
+def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
+    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+    pattern = "orcest:workers:heartbeat:*"
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} --raw --scan --pattern {shlex.quote(pattern)}",
+    )
+    _require_redis_cli_success(result, "Failed to scan worker heartbeats")
+    keys = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    heartbeats: dict[str, tuple[str, str]] = {}
+    for key in keys:
+        if not key.startswith("orcest:workers:heartbeat:"):
+            raise RuntimeError("Worker heartbeat scan returned an unexpected key")
+        value_result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw GET {shlex.quote(key)}",
+        )
+        _require_redis_cli_success(value_result, "Failed to read worker heartbeat")
+        raw = value_result.stdout.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Worker heartbeat is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Worker heartbeat must contain a JSON mapping")
+        backend = payload.get("backend")
+        revision = payload.get("revision")
+        if not isinstance(backend, str) or not isinstance(revision, str):
+            raise RuntimeError("Worker heartbeat is missing backend or revision")
+        worker_id = key.removeprefix("orcest:workers:heartbeat:")
+        if not worker_id:
+            raise RuntimeError("Worker heartbeat is missing its worker ID")
+        heartbeats[worker_id] = (backend, revision)
+    return heartbeats
 
 
 def clean_pending_tasks(ssh_target: str) -> int:
@@ -826,6 +965,20 @@ def deploy_stack(ssh_target: str, project_name: str) -> None:
         logger.error("Deploy failed: %s", result.stderr.strip())
         raise RuntimeError(f"Failed to deploy stack orcest-{project_name}: {result.stderr.strip()}")
     logger.info("Stack orcest-%s deployed on %s", project_name, ssh_target)
+
+
+def stop_stack(ssh_target: str, project_name: str) -> None:
+    """Stop a project orchestrator without deleting its containers or volumes."""
+    _validate_project_name(project_name)
+    logger.info("Stopping stack orcest-%s on %s", project_name, ssh_target)
+    result = _ssh(
+        ssh_target,
+        f"cd /opt/orcest && docker compose -p {_project_compose_args(project_name)} stop",
+    )
+    if result.returncode != 0:
+        logger.error("Stop failed: %s", result.stderr.strip())
+        raise RuntimeError(f"Failed to stop stack orcest-{project_name}: {result.stderr.strip()}")
+    logger.info("Stack orcest-%s stopped on %s", project_name, ssh_target)
 
 
 def teardown_stack(ssh_target: str, project_name: str) -> None:
@@ -889,19 +1042,21 @@ def write_project_files(
         tmp_env_path = tmp.name
 
     try:
-        remote_tmp_env = f"/tmp/orcest-{project_name}-env"
+        remote_tmp_env = _remote_private_tmp(ssh_target, f"/tmp/orcest-{project_name}-env.XXXXXX")
         qremote_tmp_env = shlex.quote(remote_tmp_env)
-        result = _scp(tmp_env_path, ssh_target, remote_tmp_env)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to upload .env: {result.stderr.strip()}")
-        qenv_dest = shlex.quote(f"{pdir}/.env")
-        result = _ssh(
-            ssh_target,
-            f"mv {qremote_tmp_env} {qenv_dest} && chmod 600 {qenv_dest}",
-        )
-        if result.returncode != 0:
+        try:
+            result = _scp(tmp_env_path, ssh_target, remote_tmp_env)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to upload .env: {result.stderr.strip()}")
+            qenv_dest = shlex.quote(f"{pdir}/.env")
+            result = _ssh(
+                ssh_target,
+                f"mv {qremote_tmp_env} {qenv_dest} && chmod 600 {qenv_dest}",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
+        finally:
             _ssh(ssh_target, f"rm -f {qremote_tmp_env}")
-            raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
     finally:
         try:
             os.unlink(tmp_env_path)
@@ -914,19 +1069,23 @@ def write_project_files(
         tmp_config_path = tmp.name
 
     try:
-        remote_tmp_config = f"/tmp/orcest-{project_name}-config.yaml"
-        qremote_tmp_config = shlex.quote(remote_tmp_config)
-        result = _scp(tmp_config_path, ssh_target, remote_tmp_config)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to upload config: {result.stderr.strip()}")
-        qconfig_dest = shlex.quote(f"{pdir}/config/orchestrator.yaml")
-        result = _ssh(
-            ssh_target,
-            f"mv {qremote_tmp_config} {qconfig_dest} && chmod 644 {qconfig_dest}",
+        remote_tmp_config = _remote_private_tmp(
+            ssh_target, f"/tmp/orcest-{project_name}-config.XXXXXX"
         )
-        if result.returncode != 0:
+        qremote_tmp_config = shlex.quote(remote_tmp_config)
+        try:
+            result = _scp(tmp_config_path, ssh_target, remote_tmp_config)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to upload config: {result.stderr.strip()}")
+            qconfig_dest = shlex.quote(f"{pdir}/config/orchestrator.yaml")
+            result = _ssh(
+                ssh_target,
+                f"mv {qremote_tmp_config} {qconfig_dest} && chmod 644 {qconfig_dest}",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
+        finally:
             _ssh(ssh_target, f"rm -f {qremote_tmp_config}")
-            raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
     finally:
         try:
             os.unlink(tmp_config_path)

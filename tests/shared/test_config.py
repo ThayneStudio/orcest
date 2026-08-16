@@ -33,6 +33,8 @@ _ENV_VARS_TO_CLEAR = [
     "ORCEST_TASK_KEY_PREFIX",
     "XAI_API_KEY",
     "GROK_API_KEY",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
     "CLAUDER_API_KEY",
     "ANTHROPIC_API_KEY",
 ]
@@ -155,6 +157,64 @@ def test_load_worker_config_from_yaml(tmp_path: Path):
     assert config.runner.max_retries == 5
     assert config.runner.retry_backoff == 20
     assert config.runner.model == "opus"
+
+
+def test_load_worker_config_clauder_defaults_to_interactive_claude(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("backend: clauder\nrunner:\n  type: claude\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.runner.type == "claude"
+    assert config.runner.extra["mode"] == "interactive"
+
+
+@pytest.mark.parametrize("backend", ["codex", "grok"])
+def test_load_worker_config_backend_defaults_to_matching_runner(tmp_path: Path, backend: str):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text(f"backend: {backend}\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.backend == backend
+    assert config.runner.type == backend
+    assert "mode" not in config.runner.extra
+
+
+@pytest.mark.parametrize(
+    "runner_yaml",
+    ["runner:\n  type: clauder\n", "runner:\n  type: claude\n  extra:\n    mode: batch\n"],
+)
+def test_load_worker_config_rejects_unsafe_clauder_runner(tmp_path: Path, runner_yaml: str):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text(f"backend: clauder\n{runner_yaml}")
+
+    with pytest.raises(ValueError, match="backend 'clauder' requires"):
+        load_worker_config(cfg_file)
+
+
+def test_load_worker_config_rejects_backend_that_collides_with_issue_stream(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("backend: issue:grok\nrunner:\n  type: grok\n")
+
+    with pytest.raises(ValueError, match="Invalid provider name"):
+        load_worker_config(cfg_file)
+
+
+def test_load_worker_config_rejects_backend_runner_mismatch(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("backend: codex\nrunner:\n  type: grok\n")
+
+    with pytest.raises(ValueError, match="requires matching runner.type 'codex'"):
+        load_worker_config(cfg_file)
+
+
+def test_load_worker_config_rejects_non_claude_runner_mode(tmp_path: Path):
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("backend: grok\nrunner:\n  type: grok\n  extra:\n    mode: interactive\n")
+
+    with pytest.raises(ValueError, match="does not support runner.extra.mode"):
+        load_worker_config(cfg_file)
 
 
 def test_load_worker_config_runner_model_null_uses_cli_default(tmp_path: Path):

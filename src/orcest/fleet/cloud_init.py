@@ -8,6 +8,7 @@ and configures the appropriate services.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -205,6 +206,11 @@ def _worker_tooling_runcmd() -> list[str]:
     # Effective grok installer digest: env override (set at bake time, no code
     # edit) falls back to the pinned constant. Empty => FAIL CLOSED (skip).
     grok_sha = os.environ.get("ORCEST_GROK_INSTALLER_SHA256", _GROK_INSTALLER_SHA256)
+    if grok_sha and re.fullmatch(r"[0-9a-fA-F]{64}", grok_sha) is None:
+        raise ValueError(
+            "ORCEST_GROK_INSTALLER_SHA256 must be empty or exactly 64 hexadecimal characters"
+        )
+    grok_sha = grok_sha.lower()
     return [
         # Node.js: NodeSource channel for the configured major version.
         f"curl -fsSL https://deb.nodesource.com/setup_{_NODE_MAJOR}.x | bash -",

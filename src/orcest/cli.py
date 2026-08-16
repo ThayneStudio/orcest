@@ -127,6 +127,18 @@ def revision(json_output: bool, short: bool) -> None:
     help="Exact clean revision expected for this checker installation.",
 )
 @click.option("--expected-pool-size", type=click.IntRange(min=0), default=None)
+@click.option(
+    "--expected-vmid-start",
+    type=click.IntRange(min=1),
+    default=None,
+    help="First managed worker VMID; required with --expected-backend.",
+)
+@click.option(
+    "--expected-backend",
+    "expected_backends",
+    multiple=True,
+    help="Required worker backend; repeat for mixed fleets.",
+)
 @click.option("--baseline-dead-letters", type=click.IntRange(min=0), default=None)
 @click.option("--baseline-exhausted-skips", type=click.IntRange(min=0), default=None)
 @click.option("--baseline-rebake-failures", type=click.IntRange(min=0), default=None)
@@ -140,6 +152,8 @@ def rollout_health(
     task_prefix: str,
     expected_revision: str,
     expected_pool_size: int | None,
+    expected_vmid_start: int | None,
+    expected_backends: tuple[str, ...],
     baseline_dead_letters: int | None,
     baseline_exhausted_skips: int | None,
     baseline_rebake_failures: int | None,
@@ -158,6 +172,31 @@ def rollout_health(
             "must be an exact clean hexadecimal revision",
             param_hint="--expected-revision",
         )
+    from orcest.shared.models import require_valid_provider_name
+
+    try:
+        for backend in expected_backends:
+            require_valid_provider_name(backend)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--expected-backend") from exc
+    if expected_backends and expected_pool_size is None:
+        raise click.BadParameter(
+            "requires --expected-pool-size so worker heartbeats can be correlated "
+            "to managed pool slots",
+            param_hint="--expected-backend",
+        )
+    if expected_backends and expected_vmid_start is None:
+        raise click.BadParameter(
+            "requires --expected-vmid-start so the exact managed VMID/backend "
+            "layout can be verified",
+            param_hint="--expected-backend",
+        )
+    if expected_pool_size is not None and expected_backends:
+        if len(expected_backends) != expected_pool_size:
+            raise click.BadParameter(
+                "must be repeated exactly once per expected pool slot",
+                param_hint="--expected-backend",
+            )
 
     redis_cfg = _resolve_redis_config(redis_host, config, prefix)
     redis = RedisClient(redis_cfg)
@@ -167,6 +206,8 @@ def rollout_health(
             expected_revision=normalized,
             task_prefix=task_prefix,
             expected_pool_size=expected_pool_size,
+            expected_vmid_start=expected_vmid_start,
+            expected_backends=expected_backends,
             baseline_dead_letters=baseline_dead_letters,
             baseline_exhausted_skips=baseline_exhausted_skips,
             baseline_rebake_failures=baseline_rebake_failures,
@@ -187,6 +228,140 @@ def rollout_health(
         click.echo(f"METRICS {json.dumps(report['metrics'], sort_keys=True)}")
     if not report["ok"]:
         raise SystemExit(1)
+
+
+@main.command("canary-evidence")
+@click.argument("redis_host", required=False, default=None)
+@click.option("--config", default="config/orchestrator.yaml", help="Config file for Redis.")
+@click.option("--prefix", required=True, help="Project Redis key prefix.")
+@click.option("--task-prefix", default="orcest", show_default=True)
+@click.option(
+    "--canary",
+    "canary_specs",
+    multiple=True,
+    required=True,
+    help="Provider/task pair as PROVIDER=TASK_ID; repeat once per provider.",
+)
+def canary_evidence(
+    redis_host: str | None,
+    config: str,
+    prefix: str,
+    task_prefix: str,
+    canary_specs: tuple[str, ...],
+) -> None:
+    """Emit secret-safe proof that provider canaries completed exactly once."""
+    from orcest.canary_evidence import CanaryEvidenceError, collect_canary_evidence
+    from orcest.shared.redis_client import RedisClient
+
+    canaries: dict[str, str] = {}
+    for spec in canary_specs:
+        provider, separator, task_id = spec.partition("=")
+        if not separator or not provider or not task_id:
+            raise click.BadParameter("must use PROVIDER=TASK_ID", param_hint="--canary")
+        if provider in canaries:
+            raise click.BadParameter(
+                f"provider {provider!r} was specified more than once",
+                param_hint="--canary",
+            )
+        canaries[provider] = task_id
+
+    redis_cfg = _resolve_redis_config(redis_host, config, prefix)
+    redis = RedisClient(redis_cfg)
+    try:
+        evidence = collect_canary_evidence(
+            redis,
+            task_prefix=task_prefix,
+            canaries=canaries,
+        )
+    except CanaryEvidenceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        redis.close()
+    click.echo(json.dumps(evidence, sort_keys=True))
+
+
+@main.group("task-streams")
+def task_streams() -> None:
+    """Fence or restore provider task streams during a controlled migration."""
+
+
+def _task_stream_transition(
+    *,
+    operation: str,
+    redis_host: str | None,
+    config: str,
+    task_prefix: str,
+    quarantine_id: str,
+) -> None:
+    from orcest.shared.redis_client import RedisClient
+    from orcest.task_stream_quarantine import (
+        TaskStreamQuarantineError,
+        quarantine_task_streams,
+        restore_task_streams,
+    )
+
+    redis_cfg = _resolve_redis_config(redis_host, config, None)
+    redis = RedisClient(redis_cfg)
+    try:
+        if operation == "quarantine":
+            report = quarantine_task_streams(
+                redis,
+                task_prefix=task_prefix,
+                quarantine_id=quarantine_id,
+            )
+        else:
+            report = restore_task_streams(
+                redis,
+                task_prefix=task_prefix,
+                quarantine_id=quarantine_id,
+            )
+    except TaskStreamQuarantineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        redis.close()
+    click.echo(json.dumps(report, sort_keys=True))
+
+
+@task_streams.command("quarantine")
+@click.argument("redis_host", required=False, default=None)
+@click.option("--config", default="config/orchestrator.yaml", help="Config file for Redis.")
+@click.option("--task-prefix", default="orcest", show_default=True)
+@click.option("--quarantine-id", required=True, help="Unique release identifier.")
+def task_streams_quarantine(
+    redis_host: str | None,
+    config: str,
+    task_prefix: str,
+    quarantine_id: str,
+) -> None:
+    """Atomically move active task streams behind a migration fence."""
+    _task_stream_transition(
+        operation="quarantine",
+        redis_host=redis_host,
+        config=config,
+        task_prefix=task_prefix,
+        quarantine_id=quarantine_id,
+    )
+
+
+@task_streams.command("restore")
+@click.argument("redis_host", required=False, default=None)
+@click.option("--config", default="config/orchestrator.yaml", help="Config file for Redis.")
+@click.option("--task-prefix", default="orcest", show_default=True)
+@click.option("--quarantine-id", required=True, help="Release identifier used to quarantine.")
+def task_streams_restore(
+    redis_host: str | None,
+    config: str,
+    task_prefix: str,
+    quarantine_id: str,
+) -> None:
+    """Restore fenced task streams without overwriting any new work."""
+    _task_stream_transition(
+        operation="restore",
+        redis_host=redis_host,
+        config=config,
+        task_prefix=task_prefix,
+        quarantine_id=quarantine_id,
+    )
 
 
 @main.command()
@@ -213,8 +388,14 @@ def work(worker_id: str, config: str, runner: str | None, once: bool) -> None:
     cfg = load_worker_config(config)
     cfg.worker_id = worker_id
     if runner:
-        cfg.runner.type = runner
-        cfg.backend = runner
+        from orcest.fleet.config import normalize_worker_runner_for_backend
+
+        backend, runner_type, runner_mode = normalize_worker_runner_for_backend(runner, "", "")
+        cfg.runner.type = runner_type
+        cfg.runner.extra.pop("mode", None)
+        if runner_mode:
+            cfg.runner.extra["mode"] = runner_mode
+        cfg.backend = backend
     if once:
         cfg.ephemeral = True
     run_worker(cfg)

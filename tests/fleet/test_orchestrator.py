@@ -12,6 +12,8 @@ from orcest.fleet.orchestrator import (
     generate_env_file,
     generate_orchestrator_config,
     get_deployed_pool_backend,
+    get_deployed_pool_vmid_range,
+    get_worker_heartbeats,
     image_exists,
     upload_fleet_config,
 )
@@ -25,7 +27,9 @@ def test_get_deployed_pool_backend_defaults_legacy_config_to_claude(mocker):
         return_value=subprocess.CompletedProcess([], 0, stdout="pool: {}\n", stderr=""),
     )
 
-    assert get_deployed_pool_backend("user@host") == "claude"
+    assert get_deployed_pool_backend("user@host") == (
+        "vm_id_start=0;vm_id_end=0;backend=claude;runner=claude;mode="
+    )
 
 
 def test_get_deployed_pool_backend_reads_configured_backend(mocker):
@@ -36,7 +40,65 @@ def test_get_deployed_pool_backend_reads_configured_backend(mocker):
         ),
     )
 
-    assert get_deployed_pool_backend("user@host") == "clauder"
+    assert get_deployed_pool_backend("user@host") == (
+        "vm_id_start=0;vm_id_end=0;backend=clauder;runner=claude;mode=interactive"
+    )
+
+
+def test_get_deployed_pool_backend_returns_full_mixed_layout_signature(mocker):
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "pool:\n"
+                "  vm_id_start: 10000\n"
+                "  worker_profiles:\n"
+                "    - backend: clauder\n"
+                "    - backend: codex\n"
+                "    - backend: grok\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    assert get_deployed_pool_backend("user@host") == (
+        "vm_id_start=10000;vm_id_end=0;profiles=clauder:claude:interactive,codex:codex:,grok:grok:"
+    )
+
+
+def test_get_deployed_pool_vmid_range_reads_both_bounds(mocker):
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="pool:\n  vm_id_start: 10000\n  vm_id_end: 10099\n",
+            stderr="",
+        ),
+    )
+
+    assert get_deployed_pool_vmid_range("user@host") == (10000, 10099)
+
+
+def test_get_worker_heartbeats_returns_backend_and_revision(mocker):
+    key = "orcest:workers:heartbeat:orcest-worker-10001"
+    ssh = mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=f"{key}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout='{"backend":"codex","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n',
+                stderr="",
+            ),
+        ],
+    )
+
+    assert get_worker_heartbeats("user@host") == {"orcest-worker-10001": ("codex", "a" * 40)}
+    assert ssh.call_count == 2
 
 
 class TestValidateProjectName:
@@ -284,25 +346,26 @@ class TestUploadFleetConfig:
     def test_happy_path(self, mocker, tmp_path):
         cfg_file = tmp_path / "config.yaml"
         cfg_file.write_text("test: true\n")
-        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        remote_tmp = "/tmp/orcest-config.ABC123"
+
+        def ssh_side_effect(_target, command):
+            if "mktemp" in command:
+                return subprocess.CompletedProcess([], 0, stdout=f"{remote_tmp}\n", stderr="")
+            return self._ok()
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         scp = mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._ok)
         upload_fleet_config("user@host", str(cfg_file))
-        # mkdir, mv+chmod
-        assert ssh.call_count == 2
+        # mkdir, private mktemp, install, cleanup
+        assert ssh.call_count == 4
         assert scp.call_count == 1
-        # Verify the SSH commands are correct
         ssh.assert_any_call("user@host", "sudo mkdir -p /etc/orcest")
         ssh.assert_any_call(
             "user@host",
-            "sudo mv /tmp/.orcest-config.yaml.tmp /etc/orcest/config.yaml"
-            " && sudo chmod 600 /etc/orcest/config.yaml",
+            f"sudo install -m 600 -o root -g root {remote_tmp} /etc/orcest/config.yaml",
         )
-        # Verify SCP uploads the local file to the temp path on the remote
-        scp.assert_called_once_with(
-            str(cfg_file),
-            "user@host",
-            "/tmp/.orcest-config.yaml.tmp",
-        )
+        ssh.assert_any_call("user@host", f"rm -f {remote_tmp}")
+        scp.assert_called_once_with(str(cfg_file), "user@host", remote_tmp)
 
     def test_missing_config_raises(self):
         with pytest.raises(FileNotFoundError, match="Fleet config not found"):
@@ -318,12 +381,19 @@ class TestUploadFleetConfig:
     def test_scp_failure_raises(self, mocker, tmp_path):
         cfg_file = tmp_path / "config.yaml"
         cfg_file.write_text("test: true\n")
-        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        remote_tmp = "/tmp/orcest-config.ABC123"
+
+        def ssh_side_effect(_target, command):
+            if "mktemp" in command:
+                return subprocess.CompletedProcess([], 0, stdout=f"{remote_tmp}\n", stderr="")
+            return self._ok()
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
         mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._fail)
         with pytest.raises(RuntimeError, match="Failed to upload fleet config"):
             upload_fleet_config("user@host", str(cfg_file))
-        # Only the mkdir call should have happened; mv+chmod must not run
-        assert ssh.call_count == 1
+        assert ssh.call_count == 3  # mkdir, mktemp, cleanup; no install
+        ssh.assert_any_call("user@host", f"rm -f {remote_tmp}")
 
     def test_mv_failure_cleans_up(self, mocker, tmp_path):
         cfg_file = tmp_path / "config.yaml"
@@ -335,7 +405,11 @@ class TestUploadFleetConfig:
             call_count += 1
             if call_count == 1:  # mkdir
                 return self._ok()
-            elif call_count == 2:  # mv+chmod
+            elif call_count == 2:  # mktemp
+                return subprocess.CompletedProcess(
+                    [], 0, stdout="/tmp/orcest-config.ABC123\n", stderr=""
+                )
+            elif call_count == 3:  # install
                 return self._fail()
             else:  # cleanup rm
                 return self._ok()
@@ -344,13 +418,13 @@ class TestUploadFleetConfig:
         mocker.patch("orcest.fleet.orchestrator._scp", side_effect=self._ok)
         with pytest.raises(RuntimeError, match="Failed to install fleet config"):
             upload_fleet_config("user@host", str(cfg_file))
-        # mkdir + mv(fail) + rm cleanup
-        assert ssh.call_count == 3
+        # mkdir + mktemp + install(fail) + rm cleanup
+        assert ssh.call_count == 4
         # Verify the cleanup call removes the temp file
-        cleanup_call = ssh.call_args_list[2]
+        cleanup_call = ssh.call_args_list[3]
         assert cleanup_call == mocker.call(
             "user@host",
-            "rm -f /tmp/.orcest-config.yaml.tmp",
+            "rm -f /tmp/orcest-config.ABC123",
         )
 
 
@@ -497,7 +571,7 @@ class TestCleanPoolRedis:
         from orcest.fleet.orchestrator import clean_pool_redis
 
         def ssh_side_effect(_target, command):
-            stdout = "0\n0\n0\n0\n" if "EXISTS" in command else ""
+            stdout = "0\n0\n0\n0\n0\n" if "EXISTS" in command else ""
             return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
         ssh = mocker.patch(
@@ -513,6 +587,7 @@ class TestCleanPoolRedis:
         assert "SREM orcest:pool:provisioning 300" in cmd
         assert "SREM orcest:pool:ambiguous-clones 300" in cmd
         assert "DEL orcest:pool:done:orcest-worker-300" in cmd
+        assert "DEL orcest:workers:heartbeat:orcest-worker-300" in cmd
         assert "300" in cmd
         assert "301" in cmd
 
@@ -547,7 +622,7 @@ class TestCleanPoolRedis:
             side_effect=[
                 subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
                 subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="1\n0\n0\n0\n", stderr=""
+                    args=[], returncode=0, stdout="1\n0\n0\n0\n0\n", stderr=""
                 ),
             ],
         )
@@ -606,7 +681,7 @@ class TestRedisCliRoutedThroughDockerExec:
         def ssh_side_effect(_target, command):
             if "EXISTS" in command:
                 return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="0\n0\n0\n0\n", stderr=""
+                    args=[], returncode=0, stdout="0\n0\n0\n0\n0\n", stderr=""
                 )
             return self._ok()
 
@@ -614,8 +689,8 @@ class TestRedisCliRoutedThroughDockerExec:
         clean_pool_redis("user@host", ["300"])
         cleanup_cmd = ssh.call_args_list[0][0][1]
         verify_cmd = ssh.call_args_list[1][0][1]
-        assert cleanup_cmd.count("docker exec orcest-redis-redis-1") == 6
-        assert verify_cmd.count("docker exec orcest-redis-redis-1") == 4
+        assert cleanup_cmd.count("docker exec orcest-redis-redis-1") == 7
+        assert verify_cmd.count("docker exec orcest-redis-redis-1") == 5
 
     def test_clean_pending_tasks_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import clean_pending_tasks
@@ -823,6 +898,13 @@ class TestUploadSource:
 
         def ssh_side_effect(target, cmd):
             ssh_cmds.append(cmd)
+            if cmd.startswith("umask 077 && mktemp"):
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="/tmp/orcest-source.ABC123\n",
+                    stderr="",
+                )
             return self._ok()
 
         def scp_side_effect(src, dest_target, dest_path):
@@ -848,6 +930,33 @@ class TestUploadSource:
             "requirements.lock must be at the deploy context root for the "
             f"Dockerfile COPY to resolve; got {members!r}"
         )
+
+    def test_uses_unique_private_remote_archive_and_cleans_it(self, mocker):
+        from orcest.fleet import orchestrator as orch
+
+        destinations: list[str] = []
+
+        def ssh_side_effect(_target, command):
+            if command.startswith("umask 077 && mktemp"):
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="/tmp/orcest-source.XYZ789\n",
+                    stderr="",
+                )
+            return self._ok()
+
+        def scp_side_effect(_src, _dest_target, dest_path):
+            destinations.append(dest_path)
+            return self._ok()
+
+        ssh = mocker.patch.object(orch, "_ssh", side_effect=ssh_side_effect)
+        mocker.patch.object(orch, "_scp", side_effect=scp_side_effect)
+
+        orch.upload_source("user@host")
+
+        assert destinations == ["/tmp/orcest-source.XYZ789"]
+        assert any(call.args[1] == "rm -f /tmp/orcest-source.XYZ789" for call in ssh.call_args_list)
 
     def test_exact_revision_is_baked_into_source_archive(self, mocker):
         revision = "a" * 40
@@ -1157,6 +1266,16 @@ class TestRedisStackEnvFile:
         compose = Path("src/orcest/fleet/deploy/docker-compose.yml").read_text()
         assert "- CLAUDER_API_KEY" in compose
 
+    @pytest.mark.parametrize(
+        "compose_path",
+        ["docker-compose.yml", "src/orcest/fleet/deploy/docker-compose.yml"],
+    )
+    def test_orchestrator_compose_passes_codex_credentials(self, compose_path):
+        compose = Path(compose_path).read_text()
+
+        assert "CODEX_API_KEY" in compose
+        assert "OPENAI_API_KEY" in compose
+
 
 class TestRedisCliAuthenticates:
     """C1: _REDIS_CLI_PREFIX must authenticate -- otherwise every fleet redis-cli
@@ -1193,7 +1312,7 @@ class TestRedisCliAuthenticates:
         )
 
         def ssh_side_effect(_target, command):
-            stdout = "0\n0\n0\n0\n" if "EXISTS" in command else ""
+            stdout = "0\n0\n0\n0\n0\n" if "EXISTS" in command else ""
             return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=ssh_side_effect)
@@ -1210,9 +1329,9 @@ class TestRedisCliAuthenticates:
         clean_pool_redis("user@host", ["300"])
         cleanup_cmd = ssh.call_args_list[0][0][1]
         verify_cmd = ssh.call_args_list[1][0][1]
-        # Six cleanup operations plus four verification reads are authenticated.
-        assert cleanup_cmd.count("--no-auth-warning") == 6
-        assert verify_cmd.count("--no-auth-warning") == 4
+        # Seven cleanup operations plus five verification reads are authenticated.
+        assert cleanup_cmd.count("--no-auth-warning") == 7
+        assert verify_cmd.count("--no-auth-warning") == 5
 
     def test_raw_flag_preserved(self, mocker):
         """--raw is still appended for line-per-value parsing."""

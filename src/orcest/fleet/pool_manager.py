@@ -21,7 +21,7 @@ from typing import Any, cast
 import redis
 
 from orcest.fleet.cloud_init import render_clone_userdata
-from orcest.fleet.config import FleetConfig
+from orcest.fleet.config import FleetConfig, WorkerProfileConfig
 from orcest.fleet.proxmox_api import ProxmoxClient, mac_for_vm_id
 from orcest.shared.coordination import (
     clear_pending_task_if_matches,
@@ -55,6 +55,7 @@ _POOL_DRAINING_KEY = "pool:draining"
 _POOL_DONE_PREFIX = "pool:done:"
 _POOL_PROVISIONING_KEY = "pool:provisioning"
 _POOL_AMBIGUOUS_CLONES_KEY = "pool:ambiguous-clones"
+_WORKER_HEARTBEAT_PREFIX = "workers:heartbeat:"
 # Workers can block on the issue stream for up to five seconds. A drain lease
 # must be visible for longer than that before the final PEL check.
 _DRAIN_QUIESCE_SECONDS = 5.25
@@ -233,6 +234,10 @@ class PoolManager:
 
     def _fill_pool(self) -> None:
         """Adjust pool to target size: clone new VMs or drain idle excess."""
+        if self._pool.worker_profiles:
+            self._fill_profiled_pool()
+            return
+
         idle_count = self._redis.scard(_POOL_IDLE_KEY)
         active_count = self._redis.hlen(_POOL_ACTIVE_KEY)
         total = int(idle_count) + int(active_count)
@@ -348,6 +353,124 @@ class PoolManager:
                 if self._destroy_stopped_vm(vm_id):
                     drained += 1
 
+    def _fill_profiled_pool(self) -> None:
+        """Reconcile heterogeneous workers to deterministic VMID/profile slots."""
+        start = self._pool.vm_id_start
+        if start <= 0:
+            logger.error("No worker VM ID range configured (pool.vm_id_start)")
+            return
+        desired_vmids = set(range(start, start + self._pool.size))
+        idle_vmids: set[int] = set()
+        for member in self._redis.smembers(_POOL_IDLE_KEY):
+            try:
+                idle_vmids.add(int(member))
+            except (ValueError, TypeError):
+                continue
+        active_vmids: set[int] = set()
+        for member in self._redis.hgetall(_POOL_ACTIVE_KEY):
+            try:
+                active_vmids.add(int(member))
+            except (ValueError, TypeError):
+                continue
+        tracked_vmids = idle_vmids | active_vmids
+
+        # Scale-down and layout convergence retire only slots outside the exact
+        # desired set. Active extras finish normally and are never replaced.
+        extra_idle = sorted(idle_vmids - desired_vmids)
+        if extra_idle:
+            logger.info("Draining heterogeneous-pool slots outside target: %s", extra_idle)
+            self._drain_profiled_idle_workers(extra_idle)
+
+        missing = sorted(desired_vmids - tracked_vmids)
+        if not missing:
+            return
+        logger.info(
+            "Heterogeneous pool missing desired VMID slots %s (active extras=%s)",
+            missing,
+            sorted(active_vmids - desired_vmids),
+        )
+        for vm_id in missing:
+            profile = self._pool.worker_profile_for_vmid(vm_id)
+            try:
+                if self._clone_and_boot(new_id=vm_id, profile=profile) is None:
+                    break
+            except Exception:
+                logger.error(
+                    "Failed to clone and boot VM %d for backend %s",
+                    vm_id,
+                    profile.backend,
+                    exc_info=True,
+                )
+                break
+
+    def _drain_profiled_idle_workers(self, idle_vmids: list[int]) -> int:
+        """Drain the supplied out-of-layout idle workers in deterministic order."""
+        drained = 0
+        for vm_id in idle_vmids:
+            worker_id = self._vm_id_to_worker_id(vm_id)
+            pending_consumers, pending_complete = self._consumers_with_pending_status()
+            if not pending_complete:
+                logger.warning(
+                    "Skipping drain of VM %d: pending-task state is unavailable",
+                    vm_id,
+                )
+                continue
+            if worker_id in pending_consumers:
+                logger.info(
+                    "Skipping drain of VM %d: it has a pending task "
+                    "(claimed since active-detection ran this pass)",
+                    vm_id,
+                )
+                continue
+            try:
+                pipe = self._redis.pipeline()
+                pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+                pipe.sadd(_POOL_DRAINING_KEY, worker_id)
+                pipe.execute()
+            except Exception:
+                logger.warning("Failed to reserve VM %d for draining", vm_id, exc_info=True)
+                continue
+            time.sleep(_DRAIN_QUIESCE_SECONDS)
+            pending_consumers, pending_complete = self._consumers_with_pending_status()
+            if not pending_complete or worker_id in pending_consumers:
+                logger.info(
+                    "Skipping drain of VM %d: it claimed a task or final pending-state "
+                    "inspection failed",
+                    vm_id,
+                )
+                try:
+                    pipe = self._redis.pipeline()
+                    pipe.srem(_POOL_DRAINING_KEY, worker_id)
+                    pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(time.time()))
+                    pipe.execute()
+                except Exception:
+                    logger.error(
+                        "Failed to restore busy VM %d after drain race", vm_id, exc_info=True
+                    )
+                continue
+            logger.info("Draining out-of-layout idle VM %d", vm_id)
+            if not self._stop_vm(vm_id):
+                self._restore_worker_after_failed_drain(vm_id, worker_id)
+                continue
+            pending_consumers, pending_complete = self._consumers_with_pending_status()
+            if not pending_complete:
+                logger.warning(
+                    "Leaving drained VM %d stopped: post-stop pending-state inspection failed",
+                    vm_id,
+                )
+                self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
+                continue
+            if worker_id in pending_consumers and not self._coordinate_reaped_vm(vm_id):
+                logger.warning(
+                    "Leaving drained VM %d: late task claim could not be recovered",
+                    vm_id,
+                )
+                self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
+                continue
+            if self._destroy_stopped_vm(vm_id):
+                drained += 1
+        return drained
+
     def _restore_worker_after_failed_drain(
         self,
         vm_id: int,
@@ -454,6 +577,7 @@ class PoolManager:
         # Destruction is not complete until durable generation markers are gone.
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
+        heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.srem(_POOL_IDLE_KEY, str(vm_id))
@@ -462,9 +586,11 @@ class PoolManager:
             pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
             pipe.delete(done_key)
+            pipe.delete(heartbeat_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
+                or self._redis.exists(heartbeat_key)
                 or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
                 or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
                 or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
@@ -669,7 +795,12 @@ class PoolManager:
                 exc_info=True,
             )
 
-    def _clone_and_boot(self) -> int | None:
+    def _clone_and_boot(
+        self,
+        *,
+        new_id: int | None = None,
+        profile: WorkerProfileConfig | None = None,
+    ) -> int | None:
         """Clone a new VM from template, start it, add to idle set.
 
         Returns the new VM ID, or None if the operation fails.
@@ -690,8 +821,9 @@ class PoolManager:
             logger.error("No worker VM ID range configured (pool.vm_id_start)")
             return None
 
-        new_id = self._next_vm_id()
+        new_id = self._next_vm_id(preferred=new_id)
         name = self._vm_id_to_worker_id(new_id)
+        profile = profile or self._pool.worker_profile_for_vmid(new_id)
 
         # VMIDs are intentionally reused. A durable done key or drain member
         # from the prior generation would make the next reconciliation destroy
@@ -705,7 +837,15 @@ class PoolManager:
         # prevents both reuse and orphan cleanup from guessing based on a name.
         self._reserve_clone_attempt(new_id)
 
-        logger.info("Cloning VM %d from template %d (name=%s)", new_id, template_id, name)
+        logger.info(
+            "Cloning VM %d from template %d (name=%s, backend=%s, runner=%s, mode=%s)",
+            new_id,
+            template_id,
+            name,
+            profile.backend,
+            profile.runner_type,
+            profile.runner_mode or "default",
+        )
 
         try:
             self._proxmox.clone_vm(
@@ -764,9 +904,9 @@ class PoolManager:
                 worker_id=name,
                 key_prefix=self._key_prefix,
                 redis_password=os.environ.get("ORCEST_REDIS_PASSWORD", ""),
-                worker_backend=self._pool.worker_backend,
-                worker_runner_type=self._pool.worker_runner_type,
-                worker_runner_mode=self._pool.worker_runner_mode,
+                worker_backend=profile.backend,
+                worker_runner_type=profile.runner_type,
+                worker_runner_mode=profile.runner_mode,
             )
             self._proxmox.set_cloud_init_userdata(
                 new_id,
@@ -815,15 +955,18 @@ class PoolManager:
         """Clear and verify durable lifecycle state before reusing *vm_id*."""
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
+        heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.delete(done_key)
             pipe.srem(_POOL_DRAINING_KEY, worker_id)
             pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
+            pipe.delete(heartbeat_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
+                or self._redis.exists(heartbeat_key)
                 or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
                 or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
                 or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
@@ -956,6 +1099,7 @@ class PoolManager:
         """Clear lifecycle state after inventory proves the VM is absent."""
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
+        heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.srem(_POOL_IDLE_KEY, str(vm_id))
@@ -964,9 +1108,11 @@ class PoolManager:
             pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
             pipe.delete(done_key)
+            pipe.delete(heartbeat_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
+                or self._redis.exists(heartbeat_key)
                 or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
                 or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
                 or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
@@ -1177,6 +1323,8 @@ class PoolManager:
                 )
                 try:
                     self._redis.srem(_POOL_IDLE_KEY, str(vm_id))
+                    self._allocated_vmids.discard(vm_id)
+                    self._owned_provisioning_vmids.discard(vm_id)
                 except Exception:
                     logger.error(
                         "Failed to remove stale idle entry VM %d from Redis",
@@ -1198,6 +1346,8 @@ class PoolManager:
                 )
                 try:
                     self._redis.hdel(_POOL_ACTIVE_KEY, str(vm_id))
+                    self._allocated_vmids.discard(vm_id)
+                    self._owned_provisioning_vmids.discard(vm_id)
                 except Exception:
                     logger.error(
                         "Failed to remove stale active entry VM %d from Redis",
@@ -1216,9 +1366,10 @@ class PoolManager:
             interval: Seconds between reconciliation passes.
         """
         logger.info(
-            "Pool manager starting (target_size=%d, interval=%.1fs)",
+            "Pool manager starting (target_size=%d, interval=%.1fs, layout=%s)",
             self._pool.size,
             interval,
+            self._pool.worker_layout_signature(),
         )
         self._reconcile_orphans()
         stop_event = threading.Event()
@@ -1244,13 +1395,13 @@ class PoolManager:
 
     def _task_streams_with_discovery_status(self) -> tuple[tuple[str, ...], bool]:
         """Return task streams plus whether Redis discovery completed."""
-        configured_backend = self._pool.worker_backend.strip() or "claude"
         streams = {
             self._fq_task_stream("tasks:claude"),
             self._fq_task_stream("tasks:issue:claude"),
-            self._fq_task_stream(f"tasks:{configured_backend}"),
-            self._fq_task_stream(f"tasks:issue:{configured_backend}"),
         }
+        for backend in self._pool.worker_backends():
+            streams.add(self._fq_task_stream(f"tasks:{backend}"))
+            streams.add(self._fq_task_stream(f"tasks:issue:{backend}"))
         try:
             for key in self._redis.scan_iter(match="tasks:*"):
                 if not self._is_task_stream_key(key):
@@ -1394,7 +1545,7 @@ class PoolManager:
         except (TypeError, ValueError):
             return bool(flag)
 
-    def _next_vm_id(self) -> int:
+    def _next_vm_id(self, preferred: int | None = None) -> int:
         """Allocate the next VM ID from the configured pool range.
 
         Scans existing orcest-worker-* VMs in Proxmox and picks the next
@@ -1437,6 +1588,15 @@ class PoolManager:
                 except (ValueError, TypeError):
                     pass
         existing.update(self._allocated_vmids)
+
+        if preferred is not None:
+            if not self._pool.contains_worker_vmid(preferred):
+                raise RuntimeError(
+                    f"Requested worker VMID {preferred} is outside the configured pool range"
+                )
+            if preferred in existing:
+                raise RuntimeError(f"Requested worker VMID {preferred} is already in use")
+            return preferred
 
         candidate = start
         while candidate in existing:

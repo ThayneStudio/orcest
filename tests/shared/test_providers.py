@@ -8,9 +8,16 @@ via str/repr/logs/DL/exception paths.
 
 import logging
 
+import pytest
+
 from orcest.orchestrator.provider_pool import ProviderPool
 from orcest.shared.models import Task, TaskType
 from orcest.shared.providers import ProviderEntry
+
+
+def test_provider_entry_rejects_unsafe_provider_name():
+    with pytest.raises(ValueError, match="Invalid provider name"):
+        ProviderEntry("issue:grok", "secret")
 
 
 def test_account_key_is_model_independent_but_identity_is_not():

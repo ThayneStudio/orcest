@@ -337,6 +337,13 @@ def test_grok_oauth_json_without_refresh_token_filtered_from_selection():
     assert pool.next_entry() == good
 
 
+def test_codex_oauth_json_without_refresh_token_rejected():
+    bad = ProviderEntry("codex", '{"tokens":{"access_token":"access-only"}}')
+
+    with pytest.raises(ValueError, match="usable"):
+        ProviderPool([bad])
+
+
 def test_duplicate_identities_rejected():
     e1 = ProviderEntry("claude", "same")
     e2 = ProviderEntry("claude", "same")
@@ -503,6 +510,34 @@ def test_apply_credential_update_rejects_grok_json_without_refresh_token():
 
     assert account is None
     assert pool.effective_credential(entry) == "orig"
+
+
+def test_apply_credential_update_rejects_codex_json_without_refresh_token():
+    entry = ProviderEntry("codex", '{"tokens":{"refresh_token":"original"}}')
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+
+    account = pool.apply_credential_update(
+        "t1",
+        '{"tokens":{"access_token":"new-access"}}',
+        minted_at=100.0,
+    )
+
+    assert account is None
+    assert pool.effective_credential(entry) == entry.credential
+
+
+def test_seed_credential_override_rejects_unrefreshable_codex_json():
+    entry = ProviderEntry("codex", '{"tokens":{"refresh_token":"original"}}')
+    pool = ProviderPool([entry])
+
+    pool.seed_credential_override(
+        entry.account_key(),
+        '{"tokens":{"access_token":"access-only"}}',
+        minted_at=100.0,
+    )
+
+    assert pool.effective_credential(entry) == entry.credential
 
 
 def test_apply_credential_update_ignores_stale_minted_at():

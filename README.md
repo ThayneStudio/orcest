@@ -461,8 +461,11 @@ Notes:
 
 - `orcest fleet deploy` coordinates layer 2 and (with
   `--rebuild-template`) layer 3, including stopping and restarting the worker
-  pool. It does **not** install a new host CLI; update layer 1 separately before
-  invoking it when `src/orcest/fleet/*` changed.
+  pool. Project orchestrators are stopped before the workerless interval and
+  resume only after the exact VMID/backend/revision worker layout attests. This
+  is a no-lost-work maintenance cutover, not a zero-worker-downtime rollout. It
+  does **not** install a new host CLI; update layer 1 separately before invoking
+  it when `src/orcest/fleet/*` changed.
 - During `deploy --rebuild-template`, the pool manager stays stopped
   until the new template pointer has been swapped, so fresh clones use
   the rebaked template.
@@ -496,6 +499,27 @@ Notes:
   `default_runner: clauder` or an explicit `provider: clauder`.
   The `claude` backend remains available for deployments that still run
   the legacy prompt-mode worker.
+- A fleet can schedule dedicated mixed-provider workers with an ordered
+  round-robin layout. Consecutive VMID slots use consecutive profiles and the
+  list wraps; repetition adds worker capacity for that backend:
+  ```yaml
+  pool:
+    size: 4
+    vm_id_start: 10000
+    worker_profiles:
+      - backend: clauder
+      - backend: codex
+      - backend: grok
+  ```
+  This produces `clauder`, `codex`, `grok`, `clauder` for VMIDs
+  `10000`–`10003`. Each worker still consumes only its own PR and issue streams.
+  Changing profile order/settings requires
+  `fleet deploy --rebuild-template --drain-active`; other fleet commands reject
+  a mixed-layout transition. Changing the worker VMID range in place is not
+  supported: drain with the deployed configuration first, retain its checksummed
+  backup, retire the deployed config only after every old worker is absent, then
+  perform a first deployment with the new range. Repetition controls capacity only—provider task
+  selection remains round-robin across configured credential entries.
 - For the pve-test dashboard path, deploy from this repo with:
   ```bash
   make deploy-dashboard-remote \
@@ -528,7 +552,10 @@ Notes:
   idle/active worker counts from Proxmox.
 - **`orcest rollout-health`** — read-only, machine-readable deployment gates for
   exact revision, Redis, queue/pending state, dead-letter/provider-counter
-  growth, pool size, and private credential-recovery residue.
+  growth, pool size, private credential-recovery residue, and live
+  backend/revision/stream-correlated worker heartbeats. With backend checks,
+  also pass `--expected-pool-size` and `--expected-vmid-start`, then one
+  `--expected-backend` per consecutive VMID slot, including duplicates.
 - **Dashboard container** on the orchestrator VM — the live task view.
 - **Container logs on the orchestrator VM:**
   ```bash

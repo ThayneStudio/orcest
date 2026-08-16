@@ -154,6 +154,63 @@ def test_rollout_health_text_output_includes_metrics(runner, mocker):
     client.close.assert_called_once()
 
 
+def test_rollout_health_expected_backend_requires_pool_size_and_vmid_start(runner):
+    revision = "a" * 40
+
+    missing_size = runner.invoke(
+        main,
+        [
+            "rollout-health",
+            "localhost",
+            "--expected-revision",
+            revision,
+            "--expected-backend",
+            "codex",
+        ],
+    )
+    assert missing_size.exit_code != 0
+    assert "requires --expected-pool-size" in missing_size.output
+
+    missing_start = runner.invoke(
+        main,
+        [
+            "rollout-health",
+            "localhost",
+            "--expected-revision",
+            revision,
+            "--expected-pool-size",
+            "1",
+            "--expected-backend",
+            "codex",
+        ],
+    )
+    assert missing_start.exit_code != 0
+    assert "requires --expected-vmid-start" in missing_start.output
+
+
+def test_rollout_health_expected_backend_count_must_match_pool_size(runner):
+    revision = "a" * 40
+
+    result = runner.invoke(
+        main,
+        [
+            "rollout-health",
+            "localhost",
+            "--expected-revision",
+            revision,
+            "--expected-pool-size",
+            "2",
+            "--expected-vmid-start",
+            "300",
+            "--expected-backend",
+            "codex",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "exactly once per expected pool slot" in result.output
+
+
 def test_work_missing_required_id(runner):
     """work without --id exits non-zero (--id is a required option)."""
     result = runner.invoke(main, ["work"])
@@ -328,6 +385,21 @@ def test_work_runner_override(mocker, runner):
 
     assert mock_config.runner.type == "noop"
     assert mock_config.backend == "noop"
+
+
+def test_work_clauder_override_preserves_interactive_alias_semantics(mocker, runner):
+    """work --runner=clauder uses the Claude CLI in interactive mode."""
+    mock_config = MagicMock()
+    mock_config.runner.extra = {}
+    mocker.patch("orcest.shared.config.load_worker_config", return_value=mock_config)
+    mocker.patch("orcest.worker.loop.run_worker")
+
+    result = runner.invoke(main, ["work", "--id", "worker-1", "--runner", "clauder"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_config.backend == "clauder"
+    assert mock_config.runner.type == "claude"
+    assert mock_config.runner.extra["mode"] == "interactive"
 
 
 def test_pool_manage_accepts_template_range_without_legacy_id(mocker, runner):

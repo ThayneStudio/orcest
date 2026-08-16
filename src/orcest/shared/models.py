@@ -5,6 +5,7 @@ Empty string is used as the None sentinel for optional fields.
 """
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,17 @@ DEAD_LETTER_METADATA_FIELDS = frozenset(
 # beyond claude_token.
 REDACTED_FIELDS = frozenset({"token", "claude_token", "credential"})
 CLAUDE_PROVIDER_ALIASES = frozenset({"claude", "clauder"})
+PROVIDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+
+
+def require_valid_provider_name(provider: str) -> str:
+    """Return a provider name that is safe in Redis keys and env-var derivation."""
+    if not isinstance(provider, str) or not PROVIDER_NAME_RE.fullmatch(provider):
+        raise ValueError(
+            "Invalid provider name: must be 1-64 lowercase characters, "
+            "start with a letter or digit, and contain only letters, digits, or underscore."
+        )
+    return provider
 
 
 def is_claude_provider(provider: str) -> bool:
@@ -42,9 +54,7 @@ def is_claude_provider(provider: str) -> bool:
 
 def task_stream_name(provider: str, *, issue: bool = False) -> str:
     """Return the Redis task stream name for a provider."""
-    normalized = str(provider or "").strip()
-    if not normalized:
-        raise ValueError("provider must be non-empty")
+    normalized = require_valid_provider_name(provider)
     prefix = "tasks:issue" if issue else "tasks"
     return f"{prefix}:{normalized}"
 
@@ -119,6 +129,9 @@ class Task:
     # anchored to the configured credential even when ``credential`` carries a
     # later OAuth rotation.
     provider_account: str = ""
+
+    def __post_init__(self) -> None:
+        require_valid_provider_name(self.provider)
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD.

@@ -1,5 +1,7 @@
 """Tests for orcest.fleet.cloud_init."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -15,6 +17,12 @@ from orcest.fleet.cloud_init import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_manual_setup_codex_pin_matches_cloud_init() -> None:
+    script = (Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh").read_text()
+
+    assert f'CODEX_VERSION="{_CODEX_VERSION}"' in script
 
 
 # NOTE: the dead, secret-leaking ``render_worker_userdata`` and its
@@ -131,6 +139,16 @@ class TestTemplateUserdata:
         assert f"npm install -g @openai/codex@{_CODEX_VERSION}" in runcmd
         assert f"npm install -g @openai/codex@{_CODEX_VERSION} || true" not in runcmd
         assert "sudo -u orcest -H bash -lc 'command -v codex && codex --version'" in runcmd
+
+    @pytest.mark.parametrize(
+        "digest",
+        ["not-a-digest", "a" * 63, "a" * 65, '"; touch /root/pwned; #', "a" * 32 + "\nwhoami"],
+    )
+    def test_rejects_unsafe_grok_installer_digest_override(self, monkeypatch, digest):
+        monkeypatch.setenv("ORCEST_GROK_INSTALLER_SHA256", digest)
+
+        with pytest.raises(ValueError, match="exactly 64 hexadecimal"):
+            render_template_userdata()
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())
@@ -537,6 +555,15 @@ def test_setup_worker_sh_creates_codex_and_grok_dirs():
     )
     # Owned by orcest so the worker can write auth.json under them at runtime.
     assert "chown -R orcest:orcest /home/orcest" in text
+
+
+def test_setup_worker_sh_replaces_mismatched_grok_version():
+    setup = Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh"
+    text = setup.read_text()
+    assert 'installed_grok_version="$([ -x /usr/local/bin/grok ]' in text
+    assert "/usr/local/bin/grok --version" in text
+    assert 'if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then' in text
+    assert 'if [ "${installed_grok_version}" = "${GROK_VERSION}" ]; then' in text
 
 
 # ── M2-infra: grok installer SHA-256 gate must FAIL CLOSED when unset ──

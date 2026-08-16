@@ -7,7 +7,7 @@ import logging
 import signal
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call as mock_call, patch
 
 import pytest
 
@@ -1201,6 +1201,15 @@ def test_pool_managed_done_handoff_retries_until_redis_accepts(worker_config):
     redis.set_ex.assert_not_called()
 
 
+def _pool_done_calls(redis: MagicMock) -> list:
+    """Return SETEX calls for the lifecycle marker, excluding liveness writes."""
+    return [
+        redis_call
+        for redis_call in redis.set_ex.call_args_list
+        if redis_call.args and str(redis_call.args[0]).startswith("pool:done:")
+    ]
+
+
 class TestRunWorker:
     """Integration-level tests for the run_worker main loop.
 
@@ -1351,6 +1360,26 @@ class TestRunWorker:
         result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.COMPLETED.value
         assert result_fields["task_id"] == sample_task.id
+
+    def test_worker_rejects_task_from_wrong_provider_stream(
+        self, mocker, worker_config, sample_task
+    ):
+        """A dedicated backend never executes a cross-provider payload."""
+        sample_task.provider = "grok"
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        mocks["runner"].run.assert_not_called()
+        results_calls = [
+            c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == RESULTS_STREAM
+        ]
+        assert len(results_calls) == 1
+        result_fields = results_calls[0][0][1]
+        assert result_fields["status"] == ResultStatus.FAILED.value
+        assert "does not match" in result_fields["summary"]
 
     def test_worker_processes_issue_task_from_fallback_stream(
         self, mocker, worker_config, sample_task
@@ -1737,7 +1766,7 @@ class TestRunWorker:
         mock_redis.xack_raw.assert_called_once_with(
             "orcest:tasks:claude", CONSUMER_GROUP, "entry-bad"
         )
-        mock_redis.set_ex.assert_called_once()
+        assert len(_pool_done_calls(mock_redis)) == 1
 
     def test_worker_drain_preserves_pending_entry_on_publish_failure(
         self, mocker, worker_config, sample_task
@@ -2060,9 +2089,9 @@ class TestRunWorker:
         ]
         assert len(results_calls) == 1
         # pool:done key was set in Redis
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
         # Only one task read from the stream (no second xreadgroup for normal tasks)
         assert normal_call_count == 1
 
@@ -2080,9 +2109,9 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
 
     def test_ephemeral_worker_survives_pool_done_key_failure(
         self, mocker, worker_config, sample_task, caplog
@@ -2092,7 +2121,12 @@ class TestRunWorker:
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
-        mock_redis.set_ex.side_effect = ConnectionError("Redis unavailable")
+
+        def fail_pool_done(key, value, **kwargs):
+            if str(key).startswith("pool:done:"):
+                raise ConnectionError("Redis unavailable")
+
+        mock_redis.set_ex.side_effect = fail_pool_done
 
         task_fields = sample_task.to_dict()
 
@@ -2130,8 +2164,7 @@ class TestRunWorker:
         # Worker still exited (runner was called once, no hang)
         mocks["runner"].run.assert_called_once()
         # pool:done key was still set despite publish failure
-        mock_redis.set_ex.assert_called_once()
-        assert "pool:done:" in mock_redis.set_ex.call_args[0][0]
+        assert len(_pool_done_calls(mock_redis)) == 1
         assert publish.call_count == 2
         mock_redis.xack_raw.assert_called_once_with(
             "orcest:tasks:claude", CONSUMER_GROUP, "entry-1"
@@ -2173,9 +2206,9 @@ class TestRunWorker:
         mock_redis.xack_raw.assert_called_once_with(
             "orcest:tasks:claude", CONSUMER_GROUP, "entry-1"
         )
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
         cleanup.assert_called_once()
         assert cleanup.call_args.args[0] is mock_redis
         assert cleanup.call_args.args[1].task_id == sample_task.id
@@ -2205,7 +2238,7 @@ class TestRunWorker:
 
         publish.assert_called_once()
         mock_redis.xack_raw.assert_not_called()
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
         mock_redis.set_value.assert_not_called()
         cleanup.assert_not_called()
 
@@ -2250,7 +2283,7 @@ class TestRunWorker:
 
         publish.assert_called_once()
         assert mock_redis.xack_raw.call_count == 2
-        mock_redis.set_ex.assert_called_once()
+        assert len(_pool_done_calls(mock_redis)) == 1
         mock_redis.client.delete.assert_any_call(
             _handoff_marker_key(
                 "test:results",
@@ -2285,7 +2318,7 @@ class TestRunWorker:
         run_worker(worker_config)
 
         cleanup.assert_called_once()
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
         mock_redis.set_value.assert_not_called()
 
     def test_cleanup_failure_does_not_ack_or_signal_pool_done(
@@ -2317,7 +2350,7 @@ class TestRunWorker:
 
         cleanup.assert_called_once()
         mock_redis.xack_raw.assert_not_called()
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
         mock_redis.set_value.assert_not_called()
 
     def test_preset_stop_event_aborts_redis_wait_before_health_check(self, mocker, worker_config):
@@ -2354,9 +2387,9 @@ class TestRunWorker:
 
         reject.assert_called_once()
         mocks["runner"].run.assert_not_called()
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
         assert mock_redis.xreadgroup.call_count == 1
 
     def test_ephemeral_unsupported_task_retries_until_handoff_is_durable(
@@ -2379,7 +2412,7 @@ class TestRunWorker:
 
         reject.assert_called_once()
         mocks["runner"].run.assert_not_called()
-        mock_redis.set_ex.assert_called_once()
+        assert len(_pool_done_calls(mock_redis)) == 1
         assert mock_redis.xreadgroup.call_count == 1
 
     def test_ephemeral_worker_exits_on_runner_failure(self, mocker, worker_config, sample_task):
@@ -2406,9 +2439,9 @@ class TestRunWorker:
         result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.FAILED.value
         # pool:done key was set despite task failure
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
 
     def test_non_ephemeral_worker_continues_looping(self, mocker, worker_config, sample_task):
         """Default (non-ephemeral) worker does NOT exit after one task and
@@ -2424,7 +2457,7 @@ class TestRunWorker:
         # Runner was called (task processed)
         mocks["runner"].run.assert_called_once()
         # pool:done key must NOT have been set
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
 
     def test_ephemeral_worker_exits_after_dead_lettered_task(
         self, mocker, worker_config, sample_task
@@ -2466,9 +2499,9 @@ class TestRunWorker:
         ]
         assert len(dl_calls) == 1
         # pool:done key was set (ephemeral exit)
-        mock_redis.set_ex.assert_called_once_with(
-            f"pool:done:{worker_config.worker_id}", "1", ttl=300
-        )
+        assert _pool_done_calls(mock_redis) == [
+            mock_call(f"pool:done:{worker_config.worker_id}", "1", ttl=300)
+        ]
         # Worker exited after one task (no second xreadgroup for normal tasks)
         assert normal_call_count == 1
 
@@ -2487,7 +2520,7 @@ class TestRunWorker:
         run_worker(worker_config)
 
         mocks["runner"].run.assert_not_called()
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
         mock_redis.set_value.assert_not_called()
 
     @pytest.mark.skip(
@@ -2588,7 +2621,7 @@ class TestRunWorker:
         # Runner must NOT have been called (task was dead-lettered)
         mocks["runner"].run.assert_not_called()
         # pool:done was NOT set (not ephemeral)
-        mock_redis.set_ex.assert_not_called()
+        assert _pool_done_calls(mock_redis) == []
         # Worker looped back after dead-lettering (second xreadgroup call happened)
         assert normal_call_count >= 2
 
