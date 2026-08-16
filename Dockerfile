@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
 ARG ORCEST_BUILD_REVISION=unknown
+ARG ORCEST_UID=1000
+ARG ORCEST_GID=1000
 ENV ORCEST_BUILD_REVISION=${ORCEST_BUILD_REVISION}
 LABEL org.opencontainers.image.revision=${ORCEST_BUILD_REVISION}
 
@@ -19,7 +21,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/false orcest \
+RUN groupadd --gid "${ORCEST_GID}" orcest \
+    && useradd --uid "${ORCEST_UID}" --gid "${ORCEST_GID}" \
+        --create-home --shell /bin/false orcest \
     && mkdir -p /home/orcest/app \
     && chown orcest:orcest /home/orcest/app
 

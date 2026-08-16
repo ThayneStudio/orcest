@@ -100,6 +100,8 @@ install -m 0600 -o root -g root /root/.orcest-redis.env \
 ssh orcest@10.20.1.129 'sudo cat /etc/orcest/config.yaml' \
   >"$RELEASE_BACKUP/orchestrator-fleet-config.deployed-old.yaml"
 chmod 0600 "$RELEASE_BACKUP/orchestrator-fleet-config.deployed-old.yaml"
+cmp -s "$RELEASE_BACKUP/fleet-config.deployed-old.yaml" \
+  "$RELEASE_BACKUP/orchestrator-fleet-config.deployed-old.yaml"
 ssh orcest@10.20.1.129 \
   "sudo tar -C /opt -czf /tmp/orcest-${RELEASE_ID}.tgz orcest && \
    sudo chown orcest:orcest /tmp/orcest-${RELEASE_ID}.tgz"
@@ -114,11 +116,69 @@ ssh orcest@10.20.1.129 \
 grep -Eq '^[0-9]+$' "$RELEASE_BACKUP/old-template-vmid"
 qm config "$(cat "$RELEASE_BACKUP/old-template-vmid")" | \
   tee "$RELEASE_BACKUP/old-template.conf" | grep -Eq '^template: 1$'
+old_template="$(tr -d '\n' <"$RELEASE_BACKUP/old-template-vmid")"
+probe_vmid="$(pvesh get /cluster/nextid)"
+case "$probe_vmid" in ''|*[!0-9]*) exit 2 ;; esac
+probe_created=0
+cleanup_template_probe() {
+  if [ "$probe_created" -eq 1 ]; then
+    qm stop "$probe_vmid" >/dev/null 2>&1 || true
+    qm destroy "$probe_vmid" --purge 1 >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_template_probe EXIT
+qm clone "$old_template" "$probe_vmid" \
+  --name "orcest-template-probe-${probe_vmid}" --full 1
+probe_created=1
+qm start "$probe_vmid"
+deadline=$((SECONDS + 180))
+old_source_sha=""
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if digest_result="$(qm guest exec "$probe_vmid" -- bash -eu -o pipefail -c \
+    'pkg=$(/opt/orcest/venv/bin/python -c "import pathlib,orcest; print(pathlib.Path(orcest.__file__).parent)"); test -d "$pkg"; test -n "$(find "$pkg" -type f -name "*.py" -print -quit)"; find "$pkg" -type f -name "*.py" -print0 | sort -z | xargs -0 sha256sum | sha256sum' \
+    2>/dev/null)"; then
+    old_source_sha="$(python3 -c \
+      'import json,sys; value=json.load(sys.stdin); assert value["exitcode"] == 0; print(value.get("out-data", "").split()[0])' \
+      <<<"$digest_result")"
+    printf '%s\n' "$old_source_sha" | grep -Eq '^[0-9a-f]{64}$' && break
+    old_source_sha=""
+  fi
+  sleep 3
+done
+test -n "$old_source_sha"
+qm stop "$probe_vmid"
+qm destroy "$probe_vmid" --purge 1
+if qm status "$probe_vmid" >/dev/null 2>&1; then
+  echo "template probe VM ${probe_vmid} survived cleanup" >&2
+  exit 1
+fi
+probe_created=0
+trap - EXIT
+PYTHONPATH="$ORCEST_SOURCE_ROOT/src" python3 - \
+  "$RELEASE_BACKUP/fleet-config.deployed-old.yaml" "$old_source_sha" \
+  >"$RELEASE_BACKUP/old-worker-layout.json" <<'PY'
+import json
+import sys
+
+from orcest.fleet.config import load_config
+
+cfg = load_config(sys.argv[1])
+source_sha = sys.argv[2]
+observed = {
+    f"orcest-worker-{cfg.pool.vm_id_start + index}": {
+        "backend": profile.backend,
+        "source_sha256": source_sha,
+    }
+    for index, profile in enumerate(cfg.pool.scheduled_worker_profiles())
+}
+print(json.dumps(observed, sort_keys=True))
+PY
+chmod 0600 "$RELEASE_BACKUP/old-worker-layout.json"
 (
   cd "$RELEASE_BACKUP"
   sha256sum fleet-config.deployed-old.yaml pve-root.env pve-redis.env \
     orchestrator-fleet-config.deployed-old.yaml orchestrator-opt-orcest.tgz \
-    vm-199.conf old-template.conf qm-list.txt \
+    vm-199.conf old-template.conf qm-list.txt old-worker-layout.json \
     old-template-vmid \
     >release-backup.sha256
   sha256sum -c release-backup.sha256
@@ -140,7 +200,7 @@ test "$(stat -c '%a' "$EVIDENCE_DIR/release-backup")" = 700
 for secret in \
   fleet-config.deployed-old.yaml \
   orchestrator-fleet-config.deployed-old.yaml \
-  pve-root.env pve-redis.env
+  pve-root.env pve-redis.env old-worker-layout.json
 do
   test "$(stat -c '%a' "$EVIDENCE_DIR/release-backup/$secret")" = 600
 done
@@ -344,14 +404,53 @@ snapshot:
 
 ```bash
 ssh orcest@10.20.1.129 bash -s -- "$RELEASE_ID" <<'SH'
-set -eu
+set -euo pipefail
 release_id="$1"
+case "$release_id" in
+  ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) exit 2 ;;
+esac
 backup="/opt/orcest-backups/${release_id}"
 sudo install -d -m 0700 -o orcest -g orcest "$backup"
 docker tag orcest:latest "orcest:rollback-${release_id}"
 docker image inspect orcest:latest >"$backup/orcest-image.inspect.json"
-docker run --rm -i --user 0:0 --entrypoint python \
-  -v /etc/orcest/config.yaml:/tmp/orcest-fleet-config.yaml:ro \
+rollback_uid="$(docker run --rm --entrypoint id \
+  "orcest:rollback-${release_id}" -u orcest)"
+rollback_gid="$(docker run --rm --entrypoint id \
+  "orcest:rollback-${release_id}" -g orcest)"
+printf '%s:%s\n' "$rollback_uid" "$rollback_gid" | \
+  grep -Eq '^[1-9][0-9]*:[1-9][0-9]*$'
+runtime="/var/lib/orcest-rollback-runtime/${release_id}"
+sudo install -d -m 0700 -o root -g root /var/lib/orcest-rollback-runtime
+sudo mkdir "$runtime"
+sudo chown "$rollback_uid:$rollback_gid" "$runtime"
+sudo chmod 0700 "$runtime"
+sudo install -d -m 0700 -o "$rollback_uid" -g "$rollback_gid" \
+  "$runtime/ssh"
+sudo install -m 0600 -o "$rollback_uid" -g "$rollback_gid" \
+  /etc/orcest/config.yaml "$runtime/config.yaml"
+sudo cp -a /home/orcest/.ssh/. "$runtime/ssh/"
+sudo chown -R "$rollback_uid:$rollback_gid" "$runtime/ssh"
+sudo find "$runtime/ssh" -type d -exec chmod 0700 {} +
+sudo find "$runtime/ssh" -type f -exec chmod go-rwx {} +
+sudo ssh-keygen -y -f "$runtime/ssh/id_ed25519" | \
+  ssh-keygen -lf - | awk '{print $2}' >"$backup/rollback-ssh-key.fingerprint"
+test -s "$backup/rollback-ssh-key.fingerprint"
+docker run --rm --entrypoint sh \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
+  -v "$runtime/ssh":/home/orcest/.ssh:ro \
+  "orcest:rollback-${release_id}" -c \
+  'test -r /tmp/orcest-fleet-config.yaml && test -r /home/orcest/.ssh && test -x /home/orcest/.ssh && test -f /home/orcest/.ssh/id_ed25519 && test -r /home/orcest/.ssh/id_ed25519'
+proxmox_host="$(docker run --rm --entrypoint python \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
+  "orcest:rollback-${release_id}" -c \
+  'import urllib.parse,yaml; print(urllib.parse.urlparse(yaml.safe_load(open("/tmp/orcest-fleet-config.yaml"))["proxmox"]["endpoint"]).hostname)')"
+test -n "$proxmox_host"
+docker run --rm --network host --entrypoint ssh \
+  -v "$runtime/ssh":/home/orcest/.ssh:ro \
+  "orcest:rollback-${release_id}" -o StrictHostKeyChecking=no \
+  -o BatchMode=yes -o ConnectTimeout=5 "root@${proxmox_host}" true
+docker run --rm -i --entrypoint python \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
   "orcest:rollback-${release_id}" - /tmp/orcest-fleet-config.yaml \
   >"$backup/old-pool-size" <<'PY'
 import sys
@@ -389,7 +488,8 @@ docker compose --env-file .redis.env -f docker-compose.redis.yml \
   sh -c 'redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning ping' | grep -Fx PONG
 (
   cd "$backup"
-  sha256sum orcest-image.inspect.json old-pool-size redis-data.tgz \
+  sha256sum orcest-image.inspect.json old-pool-size \
+    rollback-ssh-key.fingerprint redis-data.tgz \
     >rollback-artifacts.sha256
   sha256sum -c rollback-artifacts.sha256
 )
@@ -609,8 +709,11 @@ config_sha="$(sha256sum \
 template_sha="$(sha256sum "$RELEASE_BACKUP/old-template-vmid" | awk '{print $1}')"
 ssh orcest@10.20.1.129 bash -s -- \
   "$RELEASE_ID" "$archive_sha" "$config_sha" "$template_sha" <<'SH'
-set -eu
+set -euo pipefail
 release_id="$1"
+case "$release_id" in
+  ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) exit 2 ;;
+esac
 archive_sha="$2"
 config_sha="$3"
 template_sha="$4"
@@ -629,6 +732,26 @@ recorded_image="$(python3 -c \
   orcest-image.inspect.json)"
 test "$(docker image inspect "orcest:rollback-${release_id}" --format '{{.Id}}')" = \
   "$recorded_image"
+runtime="/var/lib/orcest-rollback-runtime/${release_id}"
+sudo test -d "$runtime/ssh"
+sudo cmp -s "$old_config" "$runtime/config.yaml"
+test "$(sudo ssh-keygen -y -f "$runtime/ssh/id_ed25519" | \
+  ssh-keygen -lf - | awk '{print $2}')" = \
+  "$(cat "$backup/rollback-ssh-key.fingerprint")"
+docker run --rm --entrypoint sh \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
+  -v "$runtime/ssh":/home/orcest/.ssh:ro \
+  "orcest:rollback-${release_id}" -c \
+  'test -r /tmp/orcest-fleet-config.yaml && test -r /home/orcest/.ssh && test -x /home/orcest/.ssh && test -f /home/orcest/.ssh/id_ed25519 && test -r /home/orcest/.ssh/id_ed25519'
+proxmox_host="$(docker run --rm --entrypoint python \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
+  "orcest:rollback-${release_id}" -c \
+  'import urllib.parse,yaml; print(urllib.parse.urlparse(yaml.safe_load(open("/tmp/orcest-fleet-config.yaml"))["proxmox"]["endpoint"]).hostname)')"
+test -n "$proxmox_host"
+docker run --rm --network host --entrypoint ssh \
+  -v "$runtime/ssh":/home/orcest/.ssh:ro \
+  "orcest:rollback-${release_id}" -o StrictHostKeyChecking=no \
+  -o BatchMode=yes -o ConnectTimeout=5 "root@${proxmox_host}" true
 test ! -e "/opt/orcest.failed-${release_id}"
 sudo mv /opt/orcest "/opt/orcest.failed-${release_id}"
 sudo tar -C /opt -xzf "$archive"
@@ -654,8 +777,8 @@ docker exec orcest-redis-redis-1 sh -c \
 restored_template="$(docker exec orcest-redis-redis-1 sh -c \
   'redis-cli -e -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw GET orcest:pool:current_template_vmid')"
 test "$restored_template" = "$old_template"
-projects="$(docker run --rm -i --user 0:0 --entrypoint python \
-  -v /etc/orcest/config.yaml:/tmp/orcest-fleet-config.yaml:ro \
+projects="$(docker run --rm -i --entrypoint python \
+  -v "$runtime/config.yaml":/tmp/orcest-fleet-config.yaml:ro \
   "orcest:rollback-${release_id}" - /tmp/orcest-fleet-config.yaml <<'PY'
 import sys
 import yaml
@@ -664,6 +787,7 @@ for project in (yaml.safe_load(open(sys.argv[1])) or {}).get('projects', []):
 PY
 )"
 test -n "$projects"
+export ORCEST_FLEET_CONFIG_PATH="$runtime/config.yaml"
 for project in $projects; do
   ORCEST_IMAGE=orcest:latest docker compose -p "orcest-${project}" \
     --env-file .redis.env --env-file "projects/${project}/.env" \
@@ -674,12 +798,19 @@ for project in $projects; do
   test "$(docker inspect -f '{{.Image}}' "$cid")" = "$recorded_image"
   test "$(docker inspect -f '{{.State.Running}}' "$cid")" = false
 done
-FLEET_CONFIG=/etc/orcest/config.yaml ORCEST_IMAGE=orcest:latest docker compose \
+export FLEET_CONFIG="$runtime/config.yaml"
+export SSH_KEY="$runtime/ssh"
+ORCEST_IMAGE=orcest:latest docker compose \
   --env-file .redis.env -f docker-compose.pool.yml -p orcest-pool \
   up -d --no-build --force-recreate pool-manager
 pool_cid="$(docker compose --env-file .redis.env -f docker-compose.pool.yml \
   -p orcest-pool ps -q pool-manager)"
 test "$(docker inspect -f '{{.Image}}' "$pool_cid")" = "$recorded_image"
+sleep 2
+test "$(docker inspect -f '{{.State.Running}}' "$pool_cid")" = true
+test "$(docker inspect -f '{{.RestartCount}}' "$pool_cid")" = 0
+docker exec "$pool_cid" sh -c \
+  'test -r /home/orcest/app/config/fleet.yaml && test -r /home/orcest/.ssh && test -x /home/orcest/.ssh && test -f /home/orcest/.ssh/id_ed25519 && test -r /home/orcest/.ssh/id_ed25519'
 sudo rm -f "$archive" "$old_config" "$old_template_file"
 SH
 ```
@@ -718,17 +849,104 @@ for vmid in range(cfg.pool.vm_id_start, cfg.pool.vm_id_start + cfg.pool.size):
 PY
 )
 test "$(printf '%s\n' "${expected_vmids[@]}" | sort -n)" = "$rolled_back_vmids"
-for vmid in $rolled_back_vmids; do
-  qm guest exec "$vmid" -- systemctl is-active --quiet orcest-worker | \
-    jq -e '.exitcode == 0' >/dev/null
-  for stream in orcest:tasks:clauder orcest:tasks:issue:clauder; do
-    ssh orcest@10.20.1.129 \
-      "docker exec orcest-redis-redis-1 sh -c \
-       'redis-cli -a \"\$ORCEST_REDIS_PASSWORD\" --no-auth-warning --raw \
-        XINFO CONSUMERS $stream workers'" | \
-      grep -Fx "orcest-worker-${vmid}" >/dev/null
-  done
-done
+PYTHONPATH="$ORCEST_SOURCE_ROOT/src" python3 - \
+  "$OLD_FLEET_CONFIG" "$RELEASE_BACKUP/old-worker-layout.json" \
+  ${rolled_back_vmids} <<'PY'
+import json
+import re
+import sys
+
+from orcest.fleet.config import load_config
+
+config_path, recorded_layout_path, *vmids = sys.argv[1:]
+cfg = load_config(config_path)
+expected_layout = {
+    f"orcest-worker-{cfg.pool.vm_id_start + index}": profile.backend
+    for index, profile in enumerate(cfg.pool.scheduled_worker_profiles())
+}
+with open(recorded_layout_path, encoding="utf-8") as handle:
+    recorded_layout = json.load(handle)
+assert {
+    worker: value["backend"] for worker, value in recorded_layout.items()
+} == expected_layout
+assert all(
+    re.fullmatch(r"[0-9a-f]{64}", value.get("source_sha256", ""))
+    for value in recorded_layout.values()
+)
+assert len({value["source_sha256"] for value in recorded_layout.values()}) == 1
+assert set(vmids) == {
+    str(cfg.pool.vm_id_start + index) for index in range(cfg.pool.size)
+}
+print(f"rollback-layout-record-ok workers={len(expected_layout)}")
+PY
+while read -r vmid backend expected_sha; do
+  digest_result="$(qm guest exec "$vmid" -- bash -eu -o pipefail -c \
+    'systemctl is-active --quiet orcest-worker; pkg=$(/opt/orcest/venv/bin/python -c "import pathlib,orcest; print(pathlib.Path(orcest.__file__).parent)"); test -d "$pkg"; test -n "$(find "$pkg" -type f -name "*.py" -print -quit)"; find "$pkg" -type f -name "*.py" -print0 | sort -z | xargs -0 sha256sum | sha256sum')"
+  actual_sha="$(python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["exitcode"] == 0; print(value.get("out-data", "").split()[0])' \
+    <<<"$digest_result")"
+  test "$actual_sha" = "$expected_sha"
+done < <(python3 - "$RELEASE_BACKUP/old-worker-layout.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    layout = json.load(handle)
+for worker, value in sorted(layout.items()):
+    print(
+        worker.removeprefix("orcest-worker-"),
+        value["backend"],
+        value["source_sha256"],
+    )
+PY
+)
+set -a
+. /root/.orcest-redis.env
+set +a
+python3 - "$RELEASE_BACKUP/old-worker-layout.json" <<'PY'
+import json
+import os
+import sys
+import time
+
+import redis
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    layout = json.load(handle)
+expected = {}
+for worker, value in layout.items():
+    expected.setdefault(value["backend"], set()).add(worker)
+client = redis.Redis(
+    host="10.20.1.129",
+    port=6379,
+    password=os.environ["ORCEST_REDIS_PASSWORD"],
+    decode_responses=True,
+)
+deadline = time.monotonic() + 30
+while True:
+    fresh = True
+    for backend, workers in expected.items():
+        for stream in (f"orcest:tasks:{backend}", f"orcest:tasks:issue:{backend}"):
+            try:
+                consumers = client.xinfo_consumers(stream, "workers")
+            except redis.ResponseError:
+                fresh = False
+                break
+            observed = {str(item["name"]): item for item in consumers}
+            if set(observed) != workers or any(
+                int(item["idle"]) >= 15_000 for item in observed.values()
+            ):
+                fresh = False
+                break
+        if not fresh:
+            break
+    if fresh:
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("rollback worker consumers were not fresh and exact")
+    time.sleep(1)
+print(f"rollback-consumers-ok workers={len(layout)}")
+PY
 for project in "${PROJECTS[@]}"; do
   ssh orcest@10.20.1.129 \
     "set -eu; cd /opt/orcest; \
@@ -743,6 +961,21 @@ candidate_orcest fleet stop --yes --config "$OLD_FLEET_CONFIG"
 qm_output="$(qm list)"
 test -z "$(awk '$2 ~ /^orcest-worker-/ && $2 !~ /template/ { print $1 }' \
   <<<"$qm_output")"
+ssh orcest@10.20.1.129 bash -s -- "$RELEASE_ID" <<'SH'
+set -euo pipefail
+release_id="$1"
+case "$release_id" in
+  ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) exit 2 ;;
+esac
+runtime_root=/var/lib/orcest-rollback-runtime
+runtime="$runtime_root/$release_id"
+test "$(dirname -- "$runtime")" = "$runtime_root"
+test "$(basename -- "$runtime")" = "$release_id"
+sudo test ! -L "$runtime"
+test "$(sudo readlink -f -- "$runtime")" = "$runtime"
+sudo rm -rf -- "$runtime"
+sudo test ! -e "$runtime"
+SH
 ```
 
 This proves the rollback path without exposing retained tasks to a worker.

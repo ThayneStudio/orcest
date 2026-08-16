@@ -5,6 +5,8 @@ services:
       context: .
       args:
         ORCEST_BUILD_REVISION: ${ORCEST_BUILD_REVISION:-unknown}
+        ORCEST_UID: ${ORCEST_UID:-1000}
+        ORCEST_GID: ${ORCEST_GID:-1000}
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
     environment:

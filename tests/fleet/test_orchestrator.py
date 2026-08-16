@@ -362,7 +362,7 @@ class TestUploadFleetConfig:
         ssh.assert_any_call("user@host", "sudo mkdir -p /etc/orcest")
         ssh.assert_any_call(
             "user@host",
-            f"sudo install -m 600 -o root -g root {remote_tmp} /etc/orcest/config.yaml",
+            f"sudo install -m 600 -o orcest -g orcest {remote_tmp} /etc/orcest/config.yaml",
         )
         ssh.assert_any_call("user@host", f"rm -f {remote_tmp}")
         scp.assert_called_once_with(str(cfg_file), "user@host", remote_tmp)
@@ -1043,7 +1043,12 @@ def test_build_image_requires_and_propagates_exact_revision(mocker):
     command = ssh.call_args.args[1]
     assert "cat .orcest-revision" in command
     assert "^[0-9a-f]{7,64}$" in command
-    assert 'ORCEST_BUILD_REVISION="$revision" docker compose build --no-cache' in command
+    assert "id -u orcest" in command
+    assert "id -g orcest" in command
+    assert 'ORCEST_BUILD_REVISION="$revision" ORCEST_UID="$orcest_uid"' in command
+    assert 'ORCEST_GID="$orcest_gid" docker compose build --no-cache' in command
+    assert "docker run --rm --entrypoint id orcest:latest -u orcest" in command
+    assert "docker run --rm --entrypoint id orcest:latest -g orcest" in command
 
 
 def test_source_root_is_discovered_from_current_working_directory(monkeypatch, tmp_path):
@@ -1247,6 +1252,14 @@ class TestRedisStackEnvFile:
         cmd = ssh.call_args[0][1]
         assert f"--env-file {REDIS_ENV_PATH}" in cmd
         assert "docker-compose.pool.yml" in cmd
+        assert "run --rm --no-deps --entrypoint sh pool-manager" in cmd
+        assert "test -r /home/orcest/app/config/fleet.yaml" in cmd
+        assert "test -r /home/orcest/.ssh" in cmd
+        assert "test -x /home/orcest/.ssh" in cmd
+        assert "test -f /home/orcest/.ssh/id_ed25519" in cmd
+        assert "test -r /home/orcest/.ssh/id_ed25519" in cmd
+        assert "up -d --force-recreate pool-manager" in cmd
+        assert "RestartCount" in cmd
 
     def test_deploy_stack_passes_redis_env_file(self, mocker):
         """The per-project orchestrator stack needs the redis password too. Its
