@@ -527,7 +527,17 @@ before continuing. Do not run template garbage collection during the rehearsal.
 Now move every active PR/issue provider stream behind a release-specific fence.
 The command renames whole Redis stream values, so entries, consumer groups, and
 PEL state remain intact; its JSON projection contains counts and key names but
-never task fields or credentials:
+never task fields or credentials.
+
+The command enforces the drained precondition itself: it refuses while any
+`orcest:workers:heartbeat:*` key is still live or any stream reports pending
+deliveries, because a worker that finishes after the rename ACKs a key that no
+longer exists, the ACK silently succeeds, and `restore` re-delivers work that
+already ran. If the refusal names only pending entries on the retained
+Codex/Grok backlog and `qm list` shows no worker VMs, the entries are orphaned
+PEL rows from destroyed workers: record the refusal output as evidence and
+re-run the same command with `--force`. Never use `--force` while a worker
+heartbeat is live.
 
 ```bash
 set -a
@@ -550,9 +560,16 @@ jq -e '
     "orcest:tasks:issue:grok"
   ]
 ' "$RELEASE_ROOT/quarantined-task-streams.json"
-jq -S '[.streams[] | {source,length,groups,pending,lag}] | sort_by(.source)' \
-  "$RELEASE_ROOT/quarantined-task-streams.json" \
+jq -S '{
+  forced,
+  live_workers,
+  in_flight_streams,
+  streams: ([.streams[] | {source,length,groups,pending,lag}] | sort_by(.source))
+}' "$RELEASE_ROOT/quarantined-task-streams.json" \
   >"$RELEASE_ROOT/quarantined-task-stream-inventory.json"
+# `live_workers` must be empty in every rehearsal outcome, forced or not.
+jq -e '(.live_workers | length) == 0' \
+  "$RELEASE_ROOT/quarantined-task-stream-inventory.json"
 ```
 
 If this step fails, restore/verify the Redis snapshot or use the checked
@@ -561,13 +578,18 @@ If this step fails, restore/verify the Redis snapshot or use the checked
 ## Deploy and observe without GitHub side effects
 
 Capture secret-safe DLQ and project-counter baselines while all task streams are
-fenced:
+fenced. The old pool is already destroyed here, so state the expected pool size
+explicitly: `--require-quiescent` treats an absent `orcest:pool:*` keyspace as an
+inspection failure unless `--expected-pool-size 0` asserts that the fleet is
+meant to be empty, which is what stops a wrong prefix from reading as a quiet
+fleet:
 
 ```bash
 for project in "${PROJECTS[@]}"; do
   candidate_orcest rollout-health 10.20.1.129:6379 \
     --prefix "$project" \
     --expected-revision "$RELEASE_SHA" \
+    --expected-pool-size 0 \
     --max-private-recovery 0 \
     --require-quiescent \
     --json >"$RELEASE_ROOT/baseline-${project}.json"

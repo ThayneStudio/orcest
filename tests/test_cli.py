@@ -145,13 +145,53 @@ def test_rollout_health_text_output_includes_metrics(runner, mocker):
 
     result = runner.invoke(
         main,
-        ["rollout-health", "localhost", "--expected-revision", revision],
+        ["rollout-health", "localhost", "--prefix", "demo", "--expected-revision", revision],
     )
 
     assert result.exit_code == 0, result.output
     assert "PASS checker_revision" in result.output
     assert 'METRICS {"lag": 2, "pending": 1, "queue_depth": 3}' in result.output
     client.close.assert_called_once()
+
+
+def test_rollout_health_requires_prefix(runner):
+    """Without --prefix the project gates would silently inspect 'orcest:*'."""
+    result = runner.invoke(
+        main,
+        ["rollout-health", "localhost", "--expected-revision", "a" * 40],
+    )
+
+    assert result.exit_code != 0
+    assert "Missing option '--prefix'" in result.output
+
+
+def test_rollout_health_forwards_pool_prefix(runner, mocker):
+    revision = "a" * 40
+    mocker.patch("orcest.cli._resolve_redis_config", return_value=MagicMock())
+    mocker.patch("orcest.shared.redis_client.RedisClient", return_value=MagicMock())
+    collect = mocker.patch(
+        "orcest.rollout_health.collect_rollout_health",
+        return_value={"ok": True, "revision": revision, "checks": [], "metrics": {}},
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "rollout-health",
+            "localhost",
+            "--prefix",
+            "demo",
+            "--task-prefix",
+            "orcest",
+            "--pool-prefix",
+            "fleet",
+            "--expected-revision",
+            revision,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert collect.call_args.kwargs["pool_prefix"] == "fleet"
 
 
 def test_rollout_health_expected_backend_requires_pool_size_and_vmid_start(runner):
@@ -162,6 +202,8 @@ def test_rollout_health_expected_backend_requires_pool_size_and_vmid_start(runne
         [
             "rollout-health",
             "localhost",
+            "--prefix",
+            "demo",
             "--expected-revision",
             revision,
             "--expected-backend",
@@ -176,6 +218,8 @@ def test_rollout_health_expected_backend_requires_pool_size_and_vmid_start(runne
         [
             "rollout-health",
             "localhost",
+            "--prefix",
+            "demo",
             "--expected-revision",
             revision,
             "--expected-pool-size",
@@ -196,6 +240,8 @@ def test_rollout_health_expected_backend_count_must_match_pool_size(runner):
         [
             "rollout-health",
             "localhost",
+            "--prefix",
+            "demo",
             "--expected-revision",
             revision,
             "--expected-pool-size",
@@ -209,6 +255,55 @@ def test_rollout_health_expected_backend_count_must_match_pool_size(runner):
 
     assert result.exit_code != 0
     assert "exactly once per expected pool slot" in result.output
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_force"),
+    [([], False), (["--force"], True)],
+)
+def test_task_streams_quarantine_forwards_force(runner, mocker, extra_args, expected_force):
+    mocker.patch("orcest.cli._resolve_redis_config", return_value=MagicMock())
+    mocker.patch("orcest.shared.redis_client.RedisClient", return_value=MagicMock())
+    quarantine = mocker.patch(
+        "orcest.task_stream_quarantine.quarantine_task_streams",
+        return_value={"ok": True, "operation": "quarantine", "streams": []},
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "task-streams",
+            "quarantine",
+            "localhost",
+            "--quarantine-id",
+            "release-1",
+            *extra_args,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert quarantine.call_args.kwargs["force"] is expected_force
+
+
+def test_task_streams_quarantine_reports_live_worker_refusal(runner, mocker):
+    from orcest.task_stream_quarantine import TaskStreamQuarantineError
+
+    mocker.patch("orcest.cli._resolve_redis_config", return_value=MagicMock())
+    mocker.patch("orcest.shared.redis_client.RedisClient", return_value=MagicMock())
+    mocker.patch(
+        "orcest.task_stream_quarantine.quarantine_task_streams",
+        side_effect=TaskStreamQuarantineError(
+            "refusing to fence task streams while work is in flight"
+        ),
+    )
+
+    result = runner.invoke(
+        main,
+        ["task-streams", "quarantine", "localhost", "--quarantine-id", "release-1"],
+    )
+
+    assert result.exit_code != 0
+    assert "refusing to fence task streams while work is in flight" in result.output
 
 
 def test_work_missing_required_id(runner):

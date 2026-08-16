@@ -28,11 +28,17 @@ def _raw_stream_work(
     stream: str,
     *,
     allow_non_stream: bool = False,
+    require_present: bool = False,
 ) -> tuple[int, int, int, bool, str | None]:
     """Return work state for a stream, failing closed when it is unknowable."""
     try:
         key_type = str(cast(Any, redis.client.type(stream)))
         if key_type == "none":
+            if require_present:
+                # A missing key is empty *and* unreadable-by-the-wrong-name; the
+                # caller asked for a gate that only means something if the
+                # stream it names is the one the project actually writes.
+                return 0, 0, 0, False, f"{stream}: stream is absent"
             return 0, 0, 0, False, None
         if key_type != "stream":
             if allow_non_stream:
@@ -175,11 +181,17 @@ def _provider_metric_total(redis: RedisClient, metric: str) -> tuple[int, str | 
     return total, None
 
 
+def _pool_key(pool_prefix: str, name: str) -> str:
+    """Build a worker-pool key under the pool manager's own key prefix."""
+    return f"{pool_prefix}:pool:{name}" if pool_prefix else f"pool:{name}"
+
+
 def collect_rollout_health(
     redis: RedisClient,
     *,
     expected_revision: str,
     task_prefix: str = "orcest",
+    pool_prefix: str | None = None,
     expected_pool_size: int | None = None,
     expected_vmid_start: int | None = None,
     expected_backends: tuple[str, ...] = (),
@@ -189,8 +201,15 @@ def collect_rollout_health(
     max_private_recovery: int = 0,
     require_quiescent: bool = False,
 ) -> dict[str, Any]:
-    """Collect one side-effect-free health snapshot and evaluate rollout gates."""
+    """Collect one side-effect-free health snapshot and evaluate rollout gates.
+
+    ``pool_prefix`` selects the key prefix the pool manager writes its worker
+    state under; it defaults to ``task_prefix`` because both default to
+    ``orcest``. Passing the wrong prefix must never look like an empty, safe
+    fleet, so pool-dependent gates fail closed when neither pool key exists.
+    """
     revision = get_build_revision()
+    resolved_pool_prefix = task_prefix if pool_prefix is None else pool_prefix
     checks = [
         _check(
             "checker_revision",
@@ -249,7 +268,7 @@ def collect_rollout_health(
         result_lag,
         unconsumed_results,
         result_error,
-    ) = _raw_stream_work(redis, result_stream)
+    ) = _raw_stream_work(redis, result_stream, require_present=require_quiescent)
     if result_error is not None:
         inspection_errors.append(result_error)
     queue_depth = task_queue_depth + result_work
@@ -268,12 +287,20 @@ def collect_rollout_health(
 
     tracked_worker_ids: set[str] = set()
     tracked_vmids: list[int] = []
+    pool_idle_key = _pool_key(resolved_pool_prefix, "idle")
+    pool_active_key = _pool_key(resolved_pool_prefix, "active")
+    pool_state_absent = False
     try:
+        idle_type = str(cast(Any, redis.client.type(pool_idle_key)))
+        active_type = str(cast(Any, redis.client.type(pool_active_key)))
+        if idle_type not in {"none", "set"} or active_type not in {"none", "hash"}:
+            raise ValueError("worker pool key has an unexpected type")
+        pool_state_absent = idle_type == "none" and active_type == "none"
         raw_idle_ids = {
-            str(value) for value in cast(set[Any], redis.client.smembers("orcest:pool:idle"))
+            str(value) for value in cast(set[Any], redis.client.smembers(pool_idle_key))
         }
         raw_active_ids = {
-            str(value) for value in cast(list[Any], redis.client.hkeys("orcest:pool:active"))
+            str(value) for value in cast(list[Any], redis.client.hkeys(pool_active_key))
         }
         pool_idle = len(raw_idle_ids)
         pool_active = len(raw_active_ids)
@@ -287,6 +314,17 @@ def collect_rollout_health(
         pool_idle = -1
         pool_active = -1
         inspection_errors.append(f"worker pool state: {type(exc).__name__}")
+    else:
+        # An absent pool keyspace is indistinguishable from a wrong pool prefix,
+        # so only an explicit `expected_pool_size == 0` may read as "no fleet".
+        if (
+            pool_state_absent
+            and expected_pool_size != 0
+            and (expected_pool_size is not None or require_quiescent)
+        ):
+            inspection_errors.append(
+                f"{pool_idle_key}/{pool_active_key}: worker pool state is absent"
+            )
 
     backend_consumers: dict[str, dict[str, int]] = {}
     backend_heartbeats: dict[str, int] = {}

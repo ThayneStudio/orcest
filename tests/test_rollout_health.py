@@ -11,6 +11,7 @@ pytestmark = pytest.mark.unit
 def test_rollout_health_passes_clean_quiescent_snapshot(fake_redis_client, mocker):
     revision = "a" * 40
     mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
 
     report = collect_rollout_health(
         fake_redis_client,
@@ -327,7 +328,7 @@ def test_rollout_health_rejects_unexpected_live_backend(fake_redis_client, mocke
 def test_rollout_health_does_not_let_stray_heartbeat_mask_dead_pool_slot(fake_redis_client, mocker):
     revision = "f" * 40
     mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
-    fake_redis_client.client.sadd("orcest:pool:idle", "300")
+    fake_redis_client.client.sadd("test:pool:idle", "300")
     fake_redis_client.set_ex(
         "workers:heartbeat:orcest-worker-999",
         json.dumps({"backend": "codex", "revision": revision}),
@@ -406,7 +407,13 @@ def test_rollout_health_fails_closed_when_stream_inspection_is_denied(fake_redis
     failed = {check["name"] for check in report["checks"] if not check["passed"]}
     assert "redis_inspection" in failed
     assert report["ok"] is False
-    assert report["metrics"]["inspection_errors"] == ["orcest:tasks:claude: ResponseError"]
+    # The quiescence gate also refuses to read an absent project result stream
+    # or an absent worker pool keyspace as "nothing is running".
+    assert report["metrics"]["inspection_errors"] == [
+        "orcest:pool:idle/orcest:pool:active: worker pool state is absent",
+        "orcest:tasks:claude: ResponseError",
+        "test:results: stream is absent",
+    ]
     assert "secret detail" not in str(report)
 
 
@@ -479,3 +486,95 @@ def test_rollout_health_fails_closed_when_results_key_has_wrong_type(fake_redis_
 
     assert report["ok"] is False
     assert "test:results: expected stream, found string" in report["metrics"]["inspection_errors"]
+
+
+def test_rollout_health_reads_pool_state_under_the_pool_prefix(fake_redis_client, mocker):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.client.hset("fleet:pool:active", "10000", "1750000000.0")
+    fake_redis_client.client.sadd("fleet:pool:idle", "10001")
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        pool_prefix="fleet",
+        expected_pool_size=2,
+        require_quiescent=True,
+    )
+
+    assert report["metrics"]["pool_active"] == 1
+    assert report["metrics"]["pool_idle"] == 1
+    assert report["metrics"]["inspection_errors"] == []
+    pool_size = next(c for c in report["checks"] if c["name"] == "pool_size")
+    assert pool_size["passed"] is True
+    quiescent = next(c for c in report["checks"] if c["name"] == "pool_quiescent")
+    assert quiescent["passed"] is False
+    assert report["ok"] is False
+
+
+def test_rollout_health_fails_closed_when_pool_state_is_absent(fake_redis_client, mocker):
+    """A mismatched pool prefix must not read as an empty, safe-to-destroy fleet."""
+    revision = "6" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    # Real pool state lives under the pool manager's own prefix.
+    fake_redis_client.client.hset("fleet:pool:active", "10000", "1750000000.0")
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_pool_size=1,
+        require_quiescent=True,
+    )
+
+    assert report["metrics"]["pool_active"] == 0
+    assert report["metrics"]["inspection_errors"] == [
+        "test:pool:idle/test:pool:active: worker pool state is absent"
+    ]
+    inspection = next(c for c in report["checks"] if c["name"] == "redis_inspection")
+    assert inspection["passed"] is False
+    assert report["ok"] is False
+
+
+def test_rollout_health_allows_absent_pool_state_for_an_explicitly_empty_pool(
+    fake_redis_client, mocker
+):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        expected_pool_size=0,
+        require_quiescent=True,
+    )
+
+    assert report["metrics"]["inspection_errors"] == []
+    assert report["ok"] is True
+
+
+def test_rollout_health_fails_closed_when_project_result_stream_is_absent(
+    fake_redis_client, mocker
+):
+    """A wrong project prefix must not report a backlogged project as quiescent."""
+    revision = "8" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.client.sadd("orcest:pool:idle", "10000")
+    # Real results live under the project prefix, not the one being inspected.
+    fake_redis_client.client.xadd("otherproject:results", {"task_id": "task-1"})
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        require_quiescent=True,
+    )
+
+    assert report["metrics"]["result_work"] == 0
+    assert report["metrics"]["inspection_errors"] == ["test:results: stream is absent"]
+    inspection = next(c for c in report["checks"] if c["name"] == "redis_inspection")
+    assert inspection["passed"] is False
+    assert report["ok"] is False
