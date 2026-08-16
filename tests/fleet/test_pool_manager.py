@@ -893,11 +893,38 @@ class TestProvisioningRecovery:
         assert proxmox.destroy_vm.call_count == 2
         assert not redis.sismember("pool:provisioning", "300")
 
+    def test_confirmed_destroy_releases_allocation_even_if_redis_verify_fails(self):
+        """D2b: a Redis blip after a confirmed destroy must not wedge the slot."""
+        manager, proxmox, redis = _make_manager()
+        manager._allocated_vmids.add(300)
+        manager._owned_provisioning_vmids.add(300)
+        redis.exists.side_effect = RuntimeError("redis blip")
+
+        assert manager._destroy_stopped_vm(300) is False
+
+        proxmox.destroy_vm.assert_called_once_with(300)
+        assert 300 not in manager._allocated_vmids
+        assert 300 not in manager._owned_provisioning_vmids
+        redis.exists.side_effect = None
+        assert manager._next_vm_id(preferred=300) == 300
+
+    def test_failed_destroy_keeps_allocation_reserved(self):
+        """The release is gated on Proxmox confirming the VM is gone."""
+        manager, proxmox, _redis = _make_manager()
+        manager._allocated_vmids.add(300)
+        manager._owned_provisioning_vmids.add(300)
+        proxmox.destroy_vm.side_effect = RuntimeError("destroy unavailable")
+
+        assert manager._destroy_stopped_vm(300) is False
+
+        assert 300 in manager._allocated_vmids
+        assert 300 in manager._owned_provisioning_vmids
+
     def test_absent_ambiguous_clone_is_released(self):
         manager, proxmox, redis = _make_manager()
         redis.sadd("pool:ambiguous-clones", "300")
 
-        assert manager._reconcile_ambiguous_clones() is True
+        assert manager._reconcile_ambiguous_clones() == set()
 
         assert not redis.sismember("pool:ambiguous-clones", "300")
         proxmox.destroy_vm.assert_not_called()
@@ -911,13 +938,14 @@ class TestProvisioningRecovery:
             {"vmid": 300, "name": "orcest-worker-300", "template": False},
         ]
 
-        assert manager._reconcile_ambiguous_clones() is False
+        assert manager._reconcile_ambiguous_clones() == {300}
 
         assert redis.sismember("pool:ambiguous-clones", "300")
         proxmox.destroy_vm.assert_not_called()
         assert "operator" in caplog.text.lower() or "inspect" in caplog.text.lower()
 
-    def test_present_ambiguity_suppresses_refill(self):
+    def test_present_ambiguity_quarantines_only_its_own_slot(self):
+        """D1: an unresolved quarantine must never halt refill of other slots."""
         config = _make_config(pool_size=1)
         manager, proxmox, redis = _make_manager(config=config)
         redis.sadd("pool:ambiguous-clones", "300")
@@ -928,8 +956,49 @@ class TestProvisioningRecovery:
 
         manager.reconcile()
 
-        proxmox.clone_vm.assert_not_called()
+        # The quarantined VMID is never cloned over, but the pool still refills.
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args.kwargs["new_id"] == 301
         assert redis.sismember("pool:ambiguous-clones", "300")
+
+    def test_unresolved_ambiguity_does_not_drain_profiled_fleet_to_zero(self):
+        """D1: quarantined slot is skipped; every other provider slot refills."""
+        config = FleetConfig(
+            proxmox=ProxmoxConfig(node="pve", storage="local-lvm"),
+            pool=PoolConfig(
+                size=3,
+                template_vm_id=9000,
+                vm_id_start=300,
+                vm_id_end=399,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="clauder"),
+                    WorkerProfileConfig(backend="codex"),
+                    WorkerProfileConfig(backend="grok"),
+                ],
+            ),
+        )
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.sadd("pool:ambiguous-clones", "300")
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata"):
+            manager.reconcile()
+
+        assert [call.kwargs["new_id"] for call in proxmox.clone_vm.call_args_list] == [301, 302]
+        assert redis.sismember("pool:ambiguous-clones", "300")
+
+    def test_unreadable_quarantine_state_still_suppresses_refill(self):
+        """Unknown quarantine state (not a known-blocked slot) blocks cloning."""
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+
+        with patch.object(manager, "_reconcile_ambiguous_clones", return_value=None):
+            manager.reconcile()
+
+        proxmox.clone_vm.assert_not_called()
 
     def test_ambiguity_does_not_block_owned_cleanup_retry(self):
         config = _make_config(pool_size=1)
@@ -945,8 +1014,27 @@ class TestProvisioningRecovery:
         manager.reconcile()
 
         proxmox.destroy_vm.assert_called_once_with(301)
-        proxmox.clone_vm.assert_not_called()
+        # 300 stays quarantined, 301 was reclaimed, so the deficit is met by 302.
+        assert proxmox.clone_vm.call_args.kwargs["new_id"] == 302
         assert redis.sismember("pool:ambiguous-clones", "300")
+
+    def test_failed_provisioning_cleanup_blocks_only_that_slot(self):
+        """D1: a stuck provisioning cleanup must not stop the rest of the pool."""
+        config = _make_config(pool_size=1)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.sadd("pool:provisioning", "300")
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+        proxmox.destroy_vm.side_effect = RuntimeError("destroy unavailable")
+
+        manager.reconcile()
+
+        proxmox.destroy_vm.assert_called_once_with(300)
+        assert redis.sismember("pool:provisioning", "300")
+        proxmox.clone_vm.assert_called_once()
+        assert proxmox.clone_vm.call_args.kwargs["new_id"] == 301
 
 
 def _make_range_config(template_vmid_range: list[int] | None = None) -> FleetConfig:
@@ -1453,6 +1541,72 @@ class TestFillPool:
         proxmox.clone_vm.assert_called_once()
         assert proxmox.clone_vm.call_args.kwargs["new_id"] == 301
         assert render.call_args.kwargs["worker_backend"] == "codex"
+
+    def test_profiled_fill_skips_only_the_slot_that_cannot_be_allocated(self):
+        """D2a: a slot-local allocation error must not starve later slots."""
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=3))
+        redis._idle_set = set()
+        # VM 301 exists in Proxmox but is untracked in Redis, so _next_vm_id
+        # rejects the preferred slot 301 while 300 and 302 stay allocatable.
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 301, "name": "orcest-worker-301", "template": False},
+        ]
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata"):
+            manager._fill_pool()
+
+        assert [call.kwargs["new_id"] for call in proxmox.clone_vm.call_args_list] == [300, 302]
+
+    def test_profiled_fill_stops_on_ambiguous_clone_outcome(self):
+        """The ambiguity/ownership signal (None) still halts the fan-out."""
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=3))
+        redis._idle_set = set()
+
+        with patch.object(manager, "_clone_and_boot", return_value=None) as clone:
+            manager._fill_pool()
+
+        clone.assert_called_once()
+        assert clone.call_args.kwargs["new_id"] == 300
+
+    def test_failed_drain_destroy_is_queued_for_durable_retry(self):
+        """D3: a stopped VM whose destroy failed must be reclaimable."""
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 1
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300"}
+        proxmox.destroy_vm.side_effect = RuntimeError("destroy unavailable")
+
+        manager._fill_pool()
+
+        proxmox.stop_vm.assert_called_once_with(300)
+        assert redis.sismember("pool:provisioning", "300")
+        assert 300 in manager._owned_provisioning_vmids
+
+        # The next pass reclaims it through the provisioning cleanup retry.
+        proxmox.destroy_vm.side_effect = None
+        proxmox.list_vms.return_value = [
+            {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+            {"vmid": 300, "name": "orcest-worker-300", "template": False},
+        ]
+
+        assert manager._retry_provisioning_cleanups() == set()
+
+        assert proxmox.destroy_vm.call_args.args[0] == 300
+        assert not redis.sismember("pool:provisioning", "300")
+        assert 300 not in manager._owned_provisioning_vmids
+
+    def test_failed_profiled_drain_destroy_is_queued_for_durable_retry(self):
+        """D3: same durable retry for the heterogeneous drain loop."""
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=1))
+        redis._idle_set = {"300", "301"}
+        proxmox.destroy_vm.side_effect = RuntimeError("destroy unavailable")
+
+        manager._fill_pool()
+
+        assert redis.sismember("pool:provisioning", "301")
+        assert 301 in manager._owned_provisioning_vmids
 
     def test_preferred_worker_vmid_must_be_free_and_in_range(self):
         manager, proxmox, _redis = _make_manager(config=self._mixed_config(size=3))
@@ -2773,6 +2927,60 @@ class TestSweepOrphanPel:
         assert redis.delconsumer_raw.call_count == 2  # two task streams
         redis.delconsumer_raw.assert_any_call("orcest:tasks:claude", "workers", "orcest-worker-305")
 
+    def test_never_reaps_a_vmid_outside_the_worker_range(self):
+        """D4: a legacy/standalone worker id is not the pool's to declare dead."""
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        # Bare-integer legacy naming: parses to VMID 42, which the pool
+        # (vm_id_start=300) never allocated.
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "42", "pending": 3},
+        ]
+
+        with patch.object(manager, "_coordinate_reaped_vm") as recover:
+            manager._sweep_orphan_pel()
+
+        recover.assert_not_called()
+        redis.delconsumer_raw.assert_not_called()
+
+    def test_never_reaps_a_worker_with_a_live_heartbeat(self):
+        """D4: a live worker's task must not be re-enqueued underneath it."""
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()  # pool bookkeeping lost the VM
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.exists.side_effect = lambda key: key == "workers:heartbeat:orcest-worker-305"
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 2},
+        ]
+
+        with patch.object(manager, "_coordinate_reaped_vm") as recover:
+            manager._sweep_orphan_pel()
+
+        recover.assert_not_called()
+        redis.delconsumer_raw.assert_not_called()
+
+    def test_never_reaps_when_heartbeat_state_is_unreadable(self):
+        manager, proxmox, redis = _make_manager()
+        redis.smembers.side_effect = None
+        redis.smembers.return_value = set()
+        redis.hgetall.return_value = {}
+        proxmox.list_vms.return_value = []
+        redis.exists.side_effect = RuntimeError("redis blip")
+        redis.xinfo_consumers_raw.return_value = [
+            {"name": "orcest-worker-305", "pending": 2},
+        ]
+
+        with patch.object(manager, "_coordinate_reaped_vm") as recover:
+            manager._sweep_orphan_pel()
+
+        recover.assert_not_called()
+        redis.delconsumer_raw.assert_not_called()
+
     def test_skips_sweep_when_proxmox_listing_fails(self):
         manager, proxmox, redis = _make_manager()
         redis.smembers.side_effect = None
@@ -2800,9 +3008,9 @@ class TestReconcile:
             patch.object(manager, "_check_done_workers", return_value=[]) as mock_done,
             patch.object(manager, "_detect_active_workers") as mock_detect,
             patch.object(
-                manager, "_reconcile_ambiguous_clones", return_value=True
+                manager, "_reconcile_ambiguous_clones", return_value=set()
             ) as mock_ambiguous,
-            patch.object(manager, "_retry_provisioning_cleanups", return_value=True) as mock_retry,
+            patch.object(manager, "_retry_provisioning_cleanups", return_value=set()) as mock_retry,
             patch.object(manager, "_fill_pool") as mock_fill,
             patch.object(manager, "_health_check") as mock_health,
             patch.object(manager, "_reconcile_stale_redis") as mock_stale,
@@ -2844,17 +3052,17 @@ class TestReconcile:
             patch.object(
                 manager,
                 "_reconcile_ambiguous_clones",
-                side_effect=lambda: call_order.append("reconcile_ambiguous") or True,
+                side_effect=lambda: call_order.append("reconcile_ambiguous") or set(),
             ),
             patch.object(
                 manager,
                 "_retry_provisioning_cleanups",
-                side_effect=lambda: call_order.append("retry_provisioning") or True,
+                side_effect=lambda: call_order.append("retry_provisioning") or set(),
             ),
             patch.object(
                 manager,
                 "_fill_pool",
-                side_effect=lambda: call_order.append("fill_pool"),
+                side_effect=lambda **_kwargs: call_order.append("fill_pool"),
             ),
             patch.object(
                 manager,
