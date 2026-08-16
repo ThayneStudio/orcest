@@ -60,6 +60,11 @@ export async function healthCheck(): Promise<boolean> {
   }
 }
 
+// Every pattern is a full server-side keyspace walk, and a snapshot build issues
+// more than twenty of them per poll. COUNT 100 turned that into thousands of
+// sequential round-trips per 2s refresh interval.
+export const SCAN_COUNT = 1000;
+
 /**
  * Collect all keys matching a pattern via SCAN (non-blocking iteration).
  */
@@ -67,19 +72,23 @@ export async function scanKeys(pattern: string): Promise<string[]> {
   const keys: string[] = [];
   let cursor = "0";
   do {
-    const [nextCursor, batch] = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+    const [nextCursor, batch] = await redis.scan(cursor, "MATCH", pattern, "COUNT", SCAN_COUNT);
     cursor = nextCursor;
     keys.push(...batch);
   } while (cursor !== "0");
   return keys;
 }
 
+/**
+ * Scan several patterns at once. The passes run concurrently — one sequential
+ * keyspace walk per pattern cannot keep up with the snapshot refresh interval.
+ */
 export async function scanKeysMany(patterns: string[]): Promise<string[]> {
+  const uniquePatterns = [...new Set(patterns)];
+  const batches = await Promise.all(uniquePatterns.map((pattern) => scanKeys(pattern)));
   const keys = new Set<string>();
-  for (const pattern of patterns) {
-    for (const key of await scanKeys(pattern)) {
-      keys.add(key);
-    }
+  for (const batch of batches) {
+    for (const key of batch) keys.add(key);
   }
   return [...keys].sort();
 }

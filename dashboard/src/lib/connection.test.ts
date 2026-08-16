@@ -5,23 +5,40 @@ import {
   snapshotAgeSeconds,
   snapshotConnectionStatus,
   snapshotDisplayTime,
-  snapshotUpdateDate,
+  snapshotFetchedDate,
+  snapshotServerTimeLabel,
 } from "./connection";
 
-describe("snapshotUpdateDate", () => {
-  it("uses the payload fetch time instead of the receive time", () => {
-    const receivedAt = new Date("2026-06-16T12:00:20Z");
-    const updateDate = snapshotUpdateDate("2026-06-16T12:00:00Z", receivedAt);
-
-    expect(updateDate.toISOString()).toBe("2026-06-16T12:00:00.000Z");
+describe("snapshotFetchedDate", () => {
+  it("parses the server-stamped fetch time for display", () => {
+    expect(snapshotFetchedDate("2026-06-16T12:00:00Z")?.toISOString()).toBe(
+      "2026-06-16T12:00:00.000Z",
+    );
   });
 
-  it("falls back to receive time for missing or invalid payload times", () => {
-    const receivedAt = new Date("2026-06-16T12:00:20Z");
+  it("returns null for missing or invalid payload times instead of inventing one", () => {
+    expect(snapshotFetchedDate("")).toBeNull();
+    expect(snapshotFetchedDate("   ")).toBeNull();
+    expect(snapshotFetchedDate("not-a-date")).toBeNull();
+    expect(snapshotFetchedDate(undefined)).toBeNull();
+    expect(snapshotFetchedDate(null)).toBeNull();
+  });
+});
 
-    expect(snapshotUpdateDate("", receivedAt)).toBe(receivedAt);
-    expect(snapshotUpdateDate("not-a-date", receivedAt)).toBe(receivedAt);
-    expect(snapshotUpdateDate(undefined, receivedAt)).toBe(receivedAt);
+describe("snapshotServerTimeLabel", () => {
+  it("discloses the server clock and that ages come from the browser clock", () => {
+    const label = snapshotServerTimeLabel(new Date("2026-06-16T12:00:00Z"));
+
+    expect(label).toBe(
+      "Snapshot generated 2026-06-16T12:00:00.000Z (server clock). " +
+        "Age is measured from browser receipt time.",
+    );
+  });
+
+  it("hides the tooltip when no usable server time is available", () => {
+    expect(snapshotServerTimeLabel(null)).toBeNull();
+    expect(snapshotServerTimeLabel(undefined)).toBeNull();
+    expect(snapshotServerTimeLabel(new Date("not-a-date"))).toBeNull();
   });
 });
 

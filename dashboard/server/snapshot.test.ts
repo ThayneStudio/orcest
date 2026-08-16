@@ -166,7 +166,44 @@ describe("fetchSnapshot queue accounting", () => {
     expect(snapshot.degraded_sections).not.toContain("queued tasks");
   });
 
-  it("keeps queue sections degraded when task stream type checks fail", async () => {
+  it("probes discovered key types concurrently instead of one round trip per key", async () => {
+    vi.mocked(scanKeysMany).mockReset();
+    vi.mocked(scanKeys).mockReset();
+    vi.mocked(scanKeysMany)
+      .mockResolvedValueOnce(["tasks:claude", "tasks:grok", "tasks:codex"])
+      .mockResolvedValue([]);
+    vi.mocked(scanKeys).mockResolvedValue([]);
+    setPipelineResults([[[null, 0], [null, 0], [null, 0]]]);
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+      // Fail-safe so a sequential implementation finishes (and fails the
+      // maxInFlight assertion) instead of hanging.
+      setTimeout(resolve, 200);
+    });
+    const type = vi.fn(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      if (inFlight === 3) releaseBarrier();
+      await barrier;
+      inFlight--;
+      return "stream";
+    });
+    (redis as unknown as { type: ReturnType<typeof vi.fn> }).type = type;
+
+    const snapshot = await fetchSnapshot();
+
+    expect(snapshot.redis_ok).toBe(true);
+    expect(type).toHaveBeenCalledTimes(3);
+    // filterStreamKeys runs three times per snapshot over every discovered key;
+    // one blocking round trip per key does not fit the refresh interval.
+    expect(maxInFlight).toBe(3);
+  });
+
+  it("drops unverified keys and degrades queue sections when task stream type checks fail", async () => {
     vi.mocked(scanKeysMany).mockReset();
     vi.mocked(scanKeys).mockReset();
     vi.mocked(scanKeysMany)
@@ -183,7 +220,8 @@ describe("fetchSnapshot queue accounting", () => {
 
     const snapshot = await fetchSnapshot();
 
-    expect(snapshot.queue_depths).toEqual({ "tasks:claude": 1 });
+    // A key whose TYPE could not be confirmed is not treated as a stream.
+    expect(snapshot.queue_depths).toEqual({});
     expect(snapshot.degraded_sections).toEqual(expect.arrayContaining([
       "queue depths",
       "consumer groups",
@@ -1076,7 +1114,7 @@ describe("fetchSnapshot queue accounting", () => {
     expect(snapshot.queue_depths).not.toHaveProperty("tasks:claude");
   });
 
-  it("bounds lag-null fallback depth counting", async () => {
+  it("reports a saturated partial depth when lag-null fallback counting is bounded", async () => {
     setPipelineResults([[[null, 50]]]);
     (redis as unknown as { xinfo: ReturnType<typeof vi.fn> }).xinfo =
       vi.fn().mockResolvedValue([
@@ -1100,7 +1138,9 @@ describe("fetchSnapshot queue accounting", () => {
 
     expect(snapshot.redis_ok).toBe(true);
     expect(snapshot.degraded_sections).toContain("queue depths");
-    expect(snapshot.queue_depths).not.toHaveProperty("tasks:claude");
+    // The page budget is a floor on the real backlog, not an excuse to report
+    // nothing for the stream exactly when its queue is deepest.
+    expect(snapshot.queue_depths["tasks:claude"]).toBe(10000);
     const fallbackCalls = (xrange.mock.calls as unknown[][]).filter((call) => call[4] === 1000);
     expect(fallbackCalls).toHaveLength(10);
   });

@@ -11,5 +11,11 @@
     "outDir": "build",
     "rootDir": "."
   },
-  "include": ["server"]
+  "include": ["server"],
+  // Test sources must never be emitted into build/: Dockerfile copies build/
+  // wholesale into the runtime stage, which runs `npm ci --omit=dev`, so any
+  // compiled *.test.js would ship dead code whose `vitest` import cannot
+  // resolve. Vitest type-checks nothing at build time and runs the .ts sources
+  // directly, so excluding them here has no effect on the test suite.
+  "exclude": ["server/**/*.test.ts"]
 }

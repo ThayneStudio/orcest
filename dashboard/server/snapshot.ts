@@ -268,7 +268,11 @@ async function fetchSnapshotInner(maxResults: number): Promise<SystemSnapshot> {
       continue;
     }
     try {
-      queueDepths[stream] = await countQueueDepthFromGroupPositions(stream, groups);
+      const counted = await countQueueDepthFromGroupPositions(stream, groups);
+      queueDepths[stream] = counted.depth;
+      // A saturated count is a floor, not the true depth: report it, but flag
+      // the section so the UI does not present it as exact.
+      if (counted.saturated) markDegraded("queue depths");
     } catch {
       markDegraded("queue depths");
     }
@@ -538,20 +542,35 @@ async function filterStreamKeys(
   sections: string | string[],
   markDegraded: (section: string) => void,
 ): Promise<string[]> {
-  const streams: string[] = [];
   const mark = () => {
     for (const section of Array.isArray(sections) ? sections : [sections]) {
       markDegraded(section);
     }
   };
-  for (const key of keys) {
-    try {
-      const type = await redis.type(key);
-      if (type === "stream") streams.push(key);
-    } catch {
+  if (keys.length === 0) return [];
+
+  // Batch the TYPE probes instead of paying one blocking round trip per key —
+  // this runs three times per snapshot build over every discovered key.
+  const types = await Promise.all(
+    keys.map(async (key) => {
+      try {
+        return await redis.type(key);
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  const streams: string[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    const type = types[i];
+    if (type === null) {
+      // Unverified: drop the key rather than passing it through to XINFO/XRANGE
+      // as if it were a confirmed stream.
       mark();
-      streams.push(key);
+      continue;
     }
+    if (type === "stream") streams.push(keys[i]);
   }
   return streams;
 }
@@ -1082,34 +1101,44 @@ function streamIdParts(entryId: string): [number, number] | null {
   return Number.isSafeInteger(ms) && Number.isSafeInteger(seq) ? [ms, seq] : null;
 }
 
-async function countStreamEntriesAfter(stream: string, lastDeliveredId: string): Promise<number> {
+type QueueDepthCount = { depth: number; saturated: boolean };
+
+async function countStreamEntriesAfter(
+  stream: string,
+  lastDeliveredId: string,
+): Promise<QueueDepthCount> {
   let total = 0;
   let start = lastDeliveredId && lastDeliveredId !== "0-0" ? `(${lastDeliveredId}` : "-";
 
   for (let page = 0; page < QUEUE_DEPTH_FALLBACK_MAX_PAGES; page++) {
     const entries = await redis.xrange(stream, start, "+", "COUNT", QUEUE_DEPTH_FALLBACK_PAGE_SIZE);
     total += entries.length;
-    if (entries.length < QUEUE_DEPTH_FALLBACK_PAGE_SIZE) return total;
+    if (entries.length < QUEUE_DEPTH_FALLBACK_PAGE_SIZE) return { depth: total, saturated: false };
     start = `(${entries[entries.length - 1][0]}`;
   }
 
-  throw new Error(`queue depth fallback exceeded ${QUEUE_DEPTH_FALLBACK_MAX_PAGES} pages for ${stream}`);
+  // The backlog is deeper than the page budget. Report the partial count — the
+  // deepest queue is exactly when the dashboard must not report nothing.
+  return { depth: total, saturated: true };
 }
 
 async function countQueueDepthFromGroupPositions(
   stream: string,
   groups: Array<{ pending: number; lastDeliveredId: string }>,
-): Promise<number> {
+): Promise<QueueDepthCount> {
   if (groups.length === 0) {
     return countStreamEntriesAfter(stream, "0-0");
   }
 
   let total = 0;
+  let saturated = false;
   for (const group of groups) {
     total += normalizeNonNegativeCount(group.pending);
-    total += await countStreamEntriesAfter(stream, group.lastDeliveredId);
+    const counted = await countStreamEntriesAfter(stream, group.lastDeliveredId);
+    total += counted.depth;
+    saturated = saturated || counted.saturated;
   }
-  return total;
+  return { depth: total, saturated };
 }
 
 function normalizeNonNegativeCount(value: unknown): number {

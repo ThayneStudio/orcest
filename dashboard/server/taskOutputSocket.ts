@@ -16,6 +16,9 @@ export const TASK_OUTPUT_READ_ERROR_LIMIT = 3;
 export const TASK_OUTPUT_COMPLETE_CLOSE_REASON = "Task output complete";
 export const TASK_OUTPUT_UNAVAILABLE_CLOSE_REASON = "Task output unavailable";
 export const TASK_OUTPUT_POLL_INTERVAL = 500;
+// Task-output frames are not idempotent (dropping one loses lines), so a client
+// that stops reading is terminated instead; the UI reconnects with after_id.
+export const TASK_OUTPUT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 type TaskStart = { stream: string; entryId: string };
 type TaskOutputReadResult = {
@@ -25,7 +28,10 @@ type TaskOutputReadResult = {
   unavailable?: boolean;
 };
 
-type TaskOutputSocket = Pick<WebSocket, "readyState" | "send" | "close" | "terminate" | "ping" | "on">;
+type TaskOutputSocket = Pick<
+  WebSocket,
+  "readyState" | "send" | "close" | "terminate" | "ping" | "on" | "bufferedAmount"
+>;
 
 type TaskOutputSocketDeps = {
   findTaskStart: typeof findTaskStart;
@@ -39,6 +45,7 @@ export type TaskOutputSocketOptions = {
   port?: number;
   pingIntervalMs?: number;
   pollIntervalMs?: number;
+  maxBufferedBytes?: number;
   taskStartLookupMaxAttempts?: number;
   readErrorLimit?: number;
   deps?: Partial<TaskOutputSocketDeps>;
@@ -76,6 +83,16 @@ export function handleTaskOutputConnection(
   req: IncomingMessage,
   options: TaskOutputSocketOptions = {},
 ): TaskOutputConnectionHandle {
+  const deps = taskOutputSocketDeps(options.deps);
+
+  // Must be the very first statement: ws emits 'error' for any protocol-level
+  // frame error, and an EventEmitter 'error' with no listener throws. Every
+  // early return below leaves the client holding a live socket, so attaching
+  // this later means one malformed frame crashes the process.
+  ws.on("error", (err) => {
+    deps.logError("Task output WS error:", err);
+  });
+
   const activeConnections = options.activeConnections ?? 1;
   const maxConnections = options.maxConnections ?? MAX_TASK_OUTPUT_CONNECTIONS;
   if (activeConnections > maxConnections) {
@@ -105,12 +122,12 @@ export function handleTaskOutputConnection(
     return resolvedTaskOutputConnectionHandle();
   }
 
-  const deps = taskOutputSocketDeps(options.deps);
   const taskStartLookupMaxAttempts = options.taskStartLookupMaxAttempts ??
     TASK_START_LOOKUP_MAX_ATTEMPTS;
   const readErrorLimit = options.readErrorLimit ?? TASK_OUTPUT_READ_ERROR_LIMIT;
   const pollIntervalMs = options.pollIntervalMs ?? TASK_OUTPUT_POLL_INTERVAL;
   const pingIntervalMs = options.pingIntervalMs ?? 30000;
+  const maxBufferedBytes = options.maxBufferedBytes ?? TASK_OUTPUT_MAX_BUFFERED_BYTES;
 
   let lastId = afterId;
   let taskStart: TaskStart | null = null;
@@ -164,6 +181,19 @@ export function handleTaskOutputConnection(
 
   const sendTaskOutput = (msg: TaskOutputMessage, closeReason?: string): boolean => {
     if (ws.readyState !== WebSocket.OPEN) return false;
+    // readyState stays OPEN for a client that completes the handshake and then
+    // stops reading, and ping/pong keeps passing while the kernel still ACKs,
+    // so bufferedAmount is the only signal that the sender queue is growing.
+    if (ws.bufferedAmount > maxBufferedBytes) {
+      deps.logError(
+        "Task output WS backpressure limit exceeded; terminating client:",
+        ws.bufferedAmount,
+      );
+      taskDone = true;
+      if (interval) clearInterval(interval);
+      terminateConnection();
+      return false;
+    }
     try {
       ws.send(JSON.stringify(msg));
     } catch (err) {
@@ -314,10 +344,8 @@ export function handleTaskOutputConnection(
     awaitingPong = false;
   });
   ws.on("close", finishConnection);
-  ws.on("error", (err) => {
-    deps.logError("Task output WS error:", err);
-    finishConnection();
-  });
+  // Errors are logged by the listener attached at the top of this function.
+  ws.on("error", finishConnection);
 
   return {
     done,

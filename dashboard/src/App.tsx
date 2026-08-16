@@ -334,7 +334,8 @@ export function redisDisconnectedDetail(
 }
 
 export default function App() {
-  const { snapshot, stuckTasks, workers, connected, error, lastUpdate } = useSnapshot();
+  const { snapshot, stuckTasks, workers, connected, error, lastUpdate, serverFetchedAt } =
+    useSnapshot();
   const [activeTab, setActiveTab] = useState<Tab>(getTabFromUrl);
   const [resultsFilter, setResultsFilter] = useState<RecentResultFilter>(getResultsFilterFromUrl);
   const degradedSections = normalizedDegradedSectionSet(snapshot?.degraded_sections || []);
@@ -584,7 +585,12 @@ export default function App() {
           <h1 className="shrink-0 text-xl font-bold tracking-tight">
             Orcest Dashboard
           </h1>
-          <ConnectionStatus connected={connected} error={error} lastUpdate={lastUpdate} />
+          <ConnectionStatus
+            connected={connected}
+            error={error}
+            lastUpdate={lastUpdate}
+            serverFetchedAt={serverFetchedAt}
+          />
         </div>
 
         {/* Tabs */}

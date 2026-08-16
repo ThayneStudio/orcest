@@ -4,7 +4,7 @@ import {
   SNAPSHOT_PROTOCOL_ERROR,
   SNAPSHOT_RECONNECT_ABNORMAL_CLOSE_THRESHOLD,
   snapshotCloseErrorMessage,
-  snapshotUpdateDate,
+  snapshotFetchedDate,
 } from "../lib/connection";
 import { normalizeDashboardMessage } from "../lib/snapshot";
 import type { SystemSnapshot, StuckTask } from "../lib/types";
@@ -15,7 +15,14 @@ interface SnapshotState {
   workers: string[];
   connected: boolean;
   error: string | null;
+  /**
+   * Browser clock at message receipt. This is the ONLY clock snapshot staleness
+   * is measured against, so the comparison stays self-consistent even when the
+   * dashboard server's clock is skewed relative to the browser's.
+   */
   lastUpdate: Date | null;
+  /** Server-stamped `snapshot.fetched_at`. Display only — never used for freshness. */
+  serverFetchedAt: Date | null;
 }
 
 export function useSnapshot(): SnapshotState {
@@ -26,6 +33,7 @@ export function useSnapshot(): SnapshotState {
     connected: false,
     error: null,
     lastUpdate: null,
+    serverFetchedAt: null,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -52,6 +60,10 @@ export function useSnapshot(): SnapshotState {
 
     ws.onmessage = (event) => {
       if (wsRef.current !== ws) return;
+      // Stamp receipt on the browser clock *before* any parsing, so the
+      // staleness comparison in ConnectionStatus (which uses Date.now()) never
+      // mixes clocks with the server-generated snapshot.fetched_at.
+      const receivedAt = new Date();
       try {
         const msg = normalizeDashboardMessage(JSON.parse(event.data));
         if (!msg) throw new Error("Malformed snapshot message");
@@ -61,7 +73,8 @@ export function useSnapshot(): SnapshotState {
           workers: msg.workers,
           connected: true,
           error: null,
-          lastUpdate: snapshotUpdateDate(msg.snapshot.fetched_at),
+          lastUpdate: receivedAt,
+          serverFetchedAt: snapshotFetchedDate(msg.snapshot.fetched_at),
         });
         hasReceivedSnapshotRef.current = true;
         retryRef.current = 0;
