@@ -350,7 +350,7 @@ backup="/opt/orcest-backups/${release_id}"
 sudo install -d -m 0700 -o orcest -g orcest "$backup"
 docker tag orcest:latest "orcest:rollback-${release_id}"
 docker image inspect orcest:latest >"$backup/orcest-image.inspect.json"
-docker run --rm --user 0:0 --entrypoint python \
+docker run --rm -i --user 0:0 --entrypoint python \
   -v /etc/orcest/config.yaml:/tmp/orcest-fleet-config.yaml:ro \
   "orcest:rollback-${release_id}" - /tmp/orcest-fleet-config.yaml \
   >"$backup/old-pool-size" <<'PY'
@@ -654,7 +654,7 @@ docker exec orcest-redis-redis-1 sh -c \
 restored_template="$(docker exec orcest-redis-redis-1 sh -c \
   'redis-cli -e -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw GET orcest:pool:current_template_vmid')"
 test "$restored_template" = "$old_template"
-projects="$(docker run --rm --user 0:0 --entrypoint python \
+projects="$(docker run --rm -i --user 0:0 --entrypoint python \
   -v /etc/orcest/config.yaml:/tmp/orcest-fleet-config.yaml:ro \
   "orcest:rollback-${release_id}" - /tmp/orcest-fleet-config.yaml <<'PY'
 import sys
