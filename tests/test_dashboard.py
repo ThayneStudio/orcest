@@ -2186,7 +2186,11 @@ exit 0
         assert "<--env-file>" not in args
         assert "<--network>" in args
         assert "<container:dashboard-1>" in args
-        assert "<DASHBOARD_TOKEN=secret-token>" in args
+        # The token must reach the container through the environment, never on
+        # the host `docker` argv, which is world-readable via /proc/<pid>/cmdline
+        # for the lifetime of the readiness loop.
+        assert "<DASHBOARD_TOKEN=secret-token>" not in args
+        assert "<DASHBOARD_TOKEN>" in args
         assert "<DASHBOARD_READY_ATTEMPTS=2>" in args
         assert "<DASHBOARD_READY_INTERVAL_MS=250>" in args
         assert "<DASHBOARD_ALLOW_DEGRADED=true>" in args

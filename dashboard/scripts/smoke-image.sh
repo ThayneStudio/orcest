@@ -3,6 +3,14 @@ set -eu
 
 image="${1:-orcest-dashboard:ci}"
 token="${DASHBOARD_SMOKE_TOKEN:-dashboard-smoke-token}"
+# Hand the token to Docker through the environment, never through argv:
+# `-e NAME=VALUE` publishes the plaintext value in the host docker process's
+# command line, which any unprivileged local user can read from `ps aux` or
+# /proc/<pid>/cmdline. The bare `-e NAME` forms below make the Docker client
+# read these exported values instead.
+DASHBOARD_TOKEN="$token"
+DASHBOARD_SMOKE_TOKEN="$token"
+export DASHBOARD_TOKEN DASHBOARD_SMOKE_TOKEN
 cid=""
 asset_file="$(mktemp)"
 asset_line_file="$(mktemp)"
@@ -16,7 +24,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-cid="$(docker run -d -e DASHBOARD_TOKEN="$token" "$image")"
+cid="$(docker run -d -e DASHBOARD_TOKEN "$image")"
 if ! docker exec "$cid" sh -lc '
 set -eu
 
@@ -52,7 +60,7 @@ fi
 
 for _attempt in $(seq 1 60); do
   if docker exec -i \
-    -e DASHBOARD_SMOKE_TOKEN="$token" \
+    -e DASHBOARD_SMOKE_TOKEN \
     -e DASHBOARD_EXPECTED_ASSETS="$expected_assets" \
     "$cid" node <<'NODE'
 const token = process.env.DASHBOARD_SMOKE_TOKEN;

@@ -184,7 +184,8 @@ The `Makefile` provides the canonical developer targets:
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
 | `make redis-up` / `make redis-down`  | Manage the test Redis container directly.                                                                 |
 | `make lock`                          | Regenerate `requirements.lock` via `pip-compile`.                                                         |
-| `make test-dashboard`                | Runs dashboard install, audit, typecheck, tests, and build in the pinned Node Docker image.                |
+| `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
+| `make audit-dashboard`               | Runs `npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL)` on its own. Kept out of `test-dashboard` (and non-blocking in CI) so a new registry advisory cannot fail an unrelated PR. |
 | `make build-dashboard`               | Builds the dashboard in the pinned Node Docker image.                                                      |
 | `make smoke-dashboard-compose`       | Builds the dashboard Compose stack with an authenticated Redis container and verifies `/api/ready`.        |
 | `make dev-dashboard`                 | Runs the dashboard dev server in the pinned Node Docker image at `http://127.0.0.1:5173/?token=dev-dashboard-token` unless `DASHBOARD_TOKEN` is set. Redis defaults to `host.docker.internal:6379`; override `DASHBOARD_DEV_REDIS_HOST` / `DASHBOARD_DEV_REDIS_PORT` when needed. `REDIS_PASSWORD` or `ORCEST_REDIS_PASSWORD` is forwarded into the container for authenticated Redis. Set `DASHBOARD_REDIS_PREFIXES=orcest,project-a` to restrict dashboard scans in shared Redis; add `unprefixed` to include legacy unprefixed keys. |
@@ -285,7 +286,7 @@ variables in this order (see `_PROVIDER_ENV_CANDIDATES` in
 | Provider | Env vars (first non-empty wins)                                  |
 | -------- | ---------------------------------------------------------------- |
 | `claude` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                   |
-| `clauder` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                  |
+| `clauder` | `CLAUDER_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
 | `grok`   | `XAI_API_KEY`, `GROK_API_KEY`, `XAI_API_TOKEN`                   |
 | `codex`  | `CODEX_API_KEY`, `OPENAI_API_KEY`                                |
 | *any*    | falls back to `<PROVIDER>_TOKEN`, `<PROVIDER>_API_KEY`, `<PROVIDER>_KEY` |
@@ -315,7 +316,8 @@ Top-level keys (from `WorkerConfig`):
 | Variable                                                 | Required when                                            |
 | -------------------------------------------------------- | -------------------------------------------------------- |
 | `GITHUB_TOKEN`                                           | `github.token` is empty in YAML.                         |
-| `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)       | A `claude` or `clauder` provider entry has no inline `credential`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)       | A `claude` provider entry has no inline `credential`.    |
+| `CLAUDER_API_KEY` (checked before `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) | A `clauder` provider entry has no inline `credential`. |
 | `XAI_API_KEY` / `GROK_API_KEY` / `XAI_API_TOKEN`         | A `grok` provider entry has no inline `credential`.     |
 | `CODEX_API_KEY` (or `OPENAI_API_KEY`)                    | A `codex` provider entry has no inline `credential`.    |
 | `ORCEST_REDIS_*`                                         | Used by `orcest pool-manage` inside the Compose stack.   |
@@ -417,7 +419,7 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 | `status`                                                         | Show orchestrator host reachability, orgs, per-project stack status, and pool summary.                     |
 | `rebake [--image-url …]`                                         | Bake a fresh template at the next free VMID from `pool.template_vmid_range` and atomically swap the Redis pointer. |
 | `destroy-template <vm-id>`                                       | Destroy a non-active template VM. Refuses if it is the active pointer target or has live clones.           |
-| `gc-templates [--dry-run]`                                       | Destroy templates in the template VMID range that are no longer active and have no live clones.            |
+| `gc-templates [--dry-run] [--yes]`                               | Destroy orcest worker templates in the template VMID range that are no longer active and have no live clones. Only VMs that are actually templates named `orcest-worker-*` are eligible; anything else sharing the range is listed and skipped. Prompts before destroying unless `--yes`. |
 | `set-pool-size <N> [--vm-id-start …]`                            | Set the target warm pool size.                                                                             |
 
 ## Onboarding a project
@@ -556,6 +558,10 @@ Notes:
   backend/revision/stream-correlated worker heartbeats. With backend checks,
   also pass `--expected-pool-size` and `--expected-vmid-start`, then one
   `--expected-backend` per consecutive VMID slot, including duplicates.
+  `--prefix` is **required**: the project-scoped gates read `{prefix}:results`
+  and friends, so a wrong or missing prefix would inspect an empty keyspace and
+  report healthy. Pass `--pool-prefix` too when the pool manager runs under a
+  key prefix different from `--task-prefix`.
 - **Dashboard container** on the orchestrator VM — the live task view.
 - **Container logs on the orchestrator VM:**
   ```bash

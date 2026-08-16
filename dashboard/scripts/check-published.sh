@@ -92,7 +92,13 @@ if [ -n "$published_docker_network" ]; then
   set -- "$@" --network "$published_docker_network"
 fi
 if [ -n "$readiness_token" ]; then
-  set -- "$@" -e "DASHBOARD_TOKEN=$readiness_token"
+  # Pass the token by NAME ONLY. `-e DASHBOARD_TOKEN=<value>` would put the
+  # plaintext token in the argv of the host `docker` process, readable by any
+  # unprivileged local user through `ps aux` / /proc/<pid>/cmdline for the whole
+  # readiness wait (up to 60s on every deploy). With a bare `-e DASHBOARD_TOKEN`
+  # the Docker client reads the value from its own environment instead, and the
+  # value below is scoped to that single invocation.
+  set -- "$@" -e DASHBOARD_TOKEN
 fi
 
 if [ -n "$ready_attempts" ]; then
@@ -114,7 +120,7 @@ if [ -n "${DASHBOARD_EXPECTED_REVISION:-}" ]; then
   set -- "$@" -e "DASHBOARD_EXPECTED_REVISION=$DASHBOARD_EXPECTED_REVISION"
 fi
 
-docker run --rm -i "$@" \
+DASHBOARD_TOKEN="$readiness_token" docker run --rm -i "$@" \
   -e DASHBOARD_BASE_URL="$base_url" \
   -e DASHBOARD_EXPECTED_ASSETS="${DASHBOARD_EXPECTED_ASSETS:-}" \
   "$node_image" node --input-type=module <<'NODE'
