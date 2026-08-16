@@ -23,6 +23,21 @@ CREDENTIAL_UPDATE_VERSION_KEY = "providers:credential_update_version"
 CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX = "credential-update-diagnostic:"
 HANDOFF_FINGERPRINT_FIELD = "orcest_handoff_fingerprint"
 HANDOFF_MARKER_TTL_SECONDS = 30 * 24 * 3600
+# The private checkpoint holds a plaintext rotated OAuth blob. The terminal
+# handoff deletes it as soon as the result is durable, so this TTL is only a
+# backstop for checkpoints that can never reach that path -- most concretely,
+# `XGROUP DELCONSUMER` (the documented operator fix for a stalled queue)
+# discards the consumer's PEL entries, leaving the checkpoint unreachable and,
+# previously, immortal.
+#
+# It must stay strictly longer than HANDOFF_MARKER_TTL_SECONDS: the reaper is
+# required to finish a checkpoint-only handoff after the bounded public
+# diagnostic/receipt markers have already expired, so the private checkpoint
+# has to outlive them. Being far longer than any task can run
+# (pool.max_task_duration is hours) it can never expire under live work.
+CREDENTIAL_CHECKPOINT_TTL_SECONDS = 90 * 24 * 3600
+if CREDENTIAL_CHECKPOINT_TTL_SECONDS <= HANDOFF_MARKER_TTL_SECONDS:
+    raise ValueError("credential checkpoints must outlive the public handoff markers")
 _CREDENTIAL_INTENT_VALUE = "1"
 
 
@@ -164,11 +179,11 @@ _CREATE_CREDENTIAL_CHECKPOINT_LUA = r"""
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return -1
 end
-local checkpoint_created = redis.call('SET', KEYS[1], ARGV[1], 'NX')
+local checkpoint_created = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3])
 if not checkpoint_created then
   return 0
 end
-local intent_created = redis.call('SET', KEYS[2], ARGV[2], 'NX')
+local intent_created = redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', ARGV[3])
 if not intent_created then
   redis.call('DEL', KEYS[1])
   return -1
@@ -187,7 +202,7 @@ end
 if redis.call('GET', KEYS[2]) ~= ARGV[3] then
   return -2
 end
-redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL')
 return 1
 """
 
@@ -205,13 +220,13 @@ if intent then
     return -2
   end
 else
-  local created = redis.call('SET', KEYS[2], ARGV[2], 'NX')
+  local created = redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', ARGV[3])
   if not created then
     return -2
   end
 end
-redis.call('PERSIST', KEYS[1])
-redis.call('PERSIST', KEYS[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
 return 1
 """
 
@@ -454,6 +469,7 @@ def store_credential_checkpoint(
             intent_key,
             serialized,
             _CREDENTIAL_INTENT_VALUE,
+            str(CREDENTIAL_CHECKPOINT_TTL_SECONDS),
         ),
     )
     if isinstance(response, int):
@@ -468,10 +484,15 @@ def store_credential_checkpoint(
         intent_absent = not isinstance(raw_intent, (str, bytes))
         if not checkpoint_absent or not intent_absent:
             raise RuntimeError("private credential checkpoint already exists or is incomplete")
-        created = redis.client.set(key, serialized, nx=True)
+        created = redis.client.set(key, serialized, nx=True, ex=CREDENTIAL_CHECKPOINT_TTL_SECONDS)
         if not _set_nx_succeeded(created):
             raise RuntimeError("private credential checkpoint creation raced")
-        intent_created = redis.client.set(intent_key, _CREDENTIAL_INTENT_VALUE, nx=True)
+        intent_created = redis.client.set(
+            intent_key,
+            _CREDENTIAL_INTENT_VALUE,
+            nx=True,
+            ex=CREDENTIAL_CHECKPOINT_TTL_SECONDS,
+        )
         if not _set_nx_succeeded(intent_created):
             # The fallback is not transactional. Remove only the exact value
             # this actor created; never delete a concurrent replacement.
@@ -500,6 +521,7 @@ def _migrate_v1_intent_once(
             intent_key,
             serialized,
             _CREDENTIAL_INTENT_VALUE,
+            str(CREDENTIAL_CHECKPOINT_TTL_SECONDS),
         ),
     )
     if isinstance(response, int):
@@ -515,17 +537,24 @@ def _migrate_v1_intent_once(
     if isinstance(current_intent, str):
         if current_intent != _CREDENTIAL_INTENT_VALUE:
             return False
-    elif not _set_nx_succeeded(redis.client.set(intent_key, _CREDENTIAL_INTENT_VALUE, nx=True)):
+    elif not _set_nx_succeeded(
+        redis.client.set(
+            intent_key,
+            _CREDENTIAL_INTENT_VALUE,
+            nx=True,
+            ex=CREDENTIAL_CHECKPOINT_TTL_SECONDS,
+        )
+    ):
         return False
     current = redis.client.get(checkpoint_key)
     if isinstance(current, bytes):
         current = current.decode("utf-8")
     if current != serialized:
         return False
-    persist = getattr(redis.client, "persist", None)
-    if callable(persist):
-        persist(checkpoint_key)
-        persist(intent_key)
+    expire = getattr(redis.client, "expire", None)
+    if callable(expire):
+        expire(checkpoint_key, CREDENTIAL_CHECKPOINT_TTL_SECONDS)
+        expire(intent_key, CREDENTIAL_CHECKPOINT_TTL_SECONDS)
     return True
 
 
@@ -692,7 +721,7 @@ def version_credential_checkpoint(
             raise RuntimeError("private credential checkpoint changed during versioning")
         if raw_checkpoint is None or (isinstance(raw_intent, str) and raw_intent != "1"):
             raise RuntimeError("private credential checkpoint changed during versioning")
-        redis.client.set(checkpoint.key, serialized)
+        redis.client.set(checkpoint.key, serialized, keepttl=True)
     return CredentialCheckpoint(checkpoint.key, serialized, fields)
 
 

@@ -2053,6 +2053,8 @@ class TestHealthCheckReapCoordination:
         """A persistent private checkpoint outranks generic force-reap recovery."""
         from orcest.shared.coordination import get_pending_task, set_pending_task
         from orcest.shared.credential_handoff import (
+            CREDENTIAL_CHECKPOINT_TTL_SECONDS,
+            HANDOFF_MARKER_TTL_SECONDS,
             credential_checkpoint_key,
             store_credential_checkpoint,
         )
@@ -2108,8 +2110,12 @@ class TestHealthCheckReapCoordination:
             result.to_dict(),
         )
         # This is the >30-day condition: any bounded public diagnostic/receipt
-        # may already be gone, while the private checkpoint never expires.
-        assert rc.client.ttl(checkpoint.key) == -1
+        # may already be gone, while the private checkpoint is still present.
+        # The checkpoint carries a plaintext OAuth blob, so it is bounded too,
+        # but strictly longer-lived than the public markers it must outlive.
+        checkpoint_ttl = rc.client.ttl(checkpoint.key)
+        assert checkpoint_ttl > HANDOFF_MARKER_TTL_SECONDS
+        assert checkpoint_ttl <= CREDENTIAL_CHECKPOINT_TTL_SECONDS
 
         assert manager._coordinate_reaped_vm(305) is True
 

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from orcest.shared.credential_handoff import (
+    CREDENTIAL_CHECKPOINT_TTL_SECONDS,
     HANDOFF_FINGERPRINT_FIELD,
     CredentialCheckpoint,
     CredentialCheckpointStatus,
@@ -108,7 +109,7 @@ def test_checkpoint_fallback_cleans_exact_checkpoint_when_intent_nx_fails() -> N
         ("serialized", "invalid", False),
     ],
 )
-def test_v1_migration_fallback_persists_only_exact_valid_state(
+def test_v1_migration_fallback_extends_ttl_only_for_exact_valid_state(
     checkpoint_value: str | None,
     intent_value: str,
     expected: bool,
@@ -126,9 +127,38 @@ def test_v1_migration_fallback_persists_only_exact_valid_state(
 
     assert migrated is expected
     if expected:
-        redis.client.persist.assert_has_calls([call("checkpoint"), call("intent")])
+        redis.client.expire.assert_has_calls(
+            [
+                call("checkpoint", CREDENTIAL_CHECKPOINT_TTL_SECONDS),
+                call("intent", CREDENTIAL_CHECKPOINT_TTL_SECONDS),
+            ]
+        )
     else:
-        redis.client.persist.assert_not_called()
+        redis.client.expire.assert_not_called()
+
+
+def test_new_checkpoint_and_intent_get_a_bounded_ttl(fake_redis_client) -> None:
+    """A freshly created checkpoint must not live forever.
+
+    Regression: both keys were created with `SET NX` and no expiry, and the
+    v1 migration actively `PERSIST`ed them. They hold the plaintext rotated
+    OAuth blob, and the only code that deletes them runs off a live PEL entry
+    -- so `XGROUP DELCONSUMER` (the documented operator fix for a stalled
+    queue) discarded the PEL entry and stranded the secret in Redis forever.
+    """
+    redis = fake_redis_client
+    task, fields = _task_and_fields()
+    checkpoint = store_credential_checkpoint(
+        redis, "test:results", "test:tasks:claude", "1-0", task.id, fields
+    )
+    intent_key = credential_intent_key("test:results", "test:tasks:claude", "1-0", task.id)
+
+    for key in (checkpoint.key, intent_key):
+        ttl = redis.client.ttl(key)
+        assert ttl > 0, f"{key} must expire eventually, got {ttl}"
+        assert ttl <= CREDENTIAL_CHECKPOINT_TTL_SECONDS
+        # Must comfortably outlive any task the pool will let run.
+        assert ttl > 24 * 3600, f"{key} must outlive any task, got {ttl}"
 
 
 def test_absent_checkpoint_fallback_requires_exact_terminal_row_and_empty_pel() -> None:
@@ -274,8 +304,15 @@ def test_fakeredis_v1_ttl_migration_persists_then_recovers(
     )
     assert status is CredentialCheckpointStatus.VALID
     assert checkpoint is not None
-    assert redis.client.ttl(checkpoint_key) == -1
-    assert redis.client.ttl(intent_key) == -1
+    # The v1 key carried a 60s TTL, which could expire while the entry is still
+    # pending. Migration lifts it to the checkpoint backstop -- far beyond any
+    # task duration, but still bounded so an unreachable checkpoint (e.g. after
+    # XGROUP DELCONSUMER discards the PEL entry) cannot retain a plaintext
+    # OAuth blob forever.
+    for key in (checkpoint_key, intent_key):
+        ttl = redis.client.ttl(key)
+        assert ttl > 60, f"{key} must outlive any task, got {ttl}"
+        assert ttl <= CREDENTIAL_CHECKPOINT_TTL_SECONDS, f"{key} must stay bounded, got {ttl}"
 
     recovered = recover_credential_checkpoint(
         redis,

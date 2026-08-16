@@ -4656,6 +4656,69 @@ def test_network_comment_failure_never_consumes_the_budget(fake_redis_client, gh
     assert fake_redis_client.get(f"result:{result.task_id}:github_side_effect_failures") is None
 
 
+def test_discarded_stale_credential_refresh_is_counted(fake_redis_client, mocker):
+    """Dropping an already-performed rotation must leave a health signal.
+
+    Two workers can hold the same OAuth account concurrently (ProviderPool
+    makes no reservation), and ordering is decided at publish time, so a
+    genuinely newer rotation can lose to an older one. That is invisible in an
+    info log; the counter is the only warning before the stored blob is found
+    to hold a consumed refresh token.
+    """
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    pool = ProviderPool([entry])
+    task_id = "task-stale-rotation"
+    fake_redis_client.hset(_TASK_PROVIDER_ACCOUNTS_KEY, task_id, entry.account_key())
+    # A newer rotation is already stored -- in the shared hash, which is where
+    # the ordering comparison actually happens -- so this result's update loses.
+    newer_minted_at = 1_900_000_000_000_000.0
+    shared_redis = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
+    shared_redis.hset_json_if_newer(
+        "providers:credential_overrides",
+        entry.account_key(),
+        json.dumps({"blob": "winning-blob", "minted_at": newer_minted_at}),
+        newer_minted_at,
+    )
+    pool.seed_credential_override(entry.account_key(), "winning-blob", minted_at=newer_minted_at)
+
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id=task_id,
+        pr_number=93,
+    )
+    result.credential_update = '{"access_token":"loser","refresh_token":"loser-refresh"}'
+    result.credential_update_minted_at = 1_700_000_000_000_000.0
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
+
+    _handle_result(
+        ProjectConfig(
+            repo="owner/testrepo",
+            token="fake-token",
+            claude_tokens=[],
+            key_prefix="test",
+            providers=[entry],
+        ),
+        LabelConfig(),
+        fake_redis_client,
+        result,
+        logging.getLogger("test"),
+        token_pool=pool,
+        shared_credential_redis=shared_redis,
+    )
+
+    counter_key = "providers:grok:credential_refresh_discarded_stale"
+    assert fake_redis_client.get(counter_key) == "1"
+    assert fake_redis_client.ttl(counter_key) > 0
+    assert pool.effective_credential(entry) == "winning-blob"
+
+
 def test_task_provider_account_uses_atomic_per_task_ttl(fake_redis_client):
     from orcest.orchestrator.loop import (
         _clear_task_provider_account,
