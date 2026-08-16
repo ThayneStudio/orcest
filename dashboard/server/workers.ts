@@ -112,9 +112,14 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const STREAM_CACHE_MAX = 100;
 const streamCache = new Map<string, { key: string; cachedAt: number }>();
 const TASK_OUTPUT_PREFIX_CACHE_MAX = 500;
+// Unresolved lookups are cached too, for a much shorter time. Without this, a
+// task whose output entries have been trimmed out of its worker stream forces a
+// full TASK_START_SCAN_MAX_ENTRIES walk of every candidate stream on every
+// snapshot build (once per snapshot refresh interval) forever.
+export const TASK_OUTPUT_PREFIX_NEGATIVE_CACHE_TTL = 30 * 1000;
 const taskOutputPrefixCache = new Map<
   string,
-  { prefix: string | null; cachedAt: number }
+  { prefix: string | null | undefined; cachedAt: number; ttl: number }
 >();
 
 type RedisPrefixFilter = string | null | undefined;
@@ -447,7 +452,7 @@ export async function findTaskOutputPrefixes(
     if (normalizedLookups.has(key)) continue;
     normalizedLookups.set(key, { workerId, taskId });
     const cached = taskOutputPrefixCache.get(key);
-    if (cached && Date.now() - cached.cachedAt < CACHE_TTL) continue;
+    if (cached && !taskOutputPrefixCacheExpired(cached)) continue;
     if (cached) taskOutputPrefixCache.delete(key);
     const tasks = tasksByWorker.get(workerId) || new Set<string>();
     tasks.add(taskId);
@@ -461,9 +466,7 @@ export async function findTaskOutputPrefixes(
     const cached = taskOutputPrefixCache.get(key);
     prefixes.set(
       key,
-      cached && Date.now() - cached.cachedAt < CACHE_TTL
-        ? cached.prefix
-        : undefined,
+      cached && !taskOutputPrefixCacheExpired(cached) ? cached.prefix : undefined,
     );
   }
   if (tasksByWorker.size === 0) return { prefixes, degraded: false };
@@ -486,7 +489,13 @@ export async function findTaskOutputPrefixes(
   let degraded = false;
   for (const [workerId, taskIds] of tasksByWorker.entries()) {
     const workerStreams = streamsByWorker.get(workerId) || [];
-    if (workerStreams.length === 0) continue;
+    if (workerStreams.length === 0) {
+      // No candidate output stream exists for this worker: a definitive negative
+      // that costs nothing to re-derive, but caching it keeps the lookup out of
+      // the scan path on the next poll.
+      cacheUnresolvedTaskOutputPrefixes(workerId, taskIds);
+      continue;
+    }
     let inspectedStreams = 0;
     let firstStreamError: unknown = null;
     let workerDegraded = false;
@@ -523,10 +532,17 @@ export async function findTaskOutputPrefixes(
       );
     }
     if (!workerDegraded) {
-      for (const [taskId, location] of bestByTask.entries()) {
+      // Cache every task in the working set, resolved or not. A lookup that
+      // stayed unresolved after a clean pass is negatively cached (short TTL);
+      // without that, an untraceable task re-triggers the full stream walk on
+      // every snapshot build.
+      for (const taskId of taskIds) {
+        const location = bestByTask.get(taskId);
+        const prefix = location ? outputStreamPrefix(location.stream) : undefined;
         cacheTaskOutputPrefix(
           taskOutputPrefixLookupKey(workerId, taskId),
-          outputStreamPrefix(location.stream),
+          prefix,
+          prefix === undefined ? TASK_OUTPUT_PREFIX_NEGATIVE_CACHE_TTL : CACHE_TTL,
         );
       }
     }
@@ -535,16 +551,33 @@ export async function findTaskOutputPrefixes(
   return { prefixes, degraded };
 }
 
+function taskOutputPrefixCacheExpired(entry: { cachedAt: number; ttl: number }): boolean {
+  return Date.now() - entry.cachedAt >= entry.ttl;
+}
+
+function cacheUnresolvedTaskOutputPrefixes(
+  workerId: string,
+  taskIds: Iterable<string>,
+): void {
+  for (const taskId of taskIds) {
+    cacheTaskOutputPrefix(
+      taskOutputPrefixLookupKey(workerId, taskId),
+      undefined,
+      TASK_OUTPUT_PREFIX_NEGATIVE_CACHE_TTL,
+    );
+  }
+}
+
 function cacheTaskOutputPrefix(
   key: string,
   prefix: string | null | undefined,
+  ttl: number = CACHE_TTL,
 ): void {
-  if (prefix === undefined) return;
   if (taskOutputPrefixCache.size >= TASK_OUTPUT_PREFIX_CACHE_MAX) {
     const firstKey = taskOutputPrefixCache.keys().next().value;
     if (firstKey !== undefined) taskOutputPrefixCache.delete(firstKey);
   }
-  taskOutputPrefixCache.set(key, { prefix, cachedAt: Date.now() });
+  taskOutputPrefixCache.set(key, { prefix, cachedAt: Date.now(), ttl });
 }
 
 async function findTaskStartsInStream(

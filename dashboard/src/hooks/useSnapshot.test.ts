@@ -72,6 +72,7 @@ function snapshot(overrides: Partial<SystemSnapshot> = {}): SystemSnapshot {
 describe("useSnapshot", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-20T02:00:00.000Z"));
     resetDashboardAuthTokenForTesting();
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     FakeWebSocket.instances = [];
@@ -126,7 +127,58 @@ describe("useSnapshot", () => {
       expect(result.current.snapshot?.fetched_at).toBe("2026-06-20T01:02:03.000Z");
       expect(result.current.stuckTasks).toHaveLength(1);
       expect(result.current.workers).toEqual(["orcest-worker-300"]);
-      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T01:02:03.000Z");
+      // Staleness clock: browser receipt time, not the server's fetched_at.
+      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T02:00:00.000Z");
+      // Server time is retained for display only.
+      expect(result.current.serverFetchedAt?.toISOString()).toBe("2026-06-20T01:02:03.000Z");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("keeps the staleness clock local when the server clock is skewed", async () => {
+    const { result, unmount } = renderHook<SnapshotHookState, void>(() => useSnapshot());
+
+    try {
+      await act(async () => {
+        FakeWebSocket.instances[0].open();
+        // Server clock 60s AHEAD of the browser. Using it for freshness would
+        // clamp the age to 0 forever and pin the badge green on a hung feed.
+        FakeWebSocket.instances[0].message({
+          snapshot: snapshot({ fetched_at: "2026-06-20T02:01:00.000Z" }),
+          stuck_tasks: [],
+          workers: [],
+        });
+      });
+
+      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T02:00:00.000Z");
+      expect(result.current.serverFetchedAt?.toISOString()).toBe("2026-06-20T02:01:00.000Z");
+
+      // Twenty seconds later the receipt-based age is a real 20s, which the
+      // stale threshold (15s) can actually reach.
+      expect(
+        Math.floor((Date.now() + 20_000 - (result.current.lastUpdate?.getTime() ?? 0)) / 1000),
+      ).toBe(20);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("still stamps a receipt time when the snapshot carries no usable fetched_at", async () => {
+    const { result, unmount } = renderHook<SnapshotHookState, void>(() => useSnapshot());
+
+    try {
+      await act(async () => {
+        FakeWebSocket.instances[0].open();
+        FakeWebSocket.instances[0].message({
+          snapshot: snapshot({ fetched_at: "" }),
+          stuck_tasks: [],
+          workers: [],
+        });
+      });
+
+      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T02:00:00.000Z");
+      expect(result.current.serverFetchedAt).toBeNull();
     } finally {
       unmount();
     }
@@ -183,7 +235,7 @@ describe("useSnapshot", () => {
 
       expect(result.current.connected).toBe(false);
       expect(result.current.error).toBeNull();
-      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T01:02:03.000Z");
+      expect(result.current.lastUpdate?.toISOString()).toBe("2026-06-20T02:00:00.000Z");
 
       for (let attempt = 1; attempt < 4; attempt += 1) {
         await act(async () => {

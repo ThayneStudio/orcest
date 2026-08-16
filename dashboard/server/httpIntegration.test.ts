@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -8,12 +9,18 @@ import { WebSocket, type WebSocketServer } from "ws";
 import {
   broadcastSnapshotMessage,
   closeWebSocketServer,
+  createCoalescedFetch,
   createDashboardServer,
   dashboardBuildRevision,
   dashboardTaskOutputConnectionOptions,
   dashboardPortFromEnv,
   dashboardRevisionFromEnv,
+  safeSendSnapshot,
   startDashboardServer,
+  MAX_SNAPSHOT_CONNECTIONS,
+  SNAPSHOT_SKIP_BUFFERED_BYTES,
+  SNAPSHOT_TERMINATE_BUFFERED_BYTES,
+  WEBSOCKET_MAX_PAYLOAD_BYTES,
   type DashboardServerInstance,
 } from "./index.js";
 import { WorkerDiscoveryPartialError } from "./workers.js";
@@ -34,8 +41,37 @@ type TestServer = {
   redisQuit: ReturnType<typeof vi.fn>;
 };
 
+/**
+ * A socket whose `emit` has real EventEmitter semantics: emitting "error" with
+ * no registered listener throws, exactly like ws does for protocol-level frame
+ * errors.
+ */
+class EmitterWebSocket extends EventEmitter {
+  readyState: WebSocket["readyState"] = WebSocket.OPEN;
+  bufferedAmount = 0;
+  closes: Array<{ code?: number; reason?: string }> = [];
+
+  send(): void {}
+
+  close(code?: number, reason?: string): void {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.closes.push({ code, reason });
+    this.emit("close", code, reason);
+  }
+
+  terminate(): void {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.emit("close");
+  }
+
+  ping(): void {}
+}
+
 class FakeSnapshotWebSocket {
   readyState: WebSocket["readyState"] = WebSocket.OPEN;
+  bufferedAmount = 0;
   sent: string[] = [];
   closes: Array<{ code?: number; reason?: string }> = [];
   pings = 0;
@@ -265,6 +301,43 @@ async function closeDashboardHttpServer(testServer: TestServer): Promise<void> {
 async function flushPromises(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function waitForOpen(ws: WebSocket): Promise<void> {
+  return withTimeout(
+    new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    }),
+    2000,
+    "Timed out waiting for snapshot WebSocket open",
+  );
+}
+
+function waitForClose(ws: WebSocket): Promise<{ code: number; reason: string }> {
+  return withTimeout(
+    new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+    }),
+    2000,
+    "Timed out waiting for snapshot WebSocket close",
+  );
 }
 
 beforeEach(() => {
@@ -738,6 +811,274 @@ describe("dashboard HTTP integration", () => {
       await instance.close();
       fs.rmSync(root, { recursive: true, force: true });
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("dashboard WebSocket resilience", () => {
+  it("survives a protocol error on a snapshot connection rejected during shutdown", async () => {
+    const testServer = await openDashboardHttpServer();
+    testServer.buildDashboardMessage.mockResolvedValue({
+      snapshot: { redis_ok: true },
+      stuck_tasks: [],
+      workers: [],
+    });
+
+    try {
+      // close() flips `closing` synchronously, so this connection takes the
+      // early `ws.close(1001)` return in the handler.
+      const closePromise = testServer.instance.close();
+      const ws = new EmitterWebSocket();
+      testServer.instance.snapshotWss.emit("connection", ws as unknown as WebSocket, {});
+
+      expect(ws.closes).toEqual([{ code: 1001, reason: "Server shutting down" }]);
+      // ws emits this for any malformed frame; with no listener it throws and
+      // there is no process-level uncaughtException handler in the dashboard.
+      expect(() => ws.emit("error", new Error("Invalid WebSocket frame"))).not.toThrow();
+
+      await closePromise;
+    } finally {
+      fs.rmSync(testServer.root, { recursive: true, force: true });
+    }
+  });
+
+  it("survives a protocol error on a task-output connection rejected during shutdown", async () => {
+    const testServer = await openDashboardHttpServer();
+
+    try {
+      const closePromise = testServer.instance.close();
+      const ws = new EmitterWebSocket();
+      testServer.instance.taskOutputWss.emit(
+        "connection",
+        ws as unknown as WebSocket,
+        { url: "/ws/task-output?worker_id=worker-1" },
+      );
+
+      expect(ws.closes).toEqual([{ code: 1001, reason: "Server shutting down" }]);
+      expect(() => ws.emit("error", new Error("Invalid WebSocket frame"))).not.toThrow();
+
+      await closePromise;
+    } finally {
+      fs.rmSync(testServer.root, { recursive: true, force: true });
+    }
+  });
+
+  it("caps WebSocket frame size on both servers", async () => {
+    const testServer = await openDashboardHttpServer();
+
+    try {
+      // ws defaults to a 100 MiB maxPayload; neither server reads client frames.
+      expect(testServer.instance.snapshotWss.options.maxPayload)
+        .toBe(WEBSOCKET_MAX_PAYLOAD_BYTES);
+      expect(testServer.instance.taskOutputWss.options.maxPayload)
+        .toBe(WEBSOCKET_MAX_PAYLOAD_BYTES);
+      expect(WEBSOCKET_MAX_PAYLOAD_BYTES).toBeLessThan(100 * 1024 * 1024);
+    } finally {
+      await closeDashboardHttpServer(testServer);
+    }
+  });
+
+  it("rejects snapshot connections past the connection cap", async () => {
+    process.env.DASHBOARD_TOKEN = "s3cret";
+    const root = createDistRoot();
+    const instance = createDashboardServer({
+      port: 0,
+      cwd: root,
+      pingIntervalMs: 60_000,
+      snapshotRefreshIntervalMs: 60_000,
+      maxSnapshotConnections: 1,
+      deps: {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        discoverWorkers: vi.fn().mockResolvedValue([]),
+        buildDashboardMessage: vi.fn().mockResolvedValue({
+          snapshot: { redis_ok: true },
+          stuck_tasks: [],
+          workers: [],
+        }),
+        redisQuit: vi.fn().mockResolvedValue(undefined),
+        logInfo: vi.fn(),
+        logError: vi.fn(),
+      },
+    });
+    const port = await listen(instance.server);
+    const first = new WebSocket(`ws://127.0.0.1:${port}/ws/snapshot?token=s3cret`);
+
+    try {
+      await waitForOpen(first);
+
+      const second = new WebSocket(`ws://127.0.0.1:${port}/ws/snapshot?token=s3cret`);
+      await expect(waitForClose(second)).resolves.toEqual({
+        code: 1013,
+        reason: "Too many connections",
+      });
+      expect(MAX_SNAPSHOT_CONNECTIONS).toBeGreaterThan(1);
+    } finally {
+      if (first.readyState === WebSocket.OPEN) first.close();
+      await instance.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("completes graceful shutdown while a real WebSocket client is connected", async () => {
+    process.env.DASHBOARD_TOKEN = "s3cret";
+    const testServer = await openDashboardHttpServer();
+    testServer.buildDashboardMessage.mockResolvedValue({
+      snapshot: { redis_ok: true },
+      stuck_tasks: [],
+      workers: [],
+    });
+    const ws = new WebSocket(`ws://127.0.0.1:${testServer.port}/ws/snapshot?token=s3cret`);
+
+    try {
+      await waitForOpen(ws);
+      const closed = waitForClose(ws);
+
+      // Upgraded sockets stay counted in net.Server._connections, so awaiting
+      // the HTTP server before the WebSocket servers deadlocked shutdown and
+      // the SIGTERM handler force-exited the container on every deploy.
+      await withTimeout(
+        testServer.instance.close(),
+        3000,
+        "close() did not resolve with a WebSocket client connected",
+      );
+
+      await expect(closed).resolves.toMatchObject({ code: 1001 });
+      expect(testServer.redisQuit).toHaveBeenCalledTimes(1);
+    } finally {
+      if (ws.readyState === WebSocket.OPEN) ws.close();
+      fs.rmSync(testServer.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("snapshot send backpressure", () => {
+  it("drops frames for a lagging client and terminates a client that never drains", () => {
+    const logError = vi.fn();
+    const lagging = new FakeSnapshotWebSocket();
+    lagging.bufferedAmount = SNAPSHOT_SKIP_BUFFERED_BYTES + 1;
+    const stalled = new FakeSnapshotWebSocket();
+    stalled.bufferedAmount = SNAPSHOT_TERMINATE_BUFFERED_BYTES + 1;
+    const healthy = new FakeSnapshotWebSocket();
+
+    broadcastSnapshotMessage([lagging, stalled, healthy], "{}", logError);
+
+    // Snapshots are idempotent full-state payloads, so dropping is safe.
+    expect(lagging.sent).toEqual([]);
+    expect(lagging.terminated).toBe(false);
+    expect(stalled.sent).toEqual([]);
+    expect(stalled.terminated).toBe(true);
+    expect(healthy.sent).toEqual(["{}"]);
+    expect(logError).toHaveBeenCalledWith(
+      "Snapshot WS backpressure limit exceeded; terminating client:",
+      SNAPSHOT_TERMINATE_BUFFERED_BYTES + 1,
+    );
+  });
+
+  it("still sends to a client with a small pending send queue", () => {
+    const ws = new FakeSnapshotWebSocket();
+    ws.bufferedAmount = 1024;
+
+    expect(safeSendSnapshot(ws, "{}", vi.fn())).toBe(true);
+    expect(ws.sent).toEqual(["{}"]);
+  });
+});
+
+describe("createCoalescedFetch", () => {
+  it("shares one in-flight run and reuses the result for the cache window", async () => {
+    let resolveFetch!: (value: number) => void;
+    const fetcher = vi.fn(() => new Promise<number>((resolve) => {
+      resolveFetch = resolve;
+    }));
+    let now = 1000;
+    const coalesced = createCoalescedFetch(fetcher, 1000, () => now);
+
+    const first = coalesced();
+    const second = coalesced();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    resolveFetch(7);
+    await expect(first).resolves.toBe(7);
+    await expect(second).resolves.toBe(7);
+
+    now = 1500;
+    await expect(coalesced()).resolves.toBe(7);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    now = 2001;
+    void coalesced();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    resolveFetch(9);
+  });
+
+  it("does not cache failures", async () => {
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new Error("redis down"))
+      .mockResolvedValueOnce("ok");
+    const coalesced = createCoalescedFetch(fetcher, 60_000);
+
+    await expect(coalesced()).rejects.toThrow("redis down");
+    await expect(coalesced()).resolves.toBe("ok");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("REST snapshot coalescing", () => {
+  it("collapses concurrent snapshot and worker reads onto one Redis sweep", async () => {
+    process.env.DASHBOARD_TOKEN = "s3cret";
+    const testServer = await openDashboardHttpServer();
+    const baseUrl = `http://127.0.0.1:${testServer.port}`;
+    const message: DashboardMessage = {
+      snapshot: {
+        redis_ok: true,
+        fetched_at: "2026-06-25T00:00:00Z",
+        queue_depths: {},
+        results_depth: 0,
+        dead_letter_count: 0,
+        locks: [],
+        consumer_groups: [],
+        recent_results: [],
+        attempt_counts: {},
+        dead_letter_entries: [],
+        queued_tasks: [],
+        provider_health: {},
+        worker_pool: [],
+        degraded_sections: [],
+        dashboard_policy: {
+          max_attempts: 3,
+          pending_task_ttl_seconds: 16500,
+          lock_ttl_seconds: 180,
+        },
+      },
+      stuck_tasks: [],
+      workers: [],
+    };
+    testServer.buildDashboardMessage.mockResolvedValue(message);
+
+    try {
+      const responses = await Promise.all([
+        fetch(`${baseUrl}/api/snapshot?token=s3cret`),
+        fetch(`${baseUrl}/api/snapshot?token=s3cret`),
+        fetch(`${baseUrl}/api/snapshot?token=s3cret`),
+      ]);
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual(message);
+      }
+      // Without coalescing each GET queued its own full-keyspace sweep on the
+      // single shared ioredis connection.
+      expect(testServer.buildDashboardMessage).toHaveBeenCalledTimes(1);
+
+      const workerResponses = await Promise.all([
+        fetch(`${baseUrl}/api/workers?token=s3cret`),
+        fetch(`${baseUrl}/api/workers?token=s3cret`),
+      ]);
+      for (const response of workerResponses) {
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ workers: ["worker-1"] });
+      }
+      expect(testServer.discoverWorkers).toHaveBeenCalledTimes(1);
+    } finally {
+      await closeDashboardHttpServer(testServer);
     }
   });
 });

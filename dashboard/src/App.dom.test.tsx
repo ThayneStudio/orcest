@@ -14,6 +14,7 @@ interface MockSnapshotState {
   connected: boolean;
   error: string | null;
   lastUpdate: Date | null;
+  serverFetchedAt: Date | null;
 }
 
 const mockUseSnapshot = vi.hoisted(() => ({
@@ -24,6 +25,7 @@ const mockUseSnapshot = vi.hoisted(() => ({
     connected: false,
     error: null,
     lastUpdate: null,
+    serverFetchedAt: null,
   } as MockSnapshotState,
 }));
 
@@ -93,6 +95,7 @@ function resetSnapshotState(overrides: Partial<MockSnapshotState> = {}) {
     connected: false,
     error: null,
     lastUpdate: null,
+    serverFetchedAt: null,
     ...overrides,
   };
 }

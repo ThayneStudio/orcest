@@ -256,6 +256,87 @@ describe("detectStuck", () => {
     }
   });
 
+  it("prefers the exact task_id match over a same-resource entry on another stream", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-16T00:03:01Z"));
+    try {
+      vi.mocked(scanKeysMany).mockResolvedValue([
+        "bbr-platform:pending:issue:bluebamboollc/bbr-platform:4251",
+      ]);
+      const pipeline = {
+        exists: vi.fn().mockReturnThis(),
+        ttl: vi.fn().mockReturnThis(),
+        get: vi.fn().mockReturnThis(),
+        exec: vi.fn().mockResolvedValue([
+          [null, 0],
+          [null, 5700],
+          [null, JSON.stringify({
+            task_id: "task-4251",
+            created_at: "2026-06-16T00:00:00Z",
+          })],
+        ]),
+      };
+      (redis as unknown as { pipeline: ReturnType<typeof vi.fn> }).pipeline =
+        vi.fn(() => pipeline);
+
+      const stuck = await detectStuck(snapshot({
+        // queued_tasks is accumulated stream by stream, so a stale same-repo
+        // entry on a different provider stream is seen first.
+        queued_tasks: [
+          {
+            entry_id: "1718400000000-0",
+            task_id: "task-stale",
+            task_type: "implement_issue",
+            repo: "bluebamboollc/bbr-platform",
+            resource_type: "issue",
+            resource_id: "4251",
+            created_at: "2026-06-15T00:00:00Z",
+            stream: "orcest:tasks:claude",
+          },
+          {
+            entry_id: "1718496000000-0",
+            task_id: "task-4251",
+            task_type: "implement_issue",
+            repo: "bluebamboollc/bbr-platform",
+            resource_type: "issue",
+            resource_id: "4251",
+            created_at: "2026-06-16T00:00:00Z",
+            stream: "orcest:tasks:grok",
+          },
+        ],
+        consumer_groups: [
+          {
+            stream: "orcest:tasks:claude",
+            name: "workers",
+            consumers: 0,
+            pending: 3,
+            lag: 3,
+          },
+          {
+            stream: "orcest:tasks:grok",
+            name: "workers",
+            consumers: 1,
+            pending: 0,
+            lag: 1,
+          },
+        ],
+      }));
+
+      const alert = stuck.find((task) =>
+        task.resource_id === "4251" && task.reason.startsWith("Queued but no worker")
+      );
+      expect(alert).toMatchObject({
+        stream: "orcest:tasks:grok",
+        entry_id: "1718496000000-0",
+        task_id: "task-4251",
+        severity: "warning",
+      });
+      expect(alert?.no_worker_consumers).toBeFalsy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("suppresses queued pickup warnings covered by no-consumer critical backlog", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-16T00:03:01Z"));
@@ -1119,9 +1200,37 @@ describe("pendingTtlState", () => {
     expect(pendingTtlState(16320, 16500, 180)).toBe("warning");
   });
 
-  it("escalates missing and nearly expired pending markers", () => {
+  it("escalates pending markers with no TTL", () => {
     expect(pendingTtlState(-1, 16500, 180)).toBe("critical");
-    expect(pendingTtlState(1650, 16500, 180)).toBe("critical");
+  });
+
+  it("makes no inference when the observed TTL disagrees with policy", () => {
+    // A legacy marker whose TTL is far below what policy says was configured is
+    // ambiguous (aged marker vs. smaller orchestrator TTL), so the guard has to
+    // run before the ratio checks — otherwise a brand-new marker written under a
+    // smaller real TTL is reported critical immediately.
+    expect(pendingTtlState(1650, 16500, 180)).toBeNull();
+    expect(pendingTtlState(4125, 16500, 180)).toBeNull();
+    expect(pendingTtlState(8249, 16500, 180)).toBeNull();
+  });
+
+  it("keeps severity from oscillating as a legacy pending marker ages", () => {
+    const expectedTtl = 16500;
+    const lockTtl = 180;
+    let previous: string | null | undefined;
+    const transitions: Array<string | null> = [];
+
+    for (let age = 0; age <= expectedTtl; age += 1) {
+      const severity = pendingTtlState(expectedTtl - age, expectedTtl, lockTtl);
+      if (severity !== previous) {
+        transitions.push(severity);
+        previous = severity;
+      }
+    }
+
+    // Before the fix this walked null -> warning -> null -> warning -> critical,
+    // so a real orphan silently went green for roughly an hour mid-life.
+    expect(transitions).toEqual([null, "warning", null]);
   });
 });
 

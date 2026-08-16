@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import type { IncomingMessage } from "http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
@@ -9,8 +10,37 @@ import {
 
 const originalDashboardRedisPrefixes = process.env.DASHBOARD_REDIS_PREFIXES;
 
+/**
+ * A socket whose `emit` has real EventEmitter semantics: emitting "error" with
+ * no registered listener throws, exactly like ws does for protocol-level frame
+ * errors (`receiverOnError` calls `websocket.emit("error", err)`).
+ */
+class EmitterWebSocket extends EventEmitter {
+  readyState: WebSocket["readyState"] = WebSocket.OPEN;
+  bufferedAmount = 0;
+  closes: Array<{ code?: number; reason?: string }> = [];
+
+  send(): void {}
+
+  close(code?: number, reason?: string): void {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.closes.push({ code, reason });
+    this.emit("close", code, reason);
+  }
+
+  terminate(): void {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.emit("close");
+  }
+
+  ping(): void {}
+}
+
 class FakeWebSocket {
   readyState: WebSocket["readyState"] = WebSocket.OPEN;
+  bufferedAmount = 0;
   sent: string[] = [];
   closes: Array<{ code?: number; reason?: string }> = [];
   pings = 0;
@@ -583,5 +613,111 @@ describe("handleTaskOutputConnection", () => {
     expect(ws.sent).toEqual([]);
     expect(logError).toHaveBeenCalledTimes(1);
     expect(logError).toHaveBeenCalledWith("Error sending task output:", expect.any(Error));
+  });
+
+  it("survives a protocol error on every early-reject path", () => {
+    // ws emits "error" for malformed frames, and an EventEmitter "error" with no
+    // listener throws — which took the whole dashboard process down, because the
+    // error listener used to be attached only after these early returns.
+    process.env.DASHBOARD_REDIS_PREFIXES = "orcest";
+    const rejects: Array<{ name: string; url: string; options: Record<string, unknown> }> = [
+      { name: "missing worker_id", url: "/ws/task-output", options: {} },
+      {
+        name: "over connection limit",
+        url: "/ws/task-output?worker_id=worker-1",
+        options: { activeConnections: 21, maxConnections: 20 },
+      },
+      {
+        name: "disallowed redis_prefix",
+        url: "/ws/task-output?worker_id=worker-1&redis_prefix=other",
+        options: {},
+      },
+    ];
+
+    for (const reject of rejects) {
+      const ws = new EmitterWebSocket();
+      const logError = vi.fn();
+      const findTaskStart = vi.fn();
+
+      handleTaskOutputConnection(ws as unknown as WebSocket, req(reject.url), {
+        ...reject.options,
+        deps: { findTaskStart, readTaskOutputFromStream: vi.fn(), logError },
+      });
+
+      expect(findTaskStart, reject.name).not.toHaveBeenCalled();
+      expect(ws.closes, reject.name).toHaveLength(1);
+      expect(
+        () => ws.emit("error", new Error("Invalid WebSocket frame: RSV1 must be clear")),
+        reject.name,
+      ).not.toThrow();
+      expect(logError, reject.name).toHaveBeenCalledWith(
+        "Task output WS error:",
+        expect.any(Error),
+      );
+    }
+  });
+
+  it("terminates a client whose send queue outgrows the backpressure limit", async () => {
+    const ws = new FakeWebSocket();
+    ws.bufferedAmount = 5 * 1024 * 1024;
+    const logError = vi.fn();
+
+    const handle = handleTaskOutputConnection(
+      ws as unknown as WebSocket,
+      req("/ws/task-output?worker_id=worker-1&task_id=task-1"),
+      {
+        pollIntervalMs: 10,
+        pingIntervalMs: 60000,
+        maxBufferedBytes: 4 * 1024 * 1024,
+        deps: {
+          findTaskStart: vi.fn().mockResolvedValue({ stream: "output:worker-1", entryId: "1-0" }),
+          readTaskOutputFromStream: vi.fn().mockResolvedValue({
+            entries: [{ id: "2-0", line: "line for a client that stopped reading" }],
+            lastId: "2-0",
+            done: false,
+          }),
+          logError,
+        },
+      },
+    );
+    await flushPromises();
+    await handle.done;
+
+    expect(ws.sent).toEqual([]);
+    expect(ws.terminated).toBe(true);
+    expect(logError).toHaveBeenCalledWith(
+      "Task output WS backpressure limit exceeded; terminating client:",
+      5 * 1024 * 1024,
+    );
+  });
+
+  it("keeps sending while the send queue stays under the backpressure limit", async () => {
+    const ws = new FakeWebSocket();
+    ws.bufferedAmount = 1024;
+
+    const handle = handleTaskOutputConnection(
+      ws as unknown as WebSocket,
+      req("/ws/task-output?worker_id=worker-1&task_id=task-1"),
+      {
+        pollIntervalMs: 10,
+        pingIntervalMs: 60000,
+        maxBufferedBytes: 4 * 1024 * 1024,
+        deps: {
+          findTaskStart: vi.fn().mockResolvedValue({ stream: "output:worker-1", entryId: "1-0" }),
+          readTaskOutputFromStream: vi.fn().mockResolvedValue({
+            entries: [{ id: "2-0", line: "line" }],
+            lastId: "2-0",
+            done: true,
+          }),
+          logError: vi.fn(),
+        },
+      },
+    );
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(10);
+    await handle.done;
+
+    expect(ws.terminated).toBe(false);
+    expect(ws.messages()).toEqual([{ lines: ["line"], last_id: "2-0", done: true }]);
   });
 });

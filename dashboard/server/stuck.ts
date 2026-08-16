@@ -414,13 +414,20 @@ function queuedTaskContext(
   },
 ): StuckTaskContext | null {
   const taskId = comparable(resource.taskId);
-  const queued = snapshot.queued_tasks.find((task) => {
-    if (!resourcePrefixesCompatible(resource.prefix, task.prefix ?? null)) return false;
-    if (taskId && comparable(task.task_id) === taskId) return true;
-    return comparable(task.resource_type) === comparable(resource.resourceType) &&
+  const candidates = snapshot.queued_tasks.filter((task) =>
+    resourcePrefixesCompatible(resource.prefix, task.prefix ?? null)
+  );
+  // queued_tasks is accumulated stream by stream, so with provider-isolated
+  // streams a stale same-repo entry on one stream would otherwise win over the
+  // exact task_id match on another. Match on task_id first, always.
+  const queued = (taskId
+    ? candidates.find((task) => comparable(task.task_id) === taskId)
+    : undefined) ??
+    candidates.find((task) =>
+      comparable(task.resource_type) === comparable(resource.resourceType) &&
       comparable(task.repo) === comparable(resource.repo) &&
-      comparable(task.resource_id) === comparable(resource.resourceId);
-  });
+      comparable(task.resource_id) === comparable(resource.resourceId)
+    );
   if (!queued) return null;
 
   const workerGroup = snapshot.consumer_groups.find((group) =>
@@ -696,14 +703,20 @@ export function pendingTtlState(
   }
 
   if (expectedTtlSeconds <= 0) return null;
-  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.1)) return "critical";
-  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.25)) return "warning";
 
   // Legacy pending markers have no created_at. In that case, inferring age from
   // expected TTL is only trustworthy when the observed TTL is close to the
   // configured initial TTL. If the dashboard expects a much larger TTL than the
   // orchestrator actually set, an otherwise fresh marker would look old.
+  // This guard has to run before every TTL-derived inference below: when it sat
+  // between the ratio checks and the elapsed check it only applied inside the
+  // (25%, 50%) band, which made severity non-monotonic in age (a marker went
+  // warning -> null -> warning -> critical as it aged) and still let a fresh
+  // marker be flagged critical whenever the policy TTL disagreed with reality.
   if (ttlSeconds < Math.ceil(expectedTtlSeconds * 0.5)) return null;
+
+  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.1)) return "critical";
+  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.25)) return "warning";
 
   const elapsedSeconds = Math.max(0, expectedTtlSeconds - ttlSeconds);
   if (elapsedSeconds >= warningAfterSeconds) return "warning";

@@ -23,6 +23,7 @@ import {
   taskOutputReadFailureMessage,
   taskOutputUnavailableMessage,
   taskOutputPrefixLookupKey,
+  TASK_OUTPUT_PREFIX_NEGATIVE_CACHE_TTL,
   TaskOutputPartialReadError,
   WorkerDiscoveryPartialError,
   workerIdFromOutputStream,
@@ -583,6 +584,68 @@ describe("readTaskOutput", () => {
     expect(redis.xrevrange).toHaveBeenCalledTimes(1);
     expect(result.prefixes.get(taskOutputPrefixLookupKey("worker-1", "task-a"))).toBe("orcest");
     expect(result.prefixes.get(taskOutputPrefixLookupKey("worker-1", "task-b"))).toBe("orcest");
+  });
+
+  it("negatively caches unresolved batch lookups instead of rescanning every poll", async () => {
+    vi.mocked(scanKeysMany).mockResolvedValue(["orcest:output:worker-1"]);
+    // The task's entries were trimmed out of the stream, so the scan walks the
+    // whole stream and finds nothing.
+    (redis as unknown as { xrevrange?: ReturnType<typeof vi.fn> }).xrevrange = vi.fn()
+      .mockResolvedValueOnce([
+        ["50-0", ["task_id", "other-task", "line", "unrelated output"]],
+      ])
+      .mockResolvedValue([]);
+
+    const first = await findTaskOutputPrefixes([
+      { workerId: "worker-1", taskId: "task-gone" },
+    ]);
+    const xrevrangeCallsAfterFirst = vi.mocked(redis.xrevrange).mock.calls.length;
+    const second = await findTaskOutputPrefixes([
+      { workerId: "worker-1", taskId: "task-gone" },
+    ]);
+
+    expect(first.degraded).toBe(false);
+    expect(second.degraded).toBe(false);
+    expect(first.prefixes.get(taskOutputPrefixLookupKey("worker-1", "task-gone")))
+      .toBeUndefined();
+    expect(second.prefixes.get(taskOutputPrefixLookupKey("worker-1", "task-gone")))
+      .toBeUndefined();
+    // The whole point: the second poll must not repeat the stream walk.
+    expect(vi.mocked(redis.xrevrange).mock.calls).toHaveLength(xrevrangeCallsAfterFirst);
+    expect(scanKeysMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries an unresolved batch lookup once the negative cache entry expires", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(scanKeysMany).mockResolvedValue(["orcest:output:worker-1"]);
+      (redis as unknown as { xrevrange?: ReturnType<typeof vi.fn> }).xrevrange = vi.fn()
+        .mockResolvedValue([]);
+
+      await findTaskOutputPrefixes([{ workerId: "worker-1", taskId: "task-gone" }]);
+      vi.advanceTimersByTime(TASK_OUTPUT_PREFIX_NEGATIVE_CACHE_TTL + 1);
+      await findTaskOutputPrefixes([{ workerId: "worker-1", taskId: "task-gone" }]);
+
+      expect(scanKeysMany).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("negatively caches lookups for workers with no output stream at all", async () => {
+    vi.mocked(scanKeysMany).mockResolvedValue(["orcest:output:worker-other"]);
+    (redis as unknown as { xrevrange?: ReturnType<typeof vi.fn> }).xrevrange = vi.fn()
+      .mockResolvedValue([]);
+
+    await findTaskOutputPrefixes([{ workerId: "worker-1", taskId: "task-1" }]);
+    const second = await findTaskOutputPrefixes([
+      { workerId: "worker-1", taskId: "task-1" },
+    ]);
+
+    expect(second.prefixes.get(taskOutputPrefixLookupKey("worker-1", "task-1")))
+      .toBeUndefined();
+    expect(scanKeysMany).toHaveBeenCalledTimes(1);
+    expect(redis.xrevrange).not.toHaveBeenCalled();
   });
 
   it("finds exact task starts across duplicate worker output streams", async () => {

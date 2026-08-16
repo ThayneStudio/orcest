@@ -1,10 +1,17 @@
 import { useEffect, useState } from "react";
-import { snapshotConnectionStatus, snapshotDisplayTime } from "../lib/connection";
+import {
+  snapshotConnectionStatus,
+  snapshotDisplayTime,
+  snapshotServerTimeLabel,
+} from "../lib/connection";
 
 interface Props {
   connected: boolean;
   error?: string | null;
+  /** Browser clock at snapshot receipt. Freshness is measured against this only. */
   lastUpdate: Date | null;
+  /** Server-stamped `snapshot.fetched_at`, surfaced in the tooltip for diagnosis. */
+  serverFetchedAt?: Date | null;
 }
 
 function dotClass(kind: string): string {
@@ -35,7 +42,7 @@ function detailClass(kind: string): string {
   return kind === "stale" ? "text-yellow-300" : "text-red-300";
 }
 
-export function ConnectionStatus({ connected, error, lastUpdate }: Props) {
+export function ConnectionStatus({ connected, error, lastUpdate, serverFetchedAt }: Props) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -47,6 +54,7 @@ export function ConnectionStatus({ connected, error, lastUpdate }: Props) {
 
   const status = snapshotConnectionStatus(connected, error, lastUpdate, nowMs);
   const displayTime = snapshotDisplayTime(lastUpdate);
+  const serverTimeLabel = snapshotServerTimeLabel(serverFetchedAt);
   const announcementDetail = status.announcement.startsWith(`${status.label}: `)
     ? status.announcement.slice(status.label.length + 2)
     : "";
@@ -75,7 +83,7 @@ export function ConnectionStatus({ connected, error, lastUpdate }: Props) {
         </span>
       )}
       {displayTime && (
-        <span className="shrink-0 text-zinc-500">
+        <span className="shrink-0 text-zinc-500" title={serverTimeLabel ?? undefined}>
           {displayTime}
         </span>
       )}

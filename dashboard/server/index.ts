@@ -33,9 +33,23 @@ const SHUTDOWN_TIMEOUT_MS = 5000;
 const WEBSOCKET_CLOSE_GRACE_MS = 1000;
 const CLEAN_REVISION_RE = /^[0-9a-f]{7,64}$/;
 const BUILD_REVISION_PATH = "/app/.orcest-revision";
+// Neither WebSocket server reads client messages, but ws buffers a whole frame
+// before emitting it, so the 100 MiB library default is pure memory exposure.
+export const WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1024;
+export const MAX_SNAPSHOT_CONNECTIONS = 50;
+// Snapshot payloads are idempotent full-state dumps: a client that stops
+// reading gets frames dropped rather than growing the sender queue forever.
+export const SNAPSHOT_SKIP_BUFFERED_BYTES = 1024 * 1024;
+export const SNAPSHOT_TERMINATE_BUFFERED_BYTES = 8 * 1024 * 1024;
+// REST snapshot/worker reads coalesce onto one Redis sweep and reuse it briefly
+// so N concurrent GETs cannot queue N full-keyspace sweeps on one connection.
+const REST_CACHE_TTL_MS = 1000;
 
 type LogFn = (...args: unknown[]) => void;
-type SnapshotSendSocket = Pick<WebSocket, "readyState" | "send" | "terminate">;
+type SnapshotSendSocket = Pick<
+  WebSocket,
+  "readyState" | "send" | "terminate" | "bufferedAmount"
+>;
 
 type DashboardServerDeps = {
   healthCheck: typeof healthCheck;
@@ -53,6 +67,8 @@ export interface DashboardServerOptions {
   pingIntervalMs?: number;
   snapshotRefreshIntervalMs?: number;
   shutdownTimeoutMs?: number;
+  maxSnapshotConnections?: number;
+  restCacheTtlMs?: number;
   taskOutputOptions?: TaskOutputSocketOptions;
   deps?: Partial<DashboardServerDeps>;
 }
@@ -134,6 +150,16 @@ export function safeSendSnapshot(
   logError: LogFn,
 ): boolean {
   if (ws.readyState !== WebSocket.OPEN) return false;
+  // readyState stays OPEN while a client completes the handshake and then stops
+  // reading, and ping/pong keeps passing while the kernel still ACKs, so
+  // bufferedAmount is the only signal that the sender queue is growing.
+  const buffered = ws.bufferedAmount;
+  if (buffered > SNAPSHOT_TERMINATE_BUFFERED_BYTES) {
+    logError("Snapshot WS backpressure limit exceeded; terminating client:", buffered);
+    ws.terminate();
+    return false;
+  }
+  if (buffered > SNAPSHOT_SKIP_BUFFERED_BYTES) return false;
   try {
     ws.send(msg);
     return true;
@@ -152,6 +178,37 @@ export function broadcastSnapshotMessage(
   for (const client of clients) {
     safeSendSnapshot(client, msg, logError);
   }
+}
+
+/**
+ * Wrap an expensive fetch so concurrent callers share one in-flight run and a
+ * result is reused for `ttlMs`. Failures are shared too, but never cached.
+ */
+export function createCoalescedFetch<T>(
+  fetcher: () => Promise<T>,
+  ttlMs: number,
+  now: () => number = Date.now,
+): () => Promise<T> {
+  let inFlight: Promise<T> | null = null;
+  let cached: { value: T; at: number } | null = null;
+
+  return () => {
+    if (cached && now() - cached.at < ttlMs) return Promise.resolve(cached.value);
+    if (inFlight) return inFlight;
+
+    let promise!: Promise<T>;
+    promise = (async () => {
+      try {
+        const value = await fetcher();
+        cached = { value, at: now() };
+        return value;
+      } finally {
+        if (inFlight === promise) inFlight = null;
+      }
+    })();
+    inFlight = promise;
+    return promise;
+  };
 }
 
 export function dashboardTaskOutputConnectionOptions(
@@ -215,7 +272,15 @@ export function createDashboardServer(
   const snapshotRefreshIntervalMs =
     options.snapshotRefreshIntervalMs ?? SNAPSHOT_REFRESH_INTERVAL;
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS;
+  const maxSnapshotConnections =
+    options.maxSnapshotConnections ?? MAX_SNAPSHOT_CONNECTIONS;
+  const restCacheTtlMs = options.restCacheTtlMs ?? REST_CACHE_TTL_MS;
   const deps = dashboardServerDeps(options.deps);
+  const restSnapshot = createCoalescedFetch(
+    () => deps.buildDashboardMessage(),
+    restCacheTtlMs,
+  );
+  const restWorkers = createCoalescedFetch(() => deps.discoverWorkers(), restCacheTtlMs);
   const revision = dashboardBuildRevision();
   const app = express();
   const server = createServer(app);
@@ -294,7 +359,7 @@ export function createDashboardServer(
 
   app.get("/api/workers", async (_req, res) => {
     try {
-      const workers = await deps.discoverWorkers();
+      const workers = await restWorkers();
       res.json({ workers });
     } catch (err) {
       deps.logError("Error discovering workers:", err);
@@ -312,7 +377,7 @@ export function createDashboardServer(
 
   app.get("/api/snapshot", async (_req, res) => {
     try {
-      res.json(await deps.buildDashboardMessage());
+      res.json(await restSnapshot());
     } catch (err) {
       deps.logError("Error building dashboard snapshot:", err);
       res.status(503).json({ error: "Snapshot unavailable" });
@@ -355,8 +420,14 @@ export function createDashboardServer(
   // --- WebSocket ---
   // Use noServer mode and handle upgrades manually to avoid conflicts with Express
 
-  const snapshotWss = new WebSocketServer({ noServer: true });
-  const taskOutputWss = new WebSocketServer({ noServer: true });
+  const snapshotWss = new WebSocketServer({
+    noServer: true,
+    maxPayload: WEBSOCKET_MAX_PAYLOAD_BYTES,
+  });
+  const taskOutputWss = new WebSocketServer({
+    noServer: true,
+    maxPayload: WEBSOCKET_MAX_PAYLOAD_BYTES,
+  });
 
   server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     if (closing) {
@@ -445,8 +516,20 @@ export function createDashboardServer(
   }, snapshotRefreshIntervalMs);
 
   snapshotWss.on("connection", (ws) => {
+    // Must be the very first statement: ws emits 'error' for any protocol-level
+    // frame error, and an EventEmitter 'error' with no listener throws, so a
+    // single malformed frame on a connection that hits an early return below
+    // would otherwise take down the process.
+    ws.on("error", (err) => {
+      deps.logError("Snapshot WS error:", err);
+    });
+
     if (closing) {
       ws.close(1001, "Server shutting down");
+      return;
+    }
+    if (snapshotWss.clients.size > maxSnapshotConnections) {
+      ws.close(1013, "Too many connections");
       return;
     }
 
@@ -479,10 +562,8 @@ export function createDashboardServer(
       awaitingPong = false;
     });
     ws.on("close", () => clearInterval(pingTimer));
-    ws.on("error", (err) => {
-      deps.logError("Snapshot WS error:", err);
-      clearInterval(pingTimer);
-    });
+    // Errors are logged by the listener attached at the top of this handler.
+    ws.on("error", () => clearInterval(pingTimer));
   });
 
   // --- Task Output WebSocket ---
@@ -502,6 +583,11 @@ export function createDashboardServer(
   }
 
   taskOutputWss.on("connection", (ws, req) => {
+    // Must be the very first statement — see the snapshot handler above.
+    // handleTaskOutputConnection attaches its own logging listener, but it is
+    // not reached on the `closing` early return below.
+    ws.on("error", () => {});
+
     if (closing) {
       ws.close(1001, "Server shutting down");
       return;
@@ -529,12 +615,17 @@ export function createDashboardServer(
     if (!transportClosePromise) {
       transportClosePromise = (async () => {
         clearInterval(snapshotInterval);
-        await closeHttpServer(server);
-        await waitForHttpRequests();
+        // The WebSocket servers must be closed concurrently with (not after)
+        // the HTTP server: upgraded sockets stay counted in the net.Server
+        // connection table, so server.close() never fires its callback while a
+        // client is connected. Awaiting the HTTP server first deadlocks the two
+        // steps against each other whenever a dashboard tab is open.
         await Promise.all([
+          closeHttpServer(server),
           closeWebSocketServer(snapshotWss),
           closeWebSocketServer(taskOutputWss),
         ]);
+        await waitForHttpRequests();
         await waitForSnapshotRefresh();
         await waitForTaskOutputConnections();
       })().catch((err) => {

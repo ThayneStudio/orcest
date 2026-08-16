@@ -3,15 +3,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const redisMock = vi.hoisted(() => {
   const quit = vi.fn();
   const ping = vi.fn();
+  const scan = vi.fn();
   const Redis = vi.fn(function RedisMock() {
-    return { ping, quit };
+    return { ping, quit, scan };
   });
-  return { Redis, ping, quit };
+  return { Redis, ping, quit, scan };
 });
 
 const redisCtor = redisMock.Redis;
 const quit = redisMock.quit;
 const ping = redisMock.ping;
+const scan = redisMock.scan;
 const originalDashboardRedisPrefixes = process.env.DASHBOARD_REDIS_PREFIXES;
 const originalRedisPort = process.env.REDIS_PORT;
 
@@ -24,10 +26,12 @@ async function importRedisModule(): Promise<typeof import("./redis.js")> {
   redisCtor.mockReset();
   quit.mockReset();
   ping.mockReset();
+  scan.mockReset();
   redisCtor.mockImplementation(function RedisMock() {
     return {
       ping,
       quit,
+      scan,
     };
   });
   return import("./redis.js");
@@ -169,5 +173,53 @@ describe("dashboard Redis key patterns", () => {
       "project\\[1\\]:results",
       "literal\\*:results",
     ]);
+  });
+});
+
+describe("key scanning", () => {
+  it("iterates the keyspace with a large SCAN COUNT", async () => {
+    const { scanKeys, SCAN_COUNT } = await importRedisModule();
+    scan
+      .mockResolvedValueOnce(["17", ["orcest:tasks:claude"]])
+      .mockResolvedValueOnce(["0", ["orcest:tasks:grok"]]);
+
+    await expect(scanKeys("orcest:tasks:*")).resolves.toEqual([
+      "orcest:tasks:claude",
+      "orcest:tasks:grok",
+    ]);
+    // COUNT 100 turned each of the 20+ per-poll patterns into hundreds of
+    // sequential round-trips against a 2s refresh interval.
+    expect(SCAN_COUNT).toBeGreaterThanOrEqual(1000);
+    expect(scan).toHaveBeenNthCalledWith(1, "0", "MATCH", "orcest:tasks:*", "COUNT", SCAN_COUNT);
+    expect(scan).toHaveBeenNthCalledWith(2, "17", "MATCH", "orcest:tasks:*", "COUNT", SCAN_COUNT);
+  });
+
+  it("scans multiple patterns concurrently and de-duplicates them", async () => {
+    const { scanKeysMany } = await importRedisModule();
+    const release: Array<() => void> = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    scan.mockImplementation(async (_cursor: string, _match: string, pattern: string) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise<void>((resolve) => release.push(resolve));
+      inFlight--;
+      return ["0", [`key-for-${pattern}`]];
+    });
+
+    const scanned = scanKeysMany(["b:*", "a:*", "c:*", "a:*"]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // One sequential keyspace walk per pattern cannot keep up with the refresh.
+    expect(scan).toHaveBeenCalledTimes(3);
+    for (const resolve of release.splice(0)) resolve();
+
+    await expect(scanned).resolves.toEqual([
+      "key-for-a:*",
+      "key-for-b:*",
+      "key-for-c:*",
+    ]);
+    expect(maxInFlight).toBe(3);
   });
 });

@@ -15,16 +15,37 @@ export interface SnapshotConnectionStatus {
   announcement: string;
 }
 
-export function snapshotUpdateDate(
-  fetchedAt: string | null | undefined,
-  receivedAt = new Date(),
-): Date {
+/**
+ * Parse the SERVER-generated `snapshot.fetched_at` into a Date, for DISPLAY ONLY.
+ *
+ * Never feed this into staleness math. `fetched_at` is stamped by the dashboard
+ * server process (`new Date().toISOString()`), while every freshness comparison
+ * here runs against `Date.now()` in the browser, and the two clocks are never
+ * reconciled. If the server clock runs ahead, snapshots arrive "in the future",
+ * the `Math.max(0, …)` clamp in `snapshotAgeSeconds` pins the age at 0, and a
+ * hung feed on a still-open socket would read "Connected" forever; if it runs
+ * behind, a perfectly healthy feed reads "Stale snapshot" permanently. Staleness
+ * is measured from the receipt timestamp the client stamps in `ws.onmessage`,
+ * which is self-consistent and skew-immune.
+ */
+export function snapshotFetchedDate(fetchedAt: string | null | undefined): Date | null {
   if (typeof fetchedAt !== "string" || fetchedAt.trim() === "") {
-    return receivedAt;
+    return null;
   }
 
   const parsed = new Date(fetchedAt);
-  return Number.isFinite(parsed.getTime()) ? parsed : receivedAt;
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+/** Tooltip text disclosing the server-side snapshot time next to the local receipt time. */
+export function snapshotServerTimeLabel(
+  serverFetchedAt: Date | null | undefined,
+): string | null {
+  if (!serverFetchedAt || !Number.isFinite(serverFetchedAt.getTime())) return null;
+  return (
+    `Snapshot generated ${serverFetchedAt.toISOString()} (server clock). ` +
+    "Age is measured from browser receipt time."
+  );
 }
 
 export function snapshotAgeSeconds(lastUpdate: Date | null, nowMs = Date.now()): number | null {
