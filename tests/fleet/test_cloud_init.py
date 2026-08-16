@@ -636,6 +636,18 @@ def test_requirements_lock_and_dockerfiles_are_reproducible():
         assert "tomllib.load" not in text, (
             f"{df} still resolves unpinned deps from pyproject.toml — non-reproducible"
         )
+        assert "ARG ORCEST_UID=1000" in text
+        assert "ARG ORCEST_GID=1000" in text
+        assert 'groupadd --gid "${ORCEST_GID}" orcest' in text
+        assert 'useradd --uid "${ORCEST_UID}" --gid "${ORCEST_GID}"' in text
+
+    for compose in (
+        root / "docker-compose.yml",
+        root / "src" / "orcest" / "fleet" / "deploy" / "docker-compose.yml",
+    ):
+        text = compose.read_text()
+        assert "ORCEST_UID: ${ORCEST_UID:-1000}" in text
+        assert "ORCEST_GID: ${ORCEST_GID:-1000}" in text
 
 
 # ── C1: Redis AUTH password injected into worker .env (from fix/redis-security) ──

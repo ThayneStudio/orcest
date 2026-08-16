@@ -140,9 +140,18 @@ def build_image(ssh_target: str) -> None:
         ssh_target,
         "cd /opt/orcest && "
         "revision=$(cat .orcest-revision) && "
+        "orcest_uid=$(id -u orcest) && orcest_gid=$(id -g orcest) && "
         "printf '%s\\n' \"$revision\" | grep -Eq '^[0-9a-f]{7,64}$' || "
         "{ echo 'Build requires an exact clean .orcest-revision' >&2; exit 2; }; "
-        'ORCEST_BUILD_REVISION="$revision" docker compose build --no-cache',
+        "printf '%s:%s\\n' \"$orcest_uid\" \"$orcest_gid\" | "
+        "grep -Eq '^[1-9][0-9]*:[1-9][0-9]*$' || "
+        "{ echo 'Host orcest UID/GID must be positive integers' >&2; exit 2; }; "
+        'ORCEST_BUILD_REVISION="$revision" ORCEST_UID="$orcest_uid" '
+        'ORCEST_GID="$orcest_gid" docker compose build --no-cache && '
+        'test "$(docker run --rm --entrypoint id orcest:latest -u orcest)" '
+        '= "$orcest_uid" && '
+        'test "$(docker run --rm --entrypoint id orcest:latest -g orcest)" '
+        '= "$orcest_gid"',
     )
     if result.returncode != 0:
         logger.error("Image build failed: %s", result.stderr.strip())
@@ -477,9 +486,13 @@ def upload_fleet_config(
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
 
+        # The deployed image is built with the host ``orcest`` UID/GID and the
+        # bind-mounted config is consumed by that unprivileged user. Keep it
+        # private to the service identity (and root), matching the SSH-key
+        # mount used by the same container.
         result = _ssh(
             ssh_target,
-            f"sudo install -m 600 -o root -g root {shlex.quote(remote_tmp)} "
+            f"sudo install -m 600 -o orcest -g orcest {shlex.quote(remote_tmp)} "
             f"{shlex.quote(remote_dest)}",
         )
         if result.returncode != 0:
@@ -615,10 +628,20 @@ def ensure_pool_manager(
     result = _ssh(
         ssh_target,
         f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
-        f" --env-file {REDIS_ENV_PATH}"
-        " -f docker-compose.pool.yml"
-        " -p orcest-pool"
-        " up -d",
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        " run --rm --no-deps --entrypoint sh pool-manager"
+        " -c 'test -r /home/orcest/app/config/fleet.yaml &&"
+        " test -r /home/orcest/.ssh && test -x /home/orcest/.ssh &&"
+        " test -f /home/orcest/.ssh/id_ed25519 &&"
+        " test -r /home/orcest/.ssh/id_ed25519' &&"
+        f" FLEET_CONFIG={quoted_path} docker compose"
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        " up -d --force-recreate pool-manager && sleep 2 &&"
+        f" cid=$(FLEET_CONFIG={quoted_path} docker compose"
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        " ps -q pool-manager) && test -n \"$cid\" &&"
+        " test \"$(docker inspect -f '{{.State.Running}}' \"$cid\")\" = true &&"
+        " test \"$(docker inspect -f '{{.RestartCount}}' \"$cid\")\" = 0",
     )
     if result.returncode != 0:
         logger.error("Pool manager failed: %s", result.stderr.strip())
