@@ -1413,6 +1413,15 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                     "Worker lost the Redis lock before publishing; dropping task result.",
                     result.duration_seconds,
                     rate_limit_resets_at=result.rate_limit_resets_at,
+                    # The task outcome is dropped, but an OAuth rotation that
+                    # already happened is real and irreversible: for Path B
+                    # providers the CLI has consumed the old refresh token
+                    # server-side. Losing the new blob here strands the account
+                    # on a dead credential until an operator re-authenticates,
+                    # so carry it through -- the orchestrator applies credential
+                    # updates regardless of task staleness.
+                    credential_update=result.credential_update,
+                    credential_update_minted_at=result.credential_update_minted_at,
                 )
             else:
                 logger.info(f"Released lock {lock.key}")

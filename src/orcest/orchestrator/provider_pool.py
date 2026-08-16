@@ -61,7 +61,7 @@ class ProviderPool:
         # Validate uniqueness by stable identity (never by raw credential)
         seen: dict[str, ProviderEntry] = {}
         for e in entries:
-            if not _provider_credential_is_usable(e.provider, e.credential):
+            if not provider_credential_is_usable(e.provider, e.credential):
                 logger.warning(
                     "Ignoring unusable configured credential for provider %s",
                     e.provider,
@@ -393,7 +393,7 @@ class ProviderPool:
             separator
             and provider
             and credential_hash
-            and _provider_credential_is_usable(provider, blob)
+            and provider_credential_is_usable(provider, blob)
         )
 
     def _apply_credential_update_for_account_locked(
@@ -402,7 +402,7 @@ class ProviderPool:
         provider, _sep, credential_hash = account.partition(":")
         if not provider or not credential_hash:
             return None
-        if not _provider_credential_is_usable(provider, blob):
+        if not provider_credential_is_usable(provider, blob):
             logger.warning(
                 "Ignoring unusable credential update for provider %s%s",
                 provider,
@@ -434,7 +434,7 @@ class ProviderPool:
             return
         with self._lock:
             provider, _separator, _credential_hash = account.partition(":")
-            if not _provider_credential_is_usable(provider, blob):
+            if not provider_credential_is_usable(provider, blob):
                 logger.warning(
                     "Ignoring unusable persisted credential override for provider %s",
                     provider,
@@ -471,7 +471,7 @@ class ProviderPool:
             )
 
 
-def _provider_credential_is_usable(provider: str, blob: str) -> bool:
+def provider_credential_is_usable(provider: str, blob: str) -> bool:
     """Reject OAuth JSON blobs that no longer contain a refresh token."""
     if provider not in {"grok", "codex"}:
         return True

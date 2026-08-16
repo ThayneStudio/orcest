@@ -1457,6 +1457,40 @@ class TestRunWorker:
         assert result.status is ResultStatus.STALE
         assert "lost the Redis lock" in result.summary
 
+    def test_stale_result_preserves_rotated_credential(self, mocker, worker_config, sample_task):
+        """Losing the lock drops the task outcome, never a completed OAuth rotation.
+
+        Regression: the STALE replacement result carried `rate_limit_resets_at`
+        forward but not `credential_update`. For Path B providers the CLI has
+        already consumed the old refresh token server-side by this point, so
+        dropping the new blob strands the provider account on a dead credential
+        until an operator re-authenticates by hand.
+        """
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        rotated = '{"access_token":"new","refresh_token":"new-refresh"}'
+        runner_result = _success_runner_result()
+        runner_result.credential_update = rotated
+        runner_result.credential_update_minted_at = 1_700_000_000_000_000.0
+        mocks["runner"].run.return_value = runner_result
+        # Force the unconfirmed-release path that rewrites the result as STALE.
+        mock_redis.client.register_script.return_value.return_value = 0
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        # Inspect the result handed to publication: a credential-bearing result
+        # goes through the private handoff path, whose Lua is not emulated here.
+        handoff = mocker.patch("orcest.worker.loop._handoff_result_until_terminal")
+        handoff.return_value.terminal = True
+        handoff.return_value.publish_outcome = ResultPublishOutcome.PUBLISHED
+
+        run_worker(worker_config)
+
+        published = handoff.call_args.args[1]
+        assert published.status is ResultStatus.STALE
+        assert "lost the Redis lock" in published.summary
+        assert published.credential_update == rotated
+        assert published.credential_update_minted_at == 1_700_000_000_000_000.0
+
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
         task is ACKed only after a transient result is durable.
