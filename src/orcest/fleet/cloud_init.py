@@ -229,7 +229,7 @@ def _worker_tooling_runcmd() -> list[str]:
             f'echo "{grok_sha}  /tmp/grok" | sha256sum -c -; then '
             "install -m 0755 -o root -g root /tmp/grok /usr/local/bin/grok; "
             'else rm -f /usr/local/bin/grok; echo "grok binary SHA-256 unset/mismatch '
-            f'— SKIPPING grok install (set ORCEST_GROK_BINARY_SHA256 to enable); '
+            f"— SKIPPING grok install (set ORCEST_GROK_BINARY_SHA256 to enable); "
             'grok tasks will be rejected"; fi'
         ),
         "rm -f /tmp/grok",
