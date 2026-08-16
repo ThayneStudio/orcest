@@ -126,10 +126,17 @@ class PoolManager:
         try:
             self._check_done_workers()
             self._detect_active_workers()
-            ambiguity_clear = self._reconcile_ambiguous_clones()
-            provisioning_clear = self._retry_provisioning_cleanups()
-            if ambiguity_clear and provisioning_clear:
-                self._fill_pool()
+            # Both reconcilers report the VMIDs they could not resolve rather
+            # than a global "all clear" flag. A single unresolved VMID must
+            # only cost its own slot: gating the whole refill on it drains the
+            # fleet to zero while _check_done_workers keeps retiring finished
+            # workers. ``None`` means the state itself is unknown (Redis or
+            # Proxmox read failure), which is the only case that still
+            # suppresses cloning entirely.
+            ambiguous_blocked = self._reconcile_ambiguous_clones()
+            provisioning_blocked = self._retry_provisioning_cleanups()
+            if ambiguous_blocked is not None and provisioning_blocked is not None:
+                self._fill_pool(blocked_vmids=ambiguous_blocked | provisioning_blocked)
             self._health_check()
             self._reconcile_stale_redis()
             self._sweep_orphan_pel()
@@ -232,10 +239,18 @@ class PoolManager:
                     exc_info=True,
                 )
 
-    def _fill_pool(self) -> None:
-        """Adjust pool to target size: clone new VMs or drain idle excess."""
+    def _fill_pool(self, blocked_vmids: set[int] | None = None) -> None:
+        """Adjust pool to target size: clone new VMs or drain idle excess.
+
+        Args:
+            blocked_vmids: VMIDs that are quarantined or awaiting cleanup.
+                They are skipped individually; every other slot is still
+                refilled. In the flat (non-profiled) layout the allocator
+                already excludes them durably via the Redis quarantine sets,
+                so the deficit is simply satisfied by other VMIDs.
+        """
         if self._pool.worker_profiles:
-            self._fill_profiled_pool()
+            self._fill_profiled_pool(blocked_vmids)
             return
 
         idle_count = self._redis.scard(_POOL_IDLE_KEY)
@@ -352,9 +367,12 @@ class PoolManager:
                     continue
                 if self._destroy_stopped_vm(vm_id):
                     drained += 1
+                else:
+                    self._mark_pending_destroy(vm_id)
 
-    def _fill_profiled_pool(self) -> None:
+    def _fill_profiled_pool(self, blocked_vmids: set[int] | None = None) -> None:
         """Reconcile heterogeneous workers to deterministic VMID/profile slots."""
+        blocked = set(blocked_vmids or ())
         start = self._pool.vm_id_start
         if start <= 0:
             logger.error("No worker VM ID range configured (pool.vm_id_start)")
@@ -382,6 +400,14 @@ class PoolManager:
             self._drain_profiled_idle_workers(extra_idle)
 
         missing = sorted(desired_vmids - tracked_vmids)
+        quarantined = sorted(vm_id for vm_id in missing if vm_id in blocked)
+        if quarantined:
+            logger.warning(
+                "Skipping quarantined worker slots %s this pass; the remaining "
+                "slots are still refilled",
+                quarantined,
+            )
+            missing = [vm_id for vm_id in missing if vm_id not in blocked]
         if not missing:
             return
         logger.info(
@@ -393,15 +419,21 @@ class PoolManager:
             profile = self._pool.worker_profile_for_vmid(vm_id)
             try:
                 if self._clone_and_boot(new_id=vm_id, profile=profile) is None:
+                    # Ambiguous clone outcome or an owned VM awaiting cleanup:
+                    # stop fanning out clone attempts until the next pass.
                     break
             except Exception:
+                # Allocation failures are slot-local (e.g. the VMID is already
+                # in use). Aborting here would starve every higher-numbered
+                # slot, i.e. every later provider in the round-robin.
                 logger.error(
-                    "Failed to clone and boot VM %d for backend %s",
+                    "Failed to clone and boot VM %d for backend %s; "
+                    "continuing with the remaining slots",
                     vm_id,
                     profile.backend,
                     exc_info=True,
                 )
-                break
+                continue
 
     def _drain_profiled_idle_workers(self, idle_vmids: list[int]) -> int:
         """Drain the supplied out-of-layout idle workers in deterministic order."""
@@ -469,7 +501,35 @@ class PoolManager:
                 continue
             if self._destroy_stopped_vm(vm_id):
                 drained += 1
+            else:
+                self._mark_pending_destroy(vm_id)
         return drained
+
+    def _mark_pending_destroy(self, vm_id: int) -> None:
+        """Queue a stopped-but-undestroyed worker for durable cleanup retry.
+
+        A drain removes the VM from ``pool:idle`` before stopping it, so a
+        failed ``destroy_vm`` would otherwise leave a stopped VM that no
+        reconciler owns: ``_reconcile_stale_redis`` scans only idle/active,
+        ``_health_check`` only active, and ``_reconcile_orphans`` runs once at
+        startup. ``pool:provisioning`` is the retry queue drained by
+        ``_retry_provisioning_cleanups`` on every pass, so recording the VMID
+        there makes the destroy retryable across restarts too.
+        """
+        try:
+            self._redis.sadd(_POOL_PROVISIONING_KEY, str(vm_id))
+            if not self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id)):
+                raise RuntimeError("pending-destroy marker was not persisted")
+        except Exception:
+            logger.error(
+                "Failed to durably queue VM %d for destroy retry; the in-process "
+                "mirror will retry it until this manager exits",
+                vm_id,
+                exc_info=True,
+            )
+        # In-memory mirror so the retry survives a transient Redis failure for
+        # as long as this process lives.
+        self._owned_provisioning_vmids.add(vm_id)
 
     def _restore_worker_after_failed_drain(
         self,
@@ -604,8 +664,14 @@ class PoolManager:
                 exc_info=True,
             )
             return False
-        self._owned_provisioning_vmids.discard(vm_id)
-        self._allocated_vmids.discard(vm_id)
+        finally:
+            # Proxmox has confirmed the VM is gone, so the in-process
+            # allocation guards must be released even when the Redis cleanup
+            # above failed. Leaving them set wedges the slot for the lifetime
+            # of the process; the durable Redis quarantine sets (which
+            # _next_vm_id also reads) remain the safety net for reuse.
+            self._owned_provisioning_vmids.discard(vm_id)
+            self._allocated_vmids.discard(vm_id)
         return True
 
     def _read_template_pointer(self) -> int | None:
@@ -988,14 +1054,17 @@ class PoolManager:
                 f"Refusing to clone VMID {vm_id}: could not persist clone-attempt quarantine"
             ) from exc
 
-    def _retry_provisioning_cleanups(self) -> bool:
+    def _retry_provisioning_cleanups(self) -> set[int] | None:
         """Retry cleanup of every clone known to have passed clone_vm().
 
         The Redis set makes cleanup retryable across process restarts. An
         in-memory mirror covers a transient Redis failure after clone success
         without ever upgrading an ambiguous clone result into owned state.
-        Returns ``False`` while any cleanup remains so the pool does not create
-        more VMs on top of an unresolved provisioning failure.
+
+        Returns the VMIDs whose cleanup is still outstanding, so the caller can
+        skip exactly those slots while refilling the rest. Returns ``None`` when
+        the cleanup state itself is unknown (Redis or Proxmox read failure), in
+        which case no VM may be created at all.
         """
         try:
             pending = {
@@ -1005,61 +1074,67 @@ class PoolManager:
             }
         except Exception:
             logger.error("Failed to read durable provisioning cleanup state", exc_info=True)
-            return False
+            return None
         pending.update(self._owned_provisioning_vmids)
         if not pending:
-            return True
+            return set()
 
         try:
             inventory = self._proxmox.list_vms()
         except Exception:
             logger.error("Failed to list VMs for provisioning cleanup retry", exc_info=True)
-            return False
+            return None
         existing = {
             int(vm["vmid"]): vm
             for vm in inventory
             if vm.get("vmid") is not None and str(vm.get("vmid")).lstrip("-").isdigit()
         }
 
-        complete = True
+        blocked: set[int] = set()
         for vm_id in sorted(pending):
             if not self._is_destroyable_vm_id(vm_id):
                 logger.error(
                     "Refusing provisioning cleanup for VM %d outside the worker range",
                     vm_id,
                 )
-                complete = False
+                blocked.add(vm_id)
                 continue
             vm_info = existing.get(vm_id)
             if vm_info is None:
                 if not self._clear_destroyed_worker_state(vm_id):
-                    complete = False
+                    blocked.add(vm_id)
                 continue
             if self._is_proxmox_template(vm_info):
                 logger.error(
                     "Refusing to destroy template VM %d during provisioning cleanup", vm_id
                 )
-                complete = False
+                blocked.add(vm_id)
                 continue
             if not self._destroy_vm(vm_id):
-                complete = False
-        return complete
+                blocked.add(vm_id)
+        return blocked
 
-    def _reconcile_ambiguous_clones(self) -> bool:
+    def _reconcile_ambiguous_clones(self) -> set[int] | None:
         """Release quarantined VMIDs only when inventory proves no VM exists.
 
         A present VM remains quarantined because a clone exception cannot prove
         who created it. This is deliberately operator-resolved; an absent VMID
         can be released automatically from an authoritative inventory snapshot.
+
+        Returns the VMIDs that stay quarantined. The quarantine is per-slot: a
+        single unresolved VMID costs its own slot only, never the whole refill
+        (which would drain the fleet to zero while finished workers keep being
+        retired). Returns ``None`` when the quarantine state itself is unknown,
+        which is the only case that suppresses cloning entirely.
         """
         try:
             raw_members = self._redis.smembers(_POOL_AMBIGUOUS_CLONES_KEY)
             ambiguous = {int(member) for member in raw_members if str(member).lstrip("-").isdigit()}
         except Exception:
             logger.error("Failed to read ambiguous clone quarantine state", exc_info=True)
-            return False
+            return None
         if not ambiguous:
-            return True
+            return set()
         try:
             existing = {
                 int(vm["vmid"])
@@ -1068,9 +1143,9 @@ class PoolManager:
             }
         except Exception:
             logger.error("Failed to verify ambiguous clone VMIDs against Proxmox", exc_info=True)
-            return False
+            return None
 
-        complete = True
+        blocked: set[int] = set()
         for vm_id in sorted(ambiguous):
             if vm_id in existing:
                 logger.error(
@@ -1081,7 +1156,7 @@ class PoolManager:
                     vm_id,
                     _POOL_AMBIGUOUS_CLONES_KEY,
                 )
-                complete = False
+                blocked.add(vm_id)
                 continue
             try:
                 self._redis.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
@@ -1092,8 +1167,8 @@ class PoolManager:
                 logger.error(
                     "Failed to release absent ambiguous clone VMID %d", vm_id, exc_info=True
                 )
-                complete = False
-        return complete
+                blocked.add(vm_id)
+        return blocked
 
     def _clear_destroyed_worker_state(self, vm_id: int) -> bool:
         """Clear lifecycle state after inventory proves the VM is absent."""
@@ -1121,8 +1196,12 @@ class PoolManager:
         except Exception:
             logger.error("Failed to clear destroyed worker state for VM %d", vm_id, exc_info=True)
             return False
-        self._owned_provisioning_vmids.discard(vm_id)
-        self._allocated_vmids.discard(vm_id)
+        finally:
+            # Inventory already proved the VM is absent, so the in-process
+            # allocation guards are released even when the Redis cleanup or
+            # its verification failed. Durable Redis state is retried next pass.
+            self._owned_provisioning_vmids.discard(vm_id)
+            self._allocated_vmids.discard(vm_id)
         return True
 
     def _health_check(self) -> None:
@@ -2040,9 +2119,19 @@ class PoolManager:
         before removing the consumer. Empty consumers are safe to delete
         directly.
 
-        We only act on a consumer that is PROVABLY dead: its name parses to a
-        worker VMID, that VMID is absent from pool:idle and pool:active, and it
-        is not an existing Proxmox worker VM.
+        We only act on a consumer that is PROVABLY a dead pool worker:
+
+        1. Its name parses to a VMID inside the configured worker VMID range.
+           ``_worker_id_to_vm_id`` also accepts a bare integer (legacy naming),
+           so a standalone/legacy worker can parse to a VMID the pool never
+           owned; absence from the pool's own bookkeeping says nothing about
+           such a worker's liveness.
+        2. That VMID is absent from pool:idle, pool:active and the Proxmox
+           worker inventory.
+        3. Its TTL-backed ``workers:heartbeat:<worker_id>`` key is gone. This is
+           positive proof of death rather than an inference from absence, and
+           it is what stops a live worker's task from being re-enqueued while
+           it is still executing.
         """
         live_vm_ids = self._live_vm_ids()
         if live_vm_ids is None:
@@ -2060,7 +2149,21 @@ class PoolManager:
                 if vm_id is None:
                     # Not a worker consumer (e.g. orchestrator/results consumer)
                     continue
+                if not self._is_destroyable_vm_id(vm_id):
+                    # Not a VMID this pool allocates: a standalone or legacy
+                    # worker. The pool's bookkeeping cannot prove it is dead.
+                    continue
                 if vm_id in live_vm_ids:
+                    continue
+                heartbeat_present = self._worker_heartbeat_present(name)
+                if heartbeat_present is not False:
+                    logger.info(
+                        "Orphan PEL: leaving consumer %s (VM %d) alone; its liveness "
+                        "heartbeat is %s",
+                        name,
+                        vm_id,
+                        "still present" if heartbeat_present else "unreadable",
+                    )
                     continue
                 if pending > 0:
                     if vm_id in recovery_attempted_vm_ids:
@@ -2095,6 +2198,24 @@ class PoolManager:
                         fq_stream,
                         exc_info=True,
                     )
+
+    def _worker_heartbeat_present(self, worker_id: str) -> bool | None:
+        """Return whether *worker_id* still publishes a liveness heartbeat.
+
+        Workers refresh ``workers:heartbeat:<worker_id>`` (a short-TTL key)
+        both while idle and while executing a task, so its presence is positive
+        proof that the worker is alive. ``None`` means the answer is unknown
+        and callers must not treat the worker as dead.
+        """
+        try:
+            return bool(self._redis.exists(f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"))
+        except Exception:
+            logger.warning(
+                "Failed to read liveness heartbeat for worker %s",
+                worker_id,
+                exc_info=True,
+            )
+            return None
 
     def _live_vm_ids(self) -> set[int] | None:
         """VMIDs currently tracked as idle/active and present in Proxmox.

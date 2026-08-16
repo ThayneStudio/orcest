@@ -20,6 +20,6 @@ orcest fleet rebake
 # --dry-run first so the journal records what GC would do, then commit.
 echo "Garbage-collecting orphaned templates."
 orcest fleet gc-templates --dry-run
-orcest fleet gc-templates
+orcest fleet gc-templates --yes
 
 echo "Template rebake complete. Pool manager will pick up the new pointer within ~30s."

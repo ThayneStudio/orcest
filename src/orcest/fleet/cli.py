@@ -104,6 +104,39 @@ def _wait_for_worker_drain_quiescence() -> None:
     time.sleep(_DRAIN_QUIESCE_SECONDS)
 
 
+def _drain_leases_still_held(ssh_target: str, worker_ids: list[str]) -> list[str]:
+    """Return the worker IDs still present in ``orcest:pool:draining``.
+
+    A stale drain lease permanently fences a surviving worker: it exits 75 on
+    every loop until the systemd restart budget is exhausted. ``clean_pool_redis``
+    verifies the marker for destroyed VMs; workers that were deliberately left
+    alive need the same proof that their lease really went away.
+
+    Raises ``RuntimeError`` if the membership cannot be read at all.
+    """
+    from orcest.fleet.orchestrator import _REDIS_CLI_PREFIX, _require_redis_cli_success, _ssh
+
+    if not worker_ids:
+        return []
+    query = " && ".join(
+        f"{_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:draining {shlex.quote(worker_id)}"
+        for worker_id in worker_ids
+    )
+    result = _ssh(ssh_target, query)
+    _require_redis_cli_success(result, "Failed to verify worker drain leases were cleared")
+    states = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(states) != len(worker_ids):
+        raise RuntimeError(
+            "Failed to verify worker drain leases were cleared: expected "
+            f"{len(worker_ids)} SISMEMBER results, got {len(states)}"
+        )
+    return [
+        worker_id
+        for worker_id, state in zip(worker_ids, states, strict=True)
+        if state.strip() != "0"
+    ]
+
+
 def _write_project_files_from_config(
     cfg: FleetConfig,
     ssh_target: str,
@@ -781,8 +814,12 @@ def add_org(org_name: str, github_token: str, claude_token: tuple[str, ...], con
     console = Console()
     cfg = load_config(config)
 
-    if org_name in cfg.orgs:
+    existing = cfg.orgs.get(org_name)
+    if existing is not None:
         console.print(f"[yellow]Org '{org_name}' already exists, updating credentials.[/yellow]")
+        if existing.provider_credentials:
+            preserved = ", ".join(sorted(existing.provider_credentials))
+            console.print(f"  Preserving hand-configured provider_credentials: {preserved}")
 
     # Validate the GitHub token via the orchestrator's Docker image (which has gh installed)
     console.print("  Validating GitHub token...", end=" ")
@@ -806,10 +843,17 @@ def add_org(org_name: str, github_token: str, claude_token: tuple[str, ...], con
         except (OSError, subprocess.SubprocessError) as exc:
             console.print(f"[yellow]skipped ({exc})[/yellow]")
 
-    cfg.orgs[org_name] = OrgEntry(
-        github_token=github_token,
-        claude_oauth_tokens=list(claude_token),
-    )
+    # Update in place rather than replacing the entry: fields this command does
+    # not manage (notably `provider_credentials`, which is hand-edited into the
+    # fleet config) must survive a routine GitHub PAT rotation.
+    if existing is not None:
+        existing.github_token = github_token
+        existing.claude_oauth_tokens = list(claude_token)
+    else:
+        cfg.orgs[org_name] = OrgEntry(
+            github_token=github_token,
+            claude_oauth_tokens=list(claude_token),
+        )
     save_config(cfg, config)
     token_count = len(claude_token)
     pool_note = f" ({token_count} Claude tokens)" if token_count > 1 else ""
@@ -1773,15 +1817,38 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         console=console,
     )
 
-    # Save template_vm_id and prompt for worker VM ID range
+    # Save template_vm_id and prompt for worker VM ID range.
+    # The worker range must stay disjoint from the template range, otherwise
+    # load_config() raises on every subsequent fleet command and the
+    # pool-manager container refuses to start. Offer a valid default and never
+    # persist a value that would not load back.
     cfg.pool.template_vm_id = vm_id
-    default_start = vm_id + 1
-    vm_id_start = click.prompt(
-        "  Worker VM ID range starts at",
-        default=default_start,
-        type=int,
-    )
-    cfg.pool.vm_id_start = vm_id_start
+    template_rng = cfg.pool.template_range()
+    default_start = template_rng[1] + 1 if template_rng is not None else vm_id + 1
+    previous_start = cfg.pool.vm_id_start
+    vm_id_start = default_start
+    for attempt in range(3):
+        vm_id_start = click.prompt(
+            "  Worker VM ID range starts at",
+            default=default_start,
+            type=int,
+        )
+        cfg.pool.vm_id_start = vm_id_start
+        try:
+            cfg.pool.validate_vmid_ranges()
+        except ValueError as exc:
+            cfg.pool.vm_id_start = previous_start
+            console.print(f"  [red]Invalid pool configuration: {exc}[/red]")
+            if attempt == 2:
+                console.print(
+                    f"  [red]Not saving vm_id_start; template VM {vm_id} was still"
+                    " created.[/red]\n"
+                    "  Rerun with a valid worker VMID range, or set pool.vm_id_start"
+                    " in the fleet config."
+                )
+                sys.exit(1)
+            continue
+        break
     save_config(cfg, config)
 
     console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
@@ -2388,18 +2455,28 @@ def destroy_template(vm_id: int, yes: bool, config: str) -> None:
     help="Show which templates would be destroyed without destroying them.",
 )
 @click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip confirmation prompt (required for non-interactive automation).",
+)
+@click.option(
     "--config",
     default=str(DEFAULT_CONFIG_PATH),
     help="Fleet config path.",
     show_default=True,
 )
 @_serialized_fleet_operation
-def gc_templates(dry_run: bool, config: str) -> None:
+def gc_templates(dry_run: bool, yes: bool, config: str) -> None:
     """Destroy old templates in the range that have no live linked clones.
 
-    Iterates VMIDs in ``pool.template_vmid_range``, skips the currently-active
-    template, and attempts to destroy each one. Templates with live linked
-    clones will fail to destroy (Proxmox enforces this) and are left in place.
+    Only genuine orcest templates are candidates: a VM inside
+    ``pool.template_vmid_range`` must be flagged as a Proxmox template *and*
+    be named ``orcest-worker-*``. Anything else that happens to occupy a VMID
+    in the range belongs to somebody else and is reported, never destroyed.
+
+    Skips the currently-active template and attempts to destroy each remaining
+    candidate. Templates with live linked clones will fail to destroy (Proxmox
+    enforces this) and are left in place.
     """
     from orcest.fleet.config import load_config
     from orcest.fleet.orchestrator import get_current_template_vmid
@@ -2445,9 +2522,33 @@ def gc_templates(dry_run: bool, config: str) -> None:
     except Exception as exc:
         console.print(f"[red]Failed to list VMs:[/red] {exc}")
         sys.exit(1)
-    in_range_vmids = sorted(
-        int(v["vmid"]) for v in all_vms if "vmid" in v and start <= int(v["vmid"]) <= end
-    )
+    # A VMID inside the template range proves nothing on its own: anybody can
+    # create an unrelated VM there. Destructive GC is restricted to VMs that are
+    # genuinely orcest templates (Proxmox template flag + orcest-worker-* name),
+    # mirroring the ownership checks in `stop` and `destroy-template`.
+    in_range_vmids: list[int] = []
+    foreign: list[str] = []
+    for v in all_vms:
+        if "vmid" not in v:
+            continue
+        vmid = int(v["vmid"])
+        if not (start <= vmid <= end):
+            continue
+        name = str(v.get("name") or "")
+        if not v.get("template") or not name.startswith("orcest-worker-"):
+            foreign.append(f"{vmid} ({name or 'unnamed'})")
+            continue
+        in_range_vmids.append(vmid)
+    in_range_vmids.sort()
+
+    if foreign:
+        console.print(
+            f"  [yellow]Excluded {len(foreign)} non-template VM(s) inside range"
+            f" {start}-{end}[/yellow]: {', '.join(sorted(foreign))}"
+        )
+        console.print(
+            "    These are not orcest worker templates and will never be destroyed by GC."
+        )
 
     candidates = [vmid for vmid in in_range_vmids if vmid != active]
     if not candidates:
@@ -2459,6 +2560,15 @@ def gc_templates(dry_run: bool, config: str) -> None:
         return
 
     console.print(f"  Found {len(candidates)} GC candidate(s) in range {start}-{end}: {candidates}")
+
+    if not dry_run and not yes:
+        # Non-interactive callers (the weekly rebake timer) must pass --yes;
+        # click aborts on EOF, so an unattended run fails closed rather than
+        # destroying templates without an operator ever seeing the list.
+        click.confirm(
+            f"Destroy {len(candidates)} template VM(s) {candidates}?",
+            abort=True,
+        )
     destroyed: list[int] = []
     skipped: list[int] = []
     for vmid in candidates:
@@ -2744,6 +2854,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
     skipped: list[str] = list(range_skipped)
     destroy_failures: list[str] = []
     recovery_failures: list[str] = []
+    drain_lease_failures: list[str] = []
 
     def restart_stopped_worker(vm_id: int, reason: str) -> bool:
         """Re-establish worker recovery after an aborted destruction commit."""
@@ -2835,10 +2946,26 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
                     restart_stopped_worker(vm_id, "destruction failed")
     finally:
         if draining_worker_ids:
+            # A lease that outlives this command fences the worker forever, so
+            # a clear failure is a command failure -- never a warning. Workers
+            # that were destroyed get their marker verified by clean_pool_redis;
+            # the survivors are verified here.
             try:
                 set_workers_draining(ssh_target, draining_worker_ids, draining=False)
             except Exception as exc:
-                console.print(f"  [yellow]warning[/yellow]: failed to clear drain leases: {exc}")
+                console.print(f"  [red]failed to clear drain leases[/red]: {exc}")
+                drain_lease_failures = list(draining_worker_ids)
+            else:
+                try:
+                    drain_lease_failures = _drain_leases_still_held(ssh_target, draining_worker_ids)
+                except Exception as exc:
+                    console.print(f"  [red]failed to verify drain leases were cleared[/red]: {exc}")
+                    drain_lease_failures = list(draining_worker_ids)
+                else:
+                    if drain_lease_failures:
+                        console.print(
+                            "  [red]drain leases are still held after clearing them[/red]"
+                        )
 
     # Step 4: Clean Redis
     pool_cleanup_failed = False
@@ -2860,6 +2987,18 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
     if destroy_failures:
         console.print(f", failed to destroy {len(destroy_failures)}", end="")
     console.print(".")
+    if drain_lease_failures:
+        srem_cmd = "<redis-cli> SREM orcest:pool:draining " + " ".join(
+            shlex.quote(worker_id) for worker_id in drain_lease_failures
+        )
+        console.print(
+            "[red]Stop incomplete: worker drain leases were not cleared for "
+            f"{', '.join(drain_lease_failures)}.[/red]\n"
+            "  Every surviving worker holding a stale lease exits 75 on each loop "
+            "until systemd marks it failed, while still counting toward pool size.\n"
+            f"  Clear them manually on {ssh_target}: {srem_cmd}"
+        )
+        raise SystemExit(1)
     if drain_active and (skipped or destroy_failures):
         console.print("[red]Drain incomplete: one or more worker VMs were not destroyed.[/red]")
         raise SystemExit(1)
