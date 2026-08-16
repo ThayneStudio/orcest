@@ -143,7 +143,7 @@ def build_image(ssh_target: str) -> None:
         "orcest_uid=$(id -u orcest) && orcest_gid=$(id -g orcest) && "
         "printf '%s\\n' \"$revision\" | grep -Eq '^[0-9a-f]{7,64}$' || "
         "{ echo 'Build requires an exact clean .orcest-revision' >&2; exit 2; }; "
-        "printf '%s:%s\\n' \"$orcest_uid\" \"$orcest_gid\" | "
+        'printf \'%s:%s\\n\' "$orcest_uid" "$orcest_gid" | '
         "grep -Eq '^[1-9][0-9]*:[1-9][0-9]*$' || "
         "{ echo 'Host orcest UID/GID must be positive integers' >&2; exit 2; }; "
         'ORCEST_BUILD_REVISION="$revision" ORCEST_UID="$orcest_uid" '
@@ -639,9 +639,9 @@ def ensure_pool_manager(
         " up -d --force-recreate pool-manager && sleep 2 &&"
         f" cid=$(FLEET_CONFIG={quoted_path} docker compose"
         f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
-        " ps -q pool-manager) && test -n \"$cid\" &&"
-        " test \"$(docker inspect -f '{{.State.Running}}' \"$cid\")\" = true &&"
-        " test \"$(docker inspect -f '{{.RestartCount}}' \"$cid\")\" = 0",
+        ' ps -q pool-manager) && test -n "$cid" &&'
+        ' test "$(docker inspect -f \'{{.State.Running}}\' "$cid")" = true &&'
+        ' test "$(docker inspect -f \'{{.RestartCount}}\' "$cid")" = 0',
     )
     if result.returncode != 0:
         logger.error("Pool manager failed: %s", result.stderr.strip())

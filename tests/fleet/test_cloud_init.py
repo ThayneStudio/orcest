@@ -120,9 +120,7 @@ class TestTemplateUserdata:
         gated = [
             c
             for c in data["runcmd"]
-            if "sha256sum" in str(c)
-            and "install -m 0755" in str(c)
-            and "&&" in str(c)
+            if "sha256sum" in str(c) and "install -m 0755" in str(c) and "&&" in str(c)
         ]
         assert gated, "Grok binary checksum gate and install must be one entry"
         # Codex CLI (OpenAI codex-cli): pinned npm-global install, no
