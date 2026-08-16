@@ -1165,6 +1165,61 @@ def test_poll_project_issue_gate_counts_provider_specific_issue_stream(
     assert "tasks:issue:grok" in counted_streams
 
 
+def test_poll_project_issue_gate_ignores_other_providers_dead_stream(
+    mocker, fake_redis_client, gh_mock
+):
+    """One backed-up provider stream must not gate discovery for a healthy one.
+
+    Regression: the gate summed unclaimed entries across every configured
+    provider issue stream. Provider streams are isolated -- only a worker whose
+    backend matches consumes one -- so a provider with no running workers
+    accumulates undelivered entries forever, and the sum stayed above zero
+    permanently. That deferred issue discovery for every healthy provider on
+    every cycle except the rotating fairness slot, collapsing throughput to
+    1/N and defeating the isolation per-provider streams exist to give.
+    """
+    from orcest.shared.config import LabelConfig
+    from orcest.shared.providers import ProviderEntry
+
+    project = ProjectConfig(
+        repo="acme/widgets",
+        token="ghp-project",
+        claude_tokens=[],
+        key_prefix="widgets",
+        providers=[
+            ProviderEntry(provider="clauder", credential="clauder-token"),
+            ProviderEntry(provider="grok", credential='{"refresh_token":"grok-refresh"}'),
+        ],
+    )
+    config = OrchestratorConfig(labels=LabelConfig(), projects=[project])
+    project_redis = RedisClient.from_client(fake_redis_client.client, key_prefix=project.key_prefix)
+
+    mocker.patch("orcest.orchestrator.loop.discover_actionable_prs", return_value=[])
+    issue_discovery = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_issues",
+        return_value=[],
+    )
+
+    # grok has no workers, so its stream never drains; clauder is healthy.
+    def unread_count(stream: str, group: str) -> int:
+        return 7 if stream == "tasks:issue:grok" else 0
+
+    mocker.patch.object(fake_redis_client, "stream_unread_count", side_effect=unread_count)
+
+    _poll_project(
+        project,
+        project_redis,
+        fake_redis_client,
+        config,
+        logging.getLogger("test"),
+        3600,
+        token_pool=None,
+        force_issue_discovery=False,
+    )
+
+    issue_discovery.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # _consume_results tests
 # ---------------------------------------------------------------------------
@@ -4446,6 +4501,161 @@ def test_credential_update_without_validated_account_remains_retryable(
         )
 
 
+def test_credential_update_without_validated_account_stops_retrying(
+    fake_redis_client,
+    mocker,
+):
+    """Retries are bounded so an unresolvable account cannot wedge the entry.
+
+    Regression: this raised `_RetryableResultError` unconditionally. The
+    resolution inputs are static, so an operator re-auth (or a task published
+    under a prior config) never becomes resolvable -- the results PEL entry was
+    deferred on every cycle forever, blocking the label/comment/pending-marker
+    side effects, leaking the task->account mapping, and re-burning GitHub API
+    calls each poll.
+    """
+    from orcest.orchestrator.loop import _MAX_UNRESOLVED_CREDENTIAL_ACCOUNT_ATTEMPTS
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(
+        provider="grok",
+        credential='{"access_token":"old","refresh_token":"old-refresh"}',
+    )
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id="unmapped-pre-upgrade-task",
+        pr_number=84,
+    )
+    result.credential_update = '{"access_token":"new","refresh_token":"new-refresh"}'
+    result.provider_account = "grok:deadbeef"
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
+
+    def handle():
+        _handle_result(
+            ProjectConfig(
+                repo="owner/testrepo",
+                token="fake-token",
+                claude_tokens=[],
+                key_prefix="test",
+                providers=[entry],
+            ),
+            LabelConfig(),
+            fake_redis_client,
+            result,
+            logging.getLogger("test"),
+            token_pool=ProviderPool([entry]),
+        )
+
+    for _ in range(_MAX_UNRESOLVED_CREDENTIAL_ACCOUNT_ATTEMPTS - 1):
+        with pytest.raises(_RetryableResultError, match="no unambiguous"):
+            handle()
+
+    # The bound is reached: the result is processed instead of deferred again.
+    handle()
+    assert fake_redis_client.get("providers:grok:credential_update_unresolved_account") == str(
+        _MAX_UNRESOLVED_CREDENTIAL_ACCOUNT_ATTEMPTS
+    )
+
+
+def test_permanent_comment_failure_stops_wedging_the_result(fake_redis_client, gh_mock):
+    """A permanently failing GitHub side effect must not defer the entry forever.
+
+    Regression: any `_post_comment` failure raised `_RetryableResultError`
+    unconditionally. A locked conversation or a revoked `issues:write` scope
+    never succeeds, so the results PEL entry was deferred on every poll cycle
+    forever -- the side-effect checkpoint was never committed, the
+    task->account mapping leaked, and each cycle re-ran the preceding GitHub
+    reads. Network errors must still retry without consuming the budget.
+    """
+    from orcest.orchestrator.loop import (
+        _MAX_GITHUB_SIDE_EFFECT_FAILURES,
+        _make_result_side_effects_processed_key,
+    )
+    from orcest.shared.config import LabelConfig
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        task_id="locked-conversation-task",
+        pr_number=91,
+        summary="Investigated; a product decision is required.",
+        needs_human=True,
+        needs_human_reason="conversation is locked",
+    )
+    gh_mock.get_pr.return_value = {
+        "headRefOid": result.snapshot_head_sha,
+        "statusCheckRollup": [],
+    }
+    gh_mock.has_issue_comment_marker.return_value = False
+    gh_mock.post_comment.side_effect = RuntimeError(
+        "HTTP 403: Unable to create comment (conversation is locked)"
+    )
+
+    def handle():
+        _handle_result(
+            ProjectConfig(
+                repo="owner/testrepo",
+                token="fake-token",
+                claude_tokens=[],
+                key_prefix="test",
+            ),
+            LabelConfig(),
+            fake_redis_client,
+            result,
+            logging.getLogger("test"),
+        )
+
+    for _ in range(_MAX_GITHUB_SIDE_EFFECT_FAILURES - 1):
+        with pytest.raises(_RetryableResultError, match="failed to post comment"):
+            handle()
+
+    # Budget exhausted: the result commits instead of deferring forever.
+    handle()
+    assert fake_redis_client.get(_make_result_side_effects_processed_key(result.task_id)) == "1"
+
+
+def test_network_comment_failure_never_consumes_the_budget(fake_redis_client, gh_mock):
+    """Transient network errors stay retryable indefinitely."""
+    from orcest.orchestrator.loop import _MAX_GITHUB_SIDE_EFFECT_FAILURES
+    from orcest.shared.config import LabelConfig
+
+    result = _make_task_result(
+        status=ResultStatus.FAILED,
+        task_id="flaky-network-task",
+        pr_number=92,
+        summary="Investigated; a product decision is required.",
+        needs_human=True,
+        needs_human_reason="transient network",
+    )
+    gh_mock.get_pr.return_value = {
+        "headRefOid": result.snapshot_head_sha,
+        "statusCheckRollup": [],
+    }
+    gh_mock.has_issue_comment_marker.return_value = False
+    gh_mock.post_comment.side_effect = RuntimeError("dial tcp 140.82.121.6:443: i/o timeout")
+
+    for _ in range(_MAX_GITHUB_SIDE_EFFECT_FAILURES + 2):
+        with pytest.raises(_RetryableResultError, match="failed to post comment"):
+            _handle_result(
+                ProjectConfig(
+                    repo="owner/testrepo",
+                    token="fake-token",
+                    claude_tokens=[],
+                    key_prefix="test",
+                ),
+                LabelConfig(),
+                fake_redis_client,
+                result,
+                logging.getLogger("test"),
+            )
+
+    assert fake_redis_client.get(f"result:{result.task_id}:github_side_effect_failures") is None
+
+
 def test_task_provider_account_uses_atomic_per_task_ttl(fake_redis_client):
     from orcest.orchestrator.loop import (
         _clear_task_provider_account,
@@ -4750,6 +4960,120 @@ def test_rejected_grok_credential_update_increments_provider_health_counter(
     assert fake_redis_client.get(counter_key) == "1"
     assert fake_redis_client.ttl(counter_key) > 0
     assert fake_redis_client.hget(_TASK_PROVIDER_ACCOUNTS_KEY, task_id) is None
+
+
+def test_rejected_codex_credential_update_increments_provider_health_counter(
+    fake_redis_client,
+    mocker,
+):
+    """Codex blobs must be judged by the same refresh-token rule as Grok.
+
+    Regression: the orchestrator kept a private grok-only copy of the
+    usability predicate, so a Codex account that lost its refresh token was
+    judged "usable", the counter never incremented, and the silent failure
+    the counter exists to surface produced no signal at all.
+    """
+    import logging
+
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig, ProjectConfig
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="codex", credential="config-blob")
+    pool = ProviderPool([entry])
+    task_id = "task-rejected-codex-refresh"
+    fake_redis_client.hset(_TASK_PROVIDER_ACCOUNTS_KEY, task_id, entry.account_key())
+
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id=task_id,
+        pr_number=81,
+    )
+    # Rotated blob that lost its refresh token -- unusable for the next task.
+    result.credential_update = '{"access_token":"new-access","expires_at":123}'
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
+
+    _handle_result(
+        ProjectConfig(
+            repo="owner/testrepo",
+            token="fake-token",
+            claude_tokens=[],
+            key_prefix="test",
+            providers=[entry],
+        ),
+        LabelConfig(),
+        fake_redis_client,
+        result,
+        logging.getLogger("test"),
+        token_pool=pool,
+    )
+
+    counter_key = "providers:codex:credential_refresh_failures"
+    assert pool.effective_credential(entry) == "config-blob"
+    assert fake_redis_client.get(counter_key) == "1"
+    assert fake_redis_client.ttl(counter_key) > 0
+
+
+def test_legacy_credential_update_is_minted_in_microseconds(fake_redis_client, mocker):
+    """A legacy result carries no minted_at, so the orchestrator synthesizes one.
+
+    Regression: it synthesized `time.time()` (seconds, ~1.7e9) while workers
+    mint from `next_monotonic_version` (microseconds, ~1.7e15). Both land in
+    one comparison domain, so once any new-worker value was stored, every
+    legacy rotation compared as older and was discarded forever -- pinning the
+    account to a blob whose refresh token had already been consumed.
+    """
+    import logging
+
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.config import LabelConfig, ProjectConfig
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    pool = ProviderPool([entry])
+    task_id = "task-legacy-mint"
+    fake_redis_client.hset(_TASK_PROVIDER_ACCOUNTS_KEY, task_id, entry.account_key())
+
+    # A new-style worker already stored a rotation stamped by the Redis clock
+    # (microseconds). Dated in the past so a value minted "now" must beat it.
+    newer_style_minted_at = 1_700_000_000_000_000.0
+    pool.seed_credential_override(
+        entry.account_key(), "blob-from-new-worker", minted_at=newer_style_minted_at
+    )
+
+    rotated = '{"access_token":"legacy","refresh_token":"legacy-refresh"}'
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        task_id=task_id,
+        pr_number=82,
+    )
+    result.credential_update = rotated
+    result.credential_update_minted_at = 0.0  # legacy worker: field absent
+    mocker.patch(
+        "orcest.orchestrator.loop.gh.get_pr",
+        return_value={"headRefOid": result.snapshot_head_sha, "statusCheckRollup": []},
+    )
+
+    _handle_result(
+        ProjectConfig(
+            repo="owner/testrepo",
+            token="fake-token",
+            claude_tokens=[],
+            key_prefix="test",
+            providers=[entry],
+        ),
+        LabelConfig(),
+        fake_redis_client,
+        result,
+        logging.getLogger("test"),
+        token_pool=pool,
+    )
+
+    # The legacy rotation happened later in real time, so it must win.
+    assert pool.effective_credential(entry) == rotated
 
 
 def test_usage_exhausted_uses_persisted_task_account_after_restart(fake_redis_client, gh_mock):

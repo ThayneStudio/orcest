@@ -7,6 +7,7 @@ review thread prompt rendering for both fix and followup tasks.
 
 import json
 import logging
+from datetime import datetime
 
 import pytest
 
@@ -1206,6 +1207,38 @@ def test_publish_and_notify_skips_xadd_on_increment_failure(
     error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
     assert any("Failed to increment attempt counter" in m for m in error_msgs)
     assert any("skipping publish" in m for m in error_msgs)
+
+
+def test_publish_issue_task_stamps_pending_marker_created_at(gh_mock, fake_redis_client):
+    """Issue pending markers must carry created_at, like PR markers do.
+
+    Regression: the issue path omitted it, so every issue marker reached the
+    dashboard with `created_at == ""`. Stuck detection then had to infer the
+    marker's age from its remaining TTL -- an inference that is only sound when
+    the dashboard's configured TTL matches the orchestrator's, and which cannot
+    distinguish "old marker" from "TTL policy mismatch".
+    """
+    _setup_gh_defaults(gh_mock)
+    issue_state = IssueState(
+        number=802,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    publish_issue_task(
+        issue_state=issue_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    pending_key = fake_redis_client._prefixed("pending:issue:test-org/test-repo:802")
+    stored = json.loads(fake_redis_client.client.get(pending_key))
+    assert stored["created_at"], "issue pending marker must record when it was created"
+    datetime.fromisoformat(stored["created_at"])
 
 
 def test_publish_issue_and_notify_skips_xadd_on_increment_failure(

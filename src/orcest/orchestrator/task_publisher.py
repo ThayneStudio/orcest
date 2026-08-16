@@ -899,9 +899,20 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Claim the pending-task slot atomically (SET NX EX).
+    # Claim the pending-task slot atomically (SET NX EX). `created_at` matters
+    # beyond bookkeeping: without it the dashboard cannot measure the marker's
+    # real age and has to infer it from the remaining TTL, an inference that is
+    # only sound when its configured TTL matches the orchestrator's. Stamping it
+    # here (as the PR path already does) keeps stuck-task detection on the
+    # reliable branch.
     if not set_pending_task(
-        redis, task.repo, "issue", issue_state.number, task.id, ttl=pending_task_ttl
+        redis,
+        task.repo,
+        "issue",
+        issue_state.number,
+        task.id,
+        ttl=pending_task_ttl,
+        created_at=task.created_at.isoformat(),
     ):
         _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
         return False
