@@ -105,33 +105,26 @@ class TestTemplateUserdata:
         assert "npm install -g bun" in runcmd
         assert "astral.sh/uv/install.sh" in runcmd
         assert "npm install -g wrangler" in runcmd
-        # Grok CLI: official installer fetched, pinned version, self-contained
-        # binary copied to a system path so the orcest worker user can run it.
-        assert "x.ai/cli/install.sh" in runcmd
-        assert _GROK_VERSION in runcmd
-        # Resolved binary copied to a system path + made executable for the
-        # non-root orcest user. The installer's symlink-into-/root must be
-        # removed first (rm before cp) — /root is 0700, so a symlink there is
-        # unexecutable by orcest (EACCES); cp would follow it, not replace it.
+        # Grok CLI: the exact versioned binary is fetched directly, checksum
+        # gated before installation, and made executable for the worker user.
+        assert f"x.ai/cli/grok-{_GROK_VERSION}-linux-x86_64" in runcmd
+        assert "x.ai/cli/install.sh" not in runcmd
         assert "/usr/local/bin/grok" in runcmd
-        assert "chmod 755 /usr/local/bin/grok" in runcmd
-        rm_idx = next(i for i, c in enumerate(data["runcmd"]) if "rm -f /usr/local/bin/grok" in c)
-        cp_idx = next(i for i, c in enumerate(data["runcmd"]) if 'cp "$(readlink' in c)
-        assert rm_idx < cp_idx, "must rm the installer symlink before cp'ing the real binary"
+        assert "install -m 0755 -o root -g root /tmp/grok /usr/local/bin/grok" in runcmd
         # The post-install check runs as the orcest worker user, so it catches
         # exec-permission regressions (not just root-visible presence).
         assert "sudo -u orcest -H bash -lc 'command -v grok && grok --version'" in runcmd
-        # No silent-failure swallow on the install (the original miss).
-        assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
         # The checksum gate and the install must be ONE runcmd entry joined by
         # `&&` — cloud-init has no `set -e` across entries, so a separate gate
         # wouldn't actually block the install on a checksum mismatch.
         gated = [
             c
             for c in data["runcmd"]
-            if "sha256sum" in str(c) and "bash /tmp/grok-install.sh" in str(c) and "&&" in str(c)
+            if "sha256sum" in str(c)
+            and "install -m 0755" in str(c)
+            and "&&" in str(c)
         ]
-        assert gated, "grok checksum gate and install must be combined with && in one entry"
+        assert gated, "Grok binary checksum gate and install must be one entry"
         # Codex CLI (OpenAI codex-cli): pinned npm-global install, no
         # silent-failure swallow, and verified as the orcest worker user so
         # any exec-perms regression (mirroring the grok /root/.local/bin
@@ -144,8 +137,8 @@ class TestTemplateUserdata:
         "digest",
         ["not-a-digest", "a" * 63, "a" * 65, '"; touch /root/pwned; #', "a" * 32 + "\nwhoami"],
     )
-    def test_rejects_unsafe_grok_installer_digest_override(self, monkeypatch, digest):
-        monkeypatch.setenv("ORCEST_GROK_INSTALLER_SHA256", digest)
+    def test_rejects_unsafe_grok_binary_digest_override(self, monkeypatch, digest):
+        monkeypatch.setenv("ORCEST_GROK_BINARY_SHA256", digest)
 
         with pytest.raises(ValueError, match="exactly 64 hexadecimal"):
             render_template_userdata()
@@ -566,50 +559,45 @@ def test_setup_worker_sh_replaces_mismatched_grok_version():
     assert 'if [ "${installed_grok_version}" = "${GROK_VERSION}" ]; then' in text
 
 
-# ── M2-infra: grok installer SHA-256 gate must FAIL CLOSED when unset ──
+# ── M2-infra: Grok binary SHA-256 gate must FAIL CLOSED when unset ──
 
 
-def test_grok_installer_gate_fails_closed_when_sha_unset(monkeypatch):
-    """M2: with no trusted Grok installer SHA-256 configured, the template must
-    NOT execute the curl'd installer as root. An empty digest must FAIL CLOSED
-    (skip the install), not short-circuit the checksum to true.
+def test_grok_binary_gate_fails_closed_when_sha_unset(monkeypatch):
+    """With no trusted Grok binary SHA, the template must not install it.
+
+    An empty digest must fail closed, not short-circuit the checksum to true.
     """
     import orcest.fleet.cloud_init as ci
 
-    monkeypatch.delenv("ORCEST_GROK_INSTALLER_SHA256", raising=False)
-    monkeypatch.setattr(ci, "_GROK_INSTALLER_SHA256", "", raising=True)
+    monkeypatch.delenv("ORCEST_GROK_BINARY_SHA256", raising=False)
+    monkeypatch.setattr(ci, "_GROK_BINARY_SHA256", "", raising=True)
 
     runcmd = ci._worker_tooling_runcmd()
     joined = "\n".join(str(c) for c in runcmd)
 
-    # The installer is still downloaded to a file (so a real digest CAN gate it)...
-    assert "https://x.ai/cli/install.sh -o /tmp/grok-install.sh" in joined
-    # ...but with no SHA configured it must NOT be executed.
-    assert "bash /tmp/grok-install.sh" in joined, "install command should be present but guarded"
-    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    assert f"https://x.ai/cli/grok-{ci._GROK_VERSION}-linux-x86_64 -o /tmp/grok" in joined
+    grok_entry = next(c for c in runcmd if "install -m 0755" in str(c))
     # The empty-digest short-circuit `[ -z "" ] ||` must be GONE — that is the bug.
     assert '[ -z "" ]' not in str(grok_entry)
-    # The execution must be gated behind a NON-empty-sha test that fails closed.
+    # Installation must be gated behind a non-empty SHA test that fails closed.
     assert 'if [ -n ""' in str(grok_entry) or "SKIPPING grok install" in str(grok_entry), (
-        "empty SHA must skip the install, not run it unverified"
+        "empty SHA must skip the install"
     )
 
 
-def test_grok_installer_gate_enforces_sha_when_set(monkeypatch):
-    """M2: when a digest IS configured (via env override), the installer runs
-    only after a sha256sum -c check against that exact digest."""
+def test_grok_binary_gate_enforces_sha_before_install(monkeypatch):
+    """An override digest gates installation of the exact downloaded binary."""
     import orcest.fleet.cloud_init as ci
 
     fake_sha = "a" * 64
-    monkeypatch.setenv("ORCEST_GROK_INSTALLER_SHA256", fake_sha)
+    monkeypatch.setenv("ORCEST_GROK_BINARY_SHA256", fake_sha)
 
     runcmd = ci._worker_tooling_runcmd()
-    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    grok_entry = next(c for c in runcmd if "install -m 0755" in str(c))
     s = str(grok_entry)
     assert fake_sha in s
     assert "sha256sum -c -" in s
-    # The install is conditional on the checksum passing.
-    assert s.index("sha256sum -c -") < s.index("bash /tmp/grok-install.sh")
+    assert s.index("sha256sum -c -") < s.index("install -m 0755")
 
 
 # ── M1: reproducible image builds — complete lock + Dockerfiles use it ──
