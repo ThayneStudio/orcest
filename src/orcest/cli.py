@@ -119,8 +119,13 @@ def revision(json_output: bool, short: bool) -> None:
 @main.command("rollout-health")
 @click.argument("redis_host", required=False, default=None)
 @click.option("--config", default="config/orchestrator.yaml", help="Config file (for Redis).")
-@click.option("--prefix", default=None, help="Redis key prefix (project name).")
+@click.option("--prefix", required=True, help="Project Redis key prefix (project name).")
 @click.option("--task-prefix", default="orcest", show_default=True, help="Shared task prefix.")
+@click.option(
+    "--pool-prefix",
+    default=None,
+    help="Redis key prefix for worker-pool state [default: --task-prefix].",
+)
 @click.option(
     "--expected-revision",
     required=True,
@@ -148,8 +153,9 @@ def revision(json_output: bool, short: bool) -> None:
 def rollout_health(
     redis_host: str | None,
     config: str,
-    prefix: str | None,
+    prefix: str,
     task_prefix: str,
+    pool_prefix: str | None,
     expected_revision: str,
     expected_pool_size: int | None,
     expected_vmid_start: int | None,
@@ -205,6 +211,7 @@ def rollout_health(
             redis,
             expected_revision=normalized,
             task_prefix=task_prefix,
+            pool_prefix=pool_prefix,
             expected_pool_size=expected_pool_size,
             expected_vmid_start=expected_vmid_start,
             expected_backends=expected_backends,
@@ -292,6 +299,7 @@ def _task_stream_transition(
     config: str,
     task_prefix: str,
     quarantine_id: str,
+    force: bool = False,
 ) -> None:
     from orcest.shared.redis_client import RedisClient
     from orcest.task_stream_quarantine import (
@@ -308,6 +316,7 @@ def _task_stream_transition(
                 redis,
                 task_prefix=task_prefix,
                 quarantine_id=quarantine_id,
+                force=force,
             )
         else:
             report = restore_task_streams(
@@ -327,11 +336,17 @@ def _task_stream_transition(
 @click.option("--config", default="config/orchestrator.yaml", help="Config file for Redis.")
 @click.option("--task-prefix", default="orcest", show_default=True)
 @click.option("--quarantine-id", required=True, help="Unique release identifier.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Fence anyway when live workers or pending deliveries are known-orphaned.",
+)
 def task_streams_quarantine(
     redis_host: str | None,
     config: str,
     task_prefix: str,
     quarantine_id: str,
+    force: bool,
 ) -> None:
     """Atomically move active task streams behind a migration fence."""
     _task_stream_transition(
@@ -340,6 +355,7 @@ def task_streams_quarantine(
         config=config,
         task_prefix=task_prefix,
         quarantine_id=quarantine_id,
+        force=force,
     )
 
 

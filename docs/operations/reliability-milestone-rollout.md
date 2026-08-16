@@ -338,6 +338,15 @@ This requires queue depth `0`, pending plus lag `0`, active pool workers `0`, an
 no private credential checkpoints or recovery intents. If it does not converge,
 stop and diagnose; do not destroy active workers.
 
+`--prefix` is mandatory: project results, provider counters, and credential
+recovery state are all read under it, so a missing prefix would gate on an empty
+keyspace. Worker pool state is read under `--pool-prefix`, which defaults to
+`--task-prefix`; pass it explicitly if the pool manager runs with a different
+`ORCEST_REDIS_KEY_PREFIX`. With `--require-quiescent`, an absent project result
+stream or an absent pool keyspace is reported as an inspection failure rather
+than as zero work — the only way to assert a deliberately empty fleet is
+`--expected-pool-size 0`.
+
 If a legacy homogeneous staging pool has backlog on provider streams it cannot
 consume, stop this generic flow. Do not delete, trim, ACK, replay, or allow new
 workers to consume those entries before approval. Use the checked
@@ -1187,9 +1196,9 @@ If an old image has a clean revision label, compare it with the recorded
 authoritative. Never inject the candidate revision into a rollback container.
 
 Keep the candidate checkout and CLI until rollback coordination is complete.
-Use `release_orcest rollout-health --expected-revision "$RELEASE_SHA"` with the
-saved baselines to check Redis/data state—the expected value identifies the
-candidate checker, not the rolled-back services. Verify old runtime image IDs
+Use `release_orcest rollout-health --prefix "$project" --expected-revision
+"$RELEASE_SHA"` with the saved baselines to check Redis/data state—the expected
+value identifies the candidate checker, not the rolled-back services. Verify old runtime image IDs
 and the old template pointer separately as above. The production host CLI was
 never replaced; retain the isolated candidate venv through diagnosis, then
 resume intake one project at a time.

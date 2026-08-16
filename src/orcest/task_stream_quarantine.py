@@ -43,6 +43,18 @@ def _stream_summary(redis: RedisClient, key: str) -> dict[str, int]:
         ) from exc
 
 
+def _live_worker_ids(redis: RedisClient, task_prefix: str) -> list[str]:
+    """Return worker IDs whose liveness heartbeat has not yet expired."""
+    heartbeat_prefix = f"{task_prefix}:workers:heartbeat:" if task_prefix else "workers:heartbeat:"
+    try:
+        keys = {str(key) for key in redis.client.scan_iter(match=f"{heartbeat_prefix}*")}
+    except redis_lib.RedisError as exc:
+        raise TaskStreamQuarantineError(
+            f"could not inspect worker liveness: {type(exc).__name__}"
+        ) from exc
+    return sorted(key.removeprefix(heartbeat_prefix) for key in keys)
+
+
 def _validate_source_key(key: str, task_prefix: str) -> str:
     prefix = f"{task_prefix}:" if task_prefix else ""
     logical = key.removeprefix(prefix)
@@ -61,8 +73,16 @@ def quarantine_task_streams(
     *,
     task_prefix: str,
     quarantine_id: str,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Atomically rename active provider task streams out of worker discovery."""
+    """Atomically rename active provider task streams out of worker discovery.
+
+    Fencing a stream that still has in-flight deliveries orphans the workers'
+    ACKs: ``XACK`` against the renamed key returns zero, which the worker treats
+    as terminal success, while the PEL entry survives inside the quarantined
+    stream and is re-delivered verbatim on restore. Refuse that state unless
+    ``force`` is set for a fleet the operator has already proven drained.
+    """
     if _QUARANTINE_ID_RE.fullmatch(quarantine_id) is None:
         raise TaskStreamQuarantineError("invalid quarantine ID")
     scan_pattern = f"{task_prefix}:tasks:*" if task_prefix else "tasks:*"
@@ -86,6 +106,17 @@ def quarantine_task_streams(
         summary = _stream_summary(redis, source)
         mappings.append({"source": source, "quarantine": destination, **summary})
 
+    live_workers = _live_worker_ids(redis, task_prefix)
+    in_flight_streams = sorted(str(item["source"]) for item in mappings if item["pending"])
+    if not force and (live_workers or in_flight_streams):
+        raise TaskStreamQuarantineError(
+            "refusing to fence task streams while work is in flight: live workers "
+            f"[{','.join(live_workers) or 'none'}], streams with pending deliveries "
+            f"[{','.join(in_flight_streams) or 'none'}]; stop publishers and workers, "
+            "then re-run with --force once the remaining pending entries are known "
+            "to be orphaned"
+        )
+
     pipe = redis.client.pipeline()
     try:
         watch_keys = [value for item in mappings for value in (item["source"], item["quarantine"])]
@@ -96,6 +127,8 @@ def quarantine_task_streams(
                 raise TaskStreamQuarantineError("task stream changed during quarantine preflight")
             if int(cast(Any, pipe.exists(item["quarantine"]))) != 0:
                 raise TaskStreamQuarantineError("quarantine destination already exists")
+        if not force and _live_worker_ids(redis, task_prefix):
+            raise TaskStreamQuarantineError("a worker became live during quarantine preflight")
         pipe.multi()
         for item in mappings:
             pipe.rename(item["source"], item["quarantine"])
@@ -108,7 +141,14 @@ def quarantine_task_streams(
         ) from exc
     finally:
         pipe.reset()
-    return {"ok": True, "operation": "quarantine", "streams": mappings}
+    return {
+        "ok": True,
+        "operation": "quarantine",
+        "forced": force,
+        "live_workers": live_workers,
+        "in_flight_streams": in_flight_streams,
+        "streams": mappings,
+    }
 
 
 def restore_task_streams(
