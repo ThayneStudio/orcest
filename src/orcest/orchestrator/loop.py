@@ -2759,10 +2759,26 @@ def _handle_result(
                     result.task_id,
                 )
             else:
+                # A real, already-performed rotation just lost the ordering
+                # comparison and was dropped. Usually benign (a retry of an
+                # update we already stored), but it is also the signature of
+                # two workers rotating one OAuth account concurrently, and of
+                # any ordering bug in the shared `minted_at` domain. Both are
+                # invisible in an info log, so count it: a rising counter on a
+                # healthy provider is the only warning before the stored blob
+                # holds a consumed refresh token.
                 logger.info(
                     "Ignored stale credential refresh for provider account %s (task %s)",
                     credential_update_account,
                     result.task_id,
+                )
+                provider, _sep, _hash = credential_update_account.partition(":")
+                _increment_provider_counter(
+                    redis,
+                    provider,
+                    "credential_refresh_discarded_stale",
+                    _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS,
+                    logger,
                 )
         else:
             _record_credential_refresh_failure_if_needed(

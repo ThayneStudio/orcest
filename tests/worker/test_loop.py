@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call as mock_call, patch
 import pytest
 
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
+from orcest.shared.credential_handoff import CREDENTIAL_CHECKPOINT_TTL_SECONDS
 from orcest.shared.models import (
     REDACTED_FIELDS,
     TRANSIENT_SUMMARY_PREFIX,
@@ -3648,7 +3649,11 @@ def test_version_failure_restart_republishes_exact_private_credential_checkpoint
     )
     assert checkpoint_key in private_store
     assert diagnostic_marker_key in private_store
-    assert checkpoint_key not in expirations
+    # The checkpoint survives the restart, but on a bounded backstop rather
+    # than forever: it holds a plaintext rotated OAuth blob, and a checkpoint
+    # whose PEL entry is discarded (e.g. by XGROUP DELCONSUMER) can never reach
+    # the terminal path that deletes it. The TTL is far longer than any task.
+    assert expirations[checkpoint_key] == CREDENTIAL_CHECKPOINT_TTL_SECONDS
     assert expirations[diagnostic_marker_key] == _HANDOFF_MARKER_TTL_SECONDS
     public_dlq = next(
         call.args[1]
