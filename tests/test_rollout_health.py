@@ -70,6 +70,31 @@ def test_rollout_health_fails_for_unconsumed_shared_task_stream(fake_redis_clien
     assert {"consumer_groups", "queue_quiescent"} <= failed
 
 
+def test_rollout_health_fails_when_group_has_work_but_no_consumers(fake_redis_client, mocker):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.client.xadd("orcest:tasks:codex", {"id": "task-1"})
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[
+            {
+                "name": "workers",
+                "consumers": 0,
+                "pending": 0,
+                "lag": 1,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["unconsumed_task_streams"] == ["orcest:tasks:codex"]
+    consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
+    assert consumer_groups["passed"] is False
+    assert report["ok"] is False
+
+
 def test_rollout_health_fails_closed_when_stream_inspection_is_denied(fake_redis_client, mocker):
     revision = "f" * 40
     mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)

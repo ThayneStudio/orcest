@@ -38,15 +38,25 @@ def _raw_stream_work(
         if not groups:
             entries = int(cast(Any, redis.client.xlen(stream)))
             return entries, 0, entries, entries > 0, None
-        if any(group.get("pending") is None or group.get("lag") is None for group in groups):
+        if any(
+            group.get("pending") is None
+            or group.get("lag") is None
+            or group.get("consumers") is None
+            for group in groups
+        ):
             return 0, 0, 0, False, f"{stream}: consumer group work is unavailable"
         pending = sum(int(group["pending"]) for group in groups)
         lag = sum(max(int(group["lag"]), 0) for group in groups)
+        unconsumed = any(
+            int(group["consumers"]) == 0
+            and (int(group["pending"]) > 0 or max(int(group["lag"]), 0) > 0)
+            for group in groups
+        )
     except (redis_lib.RedisError, TypeError, ValueError) as exc:
         # Do not include Redis exception text: ACL and connection messages can
         # contain endpoints or other deployment details.
         return 0, 0, 0, False, f"{stream}: {type(exc).__name__}"
-    return pending + lag, pending, lag, False, None
+    return pending + lag, pending, lag, unconsumed, None
 
 
 def _raw_stream_length(redis: RedisClient, stream: str) -> tuple[int, str | None]:
@@ -221,7 +231,7 @@ def collect_rollout_health(
             "consumer_groups",
             not unconsumed_task_streams and not unconsumed_results,
             sorted(unconsumed_task_streams) + ([result_stream] if unconsumed_results else []),
-            "every non-empty work stream has a consumer group",
+            "every work-bearing stream has a consumer group with an active consumer",
         )
     )
     if baseline_dead_letters is not None:
