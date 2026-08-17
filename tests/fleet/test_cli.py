@@ -2120,8 +2120,13 @@ def test_gc_templates_never_destroys_non_template_vms_in_range(runner, cfg_path,
     """C1: a VMID inside the template range is not proof of ownership.
 
     An unrelated (or still-running) VM parked in the template VMID range must be
-    reported and left alone -- only VMs that are genuine orcest worker templates
-    are GC candidates.
+    reported and left alone. Ownership proof is the orcest name prefix, not the
+    Proxmox template flag: the worker and template VMID ranges are validated
+    disjoint, so an in-range `orcest-worker-*` VM is never a live pool worker,
+    and half-baked template residue (created as `orcest-worker-*` and converted
+    only at the last step of a bake) MUST be reclaimable -- otherwise it
+    permanently consumes a slot in a 10-wide range that `rebake` tells the
+    operator to clear with this very command.
     """
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
@@ -2148,13 +2153,17 @@ def test_gc_templates_never_destroys_non_template_vms_in_range(runner, cfg_path,
     result = runner.invoke(fleet, ["gc-templates", "--yes", "--config", cfg_path])
 
     assert result.exit_code == 0, result.output
+    # 9000 (old template) and 9003 (half-baked residue) are orcest-owned and
+    # reclaimable; 9001 is the active template and is never touched.
     destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
-    assert destroyed == {9000}
-    stopped = {call.args[0] for call in mock_px.stop_vm.call_args_list}
-    assert stopped == {9000}
-    assert "Excluded 3 non-template VM(s)" in result.output
-    for excluded in ("postgres-prod", "orcest-worker-9003", "debian-12-base"):
+    assert destroyed == {9000, 9003}
+    # Foreign VMs are never stopped or destroyed, whatever their template flag.
+    for foreign in (9002, 9004):
+        assert foreign not in destroyed
+    assert "not owned by orcest" in result.output
+    for excluded in ("postgres-prod", "debian-12-base"):
         assert excluded in result.output
+    assert "orcest-worker-9003" in result.output
 
 
 def test_gc_templates_requires_confirmation_before_destroying(runner, cfg_path, mocker):
@@ -2622,7 +2631,13 @@ def test_stop_refuses_named_worker_outside_configured_vmid_range(runner, cfg_pat
 
 
 def test_stop_fails_when_drain_leases_cannot_be_cleared(runner, cfg_path, mocker):
-    """C2: a failed lease clear permanently fences surviving workers -- exit non-zero."""
+    """C2: a failed lease clear permanently fences SURVIVING workers -- exit non-zero.
+
+    Only survivors matter. A destroyed VM has no process left to fence, and
+    Step 4's clean_pool_redis clears and verifies its marker immediately after,
+    so reporting destroyed workers here would abort the command (and, through
+    `deploy`, the whole rollout) over leases that are provably gone.
+    """
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
         pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
@@ -2639,6 +2654,12 @@ def test_stop_fails_when_drain_leases_cannot_be_cleared(runner, cfg_path, mocker
         return_value=({"300", "301"}, {}),
     )
     mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle when the drain leases are taken, so both get a lease; 301 then claims
+    # a task before it is destroyed, so it is restarted and SURVIVES holding one.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), set(), {"orcest-worker-301"}],
+    )
 
     def _draining(ssh_target, worker_ids, *, draining):
         if not draining:
@@ -2651,9 +2672,49 @@ def test_stop_fails_when_drain_leases_cannot_be_cleared(runner, cfg_path, mocker
     assert result.exit_code != 0
     assert "failed to clear drain leases" in result.output
     assert "worker drain leases were not cleared" in result.output
-    assert "orcest-worker-300" in result.output
+    # Only the survivor is reported; the destroyed VM is not.
     assert "orcest-worker-301" in result.output
     assert "SREM orcest:pool:draining" in result.output
+
+
+def test_stop_succeeds_when_only_destroyed_workers_had_leases(runner, cfg_path, mocker):
+    """A lease-clear blip on workers that were all destroyed must not fail the stop.
+
+    Regression: the verification covered every drained worker, including the
+    destroyed ones whose markers `clean_pool_redis` SREMs and verifies moments
+    later. A transient blip therefore exited 1 with a no-op SREM remediation --
+    and via `deploy` aborted the rollout at step 2 of 5, after the orchestrators
+    and pool manager were already stopped.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "301"}, {}),
+    )
+    clean_pool = mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    def _draining(ssh_target, worker_ids, *, draining):
+        if not draining:
+            raise RuntimeError("redis blip")
+
+    mocker.patch("orcest.fleet.orchestrator.set_workers_draining", side_effect=_draining)
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "worker drain leases were not cleared" not in result.output
+    # Both VMs were destroyed, so clean_pool_redis owns verifying their markers.
+    assert sorted(clean_pool.call_args.args[1]) == ["300", "301"]
 
 
 def test_stop_fails_when_skipped_worker_lease_survives(runner, cfg_path, mocker):
@@ -2673,6 +2734,12 @@ def test_stop_fails_when_skipped_worker_lease_survives(runner, cfg_path, mocker)
         return_value=({"300"}, {}),
     )
     mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle at drain time so it takes a lease, then claims a task before being
+    # destroyed -- it is restarted and survives, so its lease genuinely fences it.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), {"orcest-worker-300"}],
+    )
     still_held = mocker.patch(
         "orcest.fleet.cli._drain_leases_still_held",
         return_value=["orcest-worker-300"],
@@ -2703,6 +2770,12 @@ def test_stop_fails_when_drain_lease_verification_fails(runner, cfg_path, mocker
         return_value=({"300"}, {}),
     )
     mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle at drain time so it takes a lease, then claims a task before being
+    # destroyed -- it survives holding a lease we cannot verify was cleared.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), {"orcest-worker-300"}],
+    )
     mocker.patch(
         "orcest.fleet.cli._drain_leases_still_held",
         side_effect=RuntimeError("ssh failed"),

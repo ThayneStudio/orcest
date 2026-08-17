@@ -9,5 +9,11 @@
     "noEmit": true,
     "types": ["vitest/globals", "node"]
   },
+  // `extends` inherits `exclude` -- only `files`/`include` are overridden by a
+  // child config. Without clearing it, this project would inherit the base's
+  // "server/**/*.test.ts" exclusion and check exactly nothing, silently
+  // type-checking the 12 server sources a second time instead of the tests.
+  // Verify with: npx tsc -p tsconfig.server.test.json --showConfig
+  "exclude": [],
   "include": ["server"]
 }

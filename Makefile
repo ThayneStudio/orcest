@@ -113,6 +113,9 @@ dev-dashboard:
 	@token="$${DASHBOARD_TOKEN:-dev-dashboard-token}"; \
 	redis_password="$${REDIS_PASSWORD:-$${ORCEST_REDIS_PASSWORD:-}}"; \
 	echo "Dashboard dev UI: http://127.0.0.1:$(DASHBOARD_DEV_VITE_HOST_PORT)/?token=$$token"; \
+	DASHBOARD_TOKEN="$$token" \
+	REDIS_PASSWORD="$$redis_password" \
+	ORCEST_REDIS_PASSWORD="$$redis_password" \
 	docker run --rm $(DASHBOARD_DEV_DOCKER_FLAGS) \
 		$(DASHBOARD_DEV_DOCKER_ARGS) \
 		--user "$(shell id -u):$(shell id -g)" \
@@ -120,9 +123,9 @@ dev-dashboard:
 		$(DASHBOARD_NPM_ENV) \
 		-e REDIS_HOST="$(DASHBOARD_DEV_REDIS_HOST)" \
 		-e REDIS_PORT="$(DASHBOARD_DEV_REDIS_PORT)" \
-		-e REDIS_PASSWORD="$$redis_password" \
-		-e ORCEST_REDIS_PASSWORD="$$redis_password" \
-		-e DASHBOARD_TOKEN="$$token" \
+		-e REDIS_PASSWORD \
+		-e ORCEST_REDIS_PASSWORD \
+		-e DASHBOARD_TOKEN \
 		-e DASHBOARD_REDIS_PREFIXES \
 		-p 127.0.0.1:$(DASHBOARD_DEV_API_HOST_PORT):8080 \
 		-p 127.0.0.1:$(DASHBOARD_DEV_VITE_HOST_PORT):5173 \

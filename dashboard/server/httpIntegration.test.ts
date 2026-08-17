@@ -1020,6 +1020,28 @@ describe("createCoalescedFetch", () => {
     await expect(coalesced()).resolves.toBe("ok");
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
+
+  it("recovers when the fetcher throws synchronously", async () => {
+    // A synchronous throw reaches the cleanup before the in-flight promise has
+    // been assigned. If the identity check is not deferred past that
+    // assignment, the rejected promise is retained and served to every future
+    // caller forever -- the endpoint 503s permanently and the fetcher is never
+    // called again. `mockRejectedValueOnce` cannot catch this: it rejects
+    // asynchronously and so exercises the wrong path.
+    let firstCall = true;
+    const fetcher = vi.fn(() => {
+      if (firstCall) {
+        firstCall = false;
+        throw new Error("synchronous boom");
+      }
+      return Promise.resolve("ok");
+    });
+    const coalesced = createCoalescedFetch(fetcher, 60_000);
+
+    await expect(coalesced()).rejects.toThrow("synchronous boom");
+    await expect(coalesced()).resolves.toBe("ok");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("REST snapshot coalescing", () => {

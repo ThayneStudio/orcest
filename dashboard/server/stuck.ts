@@ -697,26 +697,33 @@ export function pendingTtlState(
 
   const warningAfterSeconds = Math.max(60, lockTtlSeconds);
   const ageSeconds = pendingAgeSeconds(createdAt, nowMs);
+  // Reliable branch: the marker carries created_at, so age is measured, not
+  // inferred, and severity is monotonic in age. Escalating here is what keeps
+  // "critical" reachable at all -- the TTL-inferred branch below cannot produce
+  // it without also firing on a mere policy mismatch.
   if (ageSeconds !== null) {
+    if (expectedTtlSeconds > 0 && ageSeconds >= Math.ceil(expectedTtlSeconds * 0.5)) {
+      return "critical";
+    }
     if (ageSeconds >= warningAfterSeconds) return "warning";
     return null;
   }
 
   if (expectedTtlSeconds <= 0) return null;
 
-  // Legacy pending markers have no created_at. In that case, inferring age from
-  // expected TTL is only trustworthy when the observed TTL is close to the
-  // configured initial TTL. If the dashboard expects a much larger TTL than the
-  // orchestrator actually set, an otherwise fresh marker would look old.
-  // This guard has to run before every TTL-derived inference below: when it sat
-  // between the ratio checks and the elapsed check it only applied inside the
-  // (25%, 50%) band, which made severity non-monotonic in age (a marker went
-  // warning -> null -> warning -> critical as it aged) and still let a fresh
-  // marker be flagged critical whenever the policy TTL disagreed with reality.
+  // Legacy pending markers have no created_at, so age can only be inferred from
+  // the remaining TTL -- and that inference is only trustworthy while the
+  // observed TTL is close to the configured initial TTL. Below half, a low TTL
+  // is ambiguous between "old marker" and "the orchestrator's TTL policy
+  // differs from the dashboard's", so we decline to classify rather than
+  // report a fresh marker as critical.
+  //
+  // Consequence, stated plainly: a legacy marker cannot escalate past warning,
+  // and reports nothing once past the halfway point. That is acceptable because
+  // the population is shrinking to zero -- the orchestrator now stamps
+  // created_at on both PR and issue markers, so every new marker takes the
+  // reliable branch above, and existing ones age out within one TTL.
   if (ttlSeconds < Math.ceil(expectedTtlSeconds * 0.5)) return null;
-
-  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.1)) return "critical";
-  if (ttlSeconds <= Math.ceil(expectedTtlSeconds * 0.25)) return "warning";
 
   const elapsedSeconds = Math.max(0, expectedTtlSeconds - ttlSeconds);
   if (elapsedSeconds >= warningAfterSeconds) return "warning";

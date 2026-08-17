@@ -342,10 +342,18 @@ stop and diagnose; do not destroy active workers.
 recovery state are all read under it, so a missing prefix would gate on an empty
 keyspace. Worker pool state is read under `--pool-prefix`, which defaults to
 `--task-prefix`; pass it explicitly if the pool manager runs with a different
-`ORCEST_REDIS_KEY_PREFIX`. With `--require-quiescent`, an absent project result
-stream or an absent pool keyspace is reported as an inspection failure rather
-than as zero work — the only way to assert a deliberately empty fleet is
-`--expected-pool-size 0`.
+`ORCEST_REDIS_KEY_PREFIX`. With `--require-quiescent`, both an absent project
+result stream and an absent pool keyspace are reported as inspection failures
+rather than as zero work, but they are escaped differently:
+
+- An absent **pool** keyspace is overridable with `--expected-pool-size 0`,
+  which is how you assert a deliberately empty fleet (the rehearsal uses this
+  after the pool is destroyed).
+- An absent **project result stream** is unconditionally fatal. There is no
+  flag for it, and that is deliberate: the orchestrator creates
+  `{prefix}:results` with `mkstream` on its first run, so its absence means
+  either the wrong `--prefix` or an orchestrator that has never started —
+  neither of which should ever gate a deploy as healthy.
 
 If a legacy homogeneous staging pool has backlog on provider streams it cannot
 consume, stop this generic flow. Do not delete, trim, ACK, replay, or allow new

@@ -1016,7 +1016,14 @@ jq -e '.ok == true and .operation == "restore" and (.streams | length) == 6' \
 jq -S '[.streams[] | {source,length,groups,pending,lag}] | sort_by(.source)' \
   "$RELEASE_ROOT/restored-task-streams.json" \
   >"$RELEASE_ROOT/restored-task-stream-inventory.json"
-cmp "$RELEASE_ROOT/quarantined-task-stream-inventory.json" \
+# Compare like with like: the quarantine inventory wraps its stream list in an
+# object carrying the refusal-guard evidence (forced/live_workers/
+# in_flight_streams), so project just the stream list back out before `cmp`.
+# Comparing the wrapper against the bare restore array can never match, which
+# would abort the rehearsal here under `set -e` even on a perfect restore.
+jq -S '.streams' "$RELEASE_ROOT/quarantined-task-stream-inventory.json" \
+  >"$RELEASE_ROOT/quarantined-task-stream-inventory.streams.json"
+cmp "$RELEASE_ROOT/quarantined-task-stream-inventory.streams.json" \
   "$RELEASE_ROOT/restored-task-stream-inventory.json"
 remaining_quarantine_keys="$(ssh orcest@10.20.1.129 \
   'docker exec orcest-redis-redis-1 sh -c '\''redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning --raw --scan --pattern "orcest:quarantine:'"$RELEASE_ID"':tasks:*"'\''')"

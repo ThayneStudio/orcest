@@ -196,17 +196,41 @@ export function createCoalescedFetch<T>(
     if (cached && now() - cached.at < ttlMs) return Promise.resolve(cached.value);
     if (inFlight) return inFlight;
 
-    let promise!: Promise<T>;
-    promise = (async () => {
-      try {
-        const value = await fetcher();
-        cached = { value, at: now() };
-        return value;
-      } finally {
-        if (inFlight === promise) inFlight = null;
-      }
-    })();
+    // `inFlight` is published BEFORE the fetcher runs, so the cleanup below can
+    // always identify and clear it. The obvious `promise = (async () => …)()`
+    // shape cannot: a fetcher that throws SYNCHRONOUSLY reaches the cleanup
+    // while `promise` is still undefined, so the identity check fails,
+    // `inFlight` is never cleared, and the rejected promise is then handed to
+    // every future caller forever -- permanently 503-ing the endpoint.
+    // The fetcher is still invoked synchronously, preserving call-timing.
+    let settle!: (value: T) => void;
+    let fail!: (reason: unknown) => void;
+    const promise = new Promise<T>((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
+    });
     inFlight = promise;
+
+    const release = () => {
+      if (inFlight === promise) inFlight = null;
+    };
+
+    try {
+      Promise.resolve(fetcher()).then(
+        (value) => {
+          cached = { value, at: now() };
+          release();
+          settle(value);
+        },
+        (error) => {
+          release();
+          fail(error);
+        },
+      );
+    } catch (error) {
+      release();
+      fail(error);
+    }
     return promise;
   };
 }

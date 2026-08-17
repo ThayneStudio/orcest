@@ -104,6 +104,21 @@ def _wait_for_worker_drain_quiescence() -> None:
     time.sleep(_DRAIN_QUIESCE_SECONDS)
 
 
+def _is_proxmox_template(vm_info: dict) -> bool:
+    """Return True if Proxmox reports the VM as a converted template.
+
+    Proxmox returns the flag as an integer or a boolean depending on
+    transport, so a bare truthiness test would read the string ``"0"`` as
+    True. Mirrors ``PoolManager._is_proxmox_template``; destructive paths must
+    not parse this more loosely than the pool manager does.
+    """
+    flag = vm_info.get("template", 0)
+    try:
+        return int(flag) == 1
+    except (TypeError, ValueError):
+        return bool(flag)
+
+
 def _drain_leases_still_held(ssh_target: str, worker_ids: list[str]) -> list[str]:
     """Return the worker IDs still present in ``orcest:pool:draining``.
 
@@ -2163,7 +2178,7 @@ def pool_status(config: str) -> None:
     console.print("\n  Scanning for worker VMs...")
     try:
         worker_vms = [
-            vm for vm in px.list_vms(name_prefix="orcest-worker-") if not vm.get("template", False)
+            vm for vm in px.list_vms(name_prefix="orcest-worker-") if not _is_proxmox_template(vm)
         ]
     except Exception as exc:
         console.print(f"  [red]Failed to list VMs[/red]: {exc}")
@@ -2418,7 +2433,7 @@ def destroy_template(vm_id: int, yes: bool, config: str) -> None:
         int(v.get("vmid", 0))
         for v in all_vms
         if v.get("name", "").startswith("orcest-worker-")
-        and not v.get("template", False)
+        and not _is_proxmox_template(v)
         and int(v.get("vmid", 0)) != vm_id
     ]
     if clones:
@@ -2523,10 +2538,17 @@ def gc_templates(dry_run: bool, yes: bool, config: str) -> None:
         console.print(f"[red]Failed to list VMs:[/red] {exc}")
         sys.exit(1)
     # A VMID inside the template range proves nothing on its own: anybody can
-    # create an unrelated VM there. Destructive GC is restricted to VMs that are
-    # genuinely orcest templates (Proxmox template flag + orcest-worker-* name),
-    # mirroring the ownership checks in `stop` and `destroy-template`.
+    # create an unrelated VM there. Ownership proof here is the orcest name
+    # prefix, NOT the Proxmox template flag. `validate_vmid_ranges()` guarantees
+    # the worker and template ranges are disjoint, so an in-range
+    # `orcest-worker-*` VM can never be a live pool worker -- and requiring the
+    # template flag would permanently strand half-baked templates, which are
+    # created as `orcest-worker-template` and only converted at the very last
+    # step of the bake. Those are exactly what GC must reclaim: each one
+    # consumes a slot in a 10-wide range, and once the range fills, `rebake`
+    # tells the operator to run this command.
     in_range_vmids: list[int] = []
+    unconverted: list[str] = []
     foreign: list[str] = []
     for v in all_vms:
         if "vmid" not in v:
@@ -2535,20 +2557,26 @@ def gc_templates(dry_run: bool, yes: bool, config: str) -> None:
         if not (start <= vmid <= end):
             continue
         name = str(v.get("name") or "")
-        if not v.get("template") or not name.startswith("orcest-worker-"):
+        if not name.startswith("orcest-worker-"):
             foreign.append(f"{vmid} ({name or 'unnamed'})")
             continue
+        if not _is_proxmox_template(v):
+            unconverted.append(f"{vmid} ({name})")
         in_range_vmids.append(vmid)
     in_range_vmids.sort()
 
     if foreign:
         console.print(
-            f"  [yellow]Excluded {len(foreign)} non-template VM(s) inside range"
-            f" {start}-{end}[/yellow]: {', '.join(sorted(foreign))}"
+            f"  [yellow]Excluded {len(foreign)} VM(s) inside range"
+            f" {start}-{end} not owned by orcest[/yellow]: {', '.join(sorted(foreign))}"
         )
+        console.print("    These are not orcest worker templates and will never be destroyed.")
+    if unconverted:
         console.print(
-            "    These are not orcest worker templates and will never be destroyed by GC."
+            f"  [yellow]{len(unconverted)} in-range orcest VM(s) are not converted"
+            f" templates[/yellow]: {', '.join(sorted(unconverted))}"
         )
+        console.print("    Treating as half-baked template residue eligible for reclamation.")
 
     candidates = [vmid for vmid in in_range_vmids if vmid != active]
     if not candidates:
@@ -2812,7 +2840,7 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
     worker_vms = [
         v
         for v in worker_vms
-        if not v.get("template") and int(v.get("vmid", 0)) not in protected_template_vmids
+        if not _is_proxmox_template(v) and int(v.get("vmid", 0)) not in protected_template_vmids
     ]
 
     # Destructive lifecycle operations must never rely on a name prefix alone.
@@ -2947,25 +2975,43 @@ def stop(drain_active: bool, yes: bool, config: str) -> None:
     finally:
         if draining_worker_ids:
             # A lease that outlives this command fences the worker forever, so
-            # a clear failure is a command failure -- never a warning. Workers
-            # that were destroyed get their marker verified by clean_pool_redis;
-            # the survivors are verified here.
+            # a clear failure is a command failure -- never a warning.
+            #
+            # Only SURVIVING workers can be fenced, though. A destroyed VM has
+            # no process left to fence, and Step 4's clean_pool_redis SREMs and
+            # verifies its marker immediately after this block. Reporting those
+            # as failures would abort the command -- and, through `deploy`,
+            # abort the whole rollout after the orchestrators and pool manager
+            # are already stopped -- over leases that are provably gone moments
+            # later, with a printed SREM remediation that is a no-op.
+            surviving_worker_ids = [
+                worker_id
+                for worker_id in draining_worker_ids
+                if worker_id.removeprefix("orcest-worker-") not in destroyed
+            ]
             try:
                 set_workers_draining(ssh_target, draining_worker_ids, draining=False)
             except Exception as exc:
                 console.print(f"  [red]failed to clear drain leases[/red]: {exc}")
-                drain_lease_failures = list(draining_worker_ids)
+                drain_lease_failures = list(surviving_worker_ids)
             else:
-                try:
-                    drain_lease_failures = _drain_leases_still_held(ssh_target, draining_worker_ids)
-                except Exception as exc:
-                    console.print(f"  [red]failed to verify drain leases were cleared[/red]: {exc}")
-                    drain_lease_failures = list(draining_worker_ids)
+                if not surviving_worker_ids:
+                    drain_lease_failures = []
                 else:
-                    if drain_lease_failures:
-                        console.print(
-                            "  [red]drain leases are still held after clearing them[/red]"
+                    try:
+                        drain_lease_failures = _drain_leases_still_held(
+                            ssh_target, surviving_worker_ids
                         )
+                    except Exception as exc:
+                        console.print(
+                            f"  [red]failed to verify drain leases were cleared[/red]: {exc}"
+                        )
+                        drain_lease_failures = list(surviving_worker_ids)
+                    else:
+                        if drain_lease_failures:
+                            console.print(
+                                "  [red]drain leases are still held after clearing them[/red]"
+                            )
 
     # Step 4: Clean Redis
     pool_cleanup_failed = False
