@@ -1,7 +1,9 @@
 """Public read-only query API for the monitor service.
 
 Every route except ``/api/v1/health`` requires a bearer token configured in
-``MonitorConfig.readers`` with the ``events:read`` scope (see ``auth.py``).
+``MonitorConfig.readers`` (see ``auth.py``): the events/timeline/work/fleet
+routes require the ``events:read`` scope, and the trace route requires the
+separate ``traces:read`` scope.
 The method gate (only GET/HEAD allowed) runs as pure ASGI middleware ahead
 of FastAPI's routing/auth, so a non-GET/HEAD request is rejected with 405
 before either the router or the auth dependency ever runs.
@@ -15,11 +17,14 @@ not thread-safe, even though SQLite itself enforces read-only via
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from collections import deque
 from contextlib import closing
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from orcest.monitor import db
@@ -32,6 +37,12 @@ _TERMINAL_TYPES = (
     "net.orcest.task.killed",
     "net.orcest.task.reaped",
 )
+
+# Same allowlist as orcest.orchestrator.trace_archiver._TASK_ID_RE: task_id is
+# used to build filesystem paths (index pointer lookup + trace file read), so
+# anything outside this pattern is rejected before it ever touches the
+# filesystem.
+_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
 class _MethodGateMiddleware:
@@ -198,4 +209,30 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
         }
 
     app.include_router(router)
+
+    trace_router = APIRouter(dependencies=[Depends(require_scope("traces:read"))])
+
+    @trace_router.api_route("/api/v1/tasks/{task_id:path}/trace", methods=["GET", "HEAD"])
+    def task_trace(task_id: str, tail: int = Query(default=200, ge=1, le=5000)) -> dict:
+        if not _TASK_ID_RE.match(task_id):
+            raise HTTPException(status_code=400, detail="invalid task_id")
+        archive_path = cfg.trace_archive_path
+        if archive_path is None:
+            raise HTTPException(status_code=404, detail="trace archive disabled")
+        root = Path(archive_path)
+        pointer_path = root / "index" / "by-task-id" / task_id[:2] / task_id
+        try:
+            pointer_content = pointer_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            raise HTTPException(status_code=404, detail="unknown task") from None
+        resolved = (root / pointer_content).resolve()
+        if not resolved.is_relative_to(root.resolve()):
+            raise HTTPException(status_code=404, detail="unknown task")
+        if not resolved.is_file():
+            raise HTTPException(status_code=404, detail="unknown task")
+        with open(resolved, encoding="utf-8") as f:
+            lines = deque(f, maxlen=tail)
+        return {"task_id": task_id, "lines": [line.rstrip("\n") for line in lines]}
+
+    app.include_router(trace_router)
     return app
