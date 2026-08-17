@@ -681,8 +681,8 @@ class TestProxmoxConfigIsLocalhost:
 class TestMaxTaskDurationDefault:
     """H2-conc: the force-kill threshold must exceed the runner timeout.
 
-    A default below the runner's own timeout (RunnerConfig.timeout, 5400s)
-    makes the pool reap healthy long-running tasks before they can finish.
+    A default below the runner's own timeout (RunnerConfig.timeout) makes
+    the pool reap healthy long-running tasks before they can finish.
     """
 
     def test_default_exceeds_runner_timeout(self):
@@ -691,12 +691,26 @@ class TestMaxTaskDurationDefault:
         assert PoolConfig().max_task_duration > RunnerConfig().timeout
 
     def test_default_value(self):
-        # 5400 (runner timeout) + 1800 (grace) = 7200s. See config comment.
-        assert PoolConfig().max_task_duration == 7200
+        from orcest.shared.config import RunnerConfig
+
+        # RunnerConfig().timeout (runner ceiling) + 3600 (grace) = 25200s.
+        # See config comment.
+        assert PoolConfig().max_task_duration == RunnerConfig().timeout + 3600
+        assert PoolConfig().max_task_duration == 25200
 
     def test_load_legacy_config_default(self, tmp_path):
         """A config without an explicit max_task_duration gets the new default."""
         path = tmp_path / "config.yaml"
         path.write_text(yaml.dump({"pool": {"size": 2}}))
         cfg = load_config(path)
-        assert cfg.pool.max_task_duration == 7200
+        assert cfg.pool.max_task_duration == PoolConfig().max_task_duration
+
+    def test_activity_stale_after_default(self):
+        assert PoolConfig().activity_stale_after == 300
+
+    def test_load_legacy_config_activity_stale_after_default(self, tmp_path):
+        """A config without an explicit activity_stale_after gets the new default."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        cfg = load_config(path)
+        assert cfg.pool.activity_stale_after == 300

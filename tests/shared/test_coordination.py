@@ -168,11 +168,17 @@ def test_compute_pending_task_ttl_uses_runner_values():
 
 
 def test_compute_pending_task_ttl_reflects_non_default_values():
-    """Non-default timeout/max_retries produce a larger TTL than the default constant."""
+    """A larger timeout/max_retries config produces a larger TTL than a smaller one.
+
+    Compares two explicit RunnerConfig instances rather than the mutable
+    RunnerConfig() default, so this test doesn't silently break every time
+    the default wall-clock ceiling changes (see RunnerConfig.timeout).
+    """
+    smaller = RunnerConfig(timeout=900, max_retries=2, retry_backoff=10)
     rc = RunnerConfig(timeout=3600, max_retries=5, retry_backoff=15)
     ttl = compute_pending_task_ttl(rc)
     assert ttl == 3600 * 5 + 15 * 4 + 300
-    assert ttl > compute_pending_task_ttl(RunnerConfig())
+    assert ttl > compute_pending_task_ttl(smaller)
 
 
 def test_pending_task_metadata_round_trip(fake_redis_client):

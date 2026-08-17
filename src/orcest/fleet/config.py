@@ -201,11 +201,17 @@ class PoolConfig:
     # worker_backend/worker_runner_* configuration exactly.
     worker_profiles: list[WorkerProfileConfig] = field(default_factory=list)
     # Force-kill threshold for an active worker VM. MUST exceed the worker's
-    # RunnerConfig.timeout (default 5400s) plus a grace window, otherwise the
+    # RunnerConfig.timeout (default 21600s) plus a grace window, otherwise the
     # pool reaps HEALTHY long-running tasks before they can finish. Default =
-    # 5400 (runner timeout) + 1800 (grace) = 7200s. Raise both together if you
+    # 21600 (runner timeout) + 3600 (grace) = 25200s. Raise both together if you
     # raise the runner timeout (see project memory: pool_max_task_duration_vs_runner_timeout).
-    max_task_duration: int = 7200  # seconds before force-kill (> runner timeout + grace)
+    max_task_duration: int = 25200  # seconds before force-kill (> runner timeout + grace)
+    # Seconds since the last activity-watchdog heartbeat write to
+    # workers:activity:{worker_id} before the pool treats a worker as stale
+    # for fleet-health purposes. Distinct from max_task_duration's hard
+    # force-kill ceiling -- this feeds the pool's health/observability view,
+    # not a direct kill decision (see spec §11 config defaults).
+    activity_stale_after: int = 300
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
@@ -609,7 +615,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_runner_type=str(pl.get("worker_runner_type", "") or ""),
         worker_runner_mode=str(pl.get("worker_runner_mode", "") or ""),
         worker_profiles=worker_profiles,
-        max_task_duration=pl.get("max_task_duration", 7200),
+        max_task_duration=pl.get("max_task_duration", 25200),
+        activity_stale_after=pl.get("activity_stale_after", 300),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
@@ -699,6 +706,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
                 for profile in config.pool.worker_profiles
             ],
             "max_task_duration": config.pool.max_task_duration,
+            "activity_stale_after": config.pool.activity_stale_after,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,
             "expected_image_gpg_key": config.pool.expected_image_gpg_key,

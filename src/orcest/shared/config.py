@@ -64,15 +64,35 @@ class LabelConfig:
 
 
 @dataclass
+class WatchdogConfig:
+    """Activity watchdog settings (spec §11 config defaults).
+
+    ``enabled: false`` reproduces pre-watchdog behavior exactly: a fixed
+    wall-clock timeout at ``RunnerConfig.timeout`` and nothing else. This is
+    the rollback lever.
+    """
+
+    enabled: bool = True
+    sample_interval: float = 30.0
+    startup_grace: float = 600.0
+    idle_window: float = 600.0
+    waiting_grace: float = 1800.0
+    loop_exact_threshold: int = 4
+    loop_error_threshold: int = 3
+    loop_pingpong_threshold: int = 6
+
+
+@dataclass
 class RunnerConfig:
     type: str = "claude"
-    timeout: int = 5400  # 90 minutes
+    timeout: int = 21600  # 6 hours (ceiling; the watchdog is expected to end most tasks earlier)
     max_retries: int = 3
     retry_backoff: int = 10  # seconds between retries
     # Optional model the worker passes to the Claude CLI. Empty means no
     # --model flag is passed, so the CLI/account default applies.
     model: str = ""
     extra: dict[str, str] = field(default_factory=dict)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
 
 
 @dataclass
@@ -125,6 +145,21 @@ class OrchestratorConfig:
     # Env var name the write token is read from at process start (not the
     # token itself -- never store secrets directly in YAML/dataclass fields).
     monitor_write_token_env: str = "MONITOR_WRITE_TOKEN"
+    # Fleet-health kill-pressure gate (YAML block `fleet_health:`). Governs
+    # how the pool's activity watchdog escalation may kill worker VMs beyond
+    # a lone CEILING timeout: STUCK/LOOPING kills are throttled by both a
+    # per-window pressure gate and a rolling hourly budget so a systemic
+    # issue (e.g. a bad model rollout) can't be misread as many independent
+    # stalls and mass-kill the fleet. CEILING kills are exempt from both.
+    # Minimum concurrent kill-worthy tasks (within pressure_window) before
+    # the pressure gate opens.
+    pressure_min_tasks: int = 3
+    # Seconds over which pressure_min_tasks is evaluated.
+    pressure_window: int = 600
+    # Seconds the pressure gate, once open, stays open (avoids flapping).
+    pressure_hold: int = 900
+    # Rolling-hour ceiling on non-CEILING (STUCK/LOOPING) kills fleet-wide.
+    max_kills_per_hour: int = 6
 
 
 @dataclass
@@ -155,6 +190,24 @@ def _safe_int(value: Any, field_name: str) -> int:
     except (ValueError, TypeError) as exc:
         raise ValueError(
             f"Config field '{field_name}' has value {value!r} which cannot be converted to int."
+        ) from exc
+
+
+def _safe_float(value: Any, field_name: str) -> float:
+    """Convert a value to float with a clear error message on failure.
+
+    Same YAML-edge-case handling as ``_safe_int``, but for the watchdog's
+    fractional-second fields (sample_interval, startup_grace, etc.).
+    """
+    if value is None:
+        raise ValueError(
+            f"Config field '{field_name}' is explicitly set to null but a number is required."
+        )
+    try:
+        return float(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Config field '{field_name}' has value {value!r} which cannot be converted to float."
         ) from exc
 
 
@@ -197,6 +250,51 @@ def _safe_bool(value: Any, field_name: str) -> bool:
             "Use an unquoted YAML boolean (true or false)."
         )
     return value
+
+
+def _build_watchdog_config(runner_raw: dict[str, Any]) -> WatchdogConfig:
+    """Parse the optional ``runner.watchdog:`` block into a WatchdogConfig.
+
+    Absent block (or an empty ``runner:`` section) yields an all-default
+    WatchdogConfig (``enabled: True``), matching the RunnerConfig pattern of
+    only overriding fields explicitly present in YAML. Shared by both the
+    orchestrator and worker config loaders so the two stay in lockstep.
+    """
+    watchdog_raw = {k.replace("-", "_"): v for k, v in _safe_dict(runner_raw, "watchdog").items()}
+    _defaults = WatchdogConfig()
+    return WatchdogConfig(
+        enabled=_safe_bool(
+            watchdog_raw.get("enabled", _defaults.enabled), "runner.watchdog.enabled"
+        ),
+        sample_interval=_safe_float(
+            watchdog_raw.get("sample_interval", _defaults.sample_interval),
+            "runner.watchdog.sample_interval",
+        ),
+        startup_grace=_safe_float(
+            watchdog_raw.get("startup_grace", _defaults.startup_grace),
+            "runner.watchdog.startup_grace",
+        ),
+        idle_window=_safe_float(
+            watchdog_raw.get("idle_window", _defaults.idle_window),
+            "runner.watchdog.idle_window",
+        ),
+        waiting_grace=_safe_float(
+            watchdog_raw.get("waiting_grace", _defaults.waiting_grace),
+            "runner.watchdog.waiting_grace",
+        ),
+        loop_exact_threshold=_safe_int(
+            watchdog_raw.get("loop_exact_threshold", _defaults.loop_exact_threshold),
+            "runner.watchdog.loop_exact_threshold",
+        ),
+        loop_error_threshold=_safe_int(
+            watchdog_raw.get("loop_error_threshold", _defaults.loop_error_threshold),
+            "runner.watchdog.loop_error_threshold",
+        ),
+        loop_pingpong_threshold=_safe_int(
+            watchdog_raw.get("loop_pingpong_threshold", _defaults.loop_pingpong_threshold),
+            "runner.watchdog.loop_pingpong_threshold",
+        ),
+    )
 
 
 # Provider-specific env var name candidates (for credential fallback when omitted
@@ -578,6 +676,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in _safe_dict(runner_raw, "extra").items()
         },
+        watchdog=_build_watchdog_config(runner_raw),
     )
 
     # Default runner backend
@@ -683,6 +782,26 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         raw.get("monitor_write_token_env"), "monitor_write_token_env", "MONITOR_WRITE_TOKEN"
     ) or "MONITOR_WRITE_TOKEN"
 
+    # Fleet-health kill-pressure gate. Absent block -> spec §11 defaults.
+    fleet_health_raw = _safe_dict(raw, "fleet_health")
+    _fleet_health_defaults = OrchestratorConfig()
+    pressure_min_tasks = _safe_int(
+        fleet_health_raw.get("pressure_min_tasks", _fleet_health_defaults.pressure_min_tasks),
+        "fleet_health.pressure_min_tasks",
+    )
+    pressure_window = _safe_int(
+        fleet_health_raw.get("pressure_window", _fleet_health_defaults.pressure_window),
+        "fleet_health.pressure_window",
+    )
+    pressure_hold = _safe_int(
+        fleet_health_raw.get("pressure_hold", _fleet_health_defaults.pressure_hold),
+        "fleet_health.pressure_hold",
+    )
+    max_kills_per_hour = _safe_int(
+        fleet_health_raw.get("max_kills_per_hour", _fleet_health_defaults.max_kills_per_hour),
+        "fleet_health.max_kills_per_hour",
+    )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -702,6 +821,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         trace_archive_path=trace_archive_path,
         monitor_ingest_url=monitor_ingest_url,
         monitor_write_token_env=monitor_write_token_env,
+        pressure_min_tasks=pressure_min_tasks,
+        pressure_window=pressure_window,
+        pressure_hold=pressure_hold,
+        max_kills_per_hour=max_kills_per_hour,
     )
 
     # Validate required fields
@@ -777,6 +900,7 @@ def load_worker_config(path: str | Path) -> WorkerConfig:
             _safe_str(k, "runner.extra key"): _safe_str(v, f"runner.extra[{k!r}]")
             for k, v in runner_extra_raw.items()
         },
+        watchdog=_build_watchdog_config(runner_raw),
     )
 
     # Backend — default from runner.type when not explicitly set
