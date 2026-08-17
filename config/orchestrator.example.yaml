@@ -62,3 +62,14 @@ providers:
 # process start (never store the token itself in this file).
 # monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 # monitor_write_token_env: "MONITOR_WRITE_TOKEN"
+
+# Fleet-health kill-pressure gate for the activity watchdog's STUCK/LOOPING
+# escalation (CEILING kills are exempt from this gate and its budget). Keeps
+# a systemic issue (e.g. a bad model rollout) from reading as many
+# independent stalls and mass-killing the fleet. Values below are the
+# defaults; uncomment to override.
+# fleet_health:
+#   pressure_min_tasks: 3    # concurrent kill-worthy tasks within pressure_window before the gate opens
+#   pressure_window: 600     # seconds over which pressure_min_tasks is evaluated
+#   pressure_hold: 900       # seconds the gate stays open once triggered
+#   max_kills_per_hour: 6    # rolling-hour ceiling on non-CEILING kills fleet-wide
