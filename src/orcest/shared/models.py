@@ -129,6 +129,7 @@ class Task:
     # anchored to the configured credential even when ``credential`` carries a
     # later OAuth rotation.
     provider_account: str = ""
+    attempt: int = 0  # orchestrator cross-SHA total-attempt counter at enqueue (spec §8)
 
     def __post_init__(self) -> None:
         require_valid_provider_name(self.provider)
@@ -173,6 +174,7 @@ class Task:
             "credential": self.credential,
             "model": self.model or "",
             "provider_account": self.provider_account,
+            "attempt": str(self.attempt),
         }
 
     @classmethod
@@ -225,6 +227,7 @@ class Task:
             credential=credential_in,
             model=model_in,
             provider_account=data.get("provider_account", ""),
+            attempt=int(data.get("attempt", "0") or "0"),
         )
 
     @classmethod
@@ -254,6 +257,7 @@ class Task:
         # on publish failure/None paths, caller calls task_completed to rollback.
         task_id: str | None = None,
         provider_account: str = "",
+        attempt: int = 0,
     ) -> "Task":
         """Factory with auto-generated ID and timestamp.
 
@@ -291,6 +295,7 @@ class Task:
             credential=effective_credential,
             model=model,
             provider_account=provider_account,
+            attempt=attempt,
         )
 
     def to_safe_dict(self) -> dict[str, str]:

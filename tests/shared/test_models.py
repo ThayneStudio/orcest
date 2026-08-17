@@ -480,3 +480,14 @@ def test_safe_dict_supports_dead_letter_redaction_paths():
     # Metadata and non-secrets still present for recovery/display
     assert dl_fields["dead_letter_reason"].startswith("Exceeded")
     assert dl_fields["id"] == task.id
+
+
+def test_task_attempt_roundtrip_and_legacy_default():
+    task = _make_task(attempt=3)
+    assert task.attempt == 3
+    d = task.to_dict()
+    assert d["attempt"] == "3"
+    assert Task.from_dict(d).attempt == 3
+    # legacy payload without the key
+    del d["attempt"]
+    assert Task.from_dict(d).attempt == 0
