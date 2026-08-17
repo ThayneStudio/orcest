@@ -849,7 +849,10 @@ class TestExecuteTask:
         assert result.status == ResultStatus.COMPLETED
 
         stream = f"output:{local_worker_config.worker_id}"
-        calls = mock_redis.xadd_capped.call_args_list
+        # Filter to the output stream only: xadd_capped is also used to spool
+        # task lifecycle events (net.orcest.task.*) onto a separate "events"
+        # stream on the same mock, which would otherwise interleave here.
+        calls = [c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == stream]
 
         # First call should be task_start marker
         first_call_args = calls[0][0]

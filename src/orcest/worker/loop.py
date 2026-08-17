@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import redis as redis_py
 import yaml
@@ -45,6 +45,7 @@ from orcest.shared.credential_handoff import (
     terminal_credential_handoff_once as _terminal_credential_handoff_once,
     version_credential_checkpoint as _version_credential_checkpoint,
 )
+from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
@@ -2247,8 +2248,29 @@ def _execute_task(
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
     output_stream, output_stream_is_raw = _task_output_stream(task, config)
+    event_publisher = EventPublisher(redis)
 
-    def publish_task_end(status: ResultStatus) -> None:
+    def _emit(event_type: str, data: dict[str, Any] | None = None) -> None:
+        try:
+            event_publisher.publish(
+                make_event(
+                    event_type,
+                    source_project=task.key_prefix or "default",
+                    task_id=task.id,
+                    repo=task.repo,
+                    resource_type=task.resource_type,
+                    resource_id=task.resource_id,
+                    attempt=task.attempt,
+                    head_sha=task.snapshot_head_sha,
+                    worker_id=config.worker_id,
+                    provider=task.provider,
+                    data=data,
+                )
+            )
+        except Exception:
+            logger.warning("Failed to emit %s event", event_type, exc_info=True)
+
+    def publish_task_end(status: ResultStatus, summary: str = "") -> None:
         try:
             _publish_task_output(
                 redis,
@@ -2263,6 +2285,17 @@ def _execute_task(
             )
         except Exception:
             logger.warning("Failed to publish task_end marker to Redis", exc_info=True)
+        if status == ResultStatus.COMPLETED:
+            _emit("net.orcest.task.completed")
+        else:
+            _emit(
+                "net.orcest.task.failed",
+                {
+                    "status": status.value,
+                    "transient": summary.startswith(TRANSIENT_SUMMARY_PREFIX),
+                    "summary_head": summary[:200],
+                },
+            )
 
     try:
         # Publish task start marker (non-critical; don't fail the task).
@@ -2289,22 +2322,25 @@ def _execute_task(
         except Exception:
             logger.warning("Failed to publish task_start marker to Redis", exc_info=True)
 
+        _emit("net.orcest.task.started")
+
         try:
             is_stale, stale_reason = _validate_pr_task_snapshot(task, logger)
         except Exception as exc:
             duration = int(time.monotonic() - start)
-            publish_task_end(ResultStatus.FAILED)
+            snapshot_summary = f"{TRANSIENT_SUMMARY_PREFIX}GitHub snapshot validation failed: {exc}"
+            publish_task_end(ResultStatus.FAILED, snapshot_summary)
             return _task_result(
                 task,
                 config,
                 ResultStatus.FAILED,
                 task.branch,
-                f"{TRANSIENT_SUMMARY_PREFIX}GitHub snapshot validation failed: {exc}",
+                snapshot_summary,
                 duration,
             )
         if is_stale:
             duration = int(time.monotonic() - start)
-            publish_task_end(ResultStatus.STALE)
+            publish_task_end(ResultStatus.STALE, stale_reason)
             return _task_result(
                 task,
                 config,
@@ -2320,16 +2356,17 @@ def _execute_task(
             workspace_head_sha = workspace.current_head_sha()
             if workspace_head_sha != task.snapshot_head_sha:
                 duration = int(time.monotonic() - start)
-                publish_task_end(ResultStatus.STALE)
+                stale_summary = (
+                    f"Workspace HEAD {workspace_head_sha} did not match task snapshot "
+                    f"{task.snapshot_head_sha}; dropping stale task."
+                )
+                publish_task_end(ResultStatus.STALE, stale_summary)
                 return _task_result(
                     task,
                     config,
                     ResultStatus.STALE,
                     task.branch,
-                    (
-                        f"Workspace HEAD {workspace_head_sha} did not match task snapshot "
-                        f"{task.snapshot_head_sha}; dropping stale task."
-                    ),
+                    stale_summary,
                     duration,
                 )
 
@@ -2421,7 +2458,7 @@ def _execute_task(
         ):
             summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
 
-        publish_task_end(status)
+        publish_task_end(status, summary)
 
         return _task_result(
             task,
@@ -2441,19 +2478,20 @@ def _execute_task(
         duration = int(time.monotonic() - start)
         logger.error(f"Task execution failed: {e}", exc_info=True)
 
-        publish_task_end(ResultStatus.FAILED)
-
         # Infrastructure failures (clone timeout, network) are transient —
         # the orchestrator will retry without burning an attempt slot.
         is_transient = isinstance(e, WorkspaceError) and e.transient
         prefix = TRANSIENT_SUMMARY_PREFIX if is_transient else ""
+        exc_summary = f"{prefix}Worker exception: {e}"
+
+        publish_task_end(ResultStatus.FAILED, exc_summary)
 
         return _task_result(
             task,
             config,
             ResultStatus.FAILED,
             task.branch,
-            f"{prefix}Worker exception: {e}",
+            exc_summary,
             duration,
         )
 
