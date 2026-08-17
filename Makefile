@@ -64,7 +64,7 @@ check-dashboard-clean-copy: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,test -f package.json && test -f scripts/check-node-version.mjs && test ! -e node_modules && test ! -e dist && test ! -e build && touch .clean-copy-write-check && rm .clean-copy-write-check && npm run check:node)
 
 test-dashboard: check-dashboard-tracked
-	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm exec tsc -- -p tsconfig.json --noEmit --pretty false && npm test && npm run build && npm run check:bundle-runtime)
+	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm run typecheck && npm test && npm run build && npm run check:bundle-runtime)
 
 # Dependency audit, deliberately OUTSIDE the correctness chain above. `npm audit`
 # queries the live registry, so a brand-new advisory against a transitive dev

@@ -1,0 +1,13 @@
+// Type-checks the server test sources, which tsconfig.server.json must
+// exclude so they are never emitted into build/ (see the comment there).
+// Without this project nothing would type-check them at all: tsconfig.json
+// covers only `src`, and `npm run build` compiles tsconfig.server.json.
+// noEmit, so this never contributes output to the runtime image.
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["vitest/globals", "node"]
+  },
+  "include": ["server"]
+}
