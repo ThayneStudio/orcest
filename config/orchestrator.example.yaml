@@ -56,3 +56,10 @@ providers:
 # Workers that have the CLI for a provider baked will execute tasks for it;
 # workers that do not will early-reject with permanent FAILED + "rebake the
 # worker image to include <provider> CLI". Safe mixed claude + new providers.
+
+# Monitor ingest (EventRelay). Unset/null disables the relay -- orcest is
+# otherwise unaffected. The write token is read from the named env var at
+# process start (never store the token itself in this file).
+# monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
+# monitor_write_token_env: "MONITOR_WRITE_TOKEN"
+# events_maxlen: 50000
