@@ -443,6 +443,19 @@ class RedisClient:
         result: int = self._client.delete(*fq_keys)  # type: ignore[assignment]
         return result
 
+    def set_ex_raw(self, fq_key: str, value: str | int, ttl: int) -> None:
+        """SET key value EX ttl using a fully-qualified key."""
+        self._client.set(fq_key, value, ex=ttl)
+
+    def incr_raw(self, fq_key: str) -> int:
+        """INCR using a fully-qualified key."""
+        result: int = self._client.incr(fq_key)  # type: ignore[assignment]
+        return result
+
+    def expire_raw(self, fq_key: str, seconds: int) -> None:
+        """EXPIRE key seconds using a fully-qualified key."""
+        self._client.expire(fq_key, seconds)
+
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.
 
