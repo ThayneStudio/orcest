@@ -160,21 +160,30 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
                 " ORDER BY time DESC, rowid DESC LIMIT 1"
             ).fetchone()
             placeholders = ",".join("?" * len(_TERMINAL_TYPES))
-            # Per subject, "latest" is determined by (time, rowid) -- `time`
-            # is only second-resolution RFC3339, so several events for the
-            # same task can share a timestamp; rowid (monotonic insertion
-            # order) breaks the tie so we pick the truly-last event rather
-            # than any non-terminal event that happens to share the max
-            # timestamp with a later terminal one.
+            # Terminal states are absorbing: a task_id never becomes active
+            # again once a completed/failed/killed/reaped event exists for
+            # it, regardless of arrival order (multiple producers -- worker
+            # terminal events, the reaper, periodic task.activity -- can
+            # emit for the same subject, and `time` is only second-resolution
+            # RFC3339 so a late-arriving non-terminal event can share a
+            # timestamp with an earlier terminal one). So classification is
+            # "has >=1 task.% event AND zero terminal events" via NOT EXISTS,
+            # which is immune to insertion order. Among the (necessarily
+            # non-terminal, since the subject has no terminal event at all)
+            # rows for a qualifying subject, rowid/time only pick which one
+            # to show as last_type/time -- they never affect classification.
             active_rows = conn.execute(
                 "SELECT subject, type, time FROM events e"
                 " WHERE type LIKE 'net.orcest.task.%'"
+                "   AND NOT EXISTS ("
+                "     SELECT 1 FROM events t"
+                f"     WHERE t.subject = e.subject AND t.type IN ({placeholders})"
+                "   )"
                 "   AND e.rowid = ("
                 "     SELECT rowid FROM events"
                 "     WHERE subject = e.subject AND type LIKE 'net.orcest.task.%'"
                 "     ORDER BY time DESC, rowid DESC LIMIT 1"
                 "   )"
-                f"   AND type NOT IN ({placeholders})"
                 " ORDER BY time DESC, rowid DESC",
                 _TERMINAL_TYPES,
             ).fetchall()
