@@ -68,7 +68,10 @@ def _envelope(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def create_query_app(cfg: MonitorConfig) -> FastAPI:
-    app = FastAPI(openapi_url="/api/v1/openapi.json")
+    # spec §10 enumerates the public listener's exact endpoints; unauthenticated
+    # Swagger UI / ReDoc HTML is not among them, so both are disabled here.
+    # openapi_url stays reachable -- it's the consumer contract, not a UI.
+    app = FastAPI(openapi_url="/api/v1/openapi.json", docs_url=None, redoc_url=None)
     app.state.cfg = cfg
     app.add_middleware(_MethodGateMiddleware)
 
