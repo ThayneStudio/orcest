@@ -1080,3 +1080,88 @@ def test_next_monotonic_version_uses_shared_redis_clock(fake_redis_client):
 
     assert first > 1_000_000_000_000_000
     assert second > first
+
+
+# Tests for raw helper methods (B2)
+# ---------------------------------------------------------------------------
+
+
+def test_set_ex_raw_and_get_raw_round_trip(fake_redis_client):
+    """set_ex_raw and get_raw round-trip with TTL visible via underlying client."""
+    rc = fake_redis_client
+    fq_key = "orcest:fleet:pressure"
+
+    # Set via raw method
+    rc.set_ex_raw(fq_key, "heavy", ttl=300)
+
+    # Get via raw method
+    val = rc.get_raw(fq_key)
+    assert val == "heavy"
+
+    # TTL visible via underlying client
+    ttl = rc.client.ttl(fq_key)
+    assert 0 < ttl <= 300
+
+
+def test_incr_raw_twice_returns_two(fake_redis_client):
+    """incr_raw called twice increments to 2."""
+    rc = fake_redis_client
+    fq_key = "orcest:fleet:kill_budget:202408171000"
+
+    first = rc.incr_raw(fq_key)
+    assert first == 1
+
+    second = rc.incr_raw(fq_key)
+    assert second == 2
+
+
+def test_hgetall_raw_returns_hset_raw_writes(fake_redis_client):
+    """hgetall_raw returns what hset_raw wrote."""
+    rc = fake_redis_client
+    fq_key = "workers:activity:orcest-worker-1"
+
+    # Write via hset_raw
+    rc.hset_raw(fq_key, "task_id", "task-123")
+    rc.hset_raw(fq_key, "timestamp", "1234567890")
+
+    # Read via hgetall_raw
+    data = rc.hgetall_raw(fq_key)
+    assert data["task_id"] == "task-123"
+    assert data["timestamp"] == "1234567890"
+
+
+def test_expire_raw_sets_ttl(fake_redis_client):
+    """expire_raw sets TTL on a key."""
+    rc = fake_redis_client
+    fq_key = "orcest:fleet:pressure"
+
+    # Set a key without expiry
+    rc.client.set(fq_key, "value")
+
+    # Verify no TTL initially
+    initial_ttl = rc.client.ttl(fq_key)
+    assert initial_ttl == -1
+
+    # Set TTL via expire_raw
+    rc.expire_raw(fq_key, 200)
+
+    # Verify TTL is set
+    ttl = rc.client.ttl(fq_key)
+    assert 0 < ttl <= 200
+
+
+def test_raw_methods_do_not_prefix_in_prefixed_client(fake_redis_client):
+    """Raw methods never prefix keys, even in a prefixed-client instance."""
+    rc = fake_redis_client
+
+    # The fixture is a prefixed client with prefix "test:"
+    # Write a literal key "k" via set_ex_raw
+    rc.set_ex_raw("k", "v", ttl=300)
+
+    # Read the literal key directly from underlying client
+    val = rc.client.get("k")
+    assert val == "v"
+
+    # Verify that the prefixed key does not exist
+    val_prefixed = rc.client.get(rc._prefix + "k")
+    assert val_prefixed is None
