@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from orcest.fleet.config import FleetConfig, PoolConfig, ProxmoxConfig, WorkerProfileConfig
-from orcest.fleet.pool_manager import PoolManager
+from orcest.fleet.pool_manager import (
+    REAP_REASON_DONE_CLEANUP,
+    REAP_REASON_ORPHAN_PEL,
+    PoolManager,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -295,7 +299,7 @@ class TestCheckDoneWorkers:
             destroyed = manager._check_done_workers()
 
         assert destroyed == [300]
-        coordinate.assert_called_once_with(300)
+        coordinate.assert_called_once_with(300, reason=REAP_REASON_DONE_CLEANUP)
         proxmox.destroy_vm.assert_called_once_with(300)
         redis.delete.assert_any_call("pool:done:orcest-worker-300")
 
@@ -307,7 +311,7 @@ class TestCheckDoneWorkers:
             destroyed = manager._check_done_workers()
 
         assert destroyed == []
-        coordinate.assert_called_once_with(300)
+        coordinate.assert_called_once_with(300, reason=REAP_REASON_DONE_CLEANUP)
         proxmox.stop_vm.assert_called_once_with(300)
         proxmox.destroy_vm.assert_not_called()
         redis.delete.assert_not_called()
@@ -1937,7 +1941,7 @@ class TestHealthCheckReapCoordination:
             events.append("stopped")
             return True
 
-        def coordinated(_vm_id, elapsed_seconds=None):
+        def coordinated(_vm_id, reason=None, elapsed_seconds=None):
             assert events == ["stopped"]
             events.append("redis-coordinated")
             return True
@@ -1999,7 +2003,7 @@ class TestHealthCheckReapCoordination:
             block_ms=None,
         )
 
-        assert manager._coordinate_reaped_vm(305) is True
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is True
 
         rows = rc.client.xrevrange("test:dead-letter", count=10)
         assert len(rows) == 1
@@ -2045,7 +2049,7 @@ class TestHealthCheckReapCoordination:
         monkeypatch.setattr(rc, "xack_raw", fail_ack)
         monkeypatch.setattr(rc.client, "xgroup_delconsumer", track_delconsumer)
 
-        assert manager._coordinate_reaped_vm(305) is False
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is False
         assert "test:tasks:claude" not in deleted_consumers
         assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
         assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 1
@@ -2054,7 +2058,7 @@ class TestHealthCheckReapCoordination:
         assert rc.client.ttl(receipt_keys[0]) == -1
 
         monkeypatch.setattr(rc, "xack_raw", original_ack)
-        assert manager._coordinate_reaped_vm(305) is True
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is True
         assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
         assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
 
@@ -2082,7 +2086,7 @@ class TestHealthCheckReapCoordination:
 
         monkeypatch.setattr(rc, "xack_raw", apply_then_lose_response)
 
-        assert manager._coordinate_reaped_vm(305) is True
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is True
         assert len(rc.client.xrevrange("test:dead-letter", count=10)) == 1
         assert rc.client.xpending("test:tasks:claude", CONSUMER_GROUP)["pending"] == 0
         assert list(rc.client.scan_iter(match="test:dead-letter:handoff:*")) == []
@@ -2199,7 +2203,7 @@ class TestHealthCheckReapCoordination:
         assert checkpoint_ttl > HANDOFF_MARKER_TTL_SECONDS
         assert checkpoint_ttl <= CREDENTIAL_CHECKPOINT_TTL_SECONDS
 
-        assert manager._coordinate_reaped_vm(305) is True
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is True
 
         rows = rc.client.xrevrange("test:results", count=10)
         assert len(rows) == 1
@@ -2287,7 +2291,7 @@ class TestHealthCheckReapCoordination:
         marker = handoff_marker_key("test:results", "test:tasks:claude", entry_id, task.id)
         rc.client.set(marker, f"{result_id}|{fingerprint}")
 
-        assert manager._coordinate_reaped_vm(305) is True
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is True
 
         assert len(rc.client.xrevrange("test:results", count=10)) == 1
         assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
@@ -2354,7 +2358,7 @@ class TestHealthCheckReapCoordination:
         )
         rc.client.delete(checkpoint.key)
 
-        assert manager._coordinate_reaped_vm(305) is False
+        assert manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL) is False
 
         assert rc.client.xrevrange("test:results", count=10) == []
         assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
@@ -2390,7 +2394,7 @@ class TestHealthCheckReapCoordination:
 
         monkeypatch.setattr(rc, "xadd_capped_raw", fail_publish)
 
-        manager._coordinate_reaped_vm(305)
+        manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL)
 
         assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
         assert rc.xrevrange("results", count=10) == []
@@ -2436,7 +2440,7 @@ class TestHealthCheckReapCoordination:
             ).to_dict(),
         )
 
-        recovered = manager._coordinate_reaped_vm(305)
+        recovered = manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL)
 
         assert recovered is True
         assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
@@ -2486,7 +2490,7 @@ class TestHealthCheckReapCoordination:
             ).to_dict(),
         )
 
-        recovered = manager._coordinate_reaped_vm(305)
+        recovered = manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL)
 
         assert recovered is True
         assert get_pending_task(rc, "owner/repo", "pr", 42) == task.id
@@ -2501,7 +2505,7 @@ class TestHealthCheckReapCoordination:
         redis.xinfo_groups_raw.return_value = [{"name": "workers", "pending": 1}]
         redis.client.xpending_range.side_effect = ConnectionError("Redis down")
 
-        recovered = manager._coordinate_reaped_vm(305)
+        recovered = manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL)
 
         assert recovered is False
         redis.client.xgroup_delconsumer.assert_not_called()
@@ -2513,7 +2517,7 @@ class TestHealthCheckReapCoordination:
         redis.client.xpending_range.return_value = [{"message_id": "1-0"}]
         redis.client.xrange.side_effect = ConnectionError("Redis down")
 
-        recovered = manager._coordinate_reaped_vm(305)
+        recovered = manager._coordinate_reaped_vm(305, reason=REAP_REASON_ORPHAN_PEL)
 
         assert recovered is False
         redis.xack_raw.assert_not_called()
@@ -2959,7 +2963,7 @@ class TestSweepOrphanPel:
         with patch.object(manager, "_coordinate_reaped_vm", return_value=True) as recover:
             manager._sweep_orphan_pel()
 
-        recover.assert_called_once_with(305)
+        recover.assert_called_once_with(305, reason=REAP_REASON_ORPHAN_PEL)
         redis.delconsumer_raw.assert_not_called()
 
     def test_leaves_consumer_when_dead_vmid_recovery_is_incomplete(self):
@@ -2975,7 +2979,7 @@ class TestSweepOrphanPel:
         with patch.object(manager, "_coordinate_reaped_vm", return_value=False) as recover:
             manager._sweep_orphan_pel()
 
-        recover.assert_called_once_with(305)
+        recover.assert_called_once_with(305, reason=REAP_REASON_ORPHAN_PEL)
         redis.delconsumer_raw.assert_not_called()
 
     def test_keeps_consumer_for_live_idle_vmid(self):

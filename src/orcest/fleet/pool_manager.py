@@ -74,6 +74,14 @@ _RESULTS_STREAM = "results"
 _RESULT_MAXLEN = 20000
 # Fixed worker_id stamped on reaper-published results (operator-facing).
 _REAPER_WORKER_ID = "pool-manager-reaper"
+# Honest per-call-site reasons for the net.orcest.task.reaped event's
+# data.reason field. Only REAP_REASON_MAX_TASK_DURATION corresponds to an
+# actual timeout; the others recover Redis state for VMs destroyed for
+# unrelated reasons and must not be reported as timeouts.
+REAP_REASON_MAX_TASK_DURATION = "max_task_duration"
+REAP_REASON_DONE_CLEANUP = "done_cleanup"
+REAP_REASON_DRAIN_RACE = "drain_race"
+REAP_REASON_ORPHAN_PEL = "orphan_pel"
 # Pointer naming the active worker template VMID. Set by `orcest fleet rebake`
 # (or initialised from `pool.template_vm_id` on first run for backward compat).
 _POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
@@ -183,7 +191,7 @@ class PoolManager:
                 continue
 
             logger.info("Worker %s (VM %d) reported done, destroying", worker_id, vm_id)
-            if not self._coordinate_reaped_vm(vm_id):
+            if not self._coordinate_reaped_vm(vm_id, reason=REAP_REASON_DONE_CLEANUP):
                 logger.warning(
                     "Worker %s (VM %d) reported done, but Redis recovery is incomplete; "
                     "stopping VM to cap billing and leaving done key for the next "
@@ -368,7 +376,9 @@ class PoolManager:
                         vm_id, worker_id, restart=True, active=True
                     )
                     continue
-                if worker_id in pending_consumers and not self._coordinate_reaped_vm(vm_id):
+                if worker_id in pending_consumers and not self._coordinate_reaped_vm(
+                    vm_id, reason=REAP_REASON_DRAIN_RACE
+                ):
                     logger.warning(
                         "Leaving drained VM %d: late task claim could not be recovered",
                         vm_id,
@@ -509,7 +519,9 @@ class PoolManager:
                 )
                 self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
                 continue
-            if worker_id in pending_consumers and not self._coordinate_reaped_vm(vm_id):
+            if worker_id in pending_consumers and not self._coordinate_reaped_vm(
+                vm_id, reason=REAP_REASON_DRAIN_RACE
+            ):
                 logger.warning(
                     "Leaving drained VM %d: late task claim could not be recovered",
                     vm_id,
@@ -1273,7 +1285,9 @@ class PoolManager:
                     )
                     continue
                 try:
-                    coordinated = self._coordinate_reaped_vm(vm_id, elapsed_seconds=elapsed)
+                    coordinated = self._coordinate_reaped_vm(
+                        vm_id, reason=REAP_REASON_MAX_TASK_DURATION, elapsed_seconds=elapsed
+                    )
                 except Exception:
                     logger.error(
                         "Failed to coordinate Redis state for reaped VM %d; "
@@ -1751,7 +1765,9 @@ class PoolManager:
 
     # ── reap coordination (H2-conc) ──────────────────────────
 
-    def _coordinate_reaped_vm(self, vm_id: int, elapsed_seconds: float | None = None) -> bool:
+    def _coordinate_reaped_vm(
+        self, vm_id: int, reason: str, elapsed_seconds: float | None = None
+    ) -> bool:
         """Recover orchestrator-visible state for a force-reaped worker VM.
 
         Reads the reaped consumer's pending stream entries, reconstructs each
@@ -1765,11 +1781,17 @@ class PoolManager:
         A Redis read/publish failure returns False so the caller can leave the VM
         tracking state intact and retry recovery later.
 
+        ``reason`` is one of the ``REAP_REASON_*`` constants and is stamped
+        honestly on the emitted ``net.orcest.task.reaped`` event's
+        ``data.reason`` — callers other than ``_health_check`` (done-worker
+        cleanup, drain races, orphan-PEL sweep) are NOT timeouts and must not
+        report ``max_task_duration``.
+
         ``elapsed_seconds`` is the max-task-duration overrun computed by
         ``_health_check``, when this call originates there. Other callers
-        (done-worker cleanup, drain races, orphan-PEL sweep) don't track a
-        task's elapsed runtime, so it defaults to ``None`` and the emitted
-        event reports ``0.0``.
+        don't track a task's elapsed runtime, so it defaults to ``None`` and
+        is omitted from the emitted event's data entirely (never reported as
+        ``0.0``, which would misleadingly imply an instant reap).
         """
         consumer = self._vm_id_to_worker_id(vm_id)
         task_streams, discovery_complete = self._task_streams_with_discovery_status()
@@ -1882,7 +1904,7 @@ class PoolManager:
                     if not self._safe_xack(fq_stream, entry_id):
                         unrecovered_entries = True
                     continue
-                if not self._publish_reaped_failure(task, consumer, elapsed_seconds):
+                if not self._publish_reaped_failure(task, consumer, reason, elapsed_seconds):
                     unrecovered_entries = True
                     continue
                 self._clear_reaped_pending_marker(task)
@@ -2094,7 +2116,7 @@ class PoolManager:
         return "matches" if metadata.task_id == task.id else "different"
 
     def _publish_reaped_failure(
-        self, task: Task, worker_id: str, elapsed_seconds: float | None = None
+        self, task: Task, worker_id: str, reason: str, elapsed_seconds: float | None = None
     ) -> bool:
         """Publish a transient-FAILED result so the orchestrator re-enqueues."""
         result = TaskResult(
@@ -2129,13 +2151,18 @@ class PoolManager:
                 exc_info=True,
             )
             return False
-        self._emit_reaped_event(task, worker_id, elapsed_seconds)
+        self._emit_reaped_event(task, worker_id, reason, elapsed_seconds)
         return True
 
     def _emit_reaped_event(
-        self, task: Task, worker_id: str, elapsed_seconds: float | None
+        self, task: Task, worker_id: str, reason: str, elapsed_seconds: float | None
     ) -> None:
-        """Spool a task.reaped event. Never raises (EventPublisher swallows)."""
+        """Spool a task.reaped event. Never raises (EventPublisher swallows).
+
+        ``elapsed_seconds`` is omitted from the event data entirely when
+        unknown (rather than reported as ``0.0``), since ``0.0`` would
+        misleadingly imply an instant reap.
+        """
         try:
             if task.key_prefix:
                 project_redis = RedisClient.from_client(
@@ -2143,6 +2170,9 @@ class PoolManager:
                 )
             else:
                 project_redis = self._redis
+            data: dict[str, Any] = {"reason": reason}
+            if elapsed_seconds is not None:
+                data["elapsed_seconds"] = elapsed_seconds
             EventPublisher(project_redis).publish(
                 make_event(
                     "net.orcest.task.reaped",
@@ -2155,10 +2185,7 @@ class PoolManager:
                     head_sha=task.snapshot_head_sha,
                     worker_id=worker_id,
                     provider=task.provider,
-                    data={
-                        "reason": "max_task_duration",
-                        "elapsed_seconds": elapsed_seconds if elapsed_seconds is not None else 0.0,
-                    },
+                    data=data,
                 )
             )
         except Exception:
@@ -2260,7 +2287,7 @@ class PoolManager:
                         vm_id,
                         pending,
                     )
-                    if not self._coordinate_reaped_vm(vm_id):
+                    if not self._coordinate_reaped_vm(vm_id, reason=REAP_REASON_ORPHAN_PEL):
                         logger.warning(
                             "Orphan PEL: recovery for consumer %s (VM %d) is incomplete; "
                             "leaving pending entries attached to the consumer",
