@@ -225,7 +225,17 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
             pointer_content = pointer_path.read_text(encoding="utf-8").strip()
         except OSError:
             raise HTTPException(status_code=404, detail="unknown task") from None
-        resolved = (root / pointer_content).resolve()
+        # Contract: trace_archiver._write_index_pointer (src/orcest/orchestrator/
+        # trace_archiver.py:302-310) writes the trace file's *parent directory*
+        # relative to the archive root, plus a trailing newline (already handled
+        # by .strip() above) -- not the file path itself. Tolerate a full
+        # "<dir>/<task_id>.jsonl" pointer too, in case a future archiver format
+        # (or a hand-written test fixture) writes the file path directly.
+        if pointer_content.endswith(".jsonl"):
+            trace_file = Path(pointer_content)
+        else:
+            trace_file = Path(pointer_content) / f"{task_id}.jsonl"
+        resolved = (root / trace_file).resolve()
         if not resolved.is_relative_to(root.resolve()):
             raise HTTPException(status_code=404, detail="unknown task")
         if not resolved.is_file():
