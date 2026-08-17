@@ -39,6 +39,15 @@ if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
 
+# Install the version whose JSON event protocol is covered by CodexRunner's
+# parser fixtures. Authentication is injected per task; no credential is baked.
+CODEX_VERSION="0.131.0"
+installed_codex_version="$(codex --version 2>/dev/null | awk '{print $NF}' || true)"
+if [ "${installed_codex_version}" != "${CODEX_VERSION}" ]; then
+    echo "Installing Codex CLI ${CODEX_VERSION}..."
+    sudo npm install -g "@openai/codex@${CODEX_VERSION}"
+fi
+
 # Grok (xAI Grok Build) CLI — provider "grok".
 # ----------------------------------------------------------------
 # Execution + auth contract lives worker-side in
@@ -57,49 +66,71 @@ fi
 #
 # Adding any future provider: see docs/adding-a-provider.md.
 GROK_VERSION="0.1.216"
-# Pin the installer's SHA-256 to defend against a compromised CDN / DNS hijack
-# executing arbitrary code at bake time. FAIL CLOSED: leave empty and the
-# installer is NOT run (curl|bash-as-root with no integrity gate is the
-# threat); grok degrades gracefully (grok tasks early-reject with a rebake
-# hint). Set GROK_INSTALLER_SHA256=<sha256 of x.ai/cli/install.sh> to enable:
-#   curl -fsSL https://x.ai/cli/install.sh | sha256sum
-# Either way we download to a file first rather than piping a (possibly
-# partial) download straight into bash.
-GROK_INSTALLER_SHA256="${GROK_INSTALLER_SHA256:-}"
-if ! command -v grok &>/dev/null; then
+# SHA-256 of the exact linux-x86_64 Grok binary for GROK_VERSION. Keep this in
+# lockstep with _GROK_BINARY_SHA256 in src/orcest/fleet/cloud_init.py — that
+# module is the source of truth for fleet template bakes and this script is the
+# bare-VM/legacy path for the SAME artifact. The override env var is the same
+# one cloud_init.py reads (ORCEST_GROK_BINARY_SHA256), so one variable controls
+# both bake paths.
+#
+# The old x.ai/cli/install.sh bootstrap is deliberately gone: verifying the
+# installer only proved the *script* was authentic while the binary it then
+# downloaded was installed with no integrity check at all — and that binary
+# receives per-task SuperGrok OAuth blobs on every worker. Fetch the versioned
+# artifact directly and verify it instead.
+#
+# FAIL CLOSED: if the digest is empty or does not match, nothing is installed
+# or executed, and the gate below removes any stale /usr/local/bin/grok. Grok
+# degrades gracefully when absent — grok-backed tasks early-reject with a
+# rebake instruction.
+#
+# Re-pin deliberately with GROK_VERSION after validating the GrokRunner
+# fixtures (tests/worker/test_grok_runner.py):
+#   curl -fsSL https://x.ai/cli/grok-VERSION-linux-x86_64 | sha256sum
+# `-` not `:-`: substitute the pin only when the variable is UNSET, matching
+# cloud_init.py's os.environ.get(). With `:-`, setting the variable to the empty
+# string (the documented way to skip the grok install while a new digest is
+# being validated) would silently install the old pinned artifact here while
+# cloud-init skipped it -- and the empty-digest branch below would be dead code.
+GROK_BINARY_SHA256="${ORCEST_GROK_BINARY_SHA256-01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af}"
+installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then
     echo "Installing Grok CLI ${GROK_VERSION}..."
-    _grok_installer="$(mktemp)"
-    if curl -fsSL https://x.ai/cli/install.sh -o "${_grok_installer}"; then
-        _grok_ok=0
-        if [ -z "${GROK_INSTALLER_SHA256}" ]; then
-            echo "GROK_INSTALLER_SHA256 unset — SKIPPING grok install (fail-closed)."
-            echo "  Set GROK_INSTALLER_SHA256=<sha256 of x.ai/cli/install.sh> to enable."
-        elif echo "${GROK_INSTALLER_SHA256}  ${_grok_installer}" | sha256sum -c -; then
-            _grok_ok=1
-        else
-            echo "Grok installer checksum mismatch — skipping install"
-        fi
-        if [ "${_grok_ok}" = "1" ]; then
-            bash "${_grok_installer}" "${GROK_VERSION}" || true
-        fi
+    if [ -n "${GROK_BINARY_SHA256}" ] &&
+        ! [[ "${GROK_BINARY_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "ORCEST_GROK_BINARY_SHA256 must be empty or exactly 64 hexadecimal characters" >&2
+        exit 1
     fi
-    rm -f "${_grok_installer}"
-    # The installer symlinks ~/.local/bin/grok -> ~/.grok/downloads/<binary>.
-    # The worker runs as a systemd service whose PATH may not include
-    # ~/.local/bin, so copy the resolved, self-contained binary to a system
-    # path. (Verified: grok needs only the binary + a per-task auth.json; no
-    # bundled runtime dir.)
-    GROK_BIN="$(readlink -f "${HOME}/.local/bin/grok" 2>/dev/null || true)"
-    if [ -n "${GROK_BIN}" ] && [ -x "${GROK_BIN}" ]; then
-        sudo cp "${GROK_BIN}" /usr/local/bin/grok
-        sudo chmod 755 /usr/local/bin/grok
+    _grok_binary="$(mktemp)"
+    if [ -z "${GROK_BINARY_SHA256}" ]; then
+        echo "Grok binary SHA-256 unset — SKIPPING grok install (fail-closed)."
+        echo "  Set ORCEST_GROK_BINARY_SHA256=<sha256 of the pinned binary> to enable."
+    elif ! curl -fsSL --connect-timeout 30 --max-time 300 \
+        "https://x.ai/cli/grok-${GROK_VERSION}-linux-x86_64" -o "${_grok_binary}"; then
+        echo "Grok binary download failed — skipping install"
+    elif echo "${GROK_BINARY_SHA256}  ${_grok_binary}" | sha256sum -c -; then
+        # Only a digest-matched binary is ever placed on a system path. The
+        # worker runs as a systemd service whose PATH may not include
+        # ~/.local/bin, so install to /usr/local/bin. (Verified: grok needs
+        # only the binary + a per-task auth.json; no bundled runtime dir.)
+        sudo install -m 0755 -o root -g root "${_grok_binary}" /usr/local/bin/grok
+    else
+        echo "Grok binary checksum mismatch — skipping install"
     fi
+    rm -f "${_grok_binary}"
 fi
-if command -v grok &>/dev/null; then
+# Secondary sanity check only. Integrity is established by the SHA-256 gate
+# above (a substituted binary can report any version it likes about itself);
+# this catches a stale or partially installed binary from an earlier bake.
+installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ "${installed_grok_version}" = "${GROK_VERSION}" ]; then
     echo "Grok CLI present: $(grok --version 2>/dev/null | head -1)"
 else
-    echo "WARNING: Grok CLI install failed — Grok tasks will be cleanly rejected"
-    echo "  with a permanent FAILED + rebake instruction until the binary is present."
+    echo "WARNING: pinned Grok CLI ${GROK_VERSION} is unavailable"
+    echo "  Grok tasks must remain disabled until the worker image is successfully rebaked."
+    # setup-worker owns this system path. Never leave a known-incompatible
+    # binary available to the systemd worker after a fail-closed install.
+    sudo rm -f /usr/local/bin/grok
 fi
 
 # Install Docker Engine
@@ -192,7 +223,7 @@ fi
 # Verify dependencies
 echo ""
 echo "Verifying installation..."
-for cmd in python3 node claude gh git docker go; do
+for cmd in python3 node claude codex gh git docker go; do
     if command -v "$cmd" &>/dev/null; then
         echo "  $cmd: ok"
     else

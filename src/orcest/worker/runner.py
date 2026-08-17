@@ -108,6 +108,7 @@ class RunnerResult:
     # worker surfaces the rotated blob here so the orchestrator can persist it.
     # None for the common case (env-var credentials never rotate in place).
     credential_update: str | None = None
+    credential_update_minted_at: float = 0.0
 
 
 class Runner(Protocol):
@@ -171,8 +172,10 @@ def create_runner(config: RunnerConfig) -> Runner:
                 f"NoopRunner 'duration' must be a finite non-negative number, got {duration}"
             )
         return NoopRunner(duration)
-    else:
-        raise ValueError(f"Unknown runner type: {config.type!r}")
+    recipe = PROVIDER_REGISTRY.get(config.type)
+    if recipe is not None and recipe.runner_cls is not None:
+        return recipe.runner_cls(config.max_retries, config.retry_backoff, config.model)
+    raise ValueError(f"Unknown runner type: {config.type!r}")
 
 
 # Registry seeding happens in ``orcest/worker/__init__.py`` (see comment on

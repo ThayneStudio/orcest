@@ -31,6 +31,7 @@ def test_from_claude_tokens_synthesis_and_lean_surface():
     assert entry.provider == "claude"
     assert entry.credential == "secret-a"
     assert entry.model is None
+    assert entry.source == "legacy_claude_tokens"
     assert entry.cli_binary is None
     assert entry.env_var is None
     assert entry.extras == {}
@@ -209,6 +210,23 @@ def test_exhaustion_cooldown_is_per_account_not_per_model():
     assert creds_seen == {"acct-other"}
 
 
+def test_exhaustion_cooldown_is_shared_across_claude_aliases():
+    """The legacy and interactive Claude queue aliases rate-limit the same account."""
+    shared = "claude-oauth-shared"
+    legacy = ProviderEntry("claude", shared)
+    interactive = ProviderEntry("clauder", shared)
+    pool = ProviderPool([legacy, interactive])
+    assert pool.size == 2
+    assert pool.available_count == 2
+
+    pool.register_task("legacy-task", legacy)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    pool.mark_exhausted("legacy-task", resets_at=future)
+
+    assert pool.available_count == 0
+    assert pool.next_entry() is None
+
+
 def test_concurrent_next_under_contention():
     """Many threads calling next_entry concurrently must not crash and respect RR + cooldowns."""
     entries = _make_entries(3)
@@ -301,6 +319,29 @@ def test_available_count_and_size():
 def test_empty_pool_rejected():
     with pytest.raises(ValueError, match="at least one"):
         ProviderPool([])
+
+
+def test_grok_oauth_json_without_refresh_token_rejected():
+    bad = ProviderEntry("grok", '{"access_token":"access-only"}')
+    with pytest.raises(ValueError, match="usable"):
+        ProviderPool([bad])
+
+
+def test_grok_oauth_json_without_refresh_token_filtered_from_selection():
+    good = ProviderEntry("claude", "claude-secret")
+    bad = ProviderEntry("grok", '{"access_token":"access-only"}')
+
+    pool = ProviderPool([bad, good])
+
+    assert pool.size == 1
+    assert pool.next_entry() == good
+
+
+def test_codex_oauth_json_without_refresh_token_rejected():
+    bad = ProviderEntry("codex", '{"tokens":{"access_token":"access-only"}}')
+
+    with pytest.raises(ValueError, match="usable"):
+        ProviderPool([bad])
 
 
 def test_duplicate_identities_rejected():
@@ -444,6 +485,61 @@ def test_apply_credential_update_overrides_published_credential():
     assert pool.next_entry().identity() == entry.identity()
 
 
+def test_apply_credential_update_accepts_grok_json_with_refresh_token():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+    blob = '{"access_token":"new-access","refresh_token":"new-refresh"}'
+
+    account = pool.apply_credential_update("t1", blob, minted_at=100.0)
+
+    assert account == entry.account_key()
+    assert pool.effective_credential(entry) == blob
+
+
+def test_apply_credential_update_rejects_grok_json_without_refresh_token():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+
+    account = pool.apply_credential_update(
+        "t1",
+        '{"access_token":"new-access","expires_at":123}',
+        minted_at=100.0,
+    )
+
+    assert account is None
+    assert pool.effective_credential(entry) == "orig"
+
+
+def test_apply_credential_update_rejects_codex_json_without_refresh_token():
+    entry = ProviderEntry("codex", '{"tokens":{"refresh_token":"original"}}')
+    pool = ProviderPool([entry])
+    pool.register_task("t1", entry)
+
+    account = pool.apply_credential_update(
+        "t1",
+        '{"tokens":{"access_token":"new-access"}}',
+        minted_at=100.0,
+    )
+
+    assert account is None
+    assert pool.effective_credential(entry) == entry.credential
+
+
+def test_seed_credential_override_rejects_unrefreshable_codex_json():
+    entry = ProviderEntry("codex", '{"tokens":{"refresh_token":"original"}}')
+    pool = ProviderPool([entry])
+
+    pool.seed_credential_override(
+        entry.account_key(),
+        '{"tokens":{"access_token":"access-only"}}',
+        minted_at=100.0,
+    )
+
+    assert pool.effective_credential(entry) == entry.credential
+
+
 def test_apply_credential_update_ignores_stale_minted_at():
     entry = _grok_entry("orig")
     pool = ProviderPool([entry])
@@ -468,6 +564,72 @@ def test_apply_credential_update_empty_blob_is_noop():
     pool.register_task("t1", entry)
     assert pool.apply_credential_update("t1", "", minted_at=1.0) is None
     assert pool.effective_credential(entry) == "orig"
+
+
+def test_apply_credential_update_for_account_handles_restarted_task_mapping():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    rotated = '{"access_token":"new-access","refresh_token":"new-refresh"}'
+
+    account = pool.apply_credential_update_for_account(
+        entry.account_key(),
+        rotated,
+        minted_at=100.0,
+    )
+
+    assert account == entry.account_key()
+    assert pool.effective_credential(entry) == rotated
+
+
+def test_account_for_credential_keeps_original_anchor_after_rotation():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+    rotated = '{"access_token":"new-access","refresh_token":"new-refresh"}'
+    pool.seed_credential_override(entry.account_key(), rotated, minted_at=100.0)
+
+    assert pool.account_for_credential(entry.provider, entry.credential) == entry.account_key()
+    assert pool.account_for_credential(entry.provider, rotated) == entry.account_key()
+    assert pool.account_for_credential(entry.provider, "unknown-rotation") is None
+
+
+def test_apply_credential_update_for_account_rejects_unknown_account():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+
+    assert (
+        pool.apply_credential_update_for_account(
+            "grok:unknown-account",
+            '{"access_token":"new-access","refresh_token":"new-refresh"}',
+            minted_at=100.0,
+        )
+        is None
+    )
+    assert pool.effective_credential(entry) == "orig"
+
+
+def test_mark_account_exhausted_handles_restarted_task_mapping():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+
+    assert pool.mark_account_exhausted(
+        entry.account_key(),
+        resets_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert pool.available_count == 0
+    assert pool.next_entry() is None
+
+
+def test_mark_account_exhausted_rejects_unknown_account():
+    entry = _grok_entry("orig")
+    pool = ProviderPool([entry])
+
+    assert not pool.mark_account_exhausted(
+        "grok:unknown-account",
+        resets_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert pool.available_count == 1
 
 
 def test_seed_credential_override_restores_on_startup():

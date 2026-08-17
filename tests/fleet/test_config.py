@@ -13,6 +13,7 @@ from orcest.fleet.config import (
     PoolConfig,
     ProjectEntry,
     ProxmoxConfig,
+    WorkerProfileConfig,
     _parse_disk_size,
     load_config,
     require_valid_project_name,
@@ -79,6 +80,30 @@ class TestParseDiskSize:
             _parse_disk_size("abc")
 
 
+@pytest.mark.parametrize(
+    ("org_yaml", "message"),
+    [
+        ("provider_credentials: secret-value", "must be a mapping"),
+        ("provider_credentials:\n      codex: secret-value", "must be a list"),
+        ("provider_credentials:\n      codex: []", "must not be empty"),
+        ("provider_credentials:\n      codex: [123]", "must be a non-empty string"),
+        ("claude_oauth_tokens: secret-value", "must be a list"),
+    ],
+)
+def test_load_config_rejects_malformed_credential_schema_without_rewriting(
+    tmp_path, org_yaml, message
+):
+    cfg_path = tmp_path / "fleet.yaml"
+    original = f"orgs:\n  Org:\n    {org_yaml}\n"
+    cfg_path.write_text(original)
+
+    with pytest.raises(ValueError, match=message) as exc_info:
+        load_config(cfg_path)
+
+    assert "secret-value" not in str(exc_info.value)
+    assert cfg_path.read_text() == original
+
+
 # ── FleetConfig helpers ──────────────────────────────────────
 
 
@@ -105,9 +130,162 @@ class TestFleetConfigHelpers:
         with pytest.raises(KeyError, match="not registered"):
             cfg.resolve_org(cfg.projects[0])
 
+    def test_provider_stream_mismatches_accepts_single_matching_backend(self):
+        cfg = FleetConfig(
+            orgs={
+                "Org": OrgEntry(
+                    provider_credentials={"grok": ["secret-1", "secret-2"]},
+                )
+            },
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(worker_backend="grok", worker_runner_type="grok"),
+        )
+
+        assert cfg.provider_stream_mismatches() == {}
+
+    def test_provider_stream_mismatches_reports_stranded_provider_streams(self):
+        cfg = FleetConfig(
+            orgs={
+                "Org": OrgEntry(
+                    claude_oauth_tokens=["claude-secret"],
+                    provider_credentials={"grok": ["grok-secret"], "codex": ["codex-secret"]},
+                )
+            },
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(worker_backend="claude"),
+        )
+
+        assert cfg.provider_stream_mismatches() == {"p": ["codex", "grok"]}
+
+    def test_provider_stream_mismatches_maps_legacy_claude_to_clauder_pool(self):
+        cfg = FleetConfig(
+            orgs={"Org": OrgEntry(claude_oauth_tokens=["legacy-secret"])},
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                worker_backend="clauder",
+                worker_runner_type="claude",
+                worker_runner_mode="interactive",
+            ),
+        )
+
+        assert cfg.provider_stream_mismatches() == {}
+
+    def test_mixed_worker_profiles_cover_every_provider_stream(self):
+        cfg = FleetConfig(
+            orgs={
+                "Org": OrgEntry(
+                    claude_oauth_tokens=["claude-secret"],
+                    provider_credentials={"grok": ["g"], "codex": ["c"]},
+                )
+            },
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                size=4,
+                vm_id_start=10000,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="clauder"),
+                    WorkerProfileConfig(backend="codex"),
+                    WorkerProfileConfig(backend="grok"),
+                ],
+            ),
+        )
+
+        assert cfg.provider_stream_mismatches() == {}
+        assert [p.backend for p in cfg.pool.scheduled_worker_profiles()] == [
+            "clauder",
+            "codex",
+            "grok",
+            "clauder",
+        ]
+        assert cfg.pool.default_task_backend() == "clauder"
+
+    def test_unscheduled_profile_does_not_claim_provider_coverage(self):
+        cfg = FleetConfig(
+            orgs={"Org": OrgEntry(provider_credentials={"grok": ["g"]})},
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                size=1,
+                vm_id_start=300,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="clauder"),
+                    WorkerProfileConfig(backend="grok"),
+                ],
+            ),
+        )
+
+        assert cfg.provider_stream_mismatches() == {"p": ["grok"]}
+
+    def test_explicit_clauder_provider_is_not_remapped_to_claude(self):
+        cfg = FleetConfig(
+            orgs={"Org": OrgEntry(provider_credentials={"clauder": ["token"]})},
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                size=1,
+                vm_id_start=300,
+                worker_profiles=[WorkerProfileConfig(backend="claude")],
+            ),
+        )
+
+        assert cfg.provider_stream_mismatches() == {"p": ["clauder"]}
+
+    def test_legacy_claude_is_not_remapped_to_non_claude_profile(self):
+        cfg = FleetConfig(
+            orgs={"Org": OrgEntry(claude_oauth_tokens=["token"])},
+            projects=[ProjectEntry(name="p", repo="Org/p")],
+            pool=PoolConfig(
+                size=2,
+                vm_id_start=300,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="grok"),
+                    WorkerProfileConfig(backend="codex"),
+                ],
+            ),
+        )
+
+        assert cfg.pool.default_task_backend() == "claude"
+        assert cfg.provider_stream_mismatches() == {"p": ["claude"]}
+
     def test_ssh_target(self):
         cfg = FleetConfig(orchestrator=OrchestratorConfig(host="1.2.3.4", user="admin"))
         assert cfg.ssh_target() == "admin@1.2.3.4"
+
+    def test_worker_profile_rejects_stream_separator_in_backend(self):
+        with pytest.raises(ValueError, match="Invalid provider name"):
+            WorkerProfileConfig(backend="issue:grok")
+
+    def test_worker_profile_rejects_backend_runner_mismatch(self):
+        with pytest.raises(ValueError, match="requires matching runner_type 'codex'"):
+            WorkerProfileConfig(backend="codex", runner_type="grok")
+
+    def test_worker_profile_rejects_non_claude_runner_mode(self):
+        with pytest.raises(ValueError, match="does not support worker_runner_mode"):
+            WorkerProfileConfig(backend="codex", runner_mode="interactive")
+
+    def test_legacy_non_claude_backend_defaults_to_matching_runner(self):
+        pool = PoolConfig(worker_backend="codex")
+
+        assert pool.worker_runner_type == "codex"
+
+    def test_legacy_claude_backend_defaults_to_interactive_runner_mode(self):
+        # Configs that predate worker_runner_mode were deployed with the
+        # interactive PTY runner; unset must normalize to it, not headless.
+        pool = PoolConfig(worker_backend="claude")
+
+        assert pool.worker_runner_type == "claude"
+        assert pool.worker_runner_mode == "interactive"
+
+    def test_claude_backend_headless_opt_out_is_preserved(self):
+        pool = PoolConfig(worker_backend="claude", worker_runner_mode="headless")
+
+        assert pool.worker_runner_mode == "headless"
+
+    def test_claude_backend_rejects_unknown_runner_mode(self):
+        with pytest.raises(ValueError, match="'interactive' or 'headless'"):
+            PoolConfig(worker_backend="claude", worker_runner_mode="batch")
+
+    def test_org_entry_rejects_empty_provider_credential_list(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            OrgEntry(provider_credentials={"grok": []})
 
     def test_ssh_target_no_host(self):
         cfg = FleetConfig()
@@ -179,6 +357,9 @@ class TestConfigPersistence:
                 worker_memory=32768,
                 worker_cores=16,
                 worker_disk_size=100,
+                worker_backend="clauder",
+                worker_runner_type="claude",
+                worker_runner_mode="interactive",
                 max_task_duration=7200,
             ),
         )
@@ -189,7 +370,75 @@ class TestConfigPersistence:
         assert loaded.pool.worker_memory == 32768
         assert loaded.pool.worker_cores == 16
         assert loaded.pool.worker_disk_size == 100
+        assert loaded.pool.worker_backend == "clauder"
+        assert loaded.pool.worker_runner_type == "claude"
+        assert loaded.pool.worker_runner_mode == "interactive"
         assert loaded.pool.max_task_duration == 7200
+
+    def test_round_trip_mixed_worker_profiles(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            pool=PoolConfig(
+                size=4,
+                vm_id_start=10000,
+                worker_profiles=[
+                    WorkerProfileConfig(backend="clauder"),
+                    WorkerProfileConfig(backend="codex"),
+                    WorkerProfileConfig(backend="grok"),
+                ],
+            )
+        )
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert [profile.signature() for profile in loaded.pool.worker_profiles] == [
+            ("clauder", "claude", "interactive"),
+            ("codex", "codex", ""),
+            ("grok", "grok", ""),
+        ]
+        assert loaded.pool.worker_layout_signature().startswith("vm_id_start=10000;")
+
+    def test_load_worker_profile_shorthand_and_reject_empty_backend(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"worker_profiles": ["codex", "grok"]}}))
+        assert [p.backend for p in load_config(path).pool.worker_profiles] == ["codex", "grok"]
+
+        path.write_text(yaml.dump({"pool": {"worker_profiles": [{"runner_type": "codex"}]}}))
+        with pytest.raises(ValueError, match="backend must not be empty"):
+            load_config(path)
+
+    def test_load_rejects_worker_target_larger_than_bounded_vmid_range(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 4, "vm_id_start": 300, "vm_id_end": 302}}))
+        with pytest.raises(ValueError, match="cannot fit the target size"):
+            load_config(path)
+
+    def test_clauder_backend_defaults_to_interactive_runner_mode(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"worker_backend": "clauder"}}))
+
+        cfg = load_config(path)
+
+        assert cfg.pool.worker_backend == "clauder"
+        assert cfg.pool.worker_runner_type == "claude"
+        assert cfg.pool.worker_runner_mode == "interactive"
+
+    def test_clauder_backend_rejects_non_interactive_runner_mode(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump(
+                {
+                    "pool": {
+                        "worker_backend": "clauder",
+                        "worker_runner_mode": "batch",
+                    }
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
+            load_config(path)
 
     def test_round_trip_proxmox_verify_ssl(self, tmp_path):
         """H2-infra: proxmox.verify_ssl must persist through save/load so an

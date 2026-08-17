@@ -5,6 +5,7 @@ Empty string is used as the None sentinel for optional fields.
 """
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,30 @@ DEAD_LETTER_METADATA_FIELDS = frozenset(
 # systematic redaction layer required by the security review before generalizing
 # beyond claude_token.
 REDACTED_FIELDS = frozenset({"token", "claude_token", "credential"})
+CLAUDE_PROVIDER_ALIASES = frozenset({"claude", "clauder"})
+PROVIDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+
+
+def require_valid_provider_name(provider: str) -> str:
+    """Return a provider name that is safe in Redis keys and env-var derivation."""
+    if not isinstance(provider, str) or not PROVIDER_NAME_RE.fullmatch(provider):
+        raise ValueError(
+            "Invalid provider name: must be 1-64 lowercase characters, "
+            "start with a letter or digit, and contain only letters, digits, or underscore."
+        )
+    return provider
+
+
+def is_claude_provider(provider: str) -> bool:
+    """Return True for provider names backed by the Claude CLI."""
+    return provider in CLAUDE_PROVIDER_ALIASES
+
+
+def task_stream_name(provider: str, *, issue: bool = False) -> str:
+    """Return the Redis task stream name for a provider."""
+    normalized = require_valid_provider_name(provider)
+    prefix = "tasks:issue" if issue else "tasks"
+    return f"{prefix}:{normalized}"
 
 
 def _sync_claude_for_provider(provider: str, credential: str, claude_token: str) -> tuple[str, str]:
@@ -47,7 +72,7 @@ def _sync_claude_for_provider(provider: str, credential: str, claude_token: str)
     and to_dict(); from_dict() uses separate one-directional deserialization
     logic (to correctly handle explicit empty `credential`).
     """
-    if provider != "claude":
+    if not is_claude_provider(provider):
         return credential, claude_token
     # Prefer whichever is truthy; if both supplied and different we keep the
     # respective values (rare during transition).
@@ -100,6 +125,13 @@ class Task:
     snapshot_failed_checks: list[str] | None = None
     snapshot_review_thread_ids: list[str] | None = None
     snapshot_review_thread_fingerprints: list[str] | None = None
+    # Stable, non-secret provider account selected by the orchestrator. This is
+    # anchored to the configured credential even when ``credential`` carries a
+    # later OAuth rotation.
+    provider_account: str = ""
+
+    def __post_init__(self) -> None:
+        require_valid_provider_name(self.provider)
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD.
@@ -140,6 +172,7 @@ class Task:
             "provider": self.provider,
             "credential": self.credential,
             "model": self.model or "",
+            "provider_account": self.provider_account,
         }
 
     @classmethod
@@ -164,7 +197,7 @@ class Task:
         # so that code paths still reading task.claude_token continue to work.
         # This one-directional fill (cred -> claude) respects explicit credential
         # values (including empty) taking precedence per the new-field contract.
-        if provider_in == "claude" and not claude_token_in and credential_in:
+        if is_claude_provider(provider_in) and not claude_token_in and credential_in:
             claude_token_in = credential_in
 
         return cls(
@@ -191,6 +224,7 @@ class Task:
             provider=provider_in,
             credential=credential_in,
             model=model_in,
+            provider_account=data.get("provider_account", ""),
         )
 
     @classmethod
@@ -219,6 +253,7 @@ class Task:
         # pre-generate id, register_task(id, entry), pass here so create uses it;
         # on publish failure/None paths, caller calls task_completed to rollback.
         task_id: str | None = None,
+        provider_account: str = "",
     ) -> "Task":
         """Factory with auto-generated ID and timestamp.
 
@@ -255,6 +290,7 @@ class Task:
             provider=provider,
             credential=effective_credential,
             model=model,
+            provider_account=provider_account,
         )
 
     def to_safe_dict(self) -> dict[str, str]:
@@ -317,6 +353,15 @@ class TaskResult:
     # a run; the worker surfaces the rotated blob here so the orchestrator can
     # persist it. A SECRET — redacted in to_safe_dict, never logged in plaintext.
     credential_update: str = ""
+    # Keep newly-added optional fields at the end so callers using the historic
+    # positional constructor keep the same argument mapping.
+    repo: str = ""  # "owner/repo"; optional for legacy result payloads
+    credential_update_minted_at: float = 0.0
+    # Non-secret provider-account identity (provider + credential hash). New
+    # workers include it so credential write-back survives an orchestrator
+    # restart without persisting the credential itself outside the task/result
+    # streams. Optional for rolling compatibility with older workers.
+    provider_account: str = ""
 
     def to_dict(self) -> dict[str, str]:
         """Serialize to flat string dict for Redis stream XADD."""
@@ -329,6 +374,7 @@ class TaskResult:
             "duration_seconds": str(self.duration_seconds),
             "resource_type": self.resource_type,
             "resource_id": str(self.resource_id),
+            "repo": self.repo,
             "snapshot_head_sha": self.snapshot_head_sha,
             "decision_reason": self.decision_reason,
             "snapshot_failed_checks": json.dumps(self.snapshot_failed_checks or []),
@@ -344,6 +390,10 @@ class TaskResult:
             d["needs_human_reason"] = self.needs_human_reason
         if self.credential_update:
             d["credential_update"] = self.credential_update
+            if self.credential_update_minted_at:
+                d["credential_update_minted_at"] = str(self.credential_update_minted_at)
+        if self.provider_account:
+            d["provider_account"] = self.provider_account
         return d
 
     def to_safe_dict(self) -> dict[str, str]:
@@ -365,6 +415,7 @@ class TaskResult:
             duration_seconds=int(data["duration_seconds"]),
             resource_type=data["resource_type"],
             resource_id=int(data["resource_id"]),
+            repo=data.get("repo", ""),
             rate_limit_resets_at=int(data.get("rate_limit_resets_at", "0")),
             snapshot_head_sha=data.get("snapshot_head_sha", ""),
             decision_reason=data.get("decision_reason", ""),
@@ -376,6 +427,8 @@ class TaskResult:
             needs_human=data.get("needs_human", "") == "1",
             needs_human_reason=data.get("needs_human_reason", ""),
             credential_update=data.get("credential_update", ""),
+            credential_update_minted_at=float(data.get("credential_update_minted_at", "0")),
+            provider_account=data.get("provider_account", ""),
         )
 
 

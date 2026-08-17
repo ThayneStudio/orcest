@@ -51,9 +51,7 @@ class TestArchiverDisabledModes:
         # exposes only public surface here. Confirm nothing got written.
         assert list(archive_root.iterdir()) == []
 
-    def test_self_disables_on_unwritable_archive_path(
-        self, fake_redis_client, logger, tmp_path
-    ):
+    def test_self_disables_on_unwritable_archive_path(self, fake_redis_client, logger, tmp_path):
         read_only = tmp_path / "ro"
         read_only.mkdir()
         os.chmod(read_only, 0o500)  # read+execute only
@@ -72,9 +70,7 @@ class TestArchiverDisabledModes:
 
 
 class TestArchiverHappyPath:
-    def test_single_task_writes_jsonl_meta_and_index(
-        self, fake_redis_client, logger, archive_root
-    ):
+    def test_single_task_writes_jsonl_meta_and_index(self, fake_redis_client, logger, archive_root):
         archiver = TraceArchiver(
             redis=fake_redis_client,
             archive_path=str(archive_root),

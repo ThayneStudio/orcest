@@ -48,6 +48,17 @@ class TestHeartbeat:
         hb.stop()
         assert mock_lock.refresh.call_count >= 3
 
+    def test_heartbeat_calls_post_refresh_hook(self, mock_lock, mocker):
+        refreshed = mocker.Mock()
+        hb = Heartbeat(mock_lock, interval=0.05, on_refreshed=refreshed)
+        hb.start()
+        deadline = time.monotonic() + 5
+        while refreshed.call_count < 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        hb.stop()
+
+        refreshed.assert_called()
+
     def test_heartbeat_default_interval(self, mock_lock):
         """When no explicit interval is given, default to lock.ttl / 3."""
         mock_lock.ttl = 30

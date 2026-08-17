@@ -2,6 +2,11 @@
 
 **Status:** Part of Task 10 (Rollout & Documentation) for the overall multi-provider implementation plan.
 
+> **Fleet-managed routing constraint:** every published provider must have a
+> scheduled `pool.worker_profiles` slot. Each worker remains specialized to one
+> provider stream, while the fleet manager maintains the exact ordered mix.
+> Fleet commands reject uncovered streams before mutation.
+
 ## Critical Boundary (Reinforced)
 
 All rollout steps and documentation adhere to the **Provider Registration & Invocation Boundary (Option A)**:
@@ -23,7 +28,11 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
    - The new image must contain:
      - The `PROVIDER_REGISTRY` with at least `"claude"` (and optionally `"grok"` entry even if the binary is absent on disk — the `get_unsupported_reason` will trigger clean reject).
      - The generic CLI runner path (in `claude_runner.py`).
-   - **Verification on new image:** `orcest work --id test --config ...` (or just `which claude` and `python -c "from orcest.worker.runner import get_provider_recipe; print(get_provider_recipe('claude'))"`).
+   - **Verification on new image:** check CLI versions with `which`/`--version`
+     and inspect the registry without connecting to deployment Redis, for example
+     `python -c "from orcest.worker.runner import get_provider_recipe; print(get_provider_recipe('claude'))"`.
+     Do not start `orcest work` against deployment Redis as a template smoke test;
+     it can create a real consumer and claim real work.
    - At this stage you can still only run claude tasks safely. New-provider tasks sent to a freshly-rebaked image that lacks the CLI will produce the documented permanent FAILED.
 
 2. **Deploy the Updated Orchestrator**
@@ -33,10 +42,11 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
    - Legacy `claude_tokens` paths continue to work via synthesis into `ProviderEntry(provider="claude", ...)` — zero breaking change for existing single-claude projects.
    - `orcest status --once` will now surface the new per-provider tables (exhausted_skip, rebake_required_failures).
 
-3. **Mixed Operation (Claude + New Providers During Transition)**
+3. **Configure the Managed Worker Mix**
 
    - Existing projects using only `claude_tokens` (or synthesized providers) continue to round-robin exactly as before on any worker that has "claude" in its registry.
-   - A single project may now declare a mixed `providers:` list, e.g.:
+   - A single project may declare a mixed `providers:` list when the fleet
+     schedules a worker profile for every resulting stream, e.g.:
 
      ```yaml
      providers:
@@ -49,7 +59,22 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
      ```
 
    - The pool selects across heterogeneous entries; exhaustion of one provider's credential (e.g. grok rate limit) only skips that entry for its cooldown window — other providers remain usable.
-   - Task publishing emits the chosen provider's lean data; the receiving worker's early dispatch either runs it or cleanly fails it.
+   - Configure the matching worker layout:
+
+     ```yaml
+     pool:
+       size: 4
+       vm_id_start: 10000
+       worker_profiles:
+         - backend: clauder
+         - backend: codex
+         - backend: grok
+     ```
+
+     Slots repeat in order, so this four-worker example has two `clauder`, one
+     `codex`, and one `grok` worker. Repetition is worker capacity, not task
+     publication weight; task selection remains round-robin across credential
+     entries and execution times can differ by provider.
 
 4. **Introduce the First Non-Claude Provider**
 
@@ -57,7 +82,9 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
    - Ensure the credential is either:
      - Inline in YAML (discouraged for secrets), or
      - Omitted (`credential: ""` or absent) so that `config.py` `_parse_provider_entry` falls back to the conventional env var (`XAI_API_KEY`, `GROK_API_KEY`, etc.) present in the orchestrator process environment.
-   - For fleet-managed orchestrators: extend your `fleet.yaml` `orgs.<name>` entry with `provider_credentials` (see below) so `generate_env_file` emits the required vars into the project's `.env`.
+   - For fleet-managed orchestrators, every provider name must appear in a
+     scheduled `pool.worker_profiles` slot. An uncovered credential entry is
+     rejected before fleet mutation.
    - Rebake workers that will handle the new provider (install the CLI in `setup-worker.sh` + one-line registry entry).
    - Test with a dedicated throwaway project or by temporarily adding the provider to an existing project's list.
 
@@ -74,7 +101,14 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
 6. **Cutover & Steady State**
 
    - Rebake every worker template so the desired provider CLIs + registry entries are present.
-   - (Optional) Run specialized worker groups: some workers with `backend: claude` in `worker.yaml`, others with `backend: grok` (they consume `tasks:grok` etc.).
+   - Deploy a coordinated mixed layout with
+     `orcest fleet deploy --rebuild-template --drain-active`. Profile order,
+     runner settings and VMID bounds are part of the layout signature; the
+     full drain prevents old workers from being silently reinterpreted.
+     VMID range changes are deliberately rejected while a deployed config
+     exists. Drain using the old checksummed config, verify every old worker is
+     absent, retire the remote deployed config, and only then deploy the new
+     range as a first deployment.
    - A general-purpose worker image that has multiple registry entries can in principle consume from any stream it is pointed at (the dispatch inside the loop is provider-agnostic once the task arrives).
    - Monitor:
      - `orcest status --once` (provider health cards + counters)
@@ -93,6 +127,15 @@ orgs:
     provider_credentials:
       grok: ["xai-..."]   # list; first used for the env var in generated .env
 ```
+
+This example requires a scheduled `grok` worker profile. If the org also has
+legacy Claude tokens, the layout needs a `claude` or `clauder` profile as well.
+The fleet preflight intentionally rejects uncovered streams.
+
+Provider names are restricted to lowercase letters, digits, and underscores.
+This keeps Redis stream names and derived environment-variable names unambiguous;
+rename any older custom provider containing uppercase letters, dots, or hyphens
+before rollout.
 
 `generate_env_file(...)` (and the caller in `fleet/cli.py`) emits:
 

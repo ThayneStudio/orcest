@@ -4,11 +4,16 @@ import subprocess
 import time
 from pathlib import Path
 
+import click
 import pytest
 import yaml
 from click.testing import CliRunner
 
-from orcest.fleet.cli import fleet
+from orcest.fleet.cli import (
+    _drain_leases_still_held as _drain_leases_still_held_impl,
+    _wait_for_candidate_workers as _wait_for_candidate_workers_impl,
+    fleet,
+)
 from orcest.fleet.config import (
     FleetConfig,
     OrchestratorConfig,
@@ -16,6 +21,8 @@ from orcest.fleet.config import (
     PoolConfig,
     ProjectEntry,
     ProxmoxConfig,
+    WorkerProfileConfig,
+    load_config,
     save_config,
 )
 
@@ -34,6 +41,76 @@ def runner():
 def cfg_path(tmp_path):
     """Path to a temporary fleet config file."""
     return str(tmp_path / "config.yaml")
+
+
+def test_fleet_operation_lock_is_reentrant_and_process_held(tmp_path, mocker):
+    from orcest.fleet.cli import _fleet_operation_lock
+
+    mocker.patch(
+        "orcest.fleet.cli._FLEET_OPERATION_LOCK_PATH",
+        str(tmp_path / "fleet.lock"),
+    )
+    flock = mocker.patch("orcest.fleet.cli.fcntl.flock")
+
+    with _fleet_operation_lock():
+        with _fleet_operation_lock():
+            pass
+
+    assert flock.call_count == 2  # one acquisition and one release
+
+
+def test_fleet_operation_lock_rejects_concurrent_mutation(tmp_path, mocker):
+    from orcest.fleet.cli import _fleet_operation_lock
+
+    mocker.patch(
+        "orcest.fleet.cli._FLEET_OPERATION_LOCK_PATH",
+        str(tmp_path / "fleet.lock"),
+    )
+    mocker.patch("orcest.fleet.cli.fcntl.flock", side_effect=BlockingIOError)
+
+    with pytest.raises(click.ClickException, match="another Orcest fleet mutation"):
+        with _fleet_operation_lock():
+            pass
+
+
+@pytest.mark.parametrize(
+    "command_name",
+    [
+        "add-org",
+        "create-orchestrator",
+        "onboard",
+        "destroy",
+        "update",
+        "create-template",
+        "rebake",
+        "destroy-template",
+        "gc-templates",
+        "set-pool-size",
+        "stop",
+        "start",
+        "deploy",
+    ],
+)
+def test_mutating_fleet_commands_are_serialized(command_name):
+    callback = fleet.commands[command_name].callback
+    assert getattr(callback, "_orcest_serialized_fleet_operation", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_pending_workers_by_default(mocker, tmp_path):
+    mocker.patch(
+        "orcest.fleet.cli._FLEET_OPERATION_LOCK_PATH",
+        str(tmp_path / "fleet-operation.lock"),
+    )
+    mocker.patch("orcest.fleet.orchestrator.get_workers_with_pending_tasks", return_value=set())
+    mocker.patch("orcest.fleet.orchestrator.set_workers_draining")
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_vmid_range", return_value=None)
+    mocker.patch("orcest.fleet.orchestrator.stop_stack")
+    mocker.patch("orcest.fleet.cli._wait_for_candidate_workers")
+    mocker.patch("orcest.fleet.cli._wait_for_worker_drain_quiescence")
+    mocker.patch("orcest.fleet.cli._drain_leases_still_held", return_value=[])
+    mocker.patch("orcest.fleet.orchestrator._resolve_deploy_revision", return_value="a" * 40)
 
 
 def _save(cfg, path):
@@ -153,6 +230,53 @@ def test_onboard_mints_and_passes_redis_password(runner, cfg_path, mocker):
     assert result.exit_code == 0, result.output
     mint.assert_called_once()
     assert gen.call_args.kwargs.get("redis_password") == "minted-pw-123"
+
+
+def test_onboard_passes_pool_backend_as_generated_default_runner(runner, cfg_path, mocker):
+    """A clauder worker pool must not be stranded by generated project configs
+    that still publish legacy Claude work to tasks:claude."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        pool=PoolConfig(worker_backend="clauder"),
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    gen_config = mocker.patch(
+        "orcest.fleet.orchestrator.generate_orchestrator_config",
+        return_value="",
+    )
+    mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.image_exists", return_value=True)
+    mocker.patch("orcest.fleet.orchestrator.deploy_stack")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+
+    result = runner.invoke(fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert gen_config.call_args.kwargs["default_runner"] == "clauder"
+
+
+def test_onboard_refuses_project_when_deployed_pool_backend_differs(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        pool=PoolConfig(worker_backend="clauder"),
+        orgs={"ThayneStudio": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_backend",
+        return_value="claude",
+    )
+    write_files = mocker.patch("orcest.fleet.orchestrator.write_project_files")
+
+    result = runner.invoke(fleet, ["onboard", "ThayneStudio/my-project", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "uncoordinated worker backend change" in result.output
+    write_files.assert_not_called()
+    assert load_config(cfg_path).projects == []
 
 
 def test_onboard_mints_password_before_starting_redis(runner, cfg_path, mocker):
@@ -308,6 +432,48 @@ def test_add_org_registers_credentials(runner, cfg_path, mocker):
     assert data["orgs"]["MyOrg"]["github_token"] == "ghp_test123"
 
 
+def test_add_org_preserves_provider_credentials_on_rotation(runner, cfg_path, mocker):
+    """C3: rotating the GitHub PAT must not delete hand-edited provider_credentials."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        orgs={
+            "MyOrg": OrgEntry(
+                github_token="ghp_old",
+                claude_oauth_tokens=["sk-old"],
+                provider_credentials={"grok": ["grok-blob"], "codex": ["codex-key"]},
+            )
+        },
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.cli._run_on_orchestrator",
+        return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""),
+    )
+
+    result = runner.invoke(
+        fleet,
+        [
+            "add-org",
+            "MyOrg",
+            "--github-token",
+            "ghp_new",
+            "--claude-token",
+            "sk-new",
+            "--config",
+            cfg_path,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Preserving hand-configured provider_credentials" in result.output
+
+    reloaded = load_config(cfg_path)
+    org = reloaded.orgs["MyOrg"]
+    assert org.github_token == "ghp_new"
+    assert org.claude_oauth_tokens == ["sk-new"]
+    assert org.provider_credentials == {"grok": ["grok-blob"], "codex": ["codex-key"]}
+
+
 def test_add_org_skips_validation_without_orchestrator(runner, cfg_path):
     """fleet add-org skips token validation when orchestrator is not configured."""
     _save(FleetConfig(), cfg_path)
@@ -452,6 +618,40 @@ def test_create_orchestrator(runner, cfg_path, mocker):
     assert data["orchestrator"]["host"] == "10.20.0.99"
 
 
+def test_create_orchestrator_starts_pool_manager_for_template_range_only(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(ssh_key="ssh-ed25519 AAAA..."),
+        pool=PoolConfig(template_vm_id=0, template_vmid_range=[9000, 9009]),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.provisioner.generate_tfvars", return_value={})
+    mocker.patch("orcest.fleet.provisioner.write_tfvars")
+    mocker.patch("orcest.fleet.provisioner.apply")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.99")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    upload_config = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    ensure_pool = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+
+    result = runner.invoke(
+        fleet,
+        ["create-orchestrator", "--vm-id", "199", "--storage", "local-lvm", "--config", cfg_path],
+    )
+
+    assert result.exit_code == 0, result.output
+    upload_config.assert_called_once()
+    ensure_pool.assert_called_once()
+
+
 def test_create_orchestrator_ssh_timeout(runner, cfg_path, mocker):
     """fleet create-orchestrator saves config and exits if SSH times out."""
     cfg = FleetConfig(
@@ -483,6 +683,7 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
     """fleet update uploads source, rebuilds image, and restarts stacks."""
     cfg = FleetConfig(
         orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
         projects=[
             ProjectEntry(name="alpha", repo="Org/alpha"),
             ProjectEntry(name="beta", repo="Org/beta"),
@@ -492,6 +693,9 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.orchestrator.upload_source")
     mocker.patch("orcest.fleet.orchestrator.build_image")
     mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mock_write = mocker.patch("orcest.fleet.orchestrator.write_project_files")
     mock_ensure_redis = mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
     mock_restart = mocker.patch("orcest.fleet.orchestrator.restart_stack")
 
@@ -500,7 +704,223 @@ def test_update_rebuilds_and_restarts(runner, cfg_path, mocker):
 
     # Should update shared Redis stack and restart both project stacks
     mock_ensure_redis.assert_called_once()
+    assert mock_write.call_count == 2
     assert mock_restart.call_count == 2
+
+
+def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_path, mocker):
+    """Existing project configs must follow backend changes such as claude -> clauder."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(worker_backend="clauder"),
+        trace_archive_host_path="/mnt/orcest/traces",
+        orgs={
+            "Org": OrgEntry(
+                github_token="ghp_fake",
+                claude_oauth_tokens=["sk-claude"],
+            )
+        },
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="redis-pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    gen_env = mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="env")
+    gen_config = mocker.patch(
+        "orcest.fleet.orchestrator.generate_orchestrator_config",
+        return_value="yaml",
+    )
+    write_files = mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    mocker.patch("orcest.fleet.orchestrator.restart_stack")
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert gen_env.call_args.kwargs == {
+        "github_token": "ghp_fake",
+        "key_prefix": "alpha",
+        "project_name": "alpha",
+        "claude_tokens": ["sk-claude"],
+        "provider_credentials": {},
+        "trace_archive_host_path": "/mnt/orcest/traces",
+        "redis_password": "redis-pw",
+    }
+    assert gen_config.call_args.kwargs == {
+        "repo": "Org/alpha",
+        "key_prefix": "alpha",
+        "extra_providers": [],
+        "default_runner": "clauder",
+        "trace_archive_enabled": True,
+    }
+    write_files.assert_called_once_with("orcest@10.20.0.23", "alpha", "env", "yaml")
+
+
+def test_update_refuses_uncoordinated_worker_backend_change(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(worker_backend="clauder"),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_backend",
+        return_value="claude",
+    )
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "uncoordinated worker backend change" in result.output
+    upload.assert_not_called()
+
+
+def test_deploy_refuses_vmid_range_change_before_stopping_fleet(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            template_vm_id=9000,
+            template_vmid_range=[9000, 9009],
+            vm_id_start=400,
+            vm_id_end=499,
+        ),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value="claude")
+    mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_vmid_range", return_value=(300, 399))
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(
+        fleet,
+        ["deploy", "--rebuild-template", "--drain-active", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    assert "Refusing to change the worker VMID range" in result.output
+    stop_pool.assert_not_called()
+
+
+def test_update_rejects_dirty_revision_before_upload(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator._resolve_deploy_revision",
+        return_value=f"{'b' * 40}-dirty",
+    )
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+    build = mocker.patch("orcest.fleet.orchestrator.build_image")
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "commit every source file before updating" in result.output
+    upload.assert_not_called()
+    build.assert_not_called()
+
+
+def test_update_has_no_user_callable_backend_change_bypass(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(worker_backend="clauder"),
+    )
+    _save(cfg, cfg_path)
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(
+        fleet,
+        ["update", "--allow-backend-change", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    # Click's punctuation/quoting around unknown options varies by version.
+    assert "No such option" in result.output
+    assert "--allow-backend-change" in result.output
+    upload.assert_not_called()
+
+
+def test_update_does_not_regenerate_project_files_without_redis_password(
+    runner,
+    cfg_path,
+    mocker,
+):
+    """Regenerating .env without ORCEST_REDIS_PASSWORD would break deployed stacks."""
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch(
+        "orcest.fleet.orchestrator.ensure_redis_password",
+        side_effect=RuntimeError("missing redis env"),
+    )
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    write_files = mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    restart = mocker.patch("orcest.fleet.orchestrator.restart_stack")
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "Redis password unavailable" in result.output
+    write_files.assert_not_called()
+    restart.assert_not_called()
+
+
+def test_update_refreshes_pool_manager_for_template_range_only(runner, cfg_path, mocker):
+    """fleet update refreshes pool manager when range mode has no legacy template ID."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=0, template_vmid_range=[9000, 9009]),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    order: list[str] = []
+    mocker.patch(
+        "orcest.fleet.orchestrator.write_project_files",
+        side_effect=lambda *_args, **_kwargs: order.append("write_project_files"),
+    )
+    mock_upload_config = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mock_ensure_pool = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    mock_upload_config.side_effect = lambda *_args, **_kwargs: order.append("upload_fleet_config")
+    mock_ensure_pool.side_effect = lambda *_args, **_kwargs: order.append("ensure_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.restart_stack",
+        side_effect=lambda *_args, **_kwargs: order.append("restart_stack"),
+    )
+
+    result = runner.invoke(fleet, ["update", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    mock_upload_config.assert_called_once()
+    mock_ensure_pool.assert_called_once()
+    assert order == [
+        "write_project_files",
+        "restart_stack",
+        "upload_fleet_config",
+        "ensure_pool_manager",
+    ]
 
 
 def test_update_requires_orchestrator_host(runner, cfg_path):
@@ -568,6 +988,17 @@ def _mock_proxmox_client(mocker):
     return mock_px
 
 
+def _successful_provider_cli_probe(host, user, cmd, timeout=60):
+    """Return realistic per-binary output for template smoke-check callers."""
+    if "grok" in cmd:
+        output = "grok 0.1.216"
+    elif "codex" in cmd:
+        output = "codex-cli 0.131.0"
+    else:
+        output = "claude 1.2.3"
+    return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+
+
 def test_create_template_success(runner, cfg_path, mocker):
     """create-template creates VM from cloud image, provisions, and converts to template."""
     cfg = _proxmox_cfg()
@@ -579,9 +1010,10 @@ def test_create_template_success(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0),
+        side_effect=_successful_provider_cli_probe,
     )
 
     result = runner.invoke(
@@ -615,9 +1047,10 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0),
+        side_effect=_successful_provider_cli_probe,
     )
 
     # Accept default template VM ID and default worker VM ID range start
@@ -628,6 +1061,79 @@ def test_create_template_prompts_for_vm_id(runner, cfg_path, mocker):
     )
     assert result.exit_code == 0, result.output
     assert "VM ID for new template" in result.output
+
+
+def _mock_successful_template_bake(mocker):
+    """Patch the bake steps so create-template reaches the vm_id_start prompt."""
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
+    mocker.patch("orcest.fleet.cli._ssh_run", side_effect=_successful_provider_cli_probe)
+
+
+def test_create_template_default_vm_id_start_clears_template_range(runner, cfg_path, mocker):
+    """C4: the offered default must sit above the template range, not inside it."""
+    cfg = _proxmox_cfg(pool=PoolConfig(storage="ssd-pool", template_vmid_range=[9000, 9009]))
+    _save(cfg, cfg_path)
+
+    _mock_proxmox_client(mocker)
+    _mock_successful_template_bake(mocker)
+
+    # Accept the offered default for the worker VM ID range start.
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "9000", "--config", cfg_path],
+        input="\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    reloaded = load_config(cfg_path)  # would raise if the saved range were invalid
+    assert reloaded.pool.vm_id_start == 9010
+
+
+def test_create_template_rejects_vm_id_start_inside_template_range(runner, cfg_path, mocker):
+    """C4: an overlapping vm_id_start must be re-prompted, never saved."""
+    cfg = _proxmox_cfg(pool=PoolConfig(storage="ssd-pool", template_vmid_range=[9000, 9009]))
+    _save(cfg, cfg_path)
+
+    _mock_proxmox_client(mocker)
+    _mock_successful_template_bake(mocker)
+
+    # First answer overlaps the template range; second is valid.
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "9000", "--config", cfg_path],
+        input="9001\n10000\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid pool configuration" in result.output
+    reloaded = load_config(cfg_path)
+    assert reloaded.pool.vm_id_start == 10000
+
+
+def test_create_template_does_not_save_invalid_vm_id_start(runner, cfg_path, mocker):
+    """C4: repeated invalid answers exit non-zero and leave the config loadable."""
+    cfg = _proxmox_cfg(pool=PoolConfig(storage="ssd-pool", template_vmid_range=[9000, 9009]))
+    _save(cfg, cfg_path)
+
+    _mock_proxmox_client(mocker)
+    _mock_successful_template_bake(mocker)
+
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "9000", "--config", cfg_path],
+        input="9001\n9002\n9003\n",
+    )
+
+    assert result.exit_code == 1
+    assert "Not saving vm_id_start" in result.output
+    reloaded = load_config(cfg_path)
+    assert reloaded.pool.vm_id_start == 0
+    assert reloaded.pool.template_vm_id == 0
 
 
 def test_create_template_no_proxmox_creds(runner, cfg_path):
@@ -660,7 +1166,29 @@ def test_create_template_image_import_failure(runner, cfg_path, mocker):
     )
     assert result.exit_code != 0
     assert "download failed" in result.output
-    # Should attempt best-effort cleanup
+    # A failure before create_vm returns cannot prove ownership of VMID 200.
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_create_template_cleans_up_only_after_creation_ownership_is_proven(
+    runner, cfg_path, mocker
+):
+    from orcest.fleet.cli import _OwnedTemplateVmCreationError
+
+    cfg = _proxmox_cfg()
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch(
+        "orcest.fleet.cli._create_vm_from_cloud_image",
+        side_effect=_OwnedTemplateVmCreationError("disk import failed"),
+    )
+
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
     mock_px.destroy_vm.assert_called_once_with(200)
 
 
@@ -760,6 +1288,7 @@ def test_create_template_disable_cloud_init_failure(runner, cfg_path, mocker):
     # *cloud-init clean* step (step 7) failing -- the smoke-check shares the
     # _ssh_run mock and would otherwise abort first.
     mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
         return_value=mocker.MagicMock(returncode=1, stderr="permission denied"),
@@ -785,9 +1314,10 @@ def test_create_template_stop_timeout_cleans_up(runner, cfg_path, mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0),
+        side_effect=_successful_provider_cli_probe,
     )
     # VM never reaches "stopped" state
     mock_px.get_vm_status.return_value = "running"
@@ -885,6 +1415,66 @@ def test_rebake_fails_and_keeps_pointer_when_provider_cli_missing(runner, cfg_pa
     mock_px.destroy_vm.assert_called_once_with(9001)
 
 
+def test_create_template_fails_when_source_install_fails(runner, cfg_path, mocker):
+    """A template must not be converted if it cannot install the deployed source."""
+    cfg = _proxmox_cfg()
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.cli._create_vm_from_cloud_image")
+    mocker.patch("orcest.fleet.cli._set_vm_cloud_init")
+    mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
+    mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
+    mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._verify_provider_clis", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=False)
+
+    result = runner.invoke(
+        fleet,
+        ["create-template", "--vm-id", "200", "--config", cfg_path],
+        input="\n",
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "Source install failed" in result.output
+    mock_px.convert_to_template.assert_not_called()
+    mock_px.destroy_vm.assert_called_once_with(200)
+
+
+def test_install_source_on_worker_template_uses_local_tarball(mocker, tmp_path):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _install_source_on_worker_template
+
+    tarball = tmp_path / "orcest-source.tar.gz"
+    tarball.write_bytes(b"fake tarball")
+    mocker.patch("orcest.fleet.orchestrator.create_source_tarball", return_value=str(tarball))
+    scp = mocker.patch(
+        "orcest.fleet.cli._scp_to_vm",
+        return_value=mocker.MagicMock(returncode=0, stderr=""),
+    )
+    ssh = mocker.patch(
+        "orcest.fleet.cli._ssh_run",
+        return_value=mocker.MagicMock(returncode=0, stderr=""),
+    )
+
+    assert _install_source_on_worker_template("10.20.0.50", "orcest", Console()) is True
+
+    scp.assert_called_once_with(
+        "10.20.0.50",
+        "orcest",
+        str(tarball),
+        "/tmp/orcest-source.tar.gz",
+    )
+    install_cmd = ssh.call_args.args[2]
+    assert "/tmp/orcest-template-source/requirements.lock" in install_cmd
+    assert "--no-deps /tmp/orcest-template-source" in install_cmd
+    assert "/opt/orcest/venv/bin/orcest revision --short" in install_cmd
+    assert "/etc/orcest/source-revision" in install_cmd
+    assert "github.com/ThayneStudio/orcest.git" not in install_cmd
+    assert not tarball.exists()
+
+
 class TestVerifyProviderClis:
     """H1-infra (repair 1): the smoke-check itself."""
 
@@ -902,11 +1492,16 @@ class TestVerifyProviderClis:
 
         from orcest.fleet.cli import _verify_provider_clis
 
-        # Every `command -v <bin>` succeeds.
-        mocker.patch(
-            "orcest.fleet.cli._ssh_run",
-            return_value=mocker.MagicMock(returncode=0, stdout="/usr/local/bin/x", stderr=""),
-        )
+        def fake_ssh(host, user, cmd, timeout=60):
+            if "grok" in cmd:
+                output = "grok 0.1.216"
+            elif "codex" in cmd:
+                output = "codex-cli 0.131.0"
+            else:
+                output = "claude 1.2.3"
+            return mocker.MagicMock(returncode=0, stdout=output, stderr="")
+
+        mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
         assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is True
 
     def test_fails_when_a_cli_is_missing(self, mocker):
@@ -915,11 +1510,11 @@ class TestVerifyProviderClis:
         from orcest.fleet.cli import _verify_provider_clis
         from orcest.fleet.cloud_init import REQUIRED_PROVIDER_BINARIES
 
-        # First binary present, the rest missing (command -v returns non-zero).
+        # First binary executes, the rest are missing (probe returns non-zero).
         def fake_ssh(host, user, cmd, timeout=60):
             present = REQUIRED_PROVIDER_BINARIES[0]
             rc = 0 if present in cmd else 1
-            return mocker.MagicMock(returncode=rc, stdout="", stderr="")
+            return mocker.MagicMock(returncode=rc, stdout="claude 1.2.3", stderr="")
 
         mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
         assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is False
@@ -938,14 +1533,63 @@ class TestVerifyProviderClis:
 
         def fake_ssh(host, user, cmd, timeout=60):
             seen_cmds.append(cmd)
-            return mocker.MagicMock(returncode=0, stdout="/x", stderr="")
+            if "grok" in cmd:
+                output = "grok 0.1.216"
+            elif "codex" in cmd:
+                output = "codex-cli 0.131.0"
+            else:
+                output = "claude 1.2.3"
+            return mocker.MagicMock(returncode=0, stdout=output, stderr="")
 
         mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
         _verify_provider_clis("10.0.0.1", "orcest", Console())
         assert seen_cmds, "smoke-check ran no probes"
         for cmd in seen_cmds:
             assert "command -v" in cmd
+            assert "--version" in cmd
             assert "orcest" in cmd  # probes the worker user, not root
+
+    @pytest.mark.parametrize(
+        ("binary", "reported"),
+        (("grok", "grok 0.1.215"), ("codex", "codex-cli 0.130.0")),
+    )
+    def test_rejects_pinned_provider_version_mismatch(self, mocker, binary, reported):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+
+        def fake_ssh(host, user, cmd, timeout=60):
+            if binary in cmd:
+                output = reported
+            elif "grok" in cmd:
+                output = "grok 0.1.216"
+            elif "codex" in cmd:
+                output = "codex-cli 0.131.0"
+            else:
+                output = "claude 1.2.3"
+            return mocker.MagicMock(returncode=0, stdout=output, stderr="")
+
+        mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
+
+        assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is False
+
+    def test_rejects_update_advisory_that_mentions_pinned_version(self, mocker):
+        from rich.console import Console
+
+        from orcest.fleet.cli import _verify_provider_clis
+
+        def fake_ssh(host, user, cmd, timeout=60):
+            if "codex" in cmd:
+                output = "codex-cli 0.130.0\nUpdate available: 0.131.0"
+            elif "grok" in cmd:
+                output = "grok 0.1.216"
+            else:
+                output = "claude 1.2.3"
+            return mocker.MagicMock(returncode=0, stdout=output, stderr="")
+
+        mocker.patch("orcest.fleet.cli._ssh_run", side_effect=fake_ssh)
+
+        assert _verify_provider_clis("10.0.0.1", "orcest", Console()) is False
 
     def test_transient_ssh_timeout_fails_closed(self, mocker):
         """A timed-out probe must fail closed (return False) rather than
@@ -1182,9 +1826,10 @@ def _patch_template_bake(mocker):
     mocker.patch("orcest.fleet.cli._get_vm_ip", return_value="10.20.0.50")
     mocker.patch("orcest.fleet.cli._wait_for_ssh", return_value=True)
     mocker.patch("orcest.fleet.cli._wait_for_cloud_init", return_value=True)
+    mocker.patch("orcest.fleet.cli._install_source_on_worker_template", return_value=True)
     mocker.patch(
         "orcest.fleet.cli._ssh_run",
-        return_value=mocker.MagicMock(returncode=0),
+        side_effect=_successful_provider_cli_probe,
     )
 
 
@@ -1277,8 +1922,42 @@ def test_rebake_bake_failure_does_not_swap_pointer(runner, cfg_path, mocker):
 
     assert result.exit_code != 0
     mock_set.assert_not_called()
-    # Best-effort cleanup of the half-built VM
-    mock_px.destroy_vm.assert_called_once_with(9001)
+    # A failure before create_vm returns cannot prove ownership of VMID 9001.
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_rebake_pointer_swap_failure_prints_authenticated_redis_cli(
+    runner,
+    cfg_path,
+    mocker,
+):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(
+            template_vmid_range=[9000, 9009],
+            template_vm_id=9000,
+            storage="ssd-pool",
+            snippet_storage="local",
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [{"vmid": 9000, "template": True}]
+    _patch_template_bake(mocker)
+    mocker.patch(
+        "orcest.fleet.orchestrator.set_current_template_vmid",
+        side_effect=RuntimeError("redis auth failed"),
+    )
+
+    result = runner.invoke(fleet, ["rebake", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "pointer swap failed" in result.output
+    normalized_output = " ".join(result.output.split())
+    assert "docker exec orcest-redis-redis-1" in normalized_output
+    assert 'redis-cli -a "$ORCEST_REDIS_PASSWORD"' in normalized_output
+    assert "--no-auth-warning" in normalized_output
 
 
 def test_destroy_template_refuses_active_pointer(runner, cfg_path, mocker):
@@ -1370,7 +2049,7 @@ def test_gc_templates_destroys_inactive_only(runner, cfg_path, mocker):
         return_value=9001,
     )
 
-    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+    result = runner.invoke(fleet, ["gc-templates", "--yes", "--config", cfg_path])
 
     assert result.exit_code == 0, result.output
     # 9000 and 9002 destroyed; 9001 (active) preserved
@@ -1403,7 +2082,7 @@ def test_gc_templates_skips_template_that_becomes_active_mid_run(runner, cfg_pat
         side_effect=[9001, 9002, 9002],
     )
 
-    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path])
+    result = runner.invoke(fleet, ["gc-templates", "--yes", "--config", cfg_path])
 
     assert result.exit_code == 0, result.output
     destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
@@ -1422,8 +2101,8 @@ def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
 
     mock_px = _mock_proxmox_client(mocker)
     mock_px.list_vms.return_value = [
-        {"vmid": 9000, "template": True},
-        {"vmid": 9001, "template": True},
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
     ]
     mocker.patch(
         "orcest.fleet.orchestrator.get_current_template_vmid",
@@ -1434,6 +2113,105 @@ def test_gc_templates_dry_run_destroys_nothing(runner, cfg_path, mocker):
 
     assert result.exit_code == 0, result.output
     assert "would destroy VM 9000" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_gc_templates_never_destroys_non_template_vms_in_range(runner, cfg_path, mocker):
+    """C1: a VMID inside the template range is not proof of ownership.
+
+    An unrelated (or still-running) VM parked in the template VMID range must be
+    reported and left alone. Ownership proof is the orcest name prefix, not the
+    Proxmox template flag: the worker and template VMID ranges are validated
+    disjoint, so an in-range `orcest-worker-*` VM is never a live pool worker,
+    and half-baked template residue (created as `orcest-worker-*` and converted
+    only at the last step of a bake) MUST be reclaimable -- otherwise it
+    permanently consumes a slot in a 10-wide range that `rebake` tells the
+    operator to clear with this very command.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+        # Someone else's running VM parked inside the template range.
+        {"vmid": 9002, "name": "postgres-prod", "status": "running"},
+        # An orcest-named clone that was never converted to a template.
+        {"vmid": 9003, "name": "orcest-worker-9003", "template": False},
+        # A template that is not ours.
+        {"vmid": 9004, "name": "debian-12-base", "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--yes", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    # 9000 (old template) and 9003 (half-baked residue) are orcest-owned and
+    # reclaimable; 9001 is the active template and is never touched.
+    destroyed = {call.args[0] for call in mock_px.destroy_vm.call_args_list}
+    assert destroyed == {9000, 9003}
+    # Foreign VMs are never stopped or destroyed, whatever their template flag.
+    for foreign in (9002, 9004):
+        assert foreign not in destroyed
+    assert "not owned by orcest" in result.output
+    for excluded in ("postgres-prod", "debian-12-base"):
+        assert excluded in result.output
+    assert "orcest-worker-9003" in result.output
+
+
+def test_gc_templates_requires_confirmation_before_destroying(runner, cfg_path, mocker):
+    """C1: the destructive path prompts, and declining destroys nothing."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path], input="n\n")
+
+    assert result.exit_code != 0
+    assert "Destroy 1 template VM(s) [9000]" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_gc_templates_fails_closed_without_confirmation_input(runner, cfg_path, mocker):
+    """C1: an unattended run without --yes aborts instead of destroying."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vmid_range=[9000, 9009], template_vm_id=9001),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template", "template": True},
+    ]
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_current_template_vmid",
+        return_value=9001,
+    )
+
+    result = runner.invoke(fleet, ["gc-templates", "--config", cfg_path], input="")
+
+    assert result.exit_code != 0
     mock_px.destroy_vm.assert_not_called()
 
 
@@ -1669,14 +2447,92 @@ def test_set_pool_size_negative(runner, cfg_path):
     assert "non-negative" in result.output
 
 
+def test_set_pool_size_rejects_target_larger_than_worker_range(runner, cfg_path):
+    """set-pool-size fails without persisting an impossible exact-slot layout."""
+    cfg = FleetConfig(pool=PoolConfig(size=2, vm_id_start=300, vm_id_end=302))
+    _save(cfg, cfg_path)
+
+    result = runner.invoke(fleet, ["set-pool-size", "4", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "cannot fit the target size" in result.output
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f)
+    assert data["pool"]["size"] == 2
+
+
 # ── fleet stop ──────────────────────────────────────────────
+
+
+def test_stop_drain_active_missing_credentials_has_no_side_effects(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(endpoint="https://10.20.0.1:8006"),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(
+        fleet,
+        ["stop", "--drain-active", "--yes", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    assert "credentials are not configured" in result.output
+    assert "No fleet state was changed" in result.output
+    stop_pool.assert_not_called()
+
+
+def test_stop_refuses_deployed_vmid_range_mismatch_before_mutation(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=400, vm_id_end=499),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_vmid_range",
+        return_value=(300, 399),
+    )
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mock_px = _mock_proxmox_client(mocker)
+
+    result = runner.invoke(fleet, ["stop", "--drain-active", "--yes", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "differs from the deployed fleet" in " ".join(result.output.split())
+    assert "No fleet state was changed" in result.output
+    stop_pool.assert_not_called()
+    mock_px.list_vms.assert_not_called()
+
+
+def test_stop_refuses_deployed_vmid_range_read_failure_before_mutation(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_vmid_range",
+        side_effect=RuntimeError("remote config unreadable"),
+    )
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mock_px = _mock_proxmox_client(mocker)
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "Could not verify deployed worker VMID range" in result.output
+    assert "No fleet state was changed" in result.output
+    stop_pool.assert_not_called()
+    mock_px.list_vms.assert_not_called()
 
 
 def test_stop_destroys_idle_vms(runner, cfg_path, mocker):
     """stop destroys idle worker VMs and cleans Redis."""
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
     )
     _save(cfg, cfg_path)
 
@@ -1698,11 +2554,405 @@ def test_stop_destroys_idle_vms(runner, cfg_path, mocker):
     mock_clean.assert_called_once()
 
 
+def test_stop_fails_when_destroyed_worker_markers_cannot_be_cleaned(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.clean_pool_redis",
+        side_effect=RuntimeError("marker verification failed"),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "durable Redis done/drain markers" in result.output
+    assert "not verified as cleared" in result.output
+    mock_px.destroy_vm.assert_called_once_with(300)
+
+
+def test_stop_destroy_failure_restarts_worker_and_exits_nonzero(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mock_px.destroy_vm.side_effect = RuntimeError("destroy failed")
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "failed to destroy 1" in result.output
+    assert "Stop incomplete" in result.output
+    mock_px.start_vm.assert_called_once_with(300)
+
+
+def test_stop_refuses_named_worker_outside_configured_vmid_range(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 500, "name": "orcest-worker-500", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"500"}, {}),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "outside configured worker VMID range" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_fails_when_drain_leases_cannot_be_cleared(runner, cfg_path, mocker):
+    """C2: a failed lease clear permanently fences SURVIVING workers -- exit non-zero.
+
+    Only survivors matter. A destroyed VM has no process left to fence, and
+    Step 4's clean_pool_redis clears and verifies its marker immediately after,
+    so reporting destroyed workers here would abort the command (and, through
+    `deploy`, the whole rollout) over leases that are provably gone.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "301"}, {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle when the drain leases are taken, so both get a lease; 301 then claims
+    # a task before it is destroyed, so it is restarted and SURVIVES holding one.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), set(), {"orcest-worker-301"}],
+    )
+
+    def _draining(ssh_target, worker_ids, *, draining):
+        if not draining:
+            raise RuntimeError("redis unreachable")
+
+    mocker.patch("orcest.fleet.orchestrator.set_workers_draining", side_effect=_draining)
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "failed to clear drain leases" in result.output
+    assert "worker drain leases were not cleared" in result.output
+    # Only the survivor is reported; the destroyed VM is not.
+    assert "orcest-worker-301" in result.output
+    assert "SREM orcest:pool:draining" in result.output
+
+
+def test_stop_succeeds_when_only_destroyed_workers_had_leases(runner, cfg_path, mocker):
+    """A lease-clear blip on workers that were all destroyed must not fail the stop.
+
+    Regression: the verification covered every drained worker, including the
+    destroyed ones whose markers `clean_pool_redis` SREMs and verifies moments
+    later. A transient blip therefore exited 1 with a no-op SREM remediation --
+    and via `deploy` aborted the rollout at step 2 of 5, after the orchestrators
+    and pool manager were already stopped.
+    """
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 301, "name": "orcest-worker-301", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "301"}, {}),
+    )
+    clean_pool = mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    def _draining(ssh_target, worker_ids, *, draining):
+        if not draining:
+            raise RuntimeError("redis blip")
+
+    mocker.patch("orcest.fleet.orchestrator.set_workers_draining", side_effect=_draining)
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "worker drain leases were not cleared" not in result.output
+    # Both VMs were destroyed, so clean_pool_redis owns verifying their markers.
+    assert sorted(clean_pool.call_args.args[1]) == ["300", "301"]
+
+
+def test_stop_fails_when_skipped_worker_lease_survives(runner, cfg_path, mocker):
+    """C2: SREM can report success while the marker is still set -- verify it."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle at drain time so it takes a lease, then claims a task before being
+    # destroyed -- it is restarted and survives, so its lease genuinely fences it.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), {"orcest-worker-300"}],
+    )
+    still_held = mocker.patch(
+        "orcest.fleet.cli._drain_leases_still_held",
+        return_value=["orcest-worker-300"],
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert still_held.call_args.args[1] == ["orcest-worker-300"]
+    assert "drain leases are still held" in result.output
+    assert "worker drain leases were not cleared" in result.output
+
+
+def test_stop_fails_when_drain_lease_verification_fails(runner, cfg_path, mocker):
+    """C2: an unverifiable lease is treated as still held."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    # Idle at drain time so it takes a lease, then claims a task before being
+    # destroyed -- it survives holding a lease we cannot verify was cleared.
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), {"orcest-worker-300"}],
+    )
+    mocker.patch(
+        "orcest.fleet.cli._drain_leases_still_held",
+        side_effect=RuntimeError("ssh failed"),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "failed to verify drain leases were cleared" in result.output
+
+
+def test_drain_leases_still_held_reports_surviving_members(mocker):
+    """C2: the verifier maps SISMEMBER results back to worker IDs."""
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess([], 0, stdout="0\n1\n", stderr=""),
+    )
+
+    assert _drain_leases_still_held_impl("orcest@host", ["w-1", "w-2"]) == ["w-2"]
+
+
+def test_drain_leases_still_held_rejects_truncated_output(mocker):
+    """C2: a short SISMEMBER response must not be read as 'all cleared'."""
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        return_value=subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="expected 2 SISMEMBER results"):
+        _drain_leases_still_held_impl("orcest@host", ["w-1", "w-2"])
+
+
+def test_stop_final_pending_check_closes_idle_claim_race(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    pending = mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), set(), {"orcest-worker-300"}],
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert pending.call_count == 3
+    assert "restarted VM for task recovery" in result.output
+    mock_px.start_vm.assert_called_once_with(300)
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_fails_when_late_claim_worker_cannot_restart(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mock_px.start_vm.side_effect = RuntimeError("start rejected")
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=[set(), set(), {"orcest-worker-300"}],
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "could not be restarted" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_does_not_clean_pending_task_markers(runner, cfg_path, mocker):
+    """stop must not wipe task pending markers for still-running or recoverable work."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    mock_clean_pending = mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks")
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    mock_clean_pending.assert_not_called()
+    assert "Pending task markers left intact" in result.output
+
+
+def test_stop_aborts_when_pool_manager_stop_fails(runner, cfg_path, mocker):
+    """stop must not destroy workers while the pool manager may still mutate state."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mocker.patch(
+        "orcest.fleet.orchestrator.stop_pool_manager",
+        side_effect=RuntimeError("compose down failed"),
+    )
+    mock_members = mocker.patch("orcest.fleet.orchestrator.get_pool_redis_members")
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "pool manager may still be running" in result.output
+    mock_members.assert_not_called()
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_does_not_destroy_worker_templates(runner, cfg_path, mocker):
+    """stop must not destroy blue/green worker templates as orphan workers."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(
+            template_vm_id=9000,
+            template_vmid_range=[9000, 9009],
+            vm_id_start=300,
+            vm_id_end=399,
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+        {"vmid": 9001, "name": "orcest-worker-template"},
+        {"vmid": 9002, "name": "orcest-worker-template-old"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.get_current_template_vmid", return_value=9001)
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+    assert result.exit_code == 0
+    mock_px.destroy_vm.assert_called_once_with(300)
+
+
 def test_stop_leaves_active_vms(runner, cfg_path, mocker):
     """stop leaves active VMs running unless --drain-active."""
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
     )
     _save(cfg, cfg_path)
 
@@ -1725,11 +2975,94 @@ def test_stop_leaves_active_vms(runner, cfg_path, mocker):
     assert "Leaving active VM 301" in result.output
 
 
+def test_stop_refuses_to_destroy_when_pool_state_unavailable(runner, cfg_path, mocker):
+    """stop must not classify active workers as orphans when Redis state reads fail."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        side_effect=RuntimeError("redis unavailable"),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "Refusing to destroy worker VMs" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_refuses_when_pending_consumer_state_unavailable(runner, cfg_path, mocker):
+    """stop must not destroy idle/orphan VMs if PEL state cannot be inspected."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        side_effect=RuntimeError("xinfo failed"),
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "pending-consumer state" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
+def test_stop_skips_idle_vm_with_pending_consumer(runner, cfg_path, mocker):
+    """An idle-set VM that now has PEL entries is not destroyed during normal stop."""
+    cfg = _proxmox_cfg(
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 300, "name": "orcest-worker-300", "status": "running"},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300"}, {}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        return_value={"orcest-worker-300"},
+    )
+
+    result = runner.invoke(fleet, ["stop", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert "with pending task" in result.output
+    mock_px.destroy_vm.assert_not_called()
+
+
 def test_stop_drain_active_destroys_all(runner, cfg_path, mocker):
     """stop --drain-active also destroys active VMs."""
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
     )
     _save(cfg, cfg_path)
 
@@ -1768,7 +3101,7 @@ def test_stop_drain_active_prompt(
     """stop --drain-active follows the user's confirmation prompt answer."""
     cfg = _proxmox_cfg(
         orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
     )
     _save(cfg, cfg_path)
 
@@ -1854,6 +3187,56 @@ def test_start_uploads_config_and_starts(runner, cfg_path, mocker):
     assert "target size: 4" in result.output
 
 
+def test_start_allows_template_range_without_legacy_template(runner, cfg_path, mocker):
+    """start accepts range-mode pools where Redis pointer selects the active template."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=0, template_vmid_range=[9000, 9009], size=4),
+    )
+    _save(cfg, cfg_path)
+
+    mock_upload = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mock_ensure = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+
+    assert result.exit_code == 0
+    mock_upload.assert_called_once()
+    mock_ensure.assert_called_once()
+
+
+def test_start_refuses_uncoordinated_worker_backend_change(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.1", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, worker_backend="clauder"),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_backend",
+        return_value="claude",
+    )
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    ensure = mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+
+    result = runner.invoke(fleet, ["start", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "uncoordinated worker backend change" in result.output
+    upload.assert_not_called()
+    ensure.assert_not_called()
+
+
 def test_start_requires_orchestrator_host(runner, cfg_path):
     """start fails if orchestrator host not set."""
     _save(FleetConfig(), cfg_path)
@@ -1897,8 +3280,28 @@ def test_start_rejects_localhost_endpoint(runner, cfg_path):
 # ── deploy tests ───────────────────────────────────────────
 
 
-def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
-    """deploy runs upgrade, stop, update, and start in order."""
+def test_deploy_missing_proxmox_credentials_fails_before_stop(runner, cfg_path, mocker):
+    cfg = FleetConfig(
+        proxmox=ProxmoxConfig(endpoint="https://10.20.0.1:8006"),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, vm_id_end=399),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "Deploy preflight failed before any services were stopped" in result.output
+    assert "Proxmox API credentials are not configured" in result.output
+    stop_pool.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_deploy_rejects_provider_stream_without_managed_worker_before_stop(
+    runner, cfg_path, mocker
+):
     cfg = _proxmox_cfg(
         proxmox=ProxmoxConfig(
             endpoint="https://10.20.0.1:8006",
@@ -1906,12 +3309,88 @@ def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
             api_token_secret="secret",
         ),
         orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
-        pool=PoolConfig(template_vm_id=9000),
+        orgs={
+            "Org": OrgEntry(
+                claude_oauth_tokens=["claude-secret"],
+                provider_credentials={"grok": ["grok-secret"]},
+            )
+        },
+        projects=[ProjectEntry(name="project", repo="Org/project")],
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="claude"),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    upload = mocker.patch("orcest.fleet.orchestrator.upload_source")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "unconsumed provider stream(s) grok" in result.output
+    assert "workers consume only tasks:claude" in result.output
+    stop_pool.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_deploy_rejects_dirty_revision_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
+    )
+    _save(cfg, cfg_path)
+    mocker.patch(
+        "orcest.fleet.orchestrator._resolve_deploy_revision",
+        return_value=f"{'b' * 40}-dirty",
+    )
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "deployment source revision" in result.output
+    assert "commit every source file" in result.output
+    stop_pool.assert_not_called()
+
+
+def test_deploy_requires_worker_range_before_stop(runner, cfg_path, mocker):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=0),
+    )
+    _save(cfg, cfg_path)
+    stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "pool.vm_id_start is required" in result.output
+    stop_pool.assert_not_called()
+
+
+def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
+    """deploy runs stop, update, and start in order without self-upgrading."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300),
     )
     _save(cfg, cfg_path)
 
     # Mock all external calls
-    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    mock_upgrade = mocker.patch("orcest.fleet.cli._upgrade_cli")
     _mock_proxmox_client(mocker)
     mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
     mocker.patch(
@@ -1933,10 +3412,470 @@ def test_deploy_runs_full_sequence(runner, cfg_path, mocker):
     result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
     assert result.exit_code == 0, result.output
     assert "Deploy complete" in result.output
+    mock_upgrade.assert_not_called()
 
     # Start step should have uploaded config and started pool manager
     mock_upload_cfg.assert_called()
     mock_ensure_pool.assert_called()
+
+
+def test_deploy_attests_workers_before_project_restart(runner, cfg_path, mocker):
+    """Publishers stay stopped until regenerated candidate workers attest."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="clauder"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+
+    order: list[str] = []
+    mocker.patch(
+        "orcest.fleet.orchestrator.stop_stack",
+        side_effect=lambda *_args, **_kwargs: order.append("stop_stack"),
+    )
+    mocker.patch(
+        "orcest.fleet.cli._wait_for_candidate_workers",
+        side_effect=lambda *_args, **_kwargs: order.append("attest_workers"),
+    )
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mocker.patch(
+        "orcest.fleet.orchestrator.write_project_files",
+        side_effect=lambda *_args, **_kwargs: order.append("write_project_files"),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.restart_stack",
+        side_effect=lambda *_args, **_kwargs: order.append("restart_stack"),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.upload_fleet_config",
+        side_effect=lambda *_args, **_kwargs: order.append("upload_fleet_config"),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.ensure_pool_manager",
+        side_effect=lambda *_args, **_kwargs: order.append("ensure_pool_manager"),
+    )
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    assert order == [
+        "stop_stack",
+        "write_project_files",
+        "upload_fleet_config",
+        "ensure_pool_manager",
+        "attest_workers",
+        "restart_stack",
+    ]
+
+    order.clear()
+    result = runner.invoke(
+        fleet,
+        ["deploy", "--keep-orchestrators-paused", "--config", cfg_path],
+    )
+    assert result.exit_code == 0, result.output
+    assert order == [
+        "stop_stack",
+        "write_project_files",
+        "upload_fleet_config",
+        "ensure_pool_manager",
+        "attest_workers",
+    ]
+    assert "paused by operator request" in result.output
+
+
+def test_deploy_partial_pause_failure_keeps_stopped_projects_paused_when_requested(
+    runner, cfg_path, mocker
+):
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="clauder"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[
+            ProjectEntry(name="alpha", repo="Org/alpha"),
+            ProjectEntry(name="beta", repo="Org/beta"),
+        ],
+    )
+    _save(cfg, cfg_path)
+    stop_stack = mocker.patch(
+        "orcest.fleet.orchestrator.stop_stack",
+        side_effect=[None, RuntimeError("stop failed")],
+    )
+    restart_stack = mocker.patch("orcest.fleet.orchestrator.restart_stack")
+
+    result = runner.invoke(
+        fleet,
+        ["deploy", "--keep-orchestrators-paused", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    assert stop_stack.call_count == 2
+    restart_stack.assert_not_called()
+    assert "Already-paused stacks remain stopped" in result.output
+
+
+def test_candidate_worker_attestation_requires_exact_vmid_backend_revision_layout(mocker):
+    revision = "a" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=4,
+            vm_id_start=300,
+            worker_profiles=[
+                WorkerProfileConfig(backend="clauder"),
+                WorkerProfileConfig(backend="codex"),
+                WorkerProfileConfig(backend="grok"),
+            ],
+        ),
+    )
+    mocker.patch("orcest.fleet.orchestrator._resolve_deploy_revision", return_value=revision)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={
+            "orcest-worker-300": ("clauder", revision),
+            "orcest-worker-301": ("codex", revision),
+            "orcest-worker-302": ("grok", revision),
+            "orcest-worker-303": ("clauder", revision),
+        },
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "301", "302", "303"}, {}),
+    )
+    console = mocker.Mock()
+
+    _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    assert "attested" in console.print.call_args.args[0]
+
+    # A non-rebuild deploy accepts the single clean revision already baked in
+    # the retained template instead of waiting for the orchestrator revision.
+    console.reset_mock()
+    _wait_for_candidate_workers_impl(cfg, console, expected_revision=None)
+    assert revision[:12] in console.print.call_args.args[0]
+
+
+def test_candidate_worker_attestation_rejects_wrong_tracked_vmid_at_same_count(mocker):
+    revision = "a" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=1,
+            vm_id_start=300,
+            worker_profiles=[WorkerProfileConfig(backend="codex")],
+        ),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={"orcest-worker-300": ("codex", revision)},
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        side_effect=[({"999"}, {}), ({"300"}, {})],
+    )
+    monotonic = mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=[0.0, 0.0, 5.0, 5.0])
+    sleep = mocker.patch("orcest.fleet.cli.time.sleep")
+    console = mocker.Mock()
+
+    _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    assert monotonic.call_count == 4
+    sleep.assert_called_once_with(5)
+    assert "attested" in console.print.call_args.args[0]
+
+
+def test_candidate_worker_attestation_tolerates_spared_old_revision_workers(mocker):
+    """A busy VM spared by `stop` without --drain-active keeps heartbeating the
+    previous template revision until the pool manager retires it; it must not
+    block attestation of the fully regenerated remaining slots."""
+    revision = "a" * 40
+    old_revision = "b" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=4,
+            vm_id_start=300,
+            worker_profiles=[
+                WorkerProfileConfig(backend="clauder"),
+                WorkerProfileConfig(backend="codex"),
+                WorkerProfileConfig(backend="grok"),
+            ],
+        ),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={
+            "orcest-worker-300": ("clauder", revision),
+            "orcest-worker-301": ("codex", old_revision),
+            "orcest-worker-302": ("grok", revision),
+            "orcest-worker-303": ("clauder", revision),
+        },
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "302", "303"}, {"301": "task-1"}),
+    )
+    sleep = mocker.patch("orcest.fleet.cli.time.sleep")
+    console = mocker.Mock()
+
+    _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    sleep.assert_not_called()
+    printed = [call.args[0] for call in console.print.call_args_list]
+    assert any("Ignoring 1 surviving old-revision worker" in line for line in printed)
+    assert "orcest-worker-301" in "".join(printed)
+    assert "attested" in printed[-1]
+
+
+def test_candidate_worker_attestation_requires_at_least_one_new_revision_worker(mocker):
+    """Old-revision survivors alone attest nothing about the new template."""
+    revision = "a" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=1,
+            vm_id_start=300,
+            worker_profiles=[WorkerProfileConfig(backend="codex")],
+        ),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={"orcest-worker-300": ("codex", "b" * 40)},
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {"300": "task-1"}),
+    )
+    monotonic = mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=[0.0, 0.0, 5.0, 1000.0])
+    mocker.patch("orcest.fleet.cli.time.sleep")
+    console = mocker.Mock()
+
+    with pytest.raises(SystemExit):
+        _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    assert monotonic.call_count == 4
+    assert "did not attest" in console.print.call_args.args[0]
+
+
+def test_deploy_resumes_orchestrators_when_attestation_fails(runner, cfg_path, mocker):
+    """A failed candidate-worker wait must not leave every publisher stopped."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="clauder"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch(
+        "orcest.fleet.cli._wait_for_candidate_workers",
+        side_effect=SystemExit(1),
+    )
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    restart_stack = mocker.patch("orcest.fleet.orchestrator.restart_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    restart_stack.assert_called_once()
+    assert restart_stack.call_args.args[1] == "alpha"
+    assert "Resuming stack for 'alpha'" in result.output
+
+    # Operator explicitly asked for paused stacks: honour that even on failure.
+    restart_stack.reset_mock()
+    result = runner.invoke(
+        fleet,
+        ["deploy", "--keep-orchestrators-paused", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    restart_stack.assert_not_called()
+    assert "remain stopped by operator request" in result.output
+
+
+def test_deploy_rebuild_template_uses_rebake_pointer_swap(runner, cfg_path, mocker):
+    """deploy --rebuild-template must use rebake, not legacy create-template."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(
+            host="10.20.0.23",
+            user="orcest",
+            ssh_key="ssh-ed25519 AAA",
+        ),
+        pool=PoolConfig(
+            template_vm_id=9000,
+            template_vmid_range=[9000, 9009],
+            worker_backend="clauder",
+            vm_id_start=300,
+            vm_id_end=399,
+            storage="ssd-pool",
+            snippet_storage="local",
+        ),
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9000, "name": "orcest-worker-template", "template": True},
+    ]
+    _patch_template_bake(mocker)
+    call_order: list[str] = []
+    mock_set = mocker.patch(
+        "orcest.fleet.orchestrator.set_current_template_vmid",
+        side_effect=lambda *_args, **_kwargs: call_order.append("set_current_template_vmid"),
+    )
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_deployed_pool_backend",
+        return_value="claude",
+    )
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch(
+        "orcest.fleet.orchestrator.ensure_pool_manager",
+        side_effect=lambda *_args, **_kwargs: call_order.append("ensure_pool_manager"),
+    )
+
+    result = runner.invoke(
+        fleet,
+        [
+            "deploy",
+            "--rebuild-template",
+            "--drain-active",
+            "--config",
+            cfg_path,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Rebaking template" in result.output
+    mock_px.convert_to_template.assert_called_once_with(9001)
+    mock_set.assert_called_once_with("orcest@10.20.0.23", 9001)
+    assert call_order == ["set_current_template_vmid", "ensure_pool_manager"]
+
+
+def test_deploy_rebuild_template_requires_range_before_side_effects(runner, cfg_path, mocker):
+    """deploy --rebuild-template must fail before stopping legacy single-template fleets."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000),
+    )
+    _save(cfg, cfg_path)
+
+    mock_upgrade = mocker.patch("orcest.fleet.cli._upgrade_cli")
+    mock_stop_pool = mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--rebuild-template", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    assert "template_vmid_range" in result.output
+    mock_upgrade.assert_not_called()
+    mock_stop_pool.assert_not_called()
+
+
+def test_deploy_drain_active_forwards_to_stop(runner, cfg_path, mocker):
+    """deploy --drain-active destroys active workers through the stop step."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=9001, vm_id_end=9999),
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    mock_px = _mock_proxmox_client(mocker)
+    mock_px.list_vms.return_value = [
+        {"vmid": 9001, "name": "orcest-worker-9001", "template": False},
+    ]
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {"9001": "orcest-worker-9001"}),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_workers_with_pending_tasks",
+        return_value=set(),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pool_redis")
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+    mocker.patch("orcest.fleet.cli._ensure_orchestrator_ssh")
+
+    result = runner.invoke(fleet, ["deploy", "--drain-active", "--config", cfg_path])
+
+    assert result.exit_code == 0, result.output
+    mock_px.destroy_vm.assert_called_once_with(9001)
 
 
 # ── _prompt_storage non-interactive tests (bug 8) ───────────
@@ -2122,18 +4061,13 @@ class TestWaitForCloudInit:
 
         # boot-finished marker exists (returncode 0), but status reports error.
         boot_finished = mocker.MagicMock(returncode=0)
-        status_error = mocker.MagicMock(
-            returncode=1, stdout="status: error", stderr=""
-        )
+        status_error = mocker.MagicMock(returncode=1, stdout="status: error", stderr="")
         mocker.patch(
             "orcest.fleet.cli.subprocess.run",
             side_effect=[boot_finished, status_error],
         )
         mocker.patch("orcest.fleet.cli.time.sleep")
-        assert (
-            _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60)
-            is False
-        )
+        assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is False
 
     def test_transient_status_read_is_retried_not_aborted(self, mocker):
         """H1-infra (repair 2): a single flaky SSH read of `cloud-init status`
@@ -2194,8 +4128,7 @@ class TestWaitForCloudInit:
         boot_finished = mocker.MagicMock(returncode=0)
         mocker.patch(
             "orcest.fleet.cli.subprocess.run",
-            side_effect=[boot_finished]
-            + [subprocess.TimeoutExpired(cmd="ssh", timeout=15)] * 20,
+            side_effect=[boot_finished] + [subprocess.TimeoutExpired(cmd="ssh", timeout=15)] * 20,
         )
         mocker.patch("orcest.fleet.cli.time.sleep")
         assert _wait_for_cloud_init("10.0.0.1", "orcest", Console(), timeout=60) is False

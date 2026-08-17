@@ -1,0 +1,19 @@
+// Type-checks the server test sources, which tsconfig.server.json must
+// exclude so they are never emitted into build/ (see the comment there).
+// Without this project nothing would type-check them at all: tsconfig.json
+// covers only `src`, and `npm run build` compiles tsconfig.server.json.
+// noEmit, so this never contributes output to the runtime image.
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["vitest/globals", "node"]
+  },
+  // `extends` inherits `exclude` -- only `files`/`include` are overridden by a
+  // child config. Without clearing it, this project would inherit the base's
+  // "server/**/*.test.ts" exclusion and check exactly nothing, silently
+  // type-checking the 12 server sources a second time instead of the tests.
+  // Verify with: npx tsc -p tsconfig.server.test.json --showConfig
+  "exclude": [],
+  "include": ["server"]
+}

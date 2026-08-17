@@ -28,6 +28,7 @@ from orcest.orchestrator.gh import (
     get_pr,
     get_pr_diff,
     get_unresolved_review_threads,
+    has_issue_comment_marker,
     list_labeled_issues,
     list_open_prs,
     merge_pr,
@@ -305,6 +306,26 @@ def test_remove_label_reraises_other_errors(mocker):
 # ---------------------------------------------------------------------------
 # post_comment
 # ---------------------------------------------------------------------------
+
+
+def test_has_issue_comment_marker_searches_all_issue_comments(mocker):
+    marker = "<!-- orcest-result:abc123 -->"
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=f"an older comment\n{marker}\na newer comment",
+    )
+
+    assert has_issue_comment_marker(REPO, 3, marker, TOKEN)
+    mock_run.assert_called_once_with(
+        [
+            "api",
+            f"repos/{REPO}/issues/3/comments",
+            "--paginate",
+            "--jq",
+            ".[].body",
+        ],
+        TOKEN,
+    )
 
 
 def test_post_comment_uses_body_file(mocker):
@@ -1639,8 +1660,12 @@ def test_list_labeled_issues_paginates_past_100(mocker):
     """list_labeled_issues fetches additional GraphQL pages instead of capping at
     100, so the oldest labeled issues are not silently dropped."""
     page1_nodes = [
-        {"number": 1, "title": "oldest", "body": "b1",
-         "labels": {"nodes": [{"name": "orcest:ready", "color": "00ff00"}]}},
+        {
+            "number": 1,
+            "title": "oldest",
+            "body": "b1",
+            "labels": {"nodes": [{"name": "orcest:ready", "color": "00ff00"}]},
+        },
     ]
     page2_nodes = [
         {"number": 2, "title": "newer", "body": "b2", "labels": {"nodes": []}},
@@ -1648,10 +1673,16 @@ def test_list_labeled_issues_paginates_past_100(mocker):
 
     def _issues_response(nodes, *, has_next_page=False, end_cursor=None):
         return json.dumps(
-            {"data": {"repository": {"issues": {
-                "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
-                "nodes": nodes,
-            }}}}
+            {
+                "data": {
+                    "repository": {
+                        "issues": {
+                            "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                            "nodes": nodes,
+                        }
+                    }
+                }
+            }
         )
 
     mock_run = mocker.patch(
@@ -1684,6 +1715,7 @@ def test_get_issue_state_open_pr_blocker_returns_open(mocker):
     """When the number is a PR (not an issue), get_issue_state falls back to
     `gh pr view` and an OPEN PR resolves to 'open' so the dependent issue is
     deferred -- it must NOT collapse to non-blocking 'missing'."""
+
     def fake_run(args, token):
         # First call: `gh issue view N` -> PR numbers are not Issues.
         if args[0] == "issue":
@@ -1705,6 +1737,7 @@ def test_get_issue_state_open_pr_blocker_returns_open(mocker):
 
 def test_get_issue_state_merged_pr_blocker_returns_closed(mocker):
     """A merged PR blocker resolves to 'closed' so it no longer defers."""
+
     def fake_run(args, token):
         if args[0] == "issue":
             raise GhCliError(
@@ -1722,6 +1755,7 @@ def test_get_issue_state_merged_pr_blocker_returns_closed(mocker):
 def test_get_issue_state_missing_when_neither_issue_nor_pr(mocker):
     """Only when both the issue and PR lookups report not-found is the blocker
     treated as 'missing' (deleted / wrong number, non-blocking)."""
+
     def fake_run(args, token):
         kind = "Issue" if args[0] == "issue" else "PullRequest"
         raise GhCliError(

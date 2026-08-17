@@ -17,7 +17,52 @@ from pathlib import Path
 
 import yaml
 
+from orcest.shared.models import require_valid_provider_name
+
 SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+
+
+def normalize_worker_runner_for_backend(
+    worker_backend: str,
+    worker_runner_type: str,
+    worker_runner_mode: str,
+) -> tuple[str, str, str]:
+    """Normalize and validate worker runner settings for a pool backend."""
+    backend = worker_backend.strip() or "claude"
+    require_valid_provider_name(backend)
+    runner_type = worker_runner_type.strip() or (
+        "claude" if backend in {"claude", "clauder"} else backend
+    )
+    runner_mode = worker_runner_mode.strip()
+    if backend == "clauder":
+        if runner_type != "claude":
+            raise ValueError("pool.worker_backend 'clauder' requires worker_runner_type 'claude'")
+        if not runner_mode:
+            runner_mode = "interactive"
+        elif runner_mode != "interactive":
+            raise ValueError(
+                "pool.worker_backend 'clauder' requires worker_runner_mode 'interactive'"
+            )
+    elif runner_type != backend:
+        raise ValueError(
+            f"pool worker backend {backend!r} requires matching runner_type {backend!r}"
+        )
+    if backend == "claude":
+        if not runner_mode:
+            # Legacy fleet configs predate worker_runner_mode entirely, and the
+            # pre-field deployment wrote every claude-backend clone with the
+            # interactive PTY runner. Default unset to 'interactive' so those
+            # configs keep their deployed runner instead of silently
+            # downgrading to headless `claude -p` after a fleet update.
+            runner_mode = "interactive"
+        elif runner_mode not in {"interactive", "headless"}:
+            raise ValueError(
+                "pool.worker_backend 'claude' requires worker_runner_mode "
+                "'interactive' or 'headless'"
+            )
+    if backend not in {"claude", "clauder"} and runner_mode:
+        raise ValueError(f"pool worker backend {backend!r} does not support worker_runner_mode")
+    return backend, runner_type, runner_mode
 
 
 def validate_project_name(name: str) -> bool:
@@ -83,6 +128,19 @@ class OrgEntry:
     # providers: entries with empty credential can fall back.
     provider_credentials: dict[str, list[str]] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        for provider, credentials in self.provider_credentials.items():
+            require_valid_provider_name(provider)
+            if not isinstance(credentials, list):
+                raise ValueError(f"provider_credentials.{provider} must be a list of strings")
+            if not credentials:
+                raise ValueError(f"provider_credentials.{provider} must not be empty")
+            for index, credential in enumerate(credentials):
+                if not isinstance(credential, str) or not credential.strip():
+                    raise ValueError(
+                        f"provider_credentials.{provider}[{index}] must be a non-empty string"
+                    )
+
     @property
     def claude_oauth_token(self) -> str:
         """First token in the pool (backward compat for single-token callers)."""
@@ -95,6 +153,26 @@ class ProjectEntry:
 
     name: str = ""
     repo: str = ""  # "org/repo" format
+
+
+@dataclass
+class WorkerProfileConfig:
+    """One worker kind in the pool's ordered round-robin layout."""
+
+    backend: str = "claude"
+    runner_type: str = ""
+    runner_mode: str = ""
+
+    def __post_init__(self) -> None:
+        self.backend, self.runner_type, self.runner_mode = normalize_worker_runner_for_backend(
+            self.backend,
+            self.runner_type,
+            self.runner_mode,
+        )
+
+    def signature(self) -> tuple[str, str, str]:
+        """Return a stable representation used by deployment skew checks."""
+        return self.backend, self.runner_type, self.runner_mode
 
 
 @dataclass
@@ -114,6 +192,14 @@ class PoolConfig:
     worker_memory: int = 16384  # MB per worker VM
     worker_cores: int = 8
     worker_disk_size: int = 30  # GB
+    worker_backend: str = "claude"
+    worker_runner_type: str = ""
+    worker_runner_mode: str = ""
+    # Optional heterogeneous worker layout. Each consecutive worker VMID is
+    # assigned the next profile and the list wraps at the end. Repeating a
+    # profile gives that backend additional worker capacity. Empty preserves the legacy single
+    # worker_backend/worker_runner_* configuration exactly.
+    worker_profiles: list[WorkerProfileConfig] = field(default_factory=list)
     # Force-kill threshold for an active worker VM. MUST exceed the worker's
     # RunnerConfig.timeout (default 5400s) plus a grace window, otherwise the
     # pool reaps HEALTHY long-running tasks before they can finish. Default =
@@ -135,6 +221,106 @@ class PoolConfig:
     # against. Defaults to Ubuntu's UEC Image Automatic Signing Key
     # (cdimage@ubuntu.com) -- the same key provision/create-vm.sh pins.
     expected_image_gpg_key: str = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+
+    def __post_init__(self) -> None:
+        (
+            self.worker_backend,
+            self.worker_runner_type,
+            self.worker_runner_mode,
+        ) = normalize_worker_runner_for_backend(
+            self.worker_backend,
+            self.worker_runner_type,
+            self.worker_runner_mode,
+        )
+        normalized_profiles: list[WorkerProfileConfig] = []
+        seen_backends: dict[str, tuple[str, str]] = {}
+        for raw_profile in self.worker_profiles:
+            if not isinstance(raw_profile, WorkerProfileConfig):
+                raise ValueError("pool.worker_profiles entries must be WorkerProfileConfig values")
+            profile = WorkerProfileConfig(
+                backend=raw_profile.backend,
+                runner_type=raw_profile.runner_type,
+                runner_mode=raw_profile.runner_mode,
+            )
+            runner_settings = (profile.runner_type, profile.runner_mode)
+            previous = seen_backends.get(profile.backend)
+            if previous is not None and previous != runner_settings:
+                raise ValueError(
+                    "pool.worker_profiles cannot configure backend "
+                    f"{profile.backend!r} with conflicting runner settings"
+                )
+            seen_backends[profile.backend] = runner_settings
+            normalized_profiles.append(profile)
+        self.worker_profiles = normalized_profiles
+        if self.worker_profiles:
+            primary = self.worker_profiles[0]
+            self.worker_backend = primary.backend
+            self.worker_runner_type = primary.runner_type
+            self.worker_runner_mode = primary.runner_mode
+
+    def effective_worker_profiles(self) -> tuple[WorkerProfileConfig, ...]:
+        """Return the configured layout, including the legacy fallback profile."""
+        if self.worker_profiles:
+            return tuple(self.worker_profiles)
+        return (
+            WorkerProfileConfig(
+                backend=self.worker_backend,
+                runner_type=self.worker_runner_type,
+                runner_mode=self.worker_runner_mode,
+            ),
+        )
+
+    def scheduled_worker_profiles(self) -> tuple[WorkerProfileConfig, ...]:
+        """Return the exact profile sequence occupied at the current pool size."""
+        profiles = self.effective_worker_profiles()
+        return tuple(profiles[index % len(profiles)] for index in range(max(0, self.size)))
+
+    def worker_profile_for_vmid(self, vm_id: int) -> WorkerProfileConfig:
+        """Assign a stable round-robin profile to a worker VMID."""
+        if self.vm_id_start <= 0 or vm_id < self.vm_id_start:
+            raise ValueError(
+                f"worker VMID {vm_id} is below configured pool.vm_id_start {self.vm_id_start}"
+            )
+        profiles = self.effective_worker_profiles()
+        return profiles[(vm_id - self.vm_id_start) % len(profiles)]
+
+    def worker_backends(self) -> set[str]:
+        """Return backends that have at least one slot at the target pool size."""
+        return {profile.backend for profile in self.scheduled_worker_profiles()}
+
+    def default_task_backend(self) -> str:
+        """Return the backend that should receive legacy Claude-token work."""
+        from orcest.shared.models import is_claude_provider
+
+        for profile in self.scheduled_worker_profiles():
+            if is_claude_provider(profile.backend):
+                return profile.backend
+        return "claude"
+
+    def worker_layout_signature(self) -> str:
+        """Return the deployed-layout signature used to fence unsafe transitions."""
+        if not self.worker_profiles:
+            return (
+                f"vm_id_start={self.vm_id_start};vm_id_end={self.vm_id_end};"
+                f"backend={self.worker_backend};runner={self.worker_runner_type};"
+                f"mode={self.worker_runner_mode}"
+            )
+        profiles = ",".join(
+            f"{profile.backend}:{profile.runner_type}:{profile.runner_mode}"
+            for profile in self.worker_profiles
+        )
+        return f"vm_id_start={self.vm_id_start};vm_id_end={self.vm_id_end};profiles={profiles}"
+
+    def contains_worker_vmid(self, vm_id: int) -> bool:
+        """Return whether *vm_id* is inside the configured worker range.
+
+        Destructive lifecycle operations must fail closed when the range is
+        unconfigured.  ``vm_id_end == 0`` intentionally retains the legacy
+        open-ended range semantics above ``vm_id_start``.
+        """
+        if self.vm_id_start <= 0 or vm_id < self.vm_id_start:
+            return False
+        return self.vm_id_end <= 0 or vm_id <= self.vm_id_end
 
     def template_range(self) -> tuple[int, int] | None:
         """Return ``(start, end)`` template VMID range, or ``None`` if not configured.
@@ -169,6 +355,19 @@ class PoolConfig:
         ``vm_id_end == 0`` (open-ended) are also validated against the
         template range start.
         """
+        if self.size < 0:
+            raise ValueError(f"pool.size must be non-negative, got {self.size}")
+        if (
+            self.vm_id_start > 0
+            and self.vm_id_end > 0
+            and self.size > 0
+            and self.vm_id_start + self.size - 1 > self.vm_id_end
+        ):
+            raise ValueError(
+                "pool worker VMID range cannot fit the target size: "
+                f"{self.vm_id_start}-{self.vm_id_end} has fewer than {self.size} slots"
+            )
+
         rng = self.template_range()
         if rng is None or self.vm_id_start <= 0:
             return
@@ -219,6 +418,35 @@ class FleetConfig:
                 f"Org '{org_name}' not registered — run: orcest fleet add-org {org_name}"
             )
         return self.orgs[org_name]
+
+    def provider_stream_mismatches(self) -> dict[str, list[str]]:
+        """Return project providers not consumed by the managed worker pool.
+
+        Each worker profile consumes its backend's PR and issue streams.
+        Orchestrators publish explicit providers to provider-specific streams,
+        so accepting a provider without a scheduled profile would create
+        durable work that no fleet-managed worker can claim.
+        """
+        backends = self.pool.worker_backends()
+        claude_backend = self.pool.default_task_backend()
+        mismatches: dict[str, list[str]] = {}
+        for project in self.projects:
+            org = self.resolve_org(project)
+            providers = set()
+            for raw_provider in org.provider_credentials:
+                provider = str(raw_provider).strip()
+                if not provider:
+                    continue
+                providers.add(claude_backend if provider == "claude" else provider)
+            has_claude_credentials = bool(
+                org.claude_oauth_tokens or org.provider_credentials.get("claude")
+            )
+            if has_claude_credentials:
+                providers.add(claude_backend)
+            unsupported = sorted(provider for provider in providers if provider not in backends)
+            if unsupported:
+                mismatches[project.name] = unsupported
+        return mismatches
 
     def ssh_target(self) -> str:
         """Return user@host for the orchestrator VM."""
@@ -282,21 +510,47 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     for name, entry in (data.get("orgs") or {}).items():
         # Support both list (claude_oauth_tokens) and single string (claude_oauth_token)
         raw_tokens = entry.get("claude_oauth_tokens")
-        if isinstance(raw_tokens, list):
-            tokens = [str(t) for t in raw_tokens if t]
+        if raw_tokens is not None:
+            if not isinstance(raw_tokens, list):
+                raise ValueError(f"orgs.{name}.claude_oauth_tokens must be a list of strings")
+            tokens = []
+            for index, token in enumerate(raw_tokens):
+                if not isinstance(token, str) or not token.strip():
+                    raise ValueError(
+                        f"orgs.{name}.claude_oauth_tokens[{index}] must be a non-empty string"
+                    )
+                tokens.append(token)
         else:
             single = entry.get("claude_oauth_token", "")
+            if single and not isinstance(single, str):
+                raise ValueError(f"orgs.{name}.claude_oauth_token must be a string")
             tokens = [single] if single else []
         # provider_credentials: dict[str, list[str]]
-        raw_pc = entry.get("provider_credentials") or {}
-        if isinstance(raw_pc, dict):
-            provider_credentials = {
-                str(k): [str(x) for x in (v or []) if str(x).strip()]
-                for k, v in raw_pc.items()
-                if v
-            }
-        else:
-            provider_credentials = {}
+        raw_pc = entry.get("provider_credentials", {})
+        if raw_pc is None:
+            raw_pc = {}
+        if not isinstance(raw_pc, dict):
+            raise ValueError(f"orgs.{name}.provider_credentials must be a mapping of lists")
+        provider_credentials: dict[str, list[str]] = {}
+        for raw_provider, raw_credentials in raw_pc.items():
+            if not isinstance(raw_provider, str):
+                raise ValueError(f"orgs.{name}.provider_credentials keys must be strings")
+            provider = require_valid_provider_name(raw_provider)
+            if not isinstance(raw_credentials, list):
+                raise ValueError(
+                    f"orgs.{name}.provider_credentials.{provider} must be a list of strings"
+                )
+            if not raw_credentials:
+                raise ValueError(f"orgs.{name}.provider_credentials.{provider} must not be empty")
+            credentials: list[str] = []
+            for index, credential in enumerate(raw_credentials):
+                if not isinstance(credential, str) or not credential.strip():
+                    raise ValueError(
+                        f"orgs.{name}.provider_credentials.{provider}[{index}] "
+                        "must be a non-empty string"
+                    )
+                credentials.append(credential)
+            provider_credentials[provider] = credentials
         orgs[name] = OrgEntry(
             github_token=entry.get("github_token", ""),
             claude_oauth_tokens=tokens,
@@ -317,6 +571,30 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     if raw_range and not isinstance(raw_range, list):
         raise ValueError(f"pool.template_vmid_range must be a list, got {type(raw_range).__name__}")
     template_range_list = [int(v) for v in raw_range] if raw_range else []
+    raw_worker_profiles = pl.get("worker_profiles") or []
+    if raw_worker_profiles and not isinstance(raw_worker_profiles, list):
+        raise ValueError(
+            f"pool.worker_profiles must be a list, got {type(raw_worker_profiles).__name__}"
+        )
+    worker_profiles: list[WorkerProfileConfig] = []
+    for index, raw_profile in enumerate(raw_worker_profiles):
+        if isinstance(raw_profile, str):
+            if not raw_profile.strip():
+                raise ValueError(f"pool.worker_profiles[{index}] backend must not be empty")
+            worker_profiles.append(WorkerProfileConfig(backend=raw_profile))
+            continue
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"pool.worker_profiles[{index}] must be a backend string or mapping")
+        backend = str(raw_profile.get("backend", "") or "")
+        if not backend.strip():
+            raise ValueError(f"pool.worker_profiles[{index}].backend must not be empty")
+        worker_profiles.append(
+            WorkerProfileConfig(
+                backend=backend,
+                runner_type=str(raw_profile.get("runner_type", "") or ""),
+                runner_mode=str(raw_profile.get("runner_mode", "") or ""),
+            )
+        )
     pool = PoolConfig(
         size=pl.get("size", 4),
         template_vm_id=pl.get("template_vm_id", 0),
@@ -327,12 +605,15 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_memory=pl.get("worker_memory", 16384),
         worker_cores=pl.get("worker_cores", 8),
         worker_disk_size=pl.get("worker_disk_size", 30),
+        worker_backend=str(pl.get("worker_backend", "claude") or "claude"),
+        worker_runner_type=str(pl.get("worker_runner_type", "") or ""),
+        worker_runner_mode=str(pl.get("worker_runner_mode", "") or ""),
+        worker_profiles=worker_profiles,
         max_task_duration=pl.get("max_task_duration", 7200),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
-            pl.get("expected_image_gpg_key", "")
-            or "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+            pl.get("expected_image_gpg_key", "") or "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
         ),
     )
     # Surface VMID-range overlap at load time rather than at clone time:
@@ -406,6 +687,17 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "worker_memory": config.pool.worker_memory,
             "worker_cores": config.pool.worker_cores,
             "worker_disk_size": config.pool.worker_disk_size,
+            "worker_backend": config.pool.worker_backend,
+            "worker_runner_type": config.pool.worker_runner_type,
+            "worker_runner_mode": config.pool.worker_runner_mode,
+            "worker_profiles": [
+                {
+                    "backend": profile.backend,
+                    "runner_type": profile.runner_type,
+                    "runner_mode": profile.runner_mode,
+                }
+                for profile in config.pool.worker_profiles
+            ],
             "max_task_duration": config.pool.max_task_duration,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,

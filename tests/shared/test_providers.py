@@ -8,9 +8,16 @@ via str/repr/logs/DL/exception paths.
 
 import logging
 
+import pytest
+
 from orcest.orchestrator.provider_pool import ProviderPool
 from orcest.shared.models import Task, TaskType
 from orcest.shared.providers import ProviderEntry
+
+
+def test_provider_entry_rejects_unsafe_provider_name():
+    with pytest.raises(ValueError, match="Invalid provider name"):
+        ProviderEntry("issue:grok", "secret")
 
 
 def test_account_key_is_model_independent_but_identity_is_not():
@@ -37,6 +44,17 @@ def test_account_key_is_model_independent_but_identity_is_not():
 
     # A different credential yields a different account.
     assert other.account_key() != opus.account_key()
+
+
+def test_claude_provider_aliases_share_account_key():
+    cred = "shared-claude-oauth-token"
+    legacy = ProviderEntry("claude", cred)
+    interactive = ProviderEntry("clauder", cred)
+
+    assert legacy.identity() != interactive.identity()
+    assert legacy.account_key() == interactive.account_key()
+    assert legacy.account_key().startswith("claude:")
+    assert interactive.effective_env_var == "CLAUDE_CODE_OAUTH_TOKEN"
 
 
 def test_provider_entry_rich_fields_and_redaction():

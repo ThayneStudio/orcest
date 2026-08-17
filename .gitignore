@@ -35,6 +35,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+.dashboard-compose.last-known-good.yml
 
 # Worktrees
 .worktrees/

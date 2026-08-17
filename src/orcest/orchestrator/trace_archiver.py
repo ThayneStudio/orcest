@@ -205,13 +205,7 @@ class TraceArchiver:
         date_parts = started_at[:10].split("-")
         if len(date_parts) != 3:
             date_parts = _now_iso()[:10].split("-")
-        rel = (
-            Path(project)
-            / date_parts[0]
-            / date_parts[1]
-            / date_parts[2]
-            / f"{task_id}.jsonl"
-        )
+        rel = Path(project) / date_parts[0] / date_parts[1] / date_parts[2] / f"{task_id}.jsonl"
         abs_path = self._archive_path / rel
         try:
             abs_path.parent.mkdir(parents=True, exist_ok=True)
