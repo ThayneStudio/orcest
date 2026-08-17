@@ -44,8 +44,15 @@ _ISO_TIMESTAMP_RE = re.compile(
 # fractional part (epoch-with-millis/micros as a float).
 _EPOCH_RE = re.compile(r"(?<!\d)\d{10,}(?:\.\d+)?(?!\d)")
 # Any other long run of hex characters (ids, digests, tokens, ...). Applied
-# last so it doesn't fight with the more specific patterns above.
-_HEX_RUN_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])")
+# last so it doesn't fight with the more specific patterns above. Requires at
+# least one a-f letter in the run -- otherwise a pure-decimal run (e.g. two
+# distinct byte offsets like 100000000 vs 200000000, digits being a subset
+# of the hex alphabet) would be stripped and collapse genuinely-different
+# args into the same hash. Epoch-length pure-decimal runs (>=10 digits) are
+# still normalized by _EPOCH_RE above.
+_HEX_RUN_RE = re.compile(
+    r"(?<![0-9a-fA-F])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])"
+)
 
 _HASH_LEN = 16
 
@@ -54,8 +61,15 @@ def _normalize_args(args: dict | None) -> str:
     serialized = json.dumps(args, sort_keys=True, default=str)
     serialized = _UUID_RE.sub("<uuid>", serialized)
     serialized = _ISO_TIMESTAMP_RE.sub("<ts>", serialized)
-    serialized = _EPOCH_RE.sub("<epoch>", serialized)
+    # Hex-run stripping before epoch: _HEX_RUN_RE only matches runs
+    # containing an a-f letter, so it never touches pure-decimal epoch
+    # numbers. Running it first keeps a genuinely-hex identifier (e.g. a
+    # git SHA) that happens to contain an embedded >=10-digit decimal
+    # substring as one atomic match, instead of _EPOCH_RE fragmenting it
+    # into a hex part + a decimal part first (which produced
+    # position/length-dependent, non-deterministic normalization).
     serialized = _HEX_RUN_RE.sub("<hex>", serialized)
+    serialized = _EPOCH_RE.sub("<epoch>", serialized)
     return serialized
 
 

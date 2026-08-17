@@ -117,3 +117,38 @@ def test_verdict_hashes_contain_no_raw_args():
         assert secret_path not in h
         assert len(h) == 16
         assert all(c in "0123456789abcdef" for c in h)
+
+
+def test_distinct_decimal_offsets_do_not_collapse():
+    # Regression: digits are a subset of the hex alphabet, so a naive
+    # "8+ hex chars" strip would treat pure-decimal offsets like
+    # 100000000/200000000/... as volatile ids and collapse genuinely
+    # different calls into the same hash -- a false LOOPING verdict that
+    # would kill a productive runner. 8-9 digit pure-decimal runs must
+    # survive normalization intact.
+    d = RepetitionDetector()
+    for offset in (100000000, 200000000, 300000000, 400000000):
+        d.observe_tool_call("Read", {"path": "/a", "offset": offset})
+
+    assert d.verdict() is None
+
+
+def test_git_sha_still_normalized():
+    # Genuinely-hex identifiers (e.g. 40-char git SHAs) must still be
+    # stripped so two calls differing only in the SHA hash identically.
+    d = RepetitionDetector()
+    d.observe_tool_call(
+        "Bash", {"cmd": "git show", "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"}
+    )
+    d.observe_tool_call(
+        "Bash", {"cmd": "git show", "sha": "0011223344556677889900aabbccddeeff01122"}
+    )
+    for _ in range(2):
+        d.observe_tool_call(
+            "Bash", {"cmd": "git show", "sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
+        )
+
+    v = d.verdict()
+    assert v is not None
+    assert v.stream == "exact"
+    assert v.count == 4
