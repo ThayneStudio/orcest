@@ -119,6 +119,14 @@ class OrchestratorConfig:
     # to pre-archive). Storage backend (NFS, local disk, etc.) is opaque to
     # orcest — operator mounts whatever they want at this path.
     trace_archive_path: str | None = None
+    # Monitor ingest wiring for the EventRelay (orcest.orchestrator.event_relay).
+    # None disables the relay (default; matches trace_archive_path's pattern).
+    monitor_ingest_url: str | None = None
+    # Env var name the write token is read from at process start (not the
+    # token itself -- never store secrets directly in YAML/dataclass fields).
+    monitor_write_token_env: str = "MONITOR_WRITE_TOKEN"
+    # MAXLEN for the events spool stream (orcest.shared.events.EVENTS_STREAM).
+    events_maxlen: int = 50000
 
 
 @dataclass
@@ -663,6 +671,26 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     else:
         trace_archive_path = _safe_str(trace_archive_raw, "trace_archive_path").strip()
 
+    # Optional monitor ingest URL for the EventRelay. YAML null or absent →
+    # relay disabled, same pattern as trace_archive_path above.
+    monitor_ingest_raw = raw.get("monitor_ingest_url")
+    if monitor_ingest_raw is None or (
+        isinstance(monitor_ingest_raw, str) and not monitor_ingest_raw.strip()
+    ):
+        monitor_ingest_url: str | None = None
+    else:
+        monitor_ingest_url = _safe_str(monitor_ingest_raw, "monitor_ingest_url").strip()
+
+    monitor_write_token_env = _safe_optional_str(
+        raw.get("monitor_write_token_env"), "monitor_write_token_env", "MONITOR_WRITE_TOKEN"
+    ) or "MONITOR_WRITE_TOKEN"
+
+    events_maxlen = _safe_int(raw.get("events_maxlen", 50000), "events_maxlen")
+    if events_maxlen < 1:
+        raise ValueError(
+            f"Config field 'events_maxlen' must be a positive integer, got {events_maxlen!r}."
+        )
+
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -680,6 +708,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         task_key_prefix=task_key_prefix,
         providers=top_providers,
         trace_archive_path=trace_archive_path,
+        monitor_ingest_url=monitor_ingest_url,
+        monitor_write_token_env=monitor_write_token_env,
+        events_maxlen=events_maxlen,
     )
 
     # Validate required fields
