@@ -25,6 +25,7 @@ from orcest.shared.coordination import RedisLock, make_pr_lock_key
 from orcest.shared.credential_handoff import (
     _MIGRATE_V1_INTENT_LUA,
     ATOMIC_CREDENTIAL_TERMINAL_LUA,
+    CREDENTIAL_CHECKPOINT_TTL_SECONDS,
     CredentialCheckpointStatus,
     CredentialRecoveryOutcome,
     credential_intent_key,
@@ -364,8 +365,8 @@ class TestWorkerIsolation:
         assert status is CredentialCheckpointStatus.VALID
         assert checkpoint is not None and checkpoint.serialized == legacy
         assert redis.client.get(intent_key) == "1"
-        assert redis.client.ttl(checkpoint_key) == -1
-        assert redis.client.ttl(intent_key) == -1
+        assert redis.client.ttl(checkpoint_key) == CREDENTIAL_CHECKPOINT_TTL_SECONDS
+        assert redis.client.ttl(intent_key) == CREDENTIAL_CHECKPOINT_TTL_SECONDS
 
         recovered = recover_credential_checkpoint(
             redis,
