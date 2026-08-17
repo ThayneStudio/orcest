@@ -3,20 +3,38 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.18.3 <21"
+  },
   "scripts": {
+    "check:node": "node scripts/check-node-version.mjs",
+    "check:bundle-runtime": "node scripts/check-bundle-runtime.mjs",
+    "check:typecheck-coverage": "node scripts/check-typecheck-coverage.mjs",
+    "typecheck": "npm run check:typecheck-coverage && tsc -p tsconfig.json --noEmit --pretty false && tsc -p tsconfig.server.json --noEmit --pretty false && tsc -p tsconfig.server.test.json --noEmit --pretty false",
+    "predev": "npm run check:node",
     "dev": "concurrently \"tsx watch server/index.ts\" \"vite\"",
+    "predev:docker": "npm run check:node",
+    "dev:docker": "concurrently \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
+    "predev:server": "npm run check:node",
     "dev:server": "tsx watch server/index.ts",
+    "predev:client": "npm run check:node",
     "dev:client": "vite",
+    "prebuild": "npm run check:node",
     "build": "tsc -p tsconfig.server.json && vite build",
+    "prepreview": "npm run check:node",
     "preview": "node build/server/index.js",
+    "pretest": "npm run check:node",
     "test": "vitest run"
   },
   "dependencies": {
     "express": "^4.21.0",
+    "happy-dom": "^20.10.6",
     "ioredis": "^5.4.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/express": "^5.0.0",
     "@types/node": "^20.14.0",
     "@types/react": "^19.0.0",
@@ -26,12 +44,12 @@
     "autoprefixer": "^10.4.0",
     "concurrently": "^9.0.0",
     "postcss": "^8.4.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "tailwindcss": "^3.4.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.6.0",
     "vite": "^6.0.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.1.9"
   }
 }

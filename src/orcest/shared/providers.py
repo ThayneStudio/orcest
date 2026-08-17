@@ -10,6 +10,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
+from orcest.shared.models import require_valid_provider_name
+
+_CLAUDE_ACCOUNT_PROVIDERS = frozenset({"claude", "clauder"})
+
 
 @dataclass(frozen=True)
 class ProviderEntry:
@@ -19,6 +23,10 @@ class ProviderEntry:
     cli_binary: str | None = None
     env_var: str | None = None
     extras: dict[str, str] = field(default_factory=dict)
+    source: str = field(default="", compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        require_valid_provider_name(self.provider)
 
     # WORKER-SIDE ONLY ---------------------------------------------------
     # The two properties below encode *execution mechanics* (which binary to
@@ -48,9 +56,11 @@ class ProviderEntry:
         """
         if self.env_var:
             return self.env_var
-        return {"claude": "CLAUDE_CODE_OAUTH_TOKEN", "grok": "XAI_API_KEY"}.get(
-            self.provider, f"{self.provider.upper()}_TOKEN"
-        )
+        return {
+            "claude": "CLAUDE_CODE_OAUTH_TOKEN",
+            "clauder": "CLAUDE_CODE_OAUTH_TOKEN",
+            "grok": "XAI_API_KEY",
+        }.get(self.provider, f"{self.provider.upper()}_TOKEN")
 
     def _credential_hash(self) -> str:
         return hashlib.sha256(self.credential.encode()).hexdigest()[:12]
@@ -66,7 +76,8 @@ class ProviderEntry:
         pinned under two models must share a single cooldown. Never contains a
         raw secret (only the credential hash + provider).
         """
-        return f"{self.provider}:{self._credential_hash()}"
+        provider = "claude" if self.provider in _CLAUDE_ACCOUNT_PROVIDERS else self.provider
+        return f"{provider}:{self._credential_hash()}"
 
     def __repr__(self) -> str:
         cred = self.credential[:4] + "..." if self.credential else ""

@@ -7,12 +7,14 @@ host (where ``orcest fleet`` commands run) to the orchestrator VM.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import shlex
 import subprocess
 import tempfile
+from pathlib import Path
 
 import yaml
 
@@ -60,8 +62,39 @@ _REDIS_CONTAINER = "orcest-redis-redis-1"
 # real redis-cli exit status back through ``sh``/``docker exec``.
 _REDIS_CLI_PREFIX = (
     f"sudo docker exec {_REDIS_CONTAINER} "
-    "sh -c 'exec redis-cli -a \"$ORCEST_REDIS_PASSWORD\" --no-auth-warning \"$@\"' redis-cli"
+    'sh -c \'exec redis-cli -a "$ORCEST_REDIS_PASSWORD" --no-auth-warning -e "$@"\' redis-cli'
 )
+
+# Older redis-cli builds, wrappers, and test doubles can still report a Redis
+# command error in output while returning zero.  Every fleet lifecycle read is
+# a safety boundary, so reject recognizable server errors defensively instead
+# of parsing them as an empty set/hash or a legitimate value.
+_REDIS_ERROR_LINE_RE = re.compile(
+    r"(?im)^\s*(?:\(error\)\s*)?"
+    r"(?:AUTH failed:|ERR\b|NOAUTH\b|WRONGPASS\b|WRONGTYPE\b|NOGROUP\b|"
+    r"LOADING\b|READONLY\b|MISCONF\b)"
+)
+
+
+def _redis_cli_failure(result: subprocess.CompletedProcess[str]) -> str | None:
+    """Return a Redis/transport diagnostic when *result* is not trustworthy."""
+    for output in (result.stderr or "", result.stdout or ""):
+        match = _REDIS_ERROR_LINE_RE.search(output)
+        if match is not None:
+            return output[match.start() :].splitlines()[0].strip()
+    if result.returncode != 0:
+        return (result.stderr or result.stdout or f"exit status {result.returncode}").strip()
+    return None
+
+
+def _require_redis_cli_success(
+    result: subprocess.CompletedProcess[str],
+    context: str,
+) -> None:
+    """Raise when a redis-cli invocation failed or emitted a server error."""
+    failure = _redis_cli_failure(result)
+    if failure is not None:
+        raise RuntimeError(f"{context}: {failure}")
 
 
 def _ssh(ssh_target: str, cmd: str) -> subprocess.CompletedProcess[str]:
@@ -84,13 +117,42 @@ def _scp(src: str, dest_target: str, dest_path: str) -> subprocess.CompletedProc
     )
 
 
+def _remote_private_tmp(ssh_target: str, template: str) -> str:
+    """Create a unique 0600 temporary file owned by the deploy SSH user."""
+    if not re.fullmatch(r"/tmp/[a-zA-Z0-9._-]+\.XXXXXX", template):
+        raise ValueError("Unsafe remote temporary-file template")
+    result = _ssh(ssh_target, f"umask 077 && mktemp {shlex.quote(template)}")
+    if result.returncode != 0:
+        raise RuntimeError("Failed to allocate a private remote temporary file")
+    path = result.stdout.strip()
+    if not re.fullmatch(r"/tmp/[a-zA-Z0-9._-]+", path):
+        raise RuntimeError("Remote mktemp returned an unsafe path")
+    return path
+
+
 def build_image(ssh_target: str) -> None:
     """Build the orcest:latest Docker image on the orchestrator VM.
 
     Expects the source tarball to already be extracted at /opt/orcest/.
     """
     logger.info("Building orcest:latest image on %s", ssh_target)
-    result = _ssh(ssh_target, "cd /opt/orcest && docker compose build --no-cache")
+    result = _ssh(
+        ssh_target,
+        "cd /opt/orcest && "
+        "revision=$(cat .orcest-revision) && "
+        "orcest_uid=$(id -u orcest) && orcest_gid=$(id -g orcest) && "
+        "printf '%s\\n' \"$revision\" | grep -Eq '^[0-9a-f]{7,64}$' || "
+        "{ echo 'Build requires an exact clean .orcest-revision' >&2; exit 2; }; "
+        'printf \'%s:%s\\n\' "$orcest_uid" "$orcest_gid" | '
+        "grep -Eq '^[1-9][0-9]*:[1-9][0-9]*$' || "
+        "{ echo 'Host orcest UID/GID must be positive integers' >&2; exit 2; }; "
+        'ORCEST_BUILD_REVISION="$revision" ORCEST_UID="$orcest_uid" '
+        'ORCEST_GID="$orcest_gid" docker compose build --no-cache && '
+        'test "$(docker run --rm --entrypoint id orcest:latest -u orcest)" '
+        '= "$orcest_uid" && '
+        'test "$(docker run --rm --entrypoint id orcest:latest -g orcest)" '
+        '= "$orcest_gid"',
+    )
     if result.returncode != 0:
         logger.error("Image build failed: %s", result.stderr.strip())
         raise RuntimeError(f"Docker image build failed on {ssh_target}: {result.stderr.strip()}")
@@ -98,6 +160,14 @@ def build_image(ssh_target: str) -> None:
 
 
 _DOCKER_IMAGE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$")
+_DEPLOY_FILES = (
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.redis.yml",
+    "docker-compose.pool.yml",
+    "pyproject.toml",
+    "requirements.lock",
+)
 
 
 def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
@@ -108,70 +178,23 @@ def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
     return result.returncode == 0
 
 
-def upload_source(ssh_target: str) -> None:
+def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = None) -> None:
     """Create a source tarball locally and upload+extract it on the orchestrator.
 
-    Assembles a Docker build context from the installed package:
-    deploy files (Dockerfile, compose files, pyproject.toml) from package data,
-    and source code from the installed orcest package.
+    Assembles a Docker build context from the active source checkout when
+    available, falling back to the installed package only when no checkout is
+    present. ``ORCEST_SOURCE_ROOT`` can be set to force a specific checkout.
 
     Extracts to /opt/orcest/ on the orchestrator VM.
     """
-    import shutil
-
     logger.info("Uploading source to %s", ssh_target)
-
-    # Locate the deploy files bundled as package data
-    fleet_dir = os.path.dirname(os.path.abspath(__file__))
-    deploy_dir = os.path.join(fleet_dir, "deploy")
-
-    # Locate the installed orcest package source
-    orcest_pkg_dir = os.path.dirname(fleet_dir)  # .../site-packages/orcest/
-
-    # Assemble build context in a temp directory
-    staging = tempfile.mkdtemp(prefix="orcest-upload-")
+    tarball_path = create_source_tarball(source_root=source_root)
+    remote_tarball: str | None = None
     try:
-        # Copy deploy files (Dockerfile, compose files, pyproject.toml,
-        # requirements.lock) to the staging root. ``requirements.lock`` MUST be
-        # staged at the context root because the deploy Dockerfile does
-        # ``COPY requirements.lock .`` (reading the context root, not src/);
-        # without it the image build fails at that COPY. The lock ships as
-        # package data under deploy/ (see pyproject ``orcest.fleet`` package-data
-        # ``deploy/*``), so deploy_dir/requirements.lock is the canonical,
-        # pip-install-safe source mirroring the repo-root lock.
-        deploy_files = (
-            "Dockerfile",
-            "docker-compose.yml",
-            "docker-compose.redis.yml",
-            "docker-compose.pool.yml",
-            "pyproject.toml",
-            "requirements.lock",
-        )
-        for fname in deploy_files:
-            src_path = os.path.join(deploy_dir, fname)
-            if not os.path.exists(src_path):
-                raise RuntimeError(f"Missing deploy file: {src_path}")
-            shutil.copy2(src_path, os.path.join(staging, fname))
-
-        # Copy orcest source to staging/src/orcest/
-        dest_src = os.path.join(staging, "src", "orcest")
-        shutil.copytree(orcest_pkg_dir, dest_src, ignore=shutil.ignore_patterns("__pycache__"))
-
-        # Create tarball
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tarball_path = tmp.name
-
-        tar_result = subprocess.run(
-            ["tar", "czf", tarball_path, *deploy_files, "src/"],
-            cwd=staging,
-            capture_output=True,
-            text=True,
-        )
-        if tar_result.returncode != 0:
-            raise RuntimeError(f"Failed to create tarball: {tar_result.stderr.strip()}")
-
-        # SCP to orchestrator
-        result = _scp(tarball_path, ssh_target, "/tmp/orcest-source.tar.gz")
+        # Use a unique, mode-0600 destination so concurrent deploy attempts
+        # cannot overwrite or remove each other's candidate source archive.
+        remote_tarball = _remote_private_tmp(ssh_target, "/tmp/orcest-source.XXXXXX")
+        result = _scp(tarball_path, ssh_target, remote_tarball)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to upload tarball: {result.stderr.strip()}")
 
@@ -185,30 +208,165 @@ def upload_source(ssh_target: str) -> None:
             )
         clean_result = _ssh(
             ssh_target,
-            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose*.yml"
-            " pyproject.toml requirements.lock",
+            "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose.yml"
+            " docker-compose.redis.yml docker-compose.pool.yml pyproject.toml"
+            " requirements.lock .orcest-revision",
         )
         if clean_result.returncode != 0:
             raise RuntimeError(
                 f"Failed to clean /opt/orcest on {ssh_target}: {clean_result.stderr.strip()}"
             )
-        result = _ssh(ssh_target, "tar xzf /tmp/orcest-source.tar.gz -C /opt/orcest/")
+        result = _ssh(
+            ssh_target,
+            f"tar xzf {shlex.quote(remote_tarball)} -C /opt/orcest/",
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to extract tarball on {ssh_target}: {result.stderr.strip()}"
             )
 
-        # Clean up remote tarball
-        _ssh(ssh_target, "rm -f /tmp/orcest-source.tar.gz")
-
         logger.info("Source uploaded and extracted on %s", ssh_target)
     finally:
+        if remote_tarball is not None:
+            _ssh(ssh_target, f"rm -f {shlex.quote(remote_tarball)}")
+        try:
+            os.unlink(tarball_path)
+        except OSError:
+            pass
+
+
+def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> str:
+    """Package the active Orcest source tree into a deploy build-context tarball.
+
+    The returned path is owned by the caller and must be deleted after use.
+    """
+    import shutil
+
+    layout = _resolve_source_layout(source_root)
+    revision = _resolve_deploy_revision(source_root)
+    staging = tempfile.mkdtemp(prefix="orcest-source-")
+    try:
+        for fname, src_path in layout.deploy_files.items():
+            if not src_path.exists():
+                raise RuntimeError(f"Missing deploy file: {src_path}")
+            shutil.copy2(src_path, Path(staging) / fname)
+
+        dest_src = Path(staging) / "src" / "orcest"
+        shutil.copytree(
+            layout.package_dir,
+            dest_src,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        (Path(staging) / ".orcest-revision").write_text(f"{revision}\n", encoding="utf-8")
+        (dest_src / "_build_revision.py").write_text(
+            f"# Generated by create_source_tarball; do not edit.\nBUILD_REVISION = {revision!r}\n",
+            encoding="utf-8",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tarball_path = tmp.name
+
+        tar_result = subprocess.run(
+            ["tar", "czf", tarball_path, *_DEPLOY_FILES, ".orcest-revision", "src/"],
+            cwd=staging,
+            capture_output=True,
+            text=True,
+        )
+        if tar_result.returncode != 0:
+            raise RuntimeError(f"Failed to create tarball: {tar_result.stderr.strip()}")
+        return tarball_path
+    finally:
         shutil.rmtree(staging, ignore_errors=True)
-        if "tarball_path" in locals():
-            try:
-                os.unlink(tarball_path)
-            except OSError:
-                pass
+
+
+def _resolve_deploy_revision(source_root: str | os.PathLike[str] | None = None) -> str:
+    """Return an exact checkout revision, explicitly marking modified trees."""
+    from orcest.revision import UNKNOWN_REVISION, normalize_revision
+
+    root = _resolve_source_root(source_root)
+    if root is None or not (root / ".git").exists():
+        return normalize_revision(os.environ.get("ORCEST_BUILD_REVISION")) or UNKNOWN_REVISION
+    try:
+        head_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return UNKNOWN_REVISION
+    if head_result.returncode != 0 or status_result.returncode != 0:
+        return UNKNOWN_REVISION
+    revision = normalize_revision(head_result.stdout)
+    if revision is None:
+        return UNKNOWN_REVISION
+    return f"{revision}-dirty" if status_result.stdout.strip() else revision
+
+
+class _SourceLayout:
+    def __init__(self, package_dir: Path, deploy_files: dict[str, Path]) -> None:
+        self.package_dir = package_dir
+        self.deploy_files = deploy_files
+
+
+def _resolve_source_layout(source_root: str | os.PathLike[str] | None = None) -> _SourceLayout:
+    root = _resolve_source_root(source_root)
+    if root is not None:
+        deploy_dir = root / "src" / "orcest" / "fleet" / "deploy"
+        return _SourceLayout(
+            package_dir=root / "src" / "orcest",
+            deploy_files={
+                "Dockerfile": deploy_dir / "Dockerfile",
+                "docker-compose.yml": deploy_dir / "docker-compose.yml",
+                "docker-compose.redis.yml": deploy_dir / "docker-compose.redis.yml",
+                "docker-compose.pool.yml": deploy_dir / "docker-compose.pool.yml",
+                "pyproject.toml": root / "pyproject.toml",
+                "requirements.lock": root / "requirements.lock",
+            },
+        )
+
+    fleet_dir = Path(__file__).resolve().parent
+    deploy_dir = fleet_dir / "deploy"
+    package_dir = fleet_dir.parent
+    return _SourceLayout(
+        package_dir=package_dir,
+        deploy_files={fname: deploy_dir / fname for fname in _DEPLOY_FILES},
+    )
+
+
+def _resolve_source_root(source_root: str | os.PathLike[str] | None = None) -> Path | None:
+    forced = source_root or os.environ.get("ORCEST_SOURCE_ROOT")
+    if forced:
+        root = Path(forced).expanduser().resolve()
+        if not _is_source_root(root):
+            raise RuntimeError(
+                f"ORCEST source root is invalid: {root} "
+                "(expected pyproject.toml and src/orcest/fleet/deploy/)"
+            )
+        return root
+
+    candidates = (*[Path.cwd(), *Path.cwd().parents], *Path(__file__).resolve().parents)
+    for candidate in dict.fromkeys(candidates):
+        if _is_source_root(candidate):
+            return candidate
+    return None
+
+
+def _is_source_root(path: Path) -> bool:
+    return (
+        (path / "pyproject.toml").is_file()
+        and (path / "requirements.lock").is_file()
+        and (path / "src" / "orcest" / "__init__.py").is_file()
+        and (path / "src" / "orcest" / "fleet" / "deploy" / "Dockerfile").is_file()
+    )
 
 
 def ensure_redis_password(ssh_target: str) -> str:
@@ -316,28 +474,141 @@ def upload_fleet_config(
         raise FileNotFoundError(f"Fleet config not found: {local_config_path}")
 
     remote_dest = "/etc/orcest/config.yaml"
-    # SCP as the orcest user to a writable location, then sudo mv into place.
-    remote_tmp = "/tmp/.orcest-config.yaml.tmp"
 
     # Ensure target directory exists on the orchestrator VM
     result = _ssh(ssh_target, "sudo mkdir -p /etc/orcest")
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create /etc/orcest on orchestrator: {result.stderr.strip()}")
 
-    result = _scp(local_config_path, ssh_target, remote_tmp)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
+    remote_tmp = _remote_private_tmp(ssh_target, "/tmp/orcest-config.XXXXXX")
+    try:
+        result = _scp(local_config_path, ssh_target, remote_tmp)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to upload fleet config: {result.stderr.strip()}")
 
-    result = _ssh(
-        ssh_target,
-        f"sudo mv {shlex.quote(remote_tmp)} {shlex.quote(remote_dest)}"
-        f" && sudo chmod 600 {shlex.quote(remote_dest)}",
-    )
-    if result.returncode != 0:
+        # The deployed image is built with the host ``orcest`` UID/GID and the
+        # bind-mounted config is consumed by that unprivileged user. Keep it
+        # private to the service identity (and root), matching the SSH-key
+        # mount used by the same container.
+        result = _ssh(
+            ssh_target,
+            f"sudo install -m 600 -o orcest -g orcest {shlex.quote(remote_tmp)} "
+            f"{shlex.quote(remote_dest)}",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to install fleet config: {result.stderr.strip()}")
+    finally:
         _ssh(ssh_target, f"rm -f {shlex.quote(remote_tmp)}")
-        raise RuntimeError(f"Failed to install fleet config: {result.stderr.strip()}")
 
     logger.info("Fleet config uploaded to %s:%s", ssh_target, remote_dest)
+
+
+def _get_deployed_pool_config(ssh_target: str) -> dict | None:
+    """Read and validate the deployed pool mapping, or return None when absent."""
+    result = _ssh(ssh_target, "sudo cat /etc/orcest/config.yaml")
+    if result.returncode != 0:
+        error = (result.stderr or "").strip().lower()
+        if "no such file" in error or "not found" in error:
+            return None
+        raise RuntimeError(
+            f"Could not read deployed fleet config on {ssh_target}: {result.stderr.strip()}"
+        )
+
+    try:
+        data = yaml.safe_load(result.stdout) or {}
+    except yaml.YAMLError as exc:
+        raise RuntimeError("Deployed fleet config is not valid YAML") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Deployed fleet config must contain a YAML mapping")
+    pool = data.get("pool") or {}
+    if not isinstance(pool, dict):
+        raise RuntimeError("Deployed fleet config pool section must be a mapping")
+    return pool
+
+
+def get_deployed_pool_vmid_range(ssh_target: str) -> tuple[int, int] | None:
+    """Return the deployed worker VMID range, or None on a first deployment."""
+    pool = _get_deployed_pool_config(ssh_target)
+    if pool is None:
+        return None
+    try:
+        return int(pool.get("vm_id_start", 0) or 0), int(pool.get("vm_id_end", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Deployed pool worker VMID range must contain integers") from exc
+
+
+def get_deployed_pool_backend(ssh_target: str) -> str | None:
+    """Return the worker-layout signature in the deployed fleet config.
+
+    ``None`` means this is a first deployment and no remote fleet config exists.
+    Other read or parse failures are surfaced so callers cannot unknowingly
+    perform a backend transition with stale workers. Legacy single-backend
+    configurations return the backend name exactly; heterogeneous layouts
+    return their ordered backend/runner/mode signature.
+    """
+    pool = _get_deployed_pool_config(ssh_target)
+    if pool is None:
+        return None
+    raw_profiles = pool.get("worker_profiles") or []
+    if raw_profiles:
+        if not isinstance(raw_profiles, list):
+            raise RuntimeError("Deployed pool.worker_profiles must be a list")
+        from orcest.fleet.config import WorkerProfileConfig
+
+        profiles: list[WorkerProfileConfig] = []
+        for index, raw_profile in enumerate(raw_profiles):
+            if isinstance(raw_profile, str):
+                if not raw_profile.strip():
+                    raise RuntimeError(
+                        f"Deployed pool.worker_profiles[{index}] backend must not be empty"
+                    )
+                profiles.append(WorkerProfileConfig(backend=raw_profile))
+                continue
+            if not isinstance(raw_profile, dict):
+                raise RuntimeError(
+                    f"Deployed pool.worker_profiles[{index}] must be a string or mapping"
+                )
+            backend = str(raw_profile.get("backend", "") or "")
+            if not backend.strip():
+                raise RuntimeError(
+                    f"Deployed pool.worker_profiles[{index}].backend must not be empty"
+                )
+            profiles.append(
+                WorkerProfileConfig(
+                    backend=backend,
+                    runner_type=str(raw_profile.get("runner_type", "") or ""),
+                    runner_mode=str(raw_profile.get("runner_mode", "") or ""),
+                )
+            )
+        profile_signature = ",".join(
+            f"{profile.backend}:{profile.runner_type}:{profile.runner_mode}" for profile in profiles
+        )
+        try:
+            vm_id_start = int(pool.get("vm_id_start", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Deployed pool.vm_id_start must be an integer") from exc
+        try:
+            vm_id_end = int(pool.get("vm_id_end", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Deployed pool.vm_id_end must be an integer") from exc
+        return f"vm_id_start={vm_id_start};vm_id_end={vm_id_end};profiles={profile_signature}"
+    backend = str(pool.get("worker_backend") or "claude").strip()
+    from orcest.fleet.config import WorkerProfileConfig
+
+    profile = WorkerProfileConfig(
+        backend=backend or "claude",
+        runner_type=str(pool.get("worker_runner_type") or ""),
+        runner_mode=str(pool.get("worker_runner_mode") or ""),
+    )
+    try:
+        vm_id_start = int(pool.get("vm_id_start", 0) or 0)
+        vm_id_end = int(pool.get("vm_id_end", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Deployed pool worker VMID range must contain integers") from exc
+    return (
+        f"vm_id_start={vm_id_start};vm_id_end={vm_id_end};backend={profile.backend};"
+        f"runner={profile.runner_type};mode={profile.runner_mode}"
+    )
 
 
 def ensure_pool_manager(
@@ -357,10 +628,20 @@ def ensure_pool_manager(
     result = _ssh(
         ssh_target,
         f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
-        f" --env-file {REDIS_ENV_PATH}"
-        " -f docker-compose.pool.yml"
-        " -p orcest-pool"
-        " up -d",
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        " run --rm --no-deps --entrypoint sh pool-manager"
+        " -c 'test -r /home/orcest/app/config/fleet.yaml &&"
+        " test -r /home/orcest/.ssh && test -x /home/orcest/.ssh &&"
+        " test -f /home/orcest/.ssh/id_ed25519 &&"
+        " test -r /home/orcest/.ssh/id_ed25519' &&"
+        f" FLEET_CONFIG={quoted_path} docker compose"
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        " up -d --force-recreate pool-manager && sleep 2 &&"
+        f" cid=$(FLEET_CONFIG={quoted_path} docker compose"
+        f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
+        ' ps -q pool-manager) && test -n "$cid" &&'
+        ' test "$(docker inspect -f \'{{.State.Running}}\' "$cid")" = true &&'
+        ' test "$(docker inspect -f \'{{.RestartCount}}\' "$cid")" = 0',
     )
     if result.returncode != 0:
         logger.error("Pool manager failed: %s", result.stderr.strip())
@@ -396,22 +677,131 @@ def get_pool_redis_members(
     """
     # Read idle set
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw SMEMBERS orcest:pool:idle")
+    _require_redis_cli_success(result, "Failed to read pool idle set")
     idle: set[str] = set()
-    if result.returncode == 0:
-        for line in result.stdout.strip().splitlines():
-            stripped = line.strip()
-            if stripped:
-                idle.add(stripped)
+    for line in result.stdout.strip().splitlines():
+        stripped = line.strip()
+        if stripped:
+            idle.add(stripped)
 
     # Read active hash (returns alternating key, value lines)
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw HGETALL orcest:pool:active")
+    _require_redis_cli_success(result, "Failed to read pool active hash")
     active: dict[str, str] = {}
-    if result.returncode == 0:
-        lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
-        for i in range(0, len(lines) - 1, 2):
-            active[lines[i]] = lines[i + 1]
+    lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+    if len(lines) % 2 != 0:
+        raise RuntimeError(
+            "Failed to read pool active hash: redis-cli returned an odd number of HGETALL fields"
+        )
+    for i in range(0, len(lines) - 1, 2):
+        active[lines[i]] = lines[i + 1]
 
     return idle, active
+
+
+def _parse_xinfo_consumers_with_pending(stdout: str) -> set[str]:
+    """Parse ``redis-cli --raw XINFO CONSUMERS`` output for busy consumers."""
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    if len(lines) % 2 != 0:
+        raise RuntimeError("Malformed XINFO CONSUMERS output: incomplete field/value pair")
+    consumers: set[str] = set()
+    current_name: str | None = None
+    current_pending_seen = False
+    for i in range(0, len(lines) - 1, 2):
+        field = lines[i]
+        value = lines[i + 1]
+        if field == "name":
+            if current_name is not None and not current_pending_seen:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: consumer {current_name!r} "
+                    "has no pending count"
+                )
+            if not value:
+                raise RuntimeError("Malformed XINFO CONSUMERS output: empty consumer name")
+            current_name = value
+            current_pending_seen = False
+        elif field == "pending":
+            if current_name is None or current_pending_seen:
+                raise RuntimeError(
+                    "Malformed XINFO CONSUMERS output: pending count has no unique consumer"
+                )
+            try:
+                pending = int(value)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: invalid pending count {value!r}"
+                ) from exc
+            if pending < 0:
+                raise RuntimeError(
+                    f"Malformed XINFO CONSUMERS output: invalid pending count {value!r}"
+                )
+            current_pending_seen = True
+            if pending > 0:
+                consumers.add(current_name)
+    if current_name is None and lines:
+        raise RuntimeError("Malformed XINFO CONSUMERS output: no consumer name")
+    if current_name is not None and not current_pending_seen:
+        raise RuntimeError(
+            f"Malformed XINFO CONSUMERS output: consumer {current_name!r} has no pending count"
+        )
+    return consumers
+
+
+def get_workers_with_pending_tasks(
+    ssh_target: str,
+    *,
+    task_stream_pattern: str | None = None,
+) -> set[str]:
+    """Return worker consumer names with pending task-stream entries.
+
+    The fleet CLI uses this as a last-moment safety check before destroying
+    VMs. It mirrors the pool manager's PEL guard but uses the existing
+    orchestrator-VM ``redis-cli`` path instead of requiring Redis access from
+    the host where the CLI runs.
+    """
+    patterns = [task_stream_pattern] if task_stream_pattern else ["tasks:*", "*:tasks:*"]
+    streams: set[str] = set()
+    for pattern in patterns:
+        result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw --scan --pattern {shlex.quote(pattern)}",
+        )
+        _require_redis_cli_success(result, "Failed to scan task streams")
+        streams.update(ln.strip() for ln in result.stdout.splitlines() if ln.strip())
+
+    busy: set[str] = set()
+    for stream_name in sorted(streams):
+        result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw TYPE {shlex.quote(stream_name)}",
+        )
+        _require_redis_cli_success(
+            result,
+            f"Failed to inspect Redis type for task-stream candidate {stream_name}",
+        )
+        redis_type = result.stdout.strip()
+        if redis_type not in {"none", "string", "list", "set", "zset", "hash", "stream"}:
+            raise RuntimeError(
+                f"Failed to inspect Redis type for task-stream candidate {stream_name}: "
+                f"unexpected TYPE output {redis_type!r}"
+            )
+        if redis_type != "stream":
+            continue
+        result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw XINFO CONSUMERS {shlex.quote(stream_name)} workers",
+        )
+        failure = _redis_cli_failure(result)
+        if failure is not None:
+            diagnostic = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+            lower = diagnostic.lower()
+            if "nogroup" in lower or "no such key" in lower:
+                continue
+            raise RuntimeError(
+                f"Failed to inspect task-stream consumers for {stream_name}: {failure}"
+            )
+        busy.update(_parse_xinfo_consumers_with_pending(result.stdout))
+    return busy
 
 
 def get_current_template_vmid(ssh_target: str) -> int | None:
@@ -421,8 +811,7 @@ def get_current_template_vmid(ssh_target: str) -> int | None:
     orchestrator VM. Returns ``None`` for missing/empty/non-integer values.
     """
     result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} --raw GET orcest:pool:current_template_vmid")
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to read template pointer: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to read template pointer")
     raw = result.stdout.strip()
     if not raw:
         return None
@@ -442,20 +831,109 @@ def set_current_template_vmid(ssh_target: str, vm_id: int) -> None:
         ssh_target,
         f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {shlex.quote(str(vm_id))}",
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to set template pointer: {result.stderr.strip()}")
+    _require_redis_cli_success(result, "Failed to set template pointer")
 
 
 def clean_pool_redis(ssh_target: str, vm_ids: list[str]) -> None:
-    """Remove VM IDs from pool:idle and pool:active in Redis."""
+    """Remove destroyed VM generations and verify lifecycle markers are gone."""
     if not vm_ids:
         return
     cmds: list[str] = []
     for vm_id in vm_ids:
         quoted = shlex.quote(vm_id)
+        worker_id = shlex.quote(f"orcest-worker-{vm_id}")
         cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:idle {quoted}")
         cmds.append(f"{_REDIS_CLI_PREFIX} HDEL orcest:pool:active {quoted}")
-    _ssh(ssh_target, " && ".join(cmds))
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:draining {worker_id}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:provisioning {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} SREM orcest:pool:ambiguous-clones {quoted}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} DEL orcest:pool:done:{worker_id}")
+        cmds.append(f"{_REDIS_CLI_PREFIX} DEL orcest:workers:heartbeat:{worker_id}")
+    result = _ssh(ssh_target, " && ".join(cmds))
+    _require_redis_cli_success(result, "Failed to clean pool Redis state")
+
+    # A stale durable done key or drain membership can target a later clone
+    # after Proxmox reuses the same VMID. Verify both generation markers rather
+    # than trusting a successful-looking cleanup response.
+    for vm_id in vm_ids:
+        worker_id = shlex.quote(f"orcest-worker-{vm_id}")
+        verify = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw EXISTS orcest:pool:done:{worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw EXISTS orcest:workers:heartbeat:{worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:draining {worker_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:provisioning {vm_id}"
+            f" && {_REDIS_CLI_PREFIX} --raw SISMEMBER orcest:pool:ambiguous-clones {vm_id}",
+        )
+        _require_redis_cli_success(
+            verify,
+            f"Failed to verify pool Redis cleanup for VM {vm_id}",
+        )
+        states = [line.strip() for line in verify.stdout.splitlines() if line.strip()]
+        if states != ["0", "0", "0", "0", "0"]:
+            raise RuntimeError(
+                f"Failed to verify pool Redis cleanup for VM {vm_id}: "
+                f"expected lifecycle markers to be absent, got {states!r}"
+            )
+
+
+def set_workers_draining(
+    ssh_target: str,
+    worker_ids: list[str],
+    *,
+    draining: bool,
+) -> None:
+    """Add or remove worker consumer IDs from the shared drain set."""
+    if not worker_ids:
+        return
+    command = "SADD" if draining else "SREM"
+    members = " ".join(shlex.quote(worker_id) for worker_id in worker_ids)
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} {command} orcest:pool:draining {members}",
+    )
+    failure = _redis_cli_failure(result)
+    if failure is not None:
+        action = "mark" if draining else "clear"
+        raise RuntimeError(f"Failed to {action} worker drain state: {failure}")
+
+
+def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
+    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+    pattern = "orcest:workers:heartbeat:*"
+    result = _ssh(
+        ssh_target,
+        f"{_REDIS_CLI_PREFIX} --raw --scan --pattern {shlex.quote(pattern)}",
+    )
+    _require_redis_cli_success(result, "Failed to scan worker heartbeats")
+    keys = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    heartbeats: dict[str, tuple[str, str]] = {}
+    for key in keys:
+        if not key.startswith("orcest:workers:heartbeat:"):
+            raise RuntimeError("Worker heartbeat scan returned an unexpected key")
+        value_result = _ssh(
+            ssh_target,
+            f"{_REDIS_CLI_PREFIX} --raw GET {shlex.quote(key)}",
+        )
+        _require_redis_cli_success(value_result, "Failed to read worker heartbeat")
+        raw = value_result.stdout.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Worker heartbeat is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Worker heartbeat must contain a JSON mapping")
+        backend = payload.get("backend")
+        revision = payload.get("revision")
+        if not isinstance(backend, str) or not isinstance(revision, str):
+            raise RuntimeError("Worker heartbeat is missing backend or revision")
+        worker_id = key.removeprefix("orcest:workers:heartbeat:")
+        if not worker_id:
+            raise RuntimeError("Worker heartbeat is missing its worker ID")
+        heartbeats[worker_id] = (backend, revision)
+    return heartbeats
 
 
 def clean_pending_tasks(ssh_target: str) -> int:
@@ -464,11 +942,13 @@ def clean_pending_tasks(ssh_target: str) -> int:
         ssh_target,
         f"{_REDIS_CLI_PREFIX} --scan --pattern 'orcest:pending:*'",
     )
+    _require_redis_cli_success(result, "Failed to scan pending task markers")
     keys = [k.strip() for k in result.stdout.strip().splitlines() if k.strip()]
     if not keys:
         return 0
     quoted = " ".join(shlex.quote(k) for k in keys)
-    _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
+    result = _ssh(ssh_target, f"{_REDIS_CLI_PREFIX} DEL {quoted}")
+    _require_redis_cli_success(result, "Failed to delete pending task markers")
     return len(keys)
 
 
@@ -508,6 +988,20 @@ def deploy_stack(ssh_target: str, project_name: str) -> None:
         logger.error("Deploy failed: %s", result.stderr.strip())
         raise RuntimeError(f"Failed to deploy stack orcest-{project_name}: {result.stderr.strip()}")
     logger.info("Stack orcest-%s deployed on %s", project_name, ssh_target)
+
+
+def stop_stack(ssh_target: str, project_name: str) -> None:
+    """Stop a project orchestrator without deleting its containers or volumes."""
+    _validate_project_name(project_name)
+    logger.info("Stopping stack orcest-%s on %s", project_name, ssh_target)
+    result = _ssh(
+        ssh_target,
+        f"cd /opt/orcest && docker compose -p {_project_compose_args(project_name)} stop",
+    )
+    if result.returncode != 0:
+        logger.error("Stop failed: %s", result.stderr.strip())
+        raise RuntimeError(f"Failed to stop stack orcest-{project_name}: {result.stderr.strip()}")
+    logger.info("Stack orcest-%s stopped on %s", project_name, ssh_target)
 
 
 def teardown_stack(ssh_target: str, project_name: str) -> None:
@@ -571,19 +1065,21 @@ def write_project_files(
         tmp_env_path = tmp.name
 
     try:
-        remote_tmp_env = f"/tmp/orcest-{project_name}-env"
+        remote_tmp_env = _remote_private_tmp(ssh_target, f"/tmp/orcest-{project_name}-env.XXXXXX")
         qremote_tmp_env = shlex.quote(remote_tmp_env)
-        result = _scp(tmp_env_path, ssh_target, remote_tmp_env)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to upload .env: {result.stderr.strip()}")
-        qenv_dest = shlex.quote(f"{pdir}/.env")
-        result = _ssh(
-            ssh_target,
-            f"mv {qremote_tmp_env} {qenv_dest} && chmod 600 {qenv_dest}",
-        )
-        if result.returncode != 0:
+        try:
+            result = _scp(tmp_env_path, ssh_target, remote_tmp_env)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to upload .env: {result.stderr.strip()}")
+            qenv_dest = shlex.quote(f"{pdir}/.env")
+            result = _ssh(
+                ssh_target,
+                f"mv {qremote_tmp_env} {qenv_dest} && chmod 600 {qenv_dest}",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
+        finally:
             _ssh(ssh_target, f"rm -f {qremote_tmp_env}")
-            raise RuntimeError(f"Failed to install .env: {result.stderr.strip()}")
     finally:
         try:
             os.unlink(tmp_env_path)
@@ -596,19 +1092,23 @@ def write_project_files(
         tmp_config_path = tmp.name
 
     try:
-        remote_tmp_config = f"/tmp/orcest-{project_name}-config.yaml"
-        qremote_tmp_config = shlex.quote(remote_tmp_config)
-        result = _scp(tmp_config_path, ssh_target, remote_tmp_config)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to upload config: {result.stderr.strip()}")
-        qconfig_dest = shlex.quote(f"{pdir}/config/orchestrator.yaml")
-        result = _ssh(
-            ssh_target,
-            f"mv {qremote_tmp_config} {qconfig_dest} && chmod 644 {qconfig_dest}",
+        remote_tmp_config = _remote_private_tmp(
+            ssh_target, f"/tmp/orcest-{project_name}-config.XXXXXX"
         )
-        if result.returncode != 0:
+        qremote_tmp_config = shlex.quote(remote_tmp_config)
+        try:
+            result = _scp(tmp_config_path, ssh_target, remote_tmp_config)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to upload config: {result.stderr.strip()}")
+            qconfig_dest = shlex.quote(f"{pdir}/config/orchestrator.yaml")
+            result = _ssh(
+                ssh_target,
+                f"mv {qremote_tmp_config} {qconfig_dest} && chmod 644 {qconfig_dest}",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
+        finally:
             _ssh(ssh_target, f"rm -f {qremote_tmp_config}")
-            raise RuntimeError(f"Failed to install config: {result.stderr.strip()}")
     finally:
         try:
             os.unlink(tmp_config_path)
@@ -735,6 +1235,7 @@ def generate_orchestrator_config(
     key_prefix: str,
     task_key_prefix: str = "orcest",
     extra_providers: list[str] | None = None,
+    default_runner: str | None = None,
     trace_archive_enabled: bool = False,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
@@ -744,13 +1245,16 @@ def generate_orchestrator_config(
     ``task_key_prefix`` is the shared prefix used for the task stream
     that workers read from.
 
-    ``extra_providers`` lists non-claude provider names the org has
-    credentials for (e.g. ["grok"]). Each is emitted as a declarative
+    ``extra_providers`` lists additional provider names the org has
+    credentials for (e.g. ["grok", "clauder"]). Each is emitted as a declarative
     ``providers:`` entry with an empty credential, so the orchestrator
     resolves the value from the generated ``.env`` via the env-var fallback
     (``_PROVIDER_ENV_CANDIDATES`` in shared/config.py — e.g. XAI_API_KEY for
-    grok). Claude is intentionally omitted: it is synthesized from
+    grok). Legacy ``claude`` is intentionally omitted: it is synthesized from
     CLAUDE_CODE_OAUTH_TOKENS by the legacy path and coexists with this list.
+    ``default_runner`` lets fleet deployment align the generated orchestrator
+    with the configured worker pool backend, so a pool consuming ``tasks:clauder``
+    receives Claude-backed work even when the org only uses legacy Claude tokens.
     """
     config: dict = {
         "redis": {"host": "redis", "port": 6379, "key_prefix": key_prefix},
@@ -758,6 +1262,11 @@ def generate_orchestrator_config(
         "github": {"repo": repo},
     }
     providers = [p for p in sorted(extra_providers or []) if p and p != "claude"]
+    normalized_default_runner = (default_runner or "").strip()
+    if not normalized_default_runner and "clauder" in providers:
+        normalized_default_runner = "clauder"
+    if normalized_default_runner and normalized_default_runner != "claude":
+        config["default_runner"] = normalized_default_runner
     if providers:
         config["providers"] = [{"provider": p, "credential": "", "model": ""} for p in providers]
     if trace_archive_enabled:

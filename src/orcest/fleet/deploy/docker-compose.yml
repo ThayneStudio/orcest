@@ -1,7 +1,12 @@
 services:
   orchestrator:
     image: ${ORCEST_IMAGE:-orcest:latest}
-    build: .
+    build:
+      context: .
+      args:
+        ORCEST_BUILD_REVISION: ${ORCEST_BUILD_REVISION:-unknown}
+        ORCEST_UID: ${ORCEST_UID:-1000}
+        ORCEST_GID: ${ORCEST_GID:-1000}
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
       # Verbatim per-task trace archive. When ORCEST_TRACE_HOST_PATH is unset
@@ -30,6 +35,7 @@ services:
       # vars; otherwise the .env value never reaches the container).
       - XAI_API_KEY
       - GROK_API_KEY
+      - CLAUDER_API_KEY
       - CODEX_API_KEY
       - OPENAI_API_KEY
       - ORCEST_REDIS_HOST=redis

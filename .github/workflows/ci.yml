@@ -20,7 +20,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
-          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -44,7 +45,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
-          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -67,7 +69,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
-          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -78,6 +81,38 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -e ".[dev]"
       - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x --cov=src/orcest --cov-report=term-missing
+
+  dashboard:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout repository
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" init -q 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote remove origin 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote add origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: dashboard/.node-version
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: sh dashboard/scripts/check-tracked-files.sh
+      - name: Check dashboard Docker clean-copy wrapper
+        run: make check-dashboard-clean-copy
+      - name: Test dashboard Make target
+        run: make test-dashboard
+      # Advisory only: `npm audit` hits the live registry, so a new transitive
+      # advisory (or a registry outage) must not fail a PR that changed no code.
+      # Failures stay visible as a red annotation on this step alone.
+      - name: Audit dashboard dependencies (non-blocking)
+        continue-on-error: true
+        run: make audit-dashboard
+      - name: Dry-run dashboard Make wrappers
+        run: make -n test-dashboard audit-dashboard build-dashboard smoke-dashboard-compose deploy-dashboard-remote DASHBOARD_REMOTE=dashboard.example.invalid
 
   integration:
     runs-on: [self-hosted, linux]
@@ -105,7 +140,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
-          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -131,7 +167,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth 1 origin "${{ github.sha }}"
-          git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" clean -ffdx
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -139,6 +176,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Set lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+      - name: Set dashboard Node version
+        run: echo "DASHBOARD_NODE_VERSION=$(cat dashboard/.node-version)" >> $GITHUB_ENV
+      - name: Check dashboard tracked files
+        run: sh dashboard/scripts/check-tracked-files.sh
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -147,3 +188,16 @@ jobs:
           tags: orcest:ci
           cache-from: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:buildcache
           cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', env.IMAGE_NAME) || '' }}
+      - name: Build dashboard Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dashboard
+          load: true
+          push: false
+          tags: orcest-dashboard:ci
+          build-args: |
+            NODE_VERSION=${{ env.DASHBOARD_NODE_VERSION }}
+      - name: Smoke dashboard Docker image
+        run: DASHBOARD_SMOKE_TOKEN=ci-smoke-token sh dashboard/scripts/smoke-image.sh orcest-dashboard:ci
+      - name: Smoke dashboard compose deployment
+        run: DASHBOARD_SMOKE_TOKEN=ci-smoke-token DASHBOARD_SMOKE_REDIS_PASSWORD=ci-smoke-redis sh dashboard/scripts/smoke-compose.sh

@@ -11,6 +11,7 @@ Two test approaches are used:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -21,10 +22,31 @@ import pytest
 
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.coordination import RedisLock, make_pr_lock_key
-from orcest.shared.models import Task, TaskType
+from orcest.shared.credential_handoff import (
+    _MIGRATE_V1_INTENT_LUA,
+    ATOMIC_CREDENTIAL_TERMINAL_LUA,
+    CredentialCheckpointStatus,
+    CredentialRecoveryOutcome,
+    credential_intent_key,
+    handoff_marker_key,
+    handoff_payload_fingerprint,
+    load_credential_checkpoint,
+    recover_credential_checkpoint,
+    store_credential_checkpoint,
+    version_credential_checkpoint,
+)
+from orcest.shared.models import ResultStatus, Task, TaskResult, TaskType
 from orcest.shared.redis_client import RedisClient
 from orcest.worker.heartbeat import Heartbeat
-from orcest.worker.loop import CONSUMER_GROUP, RESULTS_STREAM, _execute_task, run_worker
+from orcest.worker.loop import (
+    CONSUMER_GROUP,
+    RESULTS_STREAM,
+    ResultPublishOutcome,
+    _credential_checkpoint_key,
+    _execute_task,
+    _publish_result_with_retry,
+    run_worker,
+)
 from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.workspace import Workspace
 
@@ -45,6 +67,400 @@ class TestWorkerIsolation:
     # ------------------------------------------------------------------
     # Approach 1: Direct _execute_task with real locks and real NoopRunner
     # ------------------------------------------------------------------
+
+    def test_credential_terminal_handoff_is_idempotent_after_lost_eval_response(
+        self,
+        real_redis_client: RedisClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A post-execution connection loss cannot append the secret twice."""
+        redis = real_redis_client
+        tasks_stream = "tasks:claude"
+        fq_tasks_stream = tasks_stream
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="github-token",
+            resource_type="pr",
+            resource_id=42,
+            prompt="fix",
+        )
+        redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
+        entry_id = redis.xadd(tasks_stream, task.to_dict())
+        claimed = redis.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer="credential-worker",
+            stream=tasks_stream,
+            count=1,
+            block_ms=None,
+        )
+        assert claimed and claimed[0][0] == entry_id
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="credential-worker",
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="done",
+            duration_seconds=1,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"secret"}',
+            credential_update_minted_at=123,
+        )
+        original_eval = redis.client.eval
+        lost = False
+
+        def lose_first_terminal_response(script: str, *args: object) -> object:
+            nonlocal lost
+            response = original_eval(script, *args)
+            if script == ATOMIC_CREDENTIAL_TERMINAL_LUA and not lost:
+                lost = True
+                raise ConnectionError("response lost after Redis executed EVAL")
+            return response
+
+        monkeypatch.setattr(redis.client, "eval", lose_first_terminal_response)
+
+        outcome = _publish_result_with_retry(
+            redis,
+            result,
+            task,
+            logging.getLogger("test.credential-response-loss"),
+            fq_tasks_stream,
+            entry_id,
+            abort_event=unittest.mock.MagicMock(wait=unittest.mock.MagicMock(return_value=False)),
+        )
+
+        assert outcome is ResultPublishOutcome.PUBLISHED
+        rows = redis.client.xrevrange(RESULTS_STREAM, count=10)
+        assert len(rows) == 1
+        assert TaskResult.from_dict(rows[0][1]).credential_update == ('{"refresh_token":"secret"}')
+        checkpoint_key = _credential_checkpoint_key(
+            RESULTS_STREAM,
+            fq_tasks_stream,
+            entry_id,
+            task.id,
+        )
+        assert redis.client.exists(checkpoint_key) == 0
+        assert redis.client.xpending(fq_tasks_stream, CONSUMER_GROUP)["pending"] == 0
+        terminal_receipt = redis.client.get(
+            handoff_marker_key(RESULTS_STREAM, fq_tasks_stream, entry_id, task.id)
+        )
+        assert isinstance(terminal_receipt, str)
+        assert terminal_receipt.startswith("terminal|")
+
+    def test_missing_checkpoint_before_terminal_eval_fails_closed(
+        self,
+        real_redis_client: RedisClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """External checkpoint deletion is not positive publication proof."""
+        redis = real_redis_client
+        tasks_stream = "tasks:claude"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="github-token",
+            resource_type="pr",
+            resource_id=43,
+            prompt="fix",
+        )
+        redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
+        entry_id = redis.xadd(tasks_stream, task.to_dict())
+        assert redis.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer="credential-worker",
+            stream=tasks_stream,
+            count=1,
+            block_ms=None,
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="credential-worker",
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="done",
+            duration_seconds=1,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"secret"}',
+            credential_update_minted_at=123,
+        )
+        original_eval = redis.client.eval
+        deleted_checkpoint_key = ""
+
+        def delete_checkpoint_before_terminal_eval(script: str, *args: object) -> object:
+            nonlocal deleted_checkpoint_key
+            if script == ATOMIC_CREDENTIAL_TERMINAL_LUA:
+                deleted_checkpoint_key = str(args[4])
+                redis.client.delete(deleted_checkpoint_key)
+            return original_eval(script, *args)
+
+        monkeypatch.setattr(redis.client, "eval", delete_checkpoint_before_terminal_eval)
+        outcome = _publish_result_with_retry(
+            redis,
+            result,
+            task,
+            logging.getLogger("test.credential-external-delete"),
+            tasks_stream,
+            entry_id,
+            abort_event=unittest.mock.MagicMock(wait=unittest.mock.MagicMock(return_value=False)),
+        )
+
+        assert outcome is ResultPublishOutcome.BLOCKED
+        assert deleted_checkpoint_key
+        assert redis.client.xlen(RESULTS_STREAM) == 0
+        assert redis.client.xpending(tasks_stream, CONSUMER_GROUP)["pending"] == 1
+        assert (
+            redis.client.exists(
+                credential_intent_key(RESULTS_STREAM, tasks_stream, entry_id, task.id)
+            )
+            == 1
+        )
+
+    def test_stale_version_actor_cannot_resurrect_or_overwrite_checkpoint(
+        self,
+        real_redis_client: RedisClient,
+    ) -> None:
+        """Version rewrites are exact CAS operations across worker/reaper actors."""
+        redis = real_redis_client
+        tasks_stream = "tasks:claude"
+        entry_id = "1-0"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="github-token",
+            resource_type="pr",
+            resource_id=44,
+            prompt="fix",
+        )
+        result = TaskResult(
+            task_id=task.id,
+            worker_id="credential-worker",
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="done",
+            duration_seconds=1,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"secret"}',
+            credential_update_minted_at=0,
+        )
+        initial = store_credential_checkpoint(
+            redis,
+            RESULTS_STREAM,
+            tasks_stream,
+            entry_id,
+            task.id,
+            result.to_dict(),
+        )
+        conflicting_fields = {**result.to_dict(), "summary": "stale actor overwrite"}
+        with pytest.raises(RuntimeError, match="already exists"):
+            store_credential_checkpoint(
+                redis,
+                RESULTS_STREAM,
+                tasks_stream,
+                entry_id,
+                task.id,
+                conflicting_fields,
+            )
+        assert redis.client.get(initial.key) == initial.serialized
+        status, actor_a = load_credential_checkpoint(
+            redis,
+            RESULTS_STREAM,
+            tasks_stream,
+            entry_id,
+            task,
+            logging.getLogger("test.credential-cas"),
+        )
+        assert status is CredentialCheckpointStatus.VALID
+        assert actor_a is not None
+        actor_b = actor_a
+        winner = version_credential_checkpoint(
+            redis, actor_b, RESULTS_STREAM, tasks_stream, entry_id, task.id
+        )
+
+        with pytest.raises(RuntimeError, match="changed during versioning"):
+            version_credential_checkpoint(
+                redis, actor_a, RESULTS_STREAM, tasks_stream, entry_id, task.id
+            )
+        assert redis.client.get(winner.key) == winner.serialized
+
+        redis.client.delete(winner.key)
+        with pytest.raises(RuntimeError, match="changed during versioning"):
+            version_credential_checkpoint(
+                redis, actor_a, RESULTS_STREAM, tasks_stream, entry_id, task.id
+            )
+        assert redis.client.exists(winner.key) == 0
+
+    @pytest.mark.parametrize("preexisting_intent", [False, True])
+    def test_valid_v1_checkpoint_migration_persists_state_then_recovers(
+        self,
+        real_redis_client: RedisClient,
+        preexisting_intent: bool,
+    ) -> None:
+        redis = real_redis_client
+        tasks_stream = "tasks:claude"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="github-token",
+            resource_type="pr",
+            resource_id=45,
+            prompt="fix",
+        )
+        redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
+        entry_id = redis.xadd(tasks_stream, task.to_dict())
+        assert redis.xreadgroup(
+            group=CONSUMER_GROUP,
+            consumer="legacy-worker",
+            stream=tasks_stream,
+            count=1,
+            block_ms=None,
+        )
+        fields = TaskResult(
+            task_id=task.id,
+            worker_id="legacy-worker",
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="legacy rotation",
+            duration_seconds=1,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"legacy-secret"}',
+            credential_update_minted_at=123,
+        ).to_dict()
+        checkpoint_key = _credential_checkpoint_key(RESULTS_STREAM, tasks_stream, entry_id, task.id)
+        legacy = json.dumps(
+            {
+                "version": 1,
+                "target_stream": RESULTS_STREAM,
+                "tasks_stream": tasks_stream,
+                "entry_id": entry_id,
+                "task_id": task.id,
+                "result_fingerprint": handoff_payload_fingerprint(fields),
+                "result": fields,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        redis.client.set(checkpoint_key, legacy, ex=60)
+        intent_key = credential_intent_key(RESULTS_STREAM, tasks_stream, entry_id, task.id)
+        if preexisting_intent:
+            redis.client.set(intent_key, "1", ex=60)
+
+        status, checkpoint = load_credential_checkpoint(
+            redis,
+            RESULTS_STREAM,
+            tasks_stream,
+            entry_id,
+            task,
+            logging.getLogger("test.credential-v1"),
+        )
+
+        assert status is CredentialCheckpointStatus.VALID
+        assert checkpoint is not None and checkpoint.serialized == legacy
+        assert redis.client.get(intent_key) == "1"
+        assert redis.client.ttl(checkpoint_key) == -1
+        assert redis.client.ttl(intent_key) == -1
+
+        recovered = recover_credential_checkpoint(
+            redis,
+            task,
+            RESULTS_STREAM,
+            tasks_stream,
+            entry_id,
+            "dead-letter",
+            logging.getLogger("test.credential-v1-recover"),
+            maxlen=20000,
+        )
+        assert recovered is CredentialRecoveryOutcome.RECOVERED
+        assert redis.client.exists(checkpoint_key) == 0
+        assert redis.client.exists(intent_key) == 0
+        assert redis.client.xpending(tasks_stream, CONSUMER_GROUP)["pending"] == 0
+        assert redis.client.xlen(RESULTS_STREAM) == 1
+
+    @pytest.mark.parametrize("mutation", ["missing", "changed", "invalid_intent"])
+    def test_v1_intent_migration_fails_closed_on_concurrent_state_change(
+        self,
+        real_redis_client: RedisClient,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation: str,
+    ) -> None:
+        redis = real_redis_client
+        tasks_stream = "tasks:claude"
+        entry_id = "1-0"
+        task = Task.create(
+            task_type=TaskType.FIX_PR,
+            repo="owner/repo",
+            token="github-token",
+            resource_type="pr",
+            resource_id=46,
+            prompt="fix",
+        )
+        fields = TaskResult(
+            task_id=task.id,
+            worker_id="legacy-worker",
+            status=ResultStatus.COMPLETED,
+            branch=task.branch,
+            summary="legacy rotation",
+            duration_seconds=1,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            repo=task.repo,
+            credential_update='{"refresh_token":"legacy-secret"}',
+            credential_update_minted_at=123,
+        ).to_dict()
+        checkpoint_key = _credential_checkpoint_key(RESULTS_STREAM, tasks_stream, entry_id, task.id)
+        legacy = json.dumps(
+            {
+                "version": 1,
+                "target_stream": RESULTS_STREAM,
+                "tasks_stream": tasks_stream,
+                "entry_id": entry_id,
+                "task_id": task.id,
+                "result_fingerprint": handoff_payload_fingerprint(fields),
+                "result": fields,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        redis.client.set(checkpoint_key, legacy)
+        original_eval = redis.client.eval
+
+        def mutate_before_migration(script: str, *args: object) -> object:
+            if script == _MIGRATE_V1_INTENT_LUA:
+                if mutation == "missing":
+                    redis.client.delete(checkpoint_key)
+                elif mutation == "changed":
+                    redis.client.set(checkpoint_key, "concurrent replacement")
+                else:
+                    redis.client.set(
+                        credential_intent_key(RESULTS_STREAM, tasks_stream, entry_id, task.id),
+                        "invalid",
+                    )
+            return original_eval(script, *args)
+
+        monkeypatch.setattr(redis.client, "eval", mutate_before_migration)
+
+        status, checkpoint = load_credential_checkpoint(
+            redis,
+            RESULTS_STREAM,
+            tasks_stream,
+            entry_id,
+            task,
+            logging.getLogger("test.credential-v1-race"),
+        )
+
+        assert status is CredentialCheckpointStatus.BLOCKED
+        assert checkpoint is None
+        intent = redis.client.get(
+            credential_intent_key(RESULTS_STREAM, tasks_stream, entry_id, task.id)
+        )
+        assert intent == ("invalid" if mutation == "invalid_intent" else None)
 
     def test_execute_task_no_overlap_same_pr(
         self,
@@ -514,19 +930,21 @@ class TestWorkerIsolation:
         )
 
     # ------------------------------------------------------------------
-    # Approach 2b: run_worker skips locked tasks (ACK without processing)
+    # Approach 2b: run_worker reports lock contention without processing
     # ------------------------------------------------------------------
 
-    def test_run_worker_skips_locked_tasks(
+    def test_run_worker_reports_locked_tasks(
         self,
         real_redis_client: RedisClient,
         make_real_redis_client,
     ) -> None:
-        """When a PR lock is already held, run_worker ACKs the task
-        without executing it (no duplicate work, no stall).
+        """A locked task gets a transient result without duplicate execution.
+
+        The following unlocked task still executes normally, and both source
+        entries are ACKed only after their respective results are durable.
         """
         redis = real_redis_client
-        tasks_stream = "tasks:claude"
+        tasks_stream = "tasks:noop"
         results_stream = RESULTS_STREAM
 
         redis.ensure_consumer_group(tasks_stream, CONSUMER_GROUP)
@@ -586,7 +1004,7 @@ class TestWorkerIsolation:
             ),
             worker_id="skip-test-worker",
             workspace_dir="/tmp/orcest-test-isolation",
-            backend="claude",
+            backend="noop",
             runner=RunnerConfig(
                 type="noop",
                 timeout=10,
@@ -612,6 +1030,20 @@ class TestWorkerIsolation:
         signal_patcher = unittest.mock.patch("orcest.worker.loop.signal.signal")
         signal_patcher.start()
 
+        runner_calls: list[str] = []
+        original_noop_run = NoopRunner.run
+
+        def counted_noop_run(self, prompt, *args, **kwargs):
+            runner_calls.append(prompt)
+            return original_noop_run(self, prompt, *args, **kwargs)
+
+        noop_run_patcher = unittest.mock.patch.object(
+            NoopRunner,
+            "run",
+            new=counted_noop_run,
+        )
+        noop_run_patcher.start()
+
         stop_event = threading.Event()
 
         try:
@@ -632,16 +1064,13 @@ class TestWorkerIsolation:
             )
             t.start()
 
-            # Wait for the unlocked task to produce a result
+            # Wait for both the lock-contention and completed results.
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 results_count = redis.client.xlen(results_stream)
-                if results_count >= 1:
+                if results_count >= 2:
                     break
                 time.sleep(0.2)
-
-            # Allow time for the worker to also process (skip) the locked task
-            time.sleep(1)
         finally:
             # Signal the worker to stop and wait for it to exit so it releases
             # its Redis connection before the fixture calls flushdb().
@@ -654,14 +1083,19 @@ class TestWorkerIsolation:
             workspace_patcher.stop()
             logging_patcher.stop()
             signal_patcher.stop()
+            noop_run_patcher.stop()
             if thread_hung:
                 raise RuntimeError(f"Worker thread {t.name!r} did not stop within 10 s")
 
-        # The results stream should have exactly 1 result (the unlocked task)
+        # Both tasks have a durable result, but only the unlocked task ran.
         results_count = redis.client.xlen(results_stream)
-        assert results_count == 1, (
-            f"Expected exactly 1 result (locked task skipped), got {results_count}"
-        )
+        assert results_count == 2, f"Expected exactly 2 results, got {results_count}"
+        results = [fields for _, fields in redis.client.xrange(results_stream)]
+        by_task = {fields["task_id"]: fields for fields in results}
+        assert by_task[task.id]["status"] == "failed"
+        assert by_task[task.id]["summary"].startswith("[transient] ")
+        assert by_task[task2.id]["status"] == "completed"
+        assert runner_calls == [task2.prompt]
 
         # Both tasks should be ACKed (no pending entries)
         pending = redis.client.xpending(tasks_stream, CONSUMER_GROUP)

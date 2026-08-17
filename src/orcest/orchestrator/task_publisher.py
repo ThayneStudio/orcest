@@ -28,7 +28,7 @@ from orcest.shared.coordination import (
     compute_pending_task_ttl,
     set_pending_task,
 )
-from orcest.shared.models import Task, TaskType
+from orcest.shared.models import Task, TaskType, task_stream_name
 from orcest.shared.redis_client import RedisClient
 
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)")
@@ -65,6 +65,11 @@ _LOG_ERROR_RE = re.compile(
 # RunnerConfig defaults.  Functions that have a live RunnerConfig available
 # should receive the TTL explicitly; this constant is used only as a fallback.
 _DEFAULT_PENDING_TASK_TTL: int = compute_pending_task_ttl(RunnerConfig())
+
+
+def _resolve_task_provider(provider: str | None, default_runner: str) -> str:
+    """Resolve an optional publish override to the effective task provider."""
+    return (provider or "").strip() or default_runner.strip()
 
 
 def _clear_pending_safe(
@@ -490,7 +495,7 @@ def _publish_and_notify(
     # Publish to backend-specific stream (shared across all projects)
     stream_redis = task_redis or redis
     try:
-        tasks_stream = f"tasks:{default_runner}"
+        tasks_stream = task_stream_name(task.provider or default_runner)
         stream_redis.xadd(tasks_stream, task.to_dict())
     except Exception:
         _log.error(
@@ -525,11 +530,12 @@ def publish_fix_task(
     task_redis: RedisClient | None = None,
     skip_transient_rerun: bool = False,
     # Lean multi-provider surface (Task 3 prep; defaults preserve all existing callers)
-    provider: str = "claude",
+    provider: str | None = None,
     credential: str = "",
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -599,6 +605,8 @@ def publish_fix_task(
         ci_logs=ci_logs,
     )
 
+    resolved_provider = _resolve_task_provider(provider, default_runner)
+
     # Create task
     task = Task.create(
         task_type=task_type,
@@ -619,10 +627,11 @@ def publish_fix_task(
         snapshot_review_thread_ids=_review_thread_ids(review_threads),
         snapshot_review_thread_fingerprints=_review_thread_fingerprints(review_threads),
         # Forward lean provider fields (claude_token path still populates via internal sync)
-        provider=provider,
+        provider=resolved_provider,
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -652,11 +661,12 @@ def publish_followup_task(
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
     # Lean multi-provider surface (Task 3 prep)
-    provider: str = "claude",
+    provider: str | None = None,
     credential: str = "",
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -686,6 +696,8 @@ def publish_followup_task(
         repo=repo,
     )
 
+    resolved_provider = _resolve_task_provider(provider, default_runner)
+
     # Create task
     task = Task.create(
         task_type=task_type,
@@ -702,10 +714,11 @@ def publish_followup_task(
         decision_reason=DECISION_FOLLOWUP_THREADS,
         snapshot_review_thread_ids=_review_thread_ids(pr_state.review_threads),
         snapshot_review_thread_fingerprints=_review_thread_fingerprints(pr_state.review_threads),
-        provider=provider,
+        provider=resolved_provider,
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -737,11 +750,12 @@ def publish_rebase_task(
     proactive: bool = False,
     task_redis: RedisClient | None = None,
     # Lean multi-provider surface (Task 3 prep)
-    provider: str = "claude",
+    provider: str | None = None,
     credential: str = "",
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -760,6 +774,8 @@ def publish_rebase_task(
         proactive=proactive,
     )
 
+    resolved_provider = _resolve_task_provider(provider, default_runner)
+
     task = Task.create(
         task_type=TaskType.REBASE_PR,
         repo=repo,
@@ -775,10 +791,11 @@ def publish_rebase_task(
         decision_reason=(
             DECISION_PROACTIVE_REBASE if proactive else DECISION_MERGE_CONFLICT_REBASE
         ),
-        provider=provider,
+        provider=resolved_provider,
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_and_notify(
@@ -809,11 +826,12 @@ def publish_issue_task(
     key_prefix: str = "",
     task_redis: RedisClient | None = None,
     # Lean multi-provider surface (Task 3 prep)
-    provider: str = "claude",
+    provider: str | None = None,
     credential: str = "",
     model: str | None = None,
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
+    provider_account: str = "",
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -829,6 +847,8 @@ def publish_issue_task(
         repo=repo,
     )
 
+    resolved_provider = _resolve_task_provider(provider, default_runner)
+
     task = Task.create(
         task_type=TaskType.IMPLEMENT_ISSUE,
         repo=repo,
@@ -839,10 +859,11 @@ def publish_issue_task(
         branch=None,
         claude_token=claude_token,
         key_prefix=key_prefix,
-        provider=provider,
+        provider=resolved_provider,
         credential=credential,
         model=model,
         task_id=task_id,
+        provider_account=provider_account,
     )
 
     published = _publish_issue_and_notify(
@@ -878,9 +899,20 @@ def _publish_issue_and_notify(
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Claim the pending-task slot atomically (SET NX EX).
+    # Claim the pending-task slot atomically (SET NX EX). `created_at` matters
+    # beyond bookkeeping: without it the dashboard cannot measure the marker's
+    # real age and has to infer it from the remaining TTL, an inference that is
+    # only sound when its configured TTL matches the orchestrator's. Stamping it
+    # here (as the PR path already does) keeps stuck-task detection on the
+    # reliable branch.
     if not set_pending_task(
-        redis, task.repo, "issue", issue_state.number, task.id, ttl=pending_task_ttl
+        redis,
+        task.repo,
+        "issue",
+        issue_state.number,
+        task.id,
+        ttl=pending_task_ttl,
+        created_at=task.created_at.isoformat(),
     ):
         _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
         return False
@@ -902,7 +934,7 @@ def _publish_issue_and_notify(
     # Publish to issue-specific stream (shared across all projects, lower priority than PR tasks)
     stream_redis = task_redis or redis
     try:
-        tasks_stream = f"tasks:issue:{default_runner}"
+        tasks_stream = task_stream_name(task.provider or default_runner, issue=True)
         stream_redis.xadd(tasks_stream, task.to_dict())
     except Exception:
         _log.error(

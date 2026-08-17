@@ -1,5 +1,7 @@
 """Tests for orcest.fleet.cloud_init."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -15,6 +17,12 @@ from orcest.fleet.cloud_init import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_manual_setup_codex_pin_matches_cloud_init() -> None:
+    script = (Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh").read_text()
+
+    assert f'CODEX_VERSION="{_CODEX_VERSION}"' in script
 
 
 # NOTE: the dead, secret-leaking ``render_worker_userdata`` and its
@@ -97,33 +105,24 @@ class TestTemplateUserdata:
         assert "npm install -g bun" in runcmd
         assert "astral.sh/uv/install.sh" in runcmd
         assert "npm install -g wrangler" in runcmd
-        # Grok CLI: official installer fetched, pinned version, self-contained
-        # binary copied to a system path so the orcest worker user can run it.
-        assert "x.ai/cli/install.sh" in runcmd
-        assert _GROK_VERSION in runcmd
-        # Resolved binary copied to a system path + made executable for the
-        # non-root orcest user. The installer's symlink-into-/root must be
-        # removed first (rm before cp) — /root is 0700, so a symlink there is
-        # unexecutable by orcest (EACCES); cp would follow it, not replace it.
+        # Grok CLI: the exact versioned binary is fetched directly, checksum
+        # gated before installation, and made executable for the worker user.
+        assert f"x.ai/cli/grok-{_GROK_VERSION}-linux-x86_64" in runcmd
+        assert "x.ai/cli/install.sh" not in runcmd
         assert "/usr/local/bin/grok" in runcmd
-        assert "chmod 755 /usr/local/bin/grok" in runcmd
-        rm_idx = next(i for i, c in enumerate(data["runcmd"]) if "rm -f /usr/local/bin/grok" in c)
-        cp_idx = next(i for i, c in enumerate(data["runcmd"]) if 'cp "$(readlink' in c)
-        assert rm_idx < cp_idx, "must rm the installer symlink before cp'ing the real binary"
+        assert "install -m 0755 -o root -g root /tmp/grok /usr/local/bin/grok" in runcmd
         # The post-install check runs as the orcest worker user, so it catches
         # exec-permission regressions (not just root-visible presence).
         assert "sudo -u orcest -H bash -lc 'command -v grok && grok --version'" in runcmd
-        # No silent-failure swallow on the install (the original miss).
-        assert f"bash /tmp/grok-install.sh {_GROK_VERSION} || true" not in runcmd
         # The checksum gate and the install must be ONE runcmd entry joined by
         # `&&` — cloud-init has no `set -e` across entries, so a separate gate
         # wouldn't actually block the install on a checksum mismatch.
         gated = [
             c
             for c in data["runcmd"]
-            if "sha256sum" in str(c) and "bash /tmp/grok-install.sh" in str(c) and "&&" in str(c)
+            if "sha256sum" in str(c) and "install -m 0755" in str(c) and "&&" in str(c)
         ]
-        assert gated, "grok checksum gate and install must be combined with && in one entry"
+        assert gated, "Grok binary checksum gate and install must be one entry"
         # Codex CLI (OpenAI codex-cli): pinned npm-global install, no
         # silent-failure swallow, and verified as the orcest worker user so
         # any exec-perms regression (mirroring the grok /root/.local/bin
@@ -131,6 +130,16 @@ class TestTemplateUserdata:
         assert f"npm install -g @openai/codex@{_CODEX_VERSION}" in runcmd
         assert f"npm install -g @openai/codex@{_CODEX_VERSION} || true" not in runcmd
         assert "sudo -u orcest -H bash -lc 'command -v codex && codex --version'" in runcmd
+
+    @pytest.mark.parametrize(
+        "digest",
+        ["not-a-digest", "a" * 63, "a" * 65, '"; touch /root/pwned; #', "a" * 32 + "\nwhoami"],
+    )
+    def test_rejects_unsafe_grok_binary_digest_override(self, monkeypatch, digest):
+        monkeypatch.setenv("ORCEST_GROK_BINARY_SHA256", digest)
+
+        with pytest.raises(ValueError, match="exactly 64 hexadecimal"):
+            render_template_userdata()
 
     def test_template_packages_include_quality_of_life_tools(self):
         data = yaml.safe_load(render_template_userdata())
@@ -161,12 +170,11 @@ class TestTemplateUserdata:
         assert eth0["dhcp4"] is True
         assert eth0["dhcp-identifier"] == "mac"
 
-    def test_creates_venv_and_installs_orcest(self):
+    def test_creates_venv_without_fetching_orcest_from_github(self):
         data = yaml.safe_load(render_template_userdata())
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "python3 -m venv /opt/orcest/venv" in runcmd
-        assert "pip install" in runcmd
-        assert "orcest.git" in runcmd
+        assert "github.com/ThayneStudio/orcest.git" not in runcmd
 
     def test_ssh_key_injection(self):
         data = yaml.safe_load(render_template_userdata(ssh_public_key="ssh-ed25519 BBBB"))
@@ -255,8 +263,58 @@ class TestCloneUserdata:
         assert cfg["redis"]["key_prefix"] == "myprefix"
         assert cfg["worker_id"] == "w-99"
         assert cfg["ephemeral"] is True
+        assert cfg["pool_managed"] is True
         assert cfg["backend"] == "claude"
         assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_can_use_isolated_clauder_backend(self):
+        output = self._render(
+            worker_backend="clauder",
+            worker_runner_type="claude",
+            worker_runner_mode="interactive",
+        )
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "clauder"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_defaults_clauder_backend_to_interactive_mode(self):
+        output = self._render(worker_backend="clauder")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "clauder"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_rejects_non_interactive_clauder_mode(self):
+        with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
+            self._render(worker_backend="clauder", worker_runner_mode="batch")
+
+    def test_worker_yaml_defaults_legacy_claude_backend_to_interactive_mode(self):
+        # Legacy fleet configs have no worker_runner_mode field; the deployed
+        # behavior before the field existed was the interactive PTY runner, so
+        # unset must keep it rather than silently downgrading to `claude -p`.
+        output = self._render(worker_runner_mode="")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_can_disable_interactive_mode_for_legacy_claude(self):
+        # Explicit opt-out: 'headless' renders the legacy `claude -p` runner
+        # section with no extra.mode key.
+        output = self._render(worker_runner_mode="headless")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude"}
+
+    def test_worker_yaml_rejects_unknown_claude_runner_mode(self):
+        with pytest.raises(ValueError, match="'interactive' or 'headless'"):
+            self._render(worker_backend="claude", worker_runner_mode="batch")
 
     def test_systemd_unit_written(self):
         data = yaml.safe_load(self._render())
@@ -269,6 +327,12 @@ class TestCloneUserdata:
         runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
         assert "systemctl daemon-reload" in runcmd
         assert "systemctl enable --now orcest-worker" in runcmd
+
+    def test_clone_does_not_reinstall_orcest_from_github(self):
+        data = yaml.safe_load(self._render())
+        runcmd = "\n".join(str(cmd) for cmd in data["runcmd"])
+        assert "github.com/ThayneStudio/orcest.git" not in runcmd
+        assert "pip install" not in runcmd
 
     def test_no_package_installation(self):
         data = yaml.safe_load(self._render())
@@ -501,50 +565,54 @@ def test_setup_worker_sh_creates_codex_and_grok_dirs():
     assert "chown -R orcest:orcest /home/orcest" in text
 
 
-# ── M2-infra: grok installer SHA-256 gate must FAIL CLOSED when unset ──
+def test_setup_worker_sh_replaces_mismatched_grok_version():
+    setup = Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh"
+    text = setup.read_text()
+    assert 'installed_grok_version="$([ -x /usr/local/bin/grok ]' in text
+    assert "/usr/local/bin/grok --version" in text
+    assert 'if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then' in text
+    assert 'if [ "${installed_grok_version}" = "${GROK_VERSION}" ]; then' in text
 
 
-def test_grok_installer_gate_fails_closed_when_sha_unset(monkeypatch):
-    """M2: with no trusted Grok installer SHA-256 configured, the template must
-    NOT execute the curl'd installer as root. An empty digest must FAIL CLOSED
-    (skip the install), not short-circuit the checksum to true.
+# ── M2-infra: Grok binary SHA-256 gate must FAIL CLOSED when unset ──
+
+
+def test_grok_binary_gate_fails_closed_when_sha_unset(monkeypatch):
+    """With no trusted Grok binary SHA, the template must not install it.
+
+    An empty digest must fail closed, not short-circuit the checksum to true.
     """
     import orcest.fleet.cloud_init as ci
 
-    monkeypatch.delenv("ORCEST_GROK_INSTALLER_SHA256", raising=False)
-    monkeypatch.setattr(ci, "_GROK_INSTALLER_SHA256", "", raising=True)
+    monkeypatch.delenv("ORCEST_GROK_BINARY_SHA256", raising=False)
+    monkeypatch.setattr(ci, "_GROK_BINARY_SHA256", "", raising=True)
 
     runcmd = ci._worker_tooling_runcmd()
     joined = "\n".join(str(c) for c in runcmd)
 
-    # The installer is still downloaded to a file (so a real digest CAN gate it)...
-    assert "https://x.ai/cli/install.sh -o /tmp/grok-install.sh" in joined
-    # ...but with no SHA configured it must NOT be executed.
-    assert "bash /tmp/grok-install.sh" in joined, "install command should be present but guarded"
-    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    assert f"https://x.ai/cli/grok-{ci._GROK_VERSION}-linux-x86_64 -o /tmp/grok" in joined
+    grok_entry = next(c for c in runcmd if "install -m 0755" in str(c))
     # The empty-digest short-circuit `[ -z "" ] ||` must be GONE — that is the bug.
     assert '[ -z "" ]' not in str(grok_entry)
-    # The execution must be gated behind a NON-empty-sha test that fails closed.
+    # Installation must be gated behind a non-empty SHA test that fails closed.
     assert 'if [ -n ""' in str(grok_entry) or "SKIPPING grok install" in str(grok_entry), (
-        "empty SHA must skip the install, not run it unverified"
+        "empty SHA must skip the install"
     )
 
 
-def test_grok_installer_gate_enforces_sha_when_set(monkeypatch):
-    """M2: when a digest IS configured (via env override), the installer runs
-    only after a sha256sum -c check against that exact digest."""
+def test_grok_binary_gate_enforces_sha_before_install(monkeypatch):
+    """An override digest gates installation of the exact downloaded binary."""
     import orcest.fleet.cloud_init as ci
 
     fake_sha = "a" * 64
-    monkeypatch.setenv("ORCEST_GROK_INSTALLER_SHA256", fake_sha)
+    monkeypatch.setenv("ORCEST_GROK_BINARY_SHA256", fake_sha)
 
     runcmd = ci._worker_tooling_runcmd()
-    grok_entry = next(c for c in runcmd if "bash /tmp/grok-install.sh" in str(c))
+    grok_entry = next(c for c in runcmd if "install -m 0755" in str(c))
     s = str(grok_entry)
     assert fake_sha in s
     assert "sha256sum -c -" in s
-    # The install is conditional on the checksum passing.
-    assert s.index("sha256sum -c -") < s.index("bash /tmp/grok-install.sh")
+    assert s.index("sha256sum -c -") < s.index("install -m 0755")
 
 
 # ── M1: reproducible image builds — complete lock + Dockerfiles use it ──
@@ -583,6 +651,18 @@ def test_requirements_lock_and_dockerfiles_are_reproducible():
         assert "tomllib.load" not in text, (
             f"{df} still resolves unpinned deps from pyproject.toml — non-reproducible"
         )
+        assert "ARG ORCEST_UID=1000" in text
+        assert "ARG ORCEST_GID=1000" in text
+        assert 'groupadd --gid "${ORCEST_GID}" orcest' in text
+        assert 'useradd --uid "${ORCEST_UID}" --gid "${ORCEST_GID}"' in text
+
+    for compose in (
+        root / "docker-compose.yml",
+        root / "src" / "orcest" / "fleet" / "deploy" / "docker-compose.yml",
+    ):
+        text = compose.read_text()
+        assert "ORCEST_UID: ${ORCEST_UID:-1000}" in text
+        assert "ORCEST_GID: ${ORCEST_GID:-1000}" in text
 
 
 # ── C1: Redis AUTH password injected into worker .env (from fix/redis-security) ──

@@ -2,3 +2,9 @@ node_modules/
 dist/
 build/
 .git/
+.env
+.env.*
+*.env
+.npmrc*
+npm-debug.log*
+vite.config.ts.timestamp-*.mjs

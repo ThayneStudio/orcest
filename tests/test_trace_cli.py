@@ -57,9 +57,7 @@ class TestTraceCmd:
     def test_meta_flag_prints_sidecar(self, archive_with_one_task):
         root, task_id = archive_with_one_task
         runner = CliRunner()
-        result = runner.invoke(
-            main, ["trace", task_id, "--meta", "--archive-root", str(root)]
-        )
+        result = runner.invoke(main, ["trace", task_id, "--meta", "--archive-root", str(root)])
         assert result.exit_code == 0, result.output
         assert task_id in result.output
         assert "failed" in result.output
@@ -75,9 +73,7 @@ class TestTraceCmd:
     def test_raw_prints_jsonl_unchanged(self, archive_with_one_task):
         root, task_id = archive_with_one_task
         runner = CliRunner()
-        result = runner.invoke(
-            main, ["trace", task_id, "--raw", "--archive-root", str(root)]
-        )
+        result = runner.invoke(main, ["trace", task_id, "--raw", "--archive-root", str(root)])
         assert result.exit_code == 0, result.output
         assert '"role":"assistant"' in result.output
 
@@ -115,9 +111,7 @@ class TestTraceCmd:
     def test_rejects_task_id_with_path_traversal(self, archive_with_one_task):
         root, _ = archive_with_one_task
         runner = CliRunner()
-        result = runner.invoke(
-            main, ["trace", "../../etc/passwd", "--archive-root", str(root)]
-        )
+        result = runner.invoke(main, ["trace", "../../etc/passwd", "--archive-root", str(root)])
         assert result.exit_code != 0
 
     def test_hostile_index_pointer_redirecting_outside_root_is_refused(
@@ -137,8 +131,6 @@ class TestTraceCmd:
         (idx_dir / "secret-task").write_text("../../../outside")
 
         runner = CliRunner()
-        result = runner.invoke(
-            main, ["trace", "secret-task", "--archive-root", str(root)]
-        )
+        result = runner.invoke(main, ["trace", "secret-task", "--archive-root", str(root)])
         assert result.exit_code != 0
         assert "DO NOT SHOW" not in result.output

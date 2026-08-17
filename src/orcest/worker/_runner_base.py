@@ -291,6 +291,10 @@ def _run_cli_agent(
                 update = None
             if update:
                 result.credential_update = update
+                # Ordering is assigned by shared Redis immediately before
+                # publication. Filesystem mtime comes from independent worker
+                # VM clocks and is not a safe cross-process version.
+                result.credential_update_minted_at = 0.0
         return result
 
     for attempt in range(1, runner.max_retries + 1):

@@ -592,9 +592,7 @@ def test_mixed_blockers_open_and_closed(
     issue_gh_mock.return_value = [
         _make_issue_data(number=220, body="Blocked by #1 and depends on #2", labels=[]),
     ]
-    issue_state_mock.side_effect = lambda repo, number, token: (
-        "closed" if number == 1 else "open"
-    )
+    issue_state_mock.side_effect = lambda repo, number, token: "closed" if number == 1 else "open"
 
     results = discover_actionable_issues(
         repo=REPO,

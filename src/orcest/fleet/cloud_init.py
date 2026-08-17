@@ -8,10 +8,13 @@ and configures the appropriate services.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 import yaml
+
+from orcest.fleet.config import normalize_worker_runner_for_backend
 
 # ── Shared building blocks ──────────────────────────────────
 
@@ -28,6 +31,7 @@ def _validate_env_value(value: str, name: str) -> None:
         raise ValueError(f"{name} must not contain newlines or null bytes")
     if "'" in value:
         raise ValueError(f"{name} must not contain single quotes")
+
 
 _BASE_PACKAGES: list[str] = [
     "qemu-guest-agent",
@@ -72,26 +76,20 @@ _SUPABASE_VERSION = "2.95.4"
 # between releases, so pin it and re-validate the GrokRunner parsers
 # (tests/worker/test_grok_runner.py) on bump.
 _GROK_VERSION = "0.1.216"
-# SHA-256 of the grok installer script (x.ai/cli/install.sh) for _GROK_VERSION,
-# to defend against a compromised CDN/DNS executing arbitrary code as root at
-# bake time.
+# SHA-256 of the exact linux-x86_64 Grok binary for _GROK_VERSION. The worker
+# cloud image is amd64, so download the versioned artifact directly instead of
+# executing xAI's mutable bootstrap as root. The x.ai primary and the official
+# installer's GCS fallback returned identical 116,449,128-byte objects with
+# this digest on 2026-08-16 (GCS generation 1779443477078136).
 #
-# FAIL CLOSED: if this is empty the installer is NOT executed (curl|bash as
-# root with no integrity gate is the threat). Grok degrades gracefully when
-# absent — grok-backed tasks early-reject with a rebake instruction (runner
-# skew handling + setup-worker.sh), never a stuck task or secret leak.
+# FAIL CLOSED: if this is empty or mismatched, the downloaded binary is not
+# installed or executed. Grok degrades gracefully when absent — grok-backed
+# tasks early-reject with a rebake instruction, never a stuck task or secret
+# leak.
 #
-# To enable grok, pin a trusted digest here OR export it at bake time without a
-# code edit:
-#   curl -fsSL https://x.ai/cli/install.sh | sha256sum
-#   export ORCEST_GROK_INSTALLER_SHA256=<that digest>
-# NOTE: this digest is of the BOOTSTRAP SCRIPT, not the grok binary. install.sh
-# is a stable bootstrap that resolves + downloads the latest stable grok at run
-# time, so pinning it does NOT freeze grok at a version -- daily grok releases
-# still flow. Re-pin only when xAI changes install.sh itself (then the bake
-# fail-closes with a clear "SHA mismatch" instead of running an unexpected
-# script). Verified against the live installer on 2026-06-15.
-_GROK_INSTALLER_SHA256 = "2019f38002a2beab27f65b928db5d33d2bbe8c2828e4e41081ac23ec33b7a658"
+# Re-pin deliberately with _GROK_VERSION after validating GrokRunner fixtures:
+#   curl -fsSL https://x.ai/cli/grok-VERSION-linux-x86_64 | sha256sum
+_GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af"
 
 # OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
 # template rebakes are reproducible; the experimental JSON event vocabulary
@@ -112,7 +110,9 @@ REQUIRED_PROVIDER_BINARIES: tuple[str, ...] = ("claude", "grok", "codex")
 # providers write at RUNTIME under ProtectHome=read-only/ProtectSystem=strict,
 # else those writes EROFS. Single line (a systemd directive cannot wrap); kept
 # as a constant so the unit f-strings stay under the line-length limit.
-_WORKER_READ_WRITE_PATHS = "/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok"  # noqa: E501
+_WORKER_READ_WRITE_PATHS = (
+    "/opt/orcest /home/orcest/.claude /home/orcest/.cache /home/orcest/.codex /home/orcest/.grok"  # noqa: E501
+)
 
 
 def _template_versions_write_file() -> dict:
@@ -197,9 +197,14 @@ def _worker_tooling_runcmd() -> list[str]:
     Installs (in order): Node, Docker, Claude CLI, Grok CLI, Codex CLI, gh,
     Supabase CLI, Playwright + Chromium, Deno, Bun, uv, wrangler.
     """
-    # Effective grok installer digest: env override (set at bake time, no code
-    # edit) falls back to the pinned constant. Empty => FAIL CLOSED (skip).
-    grok_sha = os.environ.get("ORCEST_GROK_INSTALLER_SHA256", _GROK_INSTALLER_SHA256)
+    # Effective Grok binary digest: an optional bake-time override falls back
+    # to the pinned exact-version artifact. Empty => FAIL CLOSED (skip).
+    grok_sha = os.environ.get("ORCEST_GROK_BINARY_SHA256", _GROK_BINARY_SHA256)
+    if grok_sha and re.fullmatch(r"[0-9a-fA-F]{64}", grok_sha) is None:
+        raise ValueError(
+            "ORCEST_GROK_BINARY_SHA256 must be empty or exactly 64 hexadecimal characters"
+        )
+    grok_sha = grok_sha.lower()
     return [
         # Node.js: NodeSource channel for the configured major version.
         f"curl -fsSL https://deb.nodesource.com/setup_{_NODE_MAJOR}.x | bash -",
@@ -208,46 +213,26 @@ def _worker_tooling_runcmd() -> list[str]:
         *_docker_install_runcmd(),
         # Claude CLI: floats to npm-latest; rebakes pull current.
         "npm install -g @anthropic-ai/claude-code",
-        # Grok CLI (xAI Grok Build): the official installer fetches a
-        # self-contained binary (no auth needed to download). Auth is injected
-        # per-task to ~/.grok/auth.json by GrokRunner (Path B), never baked.
-        # The installer drops the binary under /root/.grok/downloads and
-        # symlinks it; copy the RESOLVED binary to /usr/local/bin so the
-        # non-root orcest worker user can execute it. Pinned to _GROK_VERSION.
-        # NB: no `|| true` — a failed install must surface in the cloud-init
-        # log rather than silently shipping a template without the grok binary.
+        # Grok CLI (xAI Grok Build): fetch the exact versioned, self-contained
+        # amd64 binary. Auth is injected per-task to ~/.grok/auth.json by
+        # GrokRunner (Path B), never baked.
         (
             "curl -fsSL --connect-timeout 30 --max-time 300"
-            " https://x.ai/cli/install.sh -o /tmp/grok-install.sh"
+            f" https://x.ai/cli/grok-{_GROK_VERSION}-linux-x86_64 -o /tmp/grok"
         ),
-        # Integrity gate + install in ONE entry (cloud-init has no `set -e`
-        # across runcmd entries, so a separate gate could not block the
-        # install). FAIL CLOSED: the installer runs ONLY when a NON-empty
-        # digest matches the downloaded file. An empty/unset digest skips the
-        # install entirely and logs how to enable it — never curl|bash-as-root
-        # unverified. The `&&` between the `[ -n ... ]` test and the
-        # `sha256sum -c -` check keeps both conditions in one entry.
-        # Installer contract (verified against grok 0.1.216 at
-        # x.ai/cli/install.sh): GROK_BIN_DIR selects the symlink dir and the
-        # version is a bare positional arg — undocumented beta details the cp
-        # below depends on; re-verify when bumping _GROK_VERSION.
+        # Integrity gate + install in ONE entry because cloud-init has no
+        # cross-entry `set -e`. The binary is installed ONLY when a non-empty
+        # digest matches; unlike the old bootstrap path, no unverified binary
+        # is executed before this check.
         (
             f'if [ -n "{grok_sha}" ] && '
-            f'echo "{grok_sha}  /tmp/grok-install.sh" | sha256sum -c -; then '
-            f"HOME=/root GROK_BIN_DIR=/root/.local/bin bash /tmp/grok-install.sh {_GROK_VERSION}; "
-            f'else echo "grok installer SHA-256 unset/mismatch — SKIPPING grok install '
-            f'(set ORCEST_GROK_INSTALLER_SHA256 to enable); grok tasks will be rejected"; fi'
+            f'echo "{grok_sha}  /tmp/grok" | sha256sum -c -; then '
+            "install -m 0755 -o root -g root /tmp/grok /usr/local/bin/grok; "
+            'else rm -f /usr/local/bin/grok; echo "grok binary SHA-256 unset/mismatch '
+            f"— SKIPPING grok install (set ORCEST_GROK_BINARY_SHA256 to enable); "
+            'grok tasks will be rejected"; fi'
         ),
-        # The installer symlinks /usr/local/bin/grok -> /root/.local/bin/grok
-        # -> /root/.grok/downloads/<binary>. /root is 0700, so the non-root
-        # orcest worker user can't traverse it and gets EACCES on exec. Remove
-        # that symlink and replace it with a REAL copy of the resolved binary
-        # (cp would otherwise follow the symlink and write through it, leaving
-        # the unreachable-by-orcest symlink in place).
-        "rm -f /usr/local/bin/grok",
-        'cp "$(readlink -f /root/.local/bin/grok)" /usr/local/bin/grok',
-        "chmod 755 /usr/local/bin/grok",
-        "rm -f /tmp/grok-install.sh",
+        "rm -f /tmp/grok",
         # Surface a missing/broken binary in the cloud-init log. Run as the
         # orcest user (the worker's runtime user) so this also catches the
         # exec-permission regression above — not just root visibility.
@@ -447,10 +432,10 @@ def render_template_userdata(
             *_guest_agent_runcmd(),
             *_worker_workspace_runcmd(),
             *_worker_tooling_runcmd(),
-            # Create Python virtualenv and pre-install orcest
+            # Create Python virtualenv. The fleet CLI installs the active
+            # source tarball into this venv after cloud-init finishes and
+            # before converting the VM to a template.
             "sudo -u orcest python3 -m venv /opt/orcest/venv",
-            "sudo -u orcest /opt/orcest/venv/bin/pip install -q"
-            " 'git+https://github.com/ThayneStudio/orcest.git'",
         ],
     )
     return _render(cloud_config)
@@ -465,6 +450,9 @@ def render_clone_userdata(
     worker_id: str,
     key_prefix: str = "orcest",
     redis_password: str = "",
+    worker_backend: str = "claude",
+    worker_runner_type: str = "claude",
+    worker_runner_mode: str = "",
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
 
@@ -481,19 +469,34 @@ def render_clone_userdata(
             password-protected Redis. ``build_redis_config`` reads it from the
             env var ONLY (never worker.yaml), and the systemd unit loads
             ``/opt/orcest/.env`` via ``EnvironmentFile=-``.
+        worker_backend: Task backend stream this clone should consume.
+        worker_runner_type: Runner implementation type to instantiate.
+        worker_runner_mode: Optional runner mode; ``interactive`` selects the
+            PTY Claude runner (the default for Claude backends, matching the
+            pre-``worker_runner_mode`` deployments), while ``headless``
+            explicitly opts a ``claude`` backend into the legacy ``claude -p``
+            runner.
     """
+    normalized_backend, normalized_runner_type, normalized_runner_mode = (
+        normalize_worker_runner_for_backend(
+            worker_backend,
+            worker_runner_type,
+            worker_runner_mode,
+        )
+    )
     redis_section: dict = {"host": redis_host, "port": 6379, "key_prefix": key_prefix}
+    runner_section: dict[str, Any] = {"type": normalized_runner_type}
+    if normalized_runner_mode == "interactive":
+        runner_section["extra"] = {"mode": normalized_runner_mode}
     worker_yaml = yaml.dump(
         {
             "redis": redis_section,
             "worker_id": worker_id,
             "workspace_dir": "/opt/orcest/workspaces",
-            "backend": "claude",
-            "runner": {
-                "type": "claude",
-                "extra": {"mode": "interactive"},
-            },
+            "backend": normalized_backend,
+            "runner": runner_section,
             "ephemeral": True,
+            "pool_managed": True,
         },
         default_flow_style=False,
     )
@@ -545,11 +548,10 @@ def render_clone_userdata(
         "hostname": worker_id,
         "write_files": clone_write_files,
         "runcmd": [
-            # Reinstall orcest from latest commit before starting the worker.
-            # The template may have an older version baked in. --force-reinstall
-            # is needed because the version number (0.1.0) doesn't change.
-            "sudo -u orcest /opt/orcest/venv/bin/pip install -q --no-cache-dir"
-            " --force-reinstall 'git+https://github.com/ThayneStudio/orcest.git'",
+            # Orcest itself is installed during template bake from the same
+            # source tarball used for orchestrator deploys. Clones must not
+            # fetch GitHub at boot; that can silently run a different revision
+            # from the deployed orchestrator/pool-manager.
             # Ensure every /home/orcest ReadWritePaths target exists BEFORE the
             # unit is enabled. A warm template baked before .codex/.grok were
             # added would otherwise be missing them, and under

@@ -1,6 +1,11 @@
 services:
   dashboard:
-    build: ./dashboard
+    image: ${DASHBOARD_IMAGE:-orcest-dashboard:latest}
+    build:
+      context: ./dashboard
+      args:
+        NODE_VERSION: ${DASHBOARD_NODE_VERSION:-20.18.3}
+        ORCEST_BUILD_REVISION: ${ORCEST_BUILD_REVISION:-unknown}
     ports:
       # Bind to loopback only: the dashboard is a human-browser convenience
       # stack, not a cross-VM service (unlike Redis). Reach it via an SSH
@@ -10,10 +15,25 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - DASHBOARD_TOKEN
-      - LOCK_TTL_SECONDS=180
+      - ORCEST_REDIS_PASSWORD=${ORCEST_REDIS_PASSWORD:?ORCEST_REDIS_PASSWORD is required}
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:?DASHBOARD_TOKEN is required}
+      - DASHBOARD_ALLOWED_ORIGINS
+      - DASHBOARD_REDIS_PREFIXES
+      - DASHBOARD_MAX_ATTEMPTS
+      - DASHBOARD_RUNNER_TIMEOUT_SECONDS
+      - DASHBOARD_RUNNER_MAX_RETRIES
+      - DASHBOARD_PENDING_TASK_TTL_SECONDS
+      - DASHBOARD_LOCK_TTL_SECONDS
+      - LOCK_TTL_SECONDS
+      - ORCEST_MAX_ATTEMPTS
+      - ORCEST_RUNNER_TIMEOUT_SECONDS
+      - ORCEST_RUNNER_MAX_RETRIES
+      - ORCEST_PENDING_TASK_TTL_SECONDS
+      - ORCEST_LOCK_TTL_SECONDS
     restart: unless-stopped
     healthcheck:
+      # Liveness only: the dashboard can render Redis-disconnected state itself.
+      # Use /api/ready when a probe should require Redis connectivity.
       test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r => process.exit(r.ok ? 0 : 1))"]
       interval: 30s
       timeout: 5s
@@ -26,4 +46,4 @@ services:
 networks:
   orcest:
     external: true
-    name: orcest
+    name: ${ORCEST_DOCKER_NETWORK:-orcest}

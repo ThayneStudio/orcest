@@ -9,6 +9,7 @@ import pytest
 from orcest.shared.config import RunnerConfig
 from orcest.worker.claude_interactive_runner import ClaudeInteractiveRunner
 from orcest.worker.claude_runner import ClaudeRunner
+from orcest.worker.codex_runner import CodexRunner
 from orcest.worker.grok_runner import GrokRunner
 from orcest.worker.noop_runner import NoopRunner
 from orcest.worker.runner import (
@@ -34,6 +35,15 @@ def test_create_runner_claude_interactive_mode() -> None:
     config = RunnerConfig(type="claude", extra={"mode": "interactive"})
     runner = create_runner(config)
     assert isinstance(runner, ClaudeInteractiveRunner)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("runner_type", "runner_class"),
+    [("codex", CodexRunner), ("grok", GrokRunner)],
+)
+def test_create_runner_provider_registry_types(runner_type, runner_class) -> None:
+    assert isinstance(create_runner(RunnerConfig(type=runner_type)), runner_class)
 
 
 @pytest.mark.unit
@@ -125,6 +135,15 @@ def test_get_provider_recipe_grok() -> None:
 def test_provider_registry_claude_has_runner_cls() -> None:
     """The claude entry maps to ClaudeRunner via runner_cls (PR 1)."""
     recipe = PROVIDER_REGISTRY["claude"]
+    assert recipe.binary == "claude"
+    assert recipe.env_var == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert recipe.runner_cls is ClaudeRunner
+
+
+@pytest.mark.unit
+def test_provider_registry_clauder_alias_has_runner_cls() -> None:
+    """The clauder entry is a distinct queue/provider alias for the Claude CLI."""
+    recipe = PROVIDER_REGISTRY["clauder"]
     assert recipe.binary == "claude"
     assert recipe.env_var == "CLAUDE_CODE_OAUTH_TOKEN"
     assert recipe.runner_cls is ClaudeRunner
