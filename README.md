@@ -49,6 +49,23 @@ actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-m
   `merge_conflict_rebase`, ...). Workers cheap-validate before running;
   orchestrator re-validates before applying labels or escalating
   attempts. Stale tasks/results are dropped without mutating GitHub.
+- **Events spool** — orchestrator and workers emit CloudEvents-shaped
+  lifecycle events (task started/completed/failed, VM reaped, ...) onto a
+  per-project Redis stream (`events`, `MAXLEN` 50000); emission never
+  raises into the producer's main path (swallow-and-log). Events never
+  carry raw tool arguments, tool output, prompts, or credentials.
+- **Event relay** — an orchestrator-side loop tails the events stream and
+  forwards batches to the monitor's ingest listener over HTTP, tracking
+  its own Redis cursor (`event_relay:cursor`). Disabled unless
+  `monitor_ingest_url` is configured.
+- **Monitor** — a separate `orcest monitor` service with two listeners:
+  a private ingest API (write-token authenticated) and a public read-only
+  query API (SQLite opened read-only, scoped bearer tokens per reader:
+  `events:read`, `traces:read`). Deployed via `docker-compose.monitor.yml`;
+  see [`docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md`](docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md)
+  for the design and [`docs/monitor-exposure-runbook.md`](docs/monitor-exposure-runbook.md)
+  for standing it up and exposing it externally via Cloudflare Tunnel +
+  Access.
 
 ## Multi-provider model
 
@@ -659,4 +676,6 @@ real IP (or DNS name) in fleet config and retry.
 - [`docs/adding-a-provider.md`](docs/adding-a-provider.md) — end-to-end recipe for a new agent.
 - [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md) — provider rollout playbook.
 - [`docs/issue-dependencies.md`](docs/issue-dependencies.md) — body-text dependency syntax.
+- [`docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md`](docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md) — events/monitor design.
+- [`docs/monitor-exposure-runbook.md`](docs/monitor-exposure-runbook.md) — standing up and externally exposing the monitor service.
 - [`docs/plans/`](docs/plans/) — design notes and roadmap.
