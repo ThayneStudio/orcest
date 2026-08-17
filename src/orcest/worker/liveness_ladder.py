@@ -28,12 +28,33 @@ WAITING gates only the SUSPECT -> STUCK edge (escalation), for
 ``waiting_grace`` seconds after the most recent waiting signal; SUSPECT
 itself is always reachable and reported. LOOPING is evaluated independently
 of S1-S3 and fires on the second consecutive non-None repetition verdict.
-CEILING overrides everything and can fire from any state, including
-BOOTSTRAP.
+CEILING is the hard backstop and can fire from any state, including
+BOOTSTRAP -- but it only wins when no corroborated STUCK/LOOPING trigger
+also fires on the same evaluation: a corroborated stall/loop gets the
+permanent (non-transient) classification, not a blind timing-coincidence
+retry via the transient CEILING path (spec §5 kill semantics, review
+ruling).
 
-Once a kill fires (STUCK, LOOPING, or CEILING) the ladder is done: further
-``evaluate()`` calls return the same terminal state with ``kill=None`` and
-``transitioned=False`` without recomputing anything.
+Continuous provider backoff is intentionally NOT bounded by the ladder
+itself: as long as waiting signals keep arriving, STUCK stays deferred
+indefinitely (grace is measured from the *most recent* waiting signal).
+"Waiting on provider" is not stall; CEILING backstops truly-perpetual
+waiting, and rate-limit/usage-exhausted handling is a separate, existing
+mechanism. See ``test_perpetual_waiting_defers_to_ceiling``.
+
+``evaluate()`` also accepts ``escalation_blocked`` (default ``False``), a
+fleet-level gate hook (kill budget / pressure, spec §5 "Fleet gates" --
+wired up by the caller, e.g. task B7). When ``True``, a would-be
+SUSPECT -> STUCK or LOOPING kill transition is *deferred*: the reported
+state stays at its pre-kill value (SUSPECT, or whatever S1-S3 compute for
+a deferred LOOPING) and nothing latches the terminal ``_done`` flag, so a
+later unblocked ``evaluate()`` can still kill if the underlying condition
+still holds. CEILING is exempt from this gate -- it fires regardless.
+
+Once a kill actually fires (STUCK, LOOPING, or CEILING -- not merely
+deferred) the ladder is done: further ``evaluate()`` calls return the same
+terminal state with ``kill=None`` and ``transitioned=False`` without
+recomputing anything.
 """
 
 from __future__ import annotations
@@ -66,8 +87,9 @@ class LadderState(str, Enum):
 @dataclass(frozen=True)
 class Decision:
     """One ``evaluate()`` outcome. ``snapshot`` is event-safe: per-signal
-    last-fresh timestamps, ages, and the waiting reason only -- never raw
-    tool args (spec §8 redaction rule)."""
+    last-fresh timestamps, ages, the waiting reason, and (stream/count/
+    hashes only) the current repetition verdict -- never raw tool args
+    (spec §8 redaction rule). This is the kill-time post-mortem evidence."""
 
     state: LadderState
     transitioned: bool  # state changed this evaluation
@@ -99,6 +121,11 @@ class LivenessLadder:
         self._prev_cpu_seconds: float | None = None
         self._has_cpu_baseline = False
         self._cpu_idle_streak = 0
+
+        # S2 last-fresh timestamp: wall time of the last *nonzero* CPU
+        # delta (evidence the process tree was genuinely doing something),
+        # for post-mortem snapshots. started_at before any sample.
+        self._s2_last_fresh_ts: float = started_at
 
         # S3: workspace change recency. Task start counts as an initial
         # change -- the checkout populated the workspace.
@@ -140,9 +167,10 @@ class LivenessLadder:
         cpu_seconds: float | None,
         workspace_changed: bool,
         rep_verdict: RepetitionVerdict | None,
+        escalation_blocked: bool = False,
     ) -> Decision:
         if self._done:
-            return Decision(self.state, False, None, self._snapshot(now))
+            return Decision(self.state, False, None, self._snapshot(now, rep_verdict))
 
         prev_state = self.state
         ceiling_hit = (now - self.started_at) >= self.ceiling
@@ -152,14 +180,21 @@ class LivenessLadder:
                 now - self.started_at
             ) >= self.cfg.startup_grace
             if not exiting:
+                # CEILING is the one thing that still applies during
+                # BOOTSTRAP; there is no corroborated STUCK/LOOPING trigger
+                # possible here (the ladder is disabled), so it always wins.
                 if ceiling_hit:
                     self._done = True
-                    return Decision(LadderState.BOOTSTRAP, False, "ceiling", self._snapshot(now))
-                return Decision(LadderState.BOOTSTRAP, False, None, self._snapshot(now))
+                    return Decision(
+                        LadderState.BOOTSTRAP, False, "ceiling", self._snapshot(now, rep_verdict)
+                    )
+                return Decision(
+                    LadderState.BOOTSTRAP, False, None, self._snapshot(now, rep_verdict)
+                )
             # Falls through: bootstrap exits this same evaluation, and the
             # resulting state is computed normally below using this `now`.
 
-        s2_idle = self._update_cpu(cpu_seconds)
+        s2_idle = self._update_cpu(now, cpu_seconds)
 
         if workspace_changed:
             self._last_workspace_change_ts = now
@@ -176,13 +211,24 @@ class LivenessLadder:
         else:
             self._looping_streak = 0
 
-        if self._looping_streak >= _LOOPING_STREAK_THRESHOLD:
+        looping_ready = self._looping_streak >= _LOOPING_STREAK_THRESHOLD
+        if looping_ready and not escalation_blocked:
             self.state = LadderState.LOOPING
             self._done = True
-            kill = "ceiling" if ceiling_hit else "looping"
+            # Corroborated trigger wins over CEILING on the same evaluation
+            # (review ruling: permanent classification, not a blind retry
+            # via timing coincidence) -- looping always reports "looping"
+            # here, never "ceiling".
             return Decision(
-                LadderState.LOOPING, prev_state != LadderState.LOOPING, kill, self._snapshot(now)
+                LadderState.LOOPING,
+                prev_state != LadderState.LOOPING,
+                "looping",
+                self._snapshot(now, rep_verdict),
             )
+        # If looping_ready but escalation_blocked: deferred. Fall through to
+        # the normal S1-S3 computation below for the *reported* state (the
+        # streak is preserved above, so a later unblocked evaluate() with a
+        # still-non-None verdict can still kill).
 
         all_stale = (not s1_fresh) and s2_idle and (not s3_fresh)
 
@@ -191,10 +237,21 @@ class LivenessLadder:
                 self._suspect_since = now
             held = (now - self._suspect_since) >= self.cfg.idle_window
             if held:
-                blocked = self._waiting_active and (
-                    now - self._last_waiting_ts
-                ) < self.cfg.waiting_grace
-                new_state = LadderState.SUSPECT if blocked else LadderState.STUCK
+                if self._waiting_active:
+                    assert self._last_waiting_ts is not None, (
+                        "waiting_active implies last_waiting_ts is set"
+                    )
+                    waiting_blocked = (now - self._last_waiting_ts) < self.cfg.waiting_grace
+                else:
+                    waiting_blocked = False
+                # Deferred by either gate: report SUSPECT, not STUCK.
+                # Nothing here latches _done -- a later evaluate() with
+                # neither gate active can still escalate if all_stale holds.
+                new_state = (
+                    LadderState.SUSPECT
+                    if (waiting_blocked or escalation_blocked)
+                    else LadderState.STUCK
+                )
             else:
                 new_state = LadderState.SUSPECT
         else:
@@ -204,16 +261,19 @@ class LivenessLadder:
         transitioned = new_state != prev_state
         kill: str | None = None
         if new_state == LadderState.STUCK:
+            # Corroborated trigger wins over CEILING on the same evaluation
+            # (review ruling); only fall back to "ceiling" when STUCK did
+            # not fire this call (not reached, not held, or deferred).
             kill = "stuck"
             self._done = True
-        if ceiling_hit:
+        elif ceiling_hit:
             kill = "ceiling"
             self._done = True
 
         self.state = new_state
-        return Decision(new_state, transitioned, kill, self._snapshot(now))
+        return Decision(new_state, transitioned, kill, self._snapshot(now, rep_verdict))
 
-    def _update_cpu(self, cpu_seconds: float | None) -> bool:
+    def _update_cpu(self, now: float, cpu_seconds: float | None) -> bool:
         """Advance the S2 CPU-idle hysteresis by one sample. Returns whether
         S2 currently reads idle (streak >= threshold)."""
         if cpu_seconds is None:
@@ -226,16 +286,21 @@ class LivenessLadder:
             # First real sample: no delta to compare against yet.
             zero_delta = False
 
+        if not zero_delta:
+            self._s2_last_fresh_ts = now
+
         self._prev_cpu_seconds = cpu_seconds
         self._has_cpu_baseline = True
 
         self._cpu_idle_streak = self._cpu_idle_streak + 1 if zero_delta else 0
         return self._cpu_idle_streak >= _CPU_IDLE_STREAK_THRESHOLD
 
-    def _snapshot(self, now: float) -> dict:
+    def _snapshot(self, now: float, rep_verdict: RepetitionVerdict | None = None) -> dict:
         return {
             "s1_last_fresh_ts": self._last_s1_ts,
             "s1_age": None if self._last_s1_ts is None else now - self._last_s1_ts,
+            "s2_last_fresh_ts": self._s2_last_fresh_ts,
+            "s2_age": now - self._s2_last_fresh_ts,
             "s2_idle_streak": self._cpu_idle_streak,
             "s3_last_changed_ts": self._last_workspace_change_ts,
             "s3_age": now - self._last_workspace_change_ts,
@@ -244,4 +309,15 @@ class LivenessLadder:
             "waiting_reason": self._waiting_reason,
             "waiting_since": self._last_waiting_ts,
             "looping_streak": self._looping_streak,
+            # Event-safe: only stream/count/hashes ever leave RepetitionVerdict
+            # (spec §8 redaction rule) -- merged here so a LOOPING kill's
+            # snapshot carries the tripped verdict without the caller having
+            # to separately correlate it.
+            "looping_verdict": None
+            if rep_verdict is None
+            else {
+                "stream": rep_verdict.stream,
+                "count": rep_verdict.count,
+                "hashes": rep_verdict.hashes,
+            },
         }
