@@ -946,11 +946,14 @@ def _early_reject_unsupported_provider(
     abort_event: threading.Event | None = None,
     summary: str | None = None,
 ) -> ResultHandoff:
-    """Publish a clean permanent FAILED for an unknown/missing provider.
+    """Publish a clean FAILED for an unknown/missing/mismatched provider.
 
     This is the early graceful reject path (before lock, heartbeat, clone, or
-    any runner work). The orchestrator will see a non-transient failure with
-    an actionable summary telling operators to rebake the worker image.
+    any runner work). For a provider missing from the worker image the
+    orchestrator sees a non-transient failure with an actionable summary
+    telling operators to rebake the worker image; callers may pass a
+    transient-prefixed ``summary`` for retryable cases (upgrade-skew stream
+    mismatch).
     Credentials are never logged or leaked because we use the redacted path
     only for DL (if publish fails) and TaskResult itself contains no secrets.
     The source task is ACKed only after either the result or its full recovery
@@ -1179,7 +1182,10 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                     entry_id,
                     "Malformed task payload",
                 ),
-                fields.get("id", f"malformed:{entry_id}"),
+                # `or` (not a .get default): a present-but-empty id must take
+                # the malformed fallback so the handoff marker key matches the
+                # pool-manager reaper's derivation (see pool_manager.py).
+                fields.get("id") or f"malformed:{entry_id}",
                 logger,
                 terminal_abort_event,
                 coordination=_malformed_coordination_identity(fields, logger),
@@ -1198,16 +1204,25 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         # This guarantees old worker images fail cleanly (non-transient FAILED)
         # when they encounter a task for a provider they do not have baked in.
         # The registry + binary check are strictly local to the worker image.
+        #
+        # A provider/backend *stream* mismatch is different: it happens during
+        # documented upgrade skew (worker template rebaked before orchestrator
+        # containers, or tasks already queued on the legacy shared stream), so
+        # it is reported as a TRANSIENT failure. The orchestrator bounds
+        # transient retries (Fibonacci backoff plateau for PRs, poll-cycle
+        # pacing for issues), so this cannot hot-loop and stops burning
+        # PR/issue attempt budgets on skew.
         routing_mismatch = task.provider != config.backend
         unsupported = None if routing_mismatch else get_unsupported_reason(task.provider)
         if routing_mismatch or unsupported:
             logger.warning(
                 "Task %s for provider=%s cannot run on backend=%s (%s); "
-                "early graceful reject (permanent FAILED, no runner reached)",
+                "early graceful reject (%s FAILED, no runner reached)",
                 task.id,
                 task.provider,
                 config.backend,
                 "provider/backend stream mismatch" if routing_mismatch else unsupported,
+                "transient" if routing_mismatch else "permanent",
             )
             handoff = _early_reject_unsupported_provider(
                 task,
@@ -1219,6 +1234,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
                 entry_id,
                 abort_event=terminal_abort_event,
                 summary=(
+                    f"{TRANSIENT_SUMMARY_PREFIX}"
                     "Task provider does not match the dedicated worker backend"
                     if routing_mismatch
                     else None
@@ -1682,7 +1698,9 @@ def _drain_pending_tasks_raw(
                         entry_id,
                         f"Malformed pending task payload: {e}",
                     ),
-                    fields.get("id", f"malformed:{entry_id}"),
+                    # `or` (not a .get default): empty id must match the
+                    # reaper's malformed fallback derivation.
+                    fields.get("id") or f"malformed:{entry_id}",
                     logger,
                     abort,
                     retry=False,

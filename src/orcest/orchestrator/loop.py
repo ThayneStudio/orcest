@@ -108,6 +108,10 @@ _MINTED_AT_MICROSECONDS_PER_SECOND = 1_000_000
 _ISSUE_DISCOVERY_PROJECTS_KEY = "issue_discovery:projects"
 _ISSUE_DISCOVERY_CYCLE_SEQ_KEY = "issue_discovery:cycle_seq"
 _ISSUE_DISCOVERY_TURN_KEY = "issue_discovery:turn"
+# Heartbeats written before intervals were embedded ("timestamp" instead of
+# "timestamp|interval") are judged with this generous floor so mixed-version
+# orchestrators cannot starve a slow-polling project mid-rollout.
+_LEGACY_HEARTBEAT_STALE_FLOOR = 180
 
 
 class _RetryableResultError(RuntimeError):
@@ -188,12 +192,14 @@ def _configured_task_streams(
 
 
 def _published_provider_for_entry(entry: ProviderEntry, default_runner: str) -> str:
-    """Return the provider stream a selected credential should publish to."""
-    if (
-        entry.provider == "claude"
-        and entry.source == "legacy_claude_tokens"
-        and is_claude_provider(default_runner)
-    ):
+    """Return the provider stream a selected credential should publish to.
+
+    Every `provider: claude` entry -- explicit YAML or legacy synthesis --
+    follows the claude-family default runner, so fleets whose workers consume
+    only `tasks:clauder` never receive unconsumable `tasks:claude` publishes.
+    Explicit non-"claude" providers (including "clauder") keep their own stream.
+    """
+    if entry.provider == "claude" and is_claude_provider(default_runner):
         return default_runner
     return entry.provider
 
@@ -240,18 +246,31 @@ def _issue_discovery_priority(
     now = time.time()
     identities = [project.key_prefix or project.repo for project in projects]
     try:
+        # Embed this caller's own polling interval so sibling orchestrators on
+        # faster intervals judge our heartbeat by OUR cadence, not theirs.
+        heartbeat_value = f"{now}|{int(interval_seconds)}"
         for identity in identities:
-            task_redis.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, identity, str(now))
+            task_redis.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, identity, heartbeat_value)
         heartbeats = task_redis.hgetall(_ISSUE_DISCOVERY_PROJECTS_KEY)
-        stale_after = max(3, int(interval_seconds) * 3)
+        caller_stale_after = max(3, int(interval_seconds) * 3)
         live: list[str] = []
         stale: list[str] = []
-        for identity, raw_timestamp in heartbeats.items():
+        for identity, raw_heartbeat in heartbeats.items():
+            timestamp_text, _, interval_text = str(raw_heartbeat).partition("|")
             try:
-                is_live = now - float(raw_timestamp) <= stale_after
+                timestamp = float(timestamp_text)
             except (TypeError, ValueError):
-                is_live = False
-            (live if is_live else stale).append(identity)
+                # No readable timestamp: the entry's age is unknowable.
+                stale.append(identity)
+                continue
+            try:
+                stale_after = max(3, int(float(interval_text)) * 3)
+            except (TypeError, ValueError):
+                # Legacy timestamp-only heartbeat (pre-upgrade writer): judge
+                # it generously so a slow-polling project is not starved by a
+                # fast-polling sibling during a rolling upgrade.
+                stale_after = max(caller_stale_after, _LEGACY_HEARTBEAT_STALE_FLOOR)
+            (live if now - timestamp <= stale_after else stale).append(identity)
         if stale:
             task_redis.hdel(_ISSUE_DISCOVERY_PROJECTS_KEY, *stale)
         if not live:

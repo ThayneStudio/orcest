@@ -47,6 +47,42 @@ def test_rollout_health_fails_on_private_state_and_dlq_growth(fake_redis_client,
     assert failed == {"private_recovery_state", "dead_letters"}
 
 
+def test_rollout_health_counts_shared_prefix_credential_checkpoints(fake_redis_client, mocker):
+    """Checkpoints for tasks without a project key prefix live under the shared
+    task prefix; a project-prefixed health check must still count them."""
+    revision = "9" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.client.set("orcest:results:private-credential-recovery:abc", "opaque")
+    fake_redis_client.client.set("orcest:results:credential-recovery-intent:abc", "opaque")
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["private_credential_checkpoints"] == 1
+    assert report["metrics"]["credential_recovery_intents"] == 1
+    recovery = next(c for c in report["checks"] if c["name"] == "private_recovery_state")
+    assert recovery["passed"] is False
+    assert report["ok"] is False
+
+
+def test_rollout_health_counts_each_credential_checkpoint_once(fake_redis_client, mocker):
+    """When the project prefix and task prefix coincide, the two scans overlap
+    and each key must still count exactly once."""
+    revision = "9" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.client.set("test:results:private-credential-recovery:abc", "opaque")
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        max_private_recovery=1,
+    )
+
+    assert report["metrics"]["private_credential_checkpoints"] == 1
+    recovery = next(c for c in report["checks"] if c["name"] == "private_recovery_state")
+    assert recovery["passed"] is True
+
+
 def test_rollout_health_fails_revision_mismatch(fake_redis_client, mocker):
     mocker.patch("orcest.rollout_health.get_build_revision", return_value="c" * 40)
 

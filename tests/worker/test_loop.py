@@ -1365,7 +1365,12 @@ class TestRunWorker:
     def test_worker_rejects_task_from_wrong_provider_stream(
         self, mocker, worker_config, sample_task
     ):
-        """A dedicated backend never executes a cross-provider payload."""
+        """A dedicated backend never executes a cross-provider payload.
+
+        The rejection is TRANSIENT: a stream mismatch happens during upgrade
+        skew (worker template rebaked before orchestrator containers, or
+        tasks queued on the legacy shared stream), so it must not burn the
+        PR/issue attempt budget permanently."""
         sample_task.provider = "grok"
         mock_redis = self._build_mock_redis()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
@@ -1380,6 +1385,7 @@ class TestRunWorker:
         assert len(results_calls) == 1
         result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.FAILED.value
+        assert result_fields["summary"].startswith(TRANSIENT_SUMMARY_PREFIX)
         assert "does not match" in result_fields["summary"]
 
     def test_worker_processes_issue_task_from_fallback_stream(
@@ -3950,6 +3956,45 @@ def test_drain_malformed_entry_dead_letters_redacted_payload(local_worker_config
     assert "password" not in dlq
     assert "authorization" not in dlq
     mock_redis.xack_raw.assert_called_once_with("tasks:issue:claude", CONSUMER_GROUP, "1-0")
+
+
+@pytest.mark.unit
+def test_drain_malformed_entry_empty_id_uses_malformed_fallback(local_worker_config):
+    """A present-but-empty ``id`` must derive the same ``malformed:<entry>``
+    handoff identity the pool-manager reaper uses (``fields.get("id") or
+    ...``), so a worker dying between publish and ACK cannot make the reaper
+    duplicate the dead-letter row under a different marker key."""
+    fields = {
+        "id": "",
+        "repo": "owner/repo",
+        "resource_type": "issue",
+        "resource_id": "7",
+    }
+    mock_redis = MagicMock()
+    mock_redis.xreadgroup_multi.side_effect = [
+        [("tasks:issue:claude", "1-0", fields)],
+        [],
+    ]
+    mock_redis.xadd_capped.return_value = "2-0"
+    mock_redis.xack_raw.return_value = 1
+
+    complete, drained = _drain_pending_tasks_raw(
+        mock_redis,
+        "tasks:issue:claude",
+        local_worker_config,
+        logging.getLogger("test"),
+    )
+
+    assert (complete, drained) == (True, 1)
+    # The reaper (pool_manager) derives the identity with `or`, so an empty
+    # id falls back to malformed:<entry_id>. The worker must match exactly.
+    expected_key = _handoff_marker_key(
+        DEAD_LETTER_STREAM, "tasks:issue:claude", "1-0", "malformed:1-0"
+    )
+    rejected_key = _handoff_marker_key(DEAD_LETTER_STREAM, "tasks:issue:claude", "1-0", "")
+    marker_keys = [c.args[0] for c in mock_redis.client.set.call_args_list]
+    assert expected_key in marker_keys
+    assert rejected_key not in marker_keys
 
 
 @pytest.mark.unit

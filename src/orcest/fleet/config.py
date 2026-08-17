@@ -47,6 +47,19 @@ def normalize_worker_runner_for_backend(
         raise ValueError(
             f"pool worker backend {backend!r} requires matching runner_type {backend!r}"
         )
+    if backend == "claude":
+        if not runner_mode:
+            # Legacy fleet configs predate worker_runner_mode entirely, and the
+            # pre-field deployment wrote every claude-backend clone with the
+            # interactive PTY runner. Default unset to 'interactive' so those
+            # configs keep their deployed runner instead of silently
+            # downgrading to headless `claude -p` after a fleet update.
+            runner_mode = "interactive"
+        elif runner_mode not in {"interactive", "headless"}:
+            raise ValueError(
+                "pool.worker_backend 'claude' requires worker_runner_mode "
+                "'interactive' or 'headless'"
+            )
     if backend not in {"claude", "clauder"} and runner_mode:
         raise ValueError(f"pool worker backend {backend!r} does not support worker_runner_mode")
     return backend, runner_type, runner_mode

@@ -3284,11 +3284,37 @@ def deploy(
         ctx.invoke(start, config=config)
         from orcest.fleet.orchestrator import _resolve_deploy_revision
 
-        _wait_for_candidate_workers(
-            cfg,
-            console,
-            expected_revision=_resolve_deploy_revision() if rebuild_template else None,
-        )
+        try:
+            _wait_for_candidate_workers(
+                cfg,
+                console,
+                expected_revision=_resolve_deploy_revision() if rebuild_template else None,
+            )
+        except (Exception, SystemExit):
+            # Attestation failed after Step 1 stopped every project publisher.
+            # Leaving the stacks fenced would keep the whole fleet down until
+            # an operator notices, so resume them before propagating failure.
+            if keep_orchestrators_paused:
+                console.print(
+                    "  [yellow]Paused stacks remain stopped by operator request.[/yellow]"
+                )
+            else:
+                resume_failures: list[str] = []
+                for project_name in paused_projects:
+                    console.print(f"  Resuming stack for '{project_name}'...", end=" ")
+                    try:
+                        restart_stack(ssh_target, project_name)
+                        console.print("[green]ok[/green]")
+                    except Exception as resume_exc:
+                        console.print(f"[red]failed[/red]: {resume_exc}")
+                        resume_failures.append(project_name)
+                if resume_failures:
+                    console.print(
+                        "[red]Could not resume paused orchestrator stacks: "
+                        f"{', '.join(resume_failures)}.[/red]\n"
+                        f"  Restart them manually with: orcest fleet update --config {config}"
+                    )
+            raise
 
         # Step 6: Resume publishers only after workers attest.
         step += 1
@@ -3344,7 +3370,9 @@ def _wait_for_candidate_workers(
     while time.monotonic() < deadline:
         heartbeats = get_worker_heartbeats(cfg.ssh_target())
         revisions = {revision for _, revision in heartbeats.values()}
+        stale_worker_ids: set[str] = set()
         if expected_revision is None:
+            required_layout = expected_layout
             revisions_match = (not expected_layout and not revisions) or (
                 len(revisions) == 1
                 and all(revision_is_attested(revision) for revision in revisions)
@@ -3353,14 +3381,35 @@ def _wait_for_candidate_workers(
                 worker_id: backend for worker_id, (backend, _revision) in heartbeats.items()
             }
         else:
-            revisions_match = all(
-                revision == expected_revision for _, revision in heartbeats.values()
-            )
+            # `fleet stop` without --drain-active deliberately spares busy
+            # workers. Survivors keep heartbeating the previous template
+            # revision until the pool manager retires them at end of task,
+            # and their slots cannot be recloned while their VMs are alive,
+            # so they are excused from the candidate layout instead of
+            # blocking it. At least one expected slot must still be served
+            # by the new revision so the new template is actually attested.
+            stale_worker_ids = {
+                worker_id
+                for worker_id, (_backend, revision) in heartbeats.items()
+                if revision != expected_revision
+            }
+            required_layout = {
+                worker_id: backend
+                for worker_id, backend in expected_layout.items()
+                if worker_id not in stale_worker_ids
+            }
+            revisions_match = not expected_layout or bool(required_layout)
             observed_layout = {
                 worker_id: backend
                 for worker_id, (backend, revision) in heartbeats.items()
                 if revision == expected_revision
             }
+        stale_vmids: set[int] = set()
+        for worker_id in stale_worker_ids:
+            try:
+                stale_vmids.add(int(worker_id.rsplit("-", 1)[-1]))
+            except ValueError:
+                continue
         idle_ids, active_ids = get_pool_redis_members(cfg.ssh_target())
         pool_members_valid = True
         try:
@@ -3374,8 +3423,18 @@ def _wait_for_candidate_workers(
             pool_members_valid = False
         tracked_vmids = idle_vmids | active_vmids
         pool_total = len(idle_ids) + len(active_ids)
-        pool_layout_matches = pool_members_valid and tracked_vmids == expected_vmids
-        if observed_layout == expected_layout and revisions_match and pool_layout_matches:
+        # Slots held by spared old-generation workers are excused on both
+        # sides: they may legitimately remain tracked (still finishing a
+        # task) and can never carry the new-generation VMID layout.
+        pool_layout_matches = pool_members_valid and (
+            tracked_vmids - stale_vmids == expected_vmids - stale_vmids
+        )
+        if observed_layout == required_layout and revisions_match and pool_layout_matches:
+            if stale_worker_ids:
+                console.print(
+                    f"  Ignoring {len(stale_worker_ids)} surviving old-revision worker(s) "
+                    f"pending retirement: {', '.join(sorted(stale_worker_ids))}."
+                )
             revision_label = expected_revision or (next(iter(revisions)) if revisions else "none")
             console.print(
                 f"  Candidate worker layout attested [green]ok[/green] "
