@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir ".[monitor]"
+
+# monitor-db is a named volume; Docker seeds a fresh named volume's content
+# from whatever already exists at the mount point in the image, including
+# ownership -- so pre-create the directory here rather than relying on the
+# container to chown it at runtime under a non-root USER.
+RUN mkdir -p /var/lib/orcest-monitor && chown nobody:nogroup /var/lib/orcest-monitor
+
+USER nobody
+ENTRYPOINT ["orcest", "monitor", "--config", "/etc/orcest/monitor.yaml"]

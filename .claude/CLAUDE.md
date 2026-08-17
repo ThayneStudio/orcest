@@ -7,6 +7,7 @@ Autonomous CI/CD orchestration system. Replaces the Ralph system.
 - **Orchestrator**: Single instance, polls GitHub, runs heuristics, enqueues tasks to Redis. Deployed via Docker Compose on `thayne-claude-dev-01.home.prefixa.net`.
 - **Workers**: N instances on bare VMs, block on Redis streams, clone repos, run Claude. Deployed via systemd.
 - **Redis**: Task queue (streams), distributed locks (SET NX EX), operational memory.
+- **Events + Monitor**: Orchestrator/workers emit CloudEvents-shaped lifecycle events onto a Redis stream (`events`, MAXLEN 50000); an orchestrator-side relay forwards them to the `orcest monitor` service (`Dockerfile.monitor`, `docker-compose.monitor.yml`) — a private write-token ingest listener (`:9091`) plus a public read-only, scope-authenticated query listener (`:9090`, SQLite `mode=ro`). See `docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md` and `docs/monitor-exposure-runbook.md` for external (Cloudflare Tunnel + Access) exposure.
 
 Workers are repo-agnostic. Project context comes from each repo's `.claude/` directory.
 
