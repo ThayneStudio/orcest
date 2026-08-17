@@ -1,9 +1,11 @@
 """Public read-only query API for the monitor service.
 
-Every route except ``/api/v1/health`` requires a bearer token configured in
-``MonitorConfig.readers`` (see ``auth.py``): the events/timeline/work/fleet
-routes require the ``events:read`` scope, and the trace route requires the
-separate ``traces:read`` scope.
+Every route except ``/api/v1/health`` and ``/api/v1/openapi.json`` requires a
+bearer token configured in ``MonitorConfig.readers`` (see ``auth.py``): the
+events/timeline/work/fleet routes require the ``events:read`` scope, and the
+trace route requires the separate ``traces:read`` scope. The OpenAPI document
+is the consumer contract, so it stays reachable without auth alongside the
+health check.
 The method gate (only GET/HEAD allowed) runs as pure ASGI middleware ahead
 of FastAPI's routing/auth, so a non-GET/HEAD request is rejected with 405
 before either the router or the auth dependency ever runs.
@@ -30,6 +32,7 @@ from fastapi.responses import JSONResponse
 from orcest.monitor import db
 from orcest.monitor.auth import require_scope
 from orcest.monitor.config import MonitorConfig
+from orcest.shared.events import EVENT_TYPES
 
 _TERMINAL_TYPES = (
     "net.orcest.task.completed",
@@ -65,7 +68,7 @@ def _envelope(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def create_query_app(cfg: MonitorConfig) -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(openapi_url="/api/v1/openapi.json")
     app.state.cfg = cfg
     app.add_middleware(_MethodGateMiddleware)
 
@@ -77,7 +80,7 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
 
     @router.api_route("/api/v1/events", methods=["GET", "HEAD"])
     def list_events(
-        type: str | None = None,
+        type: str | None = Query(default=None, json_schema_extra={"enum": sorted(EVENT_TYPES)}),
         repo: str | None = None,
         resource_id: int | None = None,
         since: str | None = None,

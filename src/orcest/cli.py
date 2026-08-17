@@ -1361,6 +1361,16 @@ def pool_manage(config: str, interval: float) -> None:
         redis.close()
 
 
+@main.command("monitor")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+def monitor_cmd(config_path: str) -> None:
+    """Run the read-only monitor service (ingest + query listeners)."""
+    from orcest.monitor.config import load_monitor_config
+    from orcest.monitor.service import run_monitor
+
+    run_monitor(load_monitor_config(config_path))
+
+
 main.add_command(fleet)
 
 
