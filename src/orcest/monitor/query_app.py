@@ -1,0 +1,192 @@
+"""Public read-only query API for the monitor service.
+
+Every route except ``/api/v1/health`` requires a bearer token configured in
+``MonitorConfig.readers`` with the ``events:read`` scope (see ``auth.py``).
+The method gate (only GET/HEAD allowed) runs as pure ASGI middleware ahead
+of FastAPI's routing/auth, so a non-GET/HEAD request is rejected with 405
+before either the router or the auth dependency ever runs.
+
+Each request opens (and closes) its own read-only SQLite connection --
+sharing a single ``sqlite3.Connection`` across FastAPI's sync threadpool is
+not thread-safe, even though SQLite itself enforces read-only via
+``mode=ro`` + ``PRAGMA query_only=1`` (see ``db.open_ro``).
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import closing
+from typing import Any
+
+from fastapi import APIRouter, Depends, FastAPI, Query
+from fastapi.responses import JSONResponse
+
+from orcest.monitor import db
+from orcest.monitor.auth import require_scope
+from orcest.monitor.config import MonitorConfig
+
+_TERMINAL_TYPES = (
+    "net.orcest.task.completed",
+    "net.orcest.task.failed",
+    "net.orcest.task.killed",
+    "net.orcest.task.reaped",
+)
+
+
+class _MethodGateMiddleware:
+    """Pure ASGI middleware: reject non-GET/HEAD before routing/auth run."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD"):
+            response = JSONResponse({"detail": "method not allowed"}, status_code=405)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _envelope(row: sqlite3.Row) -> dict[str, Any]:
+    """Parse the full CloudEvents envelope stored verbatim in the data column."""
+    return json.loads(row["data"])
+
+
+def create_query_app(cfg: MonitorConfig) -> FastAPI:
+    app = FastAPI()
+    app.state.cfg = cfg
+    app.add_middleware(_MethodGateMiddleware)
+
+    @app.api_route("/api/v1/health", methods=["GET", "HEAD"])
+    def health() -> dict:
+        return {"ok": True}
+
+    router = APIRouter(dependencies=[Depends(require_scope("events:read"))])
+
+    @router.api_route("/api/v1/events", methods=["GET", "HEAD"])
+    def list_events(
+        type: str | None = None,
+        repo: str | None = None,
+        resource_id: int | None = None,
+        since: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict:
+        clauses = []
+        params: list[Any] = []
+        if type is not None:
+            clauses.append("type = ?")
+            params.append(type)
+        if repo is not None:
+            clauses.append("repo = ?")
+            params.append(repo)
+        if resource_id is not None:
+            clauses.append("resource_id = ?")
+            params.append(resource_id)
+        if since is not None:
+            clauses.append("time >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT data FROM events {where} ORDER BY time DESC, rowid DESC LIMIT ?"
+        params.append(limit)
+        with closing(db.open_ro(cfg.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        return {"events": [_envelope(r) for r in rows]}
+
+    @router.api_route("/api/v1/tasks/{task_id}/timeline", methods=["GET", "HEAD"])
+    def task_timeline(task_id: str) -> dict:
+        with closing(db.open_ro(cfg.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT data FROM events WHERE subject = ? ORDER BY time ASC, rowid ASC",
+                (task_id,),
+            ).fetchall()
+        return {"task_id": task_id, "events": [_envelope(r) for r in rows]}
+
+    @router.api_route(
+        "/api/v1/work/{owner}/{name}/{resource_type}/{resource_id}", methods=["GET", "HEAD"]
+    )
+    def work_detail(owner: str, name: str, resource_type: str, resource_id: int) -> dict:
+        repo = f"{owner}/{name}"
+        with closing(db.open_ro(cfg.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT data, attempt FROM events"
+                " WHERE repo = ? AND resource_type = ? AND resource_id = ?"
+                " ORDER BY time ASC, rowid ASC",
+                (repo, resource_type, resource_id),
+            ).fetchall()
+
+        attempts: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            env = _envelope(row)
+            attempt = row["attempt"]
+            bucket = attempts.setdefault(
+                attempt,
+                {
+                    "attempt": attempt,
+                    "task_ids": [],
+                    "head_shas": [],
+                    "first_time": env["time"],
+                    "last_time": env["time"],
+                    "last_type": env["type"],
+                },
+            )
+            if env["subject"] not in bucket["task_ids"]:
+                bucket["task_ids"].append(env["subject"])
+            head_sha = env.get("data", {}).get("head_sha", "")
+            if head_sha and head_sha not in bucket["head_shas"]:
+                bucket["head_shas"].append(head_sha)
+            bucket["last_time"] = env["time"]
+            bucket["last_type"] = env["type"]
+
+        ordered_attempts = [attempts[k] for k in sorted(attempts)]
+        return {
+            "work": {"repo": repo, "resource_type": resource_type, "resource_id": resource_id},
+            "attempts": ordered_attempts,
+        }
+
+    @router.api_route("/api/v1/fleet", methods=["GET", "HEAD"])
+    def fleet_status() -> dict:
+        with closing(db.open_ro(cfg.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            pressure_row = conn.execute(
+                "SELECT data FROM events WHERE type = 'net.orcest.fleet.pressure'"
+                " ORDER BY time DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            kill_limit_row = conn.execute(
+                "SELECT data FROM events WHERE type = 'net.orcest.fleet.kill_limit'"
+                " ORDER BY time DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            placeholders = ",".join("?" * len(_TERMINAL_TYPES))
+            # Per subject, "latest" is determined by (time, rowid) -- `time`
+            # is only second-resolution RFC3339, so several events for the
+            # same task can share a timestamp; rowid (monotonic insertion
+            # order) breaks the tie so we pick the truly-last event rather
+            # than any non-terminal event that happens to share the max
+            # timestamp with a later terminal one.
+            active_rows = conn.execute(
+                "SELECT subject, type, time FROM events e"
+                " WHERE type LIKE 'net.orcest.task.%'"
+                "   AND e.rowid = ("
+                "     SELECT rowid FROM events"
+                "     WHERE subject = e.subject AND type LIKE 'net.orcest.task.%'"
+                "     ORDER BY time DESC, rowid DESC LIMIT 1"
+                "   )"
+                f"   AND type NOT IN ({placeholders})"
+                " ORDER BY time DESC, rowid DESC",
+                _TERMINAL_TYPES,
+            ).fetchall()
+
+        return {
+            "pressure": _envelope(pressure_row) if pressure_row else None,
+            "kill_limit": _envelope(kill_limit_row) if kill_limit_row else None,
+            "active_tasks": [
+                {"task_id": r["subject"], "last_type": r["type"], "time": r["time"]}
+                for r in active_rows
+            ],
+        }
+
+    app.include_router(router)
+    return app
