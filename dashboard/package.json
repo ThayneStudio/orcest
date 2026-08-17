@@ -9,7 +9,8 @@
   "scripts": {
     "check:node": "node scripts/check-node-version.mjs",
     "check:bundle-runtime": "node scripts/check-bundle-runtime.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false && tsc -p tsconfig.server.json --noEmit --pretty false && tsc -p tsconfig.server.test.json --noEmit --pretty false",
+    "check:typecheck-coverage": "node scripts/check-typecheck-coverage.mjs",
+    "typecheck": "npm run check:typecheck-coverage && tsc -p tsconfig.json --noEmit --pretty false && tsc -p tsconfig.server.json --noEmit --pretty false && tsc -p tsconfig.server.test.json --noEmit --pretty false",
     "predev": "npm run check:node",
     "dev": "concurrently \"tsx watch server/index.ts\" \"vite\"",
     "predev:docker": "npm run check:node",

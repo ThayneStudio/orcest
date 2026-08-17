@@ -1230,7 +1230,41 @@ describe("pendingTtlState", () => {
 
     // Before the fix this walked null -> warning -> null -> warning -> critical,
     // so a real orphan silently went green for roughly an hour mid-life.
+    // Legacy markers stop being classifiable past the halfway point; they
+    // cannot reach critical, which is why the orchestrator now stamps
+    // created_at (see the reliable-branch test below).
     expect(transitions).toEqual([null, "warning", null]);
+  });
+
+  it("escalates a marker with created_at monotonically to critical", () => {
+    const expectedTtl = 16500;
+    const lockTtl = 180;
+    const nowMs = 1_800_000_000_000;
+    const at = (ageSeconds: number) =>
+      pendingTtlState(
+        expectedTtl - ageSeconds,
+        expectedTtl,
+        lockTtl,
+        new Date(nowMs - ageSeconds * 1000).toISOString(),
+        nowMs,
+      );
+
+    expect(at(0)).toBeNull();
+    expect(at(lockTtl)).toBe("warning");
+    expect(at(Math.ceil(expectedTtl * 0.5) - 1)).toBe("warning");
+    expect(at(Math.ceil(expectedTtl * 0.5))).toBe("critical");
+    // Bounded to a live key: ttl <= 0 means the marker is already gone, which
+    // the function reports as null before any age inference.
+    expect(at(expectedTtl - 1)).toBe("critical");
+
+    // Monotonic: severity never de-escalates as the marker ages.
+    const rank = { null: 0, warning: 1, critical: 2 } as const;
+    let previous = 0;
+    for (let age = 0; age < expectedTtl; age += 60) {
+      const current = rank[(at(age) ?? "null") as keyof typeof rank];
+      expect(current).toBeGreaterThanOrEqual(previous);
+      previous = current;
+    }
   });
 });
 

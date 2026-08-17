@@ -87,7 +87,12 @@ GROK_VERSION="0.1.216"
 # Re-pin deliberately with GROK_VERSION after validating the GrokRunner
 # fixtures (tests/worker/test_grok_runner.py):
 #   curl -fsSL https://x.ai/cli/grok-VERSION-linux-x86_64 | sha256sum
-GROK_BINARY_SHA256="${ORCEST_GROK_BINARY_SHA256:-01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af}"
+# `-` not `:-`: substitute the pin only when the variable is UNSET, matching
+# cloud_init.py's os.environ.get(). With `:-`, setting the variable to the empty
+# string (the documented way to skip the grok install while a new digest is
+# being validated) would silently install the old pinned artifact here while
+# cloud-init skipped it -- and the empty-digest branch below would be dead code.
+GROK_BINARY_SHA256="${ORCEST_GROK_BINARY_SHA256-01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af}"
 installed_grok_version="$([ -x /usr/local/bin/grok ] && /usr/local/bin/grok --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 if [ "${installed_grok_version}" != "${GROK_VERSION}" ]; then
     echo "Installing Grok CLI ${GROK_VERSION}..."

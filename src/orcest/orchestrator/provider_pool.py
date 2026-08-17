@@ -145,6 +145,20 @@ class ProviderPool:
                     seen.append(e.provider)
             return seen
 
+    def available_entries(self) -> list[ProviderEntry]:
+        """Entries whose ACCOUNT is not currently on cooldown, in round-robin order.
+
+        Snapshot semantics match next_entry(): availability is only true at the
+        instant of the call. Used by backpressure decisions that must reason
+        about where work can actually be routed right now -- a provider whose
+        accounts are all benched offers no buffer, so its queue depth says
+        nothing about whether the project can accept more work.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            benched = {k for k, exp in self._cooldowns.items() if exp > now}
+            return [e for e in self._entries if e.account_key() not in benched]
+
     def _prune_cooldowns(self) -> None:
         """Remove expired cooldown entries. Must be called while holding self._lock."""
         now = datetime.now(timezone.utc)

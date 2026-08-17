@@ -297,7 +297,9 @@ def test_poll_project_routes_single_legacy_token_fallback_to_default_clauder(
         "orcest.orchestrator.loop.discover_actionable_prs",
         return_value=[pr_state],
     )
-    mocker.patch("orcest.orchestrator.loop._unclaimed_task_count", return_value=0)
+    # The issue-discovery gate reads per-stream counts; patching the aggregate
+    # helper would no longer disable it.
+    mocker.patch("orcest.orchestrator.loop._unclaimed_task_counts", return_value={})
     mock_publish = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
 

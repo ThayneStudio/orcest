@@ -159,13 +159,17 @@ def _project_task_providers(
         if normalized and normalized not in providers:
             providers.append(normalized)
 
-    for entry in project.providers or []:
-        add(_published_provider_for_entry(entry, config.default_runner))
     if token_pool is not None:
-        for provider in token_pool.provider_names:
-            # A pool synthesized from legacy claude_tokens publishes to the
-            # configured default runner rather than to a "claude" stream.
-            add(config.default_runner if provider == "claude" else provider)
+        # Only providers that can be selected *right now*. An account on
+        # exhaustion cooldown offers no buffer, so counting its (permanently
+        # idle) stream as "has room" would switch the gate off entirely.
+        # Mirror the publish path's mapping exactly rather than approximating
+        # it, so we never name a stream this project would not publish to.
+        for entry in token_pool.available_entries():
+            add(_published_provider_for_entry(entry, config.default_runner))
+    if not providers:
+        for entry in project.providers or []:
+            add(_published_provider_for_entry(entry, config.default_runner))
     if not providers and project.claude_tokens:
         add(config.default_runner)
     return providers
@@ -216,6 +220,11 @@ def _unclaimed_task_count(
     group: str,
     logger: logging.Logger,
 ) -> int:
+    """Total unread entries across ``streams``.
+
+    Kept for callers that only need the aggregate; the issue-discovery gate
+    uses `_unclaimed_task_counts` because it must reason per stream.
+    """
     return sum(_unclaimed_task_counts(redis, streams, group, logger).values())
 
 
@@ -626,16 +635,18 @@ def _record_unresolved_credential_account(
         attempts = redis.incr(attempts_key)
         if attempts == 1:
             redis.expire(attempts_key, _UNRESOLVED_CREDENTIAL_ACCOUNT_TTL_SECONDS)
-    except Exception:
-        logger.debug(
-            "Failed to record unresolved credential account attempt for task %s",
-            result.task_id,
-            exc_info=True,
-        )
-        # Redis is unavailable for the counter, so we cannot prove how many
-        # attempts have happened. Treat it as terminal rather than risk an
-        # unbounded retry loop.
-        return _MAX_UNRESOLVED_CREDENTIAL_ACCOUNT_ATTEMPTS
+    except Exception as exc:
+        # Never fabricate an exhausted budget here. `_resolve_provider_account`
+        # returns None partly *because* Redis is unhealthy -- the durable
+        # task->account mapping read swallows its own errors -- so the same
+        # outage that produced the unresolvable account also fails this counter.
+        # Returning the max would discard a real, irreversible OAuth rotation on
+        # the very first pass. Retrying is safe: nothing else in _handle_result
+        # can commit while Redis is down either.
+        raise _RetryableResultError(
+            f"could not record unresolved credential account attempt for task "
+            f"{result.task_id}: {exc}"
+        ) from exc
     return attempts
 
 
@@ -719,12 +730,19 @@ def _make_rebake_required_processed_key(task_id: str) -> str:
     return f"result:{task_id}:rebake_required_processed"
 
 
+def _make_stale_credential_counted_key(task_id: str) -> str:
+    """Redis guard preventing retry-driven stale-rotation overcounting."""
+    return f"result:{task_id}:stale_credential_counted"
+
+
 def _raise_or_abandon_github_side_effect(
     redis: RedisClient,
     result: TaskResult,
     logger: logging.Logger,
     description: str,
     exc: Exception,
+    *,
+    side_effect: str,
 ) -> None:
     """Retry a failed GitHub side effect, but only within a bounded budget.
 
@@ -735,11 +753,19 @@ def _raise_or_abandon_github_side_effect(
     mapping leaks, and every poll cycle re-runs the preceding reads against the
     GitHub API. Past the budget, give up on this side effect and let the result
     finish committing.
+
+    ``side_effect`` scopes the budget. Labels and comments must not share a
+    counter: they fail independently, and a shared one lets the label exhaust
+    the budget so the comment is over its limit on its very first attempt --
+    silently dropping the human-escalation message entirely.
     """
-    if _is_network_error(str(exc)):
-        # Unambiguously transient: never spend the budget on these.
+    if _is_network_error(str(exc)) or isinstance(exc, gh.GhRateLimitError):
+        # Unambiguously transient. Rate limiting in particular clears on its
+        # own, and `gh` already exhausted its internal retries before raising,
+        # so spending the permanent-failure budget on it would abandon a side
+        # effect that was always going to succeed later.
         raise _RetryableResultError(f"{description}: {exc}") from exc
-    attempts_key = f"result:{result.task_id}:github_side_effect_failures"
+    attempts_key = f"result:{result.task_id}:github_side_effect_failures:{side_effect}"
     try:
         attempts = redis.incr(attempts_key)
         if attempts == 1:
@@ -2773,13 +2799,27 @@ def _handle_result(
                     result.task_id,
                 )
                 provider, _sep, _hash = credential_update_account.partition(":")
-                _increment_provider_counter(
-                    redis,
-                    provider,
-                    "credential_refresh_discarded_stale",
-                    _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS,
-                    logger,
-                )
+                # Guard like every other per-result counter. This block runs
+                # before the side-effects short-circuit, so any later
+                # _RetryableResultError re-enters it and would re-increment on
+                # every retry -- turning "a rotation was discarded" into a
+                # readout of unrelated GitHub flakiness.
+                try:
+                    first_time = redis.set_nx_ex(
+                        _make_stale_credential_counted_key(result.task_id),
+                        "1",
+                        _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS,
+                    )
+                except Exception:
+                    first_time = False
+                if first_time:
+                    _increment_provider_counter(
+                        redis,
+                        provider,
+                        "credential_refresh_discarded_stale",
+                        _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS,
+                        logger,
+                    )
         else:
             _record_credential_refresh_failure_if_needed(
                 redis,
@@ -3134,6 +3174,7 @@ def _handle_result(
                 logger,
                 f"failed to add needs-human label on {resource_label} #{resource_id}",
                 exc,
+                side_effect="label",
             )
     elif result.status == ResultStatus.BLOCKED:
         try:
@@ -3146,6 +3187,7 @@ def _handle_result(
                 logger,
                 f"failed to add blocked label on {resource_label} #{resource_id}",
                 exc,
+                side_effect="label",
             )
 
     # Only post comments for non-success statuses (failures, blocked, etc.)
@@ -3225,6 +3267,7 @@ def _handle_result(
                 logger,
                 f"failed to post comment on {resource_label} #{resource_id}",
                 exc,
+                side_effect="comment",
             )
 
         logger.info("Result comment: %s...", body[:100])
