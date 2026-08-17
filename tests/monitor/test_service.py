@@ -103,6 +103,20 @@ def test_load_monitor_config_missing_reader_token_env_raises(tmp_path, monkeypat
         load_monitor_config(config_path)
 
 
+def test_load_monitor_config_empty_write_token_env_raises(tmp_path, monkeypatch):
+    """An env var that resolves to the empty string must never authenticate.
+
+    A blank Authorization: Bearer <empty> header would otherwise satisfy a
+    naive equality check, so an empty resolved token is treated the same as
+    a missing one -- both are hard failures.
+    """
+    monkeypatch.setenv("MONITOR_WRITE_TOKEN", "")
+    config_path = _write_config(tmp_path)
+
+    with pytest.raises(ValueError, match="MONITOR_WRITE_TOKEN"):
+        load_monitor_config(config_path)
+
+
 class _CrashingFakeServer:
     """Stands in for uvicorn.Server: dies immediately, like a bind failure."""
 

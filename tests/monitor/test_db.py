@@ -30,6 +30,33 @@ def test_malformed_envelopes_skipped(tmp_path):
     assert db.insert_events(conn, [bad_type, missing, _env("t2")]) == 1
 
 
+def test_poison_envelopes_skipped_not_raised(tmp_path):
+    """A batch containing envelopes that pass the shape check but fail at
+    insert time (NULL in a NOT NULL column, non-numeric resource_id) must
+    not raise -- the whole batch would otherwise 500 the ingest endpoint and
+    the relay would retry the same poison batch forever. Only the valid
+    envelope is accepted; poison envelopes are skipped and the rest of the
+    batch (including envelopes ordered after the poison ones) is retained.
+    """
+    conn = db.open_rw(str(tmp_path / "m.db"))
+
+    poison_null_subject = _env("t-null-subject")
+    poison_null_subject["subject"] = None  # NOT NULL column -> IntegrityError
+
+    poison_bad_resource_id = _env("t-bad-resource-id")
+    poison_bad_resource_id["data"]["work"]["resource_id"] = "abc"  # int() -> ValueError
+
+    valid = _env("t-valid")
+
+    accepted = db.insert_events(
+        conn, [poison_null_subject, poison_bad_resource_id, valid]
+    )
+
+    assert accepted == 1
+    rows = conn.execute("SELECT subject FROM events").fetchall()
+    assert rows == [("t-valid",)]
+
+
 def test_ro_connection_rejects_writes(tmp_path):
     path = str(tmp_path / "m.db")
     db.open_rw(path).close()

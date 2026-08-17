@@ -89,6 +89,14 @@ class RedisClient:
         """Raw redis client for operations not covered by helpers."""
         return self._client
 
+    @property
+    def key_prefix(self) -> str:
+        """The key prefix this client prepends to every key (without the trailing colon).
+
+        Empty string when no prefix is configured.
+        """
+        return self._prefix[:-1] if self._prefix else ""
+
     def close(self) -> None:
         """Close the connection pool and release all connections."""
         self._pool.disconnect()

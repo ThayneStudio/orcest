@@ -41,7 +41,6 @@ block to that project's `orchestrator.yaml` (see
 ```yaml
 monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 monitor_write_token_env: "MONITOR_WRITE_TOKEN"
-events_maxlen: 50000
 ```
 
 `monitor` here is the compose service name — it resolves over the shared
@@ -59,7 +58,7 @@ docker compose -f docker-compose.monitor.yml up -d
 curl -s http://localhost:9090/api/v1/health
 ```
 
-Expected: `{"status":"ok"}` (or equivalent) with no auth header — `/api/v1/health`
+Expected: `{"ok": true}` with no auth header — `/api/v1/health`
 and `/api/v1/openapi.json` are the only unauthenticated routes on the query
 listener. Everything else 401s without a valid `Authorization: Bearer
 <token>` header and 403s if the token's reader lacks the required scope.

@@ -13,6 +13,7 @@ from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import (
     IssueState,
+    get_attempt_count as get_issue_attempt_count,
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.pr_ops import (
@@ -889,7 +890,7 @@ def publish_issue_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
-        attempt=get_total_attempt_count(redis, repo, issue_state.number),
+        attempt=get_issue_attempt_count(redis, repo, issue_state.number),
     )
 
     published = _publish_issue_and_notify(

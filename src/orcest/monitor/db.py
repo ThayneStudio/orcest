@@ -63,27 +63,38 @@ def insert_events(conn: sqlite3.Connection, envelopes: list[dict]) -> int:
     """Insert well-formed envelopes, deduping on (source, id).
 
     Malformed envelopes (missing a required CloudEvents attribute, or a
-    ``type`` outside the locked v1 taxonomy) are silently skipped. Returns
-    the number of rows actually inserted (excludes both malformed envelopes
-    and duplicates ignored by the unique constraint).
+    ``type`` outside the locked v1 taxonomy) are silently skipped. Envelopes
+    that pass that shape check but still fail at insert time -- e.g. a
+    ``None`` for a NOT NULL column (``sqlite3.IntegrityError``) or a
+    non-numeric ``resource_id``/``attempt`` (``ValueError``/``TypeError``) --
+    are also skipped rather than raised, so one poison envelope in a batch
+    cannot 500 the ingest endpoint and wedge the relay's retry loop on the
+    same batch forever. Returns the number of rows actually inserted
+    (excludes malformed/poison envelopes and duplicates ignored by the
+    unique constraint).
     """
     accepted = 0
     for env in envelopes:
         if not all(k in env for k in _REQUIRED) or env["type"] not in EVENT_TYPES:
             continue
-        work = env["data"].get("work", {}) if isinstance(env["data"], dict) else {}
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO events"
-            " (source,id,type,subject,time,repo,resource_type,resource_id,attempt,data,ingested_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                env["source"], env["id"], env["type"], env["subject"], env["time"],
-                work.get("repo", ""), work.get("resource_type", ""),
-                int(work.get("resource_id", 0) or 0),
-                int(env["data"].get("attempt", 0) or 0) if isinstance(env["data"], dict) else 0,
-                json.dumps(env), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            ),
-        )
+        try:
+            work = env["data"].get("work", {}) if isinstance(env["data"], dict) else {}
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO events"
+                " (source,id,type,subject,time,repo,resource_type,resource_id,"
+                "attempt,data,ingested_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    env["source"], env["id"], env["type"], env["subject"], env["time"],
+                    work.get("repo", ""), work.get("resource_type", ""),
+                    int(work.get("resource_id", 0) or 0),
+                    int(env["data"].get("attempt", 0) or 0)
+                    if isinstance(env["data"], dict) else 0,
+                    json.dumps(env), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                ),
+            )
+        except (sqlite3.Error, ValueError, TypeError):
+            continue
         accepted += cur.rowcount
     conn.commit()
     return accepted

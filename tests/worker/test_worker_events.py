@@ -28,17 +28,20 @@ def _spooled(fake_redis, type_suffix):
     return [e for e in envs if e["type"] == f"net.orcest.{type_suffix}"]
 
 
-def _make_task() -> Task:
+def _make_task(key_prefix: str = "", token: str = "test-token-events") -> Task:
     # resource_type="issue" skips the PR head-sha snapshot validation path
     # entirely, so the harness doesn't need to stub ``gh.get_pr``.
     return Task.create(
         task_type=TaskType.FIX_PR,
         repo="owner/repo",
-        token="test-token-events",
+        token=token,
         resource_type="issue",
         resource_id=7,
         prompt="Do the thing",
         attempt=1,
+        key_prefix=key_prefix,
+        credential="super-secret-credential-value",
+        provider="claude",
     )
 
 
@@ -59,9 +62,12 @@ def _mock_workspace() -> MagicMock:
     return ws
 
 
-def _run_task(fake_redis_client, runner_result: RunnerResult) -> SimpleNamespace:
+def _run_task(
+    fake_redis_client, runner_result: RunnerResult, task: Task | None = None
+) -> SimpleNamespace:
     config = _make_config()
-    task = _make_task()
+    if task is None:
+        task = _make_task()
     runner = MagicMock()
     runner.run.return_value = runner_result
 
@@ -74,7 +80,7 @@ def _run_task(fake_redis_client, runner_result: RunnerResult) -> SimpleNamespace
         logging.getLogger("test.worker_events"),
     )
 
-    return SimpleNamespace(redis=fake_redis_client, worker_id=config.worker_id)
+    return SimpleNamespace(redis=fake_redis_client, worker_id=config.worker_id, task=task)
 
 
 @pytest.fixture
@@ -110,3 +116,53 @@ def test_failed_event_on_failure(worker_harness_failing):
     assert len(failed) == 1
     assert failed[0]["data"]["status"] == "failed"
     assert isinstance(failed[0]["data"]["transient"], bool)
+
+
+@pytest.mark.unit
+def test_events_route_to_task_key_prefix_not_worker_client_prefix(fake_redis_client):
+    """A task's project events must land on ``<task.key_prefix>:events``, even
+    though the worker's own Redis client is built with a different key
+    prefix ("test", per the ``fake_redis_client`` fixture — mirroring the
+    deployed fleet where the worker's client uses the global "orcest"
+    prefix). Regression test for the bug where ``EventPublisher(redis)`` was
+    built directly on the worker's own client, silently stranding events on
+    a stream the per-project EventRelay never reads.
+    """
+    secret_token = "ghp_supersecrettoken12345"
+    secret_credential = "sk-supersecretcredential67890"
+    secret_prompt = "SECRET PROMPT TEXT do not leak me"
+    task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo="owner/repo",
+        token=secret_token,
+        resource_type="issue",
+        resource_id=7,
+        prompt=secret_prompt,
+        attempt=1,
+        key_prefix="proj",
+        credential=secret_credential,
+        provider="claude",
+    )
+
+    harness = _run_task(
+        fake_redis_client, RunnerResult(success=True, summary="All checks fixed"), task=task
+    )
+
+    # Nothing should have landed on the worker client's own prefix ("test:events").
+    assert _spooled(harness.redis, "task.started") == []
+    assert _spooled(harness.redis, "task.completed") == []
+
+    # Events should be on the task's project stream: "proj:events".
+    raw_entries = harness.redis.client.xrevrange("proj:events", count=50)
+    envs = [json.loads(fields["envelope"]) for _id, fields in raw_entries]
+    started = [e for e in envs if e["type"] == "net.orcest.task.started"]
+    completed = [e for e in envs if e["type"] == "net.orcest.task.completed"]
+    assert len(started) == 1
+    assert len(completed) == 1
+
+    # No secret material (token/credential/prompt) may appear anywhere in the
+    # serialized envelopes.
+    serialized = json.dumps(envs)
+    assert secret_token not in serialized
+    assert secret_credential not in serialized
+    assert secret_prompt not in serialized

@@ -38,3 +38,31 @@ def test_ingest_accepts_and_dedupes(tmp_path):
     assert r.json() == {"accepted": 1, "skipped": 0}
     r = client.post("/ingest/v1/events", json={"events": [env]}, headers=h)
     assert r.json() == {"accepted": 0, "skipped": 1}
+
+
+def test_ingest_skips_poison_envelopes_without_500(tmp_path):
+    """Poison envelopes (shape-valid but insert-time-invalid, e.g. a NULL
+    subject or a non-numeric resource_id) must be skipped, not crash the
+    endpoint -- otherwise the relay would retry the same poison batch
+    forever. The rest of the batch is still accepted.
+    """
+    client = TestClient(create_ingest_app(_cfg(tmp_path)))
+    h = {"Authorization": "Bearer write-secret"}
+
+    poison_null_subject = _env()
+    poison_null_subject["subject"] = None
+
+    poison_bad_resource_id = _env()
+    poison_bad_resource_id["id"] = "different-id-1"
+    poison_bad_resource_id["data"]["work"]["resource_id"] = "abc"
+
+    valid = _env()
+    valid["id"] = "different-id-2"
+
+    r = client.post(
+        "/ingest/v1/events",
+        json={"events": [poison_null_subject, poison_bad_resource_id, valid]},
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"accepted": 1, "skipped": 2}

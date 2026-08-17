@@ -125,8 +125,6 @@ class OrchestratorConfig:
     # Env var name the write token is read from at process start (not the
     # token itself -- never store secrets directly in YAML/dataclass fields).
     monitor_write_token_env: str = "MONITOR_WRITE_TOKEN"
-    # MAXLEN for the events spool stream (orcest.shared.events.EVENTS_STREAM).
-    events_maxlen: int = 50000
 
 
 @dataclass
@@ -685,12 +683,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         raw.get("monitor_write_token_env"), "monitor_write_token_env", "MONITOR_WRITE_TOKEN"
     ) or "MONITOR_WRITE_TOKEN"
 
-    events_maxlen = _safe_int(raw.get("events_maxlen", 50000), "events_maxlen")
-    if events_maxlen < 1:
-        raise ValueError(
-            f"Config field 'events_maxlen' must be a positive integer, got {events_maxlen!r}."
-        )
-
     config = OrchestratorConfig(
         redis=redis_config,
         github=github_config,
@@ -710,7 +702,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         trace_archive_path=trace_archive_path,
         monitor_ingest_url=monitor_ingest_url,
         monitor_write_token_env=monitor_write_token_env,
-        events_maxlen=events_maxlen,
     )
 
     # Validate required fields

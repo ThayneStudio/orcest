@@ -62,4 +62,3 @@ providers:
 # process start (never store the token itself in this file).
 # monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 # monitor_write_token_env: "MONITOR_WRITE_TOKEN"
-# events_maxlen: 50000

@@ -40,10 +40,17 @@ _POST_TIMEOUT_SECONDS = 10
 class EventRelay:
     """Background thread that drains the events spool to the monitor."""
 
-    def __init__(self, redis: RedisClient, ingest_url: str | None, write_token: str) -> None:
+    def __init__(
+        self,
+        redis: RedisClient,
+        ingest_url: str | None,
+        write_token: str,
+        project_prefixes: list[str] | None = None,
+    ) -> None:
         self._redis = redis
         self._ingest_url = ingest_url
         self._write_token = write_token
+        self._project_prefixes = project_prefixes or []
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
         # Exponential backoff on POST failure, reset to the initial value on
@@ -56,8 +63,39 @@ class EventRelay:
             logger.info("Event relay disabled (monitor_ingest_url unset).")
             return
         logger.info("Event relay enabled, forwarding events to %s", self._ingest_url)
+        self._warn_on_misconfiguration()
         self._thread = threading.Thread(target=self._run, name="event-relay", daemon=True)
         self._thread.start()
+
+    def _warn_on_misconfiguration(self) -> None:
+        """Loudly warn about configurations that would silently drop events.
+
+        This relay only ever drains the ``events`` spool stream under its own
+        Redis client's key prefix. Any configured project whose key_prefix
+        differs from that would have its events published to a stream this
+        relay never reads (worker/pool events are spooled under
+        ``task.key_prefix:events`` -- see EventPublisher usage in
+        worker/loop.py and fleet/pool_manager.py). Also warn if a write
+        token is required but empty, since every POST would then 401.
+        """
+        relay_prefix = self._redis.key_prefix
+        mismatched = sorted({p for p in self._project_prefixes if p and p != relay_prefix})
+        if mismatched:
+            logger.warning(
+                "Event relay is configured to drain Redis key prefix %r, but "
+                "project(s) with key_prefix %s are configured -- events "
+                "published under those prefixes will NEVER be relayed to the "
+                "monitor. Run one EventRelay per project key_prefix, or align "
+                "redis.key_prefix with the project(s) it should drain.",
+                relay_prefix,
+                mismatched,
+            )
+        if not self._write_token:
+            logger.warning(
+                "Event relay ingest_url is set but the write token is empty -- "
+                "every POST to %s will be rejected with 401.",
+                self._ingest_url,
+            )
 
     def stop(self, timeout: float = 5.0) -> None:
         self._shutdown.set()

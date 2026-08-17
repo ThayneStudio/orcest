@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from orcest.monitor import db
@@ -48,6 +49,30 @@ def test_bad_task_id_rejected(tmp_path):
 def test_unknown_task_404(tmp_path):
     c = _client(tmp_path, frozenset({"events:read", "traces:read"}))
     assert c.get("/api/v1/tasks/nosuchtask/trace", headers=H).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "ptr_content",
+    [
+        "../../etc",  # relative traversal out of the archive root
+        "/etc/passwd",  # absolute path -- Path("/a") / Path("/etc/passwd") discards "/a"
+    ],
+)
+def test_pointer_traversal_blocked(tmp_path, ptr_content):
+    """A pointer file whose content escapes the archive root (relative
+    ``../`` traversal, or an absolute path that discards the archive root
+    entirely per Path's join semantics) must 404, never read or leak
+    anything from outside ``trace_archive_path``.
+    """
+    c = _client(
+        tmp_path,
+        frozenset({"events:read", "traces:read"}),
+        ptr_content=ptr_content,
+    )
+    r = c.get("/api/v1/tasks/task1/trace", headers=H)
+    assert r.status_code == 404
+    assert r.json() == {"detail": "unknown task"}
+    assert "root:" not in r.text  # sanity: no /etc/passwd content ever surfaced
 
 
 def test_pointer_as_file_path_tolerated(tmp_path):
