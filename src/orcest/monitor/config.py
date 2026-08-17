@@ -40,6 +40,8 @@ def _resolve_env(var_name: str) -> str:
     value = os.environ.get(var_name)
     if value is None:
         raise ValueError(f"missing required environment variable: {var_name}")
+    if value == "":
+        raise ValueError(f"environment variable {var_name} must not be empty")
     return value
 
 

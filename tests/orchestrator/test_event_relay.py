@@ -1,13 +1,15 @@
 import json
+import logging
 
 from orcest.orchestrator.event_relay import EventRelay
 from orcest.shared.events import EVENTS_STREAM, make_event
 
 
 class _FakeRedis:
-    def __init__(self):
+    def __init__(self, key_prefix="orcest"):
         self.entries = []  # list of (id, fields)
         self.kv = {}
+        self.key_prefix = key_prefix
 
     def xadd_capped(self, stream, fields, maxlen):
         eid = f"{len(self.entries)+1}-0"
@@ -96,3 +98,59 @@ def test_malformed_entry_skipped(monkeypatch):
     relay._pass_once()
     assert len(posted[0]["events"]) == 1
     assert r.kv["event_relay:cursor"] == "2-0"
+
+
+def test_start_warns_on_project_prefix_mismatch(monkeypatch, caplog):
+    r = _FakeRedis(key_prefix="orcest")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", lambda *a, **k: None)
+    relay = EventRelay(
+        r,
+        "http://monitor:9091/ingest/v1/events",
+        "tok",
+        project_prefixes=["orcest", "other-project"],
+    )
+    with caplog.at_level(logging.WARNING):
+        relay.start()
+    relay.stop(timeout=1)
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("other-project" in m for m in warnings)
+    # The matching prefix should not be flagged.
+    assert not any("'orcest'" in m and "other-project" not in m for m in warnings)
+
+
+def test_start_does_not_warn_when_project_prefixes_match(monkeypatch, caplog):
+    r = _FakeRedis(key_prefix="orcest")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", lambda *a, **k: None)
+    relay = EventRelay(
+        r,
+        "http://monitor:9091/ingest/v1/events",
+        "tok",
+        project_prefixes=["orcest"],
+    )
+    with caplog.at_level(logging.WARNING):
+        relay.start()
+    relay.stop(timeout=1)
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert not any("NEVER be relayed" in m for m in warnings)
+
+
+def test_start_warns_on_empty_write_token(monkeypatch, caplog):
+    r = _FakeRedis(key_prefix="orcest")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", lambda *a, **k: None)
+    relay = EventRelay(r, "http://monitor:9091/ingest/v1/events", "")
+    with caplog.at_level(logging.WARNING):
+        relay.start()
+    relay.stop(timeout=1)
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("write token is empty" in m for m in warnings)
+
+
+def test_start_does_not_warn_when_write_token_set(monkeypatch, caplog):
+    r = _FakeRedis(key_prefix="orcest")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", lambda *a, **k: None)
+    relay = EventRelay(r, "http://monitor:9091/ingest/v1/events", "tok")
+    with caplog.at_level(logging.WARNING):
+        relay.start()
+    relay.stop(timeout=1)
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert not any("write token is empty" in m for m in warnings)

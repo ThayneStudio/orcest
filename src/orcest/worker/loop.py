@@ -2248,7 +2248,11 @@ def _execute_task(
     """Execute a single task: clone, run runner, stream output, return result."""
     start = time.monotonic()
     output_stream, output_stream_is_raw = _task_output_stream(task, config)
-    event_publisher = EventPublisher(redis)
+    if task.key_prefix:
+        event_redis = RedisClient.from_client(redis.client, key_prefix=task.key_prefix)
+    else:
+        event_redis = redis
+    event_publisher = EventPublisher(event_redis)
 
     def _emit(event_type: str, data: dict[str, Any] | None = None) -> None:
         try:

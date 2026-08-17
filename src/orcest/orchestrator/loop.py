@@ -1431,6 +1431,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
         redis,
         config.monitor_ingest_url,
         os.environ.get(config.monitor_write_token_env, ""),
+        project_prefixes=[p.key_prefix for p in config.projects if p.key_prefix],
     )
     event_relay.start()
 

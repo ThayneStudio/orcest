@@ -12,7 +12,11 @@ from datetime import datetime
 import pytest
 
 from orcest.orchestrator.gh import GhCliError
-from orcest.orchestrator.issue_ops import IssueAction, IssueState
+from orcest.orchestrator.issue_ops import (
+    IssueAction,
+    IssueState,
+    increment_attempts as increment_issue_attempts_directly,
+)
 from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
@@ -1239,6 +1243,43 @@ def test_publish_issue_task_stamps_pending_marker_created_at(gh_mock, fake_redis
     stored = json.loads(fake_redis_client.client.get(pending_key))
     assert stored["created_at"], "issue pending marker must record when it was created"
     datetime.fromisoformat(stored["created_at"])
+
+
+def test_publish_issue_task_stamps_attempt_from_issue_counter(gh_mock, fake_redis_client):
+    """Issue tasks must stamp ``attempt`` from the issue attempts counter
+    (issue_ops.get_attempt_count / ``issue:{repo}:{n}:attempts``), not from
+    the PR total-attempts counter (``pr:{repo}:{n}:total_attempts``), which
+    is never incremented for issues and would always read 0.
+
+    Regression: publish_issue_task previously stamped ``attempt`` from
+    ``pr_ops.get_total_attempt_count``.
+    """
+    _setup_gh_defaults(gh_mock)
+    issue_state = IssueState(
+        number=803,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    # Simulate two prior attempts already recorded against the issue counter.
+    increment_issue_attempts_directly(fake_redis_client, "test-org/test-repo", 803)
+    increment_issue_attempts_directly(fake_redis_client, "test-org/test-repo", 803)
+
+    task = publish_issue_task(
+        issue_state=issue_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="claude",
+    )
+
+    # attempt is stamped BEFORE the publish-time increment, so it should
+    # reflect the two prior attempts already recorded.
+    assert task.attempt == 2
+    # The PR-side counter (which the bug read from) stays at 0 for an issue.
+    assert get_total_attempt_count(fake_redis_client, "test-org/test-repo", 803) == 0
 
 
 def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
