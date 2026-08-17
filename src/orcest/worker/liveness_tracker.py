@@ -21,25 +21,52 @@ and layers on:
 Interface note: the task-B7 brief's ``__init__`` stub omits ``task_id`` and
 a wall-clock hook. Both are required in practice -- the activity record's
 ``task_id`` field has nowhere else to come from, and the record's
-``last_liveness_ts``/``ladder_since`` fields need real wall-clock time for
-the reaper's staleness math even though the ladder itself runs on the
-injectable *monotonic* ``clock`` (spec timers are duration-based, so a
-monotonic clock is correct for them; wall time is only needed for the
-Redis-visible timestamps and the kill-budget hour bucket). Both are added
+``last_liveness_ts``/``ladder_since`` fields (and the workspace S3 baseline,
+and the kill-budget hour bucket) need real wall-clock time even though the
+ladder itself runs on the injectable *monotonic* ``clock`` (spec timers are
+duration-based, so a monotonic clock is correct for them). Both are added
 as keyword arguments with sensible defaults so existing call sites that
 only pass the brief's original arguments still work modulo ``task_id``,
 which callers must supply.
 
-Thread-safety: ``observe_line`` runs on the runner's stdout-reader thread;
-``tick`` runs on the watchdog thread. All ladder/detector/sampler-baseline
-state is only ever touched while holding ``self._lock``; Redis I/O and
-``emit`` calls happen *outside* the lock so a slow Redis call or emit
-callback can never block the stdout thread.
+Clock-domain note (review round 1, finding 1): ``WorkspaceSampler.changed_since``
+compares against file ``mtime``s, which are wall-clock (epoch) timestamps --
+never the ladder's monotonic clock. Feeding it a monotonic ``now`` means
+every real mtime is numerically greater than the (much smaller, process-
+uptime-relative) monotonic timestamp, so S3 reads "changed" forever and
+SUSPECT/STUCK can never fire. The workspace baseline is tracked and passed
+in the wall-clock domain (``_last_ws_sample_wall_ts``, refreshed via
+``wall_clock()``); only the ladder's own ``now`` stays monotonic.
+
+Robustness note (review round 1, finding 2): once ``evaluate()`` latches a
+kill, that decision must never be lost. ``decision.kill`` is captured into a
+local immediately, and every post-evaluate side effect (event emits, the
+activity-record write, budget consumption) is wrapped so an exception in
+any one of them is logged and swallowed rather than propagating -- ``tick()``
+always returns the kill trigger the ladder decided on, independent of
+whether Redis or the emit callback are healthy. Symmetrically, the fleet-gate
+*reads* that happen before ``evaluate()`` fail safe: a Redis error while
+probing pressure/budget is treated as ``escalation_blocked=True`` (never
+"more likely to kill") and the ladder is still evaluated normally --
+CEILING, which bypasses gates entirely, must survive a Redis outage.
+
+Thread-safety note (review round 1, finding 3): sampling (``/proc``,
+workspace walk) and fleet-gate Redis reads are I/O and must never happen
+while holding ``self._lock`` -- ``observe_line`` runs on the runner's
+stdout-reader thread, and blocking it stalls the child's stdout pipe, which
+is exactly the kind of stall this module is supposed to detect, not cause.
+The lock is only ever held around the small, pure ladder/detector/shared-
+field access in ``tick()`` and ``observe_line()``; a ``recent_hashes()``
+snapshot for the periodic activity event is taken *inside* that locked
+section too (finding 4: ``RepetitionDetector``'s internal deque is mutated
+by ``observe_line`` from another thread, so iterating it outside the lock
+can raise ``RuntimeError`` intermittently).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -53,9 +80,11 @@ from orcest.worker.liveness_signals import ProcessTreeSampler, WorkspaceSampler
 from orcest.worker.repetition import RepetitionDetector
 from orcest.worker.stream_liveness import classify_line
 
+logger = logging.getLogger(__name__)
+
 _PRESSURE_KEY = "orcest:fleet:pressure"
 _KILL_BUDGET_LIMIT_KEY = "orcest:fleet:kill_budget:limit"
-_KILL_BUDGET_DEFAULT_LIMIT = "6"
+_KILL_BUDGET_DEFAULT_LIMIT = 6
 _KILL_BUDGET_BUCKET_TTL = 7200
 
 _ACTIVITY_KEY_PREFIX = "workers:activity:"
@@ -118,10 +147,13 @@ class LivenessTracker:
             pingpong_threshold=cfg.loop_pingpong_threshold,
         )
 
-        self._last_ws_sample_ts = started_at
+        # Wall-clock baseline for S3 (see module docstring's clock-domain
+        # note) -- deliberately NOT `started_at` (monotonic).
+        self._last_ws_sample_wall_ts = wall_clock()
         self._tick_count = 0
         self._needs_reap = False
         self._kill_limit_emitted = False
+        self._limit_malformed_logged = False
         self._state_since_wall = wall_clock()
         self._last_snapshot: dict[str, Any] = {}
 
@@ -131,14 +163,20 @@ class LivenessTracker:
 
     def observe_line(self, line: str) -> None:
         """Classify one stdout line and feed S1 + the repetition detector."""
-        sig = classify_line(line)
+        sig = classify_line(line)  # pure, no I/O -- fine to do before the lock
         with self._lock:
             now = self._clock()
             self._ladder.note_stream(now, sig)
             # classify_line sets exactly one of these per line (never both):
             # tool_error_class for a failed tool_result, tool_name for a
-            # tool_use block. Anything else (plain progress/output/waiting)
-            # is not repetition-detector input.
+            # tool_use block. Note that classify_line NEVER populates
+            # tool_name on an error signal (the "user"/tool_result branch
+            # only ever sets tool_error_class) -- error streaks are
+            # therefore tool-name-blind by construction: two different
+            # tools failing with the same error class hash identically.
+            # That is upstream (stream_liveness) behavior, not something
+            # this glue layer changes; see
+            # test_error_streaks_are_tool_name_blind.
             if sig.tool_error_class:
                 self._detector.observe_tool_error(sig.tool_name, sig.tool_error_class)
             elif sig.tool_name:
@@ -153,62 +191,83 @@ class LivenessTracker:
 
         Returns the kill trigger ("stuck" | "looping" | "ceiling") the
         ladder decided on this tick, or None. The activity record is
-        written and any transition/periodic events are emitted every call,
-        regardless of the return value.
+        written and any transition/periodic events are emitted every call
+        on a best-effort basis: none of those side effects can suppress a
+        kill the ladder already latched (see module docstring).
         """
+        # --- I/O: sampling + fleet-gate reads. Never under the lock. ---
+        cpu = self._proc_sampler.sample()
+
+        ws_wall_now = self._wall_clock()
+        with self._lock:
+            last_ws_ts = self._last_ws_sample_wall_ts
+        changed = self._workspace_sampler.changed_since(last_ws_ts)
+
+        pressure_blocked = self._probe_pressure()
+        limit = self._budget_limit()
+        budget_blocked, budget_breached = self._probe_budget(limit)
+        blocked = pressure_blocked or budget_blocked
+
+        # --- Pure ladder/detector/shared-field access: under the lock. ---
         with self._lock:
             now = self._clock()
-            cpu = self._proc_sampler.sample()
-            changed = self._workspace_sampler.changed_since(self._last_ws_sample_ts)
-            self._last_ws_sample_ts = now
+            self._last_ws_sample_wall_ts = ws_wall_now
 
             rep_verdict = self._detector.verdict()
-
-            pressure_blocked = self._redis.get_raw(_PRESSURE_KEY) is not None
-            limit = self._budget_limit()
-            budget_blocked = self._budget_probe_blocked(limit)
-            blocked = pressure_blocked or budget_blocked
 
             decision = self._ladder.evaluate(
                 now, cpu, changed, rep_verdict, escalation_blocked=blocked
             )
+            kill = decision.kill
             self._tick_count += 1
+            tick_count = self._tick_count
             if decision.transitioned:
                 self._state_since_wall = self._wall_clock()
             self._last_snapshot = decision.snapshot
-            tick_count = self._tick_count
 
-            # Emit the kill-limit event once per task, the first time the
-            # budget probe itself blocks (not on every subsequent tick).
-            emit_kill_limit = budget_blocked and not self._kill_limit_emitted
+            emit_activity_event = tick_count % _ACTIVITY_EVENT_TICK_STRIDE == 0
+            # Snapshot the recent-hashes view here, still under the lock --
+            # RepetitionDetector's deque is mutated by observe_line from
+            # another thread (finding 4).
+            recent_hashes = self._detector.recent_hashes(20) if emit_activity_event else None
+
+            # Emit the kill-limit event once per task, only for a genuine
+            # budget breach (limit>0 and the bucket count met/exceeded it)
+            # -- never for observation-mode (limit<=0) or a gate-read error.
+            emit_kill_limit = budget_breached and not self._kill_limit_emitted
             if emit_kill_limit:
                 self._kill_limit_emitted = True
 
-        # --- everything below runs without the lock held ---
-
+        # --- Side effects: outside the lock, all best-effort. ---
         if decision.transitioned:
-            self._emit_transition(decision)
+            self._safe(lambda: self._emit_transition(decision), "transition emit")
 
-        if tick_count % _ACTIVITY_EVENT_TICK_STRIDE == 0:
-            self._emit_fn(
-                "net.orcest.task.activity",
-                {
-                    "snapshot": decision.snapshot,
-                    "recent_tool_hashes": self._detector.recent_hashes(20),
-                    "cpu_seconds": cpu,
-                },
+        if emit_activity_event:
+            self._safe(
+                lambda: self._emit_fn(
+                    "net.orcest.task.activity",
+                    {
+                        "snapshot": decision.snapshot,
+                        "recent_tool_hashes": recent_hashes,
+                        "cpu_seconds": cpu,
+                    },
+                ),
+                "activity event emit",
             )
 
-        self._write_activity_record()
+        self._safe(self._write_activity_record, "activity record write")
 
         if emit_kill_limit:
-            self._emit_fn("net.orcest.fleet.kill_limit", {"limit": limit})
+            self._safe(
+                lambda: self._emit_fn("net.orcest.fleet.kill_limit", {"limit": limit}),
+                "kill_limit emit",
+            )
 
-        if decision.kill == "ceiling":
+        if kill == "ceiling":
             # Ceiling kills bypass all fleet gates (the ladder already
             # exempts them from escalation_blocked); no budget consumed.
             return "ceiling"
-        if decision.kill in ("stuck", "looping"):
+        if kill in ("stuck", "looping"):
             # The budget is only ever consumed when a kill actually fires.
             # We already probed (without incrementing) before evaluate();
             # a kill only reaches here when escalation_blocked was False on
@@ -217,9 +276,17 @@ class LivenessTracker:
             # documented race: worst case one extra kill per hour
             # fleet-wide if another task's tick consumed the last budget
             # slot between our probe and this increment.
-            self._consume_budget()
-            return decision.kill
+            self._safe(self._consume_budget, "budget consume")
+            return kill
         return None
+
+    def _safe(self, fn: Callable[[], None], what: str) -> None:
+        """Run a post-evaluate side effect, logging and swallowing any
+        exception so it can never cause a latched kill to be lost."""
+        try:
+            fn()
+        except Exception:
+            logger.warning("liveness tracker: %s failed", what, exc_info=True)
 
     def _emit_transition(self, decision: Decision) -> None:
         event_type = _STATE_EVENT_TYPES[decision.state]
@@ -229,20 +296,60 @@ class LivenessTracker:
         self._emit_fn(event_type, data)
 
     # ------------------------------------------------------------------
-    # Fleet gates (budget)
+    # Fleet gates (pressure + budget)
     # ------------------------------------------------------------------
 
-    def _budget_limit(self) -> int:
-        raw = self._redis.get_raw(_KILL_BUDGET_LIMIT_KEY)
-        return int(raw or _KILL_BUDGET_DEFAULT_LIMIT)
-
-    def _budget_probe_blocked(self, limit: int) -> bool:
-        # limit <= 0 means kills are disabled entirely (observation mode).
-        if limit <= 0:
+    def _probe_pressure(self) -> bool:
+        try:
+            return self._redis.get_raw(_PRESSURE_KEY) is not None
+        except Exception:
+            logger.warning("pressure gate read failed; failing safe to blocked", exc_info=True)
             return True
-        raw = self._redis.get_raw(self._budget_hour_key())
+
+    def _budget_limit(self) -> int:
+        try:
+            raw = self._redis.get_raw(_KILL_BUDGET_LIMIT_KEY)
+        except Exception:
+            logger.warning(
+                "kill-budget limit read failed; using default %d",
+                _KILL_BUDGET_DEFAULT_LIMIT,
+                exc_info=True,
+            )
+            return _KILL_BUDGET_DEFAULT_LIMIT
+        if raw is None:
+            return _KILL_BUDGET_DEFAULT_LIMIT
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            if not self._limit_malformed_logged:
+                logger.warning(
+                    "malformed kill-budget limit %r; using default %d",
+                    raw,
+                    _KILL_BUDGET_DEFAULT_LIMIT,
+                )
+                self._limit_malformed_logged = True
+            return _KILL_BUDGET_DEFAULT_LIMIT
+
+    def _probe_budget(self, limit: int) -> tuple[bool, bool]:
+        """Non-incrementing budget probe.
+
+        Returns ``(blocked, breached)``. ``breached`` is True only when the
+        hourly bucket was actually read and its count met/exceeded a
+        positive ``limit`` -- a genuine budget breach, as opposed to
+        "kills disabled by config" (``limit <= 0``) or "couldn't tell
+        because Redis errored" (fails safe to blocked, but is not a
+        breach and must not trigger the once-per-task kill_limit event).
+        """
+        if limit <= 0:
+            return True, False
+        try:
+            raw = self._redis.get_raw(self._budget_hour_key())
+        except Exception:
+            logger.warning("kill-budget bucket read failed; failing safe to blocked", exc_info=True)
+            return True, False
         n = int(raw) if raw is not None else 0
-        return n >= limit
+        breached = n >= limit
+        return breached, breached
 
     def _budget_hour_key(self) -> str:
         hour = time.strftime("%Y%m%d%H", time.gmtime(self._wall_clock()))
@@ -291,7 +398,7 @@ class LivenessTracker:
         # Flush immediately: after being marked, the task may be torn down
         # before the next tick() call, so the reaper flag must be visible
         # in Redis right away rather than waiting for the next sample.
-        self._write_activity_record()
+        self._safe(self._write_activity_record, "activity record write (mark_needs_reap)")
 
     def close(self) -> None:
         """Delete the activity record."""
