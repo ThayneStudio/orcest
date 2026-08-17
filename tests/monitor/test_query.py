@@ -73,3 +73,33 @@ def test_fleet_active_tasks(tmp_path):
     r = c.get("/api/v1/fleet", headers=H).json()
     assert [t["task_id"] for t in r["active_tasks"]] == ["t-live"]
     assert r["pressure"] is None
+
+
+def test_fleet_terminal_absorbs_late_arriving_non_terminal(tmp_path):
+    # Terminal states are absorbing: even if a non-terminal event for the
+    # same task_id lands *after* the terminal one (higher rowid) but shares
+    # the same second-resolution `time`, the task must stay inactive. This
+    # is the multi-producer skew case (worker terminal event vs. a late
+    # reaper/task.activity event for the same subject).
+    path = str(tmp_path / "m2.db")
+    conn = db.open_rw(path)
+    terminal = make_event(
+        "net.orcest.task.failed", source_project="p", task_id="t-terminal",
+        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+    )
+    late_non_terminal = make_event(
+        "net.orcest.task.activity", source_project="p", task_id="t-terminal",
+        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+    )
+    late_non_terminal["time"] = terminal["time"]
+
+    db.insert_events(conn, [terminal])
+    db.insert_events(conn, [late_non_terminal])  # separate call -> higher rowid
+
+    cfg = MonitorConfig(
+        db_path=path, trace_archive_path=None, write_token="w",
+        readers=[Reader(name="r", token="read-secret", scopes=frozenset({"events:read"}))],
+    )
+    c = TestClient(create_query_app(cfg))
+    r = c.get("/api/v1/fleet", headers=H).json()
+    assert "t-terminal" not in [t["task_id"] for t in r["active_tasks"]]
