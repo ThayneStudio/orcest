@@ -36,6 +36,7 @@ from orcest.shared.credential_handoff import (
     safe_dead_letter_fields,
     source_entry_pending_state,
 )
+from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.models import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
@@ -1272,7 +1273,7 @@ class PoolManager:
                     )
                     continue
                 try:
-                    coordinated = self._coordinate_reaped_vm(vm_id)
+                    coordinated = self._coordinate_reaped_vm(vm_id, elapsed_seconds=elapsed)
                 except Exception:
                     logger.error(
                         "Failed to coordinate Redis state for reaped VM %d; "
@@ -1750,7 +1751,7 @@ class PoolManager:
 
     # ── reap coordination (H2-conc) ──────────────────────────
 
-    def _coordinate_reaped_vm(self, vm_id: int) -> bool:
+    def _coordinate_reaped_vm(self, vm_id: int, elapsed_seconds: float | None = None) -> bool:
         """Recover orchestrator-visible state for a force-reaped worker VM.
 
         Reads the reaped consumer's pending stream entries, reconstructs each
@@ -1763,6 +1764,12 @@ class PoolManager:
         Returns True only when every stream was either empty or fully recovered.
         A Redis read/publish failure returns False so the caller can leave the VM
         tracking state intact and retry recovery later.
+
+        ``elapsed_seconds`` is the max-task-duration overrun computed by
+        ``_health_check``, when this call originates there. Other callers
+        (done-worker cleanup, drain races, orphan-PEL sweep) don't track a
+        task's elapsed runtime, so it defaults to ``None`` and the emitted
+        event reports ``0.0``.
         """
         consumer = self._vm_id_to_worker_id(vm_id)
         task_streams, discovery_complete = self._task_streams_with_discovery_status()
@@ -1875,7 +1882,7 @@ class PoolManager:
                     if not self._safe_xack(fq_stream, entry_id):
                         unrecovered_entries = True
                     continue
-                if not self._publish_reaped_failure(task):
+                if not self._publish_reaped_failure(task, consumer, elapsed_seconds):
                     unrecovered_entries = True
                     continue
                 self._clear_reaped_pending_marker(task)
@@ -2086,7 +2093,9 @@ class PoolManager:
             return "missing"
         return "matches" if metadata.task_id == task.id else "different"
 
-    def _publish_reaped_failure(self, task: Task) -> bool:
+    def _publish_reaped_failure(
+        self, task: Task, worker_id: str, elapsed_seconds: float | None = None
+    ) -> bool:
         """Publish a transient-FAILED result so the orchestrator re-enqueues."""
         result = TaskResult(
             task_id=task.id,
@@ -2120,7 +2129,42 @@ class PoolManager:
                 exc_info=True,
             )
             return False
+        self._emit_reaped_event(task, worker_id, elapsed_seconds)
         return True
+
+    def _emit_reaped_event(
+        self, task: Task, worker_id: str, elapsed_seconds: float | None
+    ) -> None:
+        """Spool a task.reaped event. Never raises (EventPublisher swallows)."""
+        try:
+            if task.key_prefix:
+                project_redis = RedisClient.from_client(
+                    self._redis.client, key_prefix=task.key_prefix
+                )
+            else:
+                project_redis = self._redis
+            EventPublisher(project_redis).publish(
+                make_event(
+                    "net.orcest.task.reaped",
+                    source_project=task.key_prefix or "default",
+                    task_id=task.id,
+                    repo=task.repo,
+                    resource_type=task.resource_type,
+                    resource_id=task.resource_id,
+                    attempt=task.attempt,
+                    head_sha=task.snapshot_head_sha,
+                    worker_id=worker_id,
+                    provider=task.provider,
+                    data={
+                        "reason": "max_task_duration",
+                        "elapsed_seconds": elapsed_seconds if elapsed_seconds is not None else 0.0,
+                    },
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Reaped task %s: failed to emit task.reaped event", task.id, exc_info=True
+            )
 
     def _safe_xack(self, fq_stream: str, entry_id: str) -> bool:
         try:

@@ -1937,7 +1937,7 @@ class TestHealthCheckReapCoordination:
             events.append("stopped")
             return True
 
-        def coordinated(_vm_id):
+        def coordinated(_vm_id, elapsed_seconds=None):
             assert events == ["stopped"]
             events.append("redis-coordinated")
             return True
