@@ -113,20 +113,21 @@ export async function detectStuck(snapshot: SystemSnapshot): Promise<StuckTask[]
             pending?.createdAt ?? null,
           );
           if (pendingState) {
+            const context = queuedTaskContext(snapshot, {
+              prefix,
+              resourceType,
+              repo,
+              resourceId,
+              taskId: pending?.taskId ?? null,
+            });
             stuck.push(stuckTaskWithContext({
               prefix,
               resource_type: resourceType,
               repo,
               resource_id: resourceId,
               reason: pendingTtlReason(ttl, pending_task_ttl_seconds, pending?.createdAt ?? null),
-              severity: pendingState,
-            }, queuedTaskContext(snapshot, {
-              prefix,
-              resourceType,
-              repo,
-              resourceId,
-              taskId: pending?.taskId ?? null,
-            })));
+              severity: verifiablyQueuedSeverity(pendingState, ttl, context),
+            }, context));
           }
         }
       }
@@ -445,6 +446,24 @@ function queuedTaskContext(
       ? workerGroupHasNoConsumersWhileBacklogged(workerGroup, backlog)
       : false,
   };
+}
+
+function verifiablyQueuedSeverity(
+  severity: StuckTask["severity"],
+  ttlSeconds: number,
+  context: StuckTaskContext | null,
+): StuckTask["severity"] {
+  // The half-TTL escalation in pendingTtlState exists for orphans: a pending
+  // marker whose task is nowhere to be found. When the queued-task context
+  // located the task's entry in its task stream, the task is verifiably still
+  // queued -- merely waiting behind a busy fleet -- so cap the age-derived
+  // severity at "warning" instead of paging as critical. A marker with no TTL
+  // (ttl === -1) stays critical regardless: it will never expire even after
+  // the task runs, which is a broken invariant, not a busy queue.
+  if (severity !== "critical") return severity;
+  if (ttlSeconds === -1) return severity;
+  if (!context || !stringField(context.entryId)) return severity;
+  return "warning";
 }
 
 function resourcePrefixesCompatible(

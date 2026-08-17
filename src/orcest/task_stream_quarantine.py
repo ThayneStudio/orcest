@@ -12,6 +12,19 @@ from orcest.shared.redis_client import RedisClient
 
 _QUARANTINE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
+# Consumers whose XINFO CONSUMERS idle time is below this are treated as live
+# workers even when they hold no pending deliveries and publish no heartbeat
+# key. Legacy (pre-rebake) worker images never write the
+# ``{prefix}:workers:heartbeat:*`` liveness keys, so during the migration
+# window this tool exists for, their consumer idle clock is the only liveness
+# signal they emit: Redis resets it on every attempted interaction, and an
+# idle worker blocked in XREADGROUP re-issues the command each block cycle
+# (``block_ms=5000`` in ``src/orcest/worker/loop.py``). 60s is 12 block
+# cycles — generous on purpose: a false-positive "live" merely requires
+# ``--force``, while a false-negative renames the stream out from under a
+# blocked worker (NOGROUP crash-loop, orphaned ACKs on re-delivery).
+_LIVE_CONSUMER_IDLE_THRESHOLD_MS = 60_000
+
 
 class TaskStreamQuarantineError(RuntimeError):
     """Task streams could not be fenced or restored without data loss."""
@@ -53,6 +66,41 @@ def _live_worker_ids(redis: RedisClient, task_prefix: str) -> list[str]:
             f"could not inspect worker liveness: {type(exc).__name__}"
         ) from exc
     return sorted(key.removeprefix(heartbeat_prefix) for key in keys)
+
+
+def _recently_active_consumers(redis: RedisClient, sources: list[str]) -> list[str]:
+    """Return ``stream/group/consumer`` labels for recently active consumers.
+
+    Complements the heartbeat-key scan: legacy worker images predate the
+    heartbeat keys, so a consumer whose idle time is under
+    ``_LIVE_CONSUMER_IDLE_THRESHOLD_MS`` is presumed to be a live worker even
+    with zero pending deliveries.
+    """
+    active: list[str] = []
+    try:
+        for source in sources:
+            groups = cast(list[dict[str, Any]], redis.client.xinfo_groups(source))
+            for group in groups:
+                group_name = str(group.get("name", ""))
+                consumers = cast(
+                    list[dict[str, Any]],
+                    redis.client.xinfo_consumers(source, group_name),
+                )
+                for consumer in consumers:
+                    idle = consumer.get("idle")
+                    if idle is None:
+                        raise TaskStreamQuarantineError(
+                            f"consumer idle time is unavailable for {source!r}"
+                        )
+                    if int(idle) < _LIVE_CONSUMER_IDLE_THRESHOLD_MS:
+                        active.append(f"{source}/{group_name}/{consumer.get('name')}")
+    except (redis_lib.RedisError, TypeError, ValueError) as exc:
+        if isinstance(exc, TaskStreamQuarantineError):
+            raise
+        raise TaskStreamQuarantineError(
+            f"could not inspect stream consumers: {type(exc).__name__}"
+        ) from exc
+    return sorted(active)
 
 
 def _validate_source_key(key: str, task_prefix: str) -> str:
@@ -107,11 +155,13 @@ def quarantine_task_streams(
         mappings.append({"source": source, "quarantine": destination, **summary})
 
     live_workers = _live_worker_ids(redis, task_prefix)
+    active_consumers = _recently_active_consumers(redis, sources)
     in_flight_streams = sorted(str(item["source"]) for item in mappings if item["pending"])
-    if not force and (live_workers or in_flight_streams):
+    if not force and (live_workers or active_consumers or in_flight_streams):
         raise TaskStreamQuarantineError(
             "refusing to fence task streams while work is in flight: live workers "
-            f"[{','.join(live_workers) or 'none'}], streams with pending deliveries "
+            f"[{','.join(live_workers) or 'none'}], recently active consumers "
+            f"[{','.join(active_consumers) or 'none'}], streams with pending deliveries "
             f"[{','.join(in_flight_streams) or 'none'}]; stop publishers and workers, "
             "then re-run with --force once the remaining pending entries are known "
             "to be orphaned"
@@ -127,7 +177,9 @@ def quarantine_task_streams(
                 raise TaskStreamQuarantineError("task stream changed during quarantine preflight")
             if int(cast(Any, pipe.exists(item["quarantine"]))) != 0:
                 raise TaskStreamQuarantineError("quarantine destination already exists")
-        if not force and _live_worker_ids(redis, task_prefix):
+        if not force and (
+            _live_worker_ids(redis, task_prefix) or _recently_active_consumers(redis, sources)
+        ):
             raise TaskStreamQuarantineError("a worker became live during quarantine preflight")
         pipe.multi()
         for item in mappings:
@@ -146,6 +198,7 @@ def quarantine_task_streams(
         "operation": "quarantine",
         "forced": force,
         "live_workers": live_workers,
+        "recently_active_consumers": active_consumers,
         "in_flight_streams": in_flight_streams,
         "streams": mappings,
     }

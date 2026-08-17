@@ -59,6 +59,14 @@ _WORKER_HEARTBEAT_PREFIX = "workers:heartbeat:"
 # Workers can block on the issue stream for up to five seconds. A drain lease
 # must be visible for longer than that before the final PEL check.
 _DRAIN_QUIESCE_SECONDS = 5.25
+# The post-stop pending check is a drain's destruction commit point. Its
+# conservative failure branch restarts the VM and files it into pool:active —
+# a state nothing ever transitions back to idle — so a single transient Redis
+# error there would mislabel a healthy idle VM until the health check
+# force-destroys it as a phantom hung task. Retry briefly before taking that
+# branch.
+_POST_STOP_PENDING_CHECK_ATTEMPTS = 3
+_POST_STOP_PENDING_CHECK_RETRY_SECONDS = 1.0
 # Results stream + cap, mirroring worker/loop.py so the reaper writes a
 # transient-FAILED result to the same place the orchestrator reads.
 _RESULTS_STREAM = "results"
@@ -346,10 +354,13 @@ class PoolManager:
                     continue
                 # Once stopped, no new claim is possible. This post-stop PEL
                 # check is the actual destruction commit point.
-                pending_consumers, pending_complete = self._consumers_with_pending_status()
+                pending_consumers, pending_complete = self._post_stop_pending_status()
                 if not pending_complete:
                     logger.warning(
-                        "Leaving drained VM %d stopped: post-stop pending-state inspection failed",
+                        "Restarting drained VM %d and marking it active: post-stop "
+                        "pending-state inspection failed after retries; the health "
+                        "check will reap it after max_task_duration if it never "
+                        "finishes a task",
                         vm_id,
                     )
                     self._restore_worker_after_failed_drain(
@@ -484,10 +495,15 @@ class PoolManager:
             if not self._stop_vm(vm_id):
                 self._restore_worker_after_failed_drain(vm_id, worker_id)
                 continue
-            pending_consumers, pending_complete = self._consumers_with_pending_status()
+            # Once stopped, no new claim is possible. This post-stop PEL
+            # check is the actual destruction commit point.
+            pending_consumers, pending_complete = self._post_stop_pending_status()
             if not pending_complete:
                 logger.warning(
-                    "Leaving drained VM %d stopped: post-stop pending-state inspection failed",
+                    "Restarting drained VM %d and marking it active: post-stop "
+                    "pending-state inspection failed after retries; the health "
+                    "check will reap it after max_task_duration if it never "
+                    "finishes a task",
                     vm_id,
                 )
                 self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
@@ -1576,6 +1592,30 @@ class PoolManager:
                             continue
                         names.add(name)
         return names, complete
+
+    def _post_stop_pending_status(self) -> tuple[set[str], bool]:
+        """Post-stop pending check with a bounded retry on incomplete reads.
+
+        Called at the destruction commit point of both drain loops, after the
+        VM is provably stopped (so no new claim can appear between attempts).
+        The incomplete branch there is expensive — it restarts the VM and
+        files it into ``pool:active``, which nothing transitions back to
+        idle — so a transient Redis failure gets a few quick retries before
+        we give up and take the conservative path.
+        """
+        names: set[str] = set()
+        for attempt in range(1, _POST_STOP_PENDING_CHECK_ATTEMPTS + 1):
+            names, complete = self._consumers_with_pending_status()
+            if complete:
+                return names, True
+            if attempt < _POST_STOP_PENDING_CHECK_ATTEMPTS:
+                logger.warning(
+                    "Post-stop pending-state inspection incomplete (attempt %d/%d); retrying",
+                    attempt,
+                    _POST_STOP_PENDING_CHECK_ATTEMPTS,
+                )
+                time.sleep(_POST_STOP_PENDING_CHECK_RETRY_SECONDS)
+        return names, False
 
     def _is_template_vmid(self, vm_id: int) -> bool:
         """Return True if *vm_id* names a template (active or pending GC).

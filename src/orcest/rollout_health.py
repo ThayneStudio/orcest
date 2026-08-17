@@ -181,6 +181,34 @@ def _provider_metric_total(redis: RedisClient, metric: str) -> tuple[int, str | 
     return total, None
 
 
+def _credential_recovery_counts(
+    redis: RedisClient, *, task_prefix: str
+) -> tuple[int, int, str | None]:
+    """Count credential-recovery keys under both the project and task prefixes.
+
+    Checkpoint keys are named after the fully-qualified result stream: tasks
+    with a project ``key_prefix`` write ``{project}:results:...`` while tasks
+    without one fall back to the shared task prefix (``orcest:results:...``,
+    see ``worker/loop.py``). A project-prefixed health check must still see
+    the shared-prefix checkpoints, so scan both keyspaces and dedupe.
+    """
+    checkpoints: set[str] = set()
+    intents: set[str] = set()
+    try:
+        for keys, marker in (
+            (checkpoints, "private-credential-recovery"),
+            (intents, "credential-recovery-intent"),
+        ):
+            # Wrapper scan: keys under the client's per-project --prefix.
+            keys.update(redis._prefixed(key) for key in redis.scan_iter(f"*:{marker}:*"))
+            # Raw scan: keys under the shared task prefix.
+            raw_pattern = f"{task_prefix}:*:{marker}:*" if task_prefix else f"*:{marker}:*"
+            keys.update(str(key) for key in cast(Any, redis.client.scan_iter(match=raw_pattern)))
+    except redis_lib.RedisError as exc:
+        return -1, -1, f"credential recovery state: {type(exc).__name__}"
+    return len(checkpoints), len(intents), None
+
+
 def _pool_key(pool_prefix: str, name: str) -> str:
     """Build a worker-pool key under the pool manager's own key prefix."""
     return f"{pool_prefix}:pool:{name}" if pool_prefix else f"pool:{name}"
@@ -230,13 +258,11 @@ def collect_rollout_health(
         }
 
     inspection_errors: list[str] = []
-    try:
-        private_recovery = len(redis.scan_iter("*:private-credential-recovery:*"))
-        recovery_intents = len(redis.scan_iter("*:credential-recovery-intent:*"))
-    except redis_lib.RedisError as exc:
-        private_recovery = -1
-        recovery_intents = -1
-        inspection_errors.append(f"credential recovery state: {type(exc).__name__}")
+    private_recovery, recovery_intents, recovery_error = _credential_recovery_counts(
+        redis, task_prefix=task_prefix
+    )
+    if recovery_error is not None:
+        inspection_errors.append(recovery_error)
     private_total = private_recovery + recovery_intents
     task_queue_depth = 0
     task_pending = 0

@@ -130,6 +130,72 @@ def test_quarantine_refuses_while_a_worker_heartbeat_is_live(fake_redis_client):
     assert fake_redis_client.client.type("orcest:quarantine:release-1:tasks:codex") == "none"
 
 
+def test_quarantine_refuses_while_a_heartbeatless_consumer_is_recently_active(fake_redis_client):
+    """Legacy workers publish no heartbeat key; consumer idle time must count.
+
+    An idle pre-rebake worker blocked in XREADGROUP has zero pending entries
+    and no ``workers:heartbeat:*`` key, yet renaming its stream would NOGROUP
+    crash-loop it and orphan any ACK from the race window.
+    """
+    source = "orcest:tasks:codex"
+    fake_redis_client.client.xadd(source, {"id": "task-1"})
+    fake_redis_client.client.xgroup_create(source, "workers", id="$")
+    # Empty read: registers the consumer with a fresh idle clock and no PEL.
+    fake_redis_client.client.xreadgroup("workers", "legacy-worker-1", {source: ">"})
+    assert fake_redis_client.client.xinfo_groups(source)[0]["pending"] == 0
+
+    with pytest.raises(TaskStreamQuarantineError, match="legacy-worker-1"):
+        quarantine_task_streams(
+            fake_redis_client,
+            task_prefix="orcest",
+            quarantine_id="release-1",
+        )
+
+    assert fake_redis_client.client.type(source) == "stream"
+    assert fake_redis_client.client.type("orcest:quarantine:release-1:tasks:codex") == "none"
+
+
+def test_force_overrides_recently_active_consumer_gate(fake_redis_client):
+    source = "orcest:tasks:codex"
+    fake_redis_client.client.xadd(source, {"id": "task-1"})
+    fake_redis_client.client.xgroup_create(source, "workers", id="$")
+    fake_redis_client.client.xreadgroup("workers", "legacy-worker-1", {source: ">"})
+
+    report = quarantine_task_streams(
+        fake_redis_client,
+        task_prefix="orcest",
+        quarantine_id="release-1",
+        force=True,
+    )
+
+    assert report["forced"] is True
+    assert report["recently_active_consumers"] == [f"{source}/workers/legacy-worker-1"]
+    assert fake_redis_client.client.type("orcest:quarantine:release-1:tasks:codex") == "stream"
+
+
+def test_quarantine_ignores_long_idle_consumers(fake_redis_client, mocker):
+    """A consumer whose idle time exceeds the threshold is a dead worker."""
+    source = "orcest:tasks:codex"
+    fake_redis_client.client.xadd(source, {"id": "task-1"})
+    fake_redis_client.client.xgroup_create(source, "workers", id="$")
+    fake_redis_client.client.xreadgroup("workers", "legacy-worker-1", {source: ">"})
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_consumers",
+        return_value=[{"name": "legacy-worker-1", "pending": 0, "idle": 3_600_000}],
+    )
+
+    report = quarantine_task_streams(
+        fake_redis_client,
+        task_prefix="orcest",
+        quarantine_id="release-1",
+    )
+
+    assert report["forced"] is False
+    assert report["recently_active_consumers"] == []
+    assert fake_redis_client.client.type("orcest:quarantine:release-1:tasks:codex") == "stream"
+
+
 def test_quarantine_refuses_while_deliveries_are_pending(fake_redis_client):
     source = "orcest:tasks:grok"
     fake_redis_client.client.xadd(source, {"id": "task-1"})

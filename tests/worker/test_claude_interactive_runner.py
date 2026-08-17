@@ -142,6 +142,26 @@ def test_main_input_prompt_detector_rejects_setup_menus() -> None:
     )
 
 
+def test_main_input_prompt_detector_tolerates_box_drawing_borders() -> None:
+    """The composer may be framed inside a box border ('│ ❯ …'); the detector
+    must still recognize it or every attempt burns the full runner timeout."""
+    runner = ClaudeInteractiveRunner()
+
+    assert runner._looks_like_main_input_prompt('│ ❯ Try "edit <filepath> to..."') is True
+    assert runner._looks_like_main_input_prompt('┃ ❯ Try "fix the failing test"') is True
+    assert runner._looks_like_main_input_prompt("║ ❯ ") is True
+    assert runner._looks_like_main_input_prompt('| ❯ Try "help"') is True
+    # A bordered line without the composer glyph is still not an input prompt.
+    assert runner._looks_like_main_input_prompt("│ Welcome to Claude Code │") is False
+    # Excluded setup dialogs stay excluded even with borders present.
+    assert (
+        runner._looks_like_main_input_prompt(
+            "│ Quick safety check\n│ > 1. Yes, I trust this folder\n│ Enter to confirm"
+        )
+        is False
+    )
+
+
 def test_run_provides_controlling_tty_and_reads_result(tmp_path, monkeypatch) -> None:
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(

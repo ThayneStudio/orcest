@@ -499,8 +499,9 @@ Notes:
   `pool.worker_runner_type: claude`, and
   `pool.worker_runner_mode: interactive`, and publish tasks with
   `default_runner: clauder` or an explicit `provider: clauder`.
-  The `claude` backend remains available for deployments that still run
-  the legacy prompt-mode worker.
+  The `claude` backend also defaults to the interactive runner when
+  `pool.worker_runner_mode` is unset; set `pool.worker_runner_mode: headless`
+  to keep running the legacy `claude -p` prompt-mode worker.
 - A fleet can schedule dedicated mixed-provider workers with an ordered
   round-robin layout. Consecutive VMID slots use consecutive profiles and the
   list wraps; repetition adds worker capacity for that backend:

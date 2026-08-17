@@ -337,6 +337,108 @@ describe("detectStuck", () => {
     }
   });
 
+  it("caps half-TTL escalation at warning when the task is verifiably still queued", async () => {
+    vi.useFakeTimers();
+    // Age 8251s >= ceil(16500 * 0.5) = 8250s, so pendingTtlState alone says
+    // critical -- but the task is still sitting in its stream behind a busy
+    // fleet, so it must be reported as a warning, not paged as critical.
+    vi.setSystemTime(new Date("2026-06-16T02:17:31Z"));
+    try {
+      vi.mocked(scanKeysMany).mockResolvedValue([
+        "bbr-platform:pending:issue:bluebamboollc/bbr-platform:4251",
+      ]);
+      const pipeline = {
+        exists: vi.fn().mockReturnThis(),
+        ttl: vi.fn().mockReturnThis(),
+        get: vi.fn().mockReturnThis(),
+        exec: vi.fn().mockResolvedValue([
+          [null, 0],
+          [null, 8249],
+          [null, JSON.stringify({
+            task_id: "task-4251",
+            created_at: "2026-06-16T00:00:00Z",
+          })],
+        ]),
+      };
+      (redis as unknown as { pipeline: ReturnType<typeof vi.fn> }).pipeline =
+        vi.fn(() => pipeline);
+
+      const stuck = await detectStuck(snapshot({
+        queued_tasks: [{
+          prefix: "bbr-platform",
+          entry_id: "1718496000000-0",
+          task_id: "task-4251",
+          task_type: "implement_issue",
+          repo: "bluebamboollc/bbr-platform",
+          resource_type: "issue",
+          resource_id: "4251",
+          created_at: "2026-06-16T00:00:00Z",
+          stream: "orcest:tasks:issue:codex",
+        }],
+        consumer_groups: [{
+          stream: "orcest:tasks:issue:codex",
+          name: "workers",
+          consumers: 1,
+          pending: 0,
+          lag: 1,
+        }],
+      }));
+
+      expect(stuck).toEqual([{
+        prefix: "bbr-platform",
+        resource_type: "issue",
+        repo: "bluebamboollc/bbr-platform",
+        resource_id: "4251",
+        reason: "Queued but no worker has picked it up (age: 8251s, pending TTL: 8249s)",
+        severity: "warning",
+        stream: "orcest:tasks:issue:codex",
+        consumer_group: "workers",
+        entry_id: "1718496000000-0",
+        task_id: "task-4251",
+      }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps half-TTL escalation critical when the task cannot be found in any queue", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-16T02:17:31Z"));
+    try {
+      vi.mocked(scanKeysMany).mockResolvedValue([
+        "bbr-platform:pending:issue:bluebamboollc/bbr-platform:4251",
+      ]);
+      const pipeline = {
+        exists: vi.fn().mockReturnThis(),
+        ttl: vi.fn().mockReturnThis(),
+        get: vi.fn().mockReturnThis(),
+        exec: vi.fn().mockResolvedValue([
+          [null, 0],
+          [null, 8249],
+          [null, JSON.stringify({
+            task_id: "task-4251",
+            created_at: "2026-06-16T00:00:00Z",
+          })],
+        ]),
+      };
+      (redis as unknown as { pipeline: ReturnType<typeof vi.fn> }).pipeline =
+        vi.fn(() => pipeline);
+
+      const stuck = await detectStuck(snapshot());
+
+      expect(stuck).toEqual([{
+        prefix: "bbr-platform",
+        resource_type: "issue",
+        repo: "bluebamboollc/bbr-platform",
+        resource_id: "4251",
+        reason: "Queued but no worker has picked it up (age: 8251s, pending TTL: 8249s)",
+        severity: "critical",
+      }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("suppresses queued pickup warnings covered by no-consumer critical backlog", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-16T00:03:01Z"));

@@ -265,7 +265,7 @@ class TestCloneUserdata:
         assert cfg["ephemeral"] is True
         assert cfg["pool_managed"] is True
         assert cfg["backend"] == "claude"
-        assert cfg["runner"] == {"type": "claude"}
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
 
     def test_worker_yaml_can_use_isolated_clauder_backend(self):
         output = self._render(
@@ -291,13 +291,30 @@ class TestCloneUserdata:
         with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
             self._render(worker_backend="clauder", worker_runner_mode="batch")
 
-    def test_worker_yaml_can_disable_interactive_mode_for_legacy_claude(self):
+    def test_worker_yaml_defaults_legacy_claude_backend_to_interactive_mode(self):
+        # Legacy fleet configs have no worker_runner_mode field; the deployed
+        # behavior before the field existed was the interactive PTY runner, so
+        # unset must keep it rather than silently downgrading to `claude -p`.
         output = self._render(worker_runner_mode="")
         data = yaml.safe_load(output)
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["backend"] == "claude"
+        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+
+    def test_worker_yaml_can_disable_interactive_mode_for_legacy_claude(self):
+        # Explicit opt-out: 'headless' renders the legacy `claude -p` runner
+        # section with no extra.mode key.
+        output = self._render(worker_runner_mode="headless")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["backend"] == "claude"
         assert cfg["runner"] == {"type": "claude"}
+
+    def test_worker_yaml_rejects_unknown_claude_runner_mode(self):
+        with pytest.raises(ValueError, match="'interactive' or 'headless'"):
+            self._render(worker_backend="claude", worker_runner_mode="batch")
 
     def test_systemd_unit_written(self):
         data = yaml.safe_load(self._render())

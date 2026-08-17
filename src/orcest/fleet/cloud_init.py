@@ -472,8 +472,10 @@ def render_clone_userdata(
         worker_backend: Task backend stream this clone should consume.
         worker_runner_type: Runner implementation type to instantiate.
         worker_runner_mode: Optional runner mode; ``interactive`` selects the
-            PTY Claude runner, while an empty string leaves legacy runner
-            defaults in place.
+            PTY Claude runner (the default for Claude backends, matching the
+            pre-``worker_runner_mode`` deployments), while ``headless``
+            explicitly opts a ``claude`` backend into the legacy ``claude -p``
+            runner.
     """
     normalized_backend, normalized_runner_type, normalized_runner_mode = (
         normalize_worker_runner_for_backend(
@@ -484,7 +486,7 @@ def render_clone_userdata(
     )
     redis_section: dict = {"host": redis_host, "port": 6379, "key_prefix": key_prefix}
     runner_section: dict[str, Any] = {"type": normalized_runner_type}
-    if normalized_runner_mode:
+    if normalized_runner_mode == "interactive":
         runner_section["extra"] = {"mode": normalized_runner_mode}
     worker_yaml = yaml.dump(
         {

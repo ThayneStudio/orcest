@@ -319,13 +319,18 @@ def test_poll_project_routes_single_legacy_token_fallback_to_default_clauder(
     assert mock_publish.call_args.kwargs["claude_token"] == "legacy-single-token"
 
 
-def test_poll_cycle_preserves_explicit_claude_when_default_runner_is_clauder(
+def test_poll_cycle_routes_explicit_claude_to_default_clauder(
     mocker,
     fake_redis_client,
     orchestrator_config,
     gh_mock,
 ):
-    """Explicit provider: claude remains available even when legacy tokens default to clauder."""
+    """An explicit YAML `provider: claude` entry follows the clauder default.
+
+    Worker fleets baked around the default runner consume `tasks:clauder`
+    only; publishing explicit claude credentials to `tasks:claude` would
+    strand those tasks forever with a green preflight.
+    """
     from orcest.orchestrator.provider_pool import ProviderPool
     from orcest.shared.providers import ProviderEntry
 
@@ -354,7 +359,7 @@ def test_poll_cycle_preserves_explicit_claude_when_default_runner_is_clauder(
     )
 
     mock_publish.assert_called_once()
-    assert mock_publish.call_args.kwargs["provider"] == "claude"
+    assert mock_publish.call_args.kwargs["provider"] == "clauder"
     assert mock_publish.call_args.kwargs["credential"] == "explicit-claude-token"
     assert mock_publish.call_args.kwargs["claude_token"] == "explicit-claude-token"
 
@@ -5408,3 +5413,58 @@ def test_distributed_issue_priority_advances_after_lease_expiry(
 
     assert first == "busy"
     assert second_from_busy == second_from_quiet == "quiet"
+
+
+def test_fast_caller_does_not_prune_slow_projects_heartbeat(
+    mocker,
+    fake_redis_client,
+):
+    """Staleness is judged by each heartbeat's OWN declared interval.
+
+    A 5s-interval caller must not prune a sibling orchestrator's heartbeat
+    that declares a 60s interval and is only 30s old; doing so would exclude
+    the slow project from the issue-discovery rotation entirely.
+    """
+    from orcest.orchestrator.loop import (
+        _ISSUE_DISCOVERY_PROJECTS_KEY,
+        _issue_discovery_priority,
+    )
+
+    fast = ProjectConfig(repo="acme/fast", token="t", claude_tokens=[], key_prefix="fast")
+    logger = logging.getLogger("test")
+    mocker.patch("orcest.orchestrator.loop.time.time", return_value=120.0)
+
+    # A slow (60s-interval) sibling wrote its heartbeat 30 seconds ago.
+    fake_redis_client.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, "slow", "90.0|60")
+
+    _issue_discovery_priority(fake_redis_client, [fast], 5, logger)
+
+    heartbeats = fake_redis_client.hgetall(_ISSUE_DISCOVERY_PROJECTS_KEY)
+    assert "slow" in heartbeats, "fast caller pruned a live slow-interval heartbeat"
+    assert "fast" in heartbeats
+
+
+def test_fast_caller_spares_legacy_heartbeat_during_rolling_upgrade(
+    mocker,
+    fake_redis_client,
+):
+    """Timestamp-only heartbeats (old writers) get a generous staleness floor."""
+    from orcest.orchestrator.loop import (
+        _ISSUE_DISCOVERY_PROJECTS_KEY,
+        _issue_discovery_priority,
+    )
+
+    fast = ProjectConfig(repo="acme/fast", token="t", claude_tokens=[], key_prefix="fast")
+    logger = logging.getLogger("test")
+    mocker.patch("orcest.orchestrator.loop.time.time", return_value=120.0)
+
+    # Pre-upgrade writer format: bare timestamp, 30 seconds old.
+    fake_redis_client.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, "legacy", "90.0")
+    # Genuinely dead entries are still pruned.
+    fake_redis_client.hset(_ISSUE_DISCOVERY_PROJECTS_KEY, "dead", "-300.0|5")
+
+    _issue_discovery_priority(fake_redis_client, [fast], 5, logger)
+
+    heartbeats = fake_redis_client.hgetall(_ISSUE_DISCOVERY_PROJECTS_KEY)
+    assert "legacy" in heartbeats, "fast caller pruned a legacy-format heartbeat"
+    assert "dead" not in heartbeats

@@ -18,6 +18,7 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def _no_drain_wait(monkeypatch):
     monkeypatch.setattr("orcest.fleet.pool_manager._DRAIN_QUIESCE_SECONDS", 0)
+    monkeypatch.setattr("orcest.fleet.pool_manager._POST_STOP_PENDING_CHECK_RETRY_SECONDS", 0)
 
 
 def _make_config(
@@ -1457,6 +1458,87 @@ class TestFillPool:
 
         # Both idle VMs hold a pending task -> none drained.
         proxmox.destroy_vm.assert_not_called()
+
+    def test_transient_post_stop_check_failure_does_not_reclassify_vm_as_active(self):
+        """A single transient Redis failure in the post-stop pending check
+        must be retried, not treated as grounds to restart the VM and file
+        it into pool:active (a state nothing transitions back to idle)."""
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 1
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300"}
+        with patch.object(
+            manager,
+            "_consumers_with_pending_status",
+            side_effect=[
+                (set(), True),  # pre-reserve check
+                (set(), True),  # post-quiesce check
+                (set(), False),  # post-stop attempt 1: transient failure
+                (set(), True),  # post-stop attempt 2: succeeds, no pending
+            ],
+        ):
+            manager._fill_pool()
+
+        # The drain completes: VM destroyed, never restarted, never marked active.
+        proxmox.destroy_vm.assert_called_once_with(300)
+        proxmox.start_vm.assert_not_called()
+        pipe = redis.pipeline.return_value
+        active_hsets = [
+            c for c in pipe.hset.call_args_list if c.args and c.args[0] == "pool:active"
+        ]
+        assert active_hsets == []
+
+    def test_persistent_post_stop_check_failure_restarts_vm_and_marks_active(self):
+        """When every bounded retry fails, the conservative branch still
+        restarts the VM and files it into pool:active for the health check."""
+        config = _make_config(pool_size=0)
+        manager, proxmox, redis = _make_manager(config=config)
+        redis.scard.return_value = 1
+        redis.hlen.return_value = 0
+        redis._idle_set = {"300"}
+        with patch.object(
+            manager,
+            "_consumers_with_pending_status",
+            side_effect=[
+                (set(), True),  # pre-reserve check
+                (set(), True),  # post-quiesce check
+                (set(), False),  # post-stop attempt 1
+                (set(), False),  # post-stop attempt 2
+                (set(), False),  # post-stop attempt 3 (bounded: no more calls)
+            ],
+        ) as check:
+            manager._fill_pool()
+
+        assert check.call_count == 5
+        proxmox.destroy_vm.assert_not_called()
+        proxmox.start_vm.assert_called_once_with(300)
+        pipe = redis.pipeline.return_value
+        active_hsets = [
+            c for c in pipe.hset.call_args_list if c.args and c.args[0] == "pool:active"
+        ]
+        assert len(active_hsets) == 1
+        assert active_hsets[0].args[1] == "300"
+
+    def test_profiled_drain_retries_transient_post_stop_check_failure(self):
+        """Same bounded retry protects the heterogeneous drain loop."""
+        manager, proxmox, redis = _make_manager(config=self._mixed_config(size=1))
+        redis._idle_set = {"301"}
+        with patch.object(
+            manager,
+            "_consumers_with_pending_status",
+            side_effect=[
+                (set(), True),  # pre-reserve check
+                (set(), True),  # post-quiesce check
+                (set(), False),  # post-stop attempt 1: transient failure
+                (set(), True),  # post-stop attempt 2: succeeds, no pending
+            ],
+        ):
+            drained = manager._drain_profiled_idle_workers([301])
+
+        assert drained == 1
+        proxmox.destroy_vm.assert_called_once_with(301)
+        proxmox.start_vm.assert_not_called()
 
     @staticmethod
     def _mixed_config(size: int = 4) -> FleetConfig:

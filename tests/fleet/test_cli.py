@@ -3607,6 +3607,136 @@ def test_candidate_worker_attestation_rejects_wrong_tracked_vmid_at_same_count(m
     assert "attested" in console.print.call_args.args[0]
 
 
+def test_candidate_worker_attestation_tolerates_spared_old_revision_workers(mocker):
+    """A busy VM spared by `stop` without --drain-active keeps heartbeating the
+    previous template revision until the pool manager retires it; it must not
+    block attestation of the fully regenerated remaining slots."""
+    revision = "a" * 40
+    old_revision = "b" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=4,
+            vm_id_start=300,
+            worker_profiles=[
+                WorkerProfileConfig(backend="clauder"),
+                WorkerProfileConfig(backend="codex"),
+                WorkerProfileConfig(backend="grok"),
+            ],
+        ),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={
+            "orcest-worker-300": ("clauder", revision),
+            "orcest-worker-301": ("codex", old_revision),
+            "orcest-worker-302": ("grok", revision),
+            "orcest-worker-303": ("clauder", revision),
+        },
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=({"300", "302", "303"}, {"301": "task-1"}),
+    )
+    sleep = mocker.patch("orcest.fleet.cli.time.sleep")
+    console = mocker.Mock()
+
+    _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    sleep.assert_not_called()
+    printed = [call.args[0] for call in console.print.call_args_list]
+    assert any("Ignoring 1 surviving old-revision worker" in line for line in printed)
+    assert "orcest-worker-301" in "".join(printed)
+    assert "attested" in printed[-1]
+
+
+def test_candidate_worker_attestation_requires_at_least_one_new_revision_worker(mocker):
+    """Old-revision survivors alone attest nothing about the new template."""
+    revision = "a" * 40
+    cfg = FleetConfig(
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(
+            size=1,
+            vm_id_start=300,
+            worker_profiles=[WorkerProfileConfig(backend="codex")],
+        ),
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeats",
+        return_value={"orcest-worker-300": ("codex", "b" * 40)},
+    )
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {"300": "task-1"}),
+    )
+    monotonic = mocker.patch("orcest.fleet.cli.time.monotonic", side_effect=[0.0, 0.0, 5.0, 1000.0])
+    mocker.patch("orcest.fleet.cli.time.sleep")
+    console = mocker.Mock()
+
+    with pytest.raises(SystemExit):
+        _wait_for_candidate_workers_impl(cfg, console, expected_revision=revision)
+
+    assert monotonic.call_count == 4
+    assert "did not attest" in console.print.call_args.args[0]
+
+
+def test_deploy_resumes_orchestrators_when_attestation_fails(runner, cfg_path, mocker):
+    """A failed candidate-worker wait must not leave every publisher stopped."""
+    cfg = _proxmox_cfg(
+        proxmox=ProxmoxConfig(
+            endpoint="https://10.20.0.1:8006",
+            api_token_id="root@pam!orcest",
+            api_token_secret="secret",
+        ),
+        orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
+        pool=PoolConfig(template_vm_id=9000, vm_id_start=300, worker_backend="clauder"),
+        orgs={"Org": OrgEntry(github_token="ghp_fake", claude_oauth_tokens=["sk-fake"])},
+        projects=[ProjectEntry(name="alpha", repo="Org/alpha")],
+    )
+    _save(cfg, cfg_path)
+
+    mocker.patch(
+        "orcest.fleet.cli._wait_for_candidate_workers",
+        side_effect=SystemExit(1),
+    )
+    mocker.patch("orcest.fleet.cli._upgrade_cli")
+    _mock_proxmox_client(mocker)
+    mocker.patch("orcest.fleet.orchestrator.stop_pool_manager")
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_pool_redis_members",
+        return_value=(set(), {}),
+    )
+    mocker.patch("orcest.fleet.orchestrator.clean_pending_tasks", return_value=0)
+    mocker.patch("orcest.fleet.orchestrator.upload_source")
+    mocker.patch("orcest.fleet.orchestrator.build_image")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_password", return_value="pw")
+    mocker.patch("orcest.fleet.orchestrator.ensure_redis_stack")
+    mocker.patch("orcest.fleet.orchestrator.generate_env_file", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.generate_orchestrator_config", return_value="")
+    mocker.patch("orcest.fleet.orchestrator.write_project_files")
+    restart_stack = mocker.patch("orcest.fleet.orchestrator.restart_stack")
+    mocker.patch("orcest.fleet.orchestrator.upload_fleet_config")
+    mocker.patch("orcest.fleet.orchestrator.ensure_pool_manager")
+
+    result = runner.invoke(fleet, ["deploy", "--config", cfg_path])
+
+    assert result.exit_code != 0
+    restart_stack.assert_called_once()
+    assert restart_stack.call_args.args[1] == "alpha"
+    assert "Resuming stack for 'alpha'" in result.output
+
+    # Operator explicitly asked for paused stacks: honour that even on failure.
+    restart_stack.reset_mock()
+    result = runner.invoke(
+        fleet,
+        ["deploy", "--keep-orchestrators-paused", "--config", cfg_path],
+    )
+
+    assert result.exit_code != 0
+    restart_stack.assert_not_called()
+    assert "remain stopped by operator request" in result.output
+
+
 def test_deploy_rebuild_template_uses_rebake_pointer_swap(runner, cfg_path, mocker):
     """deploy --rebuild-template must use rebake, not legacy create-template."""
     cfg = _proxmox_cfg(

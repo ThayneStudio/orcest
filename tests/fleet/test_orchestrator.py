@@ -27,8 +27,10 @@ def test_get_deployed_pool_backend_defaults_legacy_config_to_claude(mocker):
         return_value=subprocess.CompletedProcess([], 0, stdout="pool: {}\n", stderr=""),
     )
 
+    # Legacy deployed configs predate worker_runner_mode; they were deployed
+    # with the interactive PTY runner, so the signature reflects that default.
     assert get_deployed_pool_backend("user@host") == (
-        "vm_id_start=0;vm_id_end=0;backend=claude;runner=claude;mode="
+        "vm_id_start=0;vm_id_end=0;backend=claude;runner=claude;mode=interactive"
     )
 
 

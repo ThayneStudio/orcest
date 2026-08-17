@@ -320,7 +320,13 @@ class ClaudeInteractiveRunner:
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text)).replace("\r", "\n")
         # Claude Code renders its main composer with the distinctive ❯ glyph.
         # Setup menus use numbered selections and must never satisfy this gate.
-        return any(line.strip().startswith("❯") for line in stripped.splitlines())
+        # The composer line may be framed inside a box border (e.g. "│ ❯ …"),
+        # so tolerate leading box-drawing characters before the glyph.
+        # Residual risk: the CLI is installed unpinned, and any future menu
+        # (beyond the three setup dialogs excluded above) that renders its
+        # selected row with a leading ❯ would still satisfy this gate; those
+        # menus cannot be enumerated safely ahead of time.
+        return any(line.lstrip(" \t│┃║|").startswith("❯") for line in stripped.splitlines())
 
     def _confirm_workspace_trust_if_needed(
         self,

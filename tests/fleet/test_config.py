@@ -266,6 +266,23 @@ class TestFleetConfigHelpers:
 
         assert pool.worker_runner_type == "codex"
 
+    def test_legacy_claude_backend_defaults_to_interactive_runner_mode(self):
+        # Configs that predate worker_runner_mode were deployed with the
+        # interactive PTY runner; unset must normalize to it, not headless.
+        pool = PoolConfig(worker_backend="claude")
+
+        assert pool.worker_runner_type == "claude"
+        assert pool.worker_runner_mode == "interactive"
+
+    def test_claude_backend_headless_opt_out_is_preserved(self):
+        pool = PoolConfig(worker_backend="claude", worker_runner_mode="headless")
+
+        assert pool.worker_runner_mode == "headless"
+
+    def test_claude_backend_rejects_unknown_runner_mode(self):
+        with pytest.raises(ValueError, match="'interactive' or 'headless'"):
+            PoolConfig(worker_backend="claude", worker_runner_mode="batch")
+
     def test_org_entry_rejects_empty_provider_credential_list(self):
         with pytest.raises(ValueError, match="must not be empty"):
             OrgEntry(provider_credentials={"grok": []})
