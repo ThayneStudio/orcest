@@ -39,7 +39,7 @@ def test_bootstrap_exempt_until_first_progress_or_grace():
 
     ladder.note_stream(now=60, sig=StreamSignal(kind="progress"))
     d = ladder.evaluate(now=60, cpu_seconds=0.0, workspace_changed=False, rep_verdict=None)
-    assert d.state != LadderState.BOOTSTRAP
+    assert d.state == LadderState.ACTIVE
     assert d.transitioned is True
 
     # A weak "output" signal does NOT exit bootstrap.
@@ -48,10 +48,27 @@ def test_bootstrap_exempt_until_first_progress_or_grace():
     d = ladder2.evaluate(now=99, cpu_seconds=0.0, workspace_changed=False, rep_verdict=None)
     assert d.state == LadderState.BOOTSTRAP
 
-    # With no progress signal at all, startup_grace elapsing exits bootstrap.
+    # With no progress signal at all, startup_grace elapsing exits bootstrap
+    # -- resulting state computed normally (the earlier output signal is
+    # still fresh at now=100, so it lands on ACTIVE, not SUSPECT).
     d = ladder2.evaluate(now=100, cpu_seconds=0.0, workspace_changed=False, rep_verdict=None)
-    assert d.state != LadderState.BOOTSTRAP
+    assert d.state == LadderState.ACTIVE
     assert d.transitioned is True
+
+
+def test_ceiling_during_bootstrap_kills_without_exiting_bootstrap():
+    # startup_grace=100, ceiling well inside it: never gets a progress
+    # signal or reaches the grace, but CEILING still applies during
+    # BOOTSTRAP (spec §5: "ladder disabled; ceiling still applies").
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=50, started_at=0)
+    d = ladder.evaluate(now=50, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.BOOTSTRAP
+    assert d.kill == "ceiling"
+
+    d2 = ladder.evaluate(now=80, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+    assert d2.kill is None
+    assert d2.transitioned is False
 
 
 def test_active_survives_past_old_timeout_with_output():
@@ -258,4 +275,283 @@ def test_snapshot_records_signal_ages_and_reason():
 
     # Event-safe: no raw tool args ever surface in the snapshot.
     assert "tool_args" not in snap
-    assert all(not isinstance(v, dict) for v in snap.values())
+    assert snap["looping_verdict"] is None  # no dict values when no verdict is in play
+
+
+# --- Round-1 review findings -------------------------------------------
+
+
+def test_stuck_kill_snapshot_has_per_signal_last_fresh_timestamps():
+    """Finding 1a: the kill-time snapshot must carry the S2 last-fresh
+    timestamp (not just the idle streak count), alongside S1/S3, so a STUCK
+    kill's post-mortem evidence is complete."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)  # progress + cpu=5.0 + workspace_changed=True at now=0
+
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=180, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    d = ladder.evaluate(now=240, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+    snap = d.snapshot
+    # S1: last progress signal at t=0, never refreshed.
+    assert snap["s1_last_fresh_ts"] == 0
+    assert snap["s1_age"] == 240
+    # S2: cpu never actually changed after the baseline sample at t=0, so
+    # the last *nonzero-delta* sample is that baseline call, not "now".
+    assert snap["s2_last_fresh_ts"] == 0
+    assert snap["s2_age"] == 240
+    # S3: workspace only changed once, at t=0 (the checkout).
+    assert snap["s3_last_changed_ts"] == 0
+    assert snap["s3_age"] == 240
+    assert snap["suspect_since"] == 120
+    assert snap["looping_verdict"] is None
+
+
+def test_looping_kill_snapshot_has_verdict_details():
+    """Finding 1b: a LOOPING kill's snapshot must merge the tripped
+    RepetitionVerdict's stream/count/hashes -- the Decision carries it, the
+    caller shouldn't have to separately correlate it."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    ladder.note_stream(now=0, sig=StreamSignal(kind="progress"))
+
+    verdict = RepetitionVerdict(stream="exact", count=4, hashes=("deadbeef01",))
+    ladder.evaluate(now=0, cpu_seconds=1.0, workspace_changed=True, rep_verdict=verdict)
+    d = ladder.evaluate(now=30, cpu_seconds=2.0, workspace_changed=True, rep_verdict=verdict)
+
+    assert d.state == LadderState.LOOPING
+    assert d.kill == "looping"
+    snap = d.snapshot
+    assert snap["looping_verdict"] == {
+        "stream": "exact",
+        "count": 4,
+        "hashes": ("deadbeef01",),
+    }
+    # Per-signal ages are still present too (this is the kill post-mortem).
+    assert snap["s1_last_fresh_ts"] == 0
+    assert snap["s3_last_changed_ts"] == 30  # workspace_changed=True on this final call too
+
+
+def test_perpetual_waiting_defers_to_ceiling():
+    """Finding 2 (ruled): continuous api_retry/waiting signals defer STUCK
+    indefinitely -- "waiting on provider" is not stall. Only CEILING can
+    end a task that is perpetually (re-)entering WAITING grace."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    now = 120
+    while now < 1000:
+        # Each new waiting signal arrives well inside waiting_grace (200s)
+        # of the previous one, so the grace window never actually expires.
+        ladder.note_stream(now=now, sig=StreamSignal(kind="waiting", reason="rate_limit"))
+        d = ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+        assert d.kill is None
+        assert d.state == LadderState.SUSPECT
+        now += 150
+
+    # CEILING backstops it regardless -- transient classification, unlike a
+    # corroborated STUCK/LOOPING kill.
+    d = ladder.evaluate(now=1000, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.kill == "ceiling"
+
+
+def test_stuck_precedes_ceiling_on_collision():
+    """Finding 3 (ruled): when STUCK and CEILING would both fire on the same
+    evaluate(), report "stuck" (permanent), not "ceiling" (transient)."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=240, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=180, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    # now - started_at == 240 == ceiling, exactly when STUCK also fires.
+    d = ladder.evaluate(now=240, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+
+
+def test_looping_precedes_ceiling_on_collision():
+    """Finding 3 (ruled): same precedence for LOOPING vs CEILING."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=30, started_at=0)
+    ladder.note_stream(now=0, sig=StreamSignal(kind="progress"))
+    verdict = RepetitionVerdict(stream="exact", count=4, hashes=("collide0",))
+    ladder.evaluate(now=0, cpu_seconds=1.0, workspace_changed=True, rep_verdict=verdict)
+
+    # now - started_at == 30 == ceiling, exactly when LOOPING also fires.
+    d = ladder.evaluate(now=30, cpu_seconds=2.0, workspace_changed=True, rep_verdict=verdict)
+    assert d.state == LadderState.LOOPING
+    assert d.kill == "looping"
+
+
+def test_escalation_blocked_defers_stuck_kill():
+    """Finding 4 (ruled, load-bearing for B7): escalation_blocked=True
+    defers a would-be STUCK kill -- state stays SUSPECT, nothing latches
+    _done, and a later unblocked evaluate() can still kill if conditions
+    persist."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    ladder.evaluate(now=180, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    d = ladder.evaluate(
+        now=240,
+        cpu_seconds=5.0,
+        workspace_changed=False,
+        rep_verdict=None,
+        escalation_blocked=True,
+    )
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+    assert d.transitioned is False
+
+    d = ladder.evaluate(now=270, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+
+
+def test_escalation_blocked_defers_looping_kill():
+    """Finding 4 (ruled): same deferral behavior for LOOPING."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    ladder.note_stream(now=0, sig=StreamSignal(kind="progress"))
+    verdict = RepetitionVerdict(stream="exact", count=4, hashes=("gated000",))
+
+    ladder.evaluate(now=0, cpu_seconds=1.0, workspace_changed=True, rep_verdict=verdict)
+    d = ladder.evaluate(
+        now=30,
+        cpu_seconds=2.0,
+        workspace_changed=True,
+        rep_verdict=verdict,
+        escalation_blocked=True,
+    )
+    assert d.state != LadderState.LOOPING
+    assert d.kill is None
+
+    d = ladder.evaluate(now=60, cpu_seconds=3.0, workspace_changed=True, rep_verdict=verdict)
+    assert d.state == LadderState.LOOPING
+    assert d.kill == "looping"
+
+
+def test_suspect_persistence_resets_after_rescue():
+    """Finding 5 coverage gap: after a rescue back to ACTIVE, re-entering
+    SUSPECT requires a fresh full idle_window -- the old suspect_since must
+    not carry over and let STUCK fire early."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    d = ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT  # suspect_since = 120
+
+    d = ladder.evaluate(now=150, cpu_seconds=6.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.ACTIVE  # rescued
+
+    for now in (180, 210):
+        d = ladder.evaluate(now=now, cpu_seconds=6.0, workspace_changed=False, rep_verdict=None)
+        assert d.state != LadderState.SUSPECT
+
+    d = ladder.evaluate(now=240, cpu_seconds=6.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT  # re-entered with a *new* suspect_since = 240
+
+    # If suspect_since had incorrectly carried over from the first episode
+    # (120), STUCK would already be reachable here (240 - 120 = 120 >=
+    # idle_window). It must not fire -- a fresh full window is required.
+    d = ladder.evaluate(now=250, cpu_seconds=6.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+
+    d = ladder.evaluate(now=340, cpu_seconds=6.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+
+
+def test_cpu_none_process_gone_drives_to_stuck():
+    """Finding 5 coverage gap: cpu_seconds=None (process tree gone) must
+    drive S2 idle and, combined with stale S1/S3, all the way to STUCK."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    ladder.note_stream(now=0, sig=StreamSignal(kind="progress"))
+    d = ladder.evaluate(now=0, cpu_seconds=None, workspace_changed=True, rep_verdict=None)
+    assert d.state == LadderState.ACTIVE
+
+    for now in (30, 60, 90):
+        d = ladder.evaluate(now=now, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+        assert d.state != LadderState.SUSPECT
+
+    d = ladder.evaluate(now=120, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+
+    d = ladder.evaluate(now=180, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+
+    d = ladder.evaluate(now=240, cpu_seconds=None, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+
+
+def test_waiting_signal_during_suspect_still_blocks_stuck():
+    """Finding 5 coverage gap: a waiting signal that arrives *after* SUSPECT
+    was already entered still gates the SUSPECT -> STUCK edge from that
+    point on."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    d = ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+
+    ladder.note_stream(now=150, sig=StreamSignal(kind="waiting", reason="rate_limit"))
+
+    # Would-be STUCK moment (120 + idle_window), but within waiting_grace
+    # (150 + 200 = 350) of the late-arriving signal.
+    d = ladder.evaluate(now=240, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+
+    d = ladder.evaluate(now=360, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
+
+
+def test_exact_staleness_and_stuck_hold_boundaries():
+    """Finding 5 coverage gap: freshness is strict "<" (age == idle_window
+    already counts as stale), while the STUCK hold check is ">=" (held ==
+    idle_window already fires) -- pin both boundaries exactly."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+
+    for now in (25, 50, 75):
+        d = ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+        assert d.state != LadderState.SUSPECT
+
+    # age == idle_window (100) exactly -> already stale.
+    d = ladder.evaluate(now=100, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+
+    d = ladder.evaluate(now=199, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+
+    # held == idle_window (100) exactly -> STUCK fires right on the
+    # boundary, not one tick past it.
+    d = ladder.evaluate(now=200, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.STUCK
+    assert d.kill == "stuck"
