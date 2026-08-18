@@ -89,6 +89,39 @@ def parse_blocker_refs(body: str) -> set[int]:
     return refs
 
 
+def native_open_blockers(issue_data: dict, repo: str) -> list[str]:
+    """Display refs of the issue's still-blocking GitHub-native dependencies.
+
+    Reads the `blocked_by` list that `gh.list_labeled_issues` normalizes from
+    the GraphQL `blockedBy` connection ({number, state, repo} dicts). Because
+    the blocker's state arrives inline, this costs no extra API calls, and
+    cross-repo blockers are supported (rendered as `owner/repo#N`; same-repo
+    ones as `#N`).
+
+    A blocker with a missing/unrecognized state fails safe to blocking,
+    mirroring the "unknown" semantics of body-declared dependencies. Only
+    "CLOSED" (and merged, for PR-typed blockers) clears a blocker.
+
+    Sorted same-repo first, then by repo and number, so log lines read
+    naturally.
+    """
+    blockers: list[tuple[int, str, int]] = []
+    for blocker in issue_data.get("blocked_by") or []:
+        state = blocker.get("state")
+        if isinstance(state, str) and state.upper() in ("CLOSED", "MERGED"):
+            continue
+        number = blocker["number"]
+        blocker_repo = blocker.get("repo") or repo
+        if blocker_repo == repo:
+            blockers.append((0, "", number))
+        else:
+            blockers.append((1, blocker_repo, number))
+    return [
+        f"#{number}" if not blocker_repo else f"{blocker_repo}#{number}"
+        for _, blocker_repo, number in sorted(blockers)
+    ]
+
+
 def fetch_blocker_states(
     repo: str,
     numbers: set[int],
