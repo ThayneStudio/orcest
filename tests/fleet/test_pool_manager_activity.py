@@ -6,13 +6,23 @@ worker/liveness_tracker.py's ``_write_activity_record``) now blocks
 destruction outright. Destruction below the ceiling only fires when:
 
 - the record's ``needs_reap`` field is ``"1"`` (the watchdog already latched
-  a kill decision), or
-- the record is absent-or-stale (worker died, or activity tracking never
-  started) AND the consumer still holds pending stream entries -- proving
-  there is a task to recover rather than an idle/just-claimed worker.
+  a kill decision -- trustworthy as-is, no heartbeat corroboration needed), or
+- the record is absent-or-stale AND the worker's liveness heartbeat
+  (``workers:heartbeat:{worker_id}``, written by every worker regardless of
+  watchdog config -- see ``worker/loop.py``) is ALSO absent AND the consumer
+  still holds pending stream entries.
+
+Fix round 1 (CRITICAL): an absent-or-stale activity record is *not* by
+itself proof of death -- ``watchdog.enabled: false`` (the ship-dark stage
+and the rollback lever) means no worker ever writes this record, and the
+same is true for an old worker image mid-rollout that predates the
+tracker. Only when the heartbeat is *also* absent does an absent/stale
+activity record mean anything; a present heartbeat means "alive, just not
+running the watchdog" and is left to the ceiling exactly like the
+pre-watchdog reaper.
 
 The ceiling itself is unconditional: ``elapsed > max_task_duration`` always
-destroys, regardless of how fresh the activity record is.
+destroys, regardless of how fresh the activity record or heartbeat are.
 
 Arrange blocks mirror TestHealthCheckReapCoordination in
 tests/fleet/test_pool_manager.py and the reason-field checks in
@@ -51,15 +61,27 @@ def _build(fake_redis_client, max_task_duration: int = 25200):
     return manager, proxmox
 
 
-def _write_activity_record(rc, *, needs_reap: bool, last_liveness_ts: float) -> None:
+def _write_activity_record(
+    rc, *, needs_reap: bool, last_liveness_ts: float, worker_id: str = _WORKER_ID
+) -> None:
     """Write a ``workers:activity:{worker_id}`` hash the way LivenessTracker does:
     unprefixed (global, cross-project) key, via the ``*_raw`` helpers."""
-    rc.hset_raw(_ACTIVITY_KEY, "task_id", "task-1")
-    rc.hset_raw(_ACTIVITY_KEY, "state", "active")
-    rc.hset_raw(_ACTIVITY_KEY, "last_liveness_ts", str(last_liveness_ts))
-    rc.hset_raw(_ACTIVITY_KEY, "ladder_since", str(last_liveness_ts))
-    rc.hset_raw(_ACTIVITY_KEY, "needs_reap", "1" if needs_reap else "0")
-    rc.hset_raw(_ACTIVITY_KEY, "snapshot", json.dumps({}))
+    key = f"workers:activity:{worker_id}"
+    rc.hset_raw(key, "task_id", "task-1")
+    rc.hset_raw(key, "state", "active")
+    rc.hset_raw(key, "last_liveness_ts", str(last_liveness_ts))
+    rc.hset_raw(key, "ladder_since", str(last_liveness_ts))
+    rc.hset_raw(key, "needs_reap", "1" if needs_reap else "0")
+    rc.hset_raw(key, "snapshot", json.dumps({}))
+
+
+def _write_heartbeat(rc, worker_id: str) -> None:
+    """Write ``workers:heartbeat:{worker_id}`` the way every worker does
+    unconditionally (worker/loop.py), regardless of watchdog config. Uses
+    the auto-prefixing ``set_value`` -- matches ``_worker_heartbeat_present``,
+    which reads via the auto-prefixing ``exists``, i.e. this key IS
+    project-scoped, unlike the global activity record."""
+    rc.set_value(f"workers:heartbeat:{worker_id}", "1")
 
 
 def _claim_pending_task(rc, worker_id: str) -> Task:
@@ -133,15 +155,18 @@ class TestActivityAwareHealthCheck:
         proxmox.destroy_vm.assert_called_once_with(305)
 
     def test_absent_record_with_pending_entries_destroys(self, fake_redis_client):
-        """No activity record at all (worker died before ever reporting, or
-        its TTL already expired) combined with a pending stream entry proves
+        """True worker death: no activity record (worker died before ever
+        reporting, or its TTL already expired) AND no liveness heartbeat
+        (nobody -- not even a non-watchdog worker -- is renewing it, so the
+        process itself is gone) combined with a pending stream entry proves
         there is a task to recover -- destroy."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
         rc.hset("pool:active", "305", str(now - 10))
         _claim_pending_task(rc, _WORKER_ID)
-        # No activity record written for _WORKER_ID.
+        # No activity record and no heartbeat written for _WORKER_ID -- the
+        # worker process is provably gone, not just quiet on activity.
 
         manager._health_check()
 
@@ -156,6 +181,71 @@ class TestActivityAwareHealthCheck:
         now = time.time()
         rc.hset("pool:active", "305", str(now - 10))
         # No activity record, no claimed task.
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_watchdog_disabled_absent_record_present_heartbeat_not_destroyed(
+        self, fake_redis_client
+    ):
+        """Fix round 1 (CRITICAL): simulates watchdog.enabled: false (the
+        ship-dark stage and the rollback lever) or an old worker image mid-
+        rollout. No worker ever writes the activity record in that case, but
+        every worker -- watchdog or not -- writes its liveness heartbeat
+        unconditionally (worker/loop.py). A present heartbeat means the
+        worker is alive and just not reporting activity: leave it to the
+        ceiling, exactly like the pre-watchdog reaper, even with a pending
+        task. Without the heartbeat gate this VM would be wrongly destroyed
+        on every health pass while the task is still in flight."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 10))
+        _write_heartbeat(rc, _WORKER_ID)
+        _claim_pending_task(rc, _WORKER_ID)
+        # No activity record written -- watchdog is "disabled".
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_true_worker_death_no_record_no_heartbeat_pending_destroys(self, fake_redis_client):
+        """True worker death, stated explicitly and independent of default
+        mock/fixture state: no activity record AND no liveness heartbeat AND
+        a pending stream entry -- the process is provably gone and there is
+        work to recover. Destroy with reason "activity_stale"."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 10))
+        _claim_pending_task(rc, _WORKER_ID)
+        assert rc.get(f"workers:heartbeat:{_WORKER_ID}") is None
+        assert rc.hgetall_raw(_ACTIVITY_KEY) == {}
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+        reaped = _reaped_events(rc)
+        assert len(reaped) == 1
+        assert reaped[0]["data"]["reason"] == "activity_stale"
+
+    def test_stale_record_with_present_heartbeat_not_destroyed(self, fake_redis_client):
+        """A stale (not merely absent) activity record behaves the same as an
+        absent one: it only means something once the heartbeat is also gone.
+        Here the record is well past activity_stale_after but the heartbeat
+        is fresh, so the worker is alive -- leave it to the ceiling."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 10))
+        stale_ts = now - 10000  # activity_stale_after default is 300s
+        _write_activity_record(rc, needs_reap=False, last_liveness_ts=stale_ts)
+        _write_heartbeat(rc, _WORKER_ID)
+        _claim_pending_task(rc, _WORKER_ID)
 
         manager._health_check()
 

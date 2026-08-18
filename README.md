@@ -63,11 +63,17 @@ actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-m
   a global `workers:activity:{worker_id}` Redis hash
   (`task_id`/`state`/`last_liveness_ts`/`needs_reap`). `PoolManager
   ._health_check` consumes it: below the hard `max_task_duration` ceiling
-  it now destroys a VM only when `needs_reap` is set or the activity record
-  is absent/stale *and* the consumer still has pending work — never on
-  elapsed time alone, and a fresh record blocks destruction outright.
-  `watchdog.enabled: false` is the rollback lever, restoring the
-  pre-watchdog pure wall-clock ceiling with no other change. See
+  it destroys a VM when `needs_reap` is set, or when the activity record is
+  absent/stale **and** the worker's `workers:heartbeat:{worker_id}`
+  liveness heartbeat (written by every worker unconditionally, watchdog on
+  or off) is *also* absent **and** the consumer still has pending work —
+  never on elapsed time alone, never on a missing activity record by
+  itself (that's expected whenever the watchdog is off or the worker
+  predates it), and a fresh record blocks destruction outright.
+  `watchdog.enabled: false` is the rollback lever, restoring
+  wall-clock-only behavior — the runner's fixed `timeout` plus a
+  ceiling-only reaper — at this migration's raised default ceilings, not a
+  return to the original pre-migration numbers. See
   [`docs/monitor-exposure-runbook.md`](docs/monitor-exposure-runbook.md)'s
   "Watchdog rollout" section for staged enablement.
 - **Event relay** — an orchestrator-side loop tails the events stream and
