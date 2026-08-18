@@ -176,6 +176,10 @@ def _write_project_files_from_config(
         )
 
     org = cfg.resolve_org(project)
+    if cfg.monitor_ingest_url and not cfg.monitor_write_token:
+        raise ValueError(
+            "monitor_ingest_url is configured but monitor_write_token is empty"
+        )
     env_content = generate_env_file(
         github_token=org.github_token,
         key_prefix=project.name,
@@ -184,6 +188,7 @@ def _write_project_files_from_config(
         provider_credentials=getattr(org, "provider_credentials", None),
         trace_archive_host_path=cfg.trace_archive_host_path,
         redis_password=redis_password,
+        monitor_write_token=cfg.monitor_write_token,
     )
     config_yaml = generate_orchestrator_config(
         repo=project.repo,
@@ -191,6 +196,7 @@ def _write_project_files_from_config(
         extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
         default_runner=cfg.pool.default_task_backend(),
         trace_archive_enabled=bool(cfg.trace_archive_host_path),
+        monitor_ingest_url=cfg.monitor_ingest_url,
     )
     write_project_files(ssh_target, project.name, env_content, config_yaml)
 

@@ -747,3 +747,16 @@ class TestMaxTaskDurationDefault:
         loaded = load_config(path)
 
         assert loaded.pool.watchdog_enabled is False
+
+    def test_round_trip_monitor_ingest_credentials(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            monitor_ingest_url="http://monitor:9091/ingest/v1/events",
+            monitor_write_token="write-secret",
+        )
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert loaded.monitor_ingest_url == "http://monitor:9091/ingest/v1/events"
+        assert loaded.monitor_write_token == "write-secret"

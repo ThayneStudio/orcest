@@ -22,7 +22,7 @@ services:
       # else the healthcheck auths with an empty password -> container reports
       # "unhealthy" and fleet redis-cli ops fail WRONGPASS.
       - ORCEST_REDIS_PASSWORD=${ORCEST_REDIS_PASSWORD}
-    command: redis-server --requirepass ${ORCEST_REDIS_PASSWORD} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    command: redis-server --requirepass ${ORCEST_REDIS_PASSWORD} --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
     restart: unless-stopped
     healthcheck:
       # $$ escapes Compose interpolation so the var is read inside the container.
@@ -36,7 +36,9 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    mem_limit: 512m
+    # Leave room above Redis's dataset ceiling for allocator/AOF overhead so
+    # Docker cannot OOM-kill it before the noeviction guard takes effect.
+    mem_limit: 1536m
     networks:
       - orcest
 

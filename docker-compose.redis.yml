@@ -5,7 +5,7 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -13,7 +13,7 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
-    mem_limit: 512m
+    mem_limit: 1536m
     logging:
       driver: json-file
       options:

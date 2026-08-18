@@ -1162,6 +1162,7 @@ def generate_env_file(
     provider_credentials: dict[str, list[str]] | None = None,
     trace_archive_host_path: str | None = None,
     redis_password: str = "",
+    monitor_write_token: str = "",
 ) -> str:
     """Generate .env file content for a project's Docker Compose stack.
 
@@ -1198,6 +1199,9 @@ def generate_env_file(
         # the redis stack's --requirepass; the .env is written 0600.
         _validate_env_value(redis_password, "redis_password")
         lines.append(f"ORCEST_REDIS_PASSWORD='{redis_password}'")
+    if monitor_write_token:
+        _validate_env_value(monitor_write_token, "monitor_write_token")
+        lines.append(f"MONITOR_WRITE_TOKEN='{monitor_write_token}'")
     if trace_archive_host_path:
         _validate_env_value(trace_archive_host_path, "trace_archive_host_path")
         if not trace_archive_host_path.startswith("/"):
@@ -1259,6 +1263,7 @@ def generate_orchestrator_config(
     extra_providers: list[str] | None = None,
     default_runner: str | None = None,
     trace_archive_enabled: bool = False,
+    monitor_ingest_url: str | None = None,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
 
@@ -1295,4 +1300,7 @@ def generate_orchestrator_config(
         # In-container path; the operator bind-mounts whatever filesystem they
         # want at ORCEST_TRACE_HOST_PATH on the host side (see docker-compose.yml).
         config["trace_archive_path"] = "/var/lib/orcest/traces"
+    if monitor_ingest_url:
+        config["monitor_ingest_url"] = monitor_ingest_url
+        config["monitor_write_token_env"] = "MONITOR_WRITE_TOKEN"
     return yaml.dump(config, default_flow_style=False, sort_keys=False)

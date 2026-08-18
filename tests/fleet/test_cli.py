@@ -746,6 +746,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "provider_credentials": {},
         "trace_archive_host_path": "/mnt/orcest/traces",
         "redis_password": "redis-pw",
+        "monitor_write_token": "",
     }
     assert gen_config.call_args.kwargs == {
         "repo": "Org/alpha",
@@ -753,6 +754,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "extra_providers": [],
         "default_runner": "clauder",
         "trace_archive_enabled": True,
+        "monitor_ingest_url": None,
     }
     write_files.assert_called_once_with("orcest@10.20.0.23", "alpha", "env", "yaml")
 

@@ -220,6 +220,16 @@ class TestGenerateEnvFile:
         env = generate_env_file(github_token="t", key_prefix="p", project_name="p")
         assert "ORCEST_REDIS_PASSWORD" not in env
 
+    def test_generate_env_file_emits_monitor_write_token(self):
+        env = generate_env_file(
+            github_token="t",
+            key_prefix="p",
+            project_name="p",
+            monitor_write_token="monitor-secret",
+        )
+
+        assert "MONITOR_WRITE_TOKEN='monitor-secret'" in env
+
     def test_generate_env_file_rejects_single_quote_in_redis_password(self):
         """C1: the password is single-quoted in .env, so a single quote must be
         rejected (mirrors the github_token/key_prefix injection guards)."""
@@ -259,6 +269,18 @@ class TestGenerateOrchestratorConfig:
         """The key_prefix in the config matches what was passed."""
         data = yaml.safe_load(generate_orchestrator_config(repo="O/r", key_prefix="alpha"))
         assert data["redis"]["key_prefix"] == "alpha"
+
+    def test_emits_monitor_ingest_wiring(self):
+        data = yaml.safe_load(
+            generate_orchestrator_config(
+                repo="O/r",
+                key_prefix="p",
+                monitor_ingest_url="http://monitor:9091/ingest/v1/events",
+            )
+        )
+
+        assert data["monitor_ingest_url"] == "http://monitor:9091/ingest/v1/events"
+        assert data["monitor_write_token_env"] == "MONITOR_WRITE_TOKEN"
 
     def test_no_providers_block_without_extra_providers(self):
         """Default: no providers: block (claude comes from legacy synthesis)."""
