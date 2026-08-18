@@ -68,10 +68,12 @@ providers:
 # Fleet-health kill-pressure gate for the activity watchdog's STUCK/LOOPING
 # escalation (CEILING kills are exempt from this gate and its budget). Keeps
 # a systemic issue (e.g. a bad model rollout) from reading as many
-# independent stalls and mass-killing the fleet. Values below are the
-# defaults; uncomment to override.
+# independent stalls and mass-killing the fleet. Values below show the
+# defaults EXCEPT max_kills_per_hour, whose default is 0 (observation mode:
+# the watchdog detects stalls and emits events but fires NO kills). Set a
+# positive max_kills_per_hour to enable autonomous kills; uncomment to override.
 # fleet_health:
 #   pressure_min_tasks: 3    # concurrent kill-worthy tasks within pressure_window before the gate opens
 #   pressure_window: 600     # seconds over which pressure_min_tasks is evaluated
 #   pressure_hold: 900       # seconds the gate stays open once triggered
-#   max_kills_per_hour: 6    # rolling-hour ceiling on non-CEILING kills fleet-wide
+#   max_kills_per_hour: 0    # 0 = kills disabled (observation). Raise to enable a rolling-hour ceiling on non-CEILING kills fleet-wide

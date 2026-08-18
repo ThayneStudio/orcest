@@ -199,7 +199,8 @@ kill step runs):
 - If `orcest:fleet:pressure` is set (§8), SUSPECT→STUCK escalation is
   suspended: keep publishing `task.suspect` into the timeline (they are
   data), but do not kill and do not page.
-- Global kill rate-limit: at most `max_kills_per_hour` (default 6)
+- Global kill rate-limit: at most `max_kills_per_hour` (default **0** =
+  observation mode, no kills; amended post-implementation from 6)
   ladder-triggered kills fleet-wide. The orchestrator mirrors the
   configured limit to `orcest:fleet:kill_budget:limit`; workers INCR an
   hourly Redis counter and compare against it, so the fleet-wide policy
