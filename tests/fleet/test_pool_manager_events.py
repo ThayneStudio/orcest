@@ -2,10 +2,12 @@
 worker VM.
 
 Fix round 1: the event's data.reason must be honest per call site, not
-hardcoded to "max_task_duration" for every _coordinate_reaped_vm caller.
-Covers the two extremes: the real timeout path (_health_check, reason
-"max_task_duration", elapsed_seconds present) and a non-timeout path
-(_check_done_workers, reason "done_cleanup", elapsed_seconds omitted).
+hardcoded to a single value for every _coordinate_reaped_vm caller.
+Covers the two extremes: the real ceiling-timeout path (_health_check,
+reason "ceiling" -- see test_pool_manager_activity.py for the other two
+_health_check reasons, "needs_reap" and "activity_stale", added by B11's
+activity-aware reaper) and a non-timeout path (_check_done_workers, reason
+"done_cleanup", elapsed_seconds omitted).
 
 Arrange blocks mirror
 TestHealthCheckReapCoordination.test_reaped_vm_publishes_transient_failure_and_clears_marker
@@ -64,7 +66,7 @@ def _reaped_events(rc) -> list[dict]:
 
 
 def test_reaped_event_emitted(fake_redis_client):
-    """Health-check timeout reap: reason is honestly "max_task_duration" with elapsed_seconds."""
+    """Health-check ceiling reap: reason is honestly "ceiling" with elapsed_seconds."""
     rc = fake_redis_client  # prefix 'test'
     manager, _proxmox = _build(rc)
     worker_id = "orcest-worker-305"
@@ -76,7 +78,7 @@ def test_reaped_event_emitted(fake_redis_client):
 
     reaped = _reaped_events(rc)
     assert len(reaped) == 1
-    assert reaped[0]["data"]["reason"] == "max_task_duration"
+    assert reaped[0]["data"]["reason"] == "ceiling"
     assert reaped[0]["data"]["worker_id"] == worker_id
     assert reaped[0]["subject"] == task.id
     assert isinstance(reaped[0]["data"]["elapsed_seconds"], float)

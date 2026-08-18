@@ -54,6 +54,22 @@ actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-m
   per-project Redis stream (`events`, `MAXLEN` 50000); emission never
   raises into the producer's main path (swallow-and-log). Events never
   carry raw tool arguments, tool output, prompts, or credentials.
+- **Activity watchdog** — each worker runs a per-task liveness ladder
+  (`worker/liveness_tracker.py`: stdout-line classification, process-tree
+  and workspace sampling, tool-call repetition detection) that escalates
+  BOOTSTRAP → ACTIVE/WAITING → SUSPECT → STUCK/LOOPING and can kill a
+  stalled task early, gated by a fleet-wide kill budget and pressure gate
+  so it never piles on during a fleet-wide incident. Every sample it writes
+  a global `workers:activity:{worker_id}` Redis hash
+  (`task_id`/`state`/`last_liveness_ts`/`needs_reap`). `PoolManager
+  ._health_check` consumes it: below the hard `max_task_duration` ceiling
+  it now destroys a VM only when `needs_reap` is set or the activity record
+  is absent/stale *and* the consumer still has pending work — never on
+  elapsed time alone, and a fresh record blocks destruction outright.
+  `watchdog.enabled: false` is the rollback lever, restoring the
+  pre-watchdog pure wall-clock ceiling with no other change. See
+  [`docs/monitor-exposure-runbook.md`](docs/monitor-exposure-runbook.md)'s
+  "Watchdog rollout" section for staged enablement.
 - **Event relay** — an orchestrator-side loop tails the events stream and
   forwards batches to the monitor's ingest listener over HTTP, tracking
   its own Redis cursor (`event_relay:cursor`). Disabled unless

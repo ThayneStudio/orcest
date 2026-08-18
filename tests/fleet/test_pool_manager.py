@@ -99,6 +99,10 @@ def _make_redis(idle_set: set[str] | None = None) -> MagicMock:
 
     mock.scan_iter.return_value = []
     mock.hgetall.return_value = {}
+    # Activity-watchdog record: default to absent (no fresh record) so tests
+    # that don't care about the activity-aware reaper get the pre-B11
+    # ceiling-only behavior (absent + no pending consumers -> not destroyed).
+    mock.hgetall_raw.return_value = {}
     mock.smembers.side_effect = _smembers
     mock.scard.return_value = 0
     mock.hlen.return_value = 0
