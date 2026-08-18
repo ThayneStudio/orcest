@@ -49,6 +49,12 @@ services:
     depends_on:
       monitor:
         condition: service_healthy
+    # Linux Docker does not create this Desktop-compatible hostname by
+    # default.  The remotely-managed tunnel also has a legacy catch-all that
+    # targets the VM-host service on port 8080, so make that origin resolvable
+    # without publishing it to the LAN.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging:
       driver: json-file
       options:
