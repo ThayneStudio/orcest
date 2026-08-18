@@ -105,19 +105,15 @@ Only do this if the query API needs to be reachable from outside the
 orchestrator host (e.g. a dashboard or a teammate's laptop). The ingest
 listener (`9091`) is never exposed this way — see the warning below.
 
-1. Add `cloudflared` as a sidecar in `docker-compose.monitor.yml` (or run it
-   as its own compose stack on the same `orcest` network), pointed at the
-   `monitor` service's query port:
+1. The checked-in `docker-compose.monitor.yml` includes `cloudflared` behind
+   the opt-in `cloudflare` profile. Add the remotely-managed tunnel token to
+   the protected monitor environment file:
 
-   ```yaml
-     cloudflared:
-       image: cloudflare/cloudflared:latest
-       restart: unless-stopped
-       command: tunnel run
-       environment:
-         - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:?set in .env}
-       networks:
-         - orcest
+   ```bash
+   echo "CLOUDFLARE_TUNNEL_TOKEN=<token>" >> .monitor.env
+   chmod 0600 .monitor.env
+   docker compose --env-file .monitor.env --profile cloudflare \
+     -f docker-compose.monitor.yml -p orcest-monitor up -d cloudflared
    ```
 
    Configure the tunnel's ingress rule (via the Cloudflare dashboard or
