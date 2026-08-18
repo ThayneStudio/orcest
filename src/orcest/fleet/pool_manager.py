@@ -376,8 +376,9 @@ class PoolManager:
                     logger.warning(
                         "Restarting drained VM %d and marking it active: post-stop "
                         "pending-state inspection failed after retries; the health "
-                        "check will reap it after max_task_duration if it never "
-                        "finishes a task",
+                        "check will reap it once it exceeds max_task_duration, or "
+                        "once its activity record and liveness heartbeat both go "
+                        "stale/absent while work is still pending",
                         vm_id,
                     )
                     self._restore_worker_after_failed_drain(
@@ -521,8 +522,9 @@ class PoolManager:
                 logger.warning(
                     "Restarting drained VM %d and marking it active: post-stop "
                     "pending-state inspection failed after retries; the health "
-                    "check will reap it after max_task_duration if it never "
-                    "finishes a task",
+                    "check will reap it once it exceeds max_task_duration, or "
+                    "once its activity record and liveness heartbeat both go "
+                    "stale/absent while work is still pending",
                     vm_id,
                 )
                 self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
@@ -1245,9 +1247,12 @@ class PoolManager:
         """Force-destroy VMs past the max_task_duration ceiling, or whose
         worker activity record (spec §6) proves the task is stuck or dead
         below the ceiling: ``needs_reap == "1"`` fires immediately; an
-        absent-or-stale record fires only when the consumer still holds
-        pending stream entries. A fresh activity record blocks destruction
-        below the ceiling regardless of elapsed time.
+        absent-or-stale record fires only when the worker's liveness
+        heartbeat is also absent (proving the process itself is gone, not
+        just quiet on activity reporting -- see ``_activity_reap_reason``)
+        and the consumer still holds pending stream entries. A fresh
+        activity record blocks destruction below the ceiling regardless of
+        elapsed time.
         """
         active = self._redis.hgetall(_POOL_ACTIVE_KEY)
         if not active:
@@ -1342,12 +1347,27 @@ class PoolManager:
         max_task_duration ceiling (spec §6).
 
         ``needs_reap == "1"`` fires immediately -- the watchdog already
-        latched a kill decision for this task. Otherwise, an absent-or-stale
-        record (the worker died, or activity tracking never started) only
-        fires when the consumer still holds pending stream entries, which
-        proves there is a task to recover rather than an idle worker whose
-        record simply hasn't been written yet. A fresh record blocks
-        destruction outright: returns ``None``.
+        latched a kill decision for this task, so the record is trustworthy
+        as-is.
+
+        An absent-or-stale record is different: by itself it is NOT proof of
+        death. ``watchdog.enabled: false`` (the ship-dark stage and the
+        rollback lever) means no worker ever writes this record at all, and
+        the same is true for an old worker image mid-rollout that predates
+        the tracker. So an absent-or-stale record only becomes a destroy
+        signal when it is corroborated by the worker's liveness heartbeat
+        (``workers:heartbeat:{worker_id}``, written by every worker
+        regardless of watchdog config -- see ``_worker_heartbeat_present``,
+        already used by the orphan-PEL sweep) being ABSENT too, proving the
+        worker process itself is gone, not just quiet on activity
+        reporting. A present (or unknown/unreadable, which fails safe the
+        same way) heartbeat means the worker is alive but not reporting
+        activity -- watchdog off, an old image, or a crashed tracker -- and
+        is left to the ceiling exactly like the pre-watchdog reaper. Only
+        once both the record is absent-or-stale AND the heartbeat is
+        provably gone does a pending stream entry (proving there is a task
+        to recover, not an idle worker) trigger destruction. A fresh record
+        blocks destruction outright: returns ``None``.
         """
         worker_id = self._vm_id_to_worker_id(vm_id)
         key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
@@ -1368,11 +1388,19 @@ class PoolManager:
         if not self._activity_record_is_stale(record, now):
             return None
 
+        heartbeat_present = self._worker_heartbeat_present(worker_id)
+        if heartbeat_present is not False:
+            # True: worker is alive but not reporting activity (watchdog
+            # disabled, old image, crashed tracker) -- leave it to the
+            # ceiling. None: unreadable/unknown -- fail safe, don't treat
+            # as dead (same contract _sweep_orphan_pel relies on).
+            return None
+
         pending_consumers, pending_complete = self._consumers_with_pending_status()
         if not pending_complete:
             logger.warning(
-                "VM %d: activity record is %s but pending-task state is unavailable; "
-                "leaving VM alone this pass",
+                "VM %d: activity record is %s and heartbeat is absent, but "
+                "pending-task state is unavailable; leaving VM alone this pass",
                 vm_id,
                 "present" if record else "absent",
             )

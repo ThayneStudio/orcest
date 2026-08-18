@@ -168,9 +168,26 @@ The activity watchdog (per-task liveness ladder on workers, `PoolManager`
 reaping on `needs_reap`/stale activity below the `max_task_duration`
 ceiling) ships disabled and is turned up in stages, independent of the
 monitor-exposure steps above. `watchdog.enabled: false` is the rollback
-lever at every stage — it restores exactly today's behavior (pure
-wall-clock reaping at `max_task_duration`, no early kills) with no other
-config change required.
+lever at every stage — it restores **wall-clock-only** behavior: the
+runner's fixed `RunnerConfig.timeout` plus the pool reaper's ceiling-only
+destroy (`_health_check`'s `needs_reap`/`activity_stale` paths never fire —
+see below), with no other config change required. This is wall-clock-only
+at the *raised* default values this migration ships (`timeout` 21600s,
+`pool.max_task_duration` 25200s), not the original pre-migration numbers —
+"restores today's behavior" would be imprecise, since those ceilings
+themselves moved as part of this change (§7 of the design doc).
+
+Why the reaper's activity-aware paths stay dark with the watchdog off: no
+worker ever writes `workers:activity:{worker_id}` when
+`watchdog.enabled: false` (same for an old worker image mid-rollout that
+predates the tracker), so the record is always absent. But
+`_health_check`'s `activity_stale` destroy path additionally requires the
+worker's `workers:heartbeat:{worker_id}` liveness heartbeat — written by
+every worker unconditionally — to be absent too, and a live worker without
+the watchdog still writes that heartbeat. So an absent activity record with
+a present heartbeat is read as "alive, just not running the watchdog," not
+"dead," and the VM is left alone below the ceiling exactly like the
+pre-watchdog reaper.
 
 Every change here touches the three deploy layers the same way the rest of
 orcest does: host CLI (`pip`/`pipx install -e .` or equivalent), `orcest
@@ -184,15 +201,23 @@ through a fresh clone of the rebaked template.
 
 1. **Ship dark.** Deploy with `watchdog.enabled: false` and the monitor
    container up (see steps 1-3 above). Events flow (enqueue/start/complete),
-   the query API is queryable, and pool-reaper behavior is unchanged —
-   this is purely wiring verification before any behavior changes.
+   the query API is queryable, and the pool reaper stays wall-clock/
+   ceiling-only — every worker still writes its liveness heartbeat, which
+   keeps `_health_check`'s `activity_stale` path from ever firing while no
+   worker is writing an activity record (see above) — this is purely wiring
+   verification before any behavior changes.
 
 2. **Observation mode.** Flip `watchdog.enabled: true` fleet-wide with
    `max_kills_per_hour: 0`. At this budget the ladder still evaluates and
-   emits `net.orcest.task.suspect`/`stuck`/`looping` transition events (and
-   the activity-aware pool reaper still only reaps on the ceiling, since a
-   `needs_reap`/`activity_stale` kill trigger is gated by the same budget),
-   but no task is killed early. Watch the `task.suspect` (and `stuck`)
+   emits `net.orcest.task.suspect`/`stuck`/`looping` transition events, but
+   the ladder's own kill decision is blocked by the exhausted budget, so
+   `needs_reap` never gets set and no still-running task is killed early on
+   the watchdog's say-so. The pool reaper's `ceiling` and `activity_stale`
+   paths are **not** gated by this budget — `activity_stale` only ever
+   fires for a worker whose liveness heartbeat has genuinely gone (see
+   above), meaning the VM already died for an unrelated reason, so
+   reclaiming it during observation mode is correct and is not itself an
+   "early kill" of a live task. Watch the `task.suspect` (and `stuck`)
    false-positive rate against real workloads via the monitor for several
    days — a task that reaches SUSPECT/STUCK and then finishes normally
    anyway is a false positive and a signal the ladder thresholds
@@ -201,14 +226,16 @@ through a fresh clone of the rebaked template.
 
 3. **Enable kills.** Once the false-positive rate is acceptable, raise
    `max_kills_per_hour` to the real budget (default 6). From this point the
-   activity-aware reaper can destroy a VM below the `max_task_duration`
-   ceiling on `needs_reap` or on an absent/stale activity record with
-   pending work — not just at the ceiling. Keep watching `task.reaped`
+   ladder can act on its own SUSPECT/STUCK/LOOPING evaluation and set
+   `needs_reap`, which the pool reaper destroys immediately below the
+   `max_task_duration` ceiling — not just at the ceiling or on a
+   provably-dead worker as in stage 2. Keep watching `task.reaped`
    events' `reason` field (`ceiling` / `needs_reap` / `activity_stale`) via
    the monitor for a few more days; a spike in `needs_reap`/`activity_stale`
    reaps relative to `ceiling` reaps is the signal to look at, since those
    are the two paths the watchdog adds.
 
 If a stage regresses, drop back to `watchdog.enabled: false` rather than
-tuning forward under pressure — it is a complete, tested rollback to the
-pre-watchdog reaper, not a partial mitigation.
+tuning forward under pressure — it is a complete, tested rollback to
+wall-clock-only reaping (at this migration's raised ceiling values), not a
+partial mitigation.

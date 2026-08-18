@@ -206,11 +206,18 @@ class PoolConfig:
     # 21600 (runner timeout) + 3600 (grace) = 25200s. Raise both together if you
     # raise the runner timeout (see project memory: pool_max_task_duration_vs_runner_timeout).
     max_task_duration: int = 25200  # seconds before force-kill (> runner timeout + grace)
-    # Seconds since the last activity-watchdog heartbeat write to
-    # workers:activity:{worker_id} before the pool treats a worker as stale
-    # for fleet-health purposes. Distinct from max_task_duration's hard
-    # force-kill ceiling -- this feeds the pool's health/observability view,
-    # not a direct kill decision (see spec §11 config defaults).
+    # Seconds since the last activity-watchdog sample write to
+    # workers:activity:{worker_id} before PoolManager._health_check treats
+    # that record as stale. Distinct from max_task_duration's hard
+    # force-kill ceiling: below the ceiling, a stale-or-absent activity
+    # record is a *kill-decision input*, not just observability -- but only
+    # when corroborated by the worker's workers:heartbeat:{worker_id}
+    # liveness heartbeat also being absent (proving the worker process
+    # itself is gone). A present heartbeat with a stale/absent activity
+    # record just means the worker isn't running the watchdog (disabled, or
+    # an old pre-watchdog image) and is left to the ceiling, exactly like
+    # the pre-watchdog reaper (see spec §6 and fleet/pool_manager.py's
+    # _activity_reap_reason).
     activity_stale_after: int = 300
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
     # Image-integrity verification for the template cloud image (M5-infra).
