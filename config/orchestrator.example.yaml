@@ -18,9 +18,11 @@ polling:
 # Default runner backend for new tasks
 default_runner: "claude"
 
-# Runner settings used to compute task marker TTLs; keep these aligned with workers.
+# Runner settings used to compute task marker TTLs; keep these aligned with
+# workers (21600 is the worker default and ceiling — see RunnerConfig.timeout;
+# this value feeds compute_pending_task_ttl).
 runner:
-  timeout: 1800
+  timeout: 21600
   max_retries: 3
   retry_backoff: 10
   # Optional Claude model; null/empty/omitted uses the Claude CLI default

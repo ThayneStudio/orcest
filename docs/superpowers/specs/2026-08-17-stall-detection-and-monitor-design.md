@@ -408,10 +408,12 @@ unchanged component). One container, **two listeners**:
 - `GET /api/v1/tasks/{task_id}/timeline` — ordered state transitions,
   last-N normalized tool-call records (name + hash + error class), errors,
   activity aggregates.
-- `GET /api/v1/work/{repo}/{resource_type}/{resource_id}` — all attempts
-  for a work item, grouped: attempt list with task_ids, SHAs, outcomes,
-  and per-attempt timeline summaries. This is the "am I looking at retry 3
-  of the same work?" endpoint.
+- `GET /api/v1/work/{owner}/{name}/{resource_type}/{resource_id}` — all
+  attempts for a work item, grouped: attempt list with task_ids, SHAs,
+  outcomes, and per-attempt timeline summaries. This is the "am I looking
+  at retry 3 of the same work?" endpoint. **(amended post-implementation)**
+  the repo is addressed as two path segments (`{owner}/{name}`), not the
+  originally-specified single `{repo}` segment.
 - `GET /api/v1/fleet` — current pressure state, kill-budget usage, active
   task states.
 - `GET /api/v1/tasks/{task_id}/trace?tail=N` — raw trace lines from the

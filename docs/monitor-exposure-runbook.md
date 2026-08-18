@@ -32,6 +32,15 @@ Treat these like any other credential: `.env` stays out of git, and each
 token maps 1:1 to a named reader in `config/monitor.yaml` (`token_env` field)
 or, for the write token, to `write_token_env`.
 
+**Adding a reader takes three edits, not two.** Besides the `.env` line and
+the `config/monitor.yaml` reader entry, the matching `MONITOR_TOKEN_<NAME>`
+variable must also be listed in `docker-compose.monitor.yml`'s
+`environment:` block — Compose only forwards explicitly-named variables, so
+without that line the container never sees the token and the reader can
+never authenticate, even though `.env` and `monitor.yaml` both look right.
+(`MONITOR_WRITE_TOKEN` and `MONITOR_TOKEN_ADMIN` are already listed; every
+additional reader needs its own line.)
+
 ## 2. Point the orchestrator(s) at the ingest listener
 
 For each project whose orchestrator should emit events, add the monitor
@@ -52,11 +61,24 @@ relay is disabled and orcest is otherwise unaffected.
 
 ## 3. Start the monitor service and verify locally
 
+On the orchestrator VM, `Dockerfile.monitor`, `docker-compose.monitor.yml`,
+`config/monitor.example.yaml`, and `README.md` (needed by the image build)
+are delivered to `/opt/orcest/` by `orcest fleet deploy`/`update` as part of
+the source tarball. There is **no** `orcest fleet` subcommand that builds or
+starts the monitor container — this step is manual:
+
 ```bash
+cd /opt/orcest
 cp config/monitor.example.yaml config/monitor.yaml   # edit readers as needed
 docker compose -f docker-compose.monitor.yml up -d
 curl -s http://localhost:9090/api/v1/health
 ```
+
+Note that every subsequent `fleet update` re-copies (overwrites) those four
+files, so keep local state in the files it preserves — `.env` and
+`config/monitor.yaml` — and never hand-edit `docker-compose.monitor.yml` on
+the VM without also landing the change in the repo (this includes the
+per-reader `MONITOR_TOKEN_<NAME>` lines from step 1).
 
 Expected: `{"ok": true}` with no auth header — `/api/v1/health`
 and `/api/v1/openapi.json` are the only unauthenticated routes on the query
@@ -150,9 +172,13 @@ Two independent layers to revoke, either or both depending on the situation:
 
 - **App-level reader token** — remove the reader's entry from
   `config/monitor.yaml` (or rotate its `token_env` value in `.env`), then
-  `docker compose -f docker-compose.monitor.yml up -d` to restart the
-  `monitor` service and pick up the change. This revokes that reader's
-  ability to authenticate to the query API entirely, tunnel or not.
+  `docker compose -f docker-compose.monitor.yml restart monitor` to pick up
+  the change. A plain `up -d` is **not** sufficient after editing only the
+  bind-mounted `monitor.yaml`: Compose sees no change to the service
+  definition and leaves the running container (and its in-memory reader
+  set) untouched — use `restart` (or `up -d --force-recreate`) so the
+  removal actually takes effect. This revokes that reader's ability to
+  authenticate to the query API entirely, tunnel or not.
 - **Cloudflare Access service token** — revoke it from the Access
   application's service token list in the Zero Trust dashboard (or `cloudflared
   access service-token revoke`). This blocks that consumer from reaching the
@@ -282,3 +308,44 @@ last write wins, with no cross-project reconciliation. Keep each project's
 per-project `orchestrator.yaml` in the fleet; divergent values don't error,
 they just flap the effective fleet-wide budget between whatever value each
 project's monitor last wrote.
+
+## 8. Operational gotchas
+
+### Deploy order: `fleet update` before `fleet rebake`
+
+Roll the containers **before** the workers: run `orcest fleet update` (which
+ships the new pool manager honoring `pool.max_task_duration`) *before*
+`orcest fleet rebake` (which bakes workers with the raised 21600s
+`runner.timeout`). Rebaking first puts long-running workers under the old
+pool manager, which will reap them at the old ceiling mid-task.
+
+If any deployment's fleet config pinned `pool.max_task_duration` explicitly
+(old guidance was 7200), it MUST be raised above the new worker timeout plus
+grace (the shipped default is 25200 = 21600 + 3600) before rebaking —
+otherwise every healthy long task gets its VM destroyed as a `ceiling` reap
+at the stale pinned value, regardless of the watchdog's verdict.
+
+### Redis memory sizing for the events spool
+
+The events spool retains up to `DEFAULT_EVENTS_MAXLEN` (50000) envelopes
+**per project stream** (`XADD ... MAXLEN ~ 50000`), and never trims below
+that cap — activity snapshots make typical envelopes ~1KB or more, so a
+single busy project can hold 50MB+ of spool indefinitely. The shipped Redis
+runs with `--maxmemory 256mb --maxmemory-policy noeviction`, and that budget
+is *shared* with the task streams, locks, and pending markers. Once Redis
+hits the wall, `noeviction` fails **writes fleet-wide** — task `XADD`s
+included, not just event spooling. Size `maxmemory` for
+(projects × 50000 × envelope size) plus operational headroom, or lower the
+events maxlen cap, before pointing multiple busy projects at the relay.
+
+### Manual PEL surgery now needs the pending markers deleted too
+
+The old recovery recipe for a stalled consumer group — `XGROUP DELCONSUMER
+orcest:tasks:<stream> workers <dead-worker-id>` to drop a dead consumer's
+PEL entries and let the orchestrator's re-poll loop re-enqueue — no longer
+re-enqueues promptly. The pending-task marker TTL is derived from the runner
+timeout (`compute_pending_task_ttl`), which at the raised 21600s ceiling is
+now ~18h; until the marker expires, the poll loop still sees the work as
+in-flight and will not re-publish it. When doing that surgery, also `DEL`
+the relevant `pending:*` markers (`pending:{resource_type}:{repo}:{id}`,
+key-prefix aware) so the next poll cycle re-enqueues immediately.

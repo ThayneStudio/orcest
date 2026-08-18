@@ -43,6 +43,11 @@ services:
       # Forwarded from the per-project .env so the orchestrator authenticates to
       # the now-password-protected Redis (Compose only passes named vars).
       - ORCEST_REDIS_PASSWORD
+      # Forwarded from the per-project .env so the EventRelay can authenticate
+      # to the monitor's ingest listener (Compose only passes named vars;
+      # without this line the relay reads "" and every ingest POST 401s).
+      # Unset is fine when monitor_ingest_url is not configured.
+      - MONITOR_WRITE_TOKEN
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import os,redis; redis.Redis('redis', password=os.environ.get('ORCEST_REDIS_PASSWORD')).ping()"]
