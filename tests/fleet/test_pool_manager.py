@@ -422,6 +422,11 @@ class TestDestroyVm:
         pipe.hdel.assert_called_once_with("pool:active", "300")
         pipe.delete.assert_any_call("pool:done:orcest-worker-300")
         pipe.delete.assert_any_call("workers:heartbeat:orcest-worker-300")
+        # I1 follow-up (final-review micro-round): the activity-watchdog
+        # record is worker_id-keyed and survives VM destruction unless
+        # deleted here -- otherwise a stale needs_reap=="1" record can
+        # false-kill the replacement VM that later reuses this worker_id.
+        pipe.delete.assert_any_call("workers:activity:orcest-worker-300")
         pipe.execute.assert_called_once()
 
     def test_cleans_redis_even_if_stop_fails(self):
@@ -485,6 +490,24 @@ class TestDestroyVm:
 
         assert destroyed is False
         proxmox.destroy_vm.assert_called_once_with(300)
+
+
+class TestClearDestroyedWorkerState:
+    """I1 follow-up (final-review micro-round): the inventory-proves-absent
+    cleanup path (used by ``_retry_provisioning_cleanups`` /
+    ``_reconcile_ambiguous_clones`` when Proxmox no longer lists the VMID)
+    must also delete the activity record, same as ``_destroy_stopped_vm``."""
+
+    def test_deletes_activity_record_alongside_lifecycle_markers(self):
+        manager, proxmox, redis = _make_manager()
+        pipe = redis.pipeline.return_value
+
+        result = manager._clear_destroyed_worker_state(300)
+
+        assert result is True
+        pipe.delete.assert_any_call("pool:done:orcest-worker-300")
+        pipe.delete.assert_any_call("workers:heartbeat:orcest-worker-300")
+        pipe.delete.assert_any_call("workers:activity:orcest-worker-300")
 
 
 class TestDestroyVmRangeGuard:

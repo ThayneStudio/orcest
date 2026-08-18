@@ -677,6 +677,21 @@ class PoolManager:
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
         heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
+        # I1 follow-up: the activity-watchdog record (workers:activity:{id})
+        # is worker_id-keyed, not vm_id-keyed, so it survives VM destruction
+        # unless deleted here explicitly. Since I1, a needs_reap record is
+        # deliberately re-flushed (not deleted) with a 600s TTL on close() so
+        # the reaper reliably sees it -- but that means it can still be
+        # sitting there, needs_reap=="1", when the lowest-free-VMID reuse
+        # policy hands this same worker_id to a freshly cloned replacement
+        # VM. That VM's own tracker hasn't ticked yet, so without this
+        # delete the reaper would read the STALE record and destroy the
+        # brand-new VM before it ever gets a chance -- a false kill,
+        # repeatable for the remainder of the stale record's TTL. The
+        # record's entire job (making the reaper fire) is complete once the
+        # VM it describes is actually destroyed, so deleting it here fully
+        # preserves I1's intent without reopening this hole.
+        activity_key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.srem(_POOL_IDLE_KEY, str(vm_id))
@@ -686,6 +701,7 @@ class PoolManager:
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
             pipe.delete(done_key)
             pipe.delete(heartbeat_key)
+            pipe.delete(activity_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
@@ -1215,6 +1231,11 @@ class PoolManager:
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
         heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
+        # I1 follow-up: see the matching comment in _destroy_stopped_vm --
+        # this record is worker_id-keyed and outlives VM destruction unless
+        # deleted here, which can false-kill the replacement VM that
+        # eventually reuses this worker_id via lowest-free-VMID reuse.
+        activity_key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.srem(_POOL_IDLE_KEY, str(vm_id))
@@ -1224,6 +1245,7 @@ class PoolManager:
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
             pipe.delete(done_key)
             pipe.delete(heartbeat_key)
+            pipe.delete(activity_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
