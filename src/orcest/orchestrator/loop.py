@@ -19,6 +19,7 @@ from typing import Any, Callable
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
 from orcest.orchestrator.event_relay import EventRelay
+from orcest.orchestrator.fleet_health import FleetHealthMonitor
 from orcest.orchestrator.gh import GhRateLimitError
 from orcest.orchestrator.issue_ops import (
     IssueAction,
@@ -1435,6 +1436,17 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     )
     event_relay.start()
 
+    # Fleet health monitor: detects fleet-wide kill pressure from task.suspect
+    # events and mirrors the configured kill budget for workers to read.
+    fleet_health = FleetHealthMonitor(
+        redis,
+        pressure_min_tasks=config.pressure_min_tasks,
+        pressure_window=config.pressure_window,
+        pressure_hold=config.pressure_hold,
+        max_kills_per_hour=config.max_kills_per_hour,
+    )
+    fleet_health.start()
+
     repos = ", ".join(p.repo for p in config.projects) if config.projects else "(none)"
     logger.info(
         "Orchestrator started. Projects: %s, poll interval: %ds",
@@ -1465,6 +1477,7 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     trace_archiver.shutdown()
     event_relay.stop()
+    fleet_health.stop()
     logger.info("Orchestrator shut down cleanly.")
 
 
