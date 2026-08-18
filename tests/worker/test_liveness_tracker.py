@@ -301,6 +301,20 @@ def test_close_deletes_activity_record(fake_redis_client):
     assert fake_redis_client.hgetall_raw(key) == {}
 
 
+def test_close_swallows_redis_failure(fake_redis_client):
+    # Review round 1 (B8 fix): close() runs in the runner's `finally` after
+    # every attempt -- a raised Redis error here must never propagate and
+    # replace an already-decided RunnerResult.
+    tracker, _events, _clock, _wall = _make_tracker(fake_redis_client)
+
+    def raising_delete_raw(key: str) -> int:
+        raise RuntimeError("redis is down")
+
+    tracker._redis.delete_raw = raising_delete_raw  # type: ignore[method-assign]
+
+    tracker.close()  # must not raise
+
+
 # ---------------------------------------------------------------------
 # Review round 1 findings: additional coverage
 # ---------------------------------------------------------------------

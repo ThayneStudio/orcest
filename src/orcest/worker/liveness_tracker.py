@@ -424,5 +424,10 @@ class LivenessTracker:
         self._safe(self._write_activity_record, "activity record write (mark_needs_reap)")
 
     def close(self) -> None:
-        """Delete the activity record."""
-        self._redis.delete_raw(self._activity_key())
+        """Delete the activity record. Best-effort (review round 1, B8 fix):
+        the runner calls this from a ``finally`` block after every attempt,
+        so a raised Redis error here must never replace an already-decided
+        ``RunnerResult`` (e.g. a completed, pushed task turning into a
+        non-transient "Worker exception" FAILED). Swallowed and logged via
+        the same ``_safe`` pattern as every other tracker side effect."""
+        self._safe(lambda: self._redis.delete_raw(self._activity_key()), "close")

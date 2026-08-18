@@ -89,13 +89,19 @@ def _run(work_dir: Path, home_dir: Path, script: Path, *, timeout: int = 60, tra
     )
 
 
-def _make_tracker_factory(fake_redis_client, workspace: Path, events: list, ceiling: float = 60.0):
+def _make_tracker_factory(
+    fake_redis_client,
+    workspace: Path,
+    events: list,
+    ceiling: float = 60.0,
+    cfg: WatchdogConfig | None = None,
+):
     def _emit(event_type: str, data: dict) -> None:
         events.append((event_type, data))
 
     def _factory(root_pid: int) -> LivenessTracker:
         return LivenessTracker(
-            _watchdog_cfg(),
+            cfg or _watchdog_cfg(),
             ceiling,
             redis=fake_redis_client,
             emit=_emit,
@@ -203,13 +209,18 @@ def test_waiting_script_not_killed_within_grace(tmp_path, fake_redis_client):
         tmp_path / "agent.sh",
         """
 echo '{"type":"system","subtype":"api_retry"}'
-sleep 1.5
+sleep 2.0
 echo '{"type":"assistant","message":{"content":[]}}'
 exit 0
 """,
     )
     events: list = []
-    tracker_factory = _make_tracker_factory(fake_redis_client, work_dir, events)
+    # waiting_grace widened to 4.0 (vs the shared 2.0 default) so the
+    # sleep-2.0s script has a comfortable scheduling margin under load
+    # instead of the original ~0.5s (review round 1, test robustness fix).
+    tracker_factory = _make_tracker_factory(
+        fake_redis_client, work_dir, events, cfg=_watchdog_cfg(waiting_grace=4.0)
+    )
 
     result = _run(work_dir, tmp_path, script, tracker_factory=tracker_factory)
 
