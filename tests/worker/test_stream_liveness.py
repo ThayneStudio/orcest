@@ -171,6 +171,24 @@ def test_grok_acp_session_update_bare_key_is_progress():
     assert classify_line(line).kind == "progress"
 
 
+def test_grok_acp_session_update_nested_in_list_is_progress():
+    # Spec: the ACP shape may appear "anywhere in the object" -- including
+    # inside list values (e.g. a batched "updates" array), not only nested
+    # dicts.
+    line = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "result": {
+                "updates": [
+                    {"other": "noise"},
+                    {"sessionUpdate": "agent_message_chunk", "content": {"text": "hi"}},
+                ]
+            },
+        }
+    )
+    assert classify_line(line).kind == "progress"
+
+
 def test_malformed_json_is_output():
     signal = classify_line("not json at all {{{")
     assert signal.kind == "output"

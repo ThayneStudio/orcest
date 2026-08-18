@@ -197,6 +197,9 @@ def _kill_process_tree(proc: subprocess.Popen[str], sigterm_timeout: float = 2.0
     signalling the group reaps grandchildren too. SIGTERM, then SIGKILL after
     ``sigterm_timeout``.
     """
+    # Pre-existing theoretical hazard (parity with the legacy watchdog): if
+    # the child was already reaped, proc.pid could have been recycled and
+    # getpgid/killpg would target an unrelated process group.
     try:
         pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError):
@@ -519,6 +522,14 @@ def _run_cli_agent(
                         _close_pipes(proc)
                         if logger:
                             logger.warning("%s subprocess killed: lock lost", binary)
+                        # A ladder kill may have latched (consuming kill
+                        # budget) just before the abort won: account for it
+                        # in the event stream even though the lock-lost
+                        # result below supersedes it. No post-kill death
+                        # verification ran on this path, so no "verified"
+                        # field is emitted.
+                        if tracker is not None and killed_trigger is not None:
+                            tracker.emit_killed(killed_trigger, superseded_by="abort")
                         return _finish(
                             RunnerResult(
                                 success=False, summary="Aborted: lock lost", transient=True

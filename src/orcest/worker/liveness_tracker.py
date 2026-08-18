@@ -426,15 +426,27 @@ class LivenessTracker:
 
         key = self._activity_key()
         wall_now = self._wall_clock()
-        self._redis.hset_raw(key, "task_id", self._task_id)
-        self._redis.hset_raw(key, "state", state)
-        self._redis.hset_raw(key, "last_liveness_ts", str(wall_now))
-        self._redis.hset_raw(key, "ladder_since", str(state_since))
-        self._redis.hset_raw(key, "needs_reap", "1" if needs_reap else "0")
-        self._redis.hset_raw(key, "deferred_kill", "1" if deferred_kill else "0")
-        self._redis.hset_raw(key, "snapshot", json.dumps(snapshot, default=str))
         ttl = ttl_override if ttl_override is not None else int(4 * self._cfg.sample_interval)
-        self._redis.expire_raw(key, ttl)
+        # RedisClient has no raw-key pipeline/mapping-hset helper, so use the
+        # underlying client directly (same fully-qualified-key discipline as
+        # hset_raw/expire_raw): one atomic MULTI/EXEC round trip for the whole
+        # record + TTL instead of ~7 chatty sequential calls, so a reader can
+        # never observe a half-written record.
+        pipe = self._redis.client.pipeline(transaction=True)
+        pipe.hset(
+            key,
+            mapping={
+                "task_id": self._task_id,
+                "state": state,
+                "last_liveness_ts": str(wall_now),
+                "ladder_since": str(state_since),
+                "needs_reap": "1" if needs_reap else "0",
+                "deferred_kill": "1" if deferred_kill else "0",
+                "snapshot": json.dumps(snapshot, default=str),
+            },
+        )
+        pipe.expire(key, ttl)
+        pipe.execute()
 
     # ------------------------------------------------------------------
     # Misc
@@ -454,16 +466,32 @@ class LivenessTracker:
         with self._lock:
             return dict(self._last_snapshot)
 
-    def emit_killed(self, trigger: str, verified: bool) -> None:
+    def emit_killed(
+        self,
+        trigger: str,
+        verified: bool | None = None,
+        *,
+        superseded_by: str | None = None,
+    ) -> None:
         """Emit ``net.orcest.task.killed`` (B8: after post-kill D-state
         verification). A small dedicated method rather than having the
         runner reach into ``_emit_fn`` directly, so the event shape and the
         best-effort-swallow semantics stay colocated with the tracker's
-        other emits."""
+        other emits.
+
+        ``verified`` is the post-kill D-state verification outcome; pass
+        ``None`` (and the field is omitted) on paths where no verification
+        ran -- e.g. a latched ladder kill whose attempt result was superseded
+        by the abort/lock-lost path, marked via ``superseded_by="abort"`` so
+        the consumed kill budget is still accounted for in the event stream.
+        """
+        data: dict[str, Any] = {"trigger": trigger}
+        if verified is not None:
+            data["verified"] = verified
+        if superseded_by is not None:
+            data["superseded_by"] = superseded_by
         self._safe(
-            lambda: self._emit_fn(
-                "net.orcest.task.killed", {"trigger": trigger, "verified": verified}
-            ),
+            lambda: self._emit_fn("net.orcest.task.killed", data),
             "killed emit",
         )
 
