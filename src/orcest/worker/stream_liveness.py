@@ -108,19 +108,24 @@ def _truncate_error_class(text: str) -> str:
 
 def _is_grok_acp_progress(obj: Any, _depth: int = 0) -> bool:
     """True if a Grok ACP session/update or agent_message_chunk shape appears
-    anywhere in the object (top-level or nested under e.g. "params").
+    anywhere in the object (top-level, nested under e.g. "params", or inside
+    list values such as an "updates" array).
 
     Depth-bounded to keep this cheap and to guarantee termination even on
     pathological (but JSON-valid) nesting.
     """
-    if _depth > 8 or not isinstance(obj, dict):
+    if _depth > 8:
+        return False
+    if isinstance(obj, list):
+        return any(_is_grok_acp_progress(item, _depth + 1) for item in obj)
+    if not isinstance(obj, dict):
         return False
     if obj.get("method") == "session/update":
         return True
     if obj.get("sessionUpdate") == "agent_message_chunk":
         return True
     for value in obj.values():
-        if isinstance(value, dict) and _is_grok_acp_progress(value, _depth + 1):
+        if isinstance(value, (dict, list)) and _is_grok_acp_progress(value, _depth + 1):
             return True
     return False
 
@@ -152,6 +157,8 @@ def _classify_line(line: str) -> StreamSignal:
 
     obj_type = obj.get("type")
 
+    # Deliberately checked BEFORE the rate-limit pattern scan: an explicit
+    # system/api_retry event beats the text-pattern heuristic below.
     if obj_type == "system" and obj.get("subtype") == "api_retry":
         return StreamSignal(kind="waiting", reason="api_retry")
 

@@ -362,3 +362,80 @@ def test_disabled_watchdog_preserves_wall_clock_timeout(tmp_path):
     assert result.transient is True
     # Killed promptly at ~1s, not left to run the full 30s sleep.
     assert elapsed < 10
+
+
+class _InstantStuckTracker(LivenessTracker):
+    """tick() latches a "stuck" kill on the very first watchdog sample, so
+    the abort-vs-latched-kill ordering below is deterministic."""
+
+    def tick(self) -> str | None:  # type: ignore[override]
+        return "stuck"
+
+
+@pytest.mark.integration
+def test_abort_over_latched_kill_still_emits_task_killed(tmp_path, fake_redis_client):
+    """When the abort/lock-lost path wins over an already-latched ladder
+    kill, the kill budget was consumed but (pre-fix) net.orcest.task.killed
+    was never emitted. The abort path must emit it with superseded_by="abort"
+    and no "verified" field (no post-kill death verification ran), while the
+    returned result stays exactly the lock-lost result."""
+    work_dir = tmp_path / "wd"
+    work_dir.mkdir()
+    # The script's only stdout line is written from its TERM trap: the main
+    # thread can therefore only observe a line AFTER the watchdog's kill
+    # (SIGTERM to the group) has already latched killed_trigger, and with
+    # abort_event pre-set that line deterministically takes the abort path.
+    script = _write_script(
+        tmp_path / "agent.sh",
+        """
+trap 'echo killed-now; exit 0' TERM
+sleep 600 &
+wait $!
+""",
+    )
+
+    events: list = []
+
+    def _emit(event_type: str, data: dict) -> None:
+        events.append((event_type, data))
+
+    def _factory(root_pid: int) -> LivenessTracker:
+        return _InstantStuckTracker(
+            _watchdog_cfg(),
+            60.0,
+            redis=fake_redis_client,
+            emit=_emit,
+            worker_id="test-worker",
+            task_id="test-task",
+            root_pid=root_pid,
+            workspace=work_dir,
+        )
+
+    abort_event = threading.Event()
+    abort_event.set()  # lock already lost before the run starts
+
+    result = _run_cli_agent(
+        _FakeCliRunner(max_retries=1, retry_backoff=0),
+        "do work",
+        work_dir,
+        "tok",
+        60,
+        binary=str(script),
+        env_var_name="",
+        credential="",
+        model="",
+        home_dir=tmp_path,
+        logger=None,
+        on_output=None,
+        on_stderr=None,
+        abort_event=abort_event,
+        tracker_factory=_factory,
+    )
+
+    # Returned result is exactly the lock-lost result -- unchanged.
+    assert result.success is False
+    assert result.summary == "Aborted: lock lost"
+    assert result.transient is True
+
+    killed = [data for event_type, data in events if event_type == "net.orcest.task.killed"]
+    assert killed == [{"trigger": "stuck", "superseded_by": "abort"}]

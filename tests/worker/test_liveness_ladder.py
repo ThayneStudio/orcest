@@ -593,3 +593,52 @@ def test_exact_staleness_and_stuck_hold_boundaries():
     d = ladder.evaluate(now=200, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
     assert d.state == LadderState.STUCK
     assert d.kill == "stuck"
+
+
+def test_waiting_label_expires_after_grace_without_new_waiting_signal():
+    """Label-only fix: a task kept alive purely by CPU/workspace signals
+    (which never clear ``_waiting_active`` -- only stream progress/output
+    lines do) must stop *reporting* WAITING once ``waiting_grace`` has
+    elapsed since the most recent waiting signal. The grace's effect on the
+    SUSPECT -> STUCK escalation gate is unchanged (covered by the existing
+    waiting-grace tests above)."""
+    cfg = _cfg()  # waiting_grace=200
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+
+    ladder.note_stream(now=10, sig=StreamSignal(kind="waiting", reason="api_retry"))
+
+    # Alive purely via CPU/workspace from here on: no stream lines at all.
+    d = ladder.evaluate(now=20, cpu_seconds=6.0, workspace_changed=True, rep_verdict=None)
+    assert d.state == LadderState.WAITING
+
+    # Still within waiting_grace of the t=10 signal.
+    d = ladder.evaluate(now=150, cpu_seconds=7.0, workspace_changed=True, rep_verdict=None)
+    assert d.state == LadderState.WAITING
+
+    # Grace elapsed with no new waiting signal: label reverts to ACTIVE.
+    d = ladder.evaluate(now=250, cpu_seconds=8.0, workspace_changed=True, rep_verdict=None)
+    assert d.state == LadderState.ACTIVE
+    assert d.kill is None
+
+
+def test_bootstrap_workspace_change_freshens_s3_baseline():
+    """A workspace change observed during a BOOTSTRAP evaluation must be
+    recorded (S3 last-fresh timestamp), so post-bootstrap S3 staleness is
+    measured from that change rather than from started_at. Strictly a
+    false-SUSPECT reduction: freshening S3 can only delay all-stale."""
+    cfg = _cfg()  # startup_grace=100, idle_window=100
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+
+    # No progress yet and grace not elapsed: still BOOTSTRAP, but the
+    # workspace change is recorded, not dropped.
+    d = ladder.evaluate(now=50, cpu_seconds=0.0, workspace_changed=True, rep_verdict=None)
+    assert d.state == LadderState.BOOTSTRAP
+    assert d.kill is None
+    assert d.snapshot["s3_last_changed_ts"] == 50
+
+    # Exit bootstrap via startup_grace: S3 age is measured from the
+    # bootstrap-era change (t=50), not started_at (t=0).
+    d = ladder.evaluate(now=100, cpu_seconds=0.0, workspace_changed=False, rep_verdict=None)
+    assert d.snapshot["s3_last_changed_ts"] == 50
+    assert d.snapshot["s3_age"] == 50

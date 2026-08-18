@@ -289,11 +289,11 @@ class ClaudeRunner(_BaseCliRunner):
         result (so an agent that emitted the signal and then exited non-zero,
         timed out, or was aborted still surfaced it). Preserve that: the
         signal lives in stream-json assistant/result lines on stdout, so
-        stdout is the scan target (``_agent_text_from_stream_json`` strips
-        the prompt echo exactly as on the success path).
+        stdout is the scan target (``_parse_needs_human`` strips the prompt
+        echo exactly as on the success path).
         """
         if not result.needs_human:
-            flag, reason = _check_needs_human(_agent_text_from_stream_json("".join(stdout_lines)))
+            flag, reason = _parse_needs_human("".join(stdout_lines))
             if flag:
                 result.needs_human = True
                 result.needs_human_reason = reason

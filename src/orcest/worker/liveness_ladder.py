@@ -199,6 +199,13 @@ class LivenessLadder:
                 now - self.started_at
             ) >= self.cfg.startup_grace
             if not exiting:
+                # A workspace change observed during BOOTSTRAP still counts
+                # for S3 recency: recording it here means post-bootstrap S3
+                # staleness is measured from this change, not from
+                # started_at. Freshening a last-fresh timestamp can only
+                # delay all-stale (SUSPECT/STUCK), never hasten any kill.
+                if workspace_changed:
+                    self._last_workspace_change_ts = now
                 # CEILING is the one thing that still applies during
                 # BOOTSTRAP; there is no corroborated STUCK/LOOPING trigger
                 # possible here (the ladder is disabled), so it always wins.
@@ -283,7 +290,18 @@ class LivenessLadder:
                 new_state = LadderState.SUSPECT
         else:
             self._suspect_since = None
-            new_state = LadderState.WAITING if self._waiting_active else LadderState.ACTIVE
+            # Label-only recency check: a task kept alive purely by
+            # CPU/workspace signals (which never clear ``_waiting_active`` --
+            # only stream progress/output lines do) must not *report* WAITING
+            # forever. The label expires ``waiting_grace`` after the most
+            # recent waiting signal; ``_waiting_active`` itself is untouched,
+            # so the SUSPECT->STUCK escalation gate above is byte-identical.
+            waiting_label = (
+                self._waiting_active
+                and self._last_waiting_ts is not None
+                and (now - self._last_waiting_ts) < self.cfg.waiting_grace
+            )
+            new_state = LadderState.WAITING if waiting_label else LadderState.ACTIVE
 
         transitioned = new_state != prev_state
         kill: str | None = None
