@@ -8,6 +8,7 @@ posting comments when tasks are queued.
 import json
 import logging
 import re
+from weakref import WeakKeyDictionary
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
@@ -412,9 +413,30 @@ def rerun_all_transient_ci(
     )
 
 
+# One EventPublisher per Redis client, reused across calls. EventPublisher's
+# decimated-error logging (warn on failure 1, 10, 100, then every 1000) keys
+# off an instance counter -- constructing a fresh EventPublisher on every
+# _emit_enqueued call (as before) reset that counter to 0 each time, so under
+# sustained Redis failure every single publish attempt logged a "1 failures
+# so far" warning instead of the intended decimation. Keyed by RedisClient
+# identity via a WeakKeyDictionary so cached publishers are dropped once
+# their client is garbage-collected -- no unbounded growth across the
+# process lifetime, and no change needed to callers (they still just pass a
+# RedisClient).
+_event_publishers: "WeakKeyDictionary[RedisClient, EventPublisher]" = WeakKeyDictionary()
+
+
+def _get_event_publisher(redis: RedisClient) -> EventPublisher:
+    publisher = _event_publishers.get(redis)
+    if publisher is None:
+        publisher = EventPublisher(redis)
+        _event_publishers[redis] = publisher
+    return publisher
+
+
 def _emit_enqueued(redis: RedisClient, task: Task) -> None:
     """Spool a task.enqueued event. Never raises (EventPublisher swallows)."""
-    EventPublisher(redis).publish(
+    _get_event_publisher(redis).publish(
         make_event(
             "net.orcest.task.enqueued",
             source_project=task.key_prefix or "default",

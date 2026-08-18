@@ -59,6 +59,39 @@ def test_make_event_envelope_shape():
     assert env2["id"] != env["id"]
 
 
+@pytest.mark.parametrize(
+    "key", ["work", "attempt", "head_sha", "worker_id", "provider"]
+)
+def test_make_event_rejects_reserved_data_key_collision(key):
+    with pytest.raises(ValueError, match=key):
+        make_event(
+            "net.orcest.task.started",
+            source_project="p",
+            task_id="t",
+            repo="o/r",
+            resource_type="pr",
+            resource_id=1,
+            attempt=0,
+            data={key: "clobbered"},
+        )
+
+
+def test_make_event_allows_non_colliding_data_keys():
+    env = make_event(
+        "net.orcest.task.started",
+        source_project="p",
+        task_id="t",
+        repo="o/r",
+        resource_type="pr",
+        resource_id=1,
+        attempt=3,
+        data={"reason": "timeout", "elapsed_seconds": 12.5},
+    )
+    assert env["data"]["attempt"] == 3
+    assert env["data"]["reason"] == "timeout"
+    assert env["data"]["elapsed_seconds"] == 12.5
+
+
 def test_make_event_rejects_unknown_type():
     with pytest.raises(ValueError):
         make_event(
