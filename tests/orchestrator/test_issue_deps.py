@@ -5,6 +5,7 @@ import pytest
 from orcest.orchestrator import gh
 from orcest.orchestrator.issue_deps import (
     fetch_blocker_states,
+    native_open_blockers,
     open_blockers,
     parse_blocker_refs,
 )
@@ -207,3 +208,52 @@ def test_huge_digit_run_is_dropped():
 def test_huge_and_normal_refs_mixed():
     body = "blocked by #" + ("9" * 50) + " and depends on #5"
     assert parse_blocker_refs(body) == {5}
+
+
+# ---------------------------------------------------------------------------
+# native_open_blockers (GitHub-native issue dependencies)
+# ---------------------------------------------------------------------------
+
+
+def _issue_with_blocked_by(blocked_by: list[dict] | None) -> dict:
+    issue = {"number": 1, "title": "t", "body": "", "labels": []}
+    if blocked_by is not None:
+        issue["blocked_by"] = blocked_by
+    return issue
+
+
+def test_native_open_blockers_reports_open_same_repo():
+    issue = _issue_with_blocked_by([{"number": 5, "state": "OPEN", "repo": REPO}])
+    assert native_open_blockers(issue, REPO) == ["#5"]
+
+
+def test_native_open_blockers_ignores_closed():
+    issue = _issue_with_blocked_by([{"number": 5, "state": "CLOSED", "repo": REPO}])
+    assert native_open_blockers(issue, REPO) == []
+
+
+def test_native_open_blockers_cross_repo_uses_full_ref():
+    issue = _issue_with_blocked_by([{"number": 7, "state": "OPEN", "repo": "other-org/other-repo"}])
+    assert native_open_blockers(issue, REPO) == ["other-org/other-repo#7"]
+
+
+def test_native_open_blockers_missing_key_is_empty():
+    assert native_open_blockers(_issue_with_blocked_by(None), REPO) == []
+
+
+def test_native_open_blockers_unknown_state_blocks():
+    """A blocker whose state we can't interpret must fail-safe to blocking,
+    mirroring the body-dep 'unknown' semantics."""
+    issue = _issue_with_blocked_by([{"number": 5, "state": None, "repo": REPO}])
+    assert native_open_blockers(issue, REPO) == ["#5"]
+
+
+def test_native_open_blockers_sorted_same_repo_first_then_by_number():
+    issue = _issue_with_blocked_by(
+        [
+            {"number": 9, "state": "OPEN", "repo": "other-org/z-repo"},
+            {"number": 12, "state": "OPEN", "repo": REPO},
+            {"number": 3, "state": "OPEN", "repo": REPO},
+        ]
+    )
+    assert native_open_blockers(issue, REPO) == ["#3", "#12", "other-org/z-repo#9"]

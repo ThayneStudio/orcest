@@ -57,16 +57,21 @@ GitHub itself is the dashboard:
 
 ## Issue Dependencies
 
-Issues labeled `orcest:ready` whose body declares a still-open
-prerequisite are automatically deferred (no manual `orcest:blocked`
-needed). Recognised body-text patterns (case-insensitive, same-repo
-only, see `src/orcest/orchestrator/issue_deps.py`):
-- `blocked by #N`
-- `depends on #N`
-- `requires #N`
-- `prerequisite[s]: #N`
-- `after #N {merges|lands|closes|ships|is done}`
-- unchecked task-list item: `- [ ] #N`
+Issues labeled `orcest:ready` with a still-open prerequisite are
+automatically deferred (no manual `orcest:blocked` needed). Two
+sources are checked (see `src/orcest/orchestrator/issue_deps.py` and
+`docs/issue-dependencies.md`); an open blocker in either defers:
+
+1. **GitHub-native blocked-by relationships** (issue sidebar /
+   `addBlockedBy` API). Fetched inline with the issue listing — zero
+   extra API calls. Cross-repo blockers supported.
+2. **Body-text patterns** (case-insensitive, same-repo only):
+   - `blocked by #N`
+   - `depends on #N`
+   - `requires #N`
+   - `prerequisite[s]: #N`
+   - `after #N {merges|lands|closes|ships|is done}`
+   - unchecked task-list item: `- [ ] #N`
 
 `Closes #N` / `Fixes #N` / `Resolves #N` are **not** treated as
 dependencies — those describe the PR's output. Bare `#N` mentions

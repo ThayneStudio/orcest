@@ -1668,7 +1668,15 @@ def test_list_labeled_issues_paginates_past_100(mocker):
         },
     ]
     page2_nodes = [
-        {"number": 2, "title": "newer", "body": "b2", "labels": {"nodes": []}},
+        {
+            "number": 2,
+            "title": "newer",
+            "body": "b2",
+            "labels": {"nodes": []},
+            "blockedBy": {
+                "nodes": [{"number": 4, "state": "OPEN", "repository": {"nameWithOwner": REPO}}]
+            },
+        },
     ]
 
     def _issues_response(nodes, *, has_next_page=False, end_cursor=None):
@@ -1700,10 +1708,93 @@ def test_list_labeled_issues_paginates_past_100(mocker):
     # Labels are normalized to the flat list shape the callers expect.
     assert result[0]["labels"] == [{"name": "orcest:ready", "color": "00ff00"}]
     assert result[1]["labels"] == []
+    # blocked_by normalization applies to every page, not just the first.
+    assert result[0]["blocked_by"] == []
+    assert result[1]["blocked_by"] == [{"number": 4, "state": "OPEN", "repo": REPO}]
     # The second gh invocation carried the pagination cursor.
     assert mock_run.call_count == 2
     second_args = mock_run.call_args_list[1][0][0]
     assert "after=cursor1" in second_args
+
+
+# ---------------------------------------------------------------------------
+# list_labeled_issues native dependencies (blockedBy)
+# ---------------------------------------------------------------------------
+
+
+def _single_issue_response(node: dict) -> str:
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "issues": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [node],
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_list_labeled_issues_normalizes_blocked_by(mocker):
+    """Native blockedBy nodes are flattened into a `blocked_by` list of
+    {number, state, repo} dicts."""
+    node = {
+        "number": 7,
+        "title": "dependent",
+        "body": "",
+        "labels": {"nodes": []},
+        "blockedBy": {
+            "nodes": [
+                {"number": 3, "state": "OPEN", "repository": {"nameWithOwner": REPO}},
+                {
+                    "number": 9,
+                    "state": "CLOSED",
+                    "repository": {"nameWithOwner": "other-org/other-repo"},
+                },
+            ]
+        },
+    }
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_single_issue_response(node),
+    )
+
+    result = list_labeled_issues(REPO, "orcest:ready", TOKEN)
+
+    assert result[0]["blocked_by"] == [
+        {"number": 3, "state": "OPEN", "repo": REPO},
+        {"number": 9, "state": "CLOSED", "repo": "other-org/other-repo"},
+    ]
+
+
+def test_list_labeled_issues_blocked_by_absent_normalizes_to_empty(mocker):
+    """A node without blockedBy data still gets a `blocked_by` key (empty list)."""
+    node = {"number": 8, "title": "clean", "body": "", "labels": {"nodes": []}}
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_single_issue_response(node),
+    )
+
+    result = list_labeled_issues(REPO, "orcest:ready", TOKEN)
+
+    assert result[0]["blocked_by"] == []
+
+
+def test_list_labeled_issues_query_requests_blocked_by(mocker):
+    """The GraphQL query asks for blockedBy(first: 50) — GitHub caps native
+    dependencies at 50 per issue, so a single page is always complete."""
+    node = {"number": 8, "title": "clean", "body": "", "labels": {"nodes": []}}
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_single_issue_response(node),
+    )
+
+    list_labeled_issues(REPO, "orcest:ready", TOKEN)
+
+    sent_args = " ".join(mock_run.call_args[0][0])
+    assert "blockedBy(first: 50)" in sent_args
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ from enum import Enum
 from orcest.orchestrator import gh
 from orcest.orchestrator.issue_deps import (
     fetch_blocker_states,
+    native_open_blockers,
     open_blockers,
     parse_blocker_refs,
 )
@@ -47,7 +48,9 @@ class IssueState:
     body: str
     action: IssueAction
     labels: list[str]
-    open_blockers: list[int] = field(default_factory=list)
+    # Display refs of still-open blockers: "#N" same-repo, "owner/repo#N"
+    # for cross-repo native dependencies.
+    open_blockers: list[str] = field(default_factory=list)
 
 
 def _make_attempts_key(repo: str, issue_number: int) -> str:
@@ -121,8 +124,9 @@ def discover_actionable_issues(
     6. Skip if task already in flight (attempts > 0 with a pending marker)
     7. Clear orphaned attempts (attempts > 0 without a pending marker)
     8. Skip if task already pending in the queue
-    9. Skip if any referenced blocker issue is still open
-    10. Everything else -> ENQUEUE_IMPLEMENT
+    9. Skip if any GitHub-native blocked-by dependency is still open
+    10. Skip if any body-declared blocker issue is still open
+    11. Everything else -> ENQUEUE_IMPLEMENT
     """
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
@@ -242,11 +246,42 @@ def discover_actionable_issues(
             )
             continue
 
-        # Skip if any referenced blocker issue is still open.
+        # Skip if any GitHub-native blocked-by relationship is still open.
+        # Blocker states arrived inline with the issue listing, so this
+        # costs nothing and runs before body-declared refs (which cost gh
+        # API calls to resolve).
+        native_open = native_open_blockers(issue_data, repo)
+        if native_open:
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_DEPENDENCY,
+                    labels=issue_labels,
+                    open_blockers=native_open,
+                )
+            )
+            continue
+
+        # Skip if any body-declared blocker issue is still open.
         # Position matters: blocker resolution costs gh API calls, so it
-        # runs after all the cheap Redis skips.
+        # runs after all the cheap Redis skips and the free native check.
         blocker_refs = parse_blocker_refs(body)
         if blocker_refs:
+            # Native data already told us the state of any same-repo blocker
+            # it listed -- seed the cache so those refs cost no gh call.
+            # The cache is keyed by bare same-repo issue numbers, so only
+            # blockers explicitly attributed to this repo may seed it; a
+            # cross-repo or unattributed blocker sharing a number with a
+            # same-repo body ref must fall through to the gh lookup.
+            for blocker in issue_data.get("blocked_by") or []:
+                state = blocker.get("state")
+                if blocker.get("repo") == repo and isinstance(state, str):
+                    blocker_state_cache.setdefault(
+                        blocker["number"],
+                        "closed" if state.upper() == "CLOSED" else "open",
+                    )
             states = fetch_blocker_states(repo, blocker_refs, token, blocker_state_cache)
             still_open = open_blockers(blocker_refs, states)
             if still_open:
@@ -257,7 +292,7 @@ def discover_actionable_issues(
                         body=body,
                         action=IssueAction.SKIP_DEPENDENCY,
                         labels=issue_labels,
-                        open_blockers=still_open,
+                        open_blockers=[f"#{n}" for n in still_open],
                     )
                 )
                 continue

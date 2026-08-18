@@ -32,6 +32,7 @@ def _make_issue_data(
     title: str = "Implement feature X",
     body: str = "Some description",
     labels: list[dict] | None = None,
+    blocked_by: list[dict] | None = None,
 ) -> dict:
     """Build an issue dict matching the shape returned by gh.list_labeled_issues."""
     return {
@@ -39,6 +40,7 @@ def _make_issue_data(
         "title": title,
         "body": body,
         "labels": labels or [],
+        "blocked_by": blocked_by or [],
     }
 
 
@@ -478,7 +480,7 @@ def test_skip_dependency_when_blocker_is_open(
 
     assert len(results) == 1
     assert results[0].action == IssueAction.SKIP_DEPENDENCY
-    assert results[0].open_blockers == [101]
+    assert results[0].open_blockers == ["#101"]
     issue_state_mock.assert_called_once_with(REPO, 101, TOKEN)
 
 
@@ -541,7 +543,7 @@ def test_skip_dependency_when_blocker_lookup_fails_transiently(
 
     assert len(results) == 1
     assert results[0].action == IssueAction.SKIP_DEPENDENCY
-    assert results[0].open_blockers == [100]
+    assert results[0].open_blockers == ["#100"]
 
 
 def test_closes_directive_does_not_block(
@@ -603,7 +605,7 @@ def test_mixed_blockers_open_and_closed(
 
     assert len(results) == 1
     assert results[0].action == IssueAction.SKIP_DEPENDENCY
-    assert results[0].open_blockers == [2]
+    assert results[0].open_blockers == ["#2"]
 
 
 def test_dependency_check_runs_after_cheap_filters(
@@ -624,6 +626,226 @@ def test_dependency_check_runs_after_cheap_filters(
 
     assert results[0].action == IssueAction.SKIP_LOCKED
     issue_state_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# GitHub-native issue dependencies (blocked_by from list_labeled_issues)
+# ---------------------------------------------------------------------------
+
+
+def test_skip_dependency_when_native_blocker_is_open(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A native blocked-by relationship defers the issue with zero extra gh calls."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=300,
+            blocked_by=[{"number": 3, "state": "OPEN", "repo": REPO}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#3"]
+    issue_state_mock.assert_not_called()
+
+
+def test_enqueue_when_native_blocker_is_closed(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=301,
+            blocked_by=[{"number": 3, "state": "CLOSED", "repo": REPO}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    issue_state_mock.assert_not_called()
+
+
+def test_skip_dependency_when_cross_repo_native_blocker_is_open(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=302,
+            blocked_by=[{"number": 8, "state": "OPEN", "repo": "other-org/other-repo"}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["other-org/other-repo#8"]
+
+
+def test_native_open_blocker_short_circuits_body_resolution(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """When a native blocker already defers the issue, body refs are not
+    resolved -- no gh calls are spent on an issue we know is deferred."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=303,
+            body="Blocked by #77",
+            blocked_by=[{"number": 3, "state": "OPEN", "repo": REPO}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#3"]
+    issue_state_mock.assert_not_called()
+
+
+def test_native_blocker_state_seeds_body_resolution_cache(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A body ref whose state is already known from native data costs no gh call
+    and does not defer when that blocker is closed."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=304,
+            body="Blocked by #9",
+            blocked_by=[{"number": 9, "state": "CLOSED", "repo": REPO}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    issue_state_mock.assert_not_called()
+
+
+def test_repo_less_native_blocker_does_not_seed_cache(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A native blocker with no repo attribution must not be treated as
+    same-repo when seeding the body-resolution cache. Here the closed
+    repo-less blocker shares issue number 12 with an open same-repo body
+    ref -- the issue must defer via a real gh lookup, not enqueue off a
+    poisoned cache entry."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=307,
+            body="Blocked by #12",
+            blocked_by=[{"number": 12, "state": "CLOSED", "repo": None}],
+        ),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#12"]
+    issue_state_mock.assert_called_once_with(REPO, 12, TOKEN)
+
+
+def test_cross_repo_closed_native_blocker_does_not_seed_cache(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """The cache is keyed by bare same-repo issue numbers, so a closed
+    cross-repo native blocker whose number collides with an open same-repo
+    body ref must not satisfy that ref."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=308,
+            body="Blocked by #9",
+            blocked_by=[{"number": 9, "state": "CLOSED", "repo": "other-org/other-repo"}],
+        ),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#9"]
+    issue_state_mock.assert_called_once_with(REPO, 9, TOKEN)
+
+
+def test_native_and_body_same_blocker_reported_once(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A blocker declared both natively and in the body appears once."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=305,
+            body="Blocked by #5",
+            blocked_by=[{"number": 5, "state": "OPEN", "repo": REPO}],
+        ),
+    ]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#5"]
+    issue_state_mock.assert_not_called()
+
+
+def test_issue_without_blocked_by_key_still_works(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """Issue dicts lacking the blocked_by key (e.g. from an older caller)
+    behave as having no native dependencies."""
+    issue = _make_issue_data(number=306)
+    del issue["blocked_by"]
+    issue_gh_mock.return_value = [issue]
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
 
 
 # ---------------------------------------------------------------------------
