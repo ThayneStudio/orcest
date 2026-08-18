@@ -106,8 +106,13 @@ class Decision:
     # that would otherwise have fired this evaluation (final-review I3): the
     # honest "would have killed" signal for observation-mode visibility.
     # False for every other outcome, including a waiting-grace-only defer
-    # (that's WAITING's own mechanism, not the fleet gate) and an actual
-    # kill. See ``evaluate()``'s two escalation_blocked checkpoints.
+    # (that's WAITING's own mechanism, not the fleet gate) and the
+    # STUCK/LOOPING kill itself when it isn't blocked. See ``evaluate()``'s
+    # two escalation_blocked checkpoints. Note this CAN be True at the same
+    # time as ``kill == "ceiling"``: CEILING is exempt from the gate (spec),
+    # so a STUCK/LOOPING kill gate-deferred on this same evaluation can
+    # still lose to a ceiling kill that fires anyway -- ``deferred`` and
+    # ``kill`` describe two different triggers, not mutually exclusive ones.
     deferred: bool = False
 
 
