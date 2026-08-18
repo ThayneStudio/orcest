@@ -169,6 +169,13 @@ class FleetHealthMonitor:
             logger.warning("Fleet pressure key read failed", exc_info=True)
             return
 
+        # Deliberate order: the gate key is set before the best-effort event
+        # is emitted. The key is the control signal every worker's
+        # LivenessTracker actually consults; the event is telemetry only. So
+        # "emitted once per pressure episode" below is really "key-set once
+        # per episode" -- `already_held` is read before the write and the
+        # event only fires on the transition, but the gate itself must be
+        # (re)armed first regardless of whether the telemetry event succeeds.
         try:
             self._redis.set_ex_raw(_PRESSURE_KEY, "1", self._pressure_hold)
         except Exception:
@@ -190,10 +197,10 @@ class FleetHealthMonitor:
             attempt=0,
             data={"suspect_tasks": distinct_task_ids, "window_seconds": self._pressure_window},
         )
-        try:
-            self._publisher.publish(envelope)
-        except Exception:
-            logger.warning("Fleet pressure event publish failed", exc_info=True)
+        # EventPublisher.publish() never raises -- it swallows its own
+        # publish failures internally (decimated logging), so no try/except
+        # is needed here.
+        self._publisher.publish(envelope)
 
     def _mirror_kill_budget_limit(self) -> None:
         try:
