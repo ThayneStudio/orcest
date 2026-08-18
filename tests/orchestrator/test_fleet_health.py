@@ -238,3 +238,54 @@ def test_malformed_envelope_skipped_and_cursor_advances(fake_redis_client):
     assert fake_redis_client.get("fleet_health:cursor") is not None
     # Only one valid suspect was recorded -- not enough to trip pressure.
     assert fake_redis_client.get_raw(_PRESSURE_KEY) is None
+
+
+def test_non_dict_envelope_skipped_and_cursor_advances(fake_redis_client):
+    """A spool entry whose ``envelope`` field is valid JSON but not a JSON
+    object (e.g. ``"[]"`` or ``"42"``) must not raise -- ``envelope.get(...)``
+    on a list/int raises AttributeError, which would otherwise propagate out
+    of _pass_once before the cursor is advanced and wedge pressure detection
+    on that entry forever. A following valid suspect must still be
+    processed in the same pass.
+    """
+    monitor, clock = _make_monitor(fake_redis_client)
+    fake_redis_client.xadd_capped(EVENTS_STREAM, {"envelope": "[]"}, 50000)
+    fake_redis_client.xadd_capped(EVENTS_STREAM, {"envelope": "42"}, 50000)
+    _spool_suspect(fake_redis_client, "t1", _iso(clock.t))
+
+    monitor._pass_once()
+
+    cursor = fake_redis_client.get("fleet_health:cursor")
+    assert cursor is not None
+    # Cursor advanced past all three entries (not stuck on the poison ones).
+    assert cursor.split("-")[0] != "0"
+    # Only one valid suspect recorded -- not enough to trip pressure, but it
+    # was processed rather than skipped as a side effect of a wedge.
+    assert fake_redis_client.get_raw(_PRESSURE_KEY) is None
+    assert list(monitor._suspects)[-1][1] == "t1"
+
+
+def test_numeric_time_envelope_skipped_and_cursor_advances(fake_redis_client):
+    """A task.suspect envelope whose ``time`` field is a JSON number (truthy,
+    so it passes the ``not task_id or not time_str`` check) must not raise --
+    ``_parse_rfc3339`` calling ``.endswith`` on an int raises AttributeError,
+    which only ValueError/TypeError were caught for. A following valid
+    suspect must still be processed in the same pass.
+    """
+    monitor, clock = _make_monitor(fake_redis_client)
+    envelope = make_event(
+        "net.orcest.task.suspect", source_project="p", task_id="bad-time-task",
+        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+    )
+    envelope["time"] = 12345
+    fake_redis_client.xadd_capped(EVENTS_STREAM, {"envelope": json.dumps(envelope)}, 50000)
+    _spool_suspect(fake_redis_client, "t1", _iso(clock.t))
+
+    monitor._pass_once()
+
+    cursor = fake_redis_client.get("fleet_health:cursor")
+    assert cursor is not None
+    assert cursor.split("-")[0] != "0"
+    assert fake_redis_client.get_raw(_PRESSURE_KEY) is None
+    task_ids = [task_id for _, task_id in monitor._suspects]
+    assert task_ids == ["t1"]

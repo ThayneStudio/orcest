@@ -57,6 +57,20 @@ def test_poison_envelopes_skipped_not_raised(tmp_path):
     assert rows == [("t-valid",)]
 
 
+def test_non_dict_envelopes_skipped_not_raised(tmp_path):
+    """A batch containing valid-JSON-but-non-dict envelopes (``null``,
+    ``42``, ``true``) must not raise -- membership checks like ``"id" in
+    env`` blow up with TypeError on a non-dict, which would otherwise
+    propagate past insert_events, 500 the ingest endpoint, and wedge the
+    relay's retry loop on the same batch forever.
+    """
+    conn = db.open_rw(str(tmp_path / "m.db"))
+    accepted = db.insert_events(conn, [None, 42, True, _env("t-valid")])
+    assert accepted == 1
+    rows = conn.execute("SELECT subject FROM events").fetchall()
+    assert rows == [("t-valid",)]
+
+
 def test_ro_connection_rejects_writes(tmp_path):
     path = str(tmp_path / "m.db")
     db.open_rw(path).close()
