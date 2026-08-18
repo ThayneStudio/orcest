@@ -764,7 +764,9 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 def list_labeled_issues(repo: str, label: str, token: str, limit: int = 1000) -> list[dict]:
     """List open issues with a specific label, oldest first.
 
-    Returns list of dicts with keys: number, title, body, labels.
+    Returns list of dicts with keys: number, title, body, labels, blocked_by.
+    `blocked_by` holds the issue's native GitHub dependencies as
+    {number, state, repo} dicts (state is GraphQL-cased: "OPEN"/"CLOSED").
     Paginated via GraphQL cursor (mirrors list_open_prs) so repos with more
     than 100 labeled issues do not silently drop the oldest ones. Capped at
     _MAX_PAGES * 100 issues.
@@ -789,6 +791,9 @@ query($owner: String!, $repo: String!, $label: String!, $first: Int!, $after: St
         title
         body
         labels(first: 100) { nodes { name color description } }
+        blockedBy(first: 50) {
+          nodes { number state repository { nameWithOwner } }
+        }
       }
     }
   }
@@ -840,6 +845,18 @@ query($owner: String!, $repo: String!, $label: String!, $first: Int!, $after: St
             labels = (node.get("labels") or {}).get("nodes") or []
             normalized = dict(node)
             normalized["labels"] = labels
+            # GitHub caps native dependencies at 50 per relationship type,
+            # so blockedBy(first: 50) is always the complete set.
+            normalized["blocked_by"] = [
+                {
+                    "number": blocker["number"],
+                    "state": blocker.get("state"),
+                    "repo": (blocker.get("repository") or {}).get("nameWithOwner"),
+                }
+                for blocker in (node.get("blockedBy") or {}).get("nodes") or []
+                if blocker.get("number") is not None
+            ]
+            normalized.pop("blockedBy", None)
             issues.append(normalized)
         page_info = issues_conn.get("pageInfo") or {}
         if page_info.get("hasNextPage") and len(issues) < limit:

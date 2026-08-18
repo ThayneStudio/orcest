@@ -1,12 +1,17 @@
 """Issue dependency parsing and resolution.
 
-Scans issue body text for prerequisite references ("blocked by #N",
-"depends on #N", etc.) and looks up each referenced issue's state so the
-orchestrator can defer dependent issues while their blockers remain open.
+Two dependency sources defer an issue while its blockers remain open:
 
-Scope (v1):
-- Same-repo `#N` references only.
-- Body text only; comments are not scanned.
+1. GitHub-native blocked-by relationships (`native_open_blockers`) --
+   states arrive inline with the issue listing, cross-repo supported.
+2. Body-text prerequisite references ("blocked by #N", "depends on #N",
+   etc.), resolved via per-blocker `gh` lookups.
+
+Scope:
+- Body-text references are same-repo `#N` only; cross-repo dependencies
+  need a native relationship. Comments are not scanned.
+- A native blocker the orchestrator token cannot see is silently omitted
+  by the API (no signal it exists), so it cannot defer the dependent.
 - No topological ordering: workers run in parallel and the next discovery
   tick re-evaluates everything, so deferral alone is sufficient.
 
@@ -87,6 +92,40 @@ def parse_blocker_refs(body: str) -> set[int]:
             if len(refs) >= _MAX_REFS_PER_BODY:
                 return refs
     return refs
+
+
+def native_open_blockers(issue_data: dict, repo: str) -> list[str]:
+    """Display refs of the issue's still-blocking GitHub-native dependencies.
+
+    Reads the `blocked_by` list that `gh.list_labeled_issues` normalizes from
+    the GraphQL `blockedBy` connection ({number, state, repo} dicts). Because
+    the blocker's state arrives inline, this costs no extra API calls, and
+    cross-repo blockers are supported (rendered as `owner/repo#N`; same-repo
+    ones as `#N`).
+
+    A blocker with a missing/unrecognized state fails safe to blocking,
+    mirroring the "unknown" semantics of body-declared dependencies. Only
+    "CLOSED" clears a blocker (the blockedBy connection holds Issues only,
+    whose GraphQL states are exactly OPEN/CLOSED).
+
+    Sorted same-repo first, then by repo and number, so log lines read
+    naturally.
+    """
+    blockers: list[tuple[int, str, int]] = []
+    for blocker in issue_data.get("blocked_by") or []:
+        state = blocker.get("state")
+        if isinstance(state, str) and state.upper() == "CLOSED":
+            continue
+        number = blocker["number"]
+        blocker_repo = blocker.get("repo") or repo
+        if blocker_repo == repo:
+            blockers.append((0, "", number))
+        else:
+            blockers.append((1, blocker_repo, number))
+    return [
+        f"#{number}" if not blocker_repo else f"{blocker_repo}#{number}"
+        for _, blocker_repo, number in sorted(blockers)
+    ]
 
 
 def fetch_blocker_states(
