@@ -58,7 +58,9 @@ from orcest.shared.models import (
     task_stream_name,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
+from orcest.worker.liveness_tracker import LivenessTracker
 from orcest.worker.runner import (
     PROVIDER_REGISTRY,
     Runner,
@@ -2421,6 +2423,37 @@ def _execute_task(
         # from ``task.model`` overrides the worker-wide default.
         per_task_runner = _runner_for_task(task, config, fallback=runner)
         effective_model = task.model or config.runner.model
+
+        # Activity watchdog (task B8): only wired up for runners that use the
+        # generic ``_BaseCliRunner._run_cli_agent`` driver -- i.e. it does not
+        # override ``run`` (Grok, Codex). ClaudeRunner keeps its legacy
+        # ``run_claude`` driver (see _runner_base.py's module docstring) and
+        # is untouched by this. ``config.runner.watchdog.enabled: False`` is
+        # the rollback lever: no tracker_factory is built, so the runner's
+        # fixed wall-clock watchdog behaves exactly as before.
+        run_kwargs: dict[str, Any] = {}
+        if (
+            config.runner.watchdog.enabled
+            and isinstance(per_task_runner, _BaseCliRunner)
+            and type(per_task_runner).run is _BaseCliRunner.run
+        ):
+
+            def _tracker_factory(
+                root_pid: int, _work_dir: Path = work_dir, _task: Task = task
+            ) -> LivenessTracker:
+                return LivenessTracker(
+                    config.runner.watchdog,
+                    float(config.runner.timeout),
+                    redis=redis,
+                    emit=_emit,
+                    worker_id=config.worker_id,
+                    task_id=_task.id,
+                    root_pid=root_pid,
+                    workspace=_work_dir,
+                )
+
+            run_kwargs["tracker_factory"] = _tracker_factory
+
         runner_result: RunnerResult = per_task_runner.run(
             prompt=task.prompt,
             work_dir=work_dir,
@@ -2434,6 +2467,7 @@ def _execute_task(
             provider=task.provider,
             credential=task.credential,
             model=effective_model,
+            **run_kwargs,
         )
 
         duration = int(time.monotonic() - start)

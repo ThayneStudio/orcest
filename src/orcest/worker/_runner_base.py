@@ -40,10 +40,33 @@ Grok ``~/.grok/auth.json``) under ``home_dir`` and return its path as
 on that path; if the CLI refreshed the token in place, the driver surfaces the
 new blob on ``RunnerResult.credential_update`` so the orchestrator can persist
 it (orchestrator-side persistence is a separate change).
+
+Activity watchdog integration (task B8): ``_run_cli_agent`` accepts an
+optional ``tracker_factory``. The task-B8 brief's original interface sketch
+was ``tracker: LivenessTracker | None``, but ``LivenessTracker`` takes the
+child's ``root_pid`` at construction time (it binds a ``ProcessTreeSampler``
+to it immediately), and the pid does not exist until *after* ``Popen`` --
+and a fresh pid exists for every retry attempt, since each attempt spawns a
+new process tree. A single pre-built tracker instance can't express that.
+So the caller (``worker/loop.py``) passes a ``Callable[[int], LivenessTracker]``
+instead; this driver calls it with ``proc.pid`` immediately after each
+successful ``Popen`` and gets a tracker scoped to that one attempt, closed
+(``tracker.close()``) when the attempt ends regardless of outcome. When
+``tracker_factory`` is ``None`` (the caller's ``watchdog.enabled: False``
+rollback lever), the fixed wall-clock watchdog runs byte-for-byte as before
+-- this is the load-bearing rollback path, see ``global-constraints.md``.
+
+Import note: this module must NOT import ``liveness_tracker`` (or its
+transitive dependency ``stream_liveness``) at module scope --
+``stream_liveness`` imports ``claude_runner``, which imports this module,
+which would deadlock the import cycle. ``LivenessTracker`` is only ever
+referenced here as a ``TYPE_CHECKING``-guarded type hint; the runtime code
+never constructs one directly, only calls the factory it's handed.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -55,9 +78,12 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from orcest.worker.runner import RunnerResult
+
+if TYPE_CHECKING:
+    from orcest.worker.liveness_tracker import LivenessTracker
 
 # Environment variables safe to forward to provider subprocesses.
 # Whitelist (not os.environ.copy()) to avoid leaking secrets for other services.
@@ -252,6 +278,7 @@ def _run_cli_agent(
     on_output: Callable[[str], None] | None,
     on_stderr: Callable[[str], None] | None,
     abort_event: threading.Event,
+    tracker_factory: Callable[[int], LivenessTracker] | None = None,
 ) -> RunnerResult:
     """Provider-agnostic subprocess driver. Spawns the CLI, streams stdout,
     drains stderr, enforces a watchdog timeout, retries transient crashes with
@@ -260,6 +287,11 @@ def _run_cli_agent(
     Credential delivery goes through ``runner.prepare_credential`` (env var or
     blob file). After a completed run, ``runner.extract_credential_update`` is
     consulted on any ``watch_path`` to capture a refreshed OAuth token.
+
+    ``tracker_factory``, when not ``None``, replaces the fixed wall-clock
+    watchdog with the activity-ladder-driven one (see the module docstring's
+    "Activity watchdog integration" note for why this is a factory and not a
+    pre-built tracker).
     """
     env = _build_base_env(token, runner.extra_env_keys)
     cred_ctx = runner.prepare_credential(credential, work_dir, home_dir, env_var_name)
@@ -318,200 +350,287 @@ def _run_cli_agent(
                 logger.error("Failed to start %s: %s", binary, e)
             return _finish(RunnerResult(success=False, summary=f"Failed to start: {e}"))
 
-        if stdin_input is not None and proc.stdin is not None:
+        # A fresh tracker per attempt: LivenessTracker binds a
+        # ProcessTreeSampler to a root_pid at construction, and each retry
+        # attempt spawns a brand-new process tree (see module docstring's
+        # "Activity watchdog integration" note). Closed in the `finally`
+        # below regardless of how this attempt ends.
+        tracker: LivenessTracker | None = None
+        if tracker_factory is not None:
             try:
-                proc.stdin.write(stdin_input)
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-
-        auth_required = threading.Event()
-
-        def _handle_stderr(line: str) -> None:
-            if on_stderr is not None:
-                try:
-                    on_stderr(line)
-                except Exception:
-                    pass
-            if runner.detect_auth_prompt(line):
-                auth_required.set()
+                tracker = tracker_factory(proc.pid)
+            except Exception:
                 if logger:
-                    logger.warning("%s requested interactive authentication", binary)
-                _kill_process_tree(proc)
-
-        try:
-            stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=_handle_stderr)
-        except RuntimeError:
-            _kill_process_tree(proc)
-            _close_pipes(proc)
-            if attempt < runner.max_retries:
-                abort_event.wait(timeout=runner.retry_backoff)
-                if abort_event.is_set():
-                    break
-            continue
-
-        if proc.stdout is None:  # pragma: no cover
-            _kill_process_tree(proc)
-            stderr_thread.join(timeout=5)
-            _close_pipes(proc)
-            raise RuntimeError("Popen stdout pipe is None despite PIPE flag")
-
-        watchdog_cancelled = threading.Event()
-        watchdog_killed = threading.Event()
-        watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
-
-        def _watchdog(
-            _proc: subprocess.Popen[str] = proc,
-            _remaining: float = watchdog_remaining,
-            _cancelled: threading.Event = watchdog_cancelled,
-            _killed: threading.Event = watchdog_killed,
-        ) -> None:
-            if _remaining > 0:
-                _cancelled.wait(timeout=_remaining)
-            if not _cancelled.is_set():
-                _killed.set()
-                _kill_process_tree(_proc)
-
-        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-        try:
-            watchdog_thread.start()
-        except RuntimeError:
-            _kill_process_tree(proc)
-            stderr_thread.join(timeout=5)
-            _close_pipes(proc)
-            if attempt < runner.max_retries:
-                abort_event.wait(timeout=runner.retry_backoff)
-                if abort_event.is_set():
-                    break
-            continue
-
-        stdout_lines = []
-        timed_out = False
-        streaming_on_output = on_output
-        try:
-            for line in proc.stdout:
-                stdout_lines.append(line)
-                if streaming_on_output is not None:
-                    try:
-                        streaming_on_output(line)
-                    except Exception:
-                        if logger:
-                            logger.warning(
-                                "on_output callback raised; disabling streaming",
-                                exc_info=True,
-                            )
-                        streaming_on_output = None
-                if abort_event.is_set():
-                    watchdog_cancelled.set()
-                    watchdog_thread.join(timeout=5)
-                    _kill_process_tree(proc)
-                    stderr_thread.join(timeout=5)
-                    _close_pipes(proc)
-                    if logger:
-                        logger.warning("%s subprocess killed: lock lost", binary)
-                    return _finish(
-                        RunnerResult(success=False, summary="Aborted: lock lost", transient=True)
+                    logger.warning(
+                        "tracker_factory raised; falling back to fixed watchdog",
+                        exc_info=True,
                     )
-                if time.monotonic() - attempt_start >= timeout:
-                    timed_out = True
-                    break
-        except Exception as stdout_exc:
-            watchdog_cancelled.set()
-            watchdog_thread.join(timeout=5)
-            _kill_process_tree(proc)
-            stderr_thread.join(timeout=5)
-            _close_pipes(proc)
-            if watchdog_killed.is_set():
-                timed_out = True
-            else:
-                if logger:
-                    logger.warning("stdout read failed: %s", stdout_exc, exc_info=True)
+
+        try:
+            if stdin_input is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(stdin_input)
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+
+            auth_required = threading.Event()
+
+            def _handle_stderr(line: str) -> None:
+                if on_stderr is not None:
+                    try:
+                        on_stderr(line)
+                    except Exception:
+                        pass
+                if runner.detect_auth_prompt(line):
+                    auth_required.set()
+                    if logger:
+                        logger.warning("%s requested interactive authentication", binary)
+                    _kill_process_tree(proc)
+
+            try:
+                stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=_handle_stderr)
+            except RuntimeError:
+                _kill_process_tree(proc)
+                _close_pipes(proc)
                 if attempt < runner.max_retries:
                     abort_event.wait(timeout=runner.retry_backoff)
                     if abort_event.is_set():
                         break
                 continue
 
-        watchdog_cancelled.set()
-        watchdog_thread.join(timeout=5)
-        if not timed_out and watchdog_killed.is_set():
-            timed_out = True
-
-        if not timed_out:
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+            if proc.stdout is None:  # pragma: no cover
                 _kill_process_tree(proc)
+                stderr_thread.join(timeout=5)
+                _close_pipes(proc)
+                raise RuntimeError("Popen stdout pipe is None despite PIPE flag")
+
+            watchdog_cancelled = threading.Event()
+            watchdog_killed = threading.Event()
+            # Only meaningful when `tracker` is not None: which ladder
+            # trigger ("stuck" | "looping" | "ceiling") fired the kill.
+            killed_trigger: str | None = None
+
+            if tracker is None:
+                watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
+
+                def _watchdog(
+                    _proc: subprocess.Popen[str] = proc,
+                    _remaining: float = watchdog_remaining,
+                    _cancelled: threading.Event = watchdog_cancelled,
+                    _killed: threading.Event = watchdog_killed,
+                ) -> None:
+                    if _remaining > 0:
+                        _cancelled.wait(timeout=_remaining)
+                    if not _cancelled.is_set():
+                        _killed.set()
+                        _kill_process_tree(_proc)
+            else:
+
+                def _watchdog(
+                    _proc: subprocess.Popen[str] = proc,
+                    _tracker: LivenessTracker = tracker,
+                    _interval: float = tracker.sample_interval,
+                    _cancelled: threading.Event = watchdog_cancelled,
+                    _killed: threading.Event = watchdog_killed,
+                ) -> None:
+                    nonlocal killed_trigger
+                    while not _cancelled.wait(timeout=_interval):
+                        trigger = _tracker.tick()
+                        if trigger:
+                            killed_trigger = trigger
+                            _killed.set()
+                            _kill_process_tree(_proc)
+                            break
+
+            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            try:
+                watchdog_thread.start()
+            except RuntimeError:
+                _kill_process_tree(proc)
+                stderr_thread.join(timeout=5)
+                _close_pipes(proc)
+                if attempt < runner.max_retries:
+                    abort_event.wait(timeout=runner.retry_backoff)
+                    if abort_event.is_set():
+                        break
+                continue
+
+            stdout_lines = []
+            timed_out = False
+            streaming_on_output = on_output
+            try:
+                for line in proc.stdout:
+                    stdout_lines.append(line)
+                    if tracker is not None:
+                        try:
+                            tracker.observe_line(line)
+                        except Exception:
+                            if logger:
+                                logger.warning(
+                                    "tracker.observe_line failed", exc_info=True
+                                )
+                    if streaming_on_output is not None:
+                        try:
+                            streaming_on_output(line)
+                        except Exception:
+                            if logger:
+                                logger.warning(
+                                    "on_output callback raised; disabling streaming",
+                                    exc_info=True,
+                                )
+                            streaming_on_output = None
+                    if abort_event.is_set():
+                        watchdog_cancelled.set()
+                        watchdog_thread.join(timeout=5)
+                        _kill_process_tree(proc)
+                        stderr_thread.join(timeout=5)
+                        _close_pipes(proc)
+                        if logger:
+                            logger.warning("%s subprocess killed: lock lost", binary)
+                        return _finish(
+                            RunnerResult(
+                                success=False, summary="Aborted: lock lost", transient=True
+                            )
+                        )
+                    # With a tracker, CEILING is the ladder's job (evaluated
+                    # in the watchdog thread via tick()); the inline
+                    # wall-clock check below is only for the no-tracker
+                    # (disabled-watchdog) fixed-timeout path.
+                    if tracker is None and time.monotonic() - attempt_start >= timeout:
+                        timed_out = True
+                        break
+            except Exception as stdout_exc:
+                watchdog_cancelled.set()
+                watchdog_thread.join(timeout=5)
+                _kill_process_tree(proc)
+                stderr_thread.join(timeout=5)
+                _close_pipes(proc)
+                if watchdog_killed.is_set():
+                    timed_out = True
+                else:
+                    if logger:
+                        logger.warning("stdout read failed: %s", stdout_exc, exc_info=True)
+                    if attempt < runner.max_retries:
+                        abort_event.wait(timeout=runner.retry_backoff)
+                        if abort_event.is_set():
+                            break
+                    continue
+
+            watchdog_cancelled.set()
+            watchdog_thread.join(timeout=5)
+            if not timed_out and watchdog_killed.is_set():
+                timed_out = True
+
+            if not timed_out:
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
-                    pass
-        else:
-            _kill_process_tree(proc)
-        stderr_thread.join(timeout=5)
-        _close_pipes(proc)
+                    _kill_process_tree(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            else:
+                _kill_process_tree(proc)
+            stderr_thread.join(timeout=5)
+            _close_pipes(proc)
 
-        stdout = "".join(stdout_lines)
-        stderr = "".join(stderr_lines)
+            # Verified kill (spec: D-state escalation). Only applies to a
+            # ladder-driven kill (tracker present, a trigger latched); the
+            # legacy fixed-watchdog timeout never verifies death.
+            if tracker is not None and timed_out and killed_trigger is not None:
+                time.sleep(2)
+                try:
+                    states = tracker.tree_states()
+                except Exception:
+                    states = []
+                    if logger:
+                        logger.warning("tracker.tree_states() failed", exc_info=True)
+                verified = "D" not in states
+                if not verified:
+                    tracker.mark_needs_reap()
+                tracker.emit_killed(killed_trigger, verified)
 
-        if auth_required.is_set():
-            return _finish(
-                RunnerResult(
-                    success=False,
-                    summary=runner.auth_required_summary(),
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_lines)
+
+            if auth_required.is_set():
+                return _finish(
+                    RunnerResult(
+                        success=False,
+                        summary=runner.auth_required_summary(),
+                    )
                 )
-            )
 
-        # Exhaustion / overload first (some CLIs exit 0 with an error envelope).
-        exhausted, resets_at = runner.detect_exhaustion(stdout, stderr)
-        if exhausted:
-            return _finish(
-                RunnerResult(
-                    success=False,
-                    summary="Usage limit reached",
-                    usage_exhausted=True,
-                    rate_limit_resets_at=resets_at,
+            # Exhaustion / overload first (some CLIs exit 0 with an error envelope).
+            exhausted, resets_at = runner.detect_exhaustion(stdout, stderr)
+            if exhausted:
+                return _finish(
+                    RunnerResult(
+                        success=False,
+                        summary="Usage limit reached",
+                        usage_exhausted=True,
+                        rate_limit_resets_at=resets_at,
+                    )
                 )
-            )
-        if runner.detect_overload(stdout, stderr):
-            return _finish(
-                RunnerResult(success=False, summary="Provider overloaded", transient=True)
-            )
+            if runner.detect_overload(stdout, stderr):
+                return _finish(
+                    RunnerResult(success=False, summary="Provider overloaded", transient=True)
+                )
 
-        if timed_out:
+            if timed_out:
+                if tracker is not None and killed_trigger in ("stuck", "looping"):
+                    if logger:
+                        logger.error(
+                            "%s killed by activity watchdog: trigger=%s", binary, killed_trigger
+                        )
+                    snapshot_head = json.dumps(tracker.last_snapshot(), default=str)[:500]
+                    return _finish(
+                        RunnerResult(
+                            success=False,
+                            summary=f"STALLED({killed_trigger}): {snapshot_head}",
+                            transient=False,
+                        )
+                    )
+                if logger:
+                    logger.error("%s timed out after %ds", binary, timeout)
+                return _finish(
+                    RunnerResult(
+                        success=False, summary=f"Timed out after {timeout}s", transient=True
+                    )
+                )
+
+            rc = proc.returncode
+            if rc is None:
+                return _finish(
+                    RunnerResult(
+                        success=False,
+                        summary="Process did not exit (stuck in D-state)",
+                        transient=True,
+                    )
+                )
+            if rc == 0:
+                summary = runner.extract_summary(stdout)
+                needs_human, reason = _check_needs_human(runner.extract_agent_text(stdout))
+                return _finish(
+                    RunnerResult(
+                        success=True,
+                        summary=summary,
+                        needs_human=needs_human,
+                        needs_human_reason=reason,
+                    )
+                )
+
             if logger:
-                logger.error("%s timed out after %ds", binary, timeout)
-            return _finish(
-                RunnerResult(success=False, summary=f"Timed out after {timeout}s", transient=True)
-            )
-
-        rc = proc.returncode
-        if rc is None:
-            return _finish(
-                RunnerResult(
-                    success=False,
-                    summary="Process did not exit (stuck in D-state)",
-                    transient=True,
-                )
-            )
-        if rc == 0:
-            summary = runner.extract_summary(stdout)
-            needs_human, reason = _check_needs_human(runner.extract_agent_text(stdout))
-            return _finish(
-                RunnerResult(
-                    success=True,
-                    summary=summary,
-                    needs_human=needs_human,
-                    needs_human_reason=reason,
-                )
-            )
-
-        if logger:
-            logger.warning("%s exited with code %d: %s", binary, rc, stderr[:500])
-        if attempt < runner.max_retries:
-            abort_event.wait(timeout=runner.retry_backoff)
-            if abort_event.is_set():
-                break
+                logger.warning("%s exited with code %d: %s", binary, rc, stderr[:500])
+            if attempt < runner.max_retries:
+                abort_event.wait(timeout=runner.retry_backoff)
+                if abort_event.is_set():
+                    break
+        finally:
+            if tracker is not None:
+                tracker.close()
 
     # Repeated non-zero exits with no explicit transient signal: treat as
     # transient infrastructure failure (retried by the orchestrator), never
@@ -631,6 +750,7 @@ class _BaseCliRunner(ABC):
         credential: str = "",
         model: str = "",
         home_dir: Path | None = None,
+        tracker_factory: Callable[[int], LivenessTracker] | None = None,
     ) -> RunnerResult:
         from orcest.worker.runner import get_provider_recipe
 
@@ -658,6 +778,7 @@ class _BaseCliRunner(ABC):
             logger=logger,
             on_output=on_output,
             on_stderr=on_stderr,
+            tracker_factory=tracker_factory,
             abort_event=abort,
         )
 

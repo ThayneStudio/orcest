@@ -392,6 +392,29 @@ class LivenessTracker:
         """Passthrough to ``ProcessTreeSampler.state_of_tree`` (B8 verify-death)."""
         return self._proc_sampler.state_of_tree()
 
+    @property
+    def sample_interval(self) -> float:
+        """The watchdog thread's poll cadence (B8: drives its ``cancelled.wait``)."""
+        return self._cfg.sample_interval
+
+    def last_snapshot(self) -> dict[str, Any]:
+        """Most recent ladder decision snapshot (B8: STALLED result summary)."""
+        with self._lock:
+            return dict(self._last_snapshot)
+
+    def emit_killed(self, trigger: str, verified: bool) -> None:
+        """Emit ``net.orcest.task.killed`` (B8: after post-kill D-state
+        verification). A small dedicated method rather than having the
+        runner reach into ``_emit_fn`` directly, so the event shape and the
+        best-effort-swallow semantics stay colocated with the tracker's
+        other emits."""
+        self._safe(
+            lambda: self._emit_fn(
+                "net.orcest.task.killed", {"trigger": trigger, "verified": verified}
+            ),
+            "killed emit",
+        )
+
     def mark_needs_reap(self) -> None:
         with self._lock:
             self._needs_reap = True
