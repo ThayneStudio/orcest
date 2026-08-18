@@ -618,7 +618,14 @@ def _run_cli_agent(
                 if reclassified is not None:
                     return _finish(reclassified)
                 if logger:
-                    logger.error("%s timed out after %ds", binary, timeout)
+                    stderr_snippet = stderr.strip()[:1000]
+                    logger.error(
+                        "%s timed out after %ds (stdout_lines=%d, stderr=%s)",
+                        binary,
+                        timeout,
+                        len(stdout_lines),
+                        stderr_snippet if stderr_snippet else "(empty)",
+                    )
                 return _finish(
                     RunnerResult(
                         success=False, summary=f"Timed out after {timeout}s", transient=True

@@ -228,6 +228,62 @@ exit 0
     assert not any(event_type == "net.orcest.task.killed" for event_type, _ in events)
 
 
+class _ExhaustionNoisyRunner(_FakeCliRunner):
+    """detect_exhaustion always fires — simulates rate-limit noise present in
+    the partial output of a run the activity ladder killed."""
+
+    def detect_exhaustion(self, stdout: str, stderr: str) -> tuple[bool, int]:
+        return True, 1778302800
+
+
+@pytest.mark.integration
+def test_stalled_kill_never_reclassified_by_exhaustion_noise(tmp_path, fake_redis_client):
+    """Task B9 controller ruling: a corroborated stall (stuck/looping ladder
+    kill) is returned as STALLED even when the exhaustion scan would fire on
+    the partial output — it must NOT be converted to usage_exhausted (or a
+    transient timeout). Guards the STALLED-before-exhaustion ordering in
+    ``_run_cli_agent``; restoring the pre-B9 ordering would fail this test
+    while passing every other one."""
+    work_dir = tmp_path / "wd"
+    work_dir.mkdir()
+    script = _write_script(
+        tmp_path / "agent.sh",
+        """
+echo '{"type":"assistant","message":{"content":[]}}'
+sleep 600
+""",
+    )
+    events: list = []
+    tracker_factory = _make_tracker_factory(fake_redis_client, work_dir, events)
+
+    result = _run_cli_agent(
+        _ExhaustionNoisyRunner(max_retries=1, retry_backoff=0),
+        "do work",
+        work_dir,
+        "tok",
+        60,
+        binary=str(script),
+        env_var_name="",
+        credential="",
+        model="",
+        home_dir=tmp_path,
+        logger=None,
+        on_output=None,
+        on_stderr=None,
+        abort_event=threading.Event(),
+        tracker_factory=tracker_factory,
+    )
+
+    assert result.success is False
+    assert result.summary.startswith("STALLED(")
+    assert result.usage_exhausted is False
+    assert result.transient is False
+    killed_data = next(
+        (data for event_type, data in events if event_type == "net.orcest.task.killed"), None
+    )
+    assert killed_data is not None and killed_data["trigger"] in ("stuck", "looping")
+
+
 @pytest.mark.integration
 def test_disabled_watchdog_preserves_wall_clock_timeout(tmp_path):
     script = _write_script(tmp_path / "agent.sh", "sleep 30\n")
