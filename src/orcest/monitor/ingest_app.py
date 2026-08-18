@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -54,8 +55,18 @@ def create_ingest_app(cfg: MonitorConfig) -> FastAPI:
         if token is None or not _token_matches(token, cfg.write_token):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
-        body = await request.json()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"detail": "malformed JSON body"}, status_code=400)
+
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"}, status_code=400)
+
         events = body.get("events", [])
+        if not isinstance(events, list):
+            return JSONResponse({"detail": "'events' must be a list"}, status_code=400)
+
         accepted = db.insert_events(app.state.conn, events)
         skipped = len(events) - accepted
         return JSONResponse({"accepted": accepted, "skipped": skipped})

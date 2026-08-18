@@ -46,6 +46,13 @@ def test_auth_required_and_method_gate(tmp_path):
     assert c.delete("/api/v1/events", headers=H).status_code == 405
 
 
+def test_method_gate_405_includes_allow_header(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/v1/events", headers=H)
+    assert r.status_code == 405
+    assert r.headers["allow"] == "GET, HEAD"
+
+
 def test_events_filtering(tmp_path):
     c = _client(tmp_path)
     r = c.get("/api/v1/events?type=net.orcest.task.failed", headers=H)

@@ -45,14 +45,20 @@ def _resolve_env(var_name: str) -> str:
     return value
 
 
+def _require_key(raw: dict, key: str) -> object:
+    if key not in raw:
+        raise ValueError(f"missing required config key: {key}")
+    return raw[key]
+
+
 def _load_reader(raw: dict) -> Reader:
     scopes = frozenset(raw.get("scopes", []))
     unknown = scopes - VALID_SCOPES
     if unknown:
         raise ValueError(f"unknown reader scope(s): {sorted(unknown)}")
     return Reader(
-        name=raw["name"],
-        token=_resolve_env(raw["token_env"]),
+        name=_require_key(raw, "name"),
+        token=_resolve_env(_require_key(raw, "token_env")),
         scopes=scopes,
     )
 
@@ -61,7 +67,10 @@ def load_monitor_config(path: str) -> MonitorConfig:
     """Load a :class:`MonitorConfig` from a YAML file.
 
     ``write_token_env`` and each reader's ``token_env`` are resolved through
-    ``os.environ``; a missing variable raises ``ValueError`` naming it.
+    ``os.environ``; a missing variable raises ``ValueError`` naming it. A
+    missing required config key (``db_path``, ``write_token_env``, or a
+    reader's ``name``/``token_env``) likewise raises ``ValueError`` naming
+    the missing key, rather than a bare ``KeyError``.
     """
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
@@ -69,12 +78,12 @@ def load_monitor_config(path: str) -> MonitorConfig:
     readers = [_load_reader(r) for r in raw.get("readers", [])]
 
     return MonitorConfig(
-        db_path=raw["db_path"],
+        db_path=_require_key(raw, "db_path"),
         trace_archive_path=raw.get("trace_archive_path"),
         ingest_host=raw.get("ingest_host", "0.0.0.0"),
         ingest_port=raw.get("ingest_port", 9091),
         query_host=raw.get("query_host", "0.0.0.0"),
         query_port=raw.get("query_port", 9090),
-        write_token=_resolve_env(raw["write_token_env"]),
+        write_token=_resolve_env(_require_key(raw, "write_token_env")),
         readers=readers,
     )
