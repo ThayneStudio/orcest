@@ -731,3 +731,19 @@ class TestMaxTaskDurationDefault:
         path.write_text(yaml.dump({"pool": {"size": 2, "watchdog_enabled": False}}))
         cfg = load_config(path)
         assert cfg.pool.watchdog_enabled is False
+
+    def test_round_trip_watchdog_enabled_false(self, tmp_path):
+        """The rollback lever must survive a save/load round-trip.
+
+        save_config previously omitted watchdog_enabled from the persisted
+        pool dict, so a load-modify-save cycle would silently reset an
+        operator's `watchdog_enabled: false` back to the True default on
+        next load -- re-enabling the watchdog mid-incident-rollback.
+        """
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(pool=PoolConfig(size=2, watchdog_enabled=False))
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert loaded.pool.watchdog_enabled is False

@@ -11,6 +11,7 @@ import pytest
 
 from orcest.fleet.config import PoolConfig
 from orcest.shared.config import (
+    OrchestratorConfig,
     RunnerConfig,
     WatchdogConfig,
     load_orchestrator_config,
@@ -191,7 +192,8 @@ def test_orchestrator_config_fleet_health_defaults_when_absent(tmp_path: Path):
     assert cfg.pressure_min_tasks == 3
     assert cfg.pressure_window == 600
     assert cfg.pressure_hold == 900
-    assert cfg.max_kills_per_hour == 6
+    assert cfg.max_kills_per_hour == OrchestratorConfig().max_kills_per_hour
+    assert cfg.max_kills_per_hour == 0  # observation-by-default: kills disabled
 
 
 def test_orchestrator_config_fleet_health_block_parses(tmp_path: Path):

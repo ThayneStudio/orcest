@@ -725,6 +725,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             ],
             "max_task_duration": config.pool.max_task_duration,
             "activity_stale_after": config.pool.activity_stale_after,
+            "watchdog_enabled": config.pool.watchdog_enabled,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,
             "expected_image_gpg_key": config.pool.expected_image_gpg_key,

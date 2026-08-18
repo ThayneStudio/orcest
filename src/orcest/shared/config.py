@@ -159,7 +159,12 @@ class OrchestratorConfig:
     # Seconds the pressure gate, once open, stays open (avoids flapping).
     pressure_hold: int = 900
     # Rolling-hour ceiling on non-CEILING (STUCK/LOOPING) kills fleet-wide.
-    max_kills_per_hour: int = 6
+    # Mirrored by the orchestrator's FleetHealthMonitor into
+    # orcest:fleet:kill_budget:limit; workers treat limit<=0 as
+    # kills-disabled (detection + events still run, no kill fires).
+    # Default 0 ships in observation mode -- an operator opts into
+    # autonomous kills by setting a positive per-hour budget.
+    max_kills_per_hour: int = 0
 
 
 @dataclass
