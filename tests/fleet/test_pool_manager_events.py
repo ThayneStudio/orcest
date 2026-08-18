@@ -85,6 +85,50 @@ def test_reaped_event_emitted(fake_redis_client):
     assert reaped[0]["data"]["elapsed_seconds"] > 0
 
 
+def test_event_publisher_is_cached_per_key_prefix(fake_redis_client):
+    """_event_publisher_for returns the same EventPublisher instance for the
+    same key_prefix on repeated calls, and a distinct instance per distinct
+    key_prefix. A fresh EventPublisher per event would reset its decimated
+    error counter on every call, defeating the 1/10/100/1000 log backoff
+    during a sustained publish-failure run."""
+    rc = fake_redis_client
+    manager, _proxmox = _build(rc)
+
+    first = manager._event_publisher_for("test")
+    second = manager._event_publisher_for("test")
+    assert first is second
+
+    other = manager._event_publisher_for("other-project")
+    assert other is not first
+
+    # None/"" key_prefix (the pool manager's own prefix) is cached under a
+    # stable "default" key and is itself reused across calls.
+    default_a = manager._event_publisher_for(None)
+    default_b = manager._event_publisher_for(None)
+    assert default_a is default_b
+    assert default_a is not first
+
+
+def test_reaped_events_reuse_the_same_publisher_across_calls(fake_redis_client):
+    """Two reaps for the same project must not construct two EventPublishers."""
+    rc = fake_redis_client
+    manager, _proxmox = _build(rc)
+    worker_a = "orcest-worker-305"
+    worker_b = "orcest-worker-306"
+    task_a = _claim_task(rc, worker_a)
+    task_b = _claim_task(rc, worker_b)
+
+    manager._emit_reaped_event(task_a, worker_a, "done_cleanup", None)
+    publisher_after_first = manager._event_publishers.get(task_a.key_prefix or "default")
+    assert publisher_after_first is not None
+
+    manager._emit_reaped_event(task_b, worker_b, "done_cleanup", None)
+    publisher_after_second = manager._event_publishers.get(task_b.key_prefix or "default")
+
+    assert publisher_after_first is publisher_after_second
+    assert len(manager._event_publishers) == 1
+
+
 def test_reaped_event_done_cleanup_reports_honest_reason_without_elapsed(fake_redis_client):
     """Done-worker cleanup is not a timeout: reason must say "done_cleanup" and
     elapsed_seconds (genuinely unknown here) must be omitted, not reported as 0.0."""

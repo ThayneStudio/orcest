@@ -214,6 +214,16 @@ Every sample, the tracker writes `{key_prefix}:task:activity:{worker_id}`
 (Redis hash, TTL = 4 × sample_interval): `task_id`, `state`,
 `last_liveness_ts`, `ladder_since`, `needs_reap`, compact signal snapshot.
 
+> **(amended post-implementation)** The activity record key is the
+> **global, unprefixed** `workers:activity:{worker_id}` (see
+> `worker/liveness_tracker.py:_ACTIVITY_KEY_PREFIX` and
+> `fleet/pool_manager.py:_ACTIVITY_KEY_PREFIX`), not
+> `{key_prefix}:task:activity:{worker_id}` as originally specified. The pool
+> manager is a cross-project, single-instance component with no per-project
+> Redis client, so it must read a key it can resolve without a project
+> `key_prefix`; keying under the project prefix would have made every
+> project's activity record invisible to the one reaper that consults them.
+
 `PoolManager._health_check` changes from `elapsed > max_duration → destroy`
 to destroy only when:
 
@@ -225,6 +235,31 @@ to destroy only when:
 
 A worker VM actively updating its activity record is never destroyed early,
 regardless of elapsed time below the ceiling.
+
+> **(amended post-implementation)** The absent-or-stale destroy path
+> additionally requires the worker's **liveness heartbeat**
+> (`workers:heartbeat:{worker_id}`, written by every worker regardless of
+> watchdog config) to be absent too — see
+> `PoolManager._activity_reap_reason`. An absent-or-stale activity record is
+> not by itself proof of death: `watchdog.enabled: false` and pre-watchdog
+> worker images never write the record at all, so treating its absence alone
+> as fatal would reap perfectly healthy workers on any watchdog-disabled
+> fleet or during a rolling image upgrade. Corroborating with the heartbeat
+> (already used by the orphan-PEL sweep) distinguishes "watchdog quiet" from
+> "process gone."
+
+> **(amended post-implementation)** The `task.reaped` event's `data.reason`
+> field (§8) uses the honest, implementation-level vocabulary
+> `ceiling` / `needs_reap` / `activity_stale` / `done_cleanup` /
+> `drain_race` / `orphan_pel` (see `pool_manager.py`'s `REAP_REASON_*`
+> constants), not just the three §6 destroy conditions above. The first
+> three (`ceiling`, `needs_reap`, `activity_stale`) correspond directly to
+> this section's destroy conditions; `done_cleanup`, `drain_race`, and
+> `orphan_pel` are the pre-existing reap-coordination call sites (normal
+> task-done cleanup, a lost drain race, and the orphan-PEL sweep) that also
+> route through the same `_coordinate_reaped_vm` path and must report their
+> actual cause rather than being mislabeled as one of the three watchdog
+> reasons they never observed.
 
 ## 7. Timeout migration
 
@@ -296,6 +331,25 @@ OpenAPI spec):**
 | `fleet.pressure` | orchestrator | ≥K tasks SUSPECT in window (§ below) |
 | `fleet.kill_limit` | worker/orchestrator | kill rate-limit breached |
 
+> **(amended post-implementation)** Three taxonomy rows behave more
+> narrowly than the table above implies:
+>
+> - `task.bootstrap` is emitted **exactly once**, at tracker start (on the
+>   transition into `BOOTSTRAP`) — not on every bootstrap entry/exit; there
+>   is only ever one bootstrap phase per task (`_bootstrap_emitted` latch in
+>   `liveness_tracker.py`).
+> - `task.activity` (the periodic aggregate snapshot) carries a
+>   `deferred_kill` field: `true` when the ladder's evaluation this tick
+>   would have escalated to STUCK/LOOPING but a fleet gate (pressure or
+>   kill-budget) deferred it, keeping the reported state at SUSPECT instead.
+>   This is also what's written into the activity record's `deferred_kill`
+>   hash field the pool reaper can read.
+> - `fleet.kill_limit` is emitted **only on an actual budget breach**
+>   (an attempted kill that the hourly counter rejects) — never during
+>   observation mode (`max_kills_per_hour: 0`), where every ladder kill is
+>   gate-deferred before a budget check is even attempted and reported as
+>   `task.suspect` with `deferred_kill: true` instead (see §13).
+
 **Fleet pressure detection** (orchestrator, the only fleet-view component):
 if ≥ `pressure_min_tasks` (default 3) distinct tasks emit `task.suspect`
 within `pressure_window` (default 600s), emit **one** `fleet.pressure`
@@ -337,10 +391,20 @@ unchanged component). One container, **two listeners**:
   by HTTP method). SQLite opened `mode=ro` + `PRAGMA query_only=1` on
   every query connection. Trace archive mounted read-only.
 
+> **(amended post-implementation)** The two listeners are on distinct ports,
+> not just distinct network bindings: **ingest listens on 9091**, **query on
+> 9090** (`config/monitor.example.yaml`'s `ingest_port`/`query_port`;
+> `docker-compose.monitor.yml` publishes only 9090 to the host — 9091 is
+> deliberately never published, since only the Docker-internal relay needs
+> it).
+
 **Query API (v1, OpenAPI spec published at `/api/v1/openapi.json`):**
 
 - `GET /api/v1/health` — unauthenticated liveness (mirrors dashboard).
-- `GET /api/v1/events?type=&repo=&resource=&since=&limit=` — filtered feed.
+- `GET /api/v1/events?type=&repo=&resource_id=&since=&limit=` — filtered
+  feed. **(amended post-implementation)** the resource filter's query param
+  is `resource_id` (matching `Task.resource_id`'s integer type), not the
+  originally-specified `resource=`.
 - `GET /api/v1/tasks/{task_id}/timeline` — ordered state transitions,
   last-N normalized tool-call records (name + hash + error class), errors,
   activity aggregates.
@@ -406,6 +470,31 @@ readers:
     scopes: [events:read, traces:read]
 ```
 
+> **(amended post-implementation)** The `orchestrator.yaml` block above does
+> not match the shipped config surface:
+>
+> - The monitor keys are **flat top-level fields**, not nested under a
+>   `monitor:` block: `monitor_ingest_url` and `monitor_write_token_env`
+>   (see `shared/config.py`'s `OrchestratorConfig` and
+>   `config/orchestrator.example.yaml`). `fleet_health:` remains a nested
+>   block as originally specified — only the monitor keys flattened.
+> - `events_maxlen` was **dropped entirely**; there is no per-deployment
+>   override. `EventPublisher` always uses the fixed default
+>   `DEFAULT_EVENTS_MAXLEN = 50000` (`shared/events.py`). A configurable cap
+>   here was judged not worth the surface area versus one hardcoded value
+>   consistent across every producer.
+> - The **ingest URL's port is 9091**, not 9090 (query stays 9090 — see the
+>   §10 amendment above); the example line above should read
+>   `http://monitor:9091/ingest/v1/events`.
+> - The kill-budget **worker-side fallback is `0`, fail-closed**: when a
+>   worker cannot read `orcest:fleet:kill_budget:limit` (key absent, read
+>   error, or the orchestrator hasn't started `FleetHealthMonitor` yet), it
+>   treats the limit as `0` rather than the configured `max_kills_per_hour`
+>   default — the same fail-closed value used deliberately for observation
+>   mode (§13), so a monitor outage can never accidentally raise the
+>   effective kill budget above what an operator explicitly set
+>   (`worker/liveness_tracker.py`'s `_KILL_BUDGET_DEFAULT_LIMIT = 0`).
+
 ## 12. Testing
 
 - **Ladder state machine:** pure unit tests with a fake clock — every
@@ -443,6 +532,37 @@ three):
 3. Raise ceilings + enable kills (`max_kills_per_hour: 6`).
 4. Operator sets up Cloudflare Tunnel/Access per runbook, mints reader
    tokens, points external agents at the query API.
+
+> **(amended post-implementation)** Three refinements to this rollout, all
+> confirmed by the shipped implementation:
+>
+> - **Step 2's "SUSPECT-only reporting" mechanism**: with `max_kills_per_hour:
+>   0`, the ladder never transitions into `STUCK`/`LOOPING` at all — the
+>   fleet kill-budget gate defers the escalation at evaluation time, so the
+>   reported state stays `SUSPECT` and the emitted events are `task.suspect`
+>   (unchanged) carrying `deferred_kill: true` in the `task.activity`
+>   aggregate and the activity record (see the §8 amendment above), not
+>   `task.stuck`/`task.looping` events that never fire. This is what makes
+>   observation mode a true dry run: the corroborated-kill decision is
+>   computed and visible, just never acted on.
+> - **The `watchdog.enabled` toggle does not need the three-layer deploy /
+>   rebake described above.** It is `PoolConfig.watchdog_enabled`, a
+>   fleet-level knob rendered into each worker's `runner.watchdog.enabled`
+>   at **clone time** via cloud-init userdata (`cloud_init.py`'s
+>   `render_clone_userdata`), not baked into the template image. Flipping it
+>   is a fleet config edit (`/etc/orcest/config.yaml` + `fleet update`) that
+>   takes effect on the *next* clone generation — already-running VMs keep
+>   whatever value they were cloned with, but no `fleet rebake` is required
+>   to change it fleet-wide.
+> - **Interactive PTY runners are outside ladder coverage entirely, in every
+>   step above.** `ClaudeInteractiveRunner` drives Claude Code through a PTY
+>   with its own execution loop (not `_BaseCliRunner._run_cli_agent`), so the
+>   watchdog wiring in `worker/loop.py` never attaches a `LivenessTracker` to
+>   it regardless of `watchdog.enabled`. It keeps a fixed, pinned timeout of
+>   **5400s** (`cloud_init.py`'s `_INTERACTIVE_RUNNER_TIMEOUT_SECONDS`) as
+>   its only ceiling. This is accepted, not a gap to close in this rollout:
+>   closing it means moving that profile to a headless/stream-json mode the
+>   ladder can parse, which is separate follow-on work, not a rollout step.
 
 ## 14. Residual risks (accepted)
 

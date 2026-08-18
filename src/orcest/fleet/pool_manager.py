@@ -141,6 +141,11 @@ class PoolManager:
         # success, and keep test doubles/inventory lag from reusing an ID.
         self._owned_provisioning_vmids: set[int] = set()
         self._allocated_vmids: set[int] = set()
+        # EventPublisher instances, cached per project key_prefix ("default"
+        # for the pool manager's own prefix). A fresh EventPublisher per call
+        # would reset its decimated-error counter every time, defeating the
+        # 1/10/100/1000-backoff log suppression in a sustained-failure run.
+        self._event_publishers: dict[str, EventPublisher] = {}
 
     def reconcile(self) -> None:
         """Single reconciliation pass.
@@ -2050,6 +2055,11 @@ class PoolManager:
                     if not self._safe_xack(fq_stream, entry_id):
                         unrecovered_entries = True
                     continue
+                # Note: a pre-ACK reap of a worker wedged in D-state (blocked on
+                # uninterruptible I/O, never dead-but-never-progressing) still
+                # republishes here as a transient FAILED result, shadowing what
+                # would otherwise be a permanent STALLED classification upstream.
+                # Rare and accepted -- the retry this produces is harmless.
                 if not self._publish_reaped_failure(task, consumer, reason, elapsed_seconds):
                     unrecovered_entries = True
                     continue
@@ -2300,6 +2310,25 @@ class PoolManager:
         self._emit_reaped_event(task, worker_id, reason, elapsed_seconds)
         return True
 
+    def _event_publisher_for(self, key_prefix: str | None) -> EventPublisher:
+        """Return the cached EventPublisher for *key_prefix*, creating it once.
+
+        Caching (rather than constructing a fresh EventPublisher per event)
+        preserves each publisher's decimated-error counter across calls, so
+        the 1/10/100/1000-backoff log suppression actually suppresses during
+        a sustained outage instead of re-logging every single failure.
+        """
+        cache_key = key_prefix or "default"
+        publisher = self._event_publishers.get(cache_key)
+        if publisher is None:
+            if key_prefix:
+                project_redis = RedisClient.from_client(self._redis.client, key_prefix=key_prefix)
+            else:
+                project_redis = self._redis
+            publisher = EventPublisher(project_redis)
+            self._event_publishers[cache_key] = publisher
+        return publisher
+
     def _emit_reaped_event(
         self, task: Task, worker_id: str, reason: str, elapsed_seconds: float | None
     ) -> None:
@@ -2310,16 +2339,11 @@ class PoolManager:
         misleadingly imply an instant reap.
         """
         try:
-            if task.key_prefix:
-                project_redis = RedisClient.from_client(
-                    self._redis.client, key_prefix=task.key_prefix
-                )
-            else:
-                project_redis = self._redis
+            publisher = self._event_publisher_for(task.key_prefix)
             data: dict[str, Any] = {"reason": reason}
             if elapsed_seconds is not None:
                 data["elapsed_seconds"] = elapsed_seconds
-            EventPublisher(project_redis).publish(
+            publisher.publish(
                 make_event(
                     "net.orcest.task.reaped",
                     source_project=task.key_prefix or "default",
