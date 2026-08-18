@@ -75,10 +75,14 @@ _RESULT_MAXLEN = 20000
 # Fixed worker_id stamped on reaper-published results (operator-facing).
 _REAPER_WORKER_ID = "pool-manager-reaper"
 # Honest per-call-site reasons for the net.orcest.task.reaped event's
-# data.reason field. Only REAP_REASON_MAX_TASK_DURATION corresponds to an
-# actual timeout; the others recover Redis state for VMs destroyed for
-# unrelated reasons and must not be reported as timeouts.
-REAP_REASON_MAX_TASK_DURATION = "max_task_duration"
+# data.reason field. REAP_REASON_CEILING, REAP_REASON_NEEDS_REAP and
+# REAP_REASON_ACTIVITY_STALE are the three _health_check destroy paths (spec
+# §6, activity-aware reaper); the remaining reasons recover Redis state for
+# VMs destroyed for unrelated reasons and must not be reported as any of
+# those three.
+REAP_REASON_CEILING = "ceiling"
+REAP_REASON_NEEDS_REAP = "needs_reap"
+REAP_REASON_ACTIVITY_STALE = "activity_stale"
 REAP_REASON_DONE_CLEANUP = "done_cleanup"
 REAP_REASON_DRAIN_RACE = "drain_race"
 REAP_REASON_ORPHAN_PEL = "orphan_pel"
@@ -86,6 +90,10 @@ REAP_REASON_ORPHAN_PEL = "orphan_pel"
 # (or initialised from `pool.template_vm_id` on first run for backward compat).
 _POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
 _PENDING_READ_BATCH_SIZE = 100
+# Global (cross-project, unprefixed) hash written by the worker-side liveness
+# tracker (see worker/liveness_tracker.py's _write_activity_record). Read here
+# with hgetall_raw -- never auto-prefixed -- to land in the same keyspace.
+_ACTIVITY_KEY_PREFIX = "workers:activity:"
 
 # VM naming convention
 _VM_NAME_PREFIX = "orcest-worker-"
@@ -1234,7 +1242,13 @@ class PoolManager:
         return True
 
     def _health_check(self) -> None:
-        """Force-destroy VMs that exceeded max_task_duration."""
+        """Force-destroy VMs past the max_task_duration ceiling, or whose
+        worker activity record (spec §6) proves the task is stuck or dead
+        below the ceiling: ``needs_reap == "1"`` fires immediately; an
+        absent-or-stale record fires only when the consumer still holds
+        pending stream entries. A fresh activity record blocks destruction
+        below the ceiling regardless of elapsed time.
+        """
         active = self._redis.hgetall(_POOL_ACTIVE_KEY)
         if not active:
             return
@@ -1266,44 +1280,124 @@ class PoolManager:
                 )
                 continue
             elapsed = raw_elapsed
+
             if elapsed > max_duration:
+                reason = REAP_REASON_CEILING
                 logger.warning(
                     "VM %d exceeded max task duration (%.0fs > %ds), force-destroying",
                     vm_id,
                     elapsed,
                     max_duration,
                 )
-                # Fence the worker before inspecting its PEL or private recovery
-                # state. Otherwise it can publish a late success/rotation while
-                # the reaper concurrently publishes failure and ACKs its source.
-                # A stopped VM also bounds billing while Redis recovery retries.
-                if not self._stop_vm(vm_id):
-                    logger.warning(
-                        "VM %d exceeded max task duration but could not be stopped; "
-                        "preserving Redis state for retry",
-                        vm_id,
-                    )
+            else:
+                reason = self._activity_reap_reason(vm_id, now)
+                if reason is None:
                     continue
-                try:
-                    coordinated = self._coordinate_reaped_vm(
-                        vm_id, reason=REAP_REASON_MAX_TASK_DURATION, elapsed_seconds=elapsed
-                    )
-                except Exception:
-                    logger.error(
-                        "Failed to coordinate Redis state for reaped VM %d; "
-                        "leaving VM active for retry",
-                        vm_id,
-                        exc_info=True,
-                    )
-                    coordinated = False
-                if not coordinated:
-                    logger.warning(
-                        "VM %d exceeded max task duration but Redis recovery is incomplete; "
-                        "leaving the fenced VM stopped and preserving Redis state for retry",
-                        vm_id,
-                    )
-                    continue
-                self._destroy_stopped_vm(vm_id)
+                logger.warning(
+                    "VM %d: activity watchdog signal (%s) at %.0fs elapsed (ceiling %ds), "
+                    "force-destroying",
+                    vm_id,
+                    reason,
+                    elapsed,
+                    max_duration,
+                )
+
+            # Fence the worker before inspecting its PEL or private recovery
+            # state. Otherwise it can publish a late success/rotation while
+            # the reaper concurrently publishes failure and ACKs its source.
+            # A stopped VM also bounds billing while Redis recovery retries.
+            if not self._stop_vm(vm_id):
+                logger.warning(
+                    "VM %d marked for force-destroy (reason=%s) but could not be "
+                    "stopped; preserving Redis state for retry",
+                    vm_id,
+                    reason,
+                )
+                continue
+            try:
+                coordinated = self._coordinate_reaped_vm(
+                    vm_id, reason=reason, elapsed_seconds=elapsed
+                )
+            except Exception:
+                logger.error(
+                    "Failed to coordinate Redis state for reaped VM %d; "
+                    "leaving VM active for retry",
+                    vm_id,
+                    exc_info=True,
+                )
+                coordinated = False
+            if not coordinated:
+                logger.warning(
+                    "VM %d marked for force-destroy (reason=%s) but Redis recovery is "
+                    "incomplete; leaving the fenced VM stopped and preserving Redis "
+                    "state for retry",
+                    vm_id,
+                    reason,
+                )
+                continue
+            self._destroy_stopped_vm(vm_id)
+
+    def _activity_reap_reason(self, vm_id: int, now: float) -> str | None:
+        """Return the reap reason from *vm_id*'s activity record, below the
+        max_task_duration ceiling (spec §6).
+
+        ``needs_reap == "1"`` fires immediately -- the watchdog already
+        latched a kill decision for this task. Otherwise, an absent-or-stale
+        record (the worker died, or activity tracking never started) only
+        fires when the consumer still holds pending stream entries, which
+        proves there is a task to recover rather than an idle worker whose
+        record simply hasn't been written yet. A fresh record blocks
+        destruction outright: returns ``None``.
+        """
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
+        try:
+            record = self._redis.hgetall_raw(key)
+        except Exception:
+            logger.warning(
+                "VM %d: failed to read activity record %s; leaving VM alone this pass",
+                vm_id,
+                key,
+                exc_info=True,
+            )
+            return None
+
+        if record.get("needs_reap") == "1":
+            return REAP_REASON_NEEDS_REAP
+
+        if not self._activity_record_is_stale(record, now):
+            return None
+
+        pending_consumers, pending_complete = self._consumers_with_pending_status()
+        if not pending_complete:
+            logger.warning(
+                "VM %d: activity record is %s but pending-task state is unavailable; "
+                "leaving VM alone this pass",
+                vm_id,
+                "present" if record else "absent",
+            )
+            return None
+        if worker_id not in pending_consumers:
+            return None
+        return REAP_REASON_ACTIVITY_STALE
+
+    def _activity_record_is_stale(self, record: dict[str, str], now: float) -> bool:
+        """True if *record* is absent or its ``last_liveness_ts`` is older
+        than ``activity_stale_after``.
+
+        The record TTLs out at 4x the worker's ``sample_interval`` (120s by
+        default), so absence after that window is itself the worker-died
+        signal, not merely a missing field -- an empty ``record`` is
+        therefore always stale.
+        """
+        if not record:
+            return True
+        raw_ts = record.get("last_liveness_ts")
+        try:
+            last_ts = float(raw_ts)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return True
+        return (now - last_ts) > self._pool.activity_stale_after
 
     def _reconcile_orphans(self) -> None:
         """Detect and clean up orphaned VMs not tracked in Redis.
@@ -1784,8 +1878,9 @@ class PoolManager:
         ``reason`` is one of the ``REAP_REASON_*`` constants and is stamped
         honestly on the emitted ``net.orcest.task.reaped`` event's
         ``data.reason`` — callers other than ``_health_check`` (done-worker
-        cleanup, drain races, orphan-PEL sweep) are NOT timeouts and must not
-        report ``max_task_duration``.
+        cleanup, drain races, orphan-PEL sweep) did not observe a ceiling
+        breach or an activity-watchdog signal and must not report
+        ``ceiling``, ``needs_reap`` or ``activity_stale``.
 
         ``elapsed_seconds`` is the max-task-duration overrun computed by
         ``_health_check``, when this call originates there. Other callers

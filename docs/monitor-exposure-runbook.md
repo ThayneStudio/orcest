@@ -161,3 +161,54 @@ Two independent layers to revoke, either or both depending on the situation:
 
 Revoke both when fully offboarding a consumer; revoking just one still
 leaves the other layer's authorization intact for anyone who retains it.
+
+## 7. Watchdog rollout
+
+The activity watchdog (per-task liveness ladder on workers, `PoolManager`
+reaping on `needs_reap`/stale activity below the `max_task_duration`
+ceiling) ships disabled and is turned up in stages, independent of the
+monitor-exposure steps above. `watchdog.enabled: false` is the rollback
+lever at every stage — it restores exactly today's behavior (pure
+wall-clock reaping at `max_task_duration`, no early kills) with no other
+config change required.
+
+Every change here touches the three deploy layers the same way the rest of
+orcest does: host CLI (`pip`/`pipx install -e .` or equivalent), `orcest
+fleet update` to roll the new code into the orchestrator/pool-manager
+containers, and `orcest fleet rebake` to bake it into the worker template.
+The watchdog's worker-side pieces (liveness tracker, ladder, activity
+record writes) only take effect after a rebake — pushing the code and
+running `fleet update` alone updates the pool manager's *reaping* logic but
+leaves already-cloned workers running the old runner until they cycle
+through a fresh clone of the rebaked template.
+
+1. **Ship dark.** Deploy with `watchdog.enabled: false` and the monitor
+   container up (see steps 1-3 above). Events flow (enqueue/start/complete),
+   the query API is queryable, and pool-reaper behavior is unchanged —
+   this is purely wiring verification before any behavior changes.
+
+2. **Observation mode.** Flip `watchdog.enabled: true` fleet-wide with
+   `max_kills_per_hour: 0`. At this budget the ladder still evaluates and
+   emits `net.orcest.task.suspect`/`stuck`/`looping` transition events (and
+   the activity-aware pool reaper still only reaps on the ceiling, since a
+   `needs_reap`/`activity_stale` kill trigger is gated by the same budget),
+   but no task is killed early. Watch the `task.suspect` (and `stuck`)
+   false-positive rate against real workloads via the monitor for several
+   days — a task that reaches SUSPECT/STUCK and then finishes normally
+   anyway is a false positive and a signal the ladder thresholds
+   (`idle_window`, `waiting_grace`, the loop thresholds) need tuning before
+   any kill budget goes live.
+
+3. **Enable kills.** Once the false-positive rate is acceptable, raise
+   `max_kills_per_hour` to the real budget (default 6). From this point the
+   activity-aware reaper can destroy a VM below the `max_task_duration`
+   ceiling on `needs_reap` or on an absent/stale activity record with
+   pending work — not just at the ceiling. Keep watching `task.reaped`
+   events' `reason` field (`ceiling` / `needs_reap` / `activity_stale`) via
+   the monitor for a few more days; a spike in `needs_reap`/`activity_stale`
+   reaps relative to `ceiling` reaps is the signal to look at, since those
+   are the two paths the watchdog adds.
+
+If a stage regresses, drop back to `watchdog.enabled: false` rather than
+tuning forward under pressure — it is a complete, tested rollback to the
+pre-watchdog reaper, not a partial mitigation.
