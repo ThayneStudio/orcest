@@ -84,8 +84,26 @@ logger = logging.getLogger(__name__)
 
 _PRESSURE_KEY = "orcest:fleet:pressure"
 _KILL_BUDGET_LIMIT_KEY = "orcest:fleet:kill_budget:limit"
-_KILL_BUDGET_DEFAULT_LIMIT = 6
+# Fail-closed default (final review, C1b): an absent or unreadable mirror
+# key means kills are DISABLED, not "use the historical default of 6".
+# ``FleetHealthMonitor`` refreshes this mirror every pass (see
+# orchestrator/fleet_health.py's _mirror_kill_budget_limit), so an absent
+# key means "no orchestrator has written a fresh limit recently" -- e.g. a
+# worker template rolled out ahead of the orchestrator, a project whose
+# orchestrator container isn't up yet, or Redis data loss. In every one of
+# those cases the safe default is to observe (SUSPECT/STUCK/LOOPING still
+# evaluate and emit events) rather than kill, exactly like an explicit
+# ``max_kills_per_hour: 0``. Set a real limit is the mirror's job, not this
+# constant's.
+_KILL_BUDGET_DEFAULT_LIMIT = 0
 _KILL_BUDGET_BUCKET_TTL = 7200
+
+# I1: when a kill fires but post-kill D-state verification fails (the
+# process tree didn't actually die), close() re-flushes the activity record
+# instead of deleting it, with this longer TTL, so the pool reaper's fast
+# (10s) loop reliably observes needs_reap=="1" before the record would
+# otherwise expire.
+_NEEDS_REAP_CLOSE_TTL = 600
 
 _ACTIVITY_KEY_PREFIX = "workers:activity:"
 
@@ -156,6 +174,12 @@ class LivenessTracker:
         self._limit_malformed_logged = False
         self._state_since_wall = wall_clock()
         self._last_snapshot: dict[str, Any] = {}
+        self._last_deferred_kill = False
+        # M1: net.orcest.task.bootstrap fires exactly once, on this
+        # tracker's first tick() call (not here in __init__, so the
+        # constructor stays side-effect-free -- see tick()'s docstring
+        # note).
+        self._bootstrap_emitted = False
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -221,9 +245,15 @@ class LivenessTracker:
             kill = decision.kill
             self._tick_count += 1
             tick_count = self._tick_count
+            bootstrap_event = not self._bootstrap_emitted
+            self._bootstrap_emitted = True
             if decision.transitioned:
                 self._state_since_wall = self._wall_clock()
             self._last_snapshot = decision.snapshot
+            # I3: the honest "would have killed here" signal for
+            # observation-mode visibility -- surfaced on both the activity
+            # record and the periodic task.activity event below.
+            self._last_deferred_kill = decision.deferred
 
             emit_activity_event = tick_count % _ACTIVITY_EVENT_TICK_STRIDE == 0
             # Snapshot the recent-hashes view here, still under the lock --
@@ -239,6 +269,17 @@ class LivenessTracker:
                 self._kill_limit_emitted = True
 
         # --- Side effects: outside the lock, all best-effort. ---
+        if bootstrap_event:
+            # M1: emitted once, on the first tick(), regardless of which
+            # state this evaluation landed on -- it marks "the tracker
+            # started observing this task", not a ladder transition.
+            self._safe(
+                lambda: self._emit_fn(
+                    "net.orcest.task.bootstrap", {"snapshot": decision.snapshot}
+                ),
+                "bootstrap emit",
+            )
+
         if decision.transitioned:
             self._safe(lambda: self._emit_transition(decision), "transition emit")
 
@@ -250,6 +291,7 @@ class LivenessTracker:
                         "snapshot": decision.snapshot,
                         "recent_tool_hashes": recent_hashes,
                         "cpu_seconds": cpu,
+                        "deferred_kill": decision.deferred,
                     },
                 ),
                 "activity event emit",
@@ -347,7 +389,14 @@ class LivenessTracker:
         except Exception:
             logger.warning("kill-budget bucket read failed; failing safe to blocked", exc_info=True)
             return True, False
-        n = int(raw) if raw is not None else 0
+        try:
+            n = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            # I2: a malformed bucket value must not raise out of the watchdog
+            # thread -- treat it the same as an unreadable bucket (fail safe
+            # to blocked, not a genuine breach).
+            logger.warning("malformed kill-budget bucket value %r; failing safe to blocked", raw)
+            return True, False
         breached = n >= limit
         return breached, breached
 
@@ -367,12 +416,13 @@ class LivenessTracker:
     def _activity_key(self) -> str:
         return f"{_ACTIVITY_KEY_PREFIX}{self._worker_id}"
 
-    def _write_activity_record(self) -> None:
+    def _write_activity_record(self, *, ttl_override: int | None = None) -> None:
         with self._lock:
             state = self._ladder.state.value
             needs_reap = self._needs_reap
             state_since = self._state_since_wall
             snapshot = self._last_snapshot
+            deferred_kill = self._last_deferred_kill
 
         key = self._activity_key()
         wall_now = self._wall_clock()
@@ -381,8 +431,10 @@ class LivenessTracker:
         self._redis.hset_raw(key, "last_liveness_ts", str(wall_now))
         self._redis.hset_raw(key, "ladder_since", str(state_since))
         self._redis.hset_raw(key, "needs_reap", "1" if needs_reap else "0")
+        self._redis.hset_raw(key, "deferred_kill", "1" if deferred_kill else "0")
         self._redis.hset_raw(key, "snapshot", json.dumps(snapshot, default=str))
-        self._redis.expire_raw(key, int(4 * self._cfg.sample_interval))
+        ttl = ttl_override if ttl_override is not None else int(4 * self._cfg.sample_interval)
+        self._redis.expire_raw(key, ttl)
 
     # ------------------------------------------------------------------
     # Misc
@@ -424,10 +476,27 @@ class LivenessTracker:
         self._safe(self._write_activity_record, "activity record write (mark_needs_reap)")
 
     def close(self) -> None:
-        """Delete the activity record. Best-effort (review round 1, B8 fix):
-        the runner calls this from a ``finally`` block after every attempt,
-        so a raised Redis error here must never replace an already-decided
-        ``RunnerResult`` (e.g. a completed, pushed task turning into a
-        non-transient "Worker exception" FAILED). Swallowed and logged via
-        the same ``_safe`` pattern as every other tracker side effect."""
+        """Delete the activity record -- unless ``needs_reap`` is set (I1),
+        in which case the record is deliberately left behind: it is
+        re-flushed with a longer TTL (``_NEEDS_REAP_CLOSE_TTL``) instead of
+        deleted, so the pool reaper's fast (10s) polling loop reliably sees
+        ``needs_reap=="1"`` even if this attempt's process is torn down
+        (and this tracker discarded) before the reaper's next pass. Deleting
+        it here -- the pre-I1 behavior -- could race the reaper into never
+        observing the flag at all.
+
+        Best-effort (review round 1, B8 fix): the runner calls this from a
+        ``finally`` block after every attempt, so a raised Redis error here
+        must never replace an already-decided ``RunnerResult`` (e.g. a
+        completed, pushed task turning into a non-transient "Worker
+        exception" FAILED). Swallowed and logged via the same ``_safe``
+        pattern as every other tracker side effect."""
+        with self._lock:
+            needs_reap = self._needs_reap
+        if needs_reap:
+            self._safe(
+                lambda: self._write_activity_record(ttl_override=_NEEDS_REAP_CLOSE_TTL),
+                "close (needs_reap re-flush)",
+            )
+            return
         self._safe(lambda: self._redis.delete_raw(self._activity_key()), "close")

@@ -54,8 +54,11 @@ runner:
     startup_grace: 600
     # Seconds of no observed activity before a task is considered STUCK.
     idle_window: 600
-    # Seconds a task may sit in a WAITING (e.g. tool-approval) state before
-    # being treated as stalled.
+    # Seconds a task may sit in a WAITING (e.g. provider rate-limit/api_retry
+    # backoff) state before being treated as stalled. Continuous waiting
+    # signals keep re-arming this grace from the *most recent* one -- a task
+    # perpetually retrying against the provider defers to the hard `timeout`
+    # ceiling above rather than being killed as stuck.
     waiting_grace: 1800
     # Consecutive identical tool calls before flagging an exact-repeat loop.
     loop_exact_threshold: 4

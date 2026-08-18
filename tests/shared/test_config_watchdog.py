@@ -142,6 +142,18 @@ def test_worker_config_watchdog_rejects_null_enabled(tmp_path: Path):
         load_worker_config(cfg_file)
 
 
+def test_worker_config_watchdog_rejects_non_positive_sample_interval(tmp_path: Path):
+    # M5: a zero/negative timer field is a config mistake (spins the
+    # watchdog thread in a tight loop), not a valid aggressive tuning.
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text(
+        "worker_id: worker-0\nrunner:\n  watchdog:\n    sample_interval: 0\n"
+    )
+
+    with pytest.raises(ValueError, match="runner.watchdog.sample_interval"):
+        load_worker_config(cfg_file)
+
+
 # -- orchestrator.yaml watchdog parsing (shares the same RunnerConfig) ------
 
 

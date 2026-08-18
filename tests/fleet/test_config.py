@@ -714,3 +714,20 @@ class TestMaxTaskDurationDefault:
         path.write_text(yaml.dump({"pool": {"size": 2}}))
         cfg = load_config(path)
         assert cfg.pool.activity_stale_after == 300
+
+    def test_watchdog_enabled_default_true(self):
+        # C1a: the fleet-level rollback lever defaults on.
+        assert PoolConfig().watchdog_enabled is True
+
+    def test_load_legacy_config_watchdog_enabled_default(self, tmp_path):
+        """A config without an explicit watchdog_enabled gets the default (True)."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        cfg = load_config(path)
+        assert cfg.pool.watchdog_enabled is True
+
+    def test_load_config_watchdog_enabled_false(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2, "watchdog_enabled": False}}))
+        cfg = load_config(path)
+        assert cfg.pool.watchdog_enabled is False

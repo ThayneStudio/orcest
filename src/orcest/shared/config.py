@@ -262,7 +262,7 @@ def _build_watchdog_config(runner_raw: dict[str, Any]) -> WatchdogConfig:
     """
     watchdog_raw = {k.replace("-", "_"): v for k, v in _safe_dict(runner_raw, "watchdog").items()}
     _defaults = WatchdogConfig()
-    return WatchdogConfig(
+    watchdog = WatchdogConfig(
         enabled=_safe_bool(
             watchdog_raw.get("enabled", _defaults.enabled), "runner.watchdog.enabled"
         ),
@@ -295,6 +295,37 @@ def _build_watchdog_config(runner_raw: dict[str, Any]) -> WatchdogConfig:
             "runner.watchdog.loop_pingpong_threshold",
         ),
     )
+    _validate_watchdog_config(watchdog)
+    return watchdog
+
+
+def _validate_watchdog_config(wd: WatchdogConfig) -> None:
+    """Reject a ``WatchdogConfig`` with a non-positive timer or a
+    sub-1 loop threshold (M5).
+
+    A zero/negative ``sample_interval`` spins the watchdog thread in a
+    tight loop; a zero ``startup_grace``/``idle_window``/``waiting_grace``
+    makes the ladder trip (or hold) instantly; a threshold below 1 can
+    never be reached by a real (always >=1) streak counter. These are
+    config mistakes, not valid (if aggressive) tunings, so they're rejected
+    at load time with the field named, same as every other ``_safe_*``
+    validator in this module.
+    """
+    for field_name, value in (
+        ("runner.watchdog.sample_interval", wd.sample_interval),
+        ("runner.watchdog.startup_grace", wd.startup_grace),
+        ("runner.watchdog.idle_window", wd.idle_window),
+        ("runner.watchdog.waiting_grace", wd.waiting_grace),
+    ):
+        if value <= 0:
+            raise ValueError(f"Config field '{field_name}' must be > 0, got {value!r}.")
+    for field_name, value in (
+        ("runner.watchdog.loop_exact_threshold", wd.loop_exact_threshold),
+        ("runner.watchdog.loop_error_threshold", wd.loop_error_threshold),
+        ("runner.watchdog.loop_pingpong_threshold", wd.loop_pingpong_threshold),
+    ):
+        if value < 1:
+            raise ValueError(f"Config field '{field_name}' must be >= 1, got {value!r}.")
 
 
 # Provider-specific env var name candidates (for credential fallback when omitted

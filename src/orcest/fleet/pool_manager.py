@@ -1012,6 +1012,7 @@ class PoolManager:
                 worker_backend=profile.backend,
                 worker_runner_type=profile.runner_type,
                 worker_runner_mode=profile.runner_mode,
+                watchdog_enabled=self._pool.watchdog_enabled,
             )
             self._proxmox.set_cloud_init_userdata(
                 new_id,

@@ -51,6 +51,13 @@ a deferred LOOPING) and nothing latches the terminal ``_done`` flag, so a
 later unblocked ``evaluate()`` can still kill if the underlying condition
 still holds. CEILING is exempt from this gate -- it fires regardless.
 
+When ``escalation_blocked`` is the reason a would-be STUCK/LOOPING kill was
+suppressed (as opposed to WAITING's own ``waiting_grace`` mechanism, which
+can independently hold a task at SUSPECT with the gate never in the
+picture), ``Decision.deferred`` is ``True`` -- the honest "the ladder would
+have killed here" signal an observation-mode operator needs, since a
+gate-blocked run never emits a STUCK/LOOPING transition event at all.
+
 Once a kill actually fires (STUCK, LOOPING, or CEILING -- not merely
 deferred) the ladder is done: further ``evaluate()`` calls return the same
 terminal state with ``kill=None`` and ``transitioned=False`` without
@@ -95,6 +102,13 @@ class Decision:
     transitioned: bool  # state changed this evaluation
     kill: str | None  # None | "stuck" | "looping" | "ceiling"
     snapshot: dict
+    # True when `escalation_blocked` alone suppressed a STUCK/LOOPING kill
+    # that would otherwise have fired this evaluation (final-review I3): the
+    # honest "would have killed" signal for observation-mode visibility.
+    # False for every other outcome, including a waiting-grace-only defer
+    # (that's WAITING's own mechanism, not the fleet gate) and an actual
+    # kill. See ``evaluate()``'s two escalation_blocked checkpoints.
+    deferred: bool = False
 
 
 class LivenessLadder:
@@ -229,6 +243,7 @@ class LivenessLadder:
         # the normal S1-S3 computation below for the *reported* state (the
         # streak is preserved above, so a later unblocked evaluate() with a
         # still-non-None verdict can still kill).
+        deferred = looping_ready and escalation_blocked
 
         all_stale = (not s1_fresh) and s2_idle and (not s3_fresh)
 
@@ -244,7 +259,14 @@ class LivenessLadder:
                     waiting_blocked = (now - self._last_waiting_ts) < self.cfg.waiting_grace
                 else:
                     waiting_blocked = False
-                # Deferred by either gate: report SUSPECT, not STUCK.
+                # Deferred by either gate: report SUSPECT, not STUCK. Only
+                # count it as a *gate*-deferred kill (I3) when the fleet gate
+                # is what's holding it -- if waiting_blocked alone already
+                # explains the SUSPECT (grace hasn't expired), that's
+                # WAITING's own mechanism, not the fleet gate, even if
+                # escalation_blocked also happens to be True this tick.
+                if escalation_blocked and not waiting_blocked:
+                    deferred = True
                 # Nothing here latches _done -- a later evaluate() with
                 # neither gate active can still escalate if all_stale holds.
                 new_state = (
@@ -271,7 +293,9 @@ class LivenessLadder:
             self._done = True
 
         self.state = new_state
-        return Decision(new_state, transitioned, kill, self._snapshot(now, rep_verdict))
+        return Decision(
+            new_state, transitioned, kill, self._snapshot(now, rep_verdict), deferred=deferred
+        )
 
     def _update_cpu(self, now: float, cpu_seconds: float | None) -> bool:
         """Advance the S2 CPU-idle hysteresis by one sample. Returns whether

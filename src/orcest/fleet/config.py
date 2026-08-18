@@ -219,6 +219,16 @@ class PoolConfig:
     # the pre-watchdog reaper (see spec §6 and fleet/pool_manager.py's
     # _activity_reap_reason).
     activity_stale_after: int = 300
+    # Fleet-level activity-watchdog rollback lever (final review, C1a).
+    # Rendered into every newly-cloned worker's ``worker.yaml`` as
+    # ``runner.watchdog.enabled`` (see ``cloud_init.render_clone_userdata``).
+    # This is clone-time cloud-init data, not baked into the template
+    # image, so toggling it takes effect for the NEXT clone with no rebake
+    # required -- only ``orcest fleet update`` (to pick up the new pool
+    # value) followed by normal pool churn (or a manual clone cycle) to
+    # roll it out fleet-wide. Existing already-cloned workers keep whatever
+    # value their own user-data was rendered with until they're replaced.
+    watchdog_enabled: bool = True
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
@@ -624,6 +634,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_profiles=worker_profiles,
         max_task_duration=pl.get("max_task_duration", 25200),
         activity_stale_after=pl.get("activity_stale_after", 300),
+        watchdog_enabled=bool(pl.get("watchdog_enabled", True)),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(

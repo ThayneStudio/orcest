@@ -417,10 +417,12 @@ def test_escalation_blocked_defers_stuck_kill():
     assert d.state == LadderState.SUSPECT
     assert d.kill is None
     assert d.transitioned is False
+    assert d.deferred is True  # I3: gate suppressed a would-be STUCK kill
 
     d = ladder.evaluate(now=270, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
     assert d.state == LadderState.STUCK
     assert d.kill == "stuck"
+    assert d.deferred is False  # an actual kill is never itself "deferred"
 
 
 def test_escalation_blocked_defers_looping_kill():
@@ -440,10 +442,46 @@ def test_escalation_blocked_defers_looping_kill():
     )
     assert d.state != LadderState.LOOPING
     assert d.kill is None
+    assert d.deferred is True  # I3: gate suppressed a would-be LOOPING kill
 
     d = ladder.evaluate(now=60, cpu_seconds=3.0, workspace_changed=True, rep_verdict=verdict)
     assert d.state == LadderState.LOOPING
     assert d.kill == "looping"
+    assert d.deferred is False
+
+
+def test_waiting_grace_defer_is_not_reported_as_gate_deferred():
+    """I3 precision: waiting_grace holding a task at SUSPECT (no fleet gate
+    involved -- escalation_blocked defaults to False) must NOT set
+    ``deferred``. That flag means specifically "the fleet gate suppressed a
+    kill", not "any mechanism kept this at SUSPECT"."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    ladder.note_stream(now=100, sig=StreamSignal(kind="waiting", reason="rate_limit"))
+
+    d = ladder.evaluate(now=220, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.kill is None
+    assert d.deferred is False
+
+
+def test_normal_stuck_wait_before_hold_is_not_deferred():
+    """A SUSPECT reported before the second idle_window has even elapsed
+    (the "not held" branch) is not a gate defer either -- ``escalation_blocked``
+    was never consulted."""
+    cfg = _cfg()
+    ladder = LivenessLadder(cfg, ceiling=1_000_000, started_at=0)
+    _active_baseline(ladder)
+    for now in (30, 60, 90):
+        ladder.evaluate(now=now, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+
+    d = ladder.evaluate(now=120, cpu_seconds=5.0, workspace_changed=False, rep_verdict=None)
+    assert d.state == LadderState.SUSPECT
+    assert d.deferred is False
 
 
 def test_suspect_persistence_resets_after_rescue():

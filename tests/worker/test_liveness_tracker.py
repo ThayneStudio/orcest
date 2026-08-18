@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from orcest.shared.config import WatchdogConfig
-from orcest.worker.liveness_tracker import LivenessTracker
+from orcest.worker.liveness_tracker import _ACTIVITY_EVENT_TICK_STRIDE, LivenessTracker
 
 _PRESSURE_KEY = "orcest:fleet:pressure"
 _BUDGET_LIMIT_KEY = "orcest:fleet:kill_budget:limit"
@@ -157,13 +157,33 @@ def test_transitions_emit_events_with_snapshot(fake_redis_client):
     result = tracker.tick()
 
     assert result is None
-    assert len(events) == 1
-    event_type, data = events[0]
+    # M1: the first tick() also emits a one-time net.orcest.task.bootstrap,
+    # ahead of the BOOTSTRAP -> ACTIVE transition event.
+    assert len(events) == 2
+    bootstrap_type, bootstrap_data = events[0]
+    assert bootstrap_type == "net.orcest.task.bootstrap"
+    assert "snapshot" in bootstrap_data
+
+    event_type, data = events[1]
     assert event_type == "net.orcest.task.active"
     assert "snapshot" in data
     assert isinstance(data["snapshot"], dict)
     assert "s1_last_fresh_ts" in data["snapshot"]
     assert "reason" not in data
+
+
+def test_bootstrap_event_emitted_exactly_once(fake_redis_client):
+    """M1: net.orcest.task.bootstrap fires on the first tick() only, never
+    again on subsequent ticks."""
+    tracker, events, clock, _wall = _make_tracker(fake_redis_client)
+
+    tracker.observe_line(_progress_line())
+    for _ in range(3):
+        clock.advance(30)
+        tracker.tick()
+
+    bootstrap_events = [e for e in events if e[0] == "net.orcest.task.bootstrap"]
+    assert len(bootstrap_events) == 1
 
 
 def test_activity_record_written_with_ttl_and_state(fake_redis_client):
@@ -299,6 +319,27 @@ def test_close_deletes_activity_record(fake_redis_client):
     tracker.close()
 
     assert fake_redis_client.hgetall_raw(key) == {}
+
+
+def test_needs_reap_survives_close(fake_redis_client):
+    """I1: close() must not delete the record when needs_reap is set --
+    instead it re-flushes with a longer TTL so the pool reaper's fast (10s)
+    loop reliably observes needs_reap=="1" even though the tracker (and its
+    process) is about to go away."""
+    tracker, _events, _clock, _wall = _make_tracker(fake_redis_client)
+
+    tracker.observe_line(_progress_line())
+    tracker.tick()
+    tracker.mark_needs_reap()
+
+    tracker.close()
+
+    key = "workers:activity:worker-1"
+    record = fake_redis_client.hgetall_raw(key)
+    assert record != {}
+    assert record["needs_reap"] == "1"
+    ttl = fake_redis_client.client.ttl(key)
+    assert ttl == 600
 
 
 def test_close_swallows_redis_failure(fake_redis_client):
@@ -471,6 +512,9 @@ def test_no_io_call_happens_while_lock_held(fake_redis_client):
 
 
 def test_looping_kill_end_to_end_via_observe_line(fake_redis_client):
+    # C1b: budget default is now fail-closed (0); this test is about the
+    # LOOPING trigger, not the budget gate, so give it a real positive limit.
+    fake_redis_client.set_ex_raw(_BUDGET_LIMIT_KEY, "10", 3600)
     tracker, events, clock, _wall = _make_tracker(fake_redis_client)
 
     tracker.observe_line(_progress_line())
@@ -527,6 +571,9 @@ def test_mark_needs_reap_persists_without_waiting_for_tick(fake_redis_client):
 
 def test_deferred_kill_fires_after_pressure_clears(fake_redis_client):
     fake_redis_client.set_ex_raw(_PRESSURE_KEY, "1", 900)
+    # C1b: budget default is now fail-closed (0); this test is about the
+    # pressure gate specifically, so give it a real positive limit.
+    fake_redis_client.set_ex_raw(_BUDGET_LIMIT_KEY, "10", 3600)
     tracker, events, clock, _wall = _make_tracker(fake_redis_client)
 
     result = _drive_to_suspect_then_hold(tracker, events, clock)
@@ -537,6 +584,45 @@ def test_deferred_kill_fires_after_pressure_clears(fake_redis_client):
     result = tracker.tick()
 
     assert result == "stuck"
+
+
+def test_deferred_kill_flag_on_activity_record_and_periodic_event(fake_redis_client):
+    """I3: when a would-be STUCK kill is suppressed by the fleet gate, both
+    the workers:activity:{id} record and the periodic task.activity event
+    must carry deferred_kill=true so an observation-mode operator can count
+    would-have-killed episodes directly, since a gate-blocked run never
+    emits a task.stuck/task.looping event at all."""
+    fake_redis_client.set_ex_raw(_PRESSURE_KEY, "1", 900)
+    tracker, events, clock, _wall = _make_tracker(fake_redis_client)
+
+    result = _drive_to_suspect_then_hold(tracker, events, clock)
+    assert result is None  # deferred by pressure
+
+    key = "workers:activity:worker-1"
+    record = fake_redis_client.hgetall_raw(key)
+    assert record["deferred_kill"] == "1"
+
+    # Advance to the 10th tick so the periodic activity event fires too.
+    while tracker._tick_count % _ACTIVITY_EVENT_TICK_STRIDE != 0:
+        clock.advance(30)
+        tracker.tick()
+
+    activity_events = [e for e in events if e[0] == "net.orcest.task.activity"]
+    assert activity_events
+    assert activity_events[-1][1]["deferred_kill"] is True
+
+
+def test_deferred_kill_flag_false_on_normal_active_record(fake_redis_client):
+    """Negative case: an ordinary ACTIVE tick (no gate involved) must not
+    set deferred_kill."""
+    tracker, _events, _clock, _wall = _make_tracker(fake_redis_client)
+
+    tracker.observe_line(_progress_line())
+    tracker.tick()
+
+    key = "workers:activity:worker-1"
+    record = fake_redis_client.hgetall_raw(key)
+    assert record["deferred_kill"] == "0"
 
 
 def test_waiting_transition_event_carries_reason(fake_redis_client):
@@ -560,9 +646,35 @@ def test_budget_limit_malformed_value_falls_back_to_default(fake_redis_client):
     fake_redis_client.set_ex_raw(_BUDGET_LIMIT_KEY, "not-a-number", 3600)
     tracker, _events, _clock, _wall = _make_tracker(fake_redis_client)
 
-    assert tracker._budget_limit() == 6
+    # C1b: the fallback default is now fail-closed (0 = kills disabled),
+    # not the historical 6 -- a malformed mirror key is indistinguishable
+    # from an absent one.
+    assert tracker._budget_limit() == 0
     # Calling again must stay tolerant (no raise, no re-log crash).
-    assert tracker._budget_limit() == 6
+    assert tracker._budget_limit() == 0
+
+
+def test_budget_limit_absent_key_is_fail_closed(fake_redis_client):
+    # C1b: no FleetHealthMonitor has ever mirrored a limit -- absent key
+    # means kills disabled, not "assume 6".
+    tracker, _events, _clock, _wall = _make_tracker(fake_redis_client)
+    assert tracker._budget_limit() == 0
+
+
+def test_probe_budget_malformed_bucket_value_fails_safe_without_raising(fake_redis_client):
+    # I2: the bucket (not the limit mirror) can also be corrupted -- must
+    # be treated as a read failure (blocked=True, not breached) rather than
+    # raising out of the watchdog thread.
+    fake_redis_client.set_ex_raw(_BUDGET_LIMIT_KEY, "5", 3600)
+    tracker, _events, _clock, wall_clock = _make_tracker(fake_redis_client)
+    hour = time.strftime("%Y%m%d%H", time.gmtime(wall_clock.t))
+    bucket_key = f"orcest:fleet:kill_budget:{hour}"
+    fake_redis_client.set_ex_raw(bucket_key, "not-a-number", 3600)
+
+    blocked, breached = tracker._probe_budget(5)
+
+    assert blocked is True
+    assert breached is False
 
 
 def test_error_streaks_are_tool_name_blind(fake_redis_client):
@@ -571,6 +683,10 @@ def test_error_streaks_are_tool_name_blind(fake_redis_client):
     streak is fed an empty name every time -- pinning that upstream
     behavior here rather than implying (as the old comment did) that
     tool_name might ever be meaningfully set for an error line."""
+    # C1b: budget default is now fail-closed (0); this test is about the
+    # tool-name-blind error streak, not the budget gate, so give it a real
+    # positive limit.
+    fake_redis_client.set_ex_raw(_BUDGET_LIMIT_KEY, "10", 3600)
     tracker, events, clock, _wall = _make_tracker(fake_redis_client)
     tracker.observe_line(_progress_line())
     tracker.tick()
