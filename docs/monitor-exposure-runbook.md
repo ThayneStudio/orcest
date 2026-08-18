@@ -278,7 +278,8 @@ stage the rest of this rollout is in.
    thresholds) or moving to stage 3.
 
 3. **Enable kills.** Once the false-positive rate is acceptable, raise
-   `max_kills_per_hour` to the real budget (default 6). From this point a
+   `max_kills_per_hour` from its shipped default of `0` (observation mode:
+   no kills) to a positive budget. From this point a
    `STUCK`/`LOOPING` kill is no longer gate-deferred, so the ladder fires it
    and the runner's watchdog thread kills the process tree — but
    `needs_reap` itself is **not** set just because a kill fired. It's set
