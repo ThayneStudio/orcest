@@ -694,6 +694,11 @@ class TestCloneAndBoot:
         pipe.srem.assert_any_call("pool:draining", "orcest-worker-300")
         redis.exists.assert_any_call("pool:done:orcest-worker-300")
         redis.sismember.assert_any_call("pool:draining", "orcest-worker-300")
+        # Defense in depth: the pre-reuse chokepoint must also purge the
+        # worker_id-keyed activity record -- a surviving needs_reap=="1"
+        # from the prior generation would false-kill the fresh replacement.
+        pipe.delete.assert_any_call("workers:activity:orcest-worker-300")
+        redis.exists.assert_any_call("workers:activity:orcest-worker-300")
         proxmox.clone_vm.assert_called_once()
 
     def test_refuses_clone_when_old_generation_cleanup_cannot_be_verified(self):

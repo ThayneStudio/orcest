@@ -583,13 +583,27 @@ def _run_cli_agent(
             # legacy fixed-watchdog timeout never verifies death.
             if tracker is not None and timed_out and killed_trigger is not None:
                 time.sleep(2)
+                # Known limitation (deliberate, not worth a heavy fix):
+                # verification only sees the surviving IN-CLOSURE tree --
+                # the root pid plus descendants reachable via the ppid
+                # walk. A D-state grandchild whose intermediate parents
+                # already died is reparented to init, leaves the closure,
+                # and is invisible here: state_of_tree() returns [] and
+                # the kill reads as "verified" even though a D-state
+                # orphan survives. Cheaply tracking reparented orphans is
+                # not possible from this vantage point; such a VM falls
+                # back to the pool's max_task_duration ceiling reap.
                 try:
                     states = tracker.tree_states()
+                    verified = "D" not in states
                 except Exception:
-                    states = []
+                    # Fail closed: a tree_states() failure must never
+                    # yield an affirmative "verified" kill. Treat exactly
+                    # like an observed D state -- mark for the pool
+                    # reaper and report the kill as unverified.
+                    verified = False
                     if logger:
                         logger.warning("tracker.tree_states() failed", exc_info=True)
-                verified = "D" not in states
                 if not verified:
                     tracker.mark_needs_reap()
                 tracker.emit_killed(killed_trigger, verified)

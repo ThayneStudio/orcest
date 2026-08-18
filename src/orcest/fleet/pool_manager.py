@@ -1083,6 +1083,12 @@ class PoolManager:
         worker_id = self._vm_id_to_worker_id(vm_id)
         done_key = f"{_POOL_DONE_PREFIX}{worker_id}"
         heartbeat_key = f"{_WORKER_HEARTBEAT_PREFIX}{worker_id}"
+        # Defense in depth: both destroy paths (_destroy_stopped_vm,
+        # _clear_destroyed_worker_state) already delete the worker_id-keyed
+        # activity record, but this pre-reuse chokepoint is the last line --
+        # a surviving needs_reap=="1" record on a reused worker_id would
+        # false-kill the fresh replacement VM the moment the reaper reads it.
+        activity_key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
         try:
             pipe = self._redis.pipeline()
             pipe.delete(done_key)
@@ -1090,10 +1096,12 @@ class PoolManager:
             pipe.srem(_POOL_PROVISIONING_KEY, str(vm_id))
             pipe.srem(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
             pipe.delete(heartbeat_key)
+            pipe.delete(activity_key)
             pipe.execute()
             if (
                 self._redis.exists(done_key)
                 or self._redis.exists(heartbeat_key)
+                or self._redis.exists(activity_key)
                 or self._redis.sismember(_POOL_DRAINING_KEY, worker_id)
                 or self._redis.sismember(_POOL_PROVISIONING_KEY, str(vm_id))
                 or self._redis.sismember(_POOL_AMBIGUOUS_CLONES_KEY, str(vm_id))
@@ -1410,6 +1418,21 @@ class PoolManager:
             )
             return None
 
+        # SECURITY: this branch is forgeable under the shared-credential
+        # threat model. All workers share one Redis password (accepted risk,
+        # 2026-06 audit), so a compromised worker can HSET
+        # workers:activity:{other_worker} needs_reap 1 and have this reaper
+        # destroy a peer VM. Deliberately NOT corroborated here: every
+        # corroboration option either breaks the D-state escalation this
+        # flag exists for or under-protects -- heartbeat-gating fails
+        # because the worker's heartbeat is still alive when needs_reap
+        # legitimately fires (the runner process is fine; its child tree is
+        # unkillable), and task_id/PEL matching fails because needs_reap
+        # deliberately outlives the attempt via close()'s long-TTL re-flush,
+        # so the PEL entry may already be gone at reap time. The forge is
+        # also strictly weaker than what the shared password already grants
+        # (full queue/lock/result read-write). Real remediation is
+        # per-worker Redis ACLs, tracked separately.
         if record.get("needs_reap") == "1":
             return REAP_REASON_NEEDS_REAP
 
