@@ -800,3 +800,171 @@ time.sleep(30)
     assert result.transient is True
     assert result.summary == "Failed to write prompt: timed out writing prompt to Claude PTY"
     assert 0 < captured["timeout"] <= 3
+
+
+def test_mcp_server_prompt_detector_survives_cursor_positioning_gaps() -> None:
+    """Real TUI output repositions the cursor mid-word, so a literal option
+    string can lose a character ('...MCP servr').  Captured from a production
+    trace where the dropped 'e' made the detector miss the menu, which then
+    satisfied the main-composer gate and burned the whole runner timeout.
+    """
+    runner = ClaudeInteractiveRunner()
+
+    text = (
+        "\x1b[38;5;220mNew MCP server found in this project: supabase"
+        "\x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mUse this MCP server\x1b[39m"
+        "\x1b[38;5;246m2. \x1b[39mUse this and all future MCP servers in this project"
+        "   \x1b[38;5;246m3. \x1b[39mContinue without using this MCP serv\x1b[45Gr"
+        "\x1b[38;5;246m\x1b[3mEnter to confirm \xb7 Esc to cancel"
+    )
+
+    assert runner._looks_like_mcp_server_prompt(text) is True
+    # And it must never be mistaken for the composer.
+    assert runner._looks_like_main_input_prompt(text) is False
+
+
+def test_main_input_prompt_detector_rejects_caret_selected_numbered_menu() -> None:
+    """Any selection dialog renders numbered options with an 'Enter to confirm'
+    footer and marks the selected row with the same glyph as the composer.
+    The gate must reject that shape generically, without enumerating dialogs.
+    """
+    runner = ClaudeInteractiveRunner()
+
+    assert (
+        runner._looks_like_main_input_prompt(
+            "Some future dialog we have never seen\n"
+            "❯ 1. Do the thing\n"
+            "  2. Do not do the thing\n"
+            "Enter to confirm \xb7 Esc to cancel"
+        )
+        is False
+    )
+    # The real composer still passes.
+    assert runner._looks_like_main_input_prompt('│ ❯ Try "fix the failing test"') is True
+
+
+def test_run_confirms_bypass_prompt_appearing_after_prompt_sent(tmp_path, monkeypatch) -> None:
+    """Production sequence: trust -> MCP menu -> bypass warning.  The bypass
+    dialog can appear after the task prompt has been sent; if the runner stops
+    answering setup dialogs at that point the session hangs until the wall
+    clock kills it (observed as ~27% of tasks dying at 'Timed out after 5400s').
+    """
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import sys
+import time
+
+def read_confirmation():
+    deadline = time.time() + 5
+    buf = b""
+    while time.time() < deadline:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if not readable:
+            continue
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\\r" in buf or b"\\n" in buf:
+            return buf
+    return buf
+
+print(
+    "Quick safety check: Is this a project you created or one you trust?\\n"
+    "1. Yes, I trust this folder\\n"
+    "2. No, exit\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+read_confirmation()
+
+# Decline option loses a character to a cursor-position escape, exactly as
+# captured in the production trace.
+print(
+    "New MCP server found in this project: supabase\\n"
+    "\\u276f 1. Use this MCP server\\n"
+    "2. Use this and all future MCP servers in this project\\n"
+    "3. Continue without using this MCP serv\\x1b[45Gr\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+mcp = read_confirmation()
+if b"3" not in mcp:
+    print(f"BAD_MCP_CONFIRMATION={mcp!r}", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+
+print("\\u276f ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 4096)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Drain the rest of the pasted prompt so the confirmation read below cannot
+# swallow prompt bytes; the real CLI is idle when it raises this dialog.
+while True:
+    readable, _, _ = select.select([0], [], [], 0.5)
+    if not readable:
+        break
+    extra = os.read(0, 4096)
+    if not extra:
+        break
+    buf += extra
+
+# The bypass warning arrives only after the task prompt was submitted.
+print(
+    "WARNING: Claude Code running in Bypass Permissions mode\\n"
+    "1. No, exit\\n"
+    "2. Yes, I accept\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+confirmation = read_confirmation()
+if b"2" not in confirmation:
+    print(f"BAD_BYPASS_CONFIRMATION={confirmation!r}", flush=True)
+    time.sleep(30)
+    raise SystemExit(1)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(30)
+    raise SystemExit(1)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("late bypass prompt confirmed\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=15,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "late bypass prompt confirmed"
