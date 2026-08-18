@@ -52,10 +52,21 @@ _SUSPECT_EVENT_TYPE = "net.orcest.task.suspect"
 _PRESSURE_EVENT_TYPE = "net.orcest.fleet.pressure"
 
 
-def _parse_rfc3339(value: str) -> float:
-    """Parse a CloudEvents ``time`` field (RFC3339 UTC, e.g. ``...Z``) to epoch seconds."""
-    v = value[:-1] + "+00:00" if value.endswith("Z") else value
-    return datetime.fromisoformat(v).timestamp()
+def _parse_rfc3339(value: Any) -> float | None:
+    """Parse a CloudEvents ``time`` field (RFC3339 UTC, e.g. ``...Z``) to epoch seconds.
+
+    ``value`` is untrusted (spool entries come from an arbitrary poison
+    envelope) and may not be a string at all -- e.g. a JSON number. Returns
+    ``None`` for anything that isn't a parsable RFC3339 string rather than
+    raising, so callers can treat "unparsable" and "wrong type" identically.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        v = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(v).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 class FleetHealthMonitor:
@@ -130,9 +141,14 @@ class FleetHealthMonitor:
             logger.warning("Skipping spool entry %s: missing envelope field", entry_id)
             return
         try:
-            envelope: dict[str, Any] = json.loads(raw)
+            envelope: Any = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             logger.warning("Skipping malformed spool entry %s", entry_id, exc_info=True)
+            return
+        if not isinstance(envelope, dict):
+            logger.warning(
+                "Skipping malformed spool entry %s: envelope is not a JSON object", entry_id
+            )
             return
         if envelope.get("type") != _SUSPECT_EVENT_TYPE:
             return
@@ -144,9 +160,8 @@ class FleetHealthMonitor:
                 "Skipping malformed task.suspect envelope %s: missing subject/time", entry_id
             )
             return
-        try:
-            ts = _parse_rfc3339(time_str)
-        except (ValueError, TypeError):
+        ts = _parse_rfc3339(time_str)
+        if ts is None:
             logger.warning(
                 "Skipping task.suspect envelope %s: unparsable time %r", entry_id, time_str
             )

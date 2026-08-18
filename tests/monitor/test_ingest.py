@@ -68,6 +68,23 @@ def test_ingest_skips_poison_envelopes_without_500(tmp_path):
     assert r.json() == {"accepted": 1, "skipped": 2}
 
 
+def test_ingest_skips_non_dict_envelopes_in_batch(tmp_path):
+    """A batch with valid-JSON-but-non-dict envelopes (null, 42, valid) must
+    not 500 -- the ingest app should count them as skipped and still accept
+    the valid envelope in the same batch.
+    """
+    client = TestClient(create_ingest_app(_cfg(tmp_path)))
+    h = {"Authorization": "Bearer write-secret"}
+
+    r = client.post(
+        "/ingest/v1/events",
+        json={"events": [None, 42, _env()]},
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"accepted": 1, "skipped": 2}
+
+
 def test_ingest_malformed_json_returns_400(tmp_path):
     client = TestClient(create_ingest_app(_cfg(tmp_path)))
     h = {"Authorization": "Bearer write-secret", "Content-Type": "application/json"}

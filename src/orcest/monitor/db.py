@@ -62,12 +62,12 @@ def open_ro(db_path: str) -> sqlite3.Connection:
 def insert_events(conn: sqlite3.Connection, envelopes: list[dict]) -> int:
     """Insert well-formed envelopes, deduping on (source, id).
 
-    Malformed envelopes (missing a required CloudEvents attribute, or a
-    ``type`` outside the locked v1 taxonomy) are silently skipped. Envelopes
-    that pass that shape check but still fail at insert time -- e.g. a
-    ``None`` for a NOT NULL column (``sqlite3.IntegrityError``) or a
-    non-numeric ``resource_id``/``attempt`` (``ValueError``/``TypeError``) --
-    are also skipped rather than raised, so one poison envelope in a batch
+    Malformed envelopes (not a JSON object, missing a required CloudEvents
+    attribute, or a ``type`` outside the locked v1 taxonomy) are silently
+    skipped. Envelopes that pass that shape check but still fail at insert
+    time -- e.g. a ``None`` for a NOT NULL column (``sqlite3.IntegrityError``)
+    or a non-numeric ``resource_id``/``attempt`` (``ValueError``/``TypeError``)
+    -- are also skipped rather than raised, so one poison envelope in a batch
     cannot 500 the ingest endpoint and wedge the relay's retry loop on the
     same batch forever. Returns the number of rows actually inserted
     (excludes malformed/poison envelopes and duplicates ignored by the
@@ -75,6 +75,8 @@ def insert_events(conn: sqlite3.Connection, envelopes: list[dict]) -> int:
     """
     accepted = 0
     for env in envelopes:
+        if not isinstance(env, dict):
+            continue
         if not all(k in env for k in _REQUIRED) or env["type"] not in EVENT_TYPES:
             continue
         try:
