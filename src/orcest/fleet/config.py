@@ -424,6 +424,12 @@ class FleetConfig:
     # emits ``ORCEST_TRACE_HOST_PATH`` and ``generate_orchestrator_config``
     # emits ``trace_archive_path`` per project.
     trace_archive_host_path: str | None = None
+    # Optional shared monitor ingest wiring. The fleet config is already a
+    # root-only credential store for provider/GitHub tokens; keeping the write
+    # token here lets every regenerated per-project .env remain consistent
+    # across `fleet update` instead of relying on fragile hand edits.
+    monitor_ingest_url: str | None = None
+    monitor_write_token: str = ""
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -654,6 +660,19 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     else:
         trace_archive_host_path = None
 
+    monitor_ingest_url_raw = data.get("monitor_ingest_url")
+    if isinstance(monitor_ingest_url_raw, str) and monitor_ingest_url_raw.strip():
+        monitor_ingest_url: str | None = monitor_ingest_url_raw.strip()
+    else:
+        monitor_ingest_url = None
+    monitor_write_token_raw = data.get("monitor_write_token", "")
+    if monitor_write_token_raw is None:
+        monitor_write_token = ""
+    elif not isinstance(monitor_write_token_raw, str):
+        raise ValueError("monitor_write_token must be a string")
+    else:
+        monitor_write_token = monitor_write_token_raw.strip()
+
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
@@ -661,6 +680,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         projects=projects,
         pool=pool,
         trace_archive_host_path=trace_archive_host_path,
+        monitor_ingest_url=monitor_ingest_url,
+        monitor_write_token=monitor_write_token,
     )
 
 
@@ -734,6 +755,10 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
 
     if config.trace_archive_host_path:
         data["trace_archive_host_path"] = config.trace_archive_host_path
+    if config.monitor_ingest_url:
+        data["monitor_ingest_url"] = config.monitor_ingest_url
+    if config.monitor_write_token:
+        data["monitor_write_token"] = config.monitor_write_token
 
     # Atomic write: write to temp file then rename, with restrictive permissions
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")

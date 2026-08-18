@@ -52,6 +52,20 @@ monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 monitor_write_token_env: "MONITOR_WRITE_TOKEN"
 ```
 
+For a fleet-managed deployment, do not hand-edit the generated project
+files. Put the shared values in the root-only fleet config instead; every
+`fleet update` then regenerates both the YAML and each protected project
+`.env` consistently:
+
+```yaml
+monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
+monitor_write_token: "<same value as MONITOR_WRITE_TOKEN in the monitor env>"
+```
+
+The fleet config already contains provider and GitHub credentials and must
+remain mode `0600`. Standalone deployments can continue to manage the
+project YAML and environment directly.
+
 `monitor` here is the compose service name — it resolves over the shared
 `orcest` Docker network, so the orchestrator container needs no port
 published to reach it. Pass `MONITOR_WRITE_TOKEN` (the same value minted in
@@ -332,7 +346,7 @@ The events spool retains up to `DEFAULT_EVENTS_MAXLEN` (50000) envelopes
 **per project stream** (`XADD ... MAXLEN ~ 50000`), and never trims below
 that cap — activity snapshots make typical envelopes ~1KB or more, so a
 single busy project can hold 50MB+ of spool indefinitely. The shipped Redis
-runs with `--maxmemory 256mb --maxmemory-policy noeviction`, and that budget
+runs with `--maxmemory 1gb --maxmemory-policy noeviction`, and that budget
 is *shared* with the task streams, locks, and pending markers. Once Redis
 hits the wall, `noeviction` fails **writes fleet-wide** — task `XADD`s
 included, not just event spooling. Size `maxmemory` for
