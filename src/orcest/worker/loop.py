@@ -326,7 +326,7 @@ def _make_abort_event(*events: threading.Event) -> threading.Event:
 
     Used to combine ``lock_lost`` and ``shutdown_event`` so that either a
     lost heartbeat lock *or* a SIGTERM will interrupt retry-backoff sleeps
-    inside ``run_claude``.  Background daemon threads watch each input event
+    inside the runner driver.  Background daemon threads watch each input event
     and set the combined event when any one of them fires.
     """
     combined = threading.Event()
@@ -1389,7 +1389,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         heartbeat.start()
 
         # Combine lock_lost and shutdown_event so that either a lost lock *or*
-        # a SIGTERM immediately wakes retry-backoff sleeps inside run_claude.
+        # a SIGTERM immediately wakes retry-backoff sleeps inside the runner.
         # Before PR #98 the abort_event was shutdown_event directly; after that
         # refactor it became lock_lost alone, losing the SIGTERM fast-exit path.
         abort_event = _make_abort_event(lock_lost, terminal_abort_event)
@@ -2425,10 +2425,10 @@ def _execute_task(
         effective_model = task.model or config.runner.model
 
         # Activity watchdog (task B8): only wired up for runners that use the
-        # generic ``_BaseCliRunner._run_cli_agent`` driver -- i.e. it does not
-        # override ``run`` (Grok, Codex). ClaudeRunner keeps its legacy
-        # ``run_claude`` driver (see _runner_base.py's module docstring) and
-        # is untouched by this. ``config.runner.watchdog.enabled: False`` is
+        # generic ``_BaseCliRunner._run_cli_agent`` driver -- i.e. any
+        # ``_BaseCliRunner`` subclass that does not override ``run`` (Claude,
+        # Grok, Codex; ClaudeInteractiveRunner has its own driver and is not
+        # a ``_BaseCliRunner``). ``config.runner.watchdog.enabled: False`` is
         # the rollback lever: no tracker_factory is built, so the runner's
         # fixed wall-clock watchdog behaves exactly as before.
         run_kwargs: dict[str, Any] = {}
