@@ -56,7 +56,11 @@ class _MethodGateMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD"):
-            response = JSONResponse({"detail": "method not allowed"}, status_code=405)
+            response = JSONResponse(
+                {"detail": "method not allowed"},
+                status_code=405,
+                headers={"Allow": "GET, HEAD"},
+            )
             await response(scope, receive, send)
             return
         await self.app(scope, receive, send)
@@ -75,15 +79,19 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
     app.state.cfg = cfg
     app.add_middleware(_MethodGateMiddleware)
 
-    @app.api_route("/api/v1/health", methods=["GET", "HEAD"])
+    @app.api_route("/api/v1/health", methods=["GET"], operation_id="health")
+    @app.api_route("/api/v1/health", methods=["HEAD"], include_in_schema=False)
     def health() -> dict:
         return {"ok": True}
 
     router = APIRouter(dependencies=[Depends(require_scope("events:read"))])
 
-    @router.api_route("/api/v1/events", methods=["GET", "HEAD"])
+    @router.api_route("/api/v1/events", methods=["GET"], operation_id="list_events")
+    @router.api_route("/api/v1/events", methods=["HEAD"], include_in_schema=False)
     def list_events(
-        type: str | None = Query(default=None, json_schema_extra={"enum": sorted(EVENT_TYPES)}),
+        event_type: str | None = Query(
+            default=None, alias="type", json_schema_extra={"enum": sorted(EVENT_TYPES)}
+        ),
         repo: str | None = None,
         resource_id: int | None = None,
         since: str | None = None,
@@ -91,9 +99,9 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
     ) -> dict:
         clauses = []
         params: list[Any] = []
-        if type is not None:
+        if event_type is not None:
             clauses.append("type = ?")
-            params.append(type)
+            params.append(event_type)
         if repo is not None:
             clauses.append("repo = ?")
             params.append(repo)
@@ -111,7 +119,12 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
             rows = conn.execute(sql, params).fetchall()
         return {"events": [_envelope(r) for r in rows]}
 
-    @router.api_route("/api/v1/tasks/{task_id}/timeline", methods=["GET", "HEAD"])
+    @router.api_route(
+        "/api/v1/tasks/{task_id}/timeline", methods=["GET"], operation_id="task_timeline"
+    )
+    @router.api_route(
+        "/api/v1/tasks/{task_id}/timeline", methods=["HEAD"], include_in_schema=False
+    )
     def task_timeline(task_id: str) -> dict:
         with closing(db.open_ro(cfg.db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -122,7 +135,14 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
         return {"task_id": task_id, "events": [_envelope(r) for r in rows]}
 
     @router.api_route(
-        "/api/v1/work/{owner}/{name}/{resource_type}/{resource_id}", methods=["GET", "HEAD"]
+        "/api/v1/work/{owner}/{name}/{resource_type}/{resource_id}",
+        methods=["GET"],
+        operation_id="work_detail",
+    )
+    @router.api_route(
+        "/api/v1/work/{owner}/{name}/{resource_type}/{resource_id}",
+        methods=["HEAD"],
+        include_in_schema=False,
     )
     def work_detail(owner: str, name: str, resource_type: str, resource_id: int) -> dict:
         repo = f"{owner}/{name}"
@@ -164,7 +184,8 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
             "attempts": ordered_attempts,
         }
 
-    @router.api_route("/api/v1/fleet", methods=["GET", "HEAD"])
+    @router.api_route("/api/v1/fleet", methods=["GET"], operation_id="fleet_status")
+    @router.api_route("/api/v1/fleet", methods=["HEAD"], include_in_schema=False)
     def fleet_status() -> dict:
         with closing(db.open_ro(cfg.db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -218,7 +239,12 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
 
     trace_router = APIRouter(dependencies=[Depends(require_scope("traces:read"))])
 
-    @trace_router.api_route("/api/v1/tasks/{task_id:path}/trace", methods=["GET", "HEAD"])
+    @trace_router.api_route(
+        "/api/v1/tasks/{task_id:path}/trace", methods=["GET"], operation_id="task_trace"
+    )
+    @trace_router.api_route(
+        "/api/v1/tasks/{task_id:path}/trace", methods=["HEAD"], include_in_schema=False
+    )
     def task_trace(task_id: str, tail: int = Query(default=200, ge=1, le=5000)) -> dict:
         if not _TASK_ID_RE.match(task_id):
             raise HTTPException(status_code=400, detail="invalid task_id")
