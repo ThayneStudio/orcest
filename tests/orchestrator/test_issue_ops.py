@@ -749,6 +749,62 @@ def test_native_blocker_state_seeds_body_resolution_cache(
     issue_state_mock.assert_not_called()
 
 
+def test_repo_less_native_blocker_does_not_seed_cache(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """A native blocker with no repo attribution must not be treated as
+    same-repo when seeding the body-resolution cache. Here the closed
+    repo-less blocker shares issue number 12 with an open same-repo body
+    ref -- the issue must defer via a real gh lookup, not enqueue off a
+    poisoned cache entry."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=307,
+            body="Blocked by #12",
+            blocked_by=[{"number": 12, "state": "CLOSED", "repo": None}],
+        ),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#12"]
+    issue_state_mock.assert_called_once_with(REPO, 12, TOKEN)
+
+
+def test_cross_repo_closed_native_blocker_does_not_seed_cache(
+    issue_gh_mock, issue_state_mock, fake_redis_client, label_config
+):
+    """The cache is keyed by bare same-repo issue numbers, so a closed
+    cross-repo native blocker whose number collides with an open same-repo
+    body ref must not satisfy that ref."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(
+            number=308,
+            body="Blocked by #9",
+            blocked_by=[{"number": 9, "state": "CLOSED", "repo": "other-org/other-repo"}],
+        ),
+    ]
+    issue_state_mock.return_value = "open"
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == IssueAction.SKIP_DEPENDENCY
+    assert results[0].open_blockers == ["#9"]
+    issue_state_mock.assert_called_once_with(REPO, 9, TOKEN)
+
+
 def test_native_and_body_same_blocker_reported_once(
     issue_gh_mock, issue_state_mock, fake_redis_client, label_config
 ):

@@ -1,12 +1,17 @@
 """Issue dependency parsing and resolution.
 
-Scans issue body text for prerequisite references ("blocked by #N",
-"depends on #N", etc.) and looks up each referenced issue's state so the
-orchestrator can defer dependent issues while their blockers remain open.
+Two dependency sources defer an issue while its blockers remain open:
 
-Scope (v1):
-- Same-repo `#N` references only.
-- Body text only; comments are not scanned.
+1. GitHub-native blocked-by relationships (`native_open_blockers`) --
+   states arrive inline with the issue listing, cross-repo supported.
+2. Body-text prerequisite references ("blocked by #N", "depends on #N",
+   etc.), resolved via per-blocker `gh` lookups.
+
+Scope:
+- Body-text references are same-repo `#N` only; cross-repo dependencies
+  need a native relationship. Comments are not scanned.
+- A native blocker the orchestrator token cannot see is silently omitted
+  by the API (no signal it exists), so it cannot defer the dependent.
 - No topological ordering: workers run in parallel and the next discovery
   tick re-evaluates everything, so deferral alone is sufficient.
 
@@ -100,7 +105,8 @@ def native_open_blockers(issue_data: dict, repo: str) -> list[str]:
 
     A blocker with a missing/unrecognized state fails safe to blocking,
     mirroring the "unknown" semantics of body-declared dependencies. Only
-    "CLOSED" (and merged, for PR-typed blockers) clears a blocker.
+    "CLOSED" clears a blocker (the blockedBy connection holds Issues only,
+    whose GraphQL states are exactly OPEN/CLOSED).
 
     Sorted same-repo first, then by repo and number, so log lines read
     naturally.
@@ -108,7 +114,7 @@ def native_open_blockers(issue_data: dict, repo: str) -> list[str]:
     blockers: list[tuple[int, str, int]] = []
     for blocker in issue_data.get("blocked_by") or []:
         state = blocker.get("state")
-        if isinstance(state, str) and state.upper() in ("CLOSED", "MERGED"):
+        if isinstance(state, str) and state.upper() == "CLOSED":
             continue
         number = blocker["number"]
         blocker_repo = blocker.get("repo") or repo

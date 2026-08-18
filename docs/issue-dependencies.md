@@ -21,11 +21,16 @@ Native blocked-by relationships arrive inline with the issue listing
 API calls. GitHub caps native dependencies at 50 per issue, so the
 single-page fetch is always complete.
 
-A native blocker defers the dependent while it is open; closed (or
-merged, for PR-typed blockers) native blockers don't block. A blocker
-whose state can't be read fails safe to blocking. Because native
-relationships carry the blocker's repo, cross-repo dependencies work —
-they're logged as `owner/repo#N`.
+A native blocker defers the dependent while it is open; closed native
+blockers don't block. A blocker whose state can't be read fails safe
+to blocking. Because native relationships carry the blocker's repo,
+cross-repo dependencies work — they're logged as `owner/repo#N`.
+
+One caveat: a native blocker in a repo the orchestrator's token
+**cannot access** is silently omitted from the API response (GitHub
+returns no signal it exists), so it cannot defer the dependent. Give
+the token read access to blocker repos, or fall back to manual
+`orcest:blocked`.
 
 ## Body-declared reference syntax
 

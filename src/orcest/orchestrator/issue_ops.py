@@ -271,12 +271,16 @@ def discover_actionable_issues(
         if blocker_refs:
             # Native data already told us the state of any same-repo blocker
             # it listed -- seed the cache so those refs cost no gh call.
+            # The cache is keyed by bare same-repo issue numbers, so only
+            # blockers explicitly attributed to this repo may seed it; a
+            # cross-repo or unattributed blocker sharing a number with a
+            # same-repo body ref must fall through to the gh lookup.
             for blocker in issue_data.get("blocked_by") or []:
                 state = blocker.get("state")
-                if blocker.get("repo") in (repo, None) and isinstance(state, str):
+                if blocker.get("repo") == repo and isinstance(state, str):
                     blocker_state_cache.setdefault(
                         blocker["number"],
-                        "closed" if state.upper() in ("CLOSED", "MERGED") else "open",
+                        "closed" if state.upper() == "CLOSED" else "open",
                     )
             states = fetch_blocker_states(repo, blocker_refs, token, blocker_state_cache)
             still_open = open_blockers(blocker_refs, states)

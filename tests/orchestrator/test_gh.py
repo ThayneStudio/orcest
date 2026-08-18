@@ -1668,7 +1668,15 @@ def test_list_labeled_issues_paginates_past_100(mocker):
         },
     ]
     page2_nodes = [
-        {"number": 2, "title": "newer", "body": "b2", "labels": {"nodes": []}},
+        {
+            "number": 2,
+            "title": "newer",
+            "body": "b2",
+            "labels": {"nodes": []},
+            "blockedBy": {
+                "nodes": [{"number": 4, "state": "OPEN", "repository": {"nameWithOwner": REPO}}]
+            },
+        },
     ]
 
     def _issues_response(nodes, *, has_next_page=False, end_cursor=None):
@@ -1700,6 +1708,9 @@ def test_list_labeled_issues_paginates_past_100(mocker):
     # Labels are normalized to the flat list shape the callers expect.
     assert result[0]["labels"] == [{"name": "orcest:ready", "color": "00ff00"}]
     assert result[1]["labels"] == []
+    # blocked_by normalization applies to every page, not just the first.
+    assert result[0]["blocked_by"] == []
+    assert result[1]["blocked_by"] == [{"number": 4, "state": "OPEN", "repo": REPO}]
     # The second gh invocation carried the pagination cursor.
     assert mock_run.call_count == 2
     second_args = mock_run.call_args_list[1][0][0]
