@@ -30,6 +30,8 @@ from orcest.worker.runner import RunnerResult, get_provider_recipe
 
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# A numbered selection row ("❯ 1. …"); the composer glyph is never numbered.
+_MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
 _USAGE_ERROR_LINE_RE = re.compile(
     r"^\s*(?:error:|api error:|claude(?: code)? error:|rate limit|usage limit|quota|"
     r"billing limit|token limit)",
@@ -298,10 +300,11 @@ class ClaudeInteractiveRunner:
             or "newmcpserversfound" in normalized
         )
         has_use_option = "usethismcpserver" in normalized or "usethesemcpservers" in normalized
-        has_decline_option = (
-            "continuewithoutusingthismcpserver" in normalized
-            or "continuewithoutusingthesemcpservers" in normalized
-        )
+        # Real TUI output repositions the cursor mid-word, so a literal option
+        # string can arrive with a character missing (observed in production:
+        # "Continue without using this MCP servr").  Match on a stem that
+        # survives that instead of the full option text.
+        has_decline_option = "continuewithoutusing" in normalized and "mcpserv" in normalized
         return (
             has_new_mcp_prompt
             and has_use_option
@@ -322,11 +325,19 @@ class ClaudeInteractiveRunner:
         # Setup menus use numbered selections and must never satisfy this gate.
         # The composer line may be framed inside a box border (e.g. "│ ❯ …"),
         # so tolerate leading box-drawing characters before the glyph.
-        # Residual risk: the CLI is installed unpinned, and any future menu
-        # (beyond the three setup dialogs excluded above) that renders its
-        # selected row with a leading ❯ would still satisfy this gate; those
-        # menus cannot be enumerated safely ahead of time.
-        return any(line.lstrip(" \t│┃║|").startswith("❯") for line in stripped.splitlines())
+        caret_lines = [
+            unframed
+            for line in stripped.splitlines()
+            if (unframed := line.lstrip(" \t│┃║|")).startswith("❯")
+        ]
+        # A selection dialog marks its highlighted row with the same glyph as
+        # the composer, so the glyph alone cannot tell them apart -- but only a
+        # dialog numbers that row.  Rejecting on that shape also covers menus
+        # that cannot be enumerated ahead of time, which the three explicit
+        # exclusions above cannot (the CLI is installed unpinned).
+        if any(_MENU_OPTION_RE.match(line) for line in caret_lines):
+            return False
+        return bool(caret_lines)
 
     def _confirm_workspace_trust_if_needed(
         self,
@@ -552,50 +563,57 @@ class ClaudeInteractiveRunner:
                                 summary="Claude usage limit reached",
                                 usage_exhausted=True,
                             )
-                        confirmed_setup = False
-                        previous = workspace_trust_confirmed
-                        workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
+
+                    # Setup dialogs are answered whenever they appear, not only
+                    # before the task prompt goes out: Claude can raise one (the
+                    # bypass-permissions warning in particular) after the prompt
+                    # was submitted, and an unanswered dialog blocks the session
+                    # until the wall clock kills it.  Each confirmation latches,
+                    # so every dialog is answered at most once.
+                    confirmed_setup = False
+                    previous = workspace_trust_confirmed
+                    workspace_trust_confirmed = self._confirm_workspace_trust_if_needed(
+                        master_fd,
+                        terminal_output,
+                        workspace_trust_confirmed,
+                        logger,
+                    )
+                    if workspace_trust_confirmed and not previous:
+                        confirmed_setup = True
+                    previous = bypass_permissions_confirmed
+                    bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
+                        master_fd,
+                        terminal_output,
+                        bypass_permissions_confirmed,
+                        logger,
+                    )
+                    if bypass_permissions_confirmed and not previous:
+                        confirmed_setup = True
+                    previous = mcp_server_confirmed
+                    mcp_server_confirmed = self._confirm_mcp_server_if_needed(
+                        master_fd,
+                        terminal_output,
+                        mcp_server_confirmed,
+                        logger,
+                    )
+                    if mcp_server_confirmed and not previous:
+                        confirmed_setup = True
+                    if confirmed_setup:
+                        # Do not let a setup menu's rendering count as the
+                        # later main prompt. Wait for new output after the
+                        # confirmation response.
+                        setup_output_index = len(terminal_output)
+                    elif not prompt_sent and self._looks_like_main_input_prompt(
+                        "".join(terminal_output[setup_output_index:])
+                    ):
+                        self._send_prompt(
                             master_fd,
-                            terminal_output,
-                            workspace_trust_confirmed,
+                            full_prompt,
                             logger,
+                            abort_event=abort,
+                            timeout=max(0.0, attempt_deadline - time.monotonic()),
                         )
-                        if workspace_trust_confirmed and not previous:
-                            confirmed_setup = True
-                        previous = bypass_permissions_confirmed
-                        bypass_permissions_confirmed = self._confirm_bypass_permissions_if_needed(
-                            master_fd,
-                            terminal_output,
-                            bypass_permissions_confirmed,
-                            logger,
-                        )
-                        if bypass_permissions_confirmed and not previous:
-                            confirmed_setup = True
-                        previous = mcp_server_confirmed
-                        mcp_server_confirmed = self._confirm_mcp_server_if_needed(
-                            master_fd,
-                            terminal_output,
-                            mcp_server_confirmed,
-                            logger,
-                        )
-                        if mcp_server_confirmed and not previous:
-                            confirmed_setup = True
-                        if confirmed_setup:
-                            # Do not let a setup menu's rendering count as the
-                            # later main prompt. Wait for new output after the
-                            # confirmation response.
-                            setup_output_index = len(terminal_output)
-                        elif self._looks_like_main_input_prompt(
-                            "".join(terminal_output[setup_output_index:])
-                        ):
-                            self._send_prompt(
-                                master_fd,
-                                full_prompt,
-                                logger,
-                                abort_event=abort,
-                                timeout=max(0.0, attempt_deadline - time.monotonic()),
-                            )
-                            prompt_sent = True
+                        prompt_sent = True
 
                 self._finish_output_decoder(
                     decoder,
