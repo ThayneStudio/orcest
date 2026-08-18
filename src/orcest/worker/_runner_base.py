@@ -437,7 +437,14 @@ def _run_cli_agent(
                     nonlocal killed_trigger
                     while not _cancelled.wait(timeout=_interval):
                         trigger = _tracker.tick()
-                        if trigger:
+                        # Re-check cancellation right before latching: tick()
+                        # can stall (e.g. a wedged Redis call) past this
+                        # attempt's watchdog_thread.join(timeout=5), in which
+                        # case the main thread has already moved on to a new
+                        # attempt with its own `killed_trigger`. A late-firing
+                        # stale-attempt trigger must not overwrite it (review
+                        # round 1 hardening).
+                        if trigger and not _cancelled.is_set():
                             killed_trigger = trigger
                             _killed.set()
                             _kill_process_tree(_proc)
