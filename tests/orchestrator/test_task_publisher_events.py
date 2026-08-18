@@ -39,12 +39,25 @@ def test_enqueued_event_emitted_after_publish(gh_mock, fake_redis_client):
     _setup_gh_defaults(gh_mock)
     pr_state = _make_pr_state(number=42)
 
+    # Distinct literal secret values so the assertions below can prove they
+    # are genuinely absent from the envelope, not just that a field named
+    # "token" is missing (a stricter check than the substring "token").
+    secret_gh_token = "ghp_SuperSecretGithubToken000111"  # noqa: S105 (test fixture, not real)
+    secret_claude_token = "claude-oauth-SecretValue222333"  # noqa: S105
+    secret_credential = "cred-SecretValue444555"  # noqa: S105
+    secret_diff_marker = "SECRET_DIFF_LINE_marker_666777"
+    gh_mock.get_pr_diff.return_value = (
+        f"diff --git a/foo.py b/foo.py\n+{secret_diff_marker}"
+    )
+
     publish_fix_task(
         pr_state=pr_state,
         repo="test-org/test-repo",
-        token="fake-token",
+        token=secret_gh_token,
         redis=fake_redis_client,
         default_runner="claude",
+        claude_token=secret_claude_token,
+        credential=secret_credential,
     )
 
     entries = fake_redis_client.xrevrange(EVENTS_STREAM, count=10)
@@ -54,5 +67,12 @@ def test_enqueued_event_emitted_after_publish(gh_mock, fake_redis_client):
     assert enq[0]["data"]["work"]["resource_id"] == pr_state.number
     assert enq[0]["data"]["attempt"] == 0
     assert enq[0]["data"]["decision_reason"] != ""
-    # secrets must not leak
-    assert "token" not in json.dumps(enq[0])
+
+    # secrets must not leak: the task's literal GitHub token, Claude OAuth
+    # token, provider credential, or any rendered-prompt content (diff text)
+    # must never appear in the serialized envelope.
+    serialized = json.dumps(enq[0])
+    assert secret_gh_token not in serialized
+    assert secret_claude_token not in serialized
+    assert secret_credential not in serialized
+    assert secret_diff_marker not in serialized

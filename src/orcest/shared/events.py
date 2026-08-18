@@ -31,6 +31,12 @@ _TYPE_SUFFIXES = (
 )
 EVENT_TYPES: frozenset[str] = frozenset("net.orcest." + s for s in _TYPE_SUFFIXES)
 
+# Payload keys make_event() always sets itself. A caller-supplied `data` dict
+# that reuses one of these would silently clobber the identity fields set
+# below (dict.update() has no notion of "already occupied"), so make_event
+# rejects any collision instead of overwriting silently.
+_RESERVED_DATA_KEYS = frozenset({"work", "attempt", "head_sha", "worker_id", "provider"})
+
 
 def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -53,6 +59,13 @@ def make_event(
     """Build a v1 envelope. ``data`` extras are merged after identity fields."""
     if event_type not in EVENT_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
+    if data:
+        collision = _RESERVED_DATA_KEYS.intersection(data)
+        if collision:
+            raise ValueError(
+                f"data key {sorted(collision)[0]!r} collides with a reserved "
+                "make_event payload field (work/attempt/head_sha/worker_id/provider)"
+            )
     payload: dict[str, Any] = {
         "work": {
             "repo": repo,
@@ -79,7 +92,7 @@ def make_event(
 class EventPublisher:
     """Fire-and-forget spool writer. Never raises into the caller."""
 
-    def __init__(self, redis: RedisClient, maxlen: int = DEFAULT_EVENTS_MAXLEN):
+    def __init__(self, redis: RedisClient, maxlen: int = DEFAULT_EVENTS_MAXLEN) -> None:
         self._redis = redis
         self._maxlen = maxlen
         self._error_count = 0

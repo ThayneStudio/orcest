@@ -100,6 +100,51 @@ def test_malformed_entry_skipped(monkeypatch):
     assert r.kv["event_relay:cursor"] == "2-0"
 
 
+def test_malformed_entry_warning_not_repeated_across_retry_passes(monkeypatch, caplog):
+    """A malformed entry stuck behind a failing POST is warned about once, not per pass."""
+    r = _FakeRedis()
+    r.xadd_capped(EVENTS_STREAM, {"envelope": "not json"}, 100)
+    _spool(r, 1)  # one good entry alongside the malformed one
+
+    def fail_post(url, json=None, headers=None, timeout=None):
+        class R:
+            status_code = 503
+
+        return R()
+
+    relay = EventRelay(r, "http://monitor:9091/ingest/v1/events", "tok")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", fail_post)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            relay._pass_once()  # POST keeps failing -> cursor never advances
+
+    malformed_warnings = [
+        rec for rec in caplog.records if "Skipping malformed spool entry" in rec.message
+    ]
+    assert len(malformed_warnings) == 1
+    assert r.kv.get("event_relay:cursor") is None  # cursor genuinely never advanced
+
+
+def test_malformed_entry_seen_set_prunes_once_cursor_advances(monkeypatch):
+    """Once the cursor advances past a malformed entry, it can be warned again later."""
+    r = _FakeRedis()
+    r.xadd_capped(EVENTS_STREAM, {"envelope": "not json"}, 100)  # id "1-0", malformed only
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        class R:
+            status_code = 200
+
+        return R()
+
+    relay = EventRelay(r, "http://monitor:9091/ingest/v1/events", "tok")
+    monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", fake_post)
+
+    relay._pass_once()  # all-malformed batch: cursor advances past id "1-0"
+    assert r.kv["event_relay:cursor"] == "1-0"
+    assert relay._warned_malformed_ids == set()
+
+
 def test_start_warns_on_project_prefix_mismatch(monkeypatch, caplog):
     r = _FakeRedis(key_prefix="orcest")
     monkeypatch.setattr("orcest.orchestrator.event_relay.requests.post", lambda *a, **k: None)

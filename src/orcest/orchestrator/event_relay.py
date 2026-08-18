@@ -37,6 +37,12 @@ _MAX_BACKOFF_SECONDS = 60.0
 _POST_TIMEOUT_SECONDS = 10
 
 
+def _entry_id_tuple(entry_id: str) -> tuple[int, int]:
+    """Parse a Redis stream entry id ("<ms>-<seq>") into a comparable tuple."""
+    ms, _, seq = entry_id.partition("-")
+    return (int(ms), int(seq or 0))
+
+
 class EventRelay:
     """Background thread that drains the events spool to the monitor."""
 
@@ -57,6 +63,13 @@ class EventRelay:
         # any 2xx response. Also doubles as the idle-pass sleep interval
         # (both start at 1s per the spec).
         self._backoff = _INITIAL_BACKOFF_SECONDS
+        # Entry ids we've already logged a "malformed spool entry" warning
+        # for. While the POST for a batch keeps failing, the cursor doesn't
+        # advance, so the same malformed entries would otherwise be re-read
+        # (and re-warned) on every retry pass. Bounded: pruned in _pass_once
+        # whenever the cursor advances past an id, so this never grows past
+        # the current unacknowledged batch.
+        self._warned_malformed_ids: set[str] = set()
 
     def start(self) -> None:
         if self._ingest_url is None:
@@ -122,6 +135,12 @@ class EventRelay:
         back off.
         """
         cursor = self._redis.get(_CURSOR_KEY) or "0-0"
+        # xread_after returns [] both when there is genuinely nothing new and
+        # when the underlying Redis call errored (RedisClient.xread_after
+        # swallows connection errors to []). We treat both cases as "idle"
+        # and just retry on the next pass -- acceptable because the outer
+        # backoff loop still polls at a bounded (<=60s) cadence, but it means
+        # a Redis outage is invisible here rather than surfaced as a failure.
         entries = self._redis.xread_after(EVENTS_STREAM, cursor, _XREAD_COUNT)
         if not entries:
             return True
@@ -137,20 +156,41 @@ class EventRelay:
             try:
                 events.append(json.loads(raw))
             except (json.JSONDecodeError, TypeError):
-                logger.warning("Skipping malformed spool entry %s", entry_id, exc_info=True)
+                # While the POST for this batch keeps failing, the cursor
+                # doesn't advance and the same malformed entry gets re-read
+                # (and would otherwise be re-warned) every retry pass. Log
+                # each entry id at most once.
+                if entry_id not in self._warned_malformed_ids:
+                    self._warned_malformed_ids.add(entry_id)
+                    logger.warning("Skipping malformed spool entry %s", entry_id, exc_info=True)
 
         if not events:
             # Every entry in this batch was malformed. Still advance the
             # cursor past them -- otherwise a single bad entry wedges the
             # relay on every pass forever.
             self._redis.set_value(_CURSOR_KEY, last_id)
+            self._prune_warned_malformed_ids(last_id)
             return True
 
         if not self._post(events):
             return False
 
         self._redis.set_value(_CURSOR_KEY, last_id)
+        self._prune_warned_malformed_ids(last_id)
         return True
+
+    def _prune_warned_malformed_ids(self, cursor: str) -> None:
+        """Drop tracked malformed-entry ids once the cursor advances past them.
+
+        Keeps ``_warned_malformed_ids`` bounded to the current unacknowledged
+        batch instead of growing for the life of the process.
+        """
+        if not self._warned_malformed_ids:
+            return
+        cursor_tuple = _entry_id_tuple(cursor)
+        self._warned_malformed_ids = {
+            eid for eid in self._warned_malformed_ids if _entry_id_tuple(eid) > cursor_tuple
+        }
 
     def _post(self, events: list[dict[str, Any]]) -> bool:
         try:
