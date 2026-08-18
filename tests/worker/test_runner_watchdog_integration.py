@@ -297,6 +297,72 @@ sleep 600
     assert killed_data is not None and killed_data["trigger"] in ("stuck", "looping")
 
 
+class _RaisingTreeStatesTracker(LivenessTracker):
+    """Fail-open regression fixture: post-kill death verification whose
+    tree_states() raises must be treated as NOT verified (previously the
+    swallowed exception produced states=[] -> "D" not in [] -> a WRONG
+    affirmative verified=True)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mark_needs_reap_calls = 0
+
+    def tree_states(self) -> list[str]:  # type: ignore[override]
+        raise RuntimeError("state_of_tree exploded")
+
+    def mark_needs_reap(self) -> None:  # type: ignore[override]
+        self.mark_needs_reap_calls += 1
+        super().mark_needs_reap()
+
+
+@pytest.mark.integration
+def test_tree_states_exception_fails_closed_to_unverified(tmp_path, fake_redis_client):
+    """A tree_states() exception during post-kill verification must yield
+    verified=False and a mark_needs_reap() handoff to the pool reaper --
+    never an affirmative "verified" kill built from a swallowed error."""
+    work_dir = tmp_path / "wd"
+    work_dir.mkdir()
+    script = _write_script(
+        tmp_path / "agent.sh",
+        """
+echo '{"type":"assistant","message":{"content":[]}}'
+sleep 600
+""",
+    )
+    fake_redis_client.set_ex_raw("orcest:fleet:kill_budget:limit", "100", 3600)
+
+    events: list = []
+    trackers: list[_RaisingTreeStatesTracker] = []
+
+    def _emit(event_type: str, data: dict) -> None:
+        events.append((event_type, data))
+
+    def _factory(root_pid: int) -> LivenessTracker:
+        tracker = _RaisingTreeStatesTracker(
+            _watchdog_cfg(),
+            60.0,
+            redis=fake_redis_client,
+            emit=_emit,
+            worker_id="test-worker",
+            task_id="test-task",
+            root_pid=root_pid,
+            workspace=work_dir,
+        )
+        trackers.append(tracker)
+        return tracker
+
+    result = _run(work_dir, tmp_path, script, tracker_factory=_factory)
+
+    assert result.success is False
+    assert result.summary.startswith("STALLED(stuck)")
+
+    killed_data = next(
+        data for event_type, data in events if event_type == "net.orcest.task.killed"
+    )
+    assert killed_data == {"trigger": "stuck", "verified": False}
+    assert sum(t.mark_needs_reap_calls for t in trackers) == 1
+
+
 class _RaisingTickTracker(LivenessTracker):
     """I2 regression fixture: a tracker whose tick() always raises, to
     prove the watchdog thread falls back to an inline wall-clock ceiling
