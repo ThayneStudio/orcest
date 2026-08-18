@@ -265,7 +265,15 @@ class TestCloneUserdata:
         assert cfg["ephemeral"] is True
         assert cfg["pool_managed"] is True
         assert cfg["backend"] == "claude"
-        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+        # C1c: interactive (PTY) mode has no ladder coverage, so its
+        # wall-clock timeout is pinned to the pre-branch default rather
+        # than inheriting the raised RunnerConfig ceiling.
+        assert cfg["runner"] == {
+            "type": "claude",
+            "extra": {"mode": "interactive"},
+            "timeout": 5400,
+            "watchdog": {"enabled": True},
+        }
 
     def test_worker_yaml_can_use_isolated_clauder_backend(self):
         output = self._render(
@@ -277,7 +285,12 @@ class TestCloneUserdata:
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["backend"] == "clauder"
-        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+        assert cfg["runner"] == {
+            "type": "claude",
+            "extra": {"mode": "interactive"},
+            "timeout": 5400,
+            "watchdog": {"enabled": True},
+        }
 
     def test_worker_yaml_defaults_clauder_backend_to_interactive_mode(self):
         output = self._render(worker_backend="clauder")
@@ -285,7 +298,12 @@ class TestCloneUserdata:
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["backend"] == "clauder"
-        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+        assert cfg["runner"] == {
+            "type": "claude",
+            "extra": {"mode": "interactive"},
+            "timeout": 5400,
+            "watchdog": {"enabled": True},
+        }
 
     def test_worker_yaml_rejects_non_interactive_clauder_mode(self):
         with pytest.raises(ValueError, match="worker_runner_mode 'interactive'"):
@@ -300,21 +318,55 @@ class TestCloneUserdata:
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["backend"] == "claude"
-        assert cfg["runner"] == {"type": "claude", "extra": {"mode": "interactive"}}
+        assert cfg["runner"] == {
+            "type": "claude",
+            "extra": {"mode": "interactive"},
+            "timeout": 5400,
+            "watchdog": {"enabled": True},
+        }
 
     def test_worker_yaml_can_disable_interactive_mode_for_legacy_claude(self):
         # Explicit opt-out: 'headless' renders the legacy `claude -p` runner
-        # section with no extra.mode key.
+        # section with no extra.mode key, and (C1c) no timeout pin either --
+        # headless workers DO get ladder coverage, so they keep the raised
+        # RunnerConfig default (rendering nothing here means worker.yaml
+        # inherits it).
         output = self._render(worker_runner_mode="headless")
         data = yaml.safe_load(output)
         worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
         cfg = yaml.safe_load(worker_file["content"])
         assert cfg["backend"] == "claude"
-        assert cfg["runner"] == {"type": "claude"}
+        assert cfg["runner"] == {"type": "claude", "watchdog": {"enabled": True}}
 
     def test_worker_yaml_rejects_unknown_claude_runner_mode(self):
         with pytest.raises(ValueError, match="'interactive' or 'headless'"):
             self._render(worker_backend="claude", worker_runner_mode="batch")
+
+    # ── C1a: fleet watchdog toggle ──────────────────────────────
+
+    def test_worker_yaml_watchdog_enabled_default_true(self):
+        output = self._render(worker_runner_mode="headless")
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["runner"]["watchdog"] == {"enabled": True}
+
+    def test_worker_yaml_watchdog_can_be_disabled(self):
+        output = self._render(worker_runner_mode="headless", watchdog_enabled=False)
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["runner"]["watchdog"] == {"enabled": False}
+
+    def test_worker_yaml_watchdog_toggle_applies_to_interactive_mode_too(self):
+        # The toggle is rendered regardless of runner mode -- interactive
+        # workers just also get the separate C1c timeout pin.
+        output = self._render(worker_runner_mode="interactive", watchdog_enabled=False)
+        data = yaml.safe_load(output)
+        worker_file = next(f for f in data["write_files"] if f["path"] == "/opt/orcest/worker.yaml")
+        cfg = yaml.safe_load(worker_file["content"])
+        assert cfg["runner"]["watchdog"] == {"enabled": False}
+        assert cfg["runner"]["timeout"] == 5400
 
     def test_systemd_unit_written(self):
         data = yaml.safe_load(self._render())

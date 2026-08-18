@@ -848,6 +848,23 @@ class TestCloneRedisPassword:
         assert kwargs.get("worker_runner_type") == "claude"
         assert kwargs.get("worker_runner_mode") == "interactive"
 
+    def test_clone_passes_pool_watchdog_enabled(self, monkeypatch):
+        """C1a: PoolConfig.watchdog_enabled must reach render_clone_userdata
+        so newly-cloned workers pick up the fleet-level rollback lever."""
+        monkeypatch.delenv("ORCEST_REDIS_PASSWORD", raising=False)
+        config = _make_config()
+        config.pool.watchdog_enabled = False
+        manager, proxmox, redis = _make_manager(config=config)
+        proxmox.get_vm_ip.return_value = "10.20.0.50"
+
+        with patch("orcest.fleet.pool_manager.render_clone_userdata") as render:
+            render.return_value = "#cloud-config\n"
+            manager._clone_and_boot()
+
+        render.assert_called_once()
+        kwargs = render.call_args.kwargs
+        assert kwargs.get("watchdog_enabled") is False
+
     def test_clone_omits_password_when_env_unset(self, monkeypatch):
         """Backward compat: with no ORCEST_REDIS_PASSWORD in the pool-manager env
         the clone is rendered without a password (empty string), preserving the

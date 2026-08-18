@@ -95,7 +95,20 @@ def _make_tracker_factory(
     events: list,
     ceiling: float = 60.0,
     cfg: WatchdogConfig | None = None,
+    kill_budget_limit: int | None = 100,
 ):
+    # C1b: LivenessTracker's kill-budget default is now fail-closed (an
+    # absent/unreadable orcest:fleet:kill_budget:limit mirror means kills
+    # disabled). In production FleetHealthMonitor keeps this mirror fresh;
+    # here we mirror that by default so these STUCK/LOOPING-kill tests keep
+    # exercising the ladder's actual kill path rather than getting gated by
+    # the safe-by-default fallback. Pass kill_budget_limit=None to opt out
+    # (e.g. to exercise observation-mode-like behavior).
+    if kill_budget_limit is not None:
+        fake_redis_client.set_ex_raw(
+            "orcest:fleet:kill_budget:limit", str(kill_budget_limit), 3600
+        )
+
     def _emit(event_type: str, data: dict) -> None:
         events.append((event_type, data))
 
@@ -282,6 +295,56 @@ sleep 600
         (data for event_type, data in events if event_type == "net.orcest.task.killed"), None
     )
     assert killed_data is not None and killed_data["trigger"] in ("stuck", "looping")
+
+
+class _RaisingTickTracker(LivenessTracker):
+    """I2 regression fixture: a tracker whose tick() always raises, to
+    prove the watchdog thread falls back to an inline wall-clock ceiling
+    check rather than silently losing kill protection for the rest of the
+    attempt."""
+
+    def tick(self) -> str | None:  # type: ignore[override]
+        raise RuntimeError("tracker.tick() exploded")
+
+
+@pytest.mark.integration
+def test_tick_exception_falls_back_to_wall_clock_ceiling_kill(tmp_path, fake_redis_client):
+    work_dir = tmp_path / "wd"
+    work_dir.mkdir()
+    script = _write_script(tmp_path / "agent.sh", "sleep 30\n")
+
+    events: list = []
+
+    def _emit(event_type: str, data: dict) -> None:
+        events.append((event_type, data))
+
+    def _factory(root_pid: int) -> LivenessTracker:
+        return _RaisingTickTracker(
+            _watchdog_cfg(),
+            60.0,
+            redis=fake_redis_client,
+            emit=_emit,
+            worker_id="test-worker",
+            task_id="test-task",
+            root_pid=root_pid,
+            workspace=work_dir,
+        )
+
+    start = time.monotonic()
+    # Small runner timeout: the ladder can never kill (tick() always
+    # raises), so only the inline wall-clock fallback can end this attempt.
+    result = _run(work_dir, tmp_path, script, timeout=2, tracker_factory=_factory)
+    elapsed = time.monotonic() - start
+
+    # The ladder never got a chance to fire (tick() always raises); the
+    # inline wall-clock fallback treats this exactly like the no-tracker
+    # ceiling path: "ceiling" -> a generic timed-out result, not a
+    # STALLED(stuck/looping) verdict.
+    assert result.success is False
+    assert result.transient is True
+    assert result.summary == "Timed out after 2s"
+    # Killed promptly at ~2s, not left to run the full 30s sleep.
+    assert elapsed < 15
 
 
 @pytest.mark.integration

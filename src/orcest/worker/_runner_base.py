@@ -433,10 +433,34 @@ def _run_cli_agent(
                     _interval: float = tracker.sample_interval,
                     _cancelled: threading.Event = watchdog_cancelled,
                     _killed: threading.Event = watchdog_killed,
+                    _timeout: float = timeout,
+                    _attempt_start: float = attempt_start,
                 ) -> None:
                     nonlocal killed_trigger
+                    # I2: tick() must never be allowed to silently disable
+                    # kill protection for the rest of this attempt. If it
+                    # raises (a bug in the ladder/tracker glue, an
+                    # unexpected Redis client exception shape, etc.), log it
+                    # once and fall back to an inline wall-clock ceiling
+                    # check for every remaining iteration -- the task still
+                    # gets killed at `timeout`, just without ladder-driven
+                    # early detection.
+                    tick_failure_logged = False
                     while not _cancelled.wait(timeout=_interval):
-                        trigger = _tracker.tick()
+                        try:
+                            trigger = _tracker.tick()
+                        except Exception:
+                            if not tick_failure_logged:
+                                if logger:
+                                    logger.error(
+                                        "tracker.tick() raised; falling back to inline "
+                                        "wall-clock ceiling kill protection for the rest "
+                                        "of this attempt",
+                                        exc_info=True,
+                                    )
+                                tick_failure_logged = True
+                            elapsed = time.monotonic() - _attempt_start
+                            trigger = "ceiling" if elapsed >= _timeout else None
                         # Re-check cancellation right before latching: tick()
                         # can stall (e.g. a wedged Redis call) past this
                         # attempt's watchdog_thread.join(timeout=5), in which

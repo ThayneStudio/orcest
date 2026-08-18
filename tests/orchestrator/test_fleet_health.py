@@ -99,6 +99,28 @@ def test_three_distinct_suspects_in_window_sets_pressure_and_emits_once(fake_red
     assert pressure_events[0]["data"]["work"]["resource_id"] == 0
 
 
+def test_flapping_same_task_does_not_trip_pressure(fake_redis_client):
+    """B10 (final review, minor deferred): pressure is evaluated on the
+    DISTINCT count of task_ids in the window -- three task.suspect events
+    for the SAME task_id (a single flapping task oscillating in/out of
+    SUSPECT) must not trip pressure, even though three raw envelopes were
+    spooled."""
+    monitor, clock = _make_monitor(fake_redis_client)
+    now = clock.t
+    _spool_suspect(fake_redis_client, "flapping-task", _iso(now))
+    _spool_suspect(fake_redis_client, "flapping-task", _iso(now))
+    _spool_suspect(fake_redis_client, "flapping-task", _iso(now))
+
+    monitor._pass_once()
+
+    assert fake_redis_client.get_raw(_PRESSURE_KEY) is None
+    events = fake_redis_client.xrange("events")
+    pressure_events = [
+        f for _, f in events if json.loads(f["envelope"])["type"] == "net.orcest.fleet.pressure"
+    ]
+    assert pressure_events == []
+
+
 def test_two_suspects_do_not_trip(fake_redis_client):
     monitor, clock = _make_monitor(fake_redis_client)
     now = clock.t

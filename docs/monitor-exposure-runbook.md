@@ -199,6 +199,25 @@ running `fleet update` alone updates the pool manager's *reaping* logic but
 leaves already-cloned workers running the old runner until they cycle
 through a fresh clone of the rebaked template.
 
+**Rollout prerequisite: interactive Claude workers have no ladder coverage.**
+`ClaudeInteractiveRunner` (pool `worker_runner_mode: interactive`, the PTY
+Claude driver) never routes through `_BaseCliRunner`/`tracker_factory` — it
+gets no `LivenessTracker`, no ladder, no `SUSPECT`/`STUCK`/`LOOPING`
+evaluation, at any stage below, `watchdog.enabled` or not. Cloud-init
+compensates by pinning those workers' wall-clock `runner.timeout` to the
+pre-branch default (5400s) instead of letting them inherit the raised
+21600s ceiling with nothing backstopping a genuine hang before it (see
+`cloud_init.render_clone_userdata`'s `_INTERACTIVE_RUNNER_TIMEOUT_SECONDS`).
+That is a mitigation, not parity: an interactive worker still only ever
+gets the blunt fixed-timeout kill, never the ladder's earlier
+stuck/looping detection. Before relying on this rollout's stage 2/3
+observability or kill behavior for a project's Claude pool, move its
+profile(s) to `worker_runner_mode: headless` (the non-PTY `claude -p`
+runner, which *does* route through the generic tracked path) to get real
+ladder coverage. Fleet configs that must stay on interactive PTY workers
+keep today's wall-clock-only behavior for that pool regardless of what
+stage the rest of this rollout is in.
+
 1. **Ship dark.** Deploy with `watchdog.enabled: false` and the monitor
    container up (see steps 1-3 above). Events flow (enqueue/start/complete),
    the query API is queryable, and the pool reaper stays wall-clock/
@@ -208,28 +227,41 @@ through a fresh clone of the rebaked template.
    verification before any behavior changes.
 
 2. **Observation mode.** Flip `watchdog.enabled: true` fleet-wide with
-   `max_kills_per_hour: 0`. At this budget the ladder still evaluates and
-   emits `net.orcest.task.suspect`/`stuck`/`looping` transition events, but
-   the ladder's own kill decision is blocked by the exhausted budget, so
-   `needs_reap` never gets set and no still-running task is killed early on
-   the watchdog's say-so. The pool reaper's `ceiling` and `activity_stale`
-   paths are **not** gated by this budget — `activity_stale` only ever
-   fires for a worker whose liveness heartbeat has genuinely gone (see
-   above), meaning the VM already died for an unrelated reason, so
-   reclaiming it during observation mode is correct and is not itself an
-   "early kill" of a live task. Watch the `task.suspect` (and `stuck`)
-   false-positive rate against real workloads via the monitor for several
-   days — a task that reaches SUSPECT/STUCK and then finishes normally
-   anyway is a false positive and a signal the ladder thresholds
-   (`idle_window`, `waiting_grace`, the loop thresholds) need tuning before
-   any kill budget goes live.
+   `max_kills_per_hour: 0`. At this budget the ladder still evaluates every
+   tick, but a would-be `STUCK`/`LOOPING` transition is *gate-deferred*: the
+   reported state stays at `SUSPECT` and the transition never happens, so
+   **no `net.orcest.task.stuck`/`net.orcest.task.looping` event is emitted
+   in observation mode at all** — only `net.orcest.task.suspect` (and the
+   periodic `net.orcest.task.activity` snapshot). `needs_reap` never gets
+   set, so no still-running task is killed early on the watchdog's say-so.
+   Operators watching false-positive rate during this stage should watch
+   two things instead: (a) `task.suspect` episodes that never recover into
+   a normal completion — a task that reaches SUSPECT and then finishes
+   normally anyway is a false positive; and (b) the `deferred_kill` flag on
+   the activity record / periodic `task.activity` event, which is `true`
+   exactly when the fleet gate suppressed a kill the ladder would otherwise
+   have fired this tick — that is the direct "would have killed" count a
+   gated-off `stuck`/`looping` event can't give you. The pool reaper's
+   `ceiling` and `activity_stale` paths are **not** gated by this budget —
+   `activity_stale` only ever fires for a worker whose liveness heartbeat
+   has genuinely gone (see above), meaning the VM already died for an
+   unrelated reason, so reclaiming it during observation mode is correct
+   and is not itself an "early kill" of a live task. Watch both signals
+   against real workloads via the monitor for several days before tuning
+   the ladder thresholds (`idle_window`, `waiting_grace`, the loop
+   thresholds) or moving to stage 3.
 
 3. **Enable kills.** Once the false-positive rate is acceptable, raise
-   `max_kills_per_hour` to the real budget (default 6). From this point the
-   ladder can act on its own SUSPECT/STUCK/LOOPING evaluation and set
-   `needs_reap`, which the pool reaper destroys immediately below the
-   `max_task_duration` ceiling — not just at the ceiling or on a
-   provably-dead worker as in stage 2. Keep watching `task.reaped`
+   `max_kills_per_hour` to the real budget (default 6). From this point a
+   `STUCK`/`LOOPING` kill is no longer gate-deferred, so the ladder fires it
+   and the runner's watchdog thread kills the process tree — but
+   `needs_reap` itself is **not** set just because a kill fired. It's set
+   only when the post-kill D-state verification (a 2s wait, then a
+   process-tree check) finds the tree did NOT actually die — i.e. a failed
+   `SIGKILL`, not every kill. A cleanly-verified kill lets the attempt exit
+   normally; only an unverified one flags `needs_reap` so the pool reaper's
+   fast (10s) loop force-destroys the VM instead of leaving a zombie
+   process tree parked in the warm pool. Keep watching `task.reaped`
    events' `reason` field (`ceiling` / `needs_reap` / `activity_stale`) via
    the monitor for a few more days; a spike in `needs_reap`/`activity_stale`
    reaps relative to `ceiling` reaps is the signal to look at, since those
@@ -239,3 +271,14 @@ If a stage regresses, drop back to `watchdog.enabled: false` rather than
 tuning forward under pressure — it is a complete, tested rollback to
 wall-clock-only reaping (at this migration's raised ceiling values), not a
 partial mitigation.
+
+**Multi-project note:** the kill-budget mirror (`orcest:fleet:kill_budget:limit`)
+and the pressure key are both *global* (unprefixed) Redis keys shared by
+every per-project orchestrator's `FleetHealthMonitor`, each refreshing the
+same mirror from its own `fleet_health.max_kills_per_hour` on every pass —
+last write wins, with no cross-project reconciliation. Keep each project's
+`fleet_health:` block (`pressure_min_tasks`, `pressure_window`,
+`pressure_hold`, `max_kills_per_hour`) identical across every
+per-project `orchestrator.yaml` in the fleet; divergent values don't error,
+they just flap the effective fleet-wide budget between whatever value each
+project's monitor last wrote.
