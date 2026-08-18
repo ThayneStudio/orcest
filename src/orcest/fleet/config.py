@@ -201,11 +201,34 @@ class PoolConfig:
     # worker_backend/worker_runner_* configuration exactly.
     worker_profiles: list[WorkerProfileConfig] = field(default_factory=list)
     # Force-kill threshold for an active worker VM. MUST exceed the worker's
-    # RunnerConfig.timeout (default 5400s) plus a grace window, otherwise the
+    # RunnerConfig.timeout (default 21600s) plus a grace window, otherwise the
     # pool reaps HEALTHY long-running tasks before they can finish. Default =
-    # 5400 (runner timeout) + 1800 (grace) = 7200s. Raise both together if you
+    # 21600 (runner timeout) + 3600 (grace) = 25200s. Raise both together if you
     # raise the runner timeout (see project memory: pool_max_task_duration_vs_runner_timeout).
-    max_task_duration: int = 7200  # seconds before force-kill (> runner timeout + grace)
+    max_task_duration: int = 25200  # seconds before force-kill (> runner timeout + grace)
+    # Seconds since the last activity-watchdog sample write to
+    # workers:activity:{worker_id} before PoolManager._health_check treats
+    # that record as stale. Distinct from max_task_duration's hard
+    # force-kill ceiling: below the ceiling, a stale-or-absent activity
+    # record is a *kill-decision input*, not just observability -- but only
+    # when corroborated by the worker's workers:heartbeat:{worker_id}
+    # liveness heartbeat also being absent (proving the worker process
+    # itself is gone). A present heartbeat with a stale/absent activity
+    # record just means the worker isn't running the watchdog (disabled, or
+    # an old pre-watchdog image) and is left to the ceiling, exactly like
+    # the pre-watchdog reaper (see spec §6 and fleet/pool_manager.py's
+    # _activity_reap_reason).
+    activity_stale_after: int = 300
+    # Fleet-level activity-watchdog rollback lever (final review, C1a).
+    # Rendered into every newly-cloned worker's ``worker.yaml`` as
+    # ``runner.watchdog.enabled`` (see ``cloud_init.render_clone_userdata``).
+    # This is clone-time cloud-init data, not baked into the template
+    # image, so toggling it takes effect for the NEXT clone with no rebake
+    # required -- only ``orcest fleet update`` (to pick up the new pool
+    # value) followed by normal pool churn (or a manual clone cycle) to
+    # roll it out fleet-wide. Existing already-cloned workers keep whatever
+    # value their own user-data was rendered with until they're replaced.
+    watchdog_enabled: bool = True
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
@@ -609,7 +632,9 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_runner_type=str(pl.get("worker_runner_type", "") or ""),
         worker_runner_mode=str(pl.get("worker_runner_mode", "") or ""),
         worker_profiles=worker_profiles,
-        max_task_duration=pl.get("max_task_duration", 7200),
+        max_task_duration=pl.get("max_task_duration", 25200),
+        activity_stale_after=pl.get("activity_stale_after", 300),
+        watchdog_enabled=bool(pl.get("watchdog_enabled", True)),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
@@ -699,6 +724,8 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
                 for profile in config.pool.worker_profiles
             ],
             "max_task_duration": config.pool.max_task_duration,
+            "activity_stale_after": config.pool.activity_stale_after,
+            "watchdog_enabled": config.pool.watchdog_enabled,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,
             "expected_image_gpg_key": config.pool.expected_image_gpg_key,

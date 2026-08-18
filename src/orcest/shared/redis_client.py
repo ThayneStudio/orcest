@@ -89,6 +89,14 @@ class RedisClient:
         """Raw redis client for operations not covered by helpers."""
         return self._client
 
+    @property
+    def key_prefix(self) -> str:
+        """The key prefix this client prepends to every key (without the trailing colon).
+
+        Empty string when no prefix is configured.
+        """
+        return self._prefix[:-1] if self._prefix else ""
+
     def close(self) -> None:
         """Close the connection pool and release all connections."""
         self._pool.disconnect()
@@ -434,6 +442,19 @@ class RedisClient:
             return 0
         result: int = self._client.delete(*fq_keys)  # type: ignore[assignment]
         return result
+
+    def set_ex_raw(self, fq_key: str, value: str | int, ttl: int) -> None:
+        """SET key value EX ttl using a fully-qualified key."""
+        self._client.set(fq_key, value, ex=ttl)
+
+    def incr_raw(self, fq_key: str) -> int:
+        """INCR using a fully-qualified key."""
+        result: int = self._client.incr(fq_key)  # type: ignore[assignment]
+        return result
+
+    def expire_raw(self, fq_key: str, seconds: int) -> None:
+        """EXPIRE key seconds using a fully-qualified key."""
+        self._client.expire(fq_key, seconds)
 
     def ensure_consumer_group(self, stream: str, group: str) -> None:
         """Create consumer group if it doesn't exist.

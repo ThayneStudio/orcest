@@ -1,0 +1,38 @@
+services:
+  monitor:
+    image: ${ORCEST_MONITOR_IMAGE:-orcest-monitor:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.monitor
+    restart: unless-stopped
+    environment:
+      - MONITOR_WRITE_TOKEN=${MONITOR_WRITE_TOKEN:?set in .env}
+      - MONITOR_TOKEN_ADMIN=${MONITOR_TOKEN_ADMIN:?set in .env}
+    volumes:
+      - ${ORCEST_MONITOR_CONFIG:-./config/monitor.yaml}:/etc/orcest/monitor.yaml:ro
+      - monitor-db:/var/lib/orcest-monitor
+      - "${ORCEST_TRACE_ARCHIVE_HOST_PATH:-/mnt/truenas-logs/orcest-traces}:/traces:ro"
+    ports:
+      # Query listener only: bind to loopback and reach it via SSH tunnel or
+      # the cloudflared sidecar below -- never publish it directly to the LAN.
+      - "127.0.0.1:9090:9090"
+    # Ingest port 9091 is intentionally NOT published here; producers (the
+    # orchestrator's EventRelay) reach it over the compose network at
+    # http://monitor:9091/ingest/v1/events. It must never get a tunnel
+    # hostname either -- see docs/monitor-exposure-runbook.md.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    mem_limit: 512m
+    networks:
+      - orcest
+
+volumes:
+  monitor-db: {}
+
+networks:
+  orcest:
+    external: true
+    name: ${ORCEST_DOCKER_NETWORK:-orcest}

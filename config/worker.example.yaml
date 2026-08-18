@@ -30,11 +30,40 @@ runner:
   # `claude -p` path while keeping the legacy non-interactive runner supported.
   # extra:
   #   mode: interactive
-  # Timeout in seconds for a single runner invocation
-  timeout: 1800
+  # Timeout in seconds for a single runner invocation. This is the hard
+  # wall-clock ceiling; with the watchdog enabled (default) most tasks end
+  # well before this via STUCK/LOOPING/WAITING detection, not this timeout.
+  timeout: 21600
   # Max retries on runner crash
   max_retries: 3
   # Seconds between retries
   retry_backoff: 10
   # Optional Claude model; null/empty/omitted uses the Claude CLI default
   # model: opus
+
+  # Activity watchdog: detects a stalled/looping/silently-waiting task well
+  # before the hard `timeout` above and ends it early. Set `enabled: false`
+  # to reproduce pre-watchdog behavior exactly (fixed wall-clock timeout
+  # only) -- this is the rollback lever.
+  watchdog:
+    enabled: true
+    # Seconds between activity samples.
+    sample_interval: 30
+    # Seconds after task start before the watchdog starts evaluating (lets
+    # the CLI/model warm up without tripping STUCK).
+    startup_grace: 600
+    # Seconds of no observed activity before a task is considered STUCK.
+    idle_window: 600
+    # Seconds a task may sit in a WAITING (e.g. provider rate-limit/api_retry
+    # backoff) state before being treated as stalled. Continuous waiting
+    # signals keep re-arming this grace from the *most recent* one -- a task
+    # perpetually retrying against the provider defers to the hard `timeout`
+    # ceiling above rather than being killed as stuck.
+    waiting_grace: 1800
+    # Consecutive identical tool calls before flagging an exact-repeat loop.
+    loop_exact_threshold: 4
+    # Consecutive tool-call errors before flagging an error loop.
+    loop_error_threshold: 3
+    # Consecutive alternating (A/B/A/B...) tool calls before flagging a
+    # ping-pong loop.
+    loop_pingpong_threshold: 6

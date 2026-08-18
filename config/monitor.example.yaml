@@ -1,0 +1,18 @@
+# Monitor service configuration (ingest + query listeners).
+#
+# Tokens are never stored here directly -- each token_env names an
+# environment variable resolved at process start (missing var = hard
+# failure). See docs/monitor-exposure-runbook.md for end-to-end setup.
+
+db_path: /var/lib/orcest-monitor/monitor.db
+trace_archive_path: /traces
+ingest_port: 9091
+query_port: 9090
+write_token_env: MONITOR_WRITE_TOKEN
+readers:
+  - name: admin
+    token_env: MONITOR_TOKEN_ADMIN
+    scopes: [events:read, traces:read]
+  # - name: grok-watcher
+  #   token_env: MONITOR_TOKEN_GROK
+  #   scopes: [events:read]

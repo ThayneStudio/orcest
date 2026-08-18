@@ -8,15 +8,18 @@ posting comments when tasks are queued.
 import json
 import logging
 import re
+from weakref import WeakKeyDictionary
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import (
     IssueState,
+    get_attempt_count as get_issue_attempt_count,
     increment_attempts as increment_issue_attempts,
 )
 from orcest.orchestrator.pr_ops import (
     PRState,
+    get_total_attempt_count,
     get_transient_attempt_count,
     increment_attempts,
     increment_transient_attempts,
@@ -28,6 +31,7 @@ from orcest.shared.coordination import (
     compute_pending_task_ttl,
     set_pending_task,
 )
+from orcest.shared.events import EventPublisher, make_event
 from orcest.shared.models import Task, TaskType, task_stream_name
 from orcest.shared.redis_client import RedisClient
 
@@ -409,6 +413,45 @@ def rerun_all_transient_ci(
     )
 
 
+# One EventPublisher per Redis client, reused across calls. EventPublisher's
+# decimated-error logging (warn on failure 1, 10, 100, then every 1000) keys
+# off an instance counter -- constructing a fresh EventPublisher on every
+# _emit_enqueued call (as before) reset that counter to 0 each time, so under
+# sustained Redis failure every single publish attempt logged a "1 failures
+# so far" warning instead of the intended decimation. Keyed by RedisClient
+# identity via a WeakKeyDictionary so cached publishers are dropped once
+# their client is garbage-collected -- no unbounded growth across the
+# process lifetime, and no change needed to callers (they still just pass a
+# RedisClient).
+_event_publishers: "WeakKeyDictionary[RedisClient, EventPublisher]" = WeakKeyDictionary()
+
+
+def _get_event_publisher(redis: RedisClient) -> EventPublisher:
+    publisher = _event_publishers.get(redis)
+    if publisher is None:
+        publisher = EventPublisher(redis)
+        _event_publishers[redis] = publisher
+    return publisher
+
+
+def _emit_enqueued(redis: RedisClient, task: Task) -> None:
+    """Spool a task.enqueued event. Never raises (EventPublisher swallows)."""
+    _get_event_publisher(redis).publish(
+        make_event(
+            "net.orcest.task.enqueued",
+            source_project=task.key_prefix or "default",
+            task_id=task.id,
+            repo=task.repo,
+            resource_type=task.resource_type,
+            resource_id=task.resource_id,
+            attempt=task.attempt,
+            head_sha=task.snapshot_head_sha,
+            provider=task.provider,
+            data={"decision_reason": task.decision_reason, "task_type": task.type.value},
+        )
+    )
+
+
 def _publish_and_notify(
     task: Task,
     pr_state: PRState,
@@ -512,6 +555,8 @@ def _publish_and_notify(
         )
         _clear_pending_safe(redis, task.repo, "pr", pr_state.number, _log, task.id)
         raise
+
+    _emit_enqueued(redis, task)
 
     _log.info(f"Published {task_type.value} task {task.id} for PR #{pr_state.number}")
     return True
@@ -632,6 +677,7 @@ def publish_fix_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
+        attempt=get_total_attempt_count(redis, repo, pr_state.number),
     )
 
     published = _publish_and_notify(
@@ -719,6 +765,7 @@ def publish_followup_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
+        attempt=get_total_attempt_count(redis, repo, pr_state.number),
     )
 
     published = _publish_and_notify(
@@ -796,6 +843,7 @@ def publish_rebase_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
+        attempt=get_total_attempt_count(redis, repo, pr_state.number),
     )
 
     published = _publish_and_notify(
@@ -864,6 +912,7 @@ def publish_issue_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
+        attempt=get_issue_attempt_count(redis, repo, issue_state.number),
     )
 
     published = _publish_issue_and_notify(
@@ -944,6 +993,8 @@ def _publish_issue_and_notify(
         _rollback_issue_attempt_increment(redis, repo, issue_state.number, _log)
         _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
         raise
+
+    _emit_enqueued(redis, task)
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
     return True

@@ -168,6 +168,21 @@ _DEPLOY_FILES = (
     "pyproject.toml",
     "requirements.lock",
 )
+# Monitor stack files live at the repo root (not src/orcest/fleet/deploy/),
+# so they are only shipped when deploying from a source checkout; the
+# installed-package fallback layout omits them. There is no `orcest fleet`
+# subcommand that builds or starts the monitor container — the operator runs
+# `docker compose -f docker-compose.monitor.yml up -d` on the orchestrator VM
+# (see docs/monitor-exposure-runbook.md) — and `fleet update` re-copies
+# (overwrites) these files on every deploy.
+_MONITOR_DEPLOY_FILES = (
+    "Dockerfile.monitor",
+    "docker-compose.monitor.yml",
+    "config/monitor.example.yaml",
+    # Dockerfile.monitor's `COPY pyproject.toml README.md ./` needs README.md
+    # in the build context or the image build fails.
+    "README.md",
+)
 
 
 def image_exists(ssh_target: str, image: str = "orcest:latest") -> bool:
@@ -210,7 +225,8 @@ def upload_source(ssh_target: str, source_root: str | os.PathLike[str] | None = 
             ssh_target,
             "cd /opt/orcest && rm -rf src/ Dockerfile docker-compose.yml"
             " docker-compose.redis.yml docker-compose.pool.yml pyproject.toml"
-            " requirements.lock .orcest-revision",
+            " requirements.lock .orcest-revision Dockerfile.monitor"
+            " docker-compose.monitor.yml config/monitor.example.yaml README.md",
         )
         if clean_result.returncode != 0:
             raise RuntimeError(
@@ -249,7 +265,9 @@ def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> 
         for fname, src_path in layout.deploy_files.items():
             if not src_path.exists():
                 raise RuntimeError(f"Missing deploy file: {src_path}")
-            shutil.copy2(src_path, Path(staging) / fname)
+            dest = Path(staging) / fname
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest)
 
         dest_src = Path(staging) / "src" / "orcest"
         shutil.copytree(
@@ -267,7 +285,7 @@ def create_source_tarball(source_root: str | os.PathLike[str] | None = None) -> 
             tarball_path = tmp.name
 
         tar_result = subprocess.run(
-            ["tar", "czf", tarball_path, *_DEPLOY_FILES, ".orcest-revision", "src/"],
+            ["tar", "czf", tarball_path, *layout.deploy_files, ".orcest-revision", "src/"],
             cwd=staging,
             capture_output=True,
             text=True,
@@ -321,16 +339,20 @@ def _resolve_source_layout(source_root: str | os.PathLike[str] | None = None) ->
     root = _resolve_source_root(source_root)
     if root is not None:
         deploy_dir = root / "src" / "orcest" / "fleet" / "deploy"
+        deploy_files = {
+            "Dockerfile": deploy_dir / "Dockerfile",
+            "docker-compose.yml": deploy_dir / "docker-compose.yml",
+            "docker-compose.redis.yml": deploy_dir / "docker-compose.redis.yml",
+            "docker-compose.pool.yml": deploy_dir / "docker-compose.pool.yml",
+            "pyproject.toml": root / "pyproject.toml",
+            "requirements.lock": root / "requirements.lock",
+        }
+        # Monitor stack files ship from the repo root (checkout deploys only).
+        for fname in _MONITOR_DEPLOY_FILES:
+            deploy_files[fname] = root / fname
         return _SourceLayout(
             package_dir=root / "src" / "orcest",
-            deploy_files={
-                "Dockerfile": deploy_dir / "Dockerfile",
-                "docker-compose.yml": deploy_dir / "docker-compose.yml",
-                "docker-compose.redis.yml": deploy_dir / "docker-compose.redis.yml",
-                "docker-compose.pool.yml": deploy_dir / "docker-compose.pool.yml",
-                "pyproject.toml": root / "pyproject.toml",
-                "requirements.lock": root / "requirements.lock",
-            },
+            deploy_files=deploy_files,
         )
 
     fleet_dir = Path(__file__).resolve().parent

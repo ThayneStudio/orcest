@@ -8,6 +8,7 @@ interruptible sleep (1-second chunks) for responsive termination.
 import json
 import logging
 import math
+import os
 import re
 import signal
 import sys
@@ -17,6 +18,8 @@ from typing import Any, Callable
 
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
+from orcest.orchestrator.event_relay import EventRelay
+from orcest.orchestrator.fleet_health import FleetHealthMonitor
 from orcest.orchestrator.gh import GhRateLimitError
 from orcest.orchestrator.issue_ops import (
     IssueAction,
@@ -1422,6 +1425,28 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     )
     trace_archiver.start()
 
+    # Event relay: drains the events spool to the monitor ingest listener.
+    # Start silently disables when monitor_ingest_url is unset, so it's safe
+    # to construct unconditionally (mirrors the trace archiver above).
+    event_relay = EventRelay(
+        redis,
+        config.monitor_ingest_url,
+        os.environ.get(config.monitor_write_token_env, ""),
+        project_prefixes=[p.key_prefix for p in config.projects if p.key_prefix],
+    )
+    event_relay.start()
+
+    # Fleet health monitor: detects fleet-wide kill pressure from task.suspect
+    # events and mirrors the configured kill budget for workers to read.
+    fleet_health = FleetHealthMonitor(
+        redis,
+        pressure_min_tasks=config.pressure_min_tasks,
+        pressure_window=config.pressure_window,
+        pressure_hold=config.pressure_hold,
+        max_kills_per_hour=config.max_kills_per_hour,
+    )
+    fleet_health.start()
+
     repos = ", ".join(p.repo for p in config.projects) if config.projects else "(none)"
     logger.info(
         "Orchestrator started. Projects: %s, poll interval: %ds",
@@ -1451,6 +1476,8 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
             time.sleep(1)
 
     trace_archiver.shutdown()
+    event_relay.stop()
+    fleet_health.stop()
     logger.info("Orchestrator shut down cleanly.")
 
 
