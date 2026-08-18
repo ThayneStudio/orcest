@@ -192,12 +192,11 @@ def test_claude_runner_hooks_match_module_functions() -> None:
     """ClaudeRunner's _BaseCliRunner hook overrides match the module-level
     helpers they delegate to.
 
-    The hooks themselves are not yet on every code path (PR 1 wires
-    ``build_argv`` through ``run_claude``; the other parsers will follow as
-    further refactor lands). This test pins the equivalence so PR 2's
-    CodexRunner, which will subclass ``_BaseCliRunner`` and copy the pattern,
-    has a working reference. A silent break in this plumbing would only
-    surface when Codex ships.
+    Since the task-B9 consolidation, ClaudeRunner executes entirely through
+    the generic ``_run_cli_agent`` driver, so these hooks ARE the Claude
+    parsing path; this test pins their equivalence to the module-level
+    helpers that other code (claude_interactive_runner, stream_liveness)
+    still imports directly.
     """
     from pathlib import Path
 

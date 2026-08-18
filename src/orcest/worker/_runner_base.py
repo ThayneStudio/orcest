@@ -6,14 +6,6 @@ driver (``_run_cli_agent``) with watchdog timeout, abort-on-lock-loss, and
 retry-with-backoff. Per-provider Runners subclass ``_BaseCliRunner`` and
 implement a small set of hooks; ``_BaseCliRunner.run`` drives them.
 
-Drift note: ``claude_runner.run_claude`` predates this driver and retains its
-own copy of the watchdog/retry loop (its test suite mocks that loop's
-internals directly). ``ClaudeRunner`` therefore overrides ``run`` to keep
-using ``run_claude``. ``_run_cli_agent`` is the canonical driver for all *new*
-runners (GrokRunner, future CodexRunner); ClaudeRunner should migrate onto it
-once PR #537 lands and its tests can be repointed. Keep the two loops in sync
-until then.
-
 Hooks each per-provider Runner overrides:
     build_argv(binary, prompt, model, work_dir) -> list[str]
     extract_summary(stdout) -> str
@@ -22,6 +14,8 @@ Hooks each per-provider Runner overrides:
     detect_overload(stdout, stderr) -> bool
     prepare_credential(credential, work_dir, home_dir, env_var_name) -> CredentialContext
     extract_credential_update(watch_path, original) -> str | None
+    classify_timeout(stdout_lines, stderr_lines, timeout) -> RunnerResult | None
+    postprocess_result(result, stdout_lines, stderr_lines) -> RunnerResult
 
 NEEDS_HUMAN contract: ``extract_agent_text`` returns only agent-authored text
 that the shared ``NEEDS_HUMAN:`` regex may scan. CLIs whose output echoes the
@@ -149,7 +143,7 @@ def _build_env(
     Whitelisted parent env vars + GITHUB_TOKEN/GH_TOKEN, plus the provider
     credential under ``env_var_name``. If ``credential`` is empty, falls back
     to the parent process's value for that var. The credential is never on
-    argv. Retained for ``claude_runner.run_claude`` (legacy driver).
+    argv. Retained for ``claude_interactive_runner`` (its own driver).
     """
     env = _build_base_env(token, extra_env_keys)
     if env_var_name:
@@ -315,6 +309,12 @@ def _run_cli_agent(
     stderr_lines: list[str] = []
 
     def _finish(result: RunnerResult) -> RunnerResult:
+        # Provider-specific post-processing of the outgoing result (e.g.
+        # Claude's NEEDS_HUMAN scan over the run's raw output, which must
+        # apply to failed results too — the base loop only checks it on
+        # rc==0). ``stdout_lines``/``stderr_lines`` are rebound per attempt;
+        # the closure always sees the current attempt's output.
+        result = runner.postprocess_result(result, stdout_lines, stderr_lines)
         # Capture a refreshed credential blob (if the CLI rotated it in place).
         if cred_ctx.watch_path is not None:
             try:
@@ -570,6 +570,25 @@ def _run_cli_agent(
                     )
                 )
 
+            # A corroborated stall (activity-ladder stuck/looping kill) is
+            # returned before the exhaustion/overload scans and is never
+            # handed to ``classify_timeout``: rate-limit noise in a stalled
+            # run's partial output must not reclassify it — the stall itself
+            # is the diagnosis (task B9 controller ruling).
+            if timed_out and tracker is not None and killed_trigger in ("stuck", "looping"):
+                if logger:
+                    logger.error(
+                        "%s killed by activity watchdog: trigger=%s", binary, killed_trigger
+                    )
+                snapshot_head = json.dumps(tracker.last_snapshot(), default=str)[:500]
+                return _finish(
+                    RunnerResult(
+                        success=False,
+                        summary=f"STALLED({killed_trigger}): {snapshot_head}",
+                        transient=False,
+                    )
+                )
+
             # Exhaustion / overload first (some CLIs exit 0 with an error envelope).
             exhausted, resets_at = runner.detect_exhaustion(stdout, stderr)
             if exhausted:
@@ -587,19 +606,17 @@ def _run_cli_agent(
                 )
 
             if timed_out:
-                if tracker is not None and killed_trigger in ("stuck", "looping"):
-                    if logger:
-                        logger.error(
-                            "%s killed by activity watchdog: trigger=%s", binary, killed_trigger
-                        )
-                    snapshot_head = json.dumps(tracker.last_snapshot(), default=str)[:500]
-                    return _finish(
-                        RunnerResult(
-                            success=False,
-                            summary=f"STALLED({killed_trigger}): {snapshot_head}",
-                            transient=False,
-                        )
-                    )
+                # Only ceiling / fixed wall-clock timeouts reach this point
+                # (STALLED stuck/looping kills returned above). Give the
+                # provider a chance to reclassify before the generic timeout
+                # result is built: Claude, for example, can stall at the wall
+                # clock because it silently hit a usage/rate limit and the
+                # CLI never exited — exactly what the legacy
+                # ``_timeout_claude_result`` reclassified. STALLED results
+                # are deliberately NOT offered to this hook (see above).
+                reclassified = runner.classify_timeout(stdout_lines, stderr_lines, timeout)
+                if reclassified is not None:
+                    return _finish(reclassified)
                 if logger:
                     logger.error("%s timed out after %ds", binary, timeout)
                 return _finish(
@@ -656,8 +673,8 @@ class _BaseCliRunner(ABC):
 
     Provides a concrete ``run`` (via ``_run_cli_agent``). Subclasses implement
     the parsing/argv hooks; OAuth-blob providers also override the credential
-    hooks. ClaudeRunner overrides ``run`` to keep its legacy ``run_claude``
-    driver (see module docstring).
+    hooks. Providers with bespoke timeout/result semantics (Claude) override
+    ``classify_timeout`` / ``postprocess_result``.
     """
 
     # Extra safe env keys to forward (CLI-specific routing flags). ClassVar so
@@ -714,6 +731,35 @@ class _BaseCliRunner(ABC):
     def auth_required_summary(self) -> str:
         """Summary used when ``detect_auth_prompt`` aborts the subprocess."""
         return "Provider authentication required"
+
+    # --- Result-shaping hooks (default: no-op) -----------------------------
+
+    def classify_timeout(
+        self, stdout_lines: list[str], stderr_lines: list[str], timeout: int
+    ) -> RunnerResult | None:
+        """Reclassify a ceiling / fixed wall-clock timeout, or return None.
+
+        Called at the timeout-result site BEFORE the generic
+        ``Timed out after {timeout}s`` result is constructed, and ONLY for
+        wall-clock/ceiling timeouts — activity-ladder STALLED(stuck/looping)
+        kills are never offered for reclassification (a corroborated stall
+        with rate-limit noise in its partial output must stay STALLED).
+        Claude uses this to convert a stall-at-the-wall caused by a silent
+        usage/rate limit into a usage-exhausted result.
+        """
+        return None
+
+    def postprocess_result(
+        self, result: RunnerResult, stdout_lines: list[str], stderr_lines: list[str]
+    ) -> RunnerResult:
+        """Final provider-specific pass over every outgoing result.
+
+        Called in the driver's ``_finish`` for all outcomes (success, timeout,
+        exhaustion, retries exhausted, abort). Claude uses it to scan the
+        run's raw output for the ``NEEDS_HUMAN:`` signal on non-success
+        results too. Default: return ``result`` unchanged.
+        """
+        return result
 
     # --- Credential hooks (default: env-var injection) ---------------------
 
