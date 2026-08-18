@@ -119,6 +119,23 @@ def test_main_help(runner):
     assert "orchestrate" in result.stdout
     assert "work" in result.stdout
     assert "status" in result.stdout
+    assert "monitor" in result.stdout
+
+
+def test_monitor_help(runner):
+    """`orcest monitor --help` exits 0 without requiring the monitor extra's
+    imports to run (they're lazy inside the command body)."""
+    result = runner.invoke(main, ["monitor", "--help"])
+    assert result.exit_code == 0
+    assert "--config" in result.stdout
+
+
+def test_monitor_requires_config(runner):
+    """`orcest monitor` without --config fails fast via Click, before any
+    lazy import of the monitor service runs."""
+    result = runner.invoke(main, ["monitor"])
+    assert result.exit_code != 0
+    assert "--config" in result.stderr
 
 
 def test_rollout_health_text_output_includes_metrics(runner, mocker):

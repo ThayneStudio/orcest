@@ -25,13 +25,22 @@ from orcest.shared.redis_client import RedisClient
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-mark tests based on directory."""
+    """Auto-mark tests based on directory.
+
+    Items outside /stress/ and /integration/ that already carry an inline
+    ``@pytest.mark.integration`` or ``@pytest.mark.stress`` marker (e.g. a
+    real-subprocess test living alongside unit tests in tests/worker/) are
+    left alone -- add_marker is additive, so blindly adding ``unit`` here
+    would make ``pytest -m unit`` select them too.
+    """
     for item in items:
         path = str(item.fspath)
         if "/stress/" in path:
             item.add_marker(pytest.mark.stress)
         elif "/integration/" in path:
             item.add_marker(pytest.mark.integration)
+        elif item.get_closest_marker("integration") or item.get_closest_marker("stress"):
+            continue
         else:
             item.add_marker(pytest.mark.unit)
 

@@ -1015,10 +1015,15 @@ def test_null_redis_key_prefix_raises(tmp_path: Path, monkeypatch: pytest.Monkey
         load_orchestrator_config(cfg_file)
 
 
-def test_runner_config_defaults_90min_and_cli_default_model():
-    """Fix tasks default to a 90-minute wall clock and the Claude CLI default model."""
+def test_runner_config_defaults_wall_clock_ceiling_and_cli_default_model():
+    """Fix tasks default to a 6-hour wall-clock ceiling and the Claude CLI default model.
+
+    The watchdog (RunnerConfig.watchdog) is expected to end most tasks well
+    before this ceiling via STUCK/LOOPING/WAITING detection; this timeout is
+    the hard backstop.
+    """
     defaults = RunnerConfig()
-    assert defaults.timeout == 5400
+    assert defaults.timeout == 21600
     assert defaults.model == ""
 
 

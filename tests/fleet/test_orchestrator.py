@@ -1003,9 +1003,18 @@ class TestUploadSource:
             "docker-compose.yml",
             "docker-compose.redis.yml",
             "docker-compose.pool.yml",
+            "Dockerfile.monitor",
+            "docker-compose.monitor.yml",
+            "config/monitor.example.yaml",
+            "README.md",
         ):
             assert expected in cleanup
         assert ".orcest-revision" in cleanup
+        # Never wipe the config/ dir wholesale: the VM's live monitor.yaml
+        # (copied from the example) must survive a redeploy.
+        assert "rm -rf config " not in cleanup and not any(
+            c.rstrip().endswith("config") for c in rm_cmds
+        )
 
     def test_forced_source_root_packages_that_source(self, mocker, tmp_path):
         source_root = tmp_path / "source"
@@ -1023,6 +1032,15 @@ class TestUploadSource:
             (deploy_dir / fname).write_text(f"{fname} from deploy dir\n")
         (source_root / "pyproject.toml").write_text("[project]\nname = 'forced-orcest'\n")
         (source_root / "requirements.lock").write_text("redis==5.0.0\n")
+        # Monitor stack files ship from the checkout root (not the deploy dir).
+        (source_root / "config").mkdir()
+        for fname in (
+            "Dockerfile.monitor",
+            "docker-compose.monitor.yml",
+            "config/monitor.example.yaml",
+            "README.md",
+        ):
+            (source_root / fname).write_text(f"{fname} from repo root\n")
 
         members, _, files = self._run_upload(mocker, source_root=source_root)
 
@@ -1030,6 +1048,13 @@ class TestUploadSource:
         assert files["src/orcest/__init__.py"] == 'SENTINEL = "from-forced-source-root"\n'
         assert files["pyproject.toml"] == "[project]\nname = 'forced-orcest'\n"
         assert files["requirements.lock"] == "redis==5.0.0\n"
+        for fname in (
+            "Dockerfile.monitor",
+            "docker-compose.monitor.yml",
+            "config/monitor.example.yaml",
+            "README.md",
+        ):
+            assert files[fname] == f"{fname} from repo root\n"
 
 
 def test_build_image_requires_and_propagates_exact_revision(mocker):

@@ -16,6 +16,15 @@ import yaml
 
 from orcest.fleet.config import normalize_worker_runner_for_backend
 
+# C1c: interactive (PTY) Claude workers (ClaudeInteractiveRunner) never
+# route through _BaseCliRunner/tracker_factory -- they have no
+# LivenessTracker/ladder coverage at all (see worker/claude_interactive_runner.py).
+# Pin their wall-clock RunnerConfig.timeout to this pre-branch default
+# rather than letting them silently inherit the raised 21600s ceiling,
+# which has no ladder backstopping it for this runner mode. Headless
+# profiles are unaffected and keep the new (raised) RunnerConfig default.
+_INTERACTIVE_RUNNER_TIMEOUT_SECONDS = 5400
+
 # ── Shared building blocks ──────────────────────────────────
 
 
@@ -453,6 +462,7 @@ def render_clone_userdata(
     worker_backend: str = "claude",
     worker_runner_type: str = "claude",
     worker_runner_mode: str = "",
+    watchdog_enabled: bool = True,
 ) -> str:
     """Render cloud-init user-data for a warm-pool clone.
 
@@ -476,6 +486,12 @@ def render_clone_userdata(
             pre-``worker_runner_mode`` deployments), while ``headless``
             explicitly opts a ``claude`` backend into the legacy ``claude -p``
             runner.
+        watchdog_enabled: Fleet-level activity-watchdog toggle (C1a,
+            ``PoolConfig.watchdog_enabled``), rendered as
+            ``runner.watchdog.enabled`` in the generated ``worker.yaml``.
+            This is clone-time cloud-init data (not baked into the template
+            image), so toggling it takes effect for the next clone with no
+            rebake needed.
     """
     normalized_backend, normalized_runner_type, normalized_runner_mode = (
         normalize_worker_runner_for_backend(
@@ -488,6 +504,11 @@ def render_clone_userdata(
     runner_section: dict[str, Any] = {"type": normalized_runner_type}
     if normalized_runner_mode == "interactive":
         runner_section["extra"] = {"mode": normalized_runner_mode}
+        # C1c: no ladder coverage for this runner mode -- pin the
+        # pre-branch wall-clock ceiling rather than inheriting the raised
+        # default (see _INTERACTIVE_RUNNER_TIMEOUT_SECONDS above).
+        runner_section["timeout"] = _INTERACTIVE_RUNNER_TIMEOUT_SECONDS
+    runner_section["watchdog"] = {"enabled": watchdog_enabled}
     worker_yaml = yaml.dump(
         {
             "redis": redis_section,
