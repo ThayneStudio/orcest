@@ -27,6 +27,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from orcest.shared.config import WatchdogConfig
 from orcest.worker.liveness_tracker import _ACTIVITY_EVENT_TICK_STRIDE, LivenessTracker
 
@@ -361,6 +363,7 @@ def test_close_swallows_redis_failure(fake_redis_client):
 # ---------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_workspace_sampler_real_clock_domain_reaches_suspect(tmp_path, fake_redis_client):
     """Regression test for finding 1: WorkspaceSampler.changed_since compares
     against real (wall-clock/epoch) file mtimes. If the tracker ever fed it
@@ -466,11 +469,15 @@ def test_kill_returned_even_if_side_effects_raise(fake_redis_client):
     def raising_emit(event_type: str, data: dict) -> None:
         raise RuntimeError("emit callback exploded")
 
-    def raising_hset_raw(*args: object, **kwargs: object) -> int:
-        raise RuntimeError("redis hset exploded")
+    def raising_pipeline(*args: object, **kwargs: object):
+        raise RuntimeError("redis pipeline exploded")
 
     tracker._emit_fn = raising_emit  # type: ignore[assignment]
-    tracker._redis.hset_raw = raising_hset_raw  # type: ignore[method-assign]
+    # _write_activity_record writes via self._redis.client.pipeline(...)
+    # directly (not hset_raw) -- patch that seam so this leg genuinely
+    # exercises a broken activity-record write, rather than silently
+    # succeeding against fakeredis.
+    tracker._redis.client.pipeline = raising_pipeline  # type: ignore[method-assign]
 
     result = _drive_to_suspect_then_hold(tracker, events, clock)
 

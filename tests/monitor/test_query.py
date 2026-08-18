@@ -46,6 +46,22 @@ def test_auth_required_and_method_gate(tmp_path):
     assert c.delete("/api/v1/events", headers=H).status_code == 405
 
 
+def test_head_events_requires_auth(tmp_path):
+    c = _client(tmp_path)
+    assert c.head("/api/v1/events").status_code == 401
+
+
+def test_head_events_with_valid_token_succeeds(tmp_path):
+    c = _client(tmp_path)
+    assert c.head("/api/v1/events", headers=H).status_code == 200
+
+
+def test_head_trace_without_scope_forbidden(tmp_path):
+    c = _client(tmp_path)  # reader has only events:read, not traces:read
+    r = c.head("/api/v1/tasks/t-a/trace", headers=H)
+    assert r.status_code == 403
+
+
 def test_method_gate_405_includes_allow_header(tmp_path):
     c = _client(tmp_path)
     r = c.post("/api/v1/events", headers=H)
