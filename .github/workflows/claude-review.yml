@@ -77,6 +77,11 @@ jobs:
 
             Do NOT use `gh pr comment`. Use only inline comments for specific feedback and `gh pr review` for the final verdict.
 
-          claude_args: '--allowedTools "Read,Write,Glob,Grep,Bash(gh *),mcp__github_inline_comment__create_inline_comment"'
+          # Pull request heads can modify .claude/settings.json. The action restores
+          # sensitive paths from the base branch, but this review job should not load
+          # project settings from an untrusted checkout while reviewing changes to
+          # those settings. Keep the required gh surface narrow so PR merges remain
+          # outside the review agent's Bash permissions.
+          claude_args: '--setting-sources user,local --allowedTools "Read,Write,Glob,Grep,Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr review *),mcp__github_inline_comment__create_inline_comment"'
         env:
           GH_TOKEN: ${{ github.token }}

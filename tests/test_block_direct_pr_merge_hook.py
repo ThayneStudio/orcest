@@ -11,6 +11,9 @@ import pytest
 
 HOOK = Path(__file__).resolve().parents[1] / ".claude" / "hooks" / "block-direct-pr-merge.sh"
 SETTINGS = Path(__file__).resolve().parents[1] / ".claude" / "settings.json"
+CLAUDE_REVIEW_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "claude-review.yml"
+)
 
 
 def _run_hook(
@@ -121,3 +124,13 @@ def test_settings_point_at_hook() -> None:
     hooks = settings["hooks"]["PreToolUse"]
     commands = [h["command"] for group in hooks for h in group["hooks"]]
     assert any(command.endswith("block-direct-pr-merge.sh") for command in commands)
+
+
+def test_claude_review_workflow_does_not_load_project_settings_or_broad_gh() -> None:
+    """PR review must not execute PR-authored settings before they land on master."""
+    text = CLAUDE_REVIEW_WORKFLOW.read_text()
+    assert "--setting-sources user,local" in text
+    assert "Bash(gh *)" not in text
+    assert "Bash(gh pr view *)" in text
+    assert "Bash(gh pr diff *)" in text
+    assert "Bash(gh pr review *)" in text
