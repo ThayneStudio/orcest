@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from orcest.fleet.cloud_init import (
+    _CLAUDE_VERSION,
     _CODEX_VERSION,
     _GROK_VERSION,
     _NODE_MAJOR,
@@ -130,6 +131,14 @@ class TestTemplateUserdata:
         assert f"npm install -g @openai/codex@{_CODEX_VERSION}" in runcmd
         assert f"npm install -g @openai/codex@{_CODEX_VERSION} || true" not in runcmd
         assert "sudo -u orcest -H bash -lc 'command -v codex && codex --version'" in runcmd
+        # Claude CLI: pinned like every other provider CLI. The interactive
+        # (PTY) runner recognises Claude's setup dialogs by their rendered
+        # text, so a floating upgrade silently changes a contract it depends
+        # on -- that is how the 2026-08-14 prompt-eaten-by-the-MCP-menu
+        # regression reached production and burned ~27% of clauder tasks.
+        assert f"npm install -g @anthropic-ai/claude-code@{_CLAUDE_VERSION}" in runcmd
+        assert "npm install -g @anthropic-ai/claude-code\"" not in runcmd
+        assert "npm install -g @anthropic-ai/claude-code'" not in runcmd
 
     @pytest.mark.parametrize(
         "digest",
@@ -218,6 +227,7 @@ class TestTemplateUserdata:
         assert f"supabase_version={_SUPABASE_VERSION}" in content
         assert f"grok_version={_GROK_VERSION}" in content
         assert f"codex_version={_CODEX_VERSION}" in content
+        assert f"claude_version={_CLAUDE_VERSION}" in content
         assert "bumped_at=" in content
 
     def test_template_versions_bumped_at_is_iso_timestamp(self):

@@ -33,10 +33,15 @@ if ! command -v node &>/dev/null; then
     sudo apt-get install -y -qq nodejs
 fi
 
-# Install Claude CLI
-if ! command -v claude &>/dev/null; then
-    echo "Installing Claude CLI..."
-    sudo npm install -g @anthropic-ai/claude-code
+# Install Claude CLI. Pinned to match cloud_init._CLAUDE_VERSION: the
+# interactive (PTY) runner recognises Claude's setup dialogs by their rendered
+# text, so a floating upgrade can silently change that contract — which is
+# exactly how the 2026-08-14 prompt-eaten-by-the-MCP-menu regression shipped.
+CLAUDE_VERSION="2.1.235"
+installed_claude_version="$(claude --version 2>/dev/null | awk '{print $1}' || true)"
+if [ "${installed_claude_version}" != "${CLAUDE_VERSION}" ]; then
+    echo "Installing Claude CLI ${CLAUDE_VERSION}..."
+    sudo npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
 fi
 
 # Install the version whose JSON event protocol is covered by CodexRunner's
