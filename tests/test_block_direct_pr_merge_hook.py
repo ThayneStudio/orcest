@@ -129,6 +129,8 @@ def test_settings_point_at_hook() -> None:
 def test_claude_review_workflow_does_not_load_project_settings_or_broad_gh() -> None:
     """PR review must not execute PR-authored settings before they land on master."""
     text = CLAUDE_REVIEW_WORKFLOW.read_text()
+    assert "uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50" in text
+    assert "uses: anthropics/claude-code-action@v1" not in text
     assert "--setting-sources user,local" in text
     assert "Bash(gh *)" not in text
     assert "Bash(gh pr view *)" in text
