@@ -46,9 +46,7 @@ def test_enqueued_event_emitted_after_publish(gh_mock, fake_redis_client):
     secret_claude_token = "claude-oauth-SecretValue222333"  # noqa: S105
     secret_credential = "cred-SecretValue444555"  # noqa: S105
     secret_diff_marker = "SECRET_DIFF_LINE_marker_666777"
-    gh_mock.get_pr_diff.return_value = (
-        f"diff --git a/foo.py b/foo.py\n+{secret_diff_marker}"
-    )
+    gh_mock.get_pr_diff.return_value = f"diff --git a/foo.py b/foo.py\n+{secret_diff_marker}"
 
     publish_fix_task(
         pr_state=pr_state,

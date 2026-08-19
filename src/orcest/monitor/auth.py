@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from collections.abc import Callable
 
 from fastapi import HTTPException, Request
 
@@ -45,7 +46,7 @@ def resolve_reader(cfg: MonitorConfig, authorization_header: str | None) -> Read
     return None
 
 
-def require_scope(scope: str):
+def require_scope(scope: str) -> Callable[[Request], Reader]:
     """Build a FastAPI dependency requiring ``scope`` on the resolved reader.
 
     Raises 401 if no/unknown token, 403 if the token's reader lacks ``scope``.

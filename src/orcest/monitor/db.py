@@ -87,12 +87,17 @@ def insert_events(conn: sqlite3.Connection, envelopes: list[dict]) -> int:
                 "attempt,data,ingested_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    env["source"], env["id"], env["type"], env["subject"], env["time"],
-                    work.get("repo", ""), work.get("resource_type", ""),
+                    env["source"],
+                    env["id"],
+                    env["type"],
+                    env["subject"],
+                    env["time"],
+                    work.get("repo", ""),
+                    work.get("resource_type", ""),
                     int(work.get("resource_id", 0) or 0),
-                    int(env["data"].get("attempt", 0) or 0)
-                    if isinstance(env["data"], dict) else 0,
-                    json.dumps(env), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    int(env["data"].get("attempt", 0) or 0) if isinstance(env["data"], dict) else 0,
+                    json.dumps(env),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 ),
             )
         except (sqlite3.Error, ValueError, TypeError):

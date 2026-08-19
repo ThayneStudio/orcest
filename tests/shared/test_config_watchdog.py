@@ -89,11 +89,7 @@ def test_worker_config_watchdog_defaults_when_runner_present_but_watchdog_absent
 def test_worker_config_watchdog_block_parses(tmp_path: Path):
     cfg_file = tmp_path / "worker.yaml"
     cfg_file.write_text(
-        "worker_id: worker-0\n"
-        "runner:\n"
-        "  watchdog:\n"
-        "    enabled: false\n"
-        "    idle_window: 120\n"
+        "worker_id: worker-0\nrunner:\n  watchdog:\n    enabled: false\n    idle_window: 120\n"
     )
 
     cfg = load_worker_config(cfg_file)
@@ -147,9 +143,7 @@ def test_worker_config_watchdog_rejects_non_positive_sample_interval(tmp_path: P
     # M5: a zero/negative timer field is a config mistake (spins the
     # watchdog thread in a tight loop), not a valid aggressive tuning.
     cfg_file = tmp_path / "worker.yaml"
-    cfg_file.write_text(
-        "worker_id: worker-0\nrunner:\n  watchdog:\n    sample_interval: 0\n"
-    )
+    cfg_file.write_text("worker_id: worker-0\nrunner:\n  watchdog:\n    sample_interval: 0\n")
 
     with pytest.raises(ValueError, match="runner.watchdog.sample_interval"):
         load_worker_config(cfg_file)
@@ -171,9 +165,7 @@ def test_orchestrator_config_watchdog_defaults_when_absent(tmp_path: Path):
 
 def test_orchestrator_config_watchdog_block_parses(tmp_path: Path):
     cfg_file = tmp_path / "orcest.yaml"
-    cfg_file.write_text(
-        "github:\n  repo: acme/widgets\nrunner:\n  watchdog:\n    enabled: false\n"
-    )
+    cfg_file.write_text("github:\n  repo: acme/widgets\nrunner:\n  watchdog:\n    enabled: false\n")
 
     cfg = load_orchestrator_config(cfg_file)
 

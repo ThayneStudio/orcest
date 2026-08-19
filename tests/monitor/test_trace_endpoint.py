@@ -18,9 +18,12 @@ def _client(tmp_path, scopes, ptr_content="proj/2026/08/17\n"):
     ptr = archive / "index" / "by-task-id" / "ta" / "task1"
     ptr.parent.mkdir(parents=True)
     ptr.write_text(ptr_content)
-    dbp = str(tmp_path / "m.db"); db.open_rw(dbp).close()  # noqa: E702
+    dbp = str(tmp_path / "m.db")
+    db.open_rw(dbp).close()  # noqa: E702
     cfg = MonitorConfig(
-        db_path=dbp, trace_archive_path=str(archive), write_token="w",
+        db_path=dbp,
+        trace_archive_path=str(archive),
+        write_token="w",
         readers=[Reader(name="r", token="tok", scopes=scopes)],
     )
     return TestClient(create_query_app(cfg))

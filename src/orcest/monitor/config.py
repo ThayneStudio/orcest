@@ -45,10 +45,21 @@ def _resolve_env(var_name: str) -> str:
     return value
 
 
-def _require_key(raw: dict, key: str) -> object:
+def _require_str_key(raw: dict, key: str) -> str:
+    """Fetch a required config key, rejecting a non-string YAML value.
+
+    Every caller feeds the result into something that requires a ``str`` (a
+    filesystem path, or an ``os.environ`` lookup). YAML happily yields ints,
+    lists and dicts, so validate here: otherwise ``db_path: 8080`` reaches
+    sqlite as an int and ``token_env: [A, B]`` raises an unrelated ``TypeError``
+    from the environ lookup, in both cases far from the offending line.
+    """
     if key not in raw:
         raise ValueError(f"missing required config key: {key}")
-    return raw[key]
+    value = raw[key]
+    if not isinstance(value, str):
+        raise ValueError(f"config key {key} must be a string, got {type(value).__name__}")
+    return value
 
 
 def _load_reader(raw: dict) -> Reader:
@@ -57,8 +68,8 @@ def _load_reader(raw: dict) -> Reader:
     if unknown:
         raise ValueError(f"unknown reader scope(s): {sorted(unknown)}")
     return Reader(
-        name=_require_key(raw, "name"),
-        token=_resolve_env(_require_key(raw, "token_env")),
+        name=_require_str_key(raw, "name"),
+        token=_resolve_env(_require_str_key(raw, "token_env")),
         scopes=scopes,
     )
 
@@ -78,12 +89,12 @@ def load_monitor_config(path: str) -> MonitorConfig:
     readers = [_load_reader(r) for r in raw.get("readers", [])]
 
     return MonitorConfig(
-        db_path=_require_key(raw, "db_path"),
+        db_path=_require_str_key(raw, "db_path"),
         trace_archive_path=raw.get("trace_archive_path"),
         ingest_host=raw.get("ingest_host", "0.0.0.0"),
         ingest_port=raw.get("ingest_port", 9091),
         query_host=raw.get("query_host", "0.0.0.0"),
         query_port=raw.get("query_port", 9090),
-        write_token=_resolve_env(_require_key(raw, "write_token_env")),
+        write_token=_resolve_env(_require_str_key(raw, "write_token_env")),
         readers=readers,
     )

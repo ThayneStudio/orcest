@@ -1331,9 +1331,15 @@ class PoolManager:
                     max_duration,
                 )
             else:
-                reason = self._activity_reap_reason(vm_id, now)
-                if reason is None:
+                # Bind the optional result to its own name: `reason` is a
+                # plain str from the ceiling branch above and everything
+                # downstream (logging, _coordinate_reaped_vm) requires one,
+                # so the "no activity signal" case must exit via `continue`
+                # rather than widen `reason` to str | None.
+                activity_reason = self._activity_reap_reason(vm_id, now)
+                if activity_reason is None:
                     continue
+                reason = activity_reason
                 logger.warning(
                     "VM %d: activity watchdog signal (%s) at %.0fs elapsed (ceiling %ds), "
                     "force-destroying",

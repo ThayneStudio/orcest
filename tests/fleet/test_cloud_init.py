@@ -137,7 +137,7 @@ class TestTemplateUserdata:
         # on -- that is how the 2026-08-14 prompt-eaten-by-the-MCP-menu
         # regression reached production and burned ~27% of clauder tasks.
         assert f"npm install -g @anthropic-ai/claude-code@{_CLAUDE_VERSION}" in runcmd
-        assert "npm install -g @anthropic-ai/claude-code\"" not in runcmd
+        assert 'npm install -g @anthropic-ai/claude-code"' not in runcmd
         assert "npm install -g @anthropic-ai/claude-code'" not in runcmd
 
     @pytest.mark.parametrize(

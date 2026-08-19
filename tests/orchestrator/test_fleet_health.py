@@ -64,10 +64,8 @@ def _spool_suspect(redis, task_id: str, iso_time: str) -> None:
 def _iso(epoch: float) -> str:
     import datetime
 
-    return (
-        datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
     )
 
 
@@ -274,8 +272,13 @@ def test_numeric_time_envelope_skipped_and_cursor_advances(fake_redis_client):
     """
     monitor, clock = _make_monitor(fake_redis_client)
     envelope = make_event(
-        "net.orcest.task.suspect", source_project="p", task_id="bad-time-task",
-        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+        "net.orcest.task.suspect",
+        source_project="p",
+        task_id="bad-time-task",
+        repo="o/r",
+        resource_type="pr",
+        resource_id=1,
+        attempt=0,
     )
     envelope["time"] = 12345
     fake_redis_client.xadd_capped(EVENTS_STREAM, {"envelope": json.dumps(envelope)}, 50000)

@@ -177,9 +177,7 @@ def _write_project_files_from_config(
 
     org = cfg.resolve_org(project)
     if cfg.monitor_ingest_url and not cfg.monitor_write_token:
-        raise ValueError(
-            "monitor_ingest_url is configured but monitor_write_token is empty"
-        )
+        raise ValueError("monitor_ingest_url is configured but monitor_write_token is empty")
     env_content = generate_env_file(
         github_token=org.github_token,
         key_prefix=project.name,

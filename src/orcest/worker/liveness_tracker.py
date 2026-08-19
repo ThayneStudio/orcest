@@ -274,9 +274,7 @@ class LivenessTracker:
             # state this evaluation landed on -- it marks "the tracker
             # started observing this task", not a ladder transition.
             self._safe(
-                lambda: self._emit_fn(
-                    "net.orcest.task.bootstrap", {"snapshot": decision.snapshot}
-                ),
+                lambda: self._emit_fn("net.orcest.task.bootstrap", {"snapshot": decision.snapshot}),
                 "bootstrap emit",
             )
 
@@ -322,9 +320,17 @@ class LivenessTracker:
             return kill
         return None
 
-    def _safe(self, fn: Callable[[], None], what: str) -> None:
+    def _safe(self, fn: Callable[[], object], what: str) -> None:
         """Run a post-evaluate side effect, logging and swallowing any
-        exception so it can never cause a latched kill to be lost."""
+        exception so it can never cause a latched kill to be lost.
+
+        ``fn`` is typed as returning ``object`` rather than ``None`` because
+        the result is deliberately discarded: these are side effects, and some
+        of the Redis helpers used as ``fn`` return a value nobody here acts on
+        (``delete_raw`` returns the number of keys deleted, which carries no
+        information for a best-effort cleanup). ``object`` accepts a ``None``
+        return too, so no existing caller loses type checking.
+        """
         try:
             fn()
         except Exception:
