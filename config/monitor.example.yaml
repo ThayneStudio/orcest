@@ -13,6 +13,6 @@ readers:
   - name: admin
     token_env: MONITOR_TOKEN_ADMIN
     scopes: [events:read, traces:read]
-  # - name: grok-watcher
-  #   token_env: MONITOR_TOKEN_GROK
-  #   scopes: [events:read]
+  - name: grok-watcher
+    token_env: MONITOR_TOKEN_GROK
+    scopes: [events:read, traces:read]
