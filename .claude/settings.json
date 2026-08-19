@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "c=$(jq -r '.tool_input.command // \"\"'); if printf '%s' \"$c\" | grep -qiE '(^|[^[:alnum:]_.-])gh[[:space:]]+pr[[:space:]]+merge|(^|[^[:alnum:]_.-])gh[[:space:]]+api[^|;&]*pulls/[0-9]+/merge'; then printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Blocked by policy: PR merges go through orcest (CI green + one approval), never a direct gh merge. If a hand-merge is genuinely required, ask the user to run it.\"}}'; fi",
+            "timeout": 10,
+            "statusMessage": "Checking merge policy"
+          }
+        ]
+      }
+    ]
+  }
+}
