@@ -968,3 +968,123 @@ raise SystemExit(0)
 
     assert result.success is True
     assert result.summary == "late bypass prompt confirmed"
+
+
+def test_run_does_not_send_prompt_into_a_partially_rendered_menu(tmp_path, monkeypatch) -> None:
+    """The composer gate must not fire mid-render.
+
+    A selection dialog emits its caret marker before the option numbers, so a
+    buffer sampled between those writes holds a bare "❯" line that is
+    indistinguishable from the composer.  Production evidence (worker-10000,
+    2026-08-18): the task prompt was pasted into the MCP menu, its trailing
+    carriage return accepted the menu default -- `settings.local.json` came out
+    with `enabledMcpjsonServers` populated, which only option 1 does -- and
+    Claude then sat at an empty composer until the wall clock killed it, with
+    no session transcript ever created.
+    """
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import sys
+import time
+
+def read_confirmation(timeout=6):
+    deadline = time.time() + timeout
+    buf = b""
+    while time.time() < deadline:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if not readable:
+            continue
+        chunk = os.read(0, 65536)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\\r" in buf or b"\\n" in buf:
+            return buf
+    return buf
+
+print(
+    "Quick safety check: Is this a project you created or one you trust?\\n"
+    "1. Yes, I trust this folder\\n"
+    "2. No, exit\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+read_confirmation()
+
+# Render the MCP menu the way a real TUI does: the caret row lands first, the
+# numbered options only after further cursor positioning.
+sys.stdout.write("New MCP server found in this project: supabase\\n\\u276f ")
+sys.stdout.flush()
+time.sleep(0.4)
+sys.stdout.write(
+    "1. Use this MCP server\\n"
+    "2. Use this and all future MCP servers in this project\\n"
+    "3. Continue without using this MCP serv\\x1b[45Gr\\n"
+    "Enter to confirm / Esc to cancel\\n"
+)
+sys.stdout.flush()
+
+mcp = read_confirmation()
+if b"3" not in mcp:
+    print(f"BAD_MCP_CONFIRMATION={mcp!r}", flush=True)
+    time.sleep(30)
+    raise SystemExit(1)
+
+print("WARNING: Claude Code running in Bypass Permissions mode\\n"
+      "1. No, exit\\n2. Yes, I accept\\nEnter to confirm / Esc to cancel", flush=True)
+bypass = read_confirmation()
+if b"2" not in bypass:
+    print(f"BAD_BYPASS_CONFIRMATION={bypass!r}", flush=True)
+    time.sleep(30)
+    raise SystemExit(1)
+
+# Only now does the real composer appear.
+print("\\u276f ", flush=True)
+
+buf = b""
+deadline = time.time() + 8
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(30)
+    raise SystemExit(1)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("prompt reached the composer\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=30,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "prompt reached the composer"

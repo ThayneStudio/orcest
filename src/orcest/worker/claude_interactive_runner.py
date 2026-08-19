@@ -30,6 +30,17 @@ from orcest.worker.runner import RunnerResult, get_provider_recipe
 
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Consecutive idle select() ticks (0.25s each) the terminal must stay quiet
+# before a composer match is trusted.  A dialog emits its caret marker before
+# its option numbers, so a buffer sampled mid-render holds a bare "❯" line that
+# is indistinguishable from the composer; waiting for the render to settle is
+# what tells them apart.
+_COMPOSER_SETTLE_TICKS = 3
+# Fall back to sending on a composer match without full quiet after this many
+# seconds without a new setup dialog.  A TUI that repaints continuously would
+# otherwise never satisfy the quiet rule and the task would stall outright; by
+# this point any dialog has long since been classified and answered.
+_COMPOSER_SETTLE_FALLBACK_SECONDS = 20.0
 # A numbered selection row ("❯ 1. …"); the composer glyph is never numbered.
 _MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
 _USAGE_ERROR_LINE_RE = re.compile(
@@ -472,6 +483,9 @@ class ClaudeInteractiveRunner:
                 mcp_server_confirmed = False
                 prompt_sent = False
                 setup_output_index = 0
+                quiet_ticks = 0
+                prompt_resends = 0
+                last_setup_at = time.monotonic()
 
                 while True:
                     summary = self._read_result(result_path)
@@ -543,7 +557,27 @@ class ClaudeInteractiveRunner:
 
                     readable, _, _ = select.select([master_fd], [], [], 0.25)
                     if not readable:
+                        # The terminal has gone quiet, so any dialog that was
+                        # mid-render has finished painting and been classified
+                        # above.  Only now is a composer match trustworthy.
+                        quiet_ticks += 1
+                        if (
+                            not prompt_sent
+                            and quiet_ticks >= _COMPOSER_SETTLE_TICKS
+                            and self._looks_like_main_input_prompt(
+                                "".join(terminal_output[setup_output_index:])
+                            )
+                        ):
+                            self._send_prompt(
+                                master_fd,
+                                full_prompt,
+                                logger,
+                                abort_event=abort,
+                                timeout=max(0.0, attempt_deadline - time.monotonic()),
+                            )
+                            prompt_sent = True
                         continue
+                    quiet_ticks = 0
                     if not self._read_available(
                         master_fd,
                         terminal_output,
@@ -598,13 +632,14 @@ class ClaudeInteractiveRunner:
                     )
                     if mcp_server_confirmed and not previous:
                         confirmed_setup = True
-                    if confirmed_setup:
-                        # Do not let a setup menu's rendering count as the
-                        # later main prompt. Wait for new output after the
-                        # confirmation response.
-                        setup_output_index = len(terminal_output)
-                    elif not prompt_sent and self._looks_like_main_input_prompt(
-                        "".join(terminal_output[setup_output_index:])
+                    if (
+                        not confirmed_setup
+                        and not prompt_sent
+                        and time.monotonic() - last_setup_at
+                        >= _COMPOSER_SETTLE_FALLBACK_SECONDS
+                        and self._looks_like_main_input_prompt(
+                            "".join(terminal_output[setup_output_index:])
+                        )
                     ):
                         self._send_prompt(
                             master_fd,
@@ -614,6 +649,25 @@ class ClaudeInteractiveRunner:
                             timeout=max(0.0, attempt_deadline - time.monotonic()),
                         )
                         prompt_sent = True
+                    if confirmed_setup:
+                        # Do not let a setup menu's rendering count as the
+                        # later main prompt. Wait for new output after the
+                        # confirmation response.
+                        setup_output_index = len(terminal_output)
+                        quiet_ticks = 0
+                        last_setup_at = time.monotonic()
+                        if prompt_sent and prompt_resends < 1:
+                            # A dialog we had to answer was on screen after the
+                            # prompt went out, so the paste landed in that menu
+                            # and its trailing carriage return picked the menu
+                            # default -- Claude never received the task. Re-arm
+                            # so the prompt is resent once the composer settles.
+                            prompt_sent = False
+                            prompt_resends += 1
+                            if logger:
+                                logger.info(
+                                    "Setup dialog consumed the task prompt; will resend it"
+                                )
 
                 self._finish_output_decoder(
                     decoder,
