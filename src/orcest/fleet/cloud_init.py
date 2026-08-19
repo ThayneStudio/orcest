@@ -106,6 +106,17 @@ _GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d
 # version, so re-validate fixtures + parser on bump.
 _CODEX_VERSION = "0.131.0"
 
+# Anthropic Claude Code CLI — published as an npm package. Pinned for the same
+# reason as the others, plus one specific to this provider: the interactive
+# (PTY) runner drives Claude's terminal UI by recognising its setup dialogs, so
+# a CLI upgrade that adds, reorders, or rewords a dialog silently changes a
+# contract that runner depends on. An unpinned install is what let that happen
+# on 2026-08-14, when a floating upgrade began pasting the task prompt into the
+# MCP consent menu and burned ~27% of clauder tasks on the wall-clock timeout
+# (see claude_interactive_runner's dialog handling + its regression tests).
+# On bump: re-run those tests and smoke a real interactive task before shipping.
+_CLAUDE_VERSION = "2.1.235"
+
 # Provider CLIs that ``_worker_tooling_runcmd`` installs and which a worker
 # MUST be able to exec (as the non-root ``orcest`` user) for any provider task
 # to run. cloud-init's runcmd has no cross-entry ``set -e``: a failed install
@@ -143,6 +154,7 @@ def _template_versions_write_file() -> dict:
         f"node_major={_NODE_MAJOR}\n"
         f"playwright_major={_PLAYWRIGHT_MAJOR}\n"
         f"supabase_version={_SUPABASE_VERSION}\n"
+        f"claude_version={_CLAUDE_VERSION}\n"
         f"grok_version={_GROK_VERSION}\n"
         f"codex_version={_CODEX_VERSION}\n"
         f"bumped_at={bumped_at}\n"
@@ -221,7 +233,7 @@ def _worker_tooling_runcmd() -> list[str]:
         # Docker Engine (no compose plugin for workers).
         *_docker_install_runcmd(),
         # Claude CLI: floats to npm-latest; rebakes pull current.
-        "npm install -g @anthropic-ai/claude-code",
+        f"npm install -g @anthropic-ai/claude-code@{_CLAUDE_VERSION}",
         # Grok CLI (xAI Grok Build): fetch the exact versioned, self-contained
         # amd64 binary. Auth is injected per-task to ~/.grok/auth.json by
         # GrokRunner (Path B), never baked.
