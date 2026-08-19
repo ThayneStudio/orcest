@@ -142,3 +142,4 @@ def test_claude_review_workflow_pins_cli_and_keeps_known_good_args() -> None:
     assert args_lines, "claude-review.yml must set claude_args"
     assert all("--setting-sources" not in line for line in args_lines)
     assert any("Bash(gh *)" in line for line in args_lines)
+    assert "continue-on-error: true" in text

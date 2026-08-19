@@ -57,6 +57,9 @@ jobs:
         # --setting-sources user,local on 2.1.235 produces the same crash, so
         # keep claude_args matching the last green review on this SHA.
         uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50
+        # Treat AI review as advisory: opaque Claude Action startup/auth
+        # failures should not block otherwise green PR CI.
+        continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
