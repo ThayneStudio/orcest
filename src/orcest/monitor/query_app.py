@@ -28,6 +28,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from orcest.monitor import db
 from orcest.monitor.auth import require_scope
@@ -51,10 +52,10 @@ _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 class _MethodGateMiddleware:
     """Pure ASGI middleware: reject non-GET/HEAD before routing/auth run."""
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD"):
             response = JSONResponse(
                 {"detail": "method not allowed"},

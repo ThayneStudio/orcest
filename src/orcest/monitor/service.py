@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+from types import FrameType
 
 import uvicorn
 
@@ -70,7 +71,7 @@ def run_monitor(cfg: MonitorConfig) -> None:
     shutdown_event = threading.Event()
     signal_shutdown = threading.Event()
 
-    def _handle_shutdown_signal(signum, frame) -> None:  # noqa: ANN001 - stdlib signature
+    def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
         logger.info("monitor service received signal %d, shutting down", signum)
         signal_shutdown.set()
         shutdown_event.set()

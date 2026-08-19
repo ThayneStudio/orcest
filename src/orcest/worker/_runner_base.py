@@ -414,10 +414,32 @@ def _run_cli_agent(
             # trigger ("stuck" | "looping" | "ceiling") fired the kill.
             killed_trigger: str | None = None
 
+            # PER-ATTEMPT VALUE CAPTURE -- DO NOT "SIMPLIFY".
+            #
+            # Both watchdog bodies below receive their captured state as
+            # *default arguments* (`_proc`, `_tracker`, `_interval`,
+            # `_cancelled`, `_killed`, `_timeout`, `_attempt_start`) instead of
+            # closing over the loop-body locals of the same name. That is
+            # load-bearing, not stylistic clutter: Python closures capture
+            # *variables*, not values, and `for attempt in range(...)` creates
+            # no new scope, so every one of those names is rebound by the next
+            # retry attempt. Default arguments are evaluated once, at `def`
+            # time, which freezes this attempt's values into the thread.
+            #
+            # It matters because a watchdog thread can outlive its own attempt:
+            # `watchdog_thread.join(timeout=5)` is bounded, and a stalled
+            # `tick()` outliving that join is explicitly anticipated below. A
+            # straggler rewritten to close over the loop locals would read the
+            # *next* attempt's `proc`/`watchdog_cancelled`/`watchdog_killed`,
+            # kill the wrong subprocess, and corrupt the newer attempt's kill
+            # bookkeeping. Keep the parameters.
+            watchdog_target: Callable[[], None]
+
             if tracker is None:
                 watchdog_remaining = max(0.0, timeout - (time.monotonic() - attempt_start))
 
-                def _watchdog(
+                # Defaults are per-attempt value capture -- see the note above.
+                def _deadline_watchdog(
                     _proc: subprocess.Popen[str] = proc,
                     _remaining: float = watchdog_remaining,
                     _cancelled: threading.Event = watchdog_cancelled,
@@ -428,12 +450,21 @@ def _run_cli_agent(
                     if not _cancelled.is_set():
                         _killed.set()
                         _kill_process_tree(_proc)
-            else:
 
-                def _watchdog(
+                watchdog_target = _deadline_watchdog
+            else:
+                # `tracker` is non-None on this branch. Bind it to a
+                # non-optional local so the `_tracker` default below keeps its
+                # narrow type -- the alternative would be widening the
+                # parameter to `LivenessTracker | None` and re-checking for
+                # None inside the thread, which is strictly worse.
+                attempt_tracker: LivenessTracker = tracker
+
+                # Defaults are per-attempt value capture -- see the note above.
+                def _liveness_watchdog(
                     _proc: subprocess.Popen[str] = proc,
-                    _tracker: LivenessTracker = tracker,
-                    _interval: float = tracker.sample_interval,
+                    _tracker: LivenessTracker = attempt_tracker,
+                    _interval: float = attempt_tracker.sample_interval,
                     _cancelled: threading.Event = watchdog_cancelled,
                     _killed: threading.Event = watchdog_killed,
                     _timeout: float = timeout,
@@ -477,7 +508,9 @@ def _run_cli_agent(
                             _kill_process_tree(_proc)
                             break
 
-            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+                watchdog_target = _liveness_watchdog
+
+            watchdog_thread = threading.Thread(target=watchdog_target, daemon=True)
             try:
                 watchdog_thread.start()
             except RuntimeError:

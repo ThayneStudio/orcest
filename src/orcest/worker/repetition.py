@@ -158,17 +158,24 @@ class RepetitionDetector:
         # just args-blind); ping-pong is the weakest/most expensive (needs
         # a full window and a shape check), so it's only consulted once the
         # two consecutive-streak streams have had their say.
-        if self._exact_streak_count >= self.exact_threshold:
+        # The streak hash is None only while the corresponding streak count is
+        # still 0 (observe_* always sets the hash before counting). Requiring
+        # it explicitly keeps `hashes` free of None *and* stops an operator who
+        # configures a threshold of 0 from tripping a verdict before a single
+        # tool call has been observed -- there is no offending hash to report.
+        exact_hash = self._exact_streak_hash
+        if exact_hash is not None and self._exact_streak_count >= self.exact_threshold:
             return RepetitionVerdict(
                 stream="exact",
                 count=self._exact_streak_count,
-                hashes=(self._exact_streak_hash,),
+                hashes=(exact_hash,),
             )
-        if self._error_streak_count >= self.error_threshold:
+        error_hash = self._error_streak_hash
+        if error_hash is not None and self._error_streak_count >= self.error_threshold:
             return RepetitionVerdict(
                 stream="error_class",
                 count=self._error_streak_count,
-                hashes=(self._error_streak_hash,),
+                hashes=(error_hash,),
             )
         return self._pingpong_verdict()
 
