@@ -4,6 +4,19 @@ on:
   pull_request:
   push:
     branches: [master]
+  # A push event can go missing: on 2026-08-19 the squash merge of #554 landed
+  # on master and GitHub delivered neither a PushEvent nor a workflow run, so
+  # master sat unverified with nobody aware. This cron re-verifies master's head
+  # on a fixed cadence, which also keeps the `integration` job (push/dispatch
+  # only) from going stale. Deliberately off the hour -- GitHub's scheduler is
+  # best-effort and most contended at :00.
+  #
+  # This bounds the blind spot, it does not close it: a scheduled run queues on
+  # the same self-hosted fleet as everything else, so a fleet outage silences
+  # the check exactly when it matters. Fully closing "nobody noticed" needs an
+  # external assertion that master's head SHA has a successful run.
+  schedule:
+    - cron: "17 6,18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -116,10 +129,14 @@ jobs:
 
   integration:
     runs-on: [self-hosted, linux]
-    # Run on push to master to catch regressions automatically, and on workflow_dispatch
-    # for on-demand runs. Skipped on PR branches to avoid Redis overhead on every push.
+    # Run on push to master to catch regressions automatically, on the schedule
+    # above so a dropped push event cannot leave master unverified, and on
+    # workflow_dispatch for on-demand runs. Scheduled runs always execute on the
+    # default branch, so no extra ref guard is needed for that leg. Skipped on PR
+    # branches to avoid Redis overhead on every push.
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/master')
     services:
       redis:
