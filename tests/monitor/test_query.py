@@ -12,21 +12,37 @@ def _seed(tmp_path):
     envs = []
     for attempt, task_id in [(0, "t-a"), (1, "t-b")]:
         for suffix in ["task.enqueued", "task.started", "task.failed"]:
-            envs.append(make_event(
-                f"net.orcest.{suffix}", source_project="p", task_id=task_id,
-                repo="o/r", resource_type="pr", resource_id=9, attempt=attempt,
-            ))
-    envs.append(make_event(
-        "net.orcest.task.started", source_project="p", task_id="t-live",
-        repo="o/r", resource_type="pr", resource_id=10, attempt=0,
-    ))
+            envs.append(
+                make_event(
+                    f"net.orcest.{suffix}",
+                    source_project="p",
+                    task_id=task_id,
+                    repo="o/r",
+                    resource_type="pr",
+                    resource_id=9,
+                    attempt=attempt,
+                )
+            )
+    envs.append(
+        make_event(
+            "net.orcest.task.started",
+            source_project="p",
+            task_id="t-live",
+            repo="o/r",
+            resource_type="pr",
+            resource_id=10,
+            attempt=0,
+        )
+    )
     db.insert_events(conn, envs)
     return path
 
 
 def _client(tmp_path, scopes=frozenset({"events:read"})):
     cfg = MonitorConfig(
-        db_path=_seed(tmp_path), trace_archive_path=None, write_token="w",
+        db_path=_seed(tmp_path),
+        trace_archive_path=None,
+        write_token="w",
         readers=[Reader(name="r", token="read-secret", scopes=scopes)],
     )
     return TestClient(create_query_app(cfg))
@@ -107,12 +123,22 @@ def test_fleet_terminal_absorbs_late_arriving_non_terminal(tmp_path):
     path = str(tmp_path / "m2.db")
     conn = db.open_rw(path)
     terminal = make_event(
-        "net.orcest.task.failed", source_project="p", task_id="t-terminal",
-        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+        "net.orcest.task.failed",
+        source_project="p",
+        task_id="t-terminal",
+        repo="o/r",
+        resource_type="pr",
+        resource_id=1,
+        attempt=0,
     )
     late_non_terminal = make_event(
-        "net.orcest.task.activity", source_project="p", task_id="t-terminal",
-        repo="o/r", resource_type="pr", resource_id=1, attempt=0,
+        "net.orcest.task.activity",
+        source_project="p",
+        task_id="t-terminal",
+        repo="o/r",
+        resource_type="pr",
+        resource_id=1,
+        attempt=0,
     )
     late_non_terminal["time"] = terminal["time"]
 
@@ -120,7 +146,9 @@ def test_fleet_terminal_absorbs_late_arriving_non_terminal(tmp_path):
     db.insert_events(conn, [late_non_terminal])  # separate call -> higher rowid
 
     cfg = MonitorConfig(
-        db_path=path, trace_archive_path=None, write_token="w",
+        db_path=path,
+        trace_archive_path=None,
+        write_token="w",
         readers=[Reader(name="r", token="read-secret", scopes=frozenset({"events:read"}))],
     )
     c = TestClient(create_query_app(cfg))

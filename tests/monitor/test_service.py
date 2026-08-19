@@ -30,8 +30,7 @@ def _write_config(tmp_path, extra: str = "") -> str:
         "ingest_port: 9191\n"
         "query_host: 127.0.0.1\n"
         "query_port: 9190\n"
-        "write_token_env: MONITOR_WRITE_TOKEN\n"
-        + extra
+        "write_token_env: MONITOR_WRITE_TOKEN\n" + extra
     )
     return str(path)
 

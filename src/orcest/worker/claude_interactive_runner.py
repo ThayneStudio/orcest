@@ -635,8 +635,7 @@ class ClaudeInteractiveRunner:
                     if (
                         not confirmed_setup
                         and not prompt_sent
-                        and time.monotonic() - last_setup_at
-                        >= _COMPOSER_SETTLE_FALLBACK_SECONDS
+                        and time.monotonic() - last_setup_at >= _COMPOSER_SETTLE_FALLBACK_SECONDS
                         and self._looks_like_main_input_prompt(
                             "".join(terminal_output[setup_output_index:])
                         )
@@ -665,9 +664,7 @@ class ClaudeInteractiveRunner:
                             prompt_sent = False
                             prompt_resends += 1
                             if logger:
-                                logger.info(
-                                    "Setup dialog consumed the task prompt; will resend it"
-                                )
+                                logger.info("Setup dialog consumed the task prompt; will resend it")
 
                 self._finish_output_decoder(
                     decoder,

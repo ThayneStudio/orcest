@@ -501,9 +501,7 @@ def _run_cli_agent(
                             tracker.observe_line(line)
                         except Exception:
                             if logger:
-                                logger.warning(
-                                    "tracker.observe_line failed", exc_info=True
-                                )
+                                logger.warning("tracker.observe_line failed", exc_info=True)
                     if streaming_on_output is not None:
                         try:
                             streaming_on_output(line)

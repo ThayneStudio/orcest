@@ -122,9 +122,7 @@ def create_query_app(cfg: MonitorConfig) -> FastAPI:
     @router.api_route(
         "/api/v1/tasks/{task_id}/timeline", methods=["GET"], operation_id="task_timeline"
     )
-    @router.api_route(
-        "/api/v1/tasks/{task_id}/timeline", methods=["HEAD"], include_in_schema=False
-    )
+    @router.api_route("/api/v1/tasks/{task_id}/timeline", methods=["HEAD"], include_in_schema=False)
     def task_timeline(task_id: str) -> dict:
         with closing(db.open_ro(cfg.db_path)) as conn:
             conn.row_factory = sqlite3.Row

@@ -50,9 +50,7 @@ _EPOCH_RE = re.compile(r"(?<!\d)\d{10,}(?:\.\d+)?(?!\d)")
 # of the hex alphabet) would be stripped and collapse genuinely-different
 # args into the same hash. Epoch-length pure-decimal runs (>=10 digits) are
 # still normalized by _EPOCH_RE above.
-_HEX_RUN_RE = re.compile(
-    r"(?<![0-9a-fA-F])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])"
-)
+_HEX_RUN_RE = re.compile(r"(?<![0-9a-fA-F])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])")
 
 _HASH_LEN = 16
 

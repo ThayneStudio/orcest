@@ -274,9 +274,7 @@ class LivenessTracker:
             # state this evaluation landed on -- it marks "the tracker
             # started observing this task", not a ladder transition.
             self._safe(
-                lambda: self._emit_fn(
-                    "net.orcest.task.bootstrap", {"snapshot": decision.snapshot}
-                ),
+                lambda: self._emit_fn("net.orcest.task.bootstrap", {"snapshot": decision.snapshot}),
                 "bootstrap emit",
             )
 

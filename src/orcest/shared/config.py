@@ -814,9 +814,12 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     else:
         monitor_ingest_url = _safe_str(monitor_ingest_raw, "monitor_ingest_url").strip()
 
-    monitor_write_token_env = _safe_optional_str(
-        raw.get("monitor_write_token_env"), "monitor_write_token_env", "MONITOR_WRITE_TOKEN"
-    ) or "MONITOR_WRITE_TOKEN"
+    monitor_write_token_env = (
+        _safe_optional_str(
+            raw.get("monitor_write_token_env"), "monitor_write_token_env", "MONITOR_WRITE_TOKEN"
+        )
+        or "MONITOR_WRITE_TOKEN"
+    )
 
     # Fleet-health kill-pressure gate. Absent block -> spec §11 defaults.
     fleet_health_raw = _safe_dict(raw, "fleet_health")

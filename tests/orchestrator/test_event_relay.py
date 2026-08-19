@@ -12,7 +12,7 @@ class _FakeRedis:
         self.key_prefix = key_prefix
 
     def xadd_capped(self, stream, fields, maxlen):
-        eid = f"{len(self.entries)+1}-0"
+        eid = f"{len(self.entries) + 1}-0"
         self.entries.append((eid, fields))
         return eid
 
@@ -35,8 +35,13 @@ def _id_gt(a, b):
 def _spool(r, n):
     for i in range(n):
         env = make_event(
-            "net.orcest.task.started", source_project="p", task_id=f"t{i}",
-            repo="o/r", resource_type="pr", resource_id=i, attempt=0,
+            "net.orcest.task.started",
+            source_project="p",
+            task_id=f"t{i}",
+            repo="o/r",
+            resource_type="pr",
+            resource_id=i,
+            attempt=0,
         )
         r.xadd_capped(EVENTS_STREAM, {"envelope": json.dumps(env)}, 100)
 
