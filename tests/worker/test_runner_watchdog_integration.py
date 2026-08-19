@@ -105,9 +105,7 @@ def _make_tracker_factory(
     # the safe-by-default fallback. Pass kill_budget_limit=None to opt out
     # (e.g. to exercise observation-mode-like behavior).
     if kill_budget_limit is not None:
-        fake_redis_client.set_ex_raw(
-            "orcest:fleet:kill_budget:limit", str(kill_budget_limit), 3600
-        )
+        fake_redis_client.set_ex_raw("orcest:fleet:kill_budget:limit", str(kill_budget_limit), 3600)
 
     def _emit(event_type: str, data: dict) -> None:
         events.append((event_type, data))

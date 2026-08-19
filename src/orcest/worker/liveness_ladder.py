@@ -195,9 +195,9 @@ class LivenessLadder:
         ceiling_hit = (now - self.started_at) >= self.ceiling
 
         if prev_state == LadderState.BOOTSTRAP:
-            exiting = self._bootstrap_seen_progress or (
-                now - self.started_at
-            ) >= self.cfg.startup_grace
+            exiting = (
+                self._bootstrap_seen_progress or (now - self.started_at) >= self.cfg.startup_grace
+            )
             if not exiting:
                 # A workspace change observed during BOOTSTRAP still counts
                 # for S3 recency: recording it here means post-bootstrap S3
@@ -226,9 +226,7 @@ class LivenessLadder:
             self._last_workspace_change_ts = now
         s3_fresh = (now - self._last_workspace_change_ts) < self.cfg.idle_window
 
-        s1_fresh = self._last_s1_ts is not None and (
-            now - self._last_s1_ts
-        ) < self.cfg.idle_window
+        s1_fresh = self._last_s1_ts is not None and (now - self._last_s1_ts) < self.cfg.idle_window
 
         # LOOPING: independent of S1-S3 by design (spec §5) -- a retry loop
         # reads ACTIVE on every other signal, that's the whole point of S4.

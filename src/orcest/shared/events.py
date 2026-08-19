@@ -24,10 +24,21 @@ EVENTS_STREAM = "events"
 DEFAULT_EVENTS_MAXLEN = 50000
 
 _TYPE_SUFFIXES = (
-    "task.enqueued", "task.started", "task.bootstrap", "task.active",
-    "task.waiting", "task.suspect", "task.stuck", "task.looping",
-    "task.killed", "task.completed", "task.failed", "task.reaped",
-    "task.activity", "fleet.pressure", "fleet.kill_limit",
+    "task.enqueued",
+    "task.started",
+    "task.bootstrap",
+    "task.active",
+    "task.waiting",
+    "task.suspect",
+    "task.stuck",
+    "task.looping",
+    "task.killed",
+    "task.completed",
+    "task.failed",
+    "task.reaped",
+    "task.activity",
+    "fleet.pressure",
+    "fleet.kill_limit",
 )
 EVENT_TYPES: frozenset[str] = frozenset("net.orcest." + s for s in _TYPE_SUFFIXES)
 
@@ -99,9 +110,7 @@ class EventPublisher:
 
     def publish(self, envelope: dict[str, Any]) -> None:
         try:
-            self._redis.xadd_capped(
-                EVENTS_STREAM, {"envelope": json.dumps(envelope)}, self._maxlen
-            )
+            self._redis.xadd_capped(EVENTS_STREAM, {"envelope": json.dumps(envelope)}, self._maxlen)
         except Exception:
             # Decimated logging, mirroring worker output-stream error handling.
             self._error_count += 1

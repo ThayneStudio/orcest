@@ -193,19 +193,26 @@ class EventRelay:
         }
 
     def _post(self, events: list[dict[str, Any]]) -> bool:
+        # `start()` refuses to launch the relay thread when ingest_url is
+        # None, so reaching here without a URL means the relay was driven
+        # directly (a caller bypassing start()). Report it rather than
+        # handing None to requests.post, which would raise a MissingSchema
+        # deep inside urllib3 instead of naming the real problem.
+        ingest_url = self._ingest_url
+        if ingest_url is None:
+            logger.error("Event relay _post called with no ingest URL configured; dropping batch")
+            return False
         try:
             resp = requests.post(
-                self._ingest_url,
+                ingest_url,
                 json={"events": events},
                 headers={"Authorization": f"Bearer {self._write_token}"},
                 timeout=_POST_TIMEOUT_SECONDS,
             )
         except requests.RequestException:
-            logger.warning("Event relay POST to %s failed", self._ingest_url, exc_info=True)
+            logger.warning("Event relay POST to %s failed", ingest_url, exc_info=True)
             return False
         if 200 <= resp.status_code < 300:
             return True
-        logger.warning(
-            "Event relay POST to %s returned status %s", self._ingest_url, resp.status_code
-        )
+        logger.warning("Event relay POST to %s returned status %s", ingest_url, resp.status_code)
         return False

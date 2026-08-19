@@ -8,8 +8,13 @@ from orcest.shared.events import make_event
 
 def _env(task_id="t1", type_="net.orcest.task.started"):
     return make_event(
-        type_, source_project="p", task_id=task_id, repo="o/r",
-        resource_type="pr", resource_id=5, attempt=1,
+        type_,
+        source_project="p",
+        task_id=task_id,
+        repo="o/r",
+        resource_type="pr",
+        resource_id=5,
+        attempt=1,
     )
 
 
@@ -48,9 +53,7 @@ def test_poison_envelopes_skipped_not_raised(tmp_path):
 
     valid = _env("t-valid")
 
-    accepted = db.insert_events(
-        conn, [poison_null_subject, poison_bad_resource_id, valid]
-    )
+    accepted = db.insert_events(conn, [poison_null_subject, poison_bad_resource_id, valid])
 
     assert accepted == 1
     rows = conn.execute("SELECT subject FROM events").fetchall()

@@ -15,10 +15,13 @@ def test_cpu_sampler_sees_busy_child():
     )
     try:
         s = ProcessTreeSampler(proc.pid)
-        a = s.sample(); time.sleep(1.0); b = s.sample()  # noqa: E702
+        a = s.sample()
+        time.sleep(1.0)
+        b = s.sample()  # noqa: E702
         assert a is not None and b is not None and b - a > 0.2
     finally:
-        proc.kill(); proc.wait()  # noqa: E702
+        proc.kill()
+        proc.wait()  # noqa: E702
 
 
 @pytest.mark.integration
@@ -26,10 +29,13 @@ def test_cpu_sampler_idle_process_near_zero():
     proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
         s = ProcessTreeSampler(proc.pid)
-        a = s.sample(); time.sleep(0.5); b = s.sample()  # noqa: E702
+        a = s.sample()
+        time.sleep(0.5)
+        b = s.sample()  # noqa: E702
         assert b - a < 0.05
     finally:
-        proc.kill(); proc.wait()  # noqa: E702
+        proc.kill()
+        proc.wait()  # noqa: E702
 
 
 @pytest.mark.integration
@@ -49,12 +55,14 @@ def test_cpu_sampler_counts_reaped_children():
             time.sleep(0.3)
         assert v is not None and v > 0.1
     finally:
-        proc.kill(); proc.wait()  # noqa: E702
+        proc.kill()
+        proc.wait()  # noqa: E702
 
 
 @pytest.mark.unit
 def test_cpu_sampler_gone_process_returns_none():
-    proc = subprocess.Popen(["true"]); proc.wait()  # noqa: E702
+    proc = subprocess.Popen(["true"])
+    proc.wait()  # noqa: E702
     assert ProcessTreeSampler(proc.pid).sample() is None
 
 
