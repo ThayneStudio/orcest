@@ -1,9 +1,25 @@
+import contextlib
+import os
+import signal
 import subprocess
 import time
 
 import pytest
 
 from orcest.worker.liveness_signals import ProcessTreeSampler, WorkspaceSampler
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the whole process group, not just the direct child.
+
+    These fixtures background a CPU burner with ``&``; ``proc.kill()`` reaps only
+    the ``sh`` parent and leaves the grandchild spinning forever under init.
+    ``start_new_session=True`` makes ``proc`` a process-group leader, so signalling
+    the group takes the whole tree down.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    proc.wait()
 
 
 @pytest.mark.integration
@@ -20,8 +36,7 @@ def test_cpu_sampler_sees_busy_child():
         b = s.sample()  # noqa: E702
         assert a is not None and b is not None and b - a > 0.2
     finally:
-        proc.kill()
-        proc.wait()  # noqa: E702
+        _kill_group(proc)
 
 
 @pytest.mark.integration
@@ -34,8 +49,7 @@ def test_cpu_sampler_idle_process_near_zero():
         b = s.sample()  # noqa: E702
         assert b - a < 0.05
     finally:
-        proc.kill()
-        proc.wait()  # noqa: E702
+        _kill_group(proc)
 
 
 @pytest.mark.integration
@@ -55,8 +69,7 @@ def test_cpu_sampler_counts_reaped_children():
             time.sleep(0.3)
         assert v is not None and v > 0.1
     finally:
-        proc.kill()
-        proc.wait()  # noqa: E702
+        _kill_group(proc)
 
 
 @pytest.mark.unit
