@@ -25,6 +25,7 @@ and put them in the compose `.env` file next to `docker-compose.monitor.yml`:
 ```bash
 echo "MONITOR_WRITE_TOKEN=$(openssl rand -hex 32)" >> .env
 echo "MONITOR_TOKEN_ADMIN=$(openssl rand -hex 32)" >> .env
+echo "MONITOR_TOKEN_GROK=$(openssl rand -hex 32)" >> .env
 # one MONITOR_TOKEN_<NAME> per additional reader, matching config/monitor.yaml
 ```
 
@@ -38,8 +39,11 @@ variable must also be listed in `docker-compose.monitor.yml`'s
 `environment:` block — Compose only forwards explicitly-named variables, so
 without that line the container never sees the token and the reader can
 never authenticate, even though `.env` and `monitor.yaml` both look right.
-(`MONITOR_WRITE_TOKEN` and `MONITOR_TOKEN_ADMIN` are already listed; every
-additional reader needs its own line.)
+(`MONITOR_WRITE_TOKEN`, `MONITOR_TOKEN_ADMIN`, and `MONITOR_TOKEN_GROK` are
+already listed; every additional reader needs its own line.) These use the
+strict `${VAR:?set in .env}` form, so a missing token fails the container at
+`docker compose up` with a message naming the variable rather than starting a
+monitor whose reader can never authenticate.
 
 ## 2. Point the orchestrator(s) at the ingest listener
 

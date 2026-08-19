@@ -8,6 +8,7 @@ services:
     environment:
       - MONITOR_WRITE_TOKEN=${MONITOR_WRITE_TOKEN:?set in .env}
       - MONITOR_TOKEN_ADMIN=${MONITOR_TOKEN_ADMIN:?set in .env}
+      - MONITOR_TOKEN_GROK=${MONITOR_TOKEN_GROK:?set in .env}
     volumes:
       - ${ORCEST_MONITOR_CONFIG:-./config/monitor.yaml}:/etc/orcest/monitor.yaml:ro
       - monitor-db:/var/lib/orcest-monitor
