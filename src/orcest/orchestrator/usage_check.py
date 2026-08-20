@@ -24,6 +24,27 @@ _TIMEOUT = 10  # seconds
 _UTILIZATION_THRESHOLD = 95
 
 
+def get_token_usage_state(token: str) -> dict[str, dict[str, object]] | None:
+    """Query the Anthropic OAuth usage endpoint for the two quota windows.
+
+    Returns only the fields that are safe for public CI summaries:
+    ``five_hour.utilization``, ``five_hour.resets_at``,
+    ``seven_day.utilization``, and ``seven_day.resets_at``.
+    """
+    data = _query_usage_endpoint(token)
+    if data is None:
+        return None
+
+    try:
+        return {
+            "five_hour": _extract_usage_window(data["five_hour"]),
+            "seven_day": _extract_usage_window(data["seven_day"]),
+        }
+    except (TypeError, KeyError, AttributeError) as exc:
+        logger.warning("Failed to parse usage response: %s", exc)
+        return None
+
+
 def get_token_reset_time(token: str) -> datetime | None:
     """Query the Anthropic OAuth usage endpoint for a token's reset time.
 
@@ -35,6 +56,38 @@ def get_token_reset_time(token: str) -> datetime | None:
     Returns ``None`` on any error (HTTP 429, network failure, unexpected
     response format) so the caller can fall back to a default cooldown.
     """
+    data = _query_usage_endpoint(token)
+    if data is None:
+        return None
+
+    try:
+        # Find the window(s) that are near their limit
+        candidates: list[datetime] = []
+        for window in (
+            _usage_window_or_empty(data.get("five_hour")),
+            _usage_window_or_empty(data.get("seven_day")),
+        ):
+            utilization_raw = window.get("utilization", 0)
+            resets_at = window.get("resets_at", "")
+            if not isinstance(utilization_raw, int | float | str) or not isinstance(resets_at, str):
+                continue
+            utilization = float(utilization_raw)
+            if utilization >= _UTILIZATION_THRESHOLD and resets_at:
+                parsed = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+                candidates.append(parsed)
+
+        if not candidates:
+            logger.info("Usage endpoint returned no high-utilization windows")
+            return None
+
+        # Return the soonest reset time
+        return min(candidates)
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        logger.warning("Failed to parse usage response: %s", exc)
+        return None
+
+
+def _query_usage_endpoint(token: str) -> dict[str, object] | None:
     req = Request(
         _USAGE_URL,
         headers={
@@ -54,25 +107,20 @@ def get_token_reset_time(token: str) -> datetime | None:
         logger.warning("Usage endpoint returned non-object JSON: %s", type(data).__name__)
         return None
 
-    try:
-        five_hour = data.get("five_hour", {})
-        seven_day = data.get("seven_day", {})
+    return data
 
-        # Find the window(s) that are near their limit
-        candidates: list[datetime] = []
-        for window in (five_hour, seven_day):
-            utilization = float(window.get("utilization", 0))
-            resets_at = window.get("resets_at", "")
-            if utilization >= _UTILIZATION_THRESHOLD and resets_at:
-                parsed = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-                candidates.append(parsed)
 
-        if not candidates:
-            logger.info("Usage endpoint returned no high-utilization windows")
-            return None
+def _usage_window_or_empty(window: object) -> dict[str, object]:
+    if isinstance(window, dict):
+        return window
+    return {}
 
-        # Return the soonest reset time
-        return min(candidates)
-    except (TypeError, ValueError, KeyError, AttributeError) as exc:
-        logger.warning("Failed to parse usage response: %s", exc)
-        return None
+
+def _extract_usage_window(window: object) -> dict[str, object]:
+    if not isinstance(window, dict):
+        raise TypeError(f"usage window must be an object, got {type(window).__name__}")
+
+    return {
+        "utilization": window["utilization"],
+        "resets_at": window["resets_at"],
+    }
