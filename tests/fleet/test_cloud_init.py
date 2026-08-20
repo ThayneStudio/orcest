@@ -1,5 +1,6 @@
 """Tests for orcest.fleet.cloud_init."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -606,6 +607,18 @@ def test_clone_runcmd_creates_codex_and_grok_dirs():
     )
     assert chown_idx is not None, "clone path must chown the created /home/orcest dirs to orcest"
     assert chown_idx < enable_idx, "chown must run before the unit is enabled"
+
+
+def test_setup_worker_sh_installs_jq():
+    """The merge-policy hook and cloud-init worker image both need jq.
+
+    ``cloud_init._WORKER_PACKAGES`` already lists jq; the bare-VM path in
+    setup-worker.sh must stay in parity so a freshly provisioned static
+    worker does not fail-closed every Bash tool call.
+    """
+    setup = Path(__file__).resolve().parents[2] / "provision" / "setup-worker.sh"
+    text = setup.read_text()
+    assert re.search(r"(?m)^\s+jq\\?$", text), "setup-worker.sh must apt-install jq"
 
 
 def test_setup_worker_sh_creates_codex_and_grok_dirs():
