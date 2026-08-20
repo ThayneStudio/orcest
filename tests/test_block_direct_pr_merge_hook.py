@@ -127,11 +127,15 @@ def test_settings_point_at_hook() -> None:
 
 
 def test_claude_review_workflow_pins_cli_and_keeps_known_good_args() -> None:
-    """@v1 floated to CLI 2.1.236, which dies with is_error:true / $0.
+    """Pin the action SHA; guard claude_args against --setting-sources drift.
 
-    Pin the action SHA that still ships 2.1.235, and do not pass
-    --setting-sources: on that CLI it produces the same immediate crash.
-    The action already restores .claude from the base branch.
+    The pin is hygiene against a floating @v1 tag, not a known-good CLI.
+    Action SHA, CLI version, and setting-sources were each ruled out as
+    the 2026-08-19 is_error:true / $0 crash: the same pinned config failed
+    and later passed. The workflow never passed --setting-sources, so that
+    assertion is a harmless guard against drift rather than protection
+    against a crash. The action already restores .claude from the base
+    branch.
     """
     text = CLAUDE_REVIEW_WORKFLOW.read_text()
     assert "uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50" in text
