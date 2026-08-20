@@ -1,0 +1,161 @@
+name: Master verified
+
+# Master's health cannot be inferred from "CI was triggered". A push
+# event can go missing, a run can sit queued on a down fleet, and a run
+# can sit red with nobody looking. This job runs on GitHub-hosted
+# ubuntu-latest and only talks to the GitHub API, so it still fires
+# when the repo's own runners do not.
+#
+# Signal is this run failing, with a ::error:: naming the SHA and which
+# condition tripped (no run / wrong event / red jobs). It does not file
+# issues, comment, or label.
+
+on:
+  schedule:
+    # Off the hour; GitHub's scheduler is most contended at :00.
+    # Offset from CI's 17 6,18 so a scheduled CI run can finish first.
+    - cron: "43 7,19 * * *"
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: >
+          Override SHA to assert instead of master's head. Fixtures:
+          715e4f1f4e121f0c6196226128690b9e6fa9708e (no run),
+          178bfa85 (red push),
+          0f5d3dd0122091d3997596e00adfd368f6458ce4 (dispatch only).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  assert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert a successful push or schedule CI run for master's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.head_sha || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HEAD_SHA_OVERRIDE}" ]; then
+            if ! printf '%s' "${HEAD_SHA_OVERRIDE}" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+              echo "::error::invalid head_sha override"
+              exit 1
+            fi
+            SHA=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA_OVERRIDE}" --jq .sha)
+          else
+            SHA=$(gh api "repos/${{ github.repository }}/commits/master" --jq .sha)
+          fi
+          export SHA
+          python3 <<'PYEOF'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          import sys
+
+          ALLOWED_EVENTS = {"push", "schedule"}
+          CI_PATH = ".github/workflows/ci.yml"
+          REQUIRED_JOBS = (
+              "lint",
+              "typecheck",
+              "test",
+              "dashboard",
+              "integration",
+              "docker",
+          )
+
+          def gh_api(path: str) -> dict:
+              proc = subprocess.run(
+                  ["gh", "api", path],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if proc.returncode != 0:
+                  sys.stderr.write(proc.stderr)
+                  raise SystemExit(f"gh api {path} failed with exit {proc.returncode}")
+              return json.loads(proc.stdout)
+
+          def fail(sha: str, condition: str, detail: str) -> None:
+              print(f"::error::{sha}: {condition}: {detail}")
+              raise SystemExit(1)
+
+          def is_ci_run(run: dict) -> bool:
+              path = run.get("path") or ""
+              return path == CI_PATH
+
+          def list_ci_runs(repo: str, sha: str) -> list[dict]:
+              runs: list[dict] = []
+              page = 1
+              while page <= 10:
+                  data = gh_api(
+                      f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100&page={page}"
+                  )
+                  batch = data.get("workflow_runs") or []
+                  runs.extend(run for run in batch if is_ci_run(run))
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              return runs
+
+          def jobs_by_name(repo: str, run_id: int) -> dict[str, dict]:
+              data = gh_api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
+              return {job["name"]: job for job in data.get("jobs") or []}
+
+          def required_jobs_succeeded(jobs: dict[str, dict]) -> bool:
+              for name in REQUIRED_JOBS:
+                  job = jobs.get(name)
+                  if job is None or job.get("conclusion") != "success":
+                      return False
+              return True
+
+          def describe_red(run: dict, jobs: dict[str, dict]) -> str:
+              parts = []
+              for name in REQUIRED_JOBS:
+                  job = jobs.get(name)
+                  if job is None:
+                      parts.append(f"{name}=absent")
+                  elif job.get("conclusion") != "success":
+                      conclusion = job.get("conclusion") or job.get("status") or "unknown"
+                      parts.append(f"{name}={conclusion}")
+              return f"run {run['id']} event={run.get('event')}: {', '.join(parts)}"
+
+          def main() -> None:
+              repo = os.environ["GITHUB_REPOSITORY"]
+              sha = os.environ["SHA"]
+              runs = list_ci_runs(repo, sha)
+              if not runs:
+                  fail(sha, "no run", "no CI workflow run exists for this SHA")
+
+              eligible = [run for run in runs if run.get("event") in ALLOWED_EVENTS]
+              if not eligible:
+                  events = ", ".join(sorted({str(run.get("event")) for run in runs}))
+                  fail(
+                      sha,
+                      "wrong event",
+                      "CI runs exist but none were triggered by push or schedule "
+                      f"(events: {events})",
+                  )
+
+              red = []
+              for run in eligible:
+                  jobs = jobs_by_name(repo, int(run["id"]))
+                  if required_jobs_succeeded(jobs):
+                      print(
+                          f"Verified {sha} via CI run {run['id']} "
+                          f"(event={run.get('event')})"
+                      )
+                      return
+                  red.append(describe_red(run, jobs))
+
+              fail(sha, "red jobs", "; ".join(red))
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
