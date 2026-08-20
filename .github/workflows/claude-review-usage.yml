@@ -1,0 +1,47 @@
+name: Claude Review Usage Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  usage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report Claude review credential usage
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import sys
+
+          sys.path.insert(0, "src")
+
+          from orcest.orchestrator.usage_check import get_token_usage_state
+
+          token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+          if not token:
+              raise SystemExit("CLAUDE_CODE_OAUTH_TOKEN is not configured")
+
+          usage = get_token_usage_state(token)
+          if usage is None:
+              raise SystemExit("Failed to query or parse Claude review credential usage")
+
+          lines = [
+              "| Window | Utilization | Resets at |",
+              "| --- | ---: | --- |",
+              f"| five_hour | {usage['five_hour']['utilization']} | {usage['five_hour']['resets_at']} |",
+              f"| seven_day | {usage['seven_day']['utilization']} | {usage['seven_day']['resets_at']} |",
+          ]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines))
+              summary.write("\n")
+          PY
