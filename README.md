@@ -698,6 +698,7 @@ real IP (or DNS name) in fleet config and retry.
 - [`docs/adding-a-provider.md`](docs/adding-a-provider.md) — end-to-end recipe for a new agent.
 - [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md) — provider rollout playbook.
 - [`docs/issue-dependencies.md`](docs/issue-dependencies.md) — body-text dependency syntax.
+- [`docs/ci-forensics.md`](docs/ci-forensics.md) — CI and `gh` investigation gotchas.
 - [`docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md`](docs/superpowers/specs/2026-08-17-stall-detection-and-monitor-design.md) — events/monitor design.
 - [`docs/monitor-exposure-runbook.md`](docs/monitor-exposure-runbook.md) — standing up and externally exposing the monitor service.
 - [`docs/plans/`](docs/plans/) — design notes and roadmap.
