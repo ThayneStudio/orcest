@@ -50,12 +50,19 @@ jobs:
           git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
 
       - name: Run Claude Code Review
-        # Pin the action so its bundled Claude Code CLI cannot float underneath
-        # this workflow. The 2026-08-19 v1 update from d40ddef... to e2a4b76...
-        # moved the CLI from 2.1.235 to 2.1.236, which returned is_error:true
-        # before the first model turn (~300ms, $0). Pinning alone is not enough:
-        # --setting-sources user,local on 2.1.235 produces the same crash, so
-        # keep claude_args matching the last green review on this SHA.
+        # Pin the action SHA so its bundled Claude Code CLI cannot float
+        # underneath this workflow. That is hygiene (same convention as
+        # 178bfa8): a floating third-party tag is reason enough. This SHA
+        # is not a known-good config: job 96233905625 ran it and failed.
+        #
+        # 2026-08-19 had a bounded upstream failure window (~20:13Z-22:38Z
+        # observed; next pass 23:24Z, so the true end is unobserved). The
+        # step failed before or during the first model turns with near-zero
+        # spend (is_error:true, $0). Action SHA, CLI version, and
+        # setting-sources were each independently ruled out: jobs failed
+        # on this pin + CLI 2.1.235 + settingSources user,project,local,
+        # and the same config passed both before and after the window.
+        # The cause is upstream; it has not reproduced since.
         uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50
         # Treat the AI review as advisory: opaque Claude Action startup/auth
         # failures should not block otherwise green PR CI.
