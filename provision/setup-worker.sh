@@ -24,7 +24,8 @@ sudo apt-get install -y -qq \
     gnupg \
     lsb-release \
     golang-go \
-    unzip
+    unzip \
+    jq
 
 # Install Node.js (required for Claude CLI)
 if ! command -v node &>/dev/null; then
