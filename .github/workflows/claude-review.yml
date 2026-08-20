@@ -57,7 +57,7 @@ jobs:
         # --setting-sources user,local on 2.1.235 produces the same crash, so
         # keep claude_args matching the last green review on this SHA.
         uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50
-        # Treat AI review as advisory: opaque Claude Action startup/auth
+        # Treat the AI review as advisory: opaque Claude Action startup/auth
         # failures should not block otherwise green PR CI.
         continue-on-error: true
         with:
@@ -70,7 +70,7 @@ jobs:
             Instructions:
             1. Run `gh pr view ${{ github.event.pull_request.number }}` to get the PR title, author, and description.
             2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changes.
-            3. Read the repository's CLAUDE.md for project conventions.
+            3. Read the repository's .claude/CLAUDE.md for project conventions.
             4. Review the changes for:
                - Code quality and best practices
                - Potential bugs or issues
