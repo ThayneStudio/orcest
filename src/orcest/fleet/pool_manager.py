@@ -1290,12 +1290,20 @@ class PoolManager:
         activity record blocks destruction below the ceiling regardless of
         elapsed time.
         """
-        active = self._redis.hgetall(_POOL_ACTIVE_KEY)
+        try:
+            active = self._redis.hgetall(_POOL_ACTIVE_KEY)
+        except Exception:
+            logger.warning(
+                "Failed to read active pool state; skipping destructive health check",
+                exc_info=True,
+            )
+            return
         if not active:
             return
 
         now = time.time()
         max_duration = self._pool.max_task_duration
+        parsed_active: list[tuple[int, float]] = []
 
         for vm_id_str, start_ts_str in active.items():
             try:
@@ -1308,7 +1316,13 @@ class PoolManager:
                     start_ts_str,
                 )
                 continue
+            parsed_active.append((vm_id, start_ts))
 
+        activity_stale_infra_fault = self._activity_stale_infra_fault(
+            [vm_id for vm_id, _start_ts in parsed_active]
+        )
+
+        for vm_id, start_ts in parsed_active:
             raw_elapsed = now - start_ts
             if raw_elapsed < 0:
                 logger.warning(
@@ -1336,7 +1350,11 @@ class PoolManager:
                 # downstream (logging, _coordinate_reaped_vm) requires one,
                 # so the "no activity signal" case must exit via `continue`
                 # rather than widen `reason` to str | None.
-                activity_reason = self._activity_reap_reason(vm_id, now)
+                activity_reason = self._activity_reap_reason(
+                    vm_id,
+                    now,
+                    activity_stale_infra_fault=activity_stale_infra_fault,
+                )
                 if activity_reason is None:
                     continue
                 reason = activity_reason
@@ -1384,7 +1402,39 @@ class PoolManager:
                 continue
             self._destroy_stopped_vm(vm_id)
 
-    def _activity_reap_reason(self, vm_id: int, now: float) -> str | None:
+    def _activity_stale_infra_fault(self, vm_ids: list[int]) -> bool:
+        """Return True when activity-stale reaping should fail safe this pass."""
+        if len(vm_ids) < 2:
+            return False
+
+        missing = 0
+        for vm_id in vm_ids:
+            worker_id = self._vm_id_to_worker_id(vm_id)
+            heartbeat_present = self._worker_heartbeat_present(worker_id)
+            if heartbeat_present is None:
+                logger.warning(
+                    "Skipping activity-stale reaping this pass because a liveness "
+                    "heartbeat read failed"
+                )
+                return True
+            if heartbeat_present is False:
+                missing += 1
+
+        if missing == len(vm_ids):
+            logger.warning(
+                "Skipping activity-stale reaping this pass because every active "
+                "worker liveness heartbeat is absent"
+            )
+            return True
+        return False
+
+    def _activity_reap_reason(
+        self,
+        vm_id: int,
+        now: float,
+        *,
+        activity_stale_infra_fault: bool = False,
+    ) -> str | None:
         """Return the reap reason from *vm_id*'s activity record, below the
         max_task_duration ceiling (spec §6).
 
@@ -1443,6 +1493,15 @@ class PoolManager:
             return REAP_REASON_NEEDS_REAP
 
         if not self._activity_record_is_stale(record, now):
+            return None
+
+        if activity_stale_infra_fault:
+            # Activity and heartbeat are two process-level signals, but both
+            # are stored in Redis. When they vanish for the whole active fleet
+            # in one health-check pass, that is shared infrastructure failure,
+            # not independent proof that every young worker died. The durable
+            # fix is an out-of-band liveness source; until then, fail safe for
+            # activity_stale while preserving ceiling and needs_reap reaping.
             return None
 
         heartbeat_present = self._worker_heartbeat_present(worker_id)
