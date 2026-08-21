@@ -18,9 +18,9 @@ jobs:
       issues: read
 
     steps:
-      - name: Install dependencies (libatomic1, unzip, gh CLI)
+      - name: Install dependencies (libatomic1, unzip, jq, gh CLI)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq libatomic1 unzip
+          sudo apt-get update -qq && sudo apt-get install -y -qq libatomic1 unzip jq
           if ! command -v gh &>/dev/null; then
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
             echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null
@@ -113,9 +113,15 @@ jobs:
           EXECUTION_FILE="${{ steps.review.outputs.execution_file }}"
           ENVELOPE="no result envelope available"
           if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
-            EXTRACTED=$(jq -c '[.[] | select(.type == "result")] | last | {subtype, is_error, num_turns, total_cost_usd}' "$EXECUTION_FILE" 2>/dev/null)
-            if [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "null" ]; then
-              ENVELOPE="$EXTRACTED"
+            if ! command -v jq >/dev/null 2>&1; then
+              ENVELOPE="jq is not available; cannot parse result envelope"
+            elif EXTRACTED=$(jq -c '[.[] | select(.type == "result")] | last | {subtype, is_error, num_turns, total_cost_usd}' "$EXECUTION_FILE" 2>&1); then
+              if [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "null" ]; then
+                ENVELOPE="$EXTRACTED"
+              fi
+            else
+              PARSE_ERROR=$(printf '%s' "$EXTRACTED" | tr '\r\n' '  ' | head -c 300)
+              ENVELOPE="failed to parse result envelope with jq: ${PARSE_ERROR}"
             fi
           fi
 
