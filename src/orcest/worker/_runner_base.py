@@ -48,7 +48,8 @@ successful ``Popen`` and gets a tracker scoped to that one attempt, closed
 (``tracker.close()``) when the attempt ends regardless of outcome. When
 ``tracker_factory`` is ``None`` (the caller's ``watchdog.enabled: False``
 rollback lever), the fixed wall-clock watchdog runs byte-for-byte as before
--- this is the load-bearing rollback path, see ``global-constraints.md``.
+-- this is the rollback path operators fall back to when the ladder
+misbehaves, so it must not drift, see ``global-constraints.md``.
 
 Import note: this module must NOT import ``liveness_tracker`` (or its
 transitive dependency ``stream_liveness``) at module scope --
@@ -420,7 +421,7 @@ def _run_cli_agent(
             # *default arguments* (`_proc`, `_tracker`, `_interval`,
             # `_cancelled`, `_killed`, `_timeout`, `_attempt_start`) instead of
             # closing over the loop-body locals of the same name. That is
-            # load-bearing, not stylistic clutter: Python closures capture
+            # required for correctness, not stylistic clutter: Python closures capture
             # *variables*, not values, and `for attempt in range(...)` creates
             # no new scope, so every one of those names is rebound by the next
             # retry attempt. Default arguments are evaluated once, at `def`
