@@ -2,6 +2,13 @@
 
 Autonomous CI/CD orchestration system. Replaces the Ralph system.
 
+## Skills
+
+Canonical skills live in `.agents/skills/` and are symlinked into `.claude/skills`, `.grok/skills`, `.codex/skills`, `.gemini/skills`, `.opencode/skills`, and `.cursor/skills`.
+
+- **`/spec`** — Fully specify a system/feature, then file a GitHub issue graph with `blocked-by` links so the fleet can pick unblocked `orcest:ready` work. Do **not** implement in that session.
+- **`/review`** — Parallel review of local git changes (existing Claude skill).
+
 ## Architecture
 
 - **Orchestrator**: Single instance, polls GitHub, runs heuristics, enqueues tasks to Redis. Deployed via Docker Compose on `thayne-claude-dev-01.home.prefixa.net`.
