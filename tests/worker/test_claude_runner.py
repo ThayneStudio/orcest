@@ -585,9 +585,8 @@ def test_stream_json_529_overloaded_is_transient_not_usage_exhausted(mock_popen,
     """A 529 provider overload is retryable infrastructure, not usage exhaustion.
 
     Ported: summary is the generic driver's "Provider overloaded" (was
-    "Claude overloaded (529)" under the legacy loop); the load-bearing
-    contract is the transient/usage_exhausted flag pair, which loop.py keys
-    off — not the summary text.
+    "Claude overloaded (529)" under the legacy loop); what loop.py actually
+    keys off is the transient/usage_exhausted flag pair, not the summary text.
     """
     mock_cls, mock_proc = mock_popen
 

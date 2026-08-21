@@ -49,6 +49,9 @@ make format
 - Redis streams for task distribution, SET NX EX for locking
 - All GitHub interaction via `gh` CLI (not API directly)
 - Click for CLI, Rich for terminal output
+- Never use the word "load-bearing". Say what actually depends on the thing,
+  or what breaks without it. Applies to code comments, commit messages, PR and
+  issue text, and chat.
 
 ## Dashboard
 
