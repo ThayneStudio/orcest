@@ -157,3 +157,19 @@ def test_claude_review_workflow_pins_cli_and_keeps_known_good_args() -> None:
     assert all("--setting-sources" not in line for line in args_lines)
     assert any("Bash(gh *)" in line for line in args_lines)
     assert "continue-on-error: true" in text
+
+
+def test_claude_review_workflow_surfaces_missing_review() -> None:
+    """A crashed review step must be diagnosable from the Actions UI (#569).
+
+    `continue-on-error: true` (added by #552, kept by this issue) leaves the
+    claude-review check green even when the review step dies without
+    posting a review. `steps.<id>.outcome` is the only signal not masked by
+    continue-on-error, so the review step needs an `id` and a following step
+    guarded on that outcome that annotates (not fails) the run.
+    """
+    text = CLAUDE_REVIEW_WORKFLOW.read_text()
+    assert "id: review" in text
+    assert "if: steps.review.outcome == 'failure'" in text
+    assert "::warning::" in text
+    assert "show_full_output" not in text

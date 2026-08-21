@@ -50,6 +50,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE" checkout FETCH_HEAD
 
       - name: Run Claude Code Review
+        id: review
         # Pin the action SHA so its bundled Claude Code CLI cannot float
         # underneath this workflow. That is hygiene (same convention as
         # 178bfa8): a floating third-party tag is reason enough. This SHA
@@ -96,3 +97,34 @@ jobs:
           claude_args: '--allowedTools "Read,Write,Glob,Grep,Bash(gh *),mcp__github_inline_comment__create_inline_comment"'
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Surface missing review
+        # The review step above has continue-on-error: true (see #552), so a
+        # crashed Claude Action still reports the claude-review check as
+        # success with no review posted. steps.review.outcome (unlike
+        # .conclusion) is not masked by continue-on-error, so it is the only
+        # signal that distinguishes "reviewed, nothing blocking" from "never
+        # ran". This step does not fail the job — only annotates it — so it
+        # does not reintroduce the red-flagging #552 deliberately removed.
+        if: steps.review.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          EXECUTION_FILE="${{ steps.review.outputs.execution_file }}"
+          ENVELOPE="no result envelope available"
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            EXTRACTED=$(jq -c '[.[] | select(.type == "result")] | last | {subtype, is_error, num_turns, total_cost_usd}' "$EXECUTION_FILE" 2>/dev/null)
+            if [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "null" ]; then
+              ENVELOPE="$EXTRACTED"
+            fi
+          fi
+
+          echo "::warning::claude-review completed without posting a review for PR #${PR_NUMBER}. Result envelope: ${ENVELOPE}"
+
+          {
+            echo "## claude-review: no review posted"
+            echo ""
+            echo "The review step completed without posting a review for PR #${PR_NUMBER}."
+            echo ""
+            echo "Result envelope: \`${ENVELOPE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
