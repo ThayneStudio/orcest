@@ -7,8 +7,9 @@ name: Master verified
 # when the repo's own runners do not.
 #
 # Signal is this run failing, with a ::error:: naming the SHA and which
-# condition tripped (no run / wrong event / red jobs). It does not file
-# issues, comment, or label.
+# condition tripped (no run / wrong event / red jobs). In-progress
+# eligible runs emit ::notice:: and succeed so the next cron re-checks.
+# It does not file issues, comment, or label.
 
 on:
   schedule:
@@ -144,7 +145,11 @@ jobs:
                   )
 
               red = []
+              pending = []
               for run in eligible:
+                  if run.get("status") != "completed":
+                      pending.append(run)
+                      continue
                   jobs = jobs_by_name(repo, int(run["id"]))
                   if required_jobs_succeeded(jobs):
                       print(
@@ -154,7 +159,15 @@ jobs:
                       return
                   red.append(describe_red(run, jobs))
 
-              fail(sha, "red jobs", "; ".join(red))
+              if red:
+                  fail(sha, "red jobs", "; ".join(red))
+
+              detail = "; ".join(
+                  f"run {run['id']} event={run.get('event')} "
+                  f"status={run.get('status') or 'unknown'}"
+                  for run in pending
+              )
+              print(f"::notice::{sha}: in progress: {detail}")
 
           if __name__ == "__main__":
               main()
