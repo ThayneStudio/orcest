@@ -281,3 +281,61 @@ def test_healthy_schedule_run_passes(
     captured = capsys.readouterr().out
     assert "::error::" not in captured
     assert "schedule" in captured
+
+
+def test_in_progress_push_run_is_not_red_jobs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "ThayneStudio/orcest")
+    monkeypatch.setenv("SHA", HEALTHY_SHA)
+    ns = _load_assert_ns()
+    jobs = [_job(name, None, status="in_progress") for name in REQUIRED_JOBS]
+    _install_api(
+        ns,
+        runs=[_run(13, "push", conclusion=None, status="in_progress")],
+        jobs={13: jobs},
+    )
+
+    ns["main"]()
+
+    captured = capsys.readouterr().out
+    assert "::error::" not in captured
+    assert "red jobs" not in captured
+    assert "::notice::" in captured
+    assert "in progress" in captured
+    assert HEALTHY_SHA in captured
+    assert "13" in captured
+
+
+def test_completed_red_run_is_red_jobs_even_with_in_progress_sibling(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "ThayneStudio/orcest")
+    monkeypatch.setenv("SHA", RED_PUSH_SHA)
+    ns = _load_assert_ns()
+    red_jobs = _green_jobs()
+    for job in red_jobs:
+        if job["name"] == "lint":
+            job["conclusion"] = "failure"
+    pending_jobs = [_job(name, None, status="in_progress") for name in REQUIRED_JOBS]
+    _install_api(
+        ns,
+        runs=[
+            _run(14, "push", conclusion=None, status="in_progress", sha=RED_PUSH_SHA),
+            _run(15, "push", conclusion="failure", sha=RED_PUSH_SHA),
+        ],
+        jobs={
+            14: pending_jobs,
+            15: red_jobs,
+        },
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        ns["main"]()
+
+    assert exited.value.code == 1
+    captured = capsys.readouterr().out
+    assert RED_PUSH_SHA in captured
+    assert "red jobs" in captured
+    assert "lint=failure" in captured
+    assert "::notice::" not in captured
