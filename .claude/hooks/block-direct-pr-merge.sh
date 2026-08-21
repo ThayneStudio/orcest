@@ -51,11 +51,51 @@ fi
 flat=$(printf '%s' "$c" | tr '\n\r\t' '   ')
 flat=${flat//\\/ }
 
-# CLI subcommand (optional global flags between gh and pr), REST PUT
-# .../pulls/N/merge, and the GraphQL mutation.
+# CLI subcommand (optional global flags between gh and pr), REST
+# .../pulls/N/merge unless it is a single explicit GET, and the GraphQL
+# mutation.
 if printf '%s' "$flat" | grep -qiE \
-  '(^|[^[:alnum:]_.-])gh[[:space:]]+([^|;&]*[[:space:]]+)?pr[[:space:]]+merge|(^|[^[:alnum:]_.-])gh[[:space:]]+([^|;&]*[[:space:]]+)?api[^|;&]*pulls/[0-9]+/merge|mergePullRequest'; then
+  '(^|[^[:alnum:]_.-])gh[[:space:]]+([^|;&]*[[:space:]]+)?pr[[:space:]]+merge|mergePullRequest'; then
   printf '%s' "$DENY_MERGE"
+elif printf '%s' "$flat" | grep -qiE \
+  '(^|[^[:alnum:]_.-])gh[[:space:]]+([^|;&]*[[:space:]]+)?api[^|;&]*pulls/[0-9]+/merge'; then
+  has_compound=$(printf '%s' "$flat" | grep -qE '(;|&&|\|\||\||`|\$\()' && printf '1' || printf '0')
+  rest_allow=""
+  if [ "$has_compound" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+    rest_allow=$(COMMAND="$flat" python3 -c '
+import os
+import re
+import shlex
+
+try:
+    tokens = shlex.split(os.environ["COMMAND"])
+except ValueError:
+    raise SystemExit(0)
+
+if len(tokens) < 2 or tokens[0] != "gh" or "api" not in tokens[1:]:
+    raise SystemExit(0)
+
+api_index = tokens.index("api", 1)
+args = tokens[api_index + 1 :]
+has_merge_path = any(re.search(r"(^|/)pulls/[0-9]+/merge$", token) for token in args)
+methods = []
+for index, token in enumerate(args):
+    upper = token.upper()
+    if upper == "-X" or upper == "--METHOD":
+        if index + 1 < len(args):
+            methods.append(args[index + 1].upper())
+    elif upper.startswith("-X") and len(token) > 2:
+        methods.append(token[2:].upper())
+    elif upper.startswith("--METHOD="):
+        methods.append(token.split("=", 1)[1].upper())
+
+if has_merge_path and methods and all(method == "GET" for method in methods):
+    print("1")
+' 2>/dev/null || true)
+  fi
+  if [ "$rest_allow" != "1" ]; then
+    printf '%s' "$DENY_MERGE"
+  fi
 fi
 
 exit 0
