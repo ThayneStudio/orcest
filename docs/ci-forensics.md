@@ -92,14 +92,20 @@ sha=<head_sha>
 gh api "repos/ThayneStudio/orcest/actions/runs?head_sha=${sha}" --jq .total_count
 ```
 
-For the durable dropped-event reproducer:
+For the dropped-event reproducer as it stood on 2026-08-19:
 
 ```bash
 gh api "repos/ThayneStudio/orcest/actions/runs?head_sha=715e4f1" --jq .total_count
 ```
 
-Do not use `0f5d3dd` as the reproducer anymore: it now returns `1` because a
-later manual `workflow_dispatch` run carries the same head SHA.
+A SHA-based query outlives the PR check summary, but it is not permanently
+stable. `total_count` for a SHA stays at `0` only while no later workflow is
+associated with that SHA, and any later run raises it, including an
+unrelated manual `workflow_dispatch` against a ref that resolves to the same
+SHA. That already happened to `0f5d3dd`: it now returns `1`, so do not use
+it as the reproducer anymore, and expect `715e4f1` to stop reproducing the
+same way. Re-confirm the `0` yourself before citing a SHA as evidence of a
+dropped event; a count recorded earlier is not proof of the count today.
 
 If a required run is missing, dispatch CI manually:
 
