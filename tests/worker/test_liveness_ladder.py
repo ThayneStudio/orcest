@@ -395,7 +395,7 @@ def test_looping_precedes_ceiling_on_collision():
 
 
 def test_escalation_blocked_defers_stuck_kill():
-    """Finding 4 (ruled, and what B7 depends on): escalation_blocked=True
+    """Finding 4 (ruled; B7 depends on it): escalation_blocked=True
     defers a would-be STUCK kill -- state stays SUSPECT, nothing latches
     _done, and a later unblocked evaluate() can still kill if conditions
     persist."""
