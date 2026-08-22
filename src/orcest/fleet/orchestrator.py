@@ -1249,7 +1249,8 @@ def generate_env_file(
             # file currently reads a plural <PROV>_API_KEYS env var, so emitting
             # one would just produce dead output in generated .env files. Add a
             # reader (mirroring CLAUDE_CODE_OAUTH_TOKENS consumption in
-            # shared/config.py) before reintroducing the plural form.
+            # shared/config.py) before reintroducing the plural form. See
+            # docs/rollout-multi-provider.md#fleet-credential-multiplicity.
             env_name = {"grok": "XAI_API_KEY"}.get(prov, f"{prov.upper()}_API_KEY")
             lines.append(f"{env_name}='{toks[0]}'")
 

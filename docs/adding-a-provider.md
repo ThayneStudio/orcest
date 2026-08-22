@@ -97,6 +97,12 @@ obeying the **Provider Registration & Invocation Boundary**.
          gemini: ["AIza..."]
    ```
 
+   Fleet-provisioned multi-token round-robin is currently Claude-only. For
+   non-Claude `provider_credentials`, fleet emits only the first configured
+   credential as the provider's singular env var. See
+   `docs/rollout-multi-provider.md#fleet-credential-multiplicity` for the
+   current limitation and the worker/config + fleet changes needed for parity.
+
    Fleet credential generation emits the generic provider variable
    `GEMINI_API_KEY=...` into the project's `.env`. Docker Compose only forwards
    variables explicitly named in its `environment:` list, so add
