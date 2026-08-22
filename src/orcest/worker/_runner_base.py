@@ -73,7 +73,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import IO, TYPE_CHECKING, ClassVar
 
 from orcest.worker.runner import RunnerResult
 
@@ -379,8 +379,15 @@ def _run_cli_agent(
             # pipe/payload so a straggler cannot write the next retry's stdin.
             _stdin_writer: threading.Thread | None = None
             if stdin_input is not None and proc.stdin is not None:
+                # Bind non-optional locals so the `_stdin`/`_data` defaults
+                # keep their narrow types (same pattern as `attempt_tracker`).
+                attempt_stdin: IO[str] = proc.stdin
+                attempt_stdin_data: str = stdin_input
 
-                def _write_stdin(_stdin=proc.stdin, _data=stdin_input) -> None:
+                def _write_stdin(
+                    _stdin: IO[str] = attempt_stdin,
+                    _data: str = attempt_stdin_data,
+                ) -> None:
                     try:
                         _stdin.write(_data)
                         _stdin.close()
