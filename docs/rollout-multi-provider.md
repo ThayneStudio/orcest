@@ -125,7 +125,7 @@ orgs:
     github_token: ...
     claude_oauth_tokens: ["sk-..."]
     provider_credentials:
-      grok: ["xai-..."]   # list; first used for the env var in generated .env
+      grok: ["xai-..."]   # list; only the first credential is emitted today
 ```
 
 This example requires a scheduled `grok` worker profile. If the org also has
@@ -143,6 +143,21 @@ before rollout.
 - `XAI_API_KEY=...` (or `GROK_API_KEY`) for grok, and analogous `{UPPER}_API_KEY` for future providers
 
 These land in the orchestrator's Docker `.env` so that `providers:` entries with empty `credential` can fall back at config load time.
+
+### Fleet Credential Multiplicity
+
+Fleet-provisioned multi-token round-robin is currently Claude-only. Claude
+gets both `CLAUDE_CODE_OAUTH_TOKEN` and the comma-separated
+`CLAUDE_CODE_OAUTH_TOKENS`, which `shared/config.py` expands into multiple
+provider entries. For `provider_credentials` entries such as `grok` or future
+providers, fleet emits only the first configured credential as the singular
+provider env var (`XAI_API_KEY` or `{UPPER}_API_KEY`), so those providers cannot
+round-robin across multiple fleet-provisioned credentials yet.
+
+Until parity exists, configure one credential per non-Claude provider in fleet
+or manage additional rotation outside fleet. Unlocking parity requires both a
+plural reader on the worker/config side (mirroring
+`CLAUDE_CODE_OAUTH_TOKENS`) and a plural env-var emit path on the fleet side.
 
 Analogous support exists (or is added) for worker cloud-init `.env` files and the `_ENV_WHITELIST` + fallback logic in `claude_runner._build_env` so that a Task carrying `credential=""` for a provider will cause the worker to pick the value from its own `/opt/orcest/.env` (the declared `env_var` from the local registry entry).
 
