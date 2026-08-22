@@ -228,7 +228,6 @@ def _runner_for_task(task: Task, config: WorkerConfig, fallback: Runner) -> Runn
         return ClaudeInteractiveRunner(
             max_retries=config.runner.max_retries,
             retry_backoff=config.runner.retry_backoff,
-            model=config.runner.model,
         )
     recipe = PROVIDER_REGISTRY.get(task.provider)
     if recipe is None or recipe.runner_cls is None:
@@ -236,7 +235,6 @@ def _runner_for_task(task: Task, config: WorkerConfig, fallback: Runner) -> Runn
     return recipe.runner_cls(
         max_retries=config.runner.max_retries,
         retry_backoff=config.runner.retry_backoff,
-        model=config.runner.model,
     )
 
 
