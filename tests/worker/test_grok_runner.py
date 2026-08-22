@@ -348,5 +348,13 @@ def test_extract_credential_update_none_when_unchanged(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_extract_credential_update_none_when_original_has_trailing_whitespace(tmp_path) -> None:
+    auth = tmp_path / "auth.json"
+    blob = json.dumps({"key": "tok", "refresh_token": "rt"})
+    auth.write_text(blob)
+    assert GrokRunner().extract_credential_update(auth, f"{blob}\n") is None
+
+
+@pytest.mark.unit
 def test_extract_credential_update_none_when_missing(tmp_path) -> None:
     assert GrokRunner().extract_credential_update(tmp_path / "nope.json", "x") is None
