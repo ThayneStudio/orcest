@@ -1511,7 +1511,8 @@ def test_consume_results_transient_failure_over_budget_keeps_retrying(
     fake_redis_client, orchestrator_config, gh_mock
 ):
     """Past the transient budget, orcest keeps retrying at the capped backoff
-    cadence -- it never escalates a transient failure to needs-human."""
+    cadence -- even an attached needs-human flag cannot make a transient
+    failure terminal."""
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     orchestrator_config.max_transient_failures = 5
 
@@ -1528,6 +1529,8 @@ def test_consume_results_transient_failure_over_budget_keeps_retrying(
         status=ResultStatus.FAILED,
         pr_number=pr_number,
         summary="[transient] Timed out after 5400s",
+        needs_human=True,
+        needs_human_reason="ambiguous requirement",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
