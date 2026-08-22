@@ -4,6 +4,11 @@ Tails the per-worker Redis output streams (``output:<worker-id>``) and
 materializes one ``.jsonl`` file per task plus a ``.meta.json`` sidecar
 on a filesystem path owned by the operator (NFS, local disk, anything).
 
+Redis entries are byte-capped: lines larger than the live-tail budget are
+split across consecutive stream entries (``part`` / ``parts``). This
+archiver concatenates those parts so the ``.jsonl`` is the original
+stream-json, not the Redis-sized fragments.
+
 Orcest is filesystem-agnostic: the archiver only knows about a writable
 directory. ``OrchestratorConfig.trace_archive_path`` being ``None`` is the
 documented "fall back to Redis logging" mode — :meth:`TraceArchiver.start`
@@ -22,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
+from orcest.shared.output_streams import OutputLineAssembler
 from orcest.shared.redis_client import RedisClient
 
 _CURSOR_HASH_KEY = "trace_archiver:cursors"
@@ -72,6 +78,7 @@ class TraceArchiver:
         self._stream_to_current_task: dict[str, str] = {}
         self._archiver_paused = False
         self._last_writability_check: float = 0.0
+        self._line_assembler = OutputLineAssembler()
 
     def start(self) -> None:
         if self._archive_path is None:
@@ -185,6 +192,7 @@ class TraceArchiver:
     def _handle_task_start(self, stream: str, entry_id: str, fields: dict[str, str]) -> None:
         if self._archive_path is None:
             return
+        self._flush_pending_line(stream)
         task_id = fields.get("task_id", "")
         if not _TASK_ID_RE.match(task_id):
             self._logger.warning(
@@ -240,6 +248,7 @@ class TraceArchiver:
         self._write_index_pointer(task_id, rel.parent)
 
     def _handle_task_end(self, stream: str, entry_id: str, fields: dict[str, str]) -> None:
+        self._flush_pending_line(stream)
         task_id = fields.get("task_id", "")
         if not _TASK_ID_RE.match(task_id):
             return
@@ -262,6 +271,15 @@ class TraceArchiver:
             self._stream_to_current_task.pop(stream, None)
 
     def _handle_line(self, stream: str, fields: dict[str, str]) -> None:
+        for complete in self._line_assembler.push(stream, fields):
+            self._write_line(stream, complete)
+
+    def _flush_pending_line(self, stream: str) -> None:
+        leftover = self._line_assembler.flush(stream)
+        if leftover is not None:
+            self._write_line(stream, leftover)
+
+    def _write_line(self, stream: str, fields: dict[str, str]) -> None:
         task_id = self._stream_to_current_task.get(stream)
         if not task_id:
             return
@@ -328,5 +346,7 @@ class TraceArchiver:
             f.write(content)
 
     def _close_all_open_files(self, status_on_unclosed: str) -> None:
+        for stream, leftover in self._line_assembler.flush_all():
+            self._write_line(stream, leftover)
         for task_id in list(self._open_files.keys()):
             self._finalize_task(task_id, status=status_on_unclosed)

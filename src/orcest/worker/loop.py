@@ -57,6 +57,11 @@ from orcest.shared.models import (
     is_claude_provider,
     task_stream_name,
 )
+from orcest.shared.output_streams import (
+    OUTPUT_STREAM_MAXLEN as _OUTPUT_STREAM_MAXLEN,
+    OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
+    iter_capped_output_fields,
+)
 from orcest.shared.redis_client import RedisClient
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
@@ -76,7 +81,11 @@ HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 WORKER_LIVENESS_TTL = 150  # Covers two 60s task-heartbeat refresh intervals plus jitter.
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
-_STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB across 4 workers)
+# Results + dead-letter only. Output streams use the OUTPUT_STREAM_* budget
+# in orcest.shared.output_streams; do not reuse this cap for *:output:* —
+# entry-count MAXLEN does not bound RSS when stream-json payloads vary by
+# orders of magnitude.
+_STREAM_MAXLEN = 20000
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 _EPHEMERAL_RESULT_RETRY_SECONDS = 5
@@ -2241,10 +2250,16 @@ def _publish_task_output(
     raw_stream: bool,
     fields: dict[str, str],
 ) -> None:
-    if raw_stream:
-        redis.xadd_capped_raw(stream, fields, maxlen=_STREAM_MAXLEN)
-    else:
-        redis.xadd_capped(stream, fields, maxlen=_STREAM_MAXLEN)
+    # Split oversized lines into ≤4 KiB Redis entries so MAXLEN is a real
+    # byte bound. TraceArchiver concatenates ``part``/``parts`` back into
+    # the verbatim archive; live-tail only needs the first chunk.
+    for entry in iter_capped_output_fields(fields):
+        if raw_stream:
+            redis.xadd_capped_raw(stream, entry, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
+            redis.expire_raw(stream, _OUTPUT_STREAM_TTL_SECONDS)
+        else:
+            redis.xadd_capped(stream, entry, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
+            redis.expire(stream, _OUTPUT_STREAM_TTL_SECONDS)
 
 
 def _execute_task(

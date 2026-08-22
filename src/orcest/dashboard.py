@@ -21,6 +21,7 @@ import redis as redis_lib
 from rich.markup import escape as rich_escape
 
 from orcest.shared.models import DEAD_LETTER_STREAM
+from orcest.shared.output_streams import is_output_continuation
 from orcest.shared.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
@@ -673,6 +674,10 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             log = self.query_one("#worker-log", RichLog)
             for entry_id, fields in entries:
                 self._last_ids[worker_id] = entry_id
+                # Continuation chunks exist so TraceArchiver can reconstruct
+                # the verbatim line; live-tail only shows the first 4 KiB.
+                if is_output_continuation(fields):
+                    continue
                 # Task boundary markers have "type" field
                 if "type" in fields:
                     line_data = json.dumps(fields)

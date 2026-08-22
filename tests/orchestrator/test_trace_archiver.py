@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from orcest.orchestrator.trace_archiver import TraceArchiver, _entry_id_to_iso
+from orcest.shared.output_streams import iter_capped_output_fields
 
 
 @pytest.fixture
@@ -411,3 +412,67 @@ class TestArchiverDuplicateTaskStart:
         body = jsonls[0].read_text()
         assert "before duplicate" in body
         assert "after duplicate" in body
+
+
+class TestArchiverChunkReassembly:
+    def test_chunked_stream_json_is_archived_verbatim(
+        self, fake_redis_client, logger, archive_root
+    ):
+        """Redis-capped fragments must reassemble into the original line (#585)."""
+        archiver = TraceArchiver(
+            redis=fake_redis_client,
+            archive_path=str(archive_root),
+            repo_to_project={"owner/r": "myproj"},
+            logger=logger,
+        )
+        archiver._probe_writability()
+        original = json.dumps({"type": "user", "payload": "x" * (48 * 1024)})
+        _xadd(
+            fake_redis_client,
+            "output:w1",
+            {"type": "task_start", "task_id": "t-chunk", "repo": "owner/r"},
+        )
+        chunks = iter_capped_output_fields({"line": original, "task_id": "t-chunk"})
+        assert len(chunks) > 1
+        for chunk in chunks:
+            _xadd(fake_redis_client, "output:w1", chunk)
+        _xadd(
+            fake_redis_client,
+            "output:w1",
+            {"type": "task_end", "task_id": "t-chunk", "status": "completed"},
+        )
+        archiver._pump_output_streams()
+        jsonl = next(archive_root.rglob("t-chunk.jsonl"))
+        body = jsonl.read_text()
+        assert body.count(original) == 1
+        assert body.strip() == original
+
+    def test_chunked_stderr_is_archived_as_single_json_object(
+        self, fake_redis_client, logger, archive_root
+    ):
+        archiver = TraceArchiver(
+            redis=fake_redis_client,
+            archive_path=str(archive_root),
+            repo_to_project={"owner/r": "myproj"},
+            logger=logger,
+        )
+        archiver._probe_writability()
+        original = "stderr-payload-" + ("z" * (48 * 1024))
+        _xadd(
+            fake_redis_client,
+            "output:w1",
+            {"type": "task_start", "task_id": "t-err", "repo": "owner/r"},
+        )
+        for chunk in iter_capped_output_fields(
+            {"line": original, "stream": "stderr", "task_id": "t-err"}
+        ):
+            _xadd(fake_redis_client, "output:w1", chunk)
+        _xadd(
+            fake_redis_client,
+            "output:w1",
+            {"type": "task_end", "task_id": "t-err", "status": "completed"},
+        )
+        archiver._pump_output_streams()
+        jsonl = next(archive_root.rglob("t-err.jsonl"))
+        records = [json.loads(line) for line in jsonl.read_text().splitlines() if line]
+        assert records == [{"stderr": original}]
