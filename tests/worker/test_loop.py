@@ -21,6 +21,16 @@ from orcest.shared.models import (
     TaskResult,
     TaskType,
 )
+from orcest.shared.output_streams import (
+    OUTPUT_BUDGET_PROJECTS as _OUTPUT_BUDGET_PROJECTS,
+    OUTPUT_BUDGET_WORKERS as _OUTPUT_BUDGET_WORKERS,
+    OUTPUT_STREAM_BUDGET_BYTES as _OUTPUT_STREAM_BUDGET_BYTES,
+    OUTPUT_STREAM_MAX_ENTRY_BYTES as _OUTPUT_STREAM_MAX_ENTRY_BYTES,
+    OUTPUT_STREAM_MAXLEN as _OUTPUT_STREAM_MAXLEN,
+    OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
+    iter_capped_output_fields,
+    output_streams_worst_case_bytes,
+)
 from orcest.worker.loop import (
     _CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX,
     _HANDOFF_FINGERPRINT_FIELD,
@@ -47,6 +57,7 @@ from orcest.worker.loop import (
     _handoff_result_until_terminal,
     _make_abort_event,
     _publish_result_with_retry,
+    _publish_task_output,
     _runner_for_task,
     _signal_ephemeral_done,
     _stream_handoff_state,
@@ -793,8 +804,10 @@ class TestExecuteTask:
         mock_redis.xadd_capped.assert_any_call(
             stream,
             {"line": '{"role": "assistant"}\n', "task_id": sample_task.id},
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
         )
+        mock_redis.expire.assert_any_call(stream, _OUTPUT_STREAM_TTL_SECONDS)
 
     def test_stderr_callback_publishes_task_id_to_redis(
         self, local_worker_config, sample_task, mock_workspace
@@ -826,7 +839,11 @@ class TestExecuteTask:
         mock_redis.xadd_capped.assert_any_call(
             f"output:{local_worker_config.worker_id}",
             {"line": "warning\n", "stream": "stderr", "task_id": sample_task.id},
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
+        )
+        mock_redis.expire.assert_any_call(
+            f"output:{local_worker_config.worker_id}", _OUTPUT_STREAM_TTL_SECONDS
         )
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
@@ -918,17 +935,20 @@ class TestExecuteTask:
                 "worker_id": local_worker_config.worker_id,
                 "branch": "fix-ci",
             },
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
         )
         mock_redis.xadd_capped_raw.assert_any_call(
             stream,
             {"line": "line one\n", "task_id": task.id},
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
         )
         mock_redis.xadd_capped_raw.assert_any_call(
             stream,
             {"line": "warning\n", "stream": "stderr", "task_id": task.id},
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
         )
         mock_redis.xadd_capped_raw.assert_any_call(
             stream,
@@ -938,8 +958,10 @@ class TestExecuteTask:
                 "status": "completed",
                 "worker_id": local_worker_config.worker_id,
             },
-            maxlen=_STREAM_MAXLEN,
+            maxlen=_OUTPUT_STREAM_MAXLEN,
+            approximate=False,
         )
+        mock_redis.expire_raw.assert_any_call(stream, _OUTPUT_STREAM_TTL_SECONDS)
         output_calls = [
             call
             for call in mock_redis.xadd_capped.call_args_list
@@ -1184,6 +1206,105 @@ class TestExecuteTask:
             task.branch,
             task.token,
         )
+
+
+# ---------------------------------------------------------------------------
+# Output-stream memory budget (#585)
+# ---------------------------------------------------------------------------
+
+
+def test_output_stream_budget_holds_for_worst_case_fanout():
+    """Worst-case project × worker fan-out at max entry size must fit the budget.
+
+    Fails if `_OUTPUT_STREAM_MAXLEN` (or the per-entry cap) silently drifts
+    back toward the old 20000-entry estimate that filled the 1 GB Redis.
+    """
+    worst = output_streams_worst_case_bytes(_OUTPUT_BUDGET_PROJECTS, _OUTPUT_BUDGET_WORKERS)
+    assert worst <= _OUTPUT_STREAM_BUDGET_BYTES
+    # Live fleet: 4 projects × pool.size 4.
+    assert output_streams_worst_case_bytes(4, 4) <= _OUTPUT_STREAM_BUDGET_BYTES
+    # Incident shape: 4 projects × 6 workers = 24 *:output:* keys.
+    assert output_streams_worst_case_bytes(4, 6) <= _OUTPUT_STREAM_BUDGET_BYTES
+    redis_ceiling = 1024 * 1024 * 1024
+    # Output streams must leave at least half of the 1 GiB noeviction ceiling
+    # for :results, :events, task streams, locks, and AOF.
+    assert _OUTPUT_STREAM_BUDGET_BYTES <= redis_ceiling // 2
+    old_style = (
+        _OUTPUT_BUDGET_PROJECTS
+        * _OUTPUT_BUDGET_WORKERS
+        * 20000
+        * _OUTPUT_STREAM_MAX_ENTRY_BYTES
+        * 2
+    )
+    assert old_style > _OUTPUT_STREAM_BUDGET_BYTES
+
+
+def test_output_stream_budget_rejects_non_positive_fanout():
+    with pytest.raises(ValueError, match="positive"):
+        output_streams_worst_case_bytes(0, 4)
+    with pytest.raises(ValueError, match="positive"):
+        output_streams_worst_case_bytes(4, 0)
+
+
+def test_capped_output_fields_chunks_line_to_max_entry_bytes():
+    """A huge stream-json line is split so MAXLEN is a real byte bound."""
+    task_id = "t" * 36
+    line = "x" * (_OUTPUT_STREAM_MAX_ENTRY_BYTES + 1000)
+    chunks = iter_capped_output_fields({"line": line, "task_id": task_id})
+    assert len(chunks) > 1
+    assert "".join(c["line"] for c in chunks) == line
+    for chunk in chunks:
+        assert sum(len(v.encode("utf-8")) for v in chunk.values()) <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+        assert chunk["task_id"] == task_id
+        assert int(chunk["parts"]) == len(chunks)
+
+
+def test_capped_output_fields_leaves_short_lines_and_markers_unchanged():
+    short = {"line": "hello\n", "task_id": "abc"}
+    assert iter_capped_output_fields(short) == [short]
+    marker = {"type": "task_start", "task_id": "abc"}
+    assert iter_capped_output_fields(marker)[0] is marker
+
+
+def test_capped_output_fields_preserves_utf8_across_chunk_boundary():
+    """A cut inside a multi-byte code point must not drop or replace characters."""
+    line = "é" * (_OUTPUT_STREAM_MAX_ENTRY_BYTES)
+    chunks = iter_capped_output_fields({"line": line, "task_id": "x"})
+    assert "".join(c["line"] for c in chunks) == line
+    for chunk in chunks:
+        chunk["line"].encode("utf-8")  # must be valid UTF-8
+        assert sum(len(v.encode("utf-8")) for v in chunk.values()) <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+
+
+def test_publish_task_output_sets_ttl_and_trims_exactly(fake_redis_client):
+    """Output streams expire and are capped by exact MAXLEN, not the results cap."""
+    stream = "output:worker-1"
+    huge = "x" * (_OUTPUT_STREAM_MAX_ENTRY_BYTES * 2)
+    _publish_task_output(fake_redis_client, stream, False, {"line": huge, "task_id": "t1"})
+    ttl = fake_redis_client.ttl(stream)
+    assert 0 < ttl <= _OUTPUT_STREAM_TTL_SECONDS
+    entries = fake_redis_client.xread_after(stream, "0-0", count=20)
+    assert len(entries) > 1
+    assert "".join(payload["line"] for _, payload in entries) == huge
+    for _, payload in entries:
+        total = sum(len(v.encode("utf-8")) for v in payload.values())
+        assert total <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+
+    for i in range(_OUTPUT_STREAM_MAXLEN + 25):
+        _publish_task_output(
+            fake_redis_client, stream, False, {"line": f"line-{i}", "task_id": "t1"}
+        )
+    assert fake_redis_client.xlen(stream) == _OUTPUT_STREAM_MAXLEN
+    assert 0 < fake_redis_client.ttl(stream) <= _OUTPUT_STREAM_TTL_SECONDS
+
+
+def test_publish_task_output_raw_sets_ttl_on_fully_qualified_key(fake_redis_client):
+    stream = "projectA:output:worker-1"
+    _publish_task_output(fake_redis_client, stream, True, {"line": "hello", "task_id": "t1"})
+    ttl = fake_redis_client.client.ttl(stream)
+    assert 0 < ttl <= _OUTPUT_STREAM_TTL_SECONDS
+    # Raw writes must not land under the client's default prefix.
+    assert fake_redis_client.xlen("output:worker-1") == 0
 
 
 # ---------------------------------------------------------------------------

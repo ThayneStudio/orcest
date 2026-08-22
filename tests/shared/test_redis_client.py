@@ -166,6 +166,17 @@ def test_xadd_capped_trims(fake_redis_client):
     assert length >= 1, "stream should not be empty after 30 inserts"
 
 
+def test_xadd_capped_exact_trim(fake_redis_client):
+    """approximate=False trims the stream to exactly maxlen."""
+    stream = "output:worker-1"
+    maxlen = 10
+    for i in range(30):
+        fake_redis_client.xadd_capped(
+            stream, {"line": f"line-{i}"}, maxlen=maxlen, approximate=False
+        )
+    assert fake_redis_client.xlen(stream) == maxlen
+
+
 def test_xadd_capped_rejects_zero_maxlen(fake_redis_client):
     """xadd_capped raises ValueError when maxlen is not positive."""
     with pytest.raises(ValueError, match="maxlen must be positive"):
