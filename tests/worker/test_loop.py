@@ -4572,8 +4572,9 @@ class TestRunnerForTask:
 
         assert isinstance(runner, ClaudeRunner)
         assert runner is not fallback
-        # RunnerConfig.model flows through to the freshly-instantiated runner.
-        assert runner.model == "some-test-model"
+        # Model is resolved at run() (task.model or config.runner.model), not
+        # construction time — stashing it on the instance is unused (issue #538).
+        assert runner.model == ""
 
     def test_claude_provider_dispatch_honors_interactive_mode(self, sample_task, tmp_path):
         """A Claude task reached through provider dispatch keeps interactive mode."""
@@ -4599,7 +4600,8 @@ class TestRunnerForTask:
 
         assert isinstance(runner, ClaudeInteractiveRunner)
         assert runner is not fallback
-        assert runner.model == "some-test-model"
+        # Model is resolved at run(), not construction (issue #538).
+        assert runner.model == ""
 
     def test_clauder_provider_dispatch_honors_interactive_mode(self, sample_task, tmp_path):
         """A clauder task uses the PTY Claude runner for isolated interactive pools."""
@@ -4626,7 +4628,8 @@ class TestRunnerForTask:
 
         assert isinstance(runner, ClaudeInteractiveRunner)
         assert runner is not fallback
-        assert runner.model == "some-test-model"
+        # Model is resolved at run(), not construction (issue #538).
+        assert runner.model == ""
 
     def test_codex_provider_dispatches_to_codex_runner(
         self, local_worker_config, sample_task, monkeypatch
