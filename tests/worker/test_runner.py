@@ -18,7 +18,21 @@ from orcest.worker.runner import (
     create_runner,
     get_provider_recipe,
     get_unsupported_reason,
+    prime_provider_binaries,
+    reset_provider_binary_cache,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_binary_cache():
+    """Isolate the module-level shutil.which memo between tests.
+
+    get_unsupported_reason caches its $PATH probe for the process lifetime, so
+    a test that monkeypatches shutil.which must not inherit (or leak) an entry.
+    """
+    reset_provider_binary_cache()
+    yield
+    reset_provider_binary_cache()
 
 
 @pytest.mark.unit
@@ -276,3 +290,73 @@ def test_grok_without_support_reports_missing_binary(monkeypatch) -> None:
     assert reason is not None
     assert 'missing binary "grok"' in reason
     assert "grok" in reason
+
+
+@pytest.mark.unit
+def test_get_unsupported_reason_probes_path_once_per_binary(monkeypatch) -> None:
+    """shutil.which runs at most once per binary, however many tasks arrive.
+
+    The baked binary set is fixed for the life of the worker process, so the
+    per-task check must not re-stat the filesystem (issue #534).
+    """
+    calls: list[str] = []
+
+    def counting_which(name: str) -> str | None:
+        calls.append(name)
+        return f"/usr/local/bin/{name}"
+
+    monkeypatch.setattr(shutil, "which", counting_which)
+
+    for _ in range(5):
+        assert get_unsupported_reason("grok") is None
+    assert calls == ["grok"]
+
+    # "claude" and "clauder" share one binary, so they share one probe.
+    for _ in range(3):
+        assert get_unsupported_reason("claude") is None
+        assert get_unsupported_reason("clauder") is None
+    assert calls == ["grok", "claude"]
+
+
+@pytest.mark.unit
+def test_missing_binary_result_is_cached_too(monkeypatch) -> None:
+    """A negative probe is memoized as well, and keeps the rebake message."""
+    calls: list[str] = []
+
+    def missing_which(name: str) -> str | None:
+        calls.append(name)
+        return None
+
+    monkeypatch.setattr(shutil, "which", missing_which)
+
+    first = get_unsupported_reason("grok")
+    second = get_unsupported_reason("grok")
+    assert first == second
+    assert first is not None
+    assert 'missing binary "grok"' in first
+    assert calls == ["grok"]
+
+
+@pytest.mark.unit
+def test_prime_provider_binaries_resolves_every_registered_binary(monkeypatch) -> None:
+    """Startup priming probes each distinct baked binary exactly once."""
+    calls: list[str] = []
+
+    def counting_which(name: str) -> str | None:
+        calls.append(name)
+        return f"/usr/local/bin/{name}"
+
+    monkeypatch.setattr(shutil, "which", counting_which)
+
+    baked = prime_provider_binaries()
+
+    expected = {r.binary for r in PROVIDER_REGISTRY.values() if r.binary}
+    assert set(baked) == expected
+    assert sorted(calls) == sorted(expected)
+    # Empty-binary entries (noop) are never probed.
+    assert "" not in baked
+
+    # Post-priming lookups add no further probes.
+    for provider in PROVIDER_REGISTRY:
+        get_unsupported_reason(provider)
+    assert sorted(calls) == sorted(expected)
