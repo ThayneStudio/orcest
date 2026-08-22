@@ -1121,6 +1121,45 @@ def test_run_claude_omits_model_flag_when_empty(mock_popen, tmp_path):
     assert "--model" not in mock_cls.call_args[0][0]
 
 
+@pytest.mark.unit
+def test_run_model_reaches_cli_only_through_build_argv(mock_popen, tmp_path, mocker):
+    """The model passed to run() is always the one build_argv sees.
+
+    Regression pin for issue #539: an earlier driver took a pre-built
+    ``cmd_argv`` alongside ``model`` and silently ignored ``model`` whenever
+    both were given. That parameter is gone -- build_argv is the only place
+    argv is constructed -- so run() must have no argv-override parameter and
+    must hand its resolved model straight to the hook.
+    """
+    import inspect
+
+    mock_cls, mock_proc = mock_popen
+    mock_proc.stdout = iter(_make_stdout_lines("ok"))
+    mock_proc.stderr = iter([])
+    mock_proc.returncode = 0
+
+    params = inspect.signature(_BaseCliRunner.run).parameters
+    assert not [name for name in params if "argv" in name], (
+        "run() gained an argv-override parameter; model would be silently "
+        "ignored for callers passing both (issue #539)"
+    )
+
+    spy = mocker.spy(ClaudeRunner, "build_argv")
+    # self.model is the fallback; the explicit run(model=...) must win.
+    runner = ClaudeRunner(max_retries=1, retry_backoff=0, model="fallback-model")
+    runner.run(
+        prompt=PROMPT,
+        work_dir=tmp_path,
+        token=TOKEN,
+        timeout=1800,
+        model="claude-opus-4-7",
+    )
+
+    assert spy.call_args.args[3] == "claude-opus-4-7"
+    cmd = mock_cls.call_args[0][0]
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-7"
+
+
 # ---------------------------------------------------------------------------
 # Timeout that is actually a usage-cap stall
 # ---------------------------------------------------------------------------

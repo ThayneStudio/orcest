@@ -893,6 +893,17 @@ class _BaseCliRunner(ABC):
         home_dir: Path | None = None,
         tracker_factory: Callable[[int], LivenessTracker] | None = None,
     ) -> RunnerResult:
+        """Resolve provider/binary/credential/model, then run the CLI driver.
+
+        ``model`` falls back to the runner's construction-time ``self.model``
+        when the caller passes none, and the resolved value reaches the CLI
+        through exactly one path: the driver calls ``build_argv`` with it.
+        Keep it that way. A second entry point taking an already-built argv
+        (the deleted ``cmd_argv`` parameter, issue #539) makes ``model`` a
+        no-op for callers who pass both, with nothing to tell them the flag
+        never reached the CLI. Providers needing different argv override
+        ``build_argv``.
+        """
         from orcest.worker.runner import get_provider_recipe
 
         if not credential and claude_token:
