@@ -21,16 +21,20 @@ from orcest.shared.models import (
     TaskResult,
     TaskType,
 )
+from orcest.shared.output_streams import (
+    OUTPUT_BUDGET_PROJECTS as _OUTPUT_BUDGET_PROJECTS,
+    OUTPUT_BUDGET_WORKERS as _OUTPUT_BUDGET_WORKERS,
+    OUTPUT_STREAM_BUDGET_BYTES as _OUTPUT_STREAM_BUDGET_BYTES,
+    OUTPUT_STREAM_MAX_ENTRY_BYTES as _OUTPUT_STREAM_MAX_ENTRY_BYTES,
+    OUTPUT_STREAM_MAXLEN as _OUTPUT_STREAM_MAXLEN,
+    OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
+    iter_capped_output_fields,
+    output_streams_worst_case_bytes,
+)
 from orcest.worker.loop import (
     _CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX,
     _HANDOFF_FINGERPRINT_FIELD,
     _HANDOFF_MARKER_TTL_SECONDS,
-    _OUTPUT_BUDGET_PROJECTS,
-    _OUTPUT_BUDGET_WORKERS,
-    _OUTPUT_STREAM_BUDGET_BYTES,
-    _OUTPUT_STREAM_MAX_ENTRY_BYTES,
-    _OUTPUT_STREAM_MAXLEN,
-    _OUTPUT_STREAM_TTL_SECONDS,
     _RESULT_PUBLISH_BACKOFF,
     _RESULT_PUBLISH_RETRIES,
     _STREAM_MAXLEN,
@@ -43,7 +47,6 @@ from orcest.worker.loop import (
     CoordinationIdentity,
     ResultHandoff,
     ResultPublishOutcome,
-    _bound_output_fields,
     _check_gh_credentials,
     _cleanup_coordination_once,
     _credential_checkpoint_key,
@@ -60,7 +63,6 @@ from orcest.worker.loop import (
     _stream_handoff_state,
     _task_result,
     _wait_for_redis,
-    output_streams_worst_case_bytes,
     run_worker,
 )
 from orcest.worker.runner import PROVIDER_REGISTRY, ProviderRecipe, RunnerResult
@@ -1244,32 +1246,34 @@ def test_output_stream_budget_rejects_non_positive_fanout():
         output_streams_worst_case_bytes(4, 0)
 
 
-def test_bound_output_fields_caps_line_to_max_entry_bytes():
-    """A huge stream-json line is truncated so MAXLEN is a real byte bound."""
+def test_capped_output_fields_chunks_line_to_max_entry_bytes():
+    """A huge stream-json line is split so MAXLEN is a real byte bound."""
     task_id = "t" * 36
-    other_bytes = len(task_id.encode("utf-8"))
     line = "x" * (_OUTPUT_STREAM_MAX_ENTRY_BYTES + 1000)
-    bounded = _bound_output_fields({"line": line, "task_id": task_id})
-    total = sum(len(v.encode("utf-8")) for v in bounded.values())
-    assert total <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
-    assert len(bounded["line"].encode("utf-8")) == _OUTPUT_STREAM_MAX_ENTRY_BYTES - other_bytes
-    assert bounded["task_id"] == task_id
+    chunks = iter_capped_output_fields({"line": line, "task_id": task_id})
+    assert len(chunks) > 1
+    assert "".join(c["line"] for c in chunks) == line
+    for chunk in chunks:
+        assert sum(len(v.encode("utf-8")) for v in chunk.values()) <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+        assert chunk["task_id"] == task_id
+        assert int(chunk["parts"]) == len(chunks)
 
 
-def test_bound_output_fields_leaves_short_lines_and_markers_unchanged():
+def test_capped_output_fields_leaves_short_lines_and_markers_unchanged():
     short = {"line": "hello\n", "task_id": "abc"}
-    assert _bound_output_fields(short) == short
+    assert iter_capped_output_fields(short) == [short]
     marker = {"type": "task_start", "task_id": "abc"}
-    assert _bound_output_fields(marker) is marker
+    assert iter_capped_output_fields(marker)[0] is marker
 
 
-def test_bound_output_fields_handles_utf8_multibyte_at_cut():
-    """Truncation must not raise, even when the cut lands inside a code point."""
+def test_capped_output_fields_preserves_utf8_across_chunk_boundary():
+    """A cut inside a multi-byte code point must not drop or replace characters."""
     line = "é" * (_OUTPUT_STREAM_MAX_ENTRY_BYTES)
-    bounded = _bound_output_fields({"line": line, "task_id": "x"})
-    bounded["line"].encode("utf-8")  # must be valid UTF-8
-    total = sum(len(v.encode("utf-8")) for v in bounded.values())
-    assert total <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+    chunks = iter_capped_output_fields({"line": line, "task_id": "x"})
+    assert "".join(c["line"] for c in chunks) == line
+    for chunk in chunks:
+        chunk["line"].encode("utf-8")  # must be valid UTF-8
+        assert sum(len(v.encode("utf-8")) for v in chunk.values()) <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
 
 
 def test_publish_task_output_sets_ttl_and_trims_exactly(fake_redis_client):
@@ -1279,10 +1283,12 @@ def test_publish_task_output_sets_ttl_and_trims_exactly(fake_redis_client):
     _publish_task_output(fake_redis_client, stream, False, {"line": huge, "task_id": "t1"})
     ttl = fake_redis_client.ttl(stream)
     assert 0 < ttl <= _OUTPUT_STREAM_TTL_SECONDS
-    entries = fake_redis_client.xread_after(stream, "0-0", count=10)
-    assert len(entries) == 1
-    payload = entries[0][1]
-    assert sum(len(v.encode("utf-8")) for v in payload.values()) <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
+    entries = fake_redis_client.xread_after(stream, "0-0", count=20)
+    assert len(entries) > 1
+    assert "".join(payload["line"] for _, payload in entries) == huge
+    for _, payload in entries:
+        total = sum(len(v.encode("utf-8")) for v in payload.values())
+        assert total <= _OUTPUT_STREAM_MAX_ENTRY_BYTES
 
     for i in range(_OUTPUT_STREAM_MAXLEN + 25):
         _publish_task_output(
