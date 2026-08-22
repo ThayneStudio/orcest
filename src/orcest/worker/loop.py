@@ -67,6 +67,7 @@ from orcest.worker.runner import (
     RunnerResult,
     create_runner,
     get_unsupported_reason,
+    prime_provider_binaries,
 )
 from orcest.worker.workspace import Workspace, WorkspaceError
 
@@ -1036,6 +1037,14 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     """
     logger = setup_logging("worker", config.worker_id)
     _check_gh_credentials(logger)
+    # Probe $PATH once per baked provider binary here so the per-task
+    # unsupported-provider check below is a pure dict lookup.
+    baked = prime_provider_binaries()
+    logger.info(
+        "Provider binaries: %s",
+        ", ".join(f"{name}={'ok' if path else 'MISSING'}" for name, path in sorted(baked.items()))
+        or "none",
+    )
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
 
