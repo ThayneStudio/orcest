@@ -25,6 +25,46 @@ ln -s ../../.agents/skills/spec .grok/skills/spec
 
 Do not add harness-only frontmatter (`allowed-tools`, Claude `argument-hint`, etc.). Portable fields are `name` and `description` only.
 
+## Symlinks and Windows checkouts
+
+The per-harness directories are symlinks, not copies:
+
+```
+.claude/skills/spec
+.codex/skills/spec
+.cursor/skills/spec
+.gemini/skills/spec
+.grok/skills/spec
+.opencode/skills/spec
+```
+
+each point at `../../.agents/skills/spec`. That only survives a checkout where
+Git can create symlinks. On Windows, creating one requires Developer Mode or an
+elevated shell, so `core.symlinks` is commonly off — and Git then materializes
+each entry as a **plain text file containing the relative path** instead of a
+link. The harness finds no `SKILL.md` under that path and simply never offers
+`/spec`, with no error saying why.
+
+Check for it: if `.claude/skills/spec` is a small regular file whose contents
+are `../../.agents/skills/spec`, this is what happened.
+
+Fix it, then re-materialize the working tree:
+
+```bash
+git config --global core.symlinks true   # plus Developer Mode, or an elevated shell
+rm .claude/skills/spec .codex/skills/spec .cursor/skills/spec \
+   .gemini/skills/spec .grok/skills/spec .opencode/skills/spec
+git checkout -- .
+```
+
+The `rm` matters: with the placeholder files present, Git sees no difference
+between index and working tree (the blob *is* that path text), so `git checkout`
+alone is a no-op. Deleting them first makes Git restore each one — as a real
+symlink this time. A fresh clone after setting `core.symlinks` works too.
+
+Failing all that, copy `.agents/skills/spec/` into whichever provider directory
+your harness reads — but keep editing the canonical copy under `.agents/skills/`.
+
 ## What travels with it
 
 - `SKILL.md` — discipline and gates

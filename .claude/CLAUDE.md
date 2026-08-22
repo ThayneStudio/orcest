@@ -4,7 +4,7 @@ Autonomous CI/CD orchestration system. Replaces the Ralph system.
 
 ## Skills
 
-Canonical skills live in `.agents/skills/` and are symlinked into `.claude/skills`, `.grok/skills`, `.codex/skills`, `.gemini/skills`, `.opencode/skills`, and `.cursor/skills`.
+Canonical skills live in `.agents/skills/` and are symlinked into `.claude/skills`, `.grok/skills`, `.codex/skills`, `.gemini/skills`, `.opencode/skills`, and `.cursor/skills`. Those symlinks need `core.symlinks` at checkout time; on a Windows clone without it they land as plain text files and the skill silently never loads — see [`.agents/skills/spec/references/packaging.md`](../.agents/skills/spec/references/packaging.md#symlinks-and-windows-checkouts).
 
 - **`/spec`** — Fully specify a system/feature, then file a GitHub issue graph with `blocked-by` links so the fleet can pick unblocked `orcest:ready` work. Do **not** implement in that session.
 - **`/review`** — Parallel review of local git changes (existing Claude skill).
