@@ -3194,7 +3194,7 @@ def _handle_result(
     # Orcest never infers needs-human from a failure or a budget count -- an
     # ordinary fix-attempt failure is just retried on the next eligible cycle.
     labeled = False
-    needs_human = result.status == ResultStatus.FAILED and result.needs_human
+    needs_human = result.status == ResultStatus.FAILED and not is_transient and result.needs_human
     if result.status == ResultStatus.FAILED and not is_transient and not is_issue:
         # The total-attempt counter only paces the retry cadence (see the
         # SKIP_MAX_TOTAL_ATTEMPTS handler); it never escalates.
