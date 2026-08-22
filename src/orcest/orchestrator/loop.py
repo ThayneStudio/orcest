@@ -1015,23 +1015,14 @@ def _mark_usage_exhausted_token(
 ) -> None:
     """Generalized for ProviderPool: mark the entry for the task exhausted.
 
-    Uses get_task_entry (lean ProviderEntry) when available for provider-aware
-    fallback query (only claude uses the anthropic usage endpoint; others rely on
-    rate_limit_resets_at from worker result). Falls back to legacy get_task_token
-    for mocks / old shims. All logging uses only masked identity().
+    Uses get_task_entry (lean ProviderEntry) for provider-aware fallback query
+    (only claude uses the anthropic usage endpoint; others rely on
+    rate_limit_resets_at from worker result). All logging uses only masked
+    identity().
     """
     if token_pool is None:
         return
     entry = token_pool.get_task_entry(result.task_id)
-    # Support legacy MagicMock tests and old registration paths that only
-    # implement the token shim: if get_task_entry gave no real ProviderEntry,
-    # fall back.
-    if not isinstance(entry, ProviderEntry):
-        cred = token_pool.get_task_token(result.task_id)
-        if cred:
-            entry = ProviderEntry(provider="claude", credential=cred, model=None)
-        else:
-            entry = None
     ident = entry.identity() if entry else account_key or "?"
     prov = entry.provider if entry else (account_key.partition(":")[0] if account_key else "?")
     logger.info(
@@ -1046,7 +1037,7 @@ def _mark_usage_exhausted_token(
 
         cooldown_until = datetime.fromtimestamp(result.rate_limit_resets_at, tz=timezone.utc)
         logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
-    elif entry and is_claude_provider(prov) and hasattr(entry, "credential") and entry.credential:
+    elif entry and is_claude_provider(prov) and entry.credential:
         try:
             cooldown_until = get_token_reset_time(entry.credential)
         except Exception as e:
@@ -3097,7 +3088,7 @@ def _handle_result(
     ):
         if token_pool is not None:
             entry = token_pool.get_task_entry(result.task_id)
-            if entry and hasattr(entry, "provider"):
+            if entry:
                 prov = entry.provider
                 rkey = f"providers:{prov}:rebake_required_failures"
                 try:

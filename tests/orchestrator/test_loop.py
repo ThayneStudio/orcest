@@ -3222,6 +3222,9 @@ def test_stale_pending_usage_exhausted_marks_token_before_return(
     gh_mock,
     mocker,
 ):
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     project = orchestrator_config.projects[0]
@@ -3242,8 +3245,12 @@ def test_stale_pending_usage_exhausted_marks_token_before_return(
         snapshot_head_sha="sha-current",
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    token_pool = mocker.MagicMock()
-    token_pool.get_task_token.return_value = "exhausted-token"
+    mocker.patch("orcest.orchestrator.loop.get_token_reset_time", return_value=None)
+    entry = ProviderEntry(provider="claude", credential="exhausted-token")
+    token_pool = ProviderPool([entry])
+    token_pool.register_task("old-task", entry)
+    mark_spy = mocker.spy(token_pool, "mark_exhausted")
+    completed_spy = mocker.spy(token_pool, "task_completed")
 
     _consume_results_for_project(
         project,
@@ -3253,9 +3260,10 @@ def test_stale_pending_usage_exhausted_marks_token_before_return(
         token_pool=token_pool,
     )
 
-    token_pool.mark_exhausted.assert_called_once()
-    token_pool.task_completed.assert_called_once_with("old-task")
+    mark_spy.assert_called_once()
+    completed_spy.assert_called_once_with("old-task")
     gh_mock.post_comment.assert_not_called()
+    assert token_pool.available_count == 0
 
 
 def test_structured_ci_result_stales_when_target_url_changes(
