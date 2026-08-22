@@ -112,6 +112,19 @@ def _reaped_events(rc) -> list[dict]:
 
 
 class TestActivityAwareHealthCheck:
+    def test_active_pool_read_failure_does_not_destroy(self, fake_redis_client, mocker):
+        """A Redis read failure means the reaper cannot trust its view of the
+        pool, so it must fail safe instead of destroying a healthy VM."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        rc.hset("pool:active", "305", str(time.time() - 153))
+        mocker.patch.object(rc, "hgetall", side_effect=RuntimeError("redis unavailable"))
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
     def test_fresh_record_blocks_destroy_below_ceiling(self, fake_redis_client):
         """A fresh, non-needs_reap activity record blocks destruction even
         though the worker has been active for a while -- below the ceiling
@@ -121,6 +134,26 @@ class TestActivityAwareHealthCheck:
         now = time.time()
         rc.hset("pool:active", "305", str(now - 10000))  # elapsed 10000s < 25200 ceiling
         _write_activity_record(rc, needs_reap=False, last_liveness_ts=now)
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_fleetwide_missing_liveness_below_ceiling_not_activity_stale_destroyed(
+        self, fake_redis_client
+    ):
+        """When every active worker's Redis-backed liveness records disappear
+        together, young VMs are not destroyed on activity_stale. That pattern
+        is one shared Redis failure domain, not independent confirmation that
+        every worker died."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 153))
+        rc.hset("pool:active", "306", str(now - 182))
+        _claim_pending_task(rc, "orcest-worker-305")
+        _claim_pending_task(rc, "orcest-worker-306")
 
         manager._health_check()
 
