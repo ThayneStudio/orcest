@@ -206,7 +206,7 @@ class GrokRunner(_BaseCliRunner):
         except OSError:
             return None
         # Only surface a change (token refreshed/rotated in place).
-        if not current.strip() or current == original:
+        if not current.strip() or current == original.strip():
             return None
         # Guard against a partial/corrupt write (e.g. grok killed mid-refresh):
         # never propagate an invalid blob — it would be persisted to Redis and
