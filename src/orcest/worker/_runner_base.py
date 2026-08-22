@@ -371,12 +371,28 @@ def _run_cli_agent(
                     )
 
         try:
+            # prompt_via_stdin=True (Codex) must write from a background
+            # thread. A blocking write on the main thread deadlocks if the
+            # child fills its stdout pipe (~64 KB) before reading stdin:
+            # the child blocks on stdout, the parent blocks on stdin, and
+            # no drain has started yet. Default args freeze this attempt's
+            # pipe/payload so a straggler cannot write the next retry's stdin.
+            _stdin_writer: threading.Thread | None = None
             if stdin_input is not None and proc.stdin is not None:
-                try:
-                    proc.stdin.write(stdin_input)
-                    proc.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
+
+                def _write_stdin(_stdin=proc.stdin, _data=stdin_input) -> None:
+                    try:
+                        _stdin.write(_data)
+                        _stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
+
+                _stdin_writer = threading.Thread(target=_write_stdin, daemon=True)
+                _stdin_writer.start()
+
+            def _join_stdin_writer() -> None:
+                if _stdin_writer is not None:
+                    _stdin_writer.join(timeout=5)
 
             auth_required = threading.Event()
 
@@ -396,6 +412,7 @@ def _run_cli_agent(
                 stderr_lines, stderr_thread = _drain_stderr(proc, on_stderr=_handle_stderr)
             except RuntimeError:
                 _kill_process_tree(proc)
+                _join_stdin_writer()
                 _close_pipes(proc)
                 if attempt < runner.max_retries:
                     abort_event.wait(timeout=runner.retry_backoff)
@@ -406,6 +423,7 @@ def _run_cli_agent(
             if proc.stdout is None:  # pragma: no cover
                 _kill_process_tree(proc)
                 stderr_thread.join(timeout=5)
+                _join_stdin_writer()
                 _close_pipes(proc)
                 raise RuntimeError("Popen stdout pipe is None despite PIPE flag")
 
@@ -517,6 +535,7 @@ def _run_cli_agent(
             except RuntimeError:
                 _kill_process_tree(proc)
                 stderr_thread.join(timeout=5)
+                _join_stdin_writer()
                 _close_pipes(proc)
                 if attempt < runner.max_retries:
                     abort_event.wait(timeout=runner.retry_backoff)
@@ -551,6 +570,7 @@ def _run_cli_agent(
                         watchdog_thread.join(timeout=5)
                         _kill_process_tree(proc)
                         stderr_thread.join(timeout=5)
+                        _join_stdin_writer()
                         _close_pipes(proc)
                         if logger:
                             logger.warning("%s subprocess killed: lock lost", binary)
@@ -579,6 +599,7 @@ def _run_cli_agent(
                 watchdog_thread.join(timeout=5)
                 _kill_process_tree(proc)
                 stderr_thread.join(timeout=5)
+                _join_stdin_writer()
                 _close_pipes(proc)
                 if watchdog_killed.is_set():
                     timed_out = True
@@ -608,6 +629,10 @@ def _run_cli_agent(
             else:
                 _kill_process_tree(proc)
             stderr_thread.join(timeout=5)
+            # Join the stdin writer before a timeout result (or any other
+            # outcome) is returned so a blocked write cannot outlive the
+            # attempt after the child is killed.
+            _join_stdin_writer()
             _close_pipes(proc)
 
             # Verified kill (spec: D-state escalation). Only applies to a
@@ -772,6 +797,11 @@ class _BaseCliRunner(ABC):
 
     # When True, the prompt is piped on stdin instead of placed in argv
     # (Codex's ``codex exec ... -``). Claude/Grok use ``-p <prompt>`` on argv.
+    #
+    # Coupled to the stdin-writer thread in ``_run_cli_agent``: True means
+    # the driver must never write stdin on the main thread. A blocking write
+    # deadlocks if the child fills its stdout pipe before reading stdin,
+    # because the stdout/stderr drains have not started yet.
     prompt_via_stdin: ClassVar[bool] = False
 
     def __init__(
