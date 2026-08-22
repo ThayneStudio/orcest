@@ -72,11 +72,55 @@ def get_provider_recipe(provider: str) -> ProviderRecipe | None:
     return PROVIDER_REGISTRY.get(provider)
 
 
+# Memoized ``shutil.which`` results, keyed by binary name (not provider —
+# "claude" and "clauder" share one binary, so they share one probe).
+#
+# The binary set is fixed once the worker image is baked, so probing the
+# filesystem on every received task is pure waste. Entries are resolved
+# lazily on first lookup and never re-probed; ``prime_provider_binaries``
+# fills the whole table at worker startup so no task pays the stat cost.
+# A worker process that gains a binary mid-run keeps reporting it missing —
+# installing a provider CLI already requires a rebake + worker restart.
+#
+# Writes are single-key dict assignments (atomic under the GIL); a concurrent
+# first lookup may probe twice and store the same answer, which is harmless.
+_BINARY_PATH_CACHE: dict[str, str | None] = {}
+
+
+def resolve_provider_binary(binary: str) -> str | None:
+    """Return the cached $PATH resolution of ``binary``, probing at most once."""
+    if binary in _BINARY_PATH_CACHE:
+        return _BINARY_PATH_CACHE[binary]
+    path = shutil.which(binary)
+    _BINARY_PATH_CACHE[binary] = path
+    return path
+
+
+def prime_provider_binaries() -> dict[str, str | None]:
+    """Resolve every registered provider binary once, populating the cache.
+
+    Called at worker startup so the per-task ``get_unsupported_reason`` check
+    is a pure dict lookup. Returns the binary -> resolved path map for logging.
+    """
+    for recipe in PROVIDER_REGISTRY.values():
+        if recipe.binary:
+            resolve_provider_binary(recipe.binary)
+    return dict(_BINARY_PATH_CACHE)
+
+
+def reset_provider_binary_cache() -> None:
+    """Drop all memoized ``shutil.which`` results (tests only)."""
+    _BINARY_PATH_CACHE.clear()
+
+
 def get_unsupported_reason(provider: str) -> str | None:
     """Return a short reason if the provider cannot be executed here, else None.
 
     Covers both "unknown provider" (not in registry) and "missing binary"
     (in registry but CLI not found in $PATH). Used for early graceful reject.
+
+    The $PATH probe is memoized per binary (see ``_BINARY_PATH_CACHE``), so
+    this is a pure dict lookup on every task after the first.
 
     A registered entry with ``binary == ""`` is treated as "no baked binary
     required" — useful for in-process runners like ``noop`` that don't shell
@@ -85,7 +129,7 @@ def get_unsupported_reason(provider: str) -> str | None:
     recipe = PROVIDER_REGISTRY.get(provider)
     if recipe is None:
         return f'unknown provider "{provider}"'
-    if recipe.binary and shutil.which(recipe.binary) is None:
+    if recipe.binary and resolve_provider_binary(recipe.binary) is None:
         return f'missing binary "{recipe.binary}" for provider "{provider}"'
     return None
 
