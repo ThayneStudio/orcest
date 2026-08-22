@@ -323,3 +323,48 @@ class TestActivityAwareHealthCheck:
         assert reasons.keys() == {"ceiling", "needs_reap", "activity_stale"}
         for event in reasons.values():
             assert isinstance(event["data"]["elapsed_seconds"], float)
+
+
+class TestHeartbeatProbeReuse:
+    """Issue #598: the fleet-wide fail-safe probe and the per-VM
+    activity_stale decision ask the same ``workers:heartbeat:{worker_id}``
+    question, so a health-check pass must EXISTS each worker at most once."""
+
+    def test_single_pass_probes_each_heartbeat_once(self, fake_redis_client, mocker):
+        """Mixed/healthy heartbeats plus a stale activity record on one VM --
+        the path where the double read used to bite (the fleet-wide fault
+        short-circuit skips the second read entirely)."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "306", str(now - 10))
+        _write_heartbeat(rc, "orcest-worker-305")
+        _write_heartbeat(rc, "orcest-worker-306")
+        # 305's record is stale (past the 300s activity_stale_after default),
+        # which is what used to trigger the second heartbeat read; 306's is
+        # fresh, so it never reaches the heartbeat question at all.
+        _write_activity_record(
+            rc, needs_reap=False, last_liveness_ts=now - 10000, worker_id="orcest-worker-305"
+        )
+        _write_activity_record(
+            rc, needs_reap=False, last_liveness_ts=now, worker_id="orcest-worker-306"
+        )
+        _claim_pending_task(rc, "orcest-worker-305")
+        spy = mocker.spy(rc, "exists")
+
+        manager._health_check()
+
+        heartbeat_reads = [
+            call.args[0]
+            for call in spy.call_args_list
+            if call.args and str(call.args[0]).startswith("workers:heartbeat:")
+        ]
+        assert sorted(heartbeat_reads) == [
+            "workers:heartbeat:orcest-worker-305",
+            "workers:heartbeat:orcest-worker-306",
+        ]
+        # Fail-safe contract unchanged: a present heartbeat still blocks
+        # activity_stale reaping below the ceiling.
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()

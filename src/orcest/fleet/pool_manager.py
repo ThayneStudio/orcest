@@ -1318,8 +1318,14 @@ class PoolManager:
                 continue
             parsed_active.append((vm_id, start_ts))
 
+        # One EXISTS per active worker for the whole pass: the fleet-wide
+        # fail-safe probe below and the per-VM activity_stale decision in
+        # _activity_reap_reason ask the same question, so they share one
+        # memo instead of each hitting Redis.
+        heartbeat_cache: dict[str, bool | None] = {}
         activity_stale_infra_fault = self._activity_stale_infra_fault(
-            [vm_id for vm_id, _start_ts in parsed_active]
+            [vm_id for vm_id, _start_ts in parsed_active],
+            heartbeat_cache=heartbeat_cache,
         )
 
         for vm_id, start_ts in parsed_active:
@@ -1354,6 +1360,7 @@ class PoolManager:
                     vm_id,
                     now,
                     activity_stale_infra_fault=activity_stale_infra_fault,
+                    heartbeat_cache=heartbeat_cache,
                 )
                 if activity_reason is None:
                     continue
@@ -1402,15 +1409,28 @@ class PoolManager:
                 continue
             self._destroy_stopped_vm(vm_id)
 
-    def _activity_stale_infra_fault(self, vm_ids: list[int]) -> bool:
-        """Return True when activity-stale reaping should fail safe this pass."""
+    def _activity_stale_infra_fault(
+        self,
+        vm_ids: list[int],
+        *,
+        heartbeat_cache: dict[str, bool | None] | None = None,
+    ) -> bool:
+        """Return True when activity-stale reaping should fail safe this pass.
+
+        Heartbeat probes are memoized into *heartbeat_cache* (worker_id ->
+        True/False/None) so ``_activity_reap_reason`` can reuse them within
+        the same health-check pass. The memo may be left incomplete when
+        this returns True on the first unreadable heartbeat, which is safe:
+        that same True makes ``_activity_reap_reason`` skip the heartbeat
+        question entirely.
+        """
         if len(vm_ids) < 2:
             return False
 
         missing = 0
         for vm_id in vm_ids:
             worker_id = self._vm_id_to_worker_id(vm_id)
-            heartbeat_present = self._worker_heartbeat_present(worker_id)
+            heartbeat_present = self._probe_worker_heartbeat(worker_id, heartbeat_cache)
             if heartbeat_present is None:
                 logger.warning(
                     "Skipping activity-stale reaping this pass because a liveness "
@@ -1434,6 +1454,7 @@ class PoolManager:
         now: float,
         *,
         activity_stale_infra_fault: bool = False,
+        heartbeat_cache: dict[str, bool | None] | None = None,
     ) -> str | None:
         """Return the reap reason from *vm_id*'s activity record, below the
         max_task_duration ceiling (spec §6).
@@ -1504,7 +1525,7 @@ class PoolManager:
             # activity_stale while preserving ceiling and needs_reap reaping.
             return None
 
-        heartbeat_present = self._worker_heartbeat_present(worker_id)
+        heartbeat_present = self._probe_worker_heartbeat(worker_id, heartbeat_cache)
         if heartbeat_present is not False:
             # True: worker is alive but not reporting activity (watchdog
             # disabled, old image, crashed tracker) -- leave it to the
@@ -2585,6 +2606,24 @@ class PoolManager:
                 exc_info=True,
             )
             return None
+
+    def _probe_worker_heartbeat(
+        self, worker_id: str, cache: dict[str, bool | None] | None
+    ) -> bool | None:
+        """``_worker_heartbeat_present`` memoized into *cache* for one pass.
+
+        A health-check pass asks the same heartbeat question twice per
+        worker -- once for the fleet-wide fail-safe, once per activity-stale
+        decision -- so a shared dict keeps it to one EXISTS. A cached
+        ``None`` (unreadable) stays ``None`` for the rest of the pass, which
+        is the same fail-safe answer a re-read would have to be treated as.
+        Passing ``cache=None`` reads through, uncached.
+        """
+        if cache is None:
+            return self._worker_heartbeat_present(worker_id)
+        if worker_id not in cache:
+            cache[worker_id] = self._worker_heartbeat_present(worker_id)
+        return cache[worker_id]
 
     def _live_vm_ids(self) -> set[int] | None:
         """VMIDs currently tracked as idle/active and present in Proxmox.
