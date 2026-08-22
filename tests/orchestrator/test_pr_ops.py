@@ -1607,6 +1607,30 @@ def test_backoff_cooldown_skips_before_enqueue(gh_mock, fake_redis_client, label
     gh_mock.get_ci_status.assert_not_called()
 
 
+def test_expired_transient_backoff_enqueues_retry(gh_mock, fake_redis_client, label_config):
+    """A transient-exhausted PR is picked up again after the cooldown expires."""
+    pr_number = 738
+    gh_mock.list_open_prs.return_value = [
+        _make_pr_data(number=pr_number, labels=[]),
+    ]
+    gh_mock.get_ci_status.return_value = [
+        {"name": "tests", "conclusion": "failure", "detailsUrl": "x"},
+    ]
+    set_backoff_cooldown(fake_redis_client, REPO, pr_number, step=2)
+    fake_redis_client.expire(f"backoff:pr:{REPO}:{pr_number}", 0)
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == PRAction.ENQUEUE_FIX
+    gh_mock.get_ci_status.assert_called_once()
+
+
 def test_backoff_cooldown_same_sha_skips_before_enqueue(gh_mock, fake_redis_client, label_config):
     """A SHA-aware transient backoff still skips for the same head SHA."""
     pr_number = 736
