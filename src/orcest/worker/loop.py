@@ -75,7 +75,53 @@ HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 WORKER_LIVENESS_TTL = 150  # Covers two 60s task-heartbeat refresh intervals plus jitter.
 MAX_DELIVERY_COUNT = 3  # Dead-letter at or after N deliveries; task runs at most N-1 times
-_STREAM_MAXLEN = 20000  # bumped from 2000 for archiver-hiccup headroom (~50MB across 4 workers)
+# Results + dead-letter only. Output streams use the _OUTPUT_STREAM_* budget
+# below; do not reuse this cap for *:output:* — entry-count MAXLEN does not
+# bound RSS when stream-json payloads vary by orders of magnitude.
+_STREAM_MAXLEN = 20000
+# Output streams are {project}:output:{worker_id}. They are a live-tail /
+# archiver buffer, not durable logs. One Redis backs every orchestrator
+# (1 GB maxmemory, noeviction); filling it stalls the whole fleet (#585).
+#
+# Arithmetic (check these numbers against the live fleet):
+#   projects          = 8   (live 4: orcest, bbr-platform, asemly,
+#                            transit-platform; + headroom)
+#   workers           = 8   (pool.size default 4; live leftovers pushed
+#                            *:output:* to 24 keys; + headroom)
+#   streams           = 8 × 8 = 64
+#   max entry payload = 4 KiB (stream-json tool results can be 100s of KiB;
+#                            without this cap, MAXLEN=20000 on a 1.5 KiB
+#                            average still reached 29.9 MB in one stream)
+#   MAXLEN            = 512
+#   overhead factor   = 2   (listpack / radix tree / field names / IDs)
+#   bytes             = 64 × 512 × 4 KiB × 2 = 256 MiB
+#
+# 256 MiB leaves ~768 MiB of the 1 GiB ceiling for :results, :events,
+# task streams, locks, and AOF. The previous MAXLEN=20000 assumed
+# "4 workers × ~50 MB" and ignored per-project namespacing.
+#
+# TTL is 8 h: covers pool.max_task_duration (7 h) if a task is silent
+# after task_start, plus 1 h for dashboard/archiver drain after the last
+# write. Keys with TTL=-1 were the other half of #585.
+_OUTPUT_BUDGET_PROJECTS = 8
+_OUTPUT_BUDGET_WORKERS = 8
+_OUTPUT_STREAM_MAX_ENTRY_BYTES = 4096
+_OUTPUT_STREAM_MAXLEN = 512
+_OUTPUT_STREAM_OVERHEAD_FACTOR = 2
+_OUTPUT_STREAM_BUDGET_BYTES = 256 * 1024 * 1024
+_OUTPUT_STREAM_TTL_SECONDS = 8 * 3600
+if (
+    _OUTPUT_BUDGET_PROJECTS
+    * _OUTPUT_BUDGET_WORKERS
+    * _OUTPUT_STREAM_MAXLEN
+    * _OUTPUT_STREAM_MAX_ENTRY_BYTES
+    * _OUTPUT_STREAM_OVERHEAD_FACTOR
+    > _OUTPUT_STREAM_BUDGET_BYTES
+):
+    raise ValueError(
+        "output-stream worst-case bytes exceed _OUTPUT_STREAM_BUDGET_BYTES; "
+        "re-derive MAXLEN from the comment arithmetic"
+    )
 _RESULT_PUBLISH_RETRIES = 3  # Max attempts to publish a result
 _RESULT_PUBLISH_BACKOFF = (1, 2)  # Seconds to sleep before each retry (before attempt 2, 3)
 _EPHEMERAL_RESULT_RETRY_SECONDS = 5
@@ -2219,6 +2265,45 @@ def _validate_pr_task_snapshot(task: Task, logger: logging.Logger) -> tuple[bool
     return False, ""
 
 
+def output_streams_worst_case_bytes(projects: int, workers: int) -> int:
+    """Upper bound on output-stream RSS for a project × worker fan-out.
+
+    Assumes every stream is full of max-size entries. The budget test uses
+    this so the MAXLEN estimate cannot silently drift.
+    """
+    if projects < 1 or workers < 1:
+        raise ValueError(f"projects and workers must be positive, got {projects}, {workers}")
+    return (
+        projects
+        * workers
+        * _OUTPUT_STREAM_MAXLEN
+        * _OUTPUT_STREAM_MAX_ENTRY_BYTES
+        * _OUTPUT_STREAM_OVERHEAD_FACTOR
+    )
+
+
+def _bound_output_fields(fields: dict[str, str]) -> dict[str, str]:
+    """Truncate the ``line`` payload so MAXLEN is a real byte bound.
+
+    Redis XADD MAXLEN counts entries, not bytes. Stream-json agent output
+    can put 100s of KiB in a single ``line``, which is how one 20k-entry
+    stream reached 29.9 MB. Marker fields (task_start / task_end) are small
+    and left intact.
+    """
+    line = fields.get("line")
+    if line is None:
+        return fields
+    other_bytes = sum(len(v.encode("utf-8")) for k, v in fields.items() if k != "line")
+    allow = _OUTPUT_STREAM_MAX_ENTRY_BYTES - other_bytes
+    if allow <= 0:
+        return {**fields, "line": ""}
+    encoded = line.encode("utf-8")
+    if len(encoded) <= allow:
+        return fields
+    truncated = encoded[:allow].decode("utf-8", errors="ignore")
+    return {**fields, "line": truncated}
+
+
 def _task_output_stream(task: Task, config: WorkerConfig) -> tuple[str, bool]:
     stream = f"output:{config.worker_id}"
     if task.key_prefix:
@@ -2232,10 +2317,13 @@ def _publish_task_output(
     raw_stream: bool,
     fields: dict[str, str],
 ) -> None:
+    bounded = _bound_output_fields(fields)
     if raw_stream:
-        redis.xadd_capped_raw(stream, fields, maxlen=_STREAM_MAXLEN)
+        redis.xadd_capped_raw(stream, bounded, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
+        redis.expire_raw(stream, _OUTPUT_STREAM_TTL_SECONDS)
     else:
-        redis.xadd_capped(stream, fields, maxlen=_STREAM_MAXLEN)
+        redis.xadd_capped(stream, bounded, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
+        redis.expire(stream, _OUTPUT_STREAM_TTL_SECONDS)
 
 
 def _execute_task(

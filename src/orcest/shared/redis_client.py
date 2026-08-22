@@ -234,13 +234,22 @@ class RedisClient:
         result: int = self._client.xack(self._prefixed(stream), group, entry_id)  # type: ignore[assignment]
         return result
 
-    def xadd_capped(self, stream: str, fields: dict[str, str], maxlen: int) -> str:
-        """Add entry to a capped stream (approximate MAXLEN).
+    def xadd_capped(
+        self,
+        stream: str,
+        fields: dict[str, str],
+        maxlen: int,
+        *,
+        approximate: bool = True,
+    ) -> str:
+        """Add entry to a capped stream (MAXLEN).
 
         Args:
             stream: Stream name.
             fields: Field dict to add.
-            maxlen: Approximate maximum stream length. Must be positive.
+            maxlen: Maximum stream length. Must be positive.
+            approximate: When True (default), use Redis ``MAXLEN ~`` for cheaper
+                trimming. When False, trim exactly to ``maxlen``.
         """
         if maxlen < 1:
             raise ValueError(f"maxlen must be positive, got {maxlen}")
@@ -250,7 +259,7 @@ class RedisClient:
             self._prefixed(stream),
             fields,  # type: ignore[arg-type]
             maxlen=maxlen,
-            approximate=True,
+            approximate=approximate,
         )
         return entry_id
 
@@ -373,7 +382,14 @@ class RedisClient:
         entry_id: str = self._client.xadd(fq_stream, fields)  # type: ignore[assignment, arg-type]
         return entry_id
 
-    def xadd_capped_raw(self, fq_stream: str, fields: dict[str, str], maxlen: int) -> str:
+    def xadd_capped_raw(
+        self,
+        fq_stream: str,
+        fields: dict[str, str],
+        maxlen: int,
+        *,
+        approximate: bool = True,
+    ) -> str:
         """Add entry to a capped stream using a fully-qualified (already-prefixed) name.
 
         Used by multi-project workers that need to publish to streams with
@@ -387,7 +403,7 @@ class RedisClient:
             fq_stream,
             fields,  # type: ignore[arg-type]
             maxlen=maxlen,
-            approximate=True,
+            approximate=approximate,
         )
         return entry_id
 
