@@ -3184,6 +3184,8 @@ def _handle_result(
     # explicitly reported a genuine human-decision blocker (result.needs_human).
     # Orcest never infers needs-human from a failure or a budget count -- an
     # ordinary fix-attempt failure is just retried on the next eligible cycle.
+    # Transient failures stay unlabeled and retryable even if the worker set
+    # result.needs_human.
     labeled = False
     needs_human = result.status == ResultStatus.FAILED and not is_transient and result.needs_human
     if result.status == ResultStatus.FAILED and not is_transient and not is_issue:
