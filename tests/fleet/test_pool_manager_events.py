@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+from unittest.mock import patch
 
 from orcest.fleet.pool_manager import PoolManager
 from orcest.shared.events import EVENTS_STREAM
@@ -66,7 +67,7 @@ def _reaped_events(rc) -> list[dict]:
 
 
 def test_reaped_event_emitted(fake_redis_client):
-    """Health-check ceiling reap: reason is honestly "ceiling" with elapsed_seconds."""
+    """Health-check ceiling reap: reason is honestly "ceiling" with frozen kill data."""
     rc = fake_redis_client  # prefix 'test'
     manager, _proxmox = _build(rc)
     worker_id = "orcest-worker-305"
@@ -83,6 +84,7 @@ def test_reaped_event_emitted(fake_redis_client):
     assert reaped[0]["subject"] == task.id
     assert isinstance(reaped[0]["data"]["elapsed_seconds"], float)
     assert reaped[0]["data"]["elapsed_seconds"] > 0
+    assert reaped[0]["data"]["killed_at"].endswith("Z")
 
 
 def test_event_publisher_is_cached_per_key_prefix(fake_redis_client):
@@ -148,3 +150,56 @@ def test_reaped_event_done_cleanup_reports_honest_reason_without_elapsed(fake_re
     assert reaped[0]["data"]["worker_id"] == worker_id
     assert reaped[0]["subject"] == task.id
     assert "elapsed_seconds" not in reaped[0]["data"]
+    assert "killed_at" not in reaped[0]["data"]
+
+
+def test_reaped_event_retry_uses_first_fence_values(fake_redis_client):
+    """A later Redis coordination retry must not become the reported kill time."""
+    rc = fake_redis_client
+    manager, proxmox = _build(rc)
+    worker_id = "orcest-worker-305"
+    task = _claim_task(rc, worker_id)
+    rc.hset("pool:active", "305", "0")
+    proxmox.stop_vm.side_effect = [None, Exception("already stopped")]
+
+    with (
+        patch.object(manager, "_coordinate_reaped_vm", return_value=False),
+        patch("orcest.fleet.pool_manager.time.time", return_value=100000.0),
+    ):
+        manager._health_check()
+
+    assert _reaped_events(rc) == []
+    assert manager._reap_fences[305].elapsed_at_kill_seconds == 100000.0
+
+    with patch("orcest.fleet.pool_manager.time.time", return_value=200000.0):
+        manager._health_check()
+
+    reaped = _reaped_events(rc)
+    assert len(reaped) == 1
+    assert reaped[0]["subject"] == task.id
+    assert reaped[0]["data"]["reason"] == "ceiling"
+    assert reaped[0]["data"]["elapsed_seconds"] == 100000.0
+    assert reaped[0]["data"]["killed_at"] == "1970-01-02T03:46:40Z"
+    assert proxmox.stop_vm.call_count == 2
+    assert manager._reap_fences == {}
+
+
+def test_reaped_event_already_stopped_without_fence_omits_unknowns(fake_redis_client):
+    """After a manager restart, an already-stopped VM has no in-memory kill fence."""
+    rc = fake_redis_client
+    manager, _proxmox = _build(rc)
+    worker_id = "orcest-worker-305"
+    task = _claim_task(rc, worker_id)
+    rc.hset("pool:active", "305", "0")
+    _proxmox.stop_vm.side_effect = Exception("already stopped")
+    _proxmox.get_vm_status.return_value = "stopped"
+
+    with patch("orcest.fleet.pool_manager.time.time", return_value=200000.0):
+        manager._health_check()
+
+    reaped = _reaped_events(rc)
+    assert len(reaped) == 1
+    assert reaped[0]["subject"] == task.id
+    assert reaped[0]["data"]["reason"] == "ceiling"
+    assert "elapsed_seconds" not in reaped[0]["data"]
+    assert "killed_at" not in reaped[0]["data"]
