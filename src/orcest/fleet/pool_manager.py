@@ -2521,9 +2521,9 @@ class PoolManager:
             if elapsed_seconds is not None:
                 data["elapsed_seconds"] = elapsed_seconds
             if killed_at_unix is not None:
-                data["killed_at"] = datetime.fromtimestamp(
-                    killed_at_unix, timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                data["killed_at"] = datetime.fromtimestamp(killed_at_unix, timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
             publisher.publish(
                 make_event(
                     "net.orcest.task.reaped",
