@@ -444,9 +444,7 @@ class RedisClient:
         text = str(error).lower()
         return "no such key" in text
 
-    def _inspect_consumer_group_fq(
-        self, fq_stream: str, group: str
-    ) -> ConsumerGroupInspection:
+    def _inspect_consumer_group_fq(self, fq_stream: str, group: str) -> ConsumerGroupInspection:
         """Inspect XINFO GROUPS on a fully-qualified stream without writing."""
         try:
             groups = cast(list[dict[str, Any]], self._client.xinfo_groups(fq_stream))
@@ -468,9 +466,7 @@ class RedisClient:
                 return ConsumerGroupInspection.EXISTS
         return ConsumerGroupInspection.MISSING
 
-    def inspect_consumer_group_raw(
-        self, fq_stream: str, group: str
-    ) -> ConsumerGroupInspection:
+    def inspect_consumer_group_raw(self, fq_stream: str, group: str) -> ConsumerGroupInspection:
         """Return whether *group* exists on a fully-qualified stream.
 
         Missing streams are reported as ``MISSING``; other Redis failures are
