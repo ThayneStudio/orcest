@@ -6,7 +6,14 @@ from unittest.mock import MagicMock
 import pytest
 import redis as _redis
 
+from orcest.shared.redis_client import ConsumerGroupInspection
+
 # Tests use the fake_redis_client fixture from conftest.py
+
+
+def _oom_error() -> _redis.ResponseError:
+    oom_cls = getattr(_redis.exceptions, "OutOfMemoryError", _redis.ResponseError)
+    return oom_cls("OOM command not allowed when used memory > maxmemory")
 
 
 def test_health_check_succeeds(fake_redis_client):
@@ -37,6 +44,165 @@ def test_ensure_consumer_group_idempotent(fake_redis_client):
     """Calling ensure_consumer_group twice raises no error."""
     fake_redis_client.ensure_consumer_group("test-stream", "test-group")
     fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_returns_exists(fake_redis_client):
+    """Existing groups are reported without creating anything."""
+    fake_redis_client.client.xadd("test:test-stream", {"k": "v"})
+    fake_redis_client.client.xgroup_create("test:test-stream", "test-group", id="0")
+
+    result = fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+    assert result is ConsumerGroupInspection.EXISTS
+
+
+def test_ensure_consumer_group_existing_group_does_not_write(fake_redis_client, mocker):
+    """Existing groups remain usable when Redis rejects writes."""
+    stream = "test-stream"
+    group = "test-group"
+    fake_redis_client.client.xadd("test:test-stream", {"k": "v"})
+    fake_redis_client.client.xgroup_create("test:test-stream", group, id="0")
+    create = mocker.patch.object(
+        fake_redis_client._client,
+        "xgroup_create",
+        side_effect=_oom_error(),
+    )
+
+    fake_redis_client.ensure_consumer_group(stream, group)
+
+    create.assert_not_called()
+    assert fake_redis_client.inspect_consumer_group(stream, group) is ConsumerGroupInspection.EXISTS
+
+
+def test_inspect_consumer_group_absent_stream_maps_to_missing(fake_redis_client, mocker):
+    """ERR no such key from XINFO GROUPS is the normal absent-stream result."""
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        side_effect=_redis.ResponseError("ERR no such key"),
+    )
+
+    result = fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+    assert result is ConsumerGroupInspection.MISSING
+
+
+def test_ensure_consumer_group_absent_stream_creates_with_mkstream(fake_redis_client, mocker):
+    """Missing streams still use XGROUP CREATE ... MKSTREAM."""
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        side_effect=_redis.ResponseError("ERR no such key"),
+    )
+    create = mocker.patch.object(fake_redis_client._client, "xgroup_create")
+
+    fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+    create.assert_called_once_with(
+        name="test:test-stream", groupname="test-group", id="0", mkstream=True
+    )
+
+
+def test_ensure_consumer_group_missing_group_creates(fake_redis_client, mocker):
+    """Streams without the requested group use the creation path."""
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        return_value=[{"name": "other-group"}],
+    )
+    create = mocker.patch.object(fake_redis_client._client, "xgroup_create")
+
+    fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+    create.assert_called_once_with(
+        name="test:test-stream", groupname="test-group", id="0", mkstream=True
+    )
+
+
+def test_ensure_consumer_group_busygroup_race_succeeds(fake_redis_client, mocker):
+    """A missing-group create race remains successful via BUSYGROUP handling."""
+    mocker.patch.object(fake_redis_client._client, "xinfo_groups", return_value=[])
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xgroup_create",
+        side_effect=_redis.ResponseError("BUSYGROUP Consumer Group name already exists"),
+    )
+
+    fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+
+def test_ensure_consumer_group_create_oom_propagates(fake_redis_client, mocker):
+    """Creation OOM is not converted into an existence result."""
+    mocker.patch.object(fake_redis_client._client, "xinfo_groups", return_value=[])
+    mocker.patch.object(fake_redis_client._client, "xgroup_create", side_effect=_oom_error())
+
+    with pytest.raises(_redis.ResponseError, match="OOM"):
+        fake_redis_client.ensure_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_wrongtype_remains_error(fake_redis_client):
+    """WRONGTYPE from XINFO GROUPS is not hidden as missing."""
+    fake_redis_client.set_value("test-stream", "not-a-stream")
+
+    with pytest.raises(_redis.ResponseError, match="WRONGTYPE"):
+        fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_acl_error_remains_error(fake_redis_client, mocker):
+    """ACL failures from XINFO GROUPS remain caller-visible errors."""
+    mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        side_effect=_redis.ResponseError("NOPERM this user has no permissions"),
+    )
+
+    with pytest.raises(_redis.ResponseError, match="NOPERM"):
+        fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_malformed_non_list_remains_error(fake_redis_client, mocker):
+    """Malformed XINFO GROUPS response shapes are not treated as missing."""
+    mocker.patch.object(fake_redis_client._client, "xinfo_groups", return_value="unexpected")
+
+    with pytest.raises(TypeError, match="xinfo_groups returned str"):
+        fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_malformed_entry_remains_error(fake_redis_client, mocker):
+    """Malformed group entries are not treated as missing."""
+    mocker.patch.object(fake_redis_client._client, "xinfo_groups", return_value=["bad-entry"])
+
+    with pytest.raises(TypeError, match="malformed group entry"):
+        fake_redis_client.inspect_consumer_group("test-stream", "test-group")
+
+
+def test_inspect_consumer_group_raw_uses_fully_qualified_stream(fake_redis_client, mocker):
+    """Raw inspection never applies the client's key prefix."""
+    xinfo = mocker.patch.object(
+        fake_redis_client._client,
+        "xinfo_groups",
+        return_value=[{"name": "test-group"}],
+    )
+
+    result = fake_redis_client.inspect_consumer_group_raw("raw-stream", "test-group")
+
+    assert result is ConsumerGroupInspection.EXISTS
+    xinfo.assert_called_once_with("raw-stream")
+
+
+def test_ensure_consumer_group_raw_existing_group_does_not_write(fake_redis_client, mocker):
+    """Raw ensure uses the same read-first semantics as prefixed ensure."""
+    fake_redis_client.client.xadd("raw-stream", {"k": "v"})
+    fake_redis_client.client.xgroup_create("raw-stream", "test-group", id="0")
+    create = mocker.patch.object(
+        fake_redis_client._client,
+        "xgroup_create",
+        side_effect=_oom_error(),
+    )
+
+    fake_redis_client.ensure_consumer_group_raw("raw-stream", "test-group")
+
+    create.assert_not_called()
 
 
 def test_xadd_then_xreadgroup_round_trip(fake_redis_client):
