@@ -314,9 +314,7 @@ class PoolManager:
 
         if self._idle_liveness_write_healthy_since is None:
             self._idle_liveness_write_healthy_since = now
-            logger.info(
-                "Redis heartbeat-class writes recovered; idle heartbeat dwell restarted"
-            )
+            logger.info("Redis heartbeat-class writes recovered; idle heartbeat dwell restarted")
 
         try:
             idle_members = self._redis.smembers(_POOL_IDLE_KEY)
@@ -385,9 +383,8 @@ class PoolManager:
                 self._record_idle_liveness_replacement(profile_key, now)
 
     def _reset_idle_liveness_dwell(self, message: str) -> None:
-        had_state = (
-            self._idle_liveness_write_healthy_since is not None
-            or bool(self._idle_missing_heartbeat_since)
+        had_state = self._idle_liveness_write_healthy_since is not None or bool(
+            self._idle_missing_heartbeat_since
         )
         self._idle_liveness_write_healthy_since = None
         self._idle_missing_heartbeat_since.clear()
