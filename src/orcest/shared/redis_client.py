@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import types
+from enum import Enum
 from typing import Any, cast
 
 import redis
@@ -16,6 +17,13 @@ import redis
 from orcest.shared.config import RedisConfig
 
 logger = logging.getLogger(__name__)
+
+
+class ConsumerGroupInspection(str, Enum):
+    """Result of inspecting consumer-group metadata without mutating Redis."""
+
+    EXISTS = "exists"
+    MISSING = "missing"
 
 
 _ROUND_ROBIN_TURN_SCRIPT = r"""
@@ -431,17 +439,65 @@ class RedisClient:
         count = entries[0].get("times_delivered", 0)  # type: ignore[index]
         return int(count)
 
+    @staticmethod
+    def _is_missing_stream_error(error: redis.ResponseError) -> bool:
+        text = str(error).lower()
+        return "no such key" in text
+
+    def _inspect_consumer_group_fq(self, fq_stream: str, group: str) -> ConsumerGroupInspection:
+        """Inspect XINFO GROUPS on a fully-qualified stream without writing."""
+        try:
+            groups = cast(list[dict[str, Any]], self._client.xinfo_groups(fq_stream))
+        except redis.ResponseError as e:
+            if self._is_missing_stream_error(e):
+                return ConsumerGroupInspection.MISSING
+            raise
+
+        if not isinstance(groups, list):
+            raise TypeError(
+                f"xinfo_groups returned {type(groups).__name__} for stream {fq_stream!r}"
+            )
+        for item in groups:
+            if not isinstance(item, dict):
+                raise TypeError(
+                    f"xinfo_groups returned malformed group entry for stream {fq_stream!r}"
+                )
+            if item.get("name") == group:
+                return ConsumerGroupInspection.EXISTS
+        return ConsumerGroupInspection.MISSING
+
+    def inspect_consumer_group_raw(self, fq_stream: str, group: str) -> ConsumerGroupInspection:
+        """Return whether *group* exists on a fully-qualified stream.
+
+        Missing streams are reported as ``MISSING``; other Redis failures are
+        left for callers to handle according to their own retry policy.
+        """
+        return self._inspect_consumer_group_fq(fq_stream, group)
+
+    def inspect_consumer_group(self, stream: str, group: str) -> ConsumerGroupInspection:
+        """Return whether *group* exists on a prefixed stream."""
+        return self._inspect_consumer_group_fq(self._prefixed(stream), group)
+
+    def _create_consumer_group_fq(self, fq_stream: str, group: str) -> None:
+        try:
+            self._client.xgroup_create(name=fq_stream, groupname=group, id="0", mkstream=True)
+        except redis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+    def _ensure_consumer_group_fq(self, fq_stream: str, group: str) -> None:
+        status = self._inspect_consumer_group_fq(fq_stream, group)
+        if status is ConsumerGroupInspection.EXISTS:
+            return
+        self._create_consumer_group_fq(fq_stream, group)
+
     def ensure_consumer_group_raw(self, fq_stream: str, group: str) -> None:
         """Create consumer group on a fully-qualified stream name.
 
         Also creates the stream if needed (MKSTREAM).
         Idempotent -- safe to call on every startup.
         """
-        try:
-            self._client.xgroup_create(name=fq_stream, groupname=group, id="0", mkstream=True)
-        except redis.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
+        self._ensure_consumer_group_fq(fq_stream, group)
 
     def set_nx_ex_raw(self, fq_key: str, value: str, ttl: int) -> bool:
         """SET key value NX EX ttl using a fully-qualified key."""
@@ -478,13 +534,7 @@ class RedisClient:
         Also creates the stream if needed (MKSTREAM).
         Idempotent -- safe to call on every startup.
         """
-        try:
-            self._client.xgroup_create(
-                name=self._prefixed(stream), groupname=group, id="0", mkstream=True
-            )
-        except redis.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
+        self._ensure_consumer_group_fq(self._prefixed(stream), group)
 
     # ------------------------------------------------------------------
     # Key/value wrapper methods (auto-prefix)
