@@ -58,6 +58,7 @@ _POOL_DRAINING_KEY = "pool:draining"
 _POOL_DONE_PREFIX = "pool:done:"
 _POOL_PROVISIONING_KEY = "pool:provisioning"
 _POOL_AMBIGUOUS_CLONES_KEY = "pool:ambiguous-clones"
+_POOL_WRITE_HEALTH_KEY = "pool:write-health"
 _WORKER_HEARTBEAT_PREFIX = "workers:heartbeat:"
 # Workers can block on the issue stream for up to five seconds. A drain lease
 # must be visible for longer than that before the final PEL check.
@@ -92,6 +93,9 @@ REAP_REASON_ORPHAN_PEL = "orphan_pel"
 # (or initialised from `pool.template_vm_id` on first run for backward compat).
 _POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
 _PENDING_READ_BATCH_SIZE = 100
+_IDLE_HEARTBEAT_DWELL_SECONDS = 300.0
+_IDLE_LIVENESS_BREAKER_WINDOW_SECONDS = 15 * 60.0
+_IDLE_LIVENESS_BREAKER_LIMIT = 2
 # Global (cross-project, unprefixed) hash written by the worker-side liveness
 # tracker (see worker/liveness_tracker.py's _write_activity_record). Read here
 # with hgetall_raw -- never auto-prefixed -- to land in the same keyspace.
@@ -158,6 +162,10 @@ class PoolManager:
         self._owned_provisioning_vmids: set[int] = set()
         self._allocated_vmids: set[int] = set()
         self._reap_fences: dict[int, ReapFence] = {}
+        self._idle_missing_heartbeat_since: dict[int, float] = {}
+        self._idle_liveness_write_healthy_since: float | None = None
+        self._idle_liveness_breaker_events: dict[str, list[float]] = {}
+        self._idle_liveness_breaker_open: dict[str, bool] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -182,6 +190,7 @@ class PoolManager:
             # suppresses cloning entirely.
             ambiguous_blocked = self._reconcile_ambiguous_clones()
             provisioning_blocked = self._retry_provisioning_cleanups()
+            self._replace_idle_workers_missing_heartbeat()
             if ambiguous_blocked is not None and provisioning_blocked is not None:
                 self._fill_pool(blocked_vmids=ambiguous_blocked | provisioning_blocked)
             self._health_check()
@@ -285,6 +294,227 @@ class PoolManager:
                     len(transitions),
                     exc_info=True,
                 )
+
+    def _replace_idle_workers_missing_heartbeat(self) -> None:
+        """Replace idle VMs whose worker liveness heartbeat never appears.
+
+        The decision is deliberately gated by an unprefixed SET EX sentinel in
+        the same Redis command class as worker heartbeat writes. If that write
+        class is failing, heartbeat absence is unknown and the complete dwell
+        restarts after recovery.
+        """
+        now = time.time()
+        try:
+            self._redis.set_ex_raw(_POOL_WRITE_HEALTH_KEY, str(int(now)), ttl=600)
+        except Exception:
+            self._reset_idle_liveness_dwell(
+                "Redis heartbeat-class write failed; idle heartbeat absence is unknown"
+            )
+            return
+
+        if self._idle_liveness_write_healthy_since is None:
+            self._idle_liveness_write_healthy_since = now
+            logger.info(
+                "Redis heartbeat-class writes recovered; idle heartbeat dwell restarted"
+            )
+
+        try:
+            idle_members = self._redis.smembers(_POOL_IDLE_KEY)
+        except Exception:
+            logger.warning(
+                "Failed to read idle pool state; skipping idle heartbeat liveness check",
+                exc_info=True,
+            )
+            return
+
+        idle_vmids: set[int] = set()
+        for member in idle_members:
+            try:
+                idle_vmids.add(int(member))
+            except (ValueError, TypeError):
+                continue
+
+        for vm_id in set(self._idle_missing_heartbeat_since) - idle_vmids:
+            logger.info(
+                "VM %d left pool:idle; clearing missing-heartbeat dwell state",
+                vm_id,
+            )
+            self._idle_missing_heartbeat_since.pop(vm_id, None)
+
+        self._refresh_idle_liveness_breakers(now)
+
+        write_dwell = now - self._idle_liveness_write_healthy_since
+        for vm_id in sorted(idle_vmids):
+            worker_id = self._vm_id_to_worker_id(vm_id)
+            heartbeat_present = self._worker_heartbeat_present(worker_id)
+            if heartbeat_present is None:
+                self._reset_idle_liveness_dwell(
+                    f"heartbeat read failed for idle VM {vm_id}; absence is unknown"
+                )
+                return
+            if heartbeat_present:
+                if vm_id in self._idle_missing_heartbeat_since:
+                    logger.info(
+                        "VM %d published worker heartbeat; clearing missing-heartbeat dwell state",
+                        vm_id,
+                    )
+                self._idle_missing_heartbeat_since.pop(vm_id, None)
+                continue
+
+            missing_since = self._idle_missing_heartbeat_since.setdefault(vm_id, now)
+            missing_dwell = now - missing_since
+            if (
+                write_dwell < _IDLE_HEARTBEAT_DWELL_SECONDS
+                or missing_dwell < _IDLE_HEARTBEAT_DWELL_SECONDS
+            ):
+                continue
+
+            profile_key = self._idle_liveness_profile_key(vm_id)
+            if not self._idle_liveness_breaker_allows(profile_key, now):
+                continue
+
+            logger.warning(
+                "VM %d has been idle without a worker heartbeat for %.0fs after %.0fs "
+                "of healthy Redis heartbeat writes; replacing it",
+                vm_id,
+                missing_dwell,
+                write_dwell,
+            )
+            if self._replace_idle_worker(vm_id):
+                self._idle_missing_heartbeat_since.pop(vm_id, None)
+                self._record_idle_liveness_replacement(profile_key, now)
+
+    def _reset_idle_liveness_dwell(self, message: str) -> None:
+        had_state = (
+            self._idle_liveness_write_healthy_since is not None
+            or bool(self._idle_missing_heartbeat_since)
+        )
+        self._idle_liveness_write_healthy_since = None
+        self._idle_missing_heartbeat_since.clear()
+        if had_state:
+            logger.warning("%s; restarted idle heartbeat dwell for all idle VMs", message)
+
+    def _idle_liveness_profile_key(self, vm_id: int) -> str:
+        profile = self._pool.worker_profile_for_vmid(vm_id)
+        return f"{profile.backend}:{profile.runner_type}:{profile.runner_mode}"
+
+    def _refresh_idle_liveness_breakers(self, now: float) -> None:
+        for profile_key in list(self._idle_liveness_breaker_events):
+            self._idle_liveness_breaker_events[profile_key] = [
+                ts
+                for ts in self._idle_liveness_breaker_events[profile_key]
+                if now - ts < _IDLE_LIVENESS_BREAKER_WINDOW_SECONDS
+            ]
+            if (
+                self._idle_liveness_breaker_open.get(profile_key)
+                and len(self._idle_liveness_breaker_events[profile_key])
+                < _IDLE_LIVENESS_BREAKER_LIMIT
+            ):
+                self._idle_liveness_breaker_open[profile_key] = False
+                logger.warning(
+                    "Idle heartbeat replacement breaker cleared for profile %s",
+                    profile_key,
+                )
+
+    def _idle_liveness_breaker_allows(self, profile_key: str, now: float) -> bool:
+        events = [
+            ts
+            for ts in self._idle_liveness_breaker_events.get(profile_key, [])
+            if now - ts < _IDLE_LIVENESS_BREAKER_WINDOW_SECONDS
+        ]
+        self._idle_liveness_breaker_events[profile_key] = events
+        if len(events) < _IDLE_LIVENESS_BREAKER_LIMIT:
+            return True
+        if not self._idle_liveness_breaker_open.get(profile_key):
+            self._idle_liveness_breaker_open[profile_key] = True
+            logger.warning(
+                "Idle heartbeat replacement breaker opened for profile %s "
+                "(%d replacements in %d seconds)",
+                profile_key,
+                _IDLE_LIVENESS_BREAKER_LIMIT,
+                int(_IDLE_LIVENESS_BREAKER_WINDOW_SECONDS),
+            )
+        return False
+
+    def _record_idle_liveness_replacement(self, profile_key: str, now: float) -> None:
+        events = self._idle_liveness_breaker_events.setdefault(profile_key, [])
+        events.append(now)
+
+    def _replace_idle_worker(self, vm_id: int) -> bool:
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        pending_consumers, pending_complete = self._consumers_with_pending_status()
+        if not pending_complete:
+            logger.warning(
+                "Skipping idle heartbeat replacement for VM %d: pending-task state is unavailable",
+                vm_id,
+            )
+            return False
+        if worker_id in pending_consumers:
+            logger.info(
+                "Skipping idle heartbeat replacement for VM %d: it has a pending task",
+                vm_id,
+            )
+            return False
+        try:
+            pipe = self._redis.pipeline()
+            pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+            pipe.sadd(_POOL_DRAINING_KEY, worker_id)
+            pipe.execute()
+        except Exception:
+            logger.warning(
+                "Failed to reserve VM %d for idle heartbeat replacement",
+                vm_id,
+                exc_info=True,
+            )
+            return False
+
+        time.sleep(_DRAIN_QUIESCE_SECONDS)
+        pending_consumers, pending_complete = self._consumers_with_pending_status()
+        if not pending_complete or worker_id in pending_consumers:
+            logger.info(
+                "Skipping idle heartbeat replacement for VM %d: it claimed a task "
+                "or final pending-state inspection failed",
+                vm_id,
+            )
+            try:
+                pipe = self._redis.pipeline()
+                pipe.srem(_POOL_DRAINING_KEY, worker_id)
+                pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(time.time()))
+                pipe.execute()
+            except Exception:
+                logger.error(
+                    "Failed to restore busy VM %d after idle heartbeat replacement race",
+                    vm_id,
+                    exc_info=True,
+                )
+            return False
+
+        if not self._stop_vm(vm_id):
+            self._restore_worker_after_failed_drain(vm_id, worker_id)
+            return False
+        pending_consumers, pending_complete = self._post_stop_pending_status()
+        if not pending_complete:
+            logger.warning(
+                "Restarting VM %d after aborted idle heartbeat replacement: "
+                "post-stop pending-state inspection failed after retries",
+                vm_id,
+            )
+            self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True)
+            return False
+        if worker_id in pending_consumers and not self._coordinate_reaped_vm(
+            vm_id, reason=REAP_REASON_DRAIN_RACE
+        ):
+            logger.warning(
+                "Leaving VM %d after aborted idle heartbeat replacement: "
+                "late task claim could not be recovered",
+                vm_id,
+            )
+            self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
+            return False
+        if self._destroy_stopped_vm(vm_id):
+            return True
+        self._mark_pending_destroy(vm_id)
+        return True
 
     def _fill_pool(self, blocked_vmids: set[int] | None = None) -> None:
         """Adjust pool to target size: clone new VMs or drain idle excess.
