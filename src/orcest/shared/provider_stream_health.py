@@ -17,10 +17,23 @@ cannot leak between those members. Published snapshots use
 and ``...:issue``) rather than a provider-only key, so a stranded member
 cannot be overwritten or hidden by its sibling. There is no provider-level
 aggregate: consumers render the per-stream snapshots as published.
+
+Restart restore (issue #636) seeds the tracker only from a *validated
+committed STRANDED* snapshot. ``HEALTHY`` records are display state: they
+must not resume an in-progress dwell candidate, because ``transitioned_at``
+is the last committed transition, not ``candidate_since``. Validation is
+pure (version, identity, TTL, timestamp order/freshness); Redis I/O stays
+in ``PoolManager``.
+
+Credential boundary: a principal that holds the shared Redis password can
+SET ``provider-stream-health:*`` and forge a STRANDED snapshot that will
+bypass dwell after restart. Per-worker Redis ACLs and snapshot signing are
+separate scope; this module authenticates nothing.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
@@ -36,6 +49,11 @@ DEFAULT_STRANDED_DWELL_SECONDS = 300.0
 STREAM_HEALTH_KEY_PREFIX = "provider-stream-health:"
 STREAM_HEALTH_KIND_PR = "pr"
 STREAM_HEALTH_KIND_ISSUE = "issue"
+
+# Wire-format version for published snapshots. Restore rejects any other
+# version (including a missing field) so an older display record cannot
+# become control state.
+STREAM_HEALTH_SNAPSHOT_VERSION = 1
 
 TransitionKind = Literal["stranded", "recovered"] | None
 
@@ -74,6 +92,7 @@ class ProviderStreamHealth:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "version": STREAM_HEALTH_SNAPSHOT_VERSION,
             "provider": self.provider,
             "stream": self.stream,
             "pending": self.pending,
@@ -87,6 +106,10 @@ class ProviderStreamHealth:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProviderStreamHealth:
+        """Display-oriented deserializer. Restore must use
+        ``parse_committed_stranded_snapshot`` instead: this path is
+        permissive and does not authenticate identity, TTL, or version.
+        """
         return cls(
             provider=str(data["provider"]),
             stream=str(data["stream"]),
@@ -98,6 +121,119 @@ class ProviderStreamHealth:
             observed_at=float(data["observed_at"]),
             transitioned_at=float(data["transitioned_at"]),
         )
+
+
+def parse_committed_stranded_snapshot(
+    payload: Any,
+    *,
+    expected_provider: str,
+    expected_stream: str,
+    now: float,
+    ttl_seconds: int,
+    max_age_seconds: float,
+) -> ProviderStreamHealth | None:
+    """Return a committed STRANDED snapshot if *payload* is safe to restore.
+
+    Missing, expired, non-expiring, malformed, identity-mismatched, future,
+    reversed, non-finite, stale, HEALTHY, UNKNOWN, and unsupported-version
+    records are all absent (``None``). ``ttl_seconds`` is the Redis TTL of
+    the key (positive remaining seconds); ``-1`` (no expire) and ``-2``
+    (missing) are rejected here so the tracker never talks to Redis.
+
+    ``transitioned_at`` is the committed transition time and may be older
+    than ``max_age_seconds``. Freshness is required of ``observed_at`` only.
+    A HEALTHY snapshot is never used to infer ``candidate_since``.
+    """
+    try:
+        return _parse_committed_stranded_snapshot(
+            payload,
+            expected_provider=expected_provider,
+            expected_stream=expected_stream,
+            now=now,
+            ttl_seconds=ttl_seconds,
+            max_age_seconds=max_age_seconds,
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _parse_committed_stranded_snapshot(
+    payload: Any,
+    *,
+    expected_provider: str,
+    expected_stream: str,
+    now: float,
+    ttl_seconds: int,
+    max_age_seconds: float,
+) -> ProviderStreamHealth:
+    if not isinstance(payload, dict):
+        raise TypeError("snapshot payload must be an object")
+    if not _positive_int(ttl_seconds):
+        raise ValueError("snapshot TTL must be a positive int")
+    if not _finite_number(now) or not _finite_number(max_age_seconds) or max_age_seconds <= 0:
+        raise ValueError("now and max_age_seconds must be finite and max_age positive")
+    version = payload.get("version")
+    if not _positive_int(version) or version != STREAM_HEALTH_SNAPSHOT_VERSION:
+        raise ValueError("unsupported snapshot version")
+
+    provider = payload["provider"]
+    stream = payload["stream"]
+    if not isinstance(provider, str) or not isinstance(stream, str):
+        raise TypeError("provider and stream must be strings")
+    if provider != expected_provider or stream != expected_stream:
+        raise ValueError("snapshot identity does not match the monitor target")
+
+    state = StreamHealthState(payload["state"])
+    if state != StreamHealthState.STRANDED:
+        raise ValueError("only committed STRANDED snapshots may be restored")
+
+    observed_at = _finite_timestamp(payload["observed_at"])
+    transitioned_at = _finite_timestamp(payload["transitioned_at"])
+    if observed_at > now or transitioned_at > now:
+        raise ValueError("snapshot timestamps must not be in the future")
+    if transitioned_at > observed_at:
+        raise ValueError("transitioned_at must be <= observed_at")
+    if now - observed_at > max_age_seconds:
+        raise ValueError("observed_at is older than the snapshot freshness window")
+
+    return ProviderStreamHealth(
+        provider=provider,
+        stream=stream,
+        pending=_optional_count(payload.get("pending")),
+        lag=_optional_count(payload.get("lag")),
+        registered_consumers=_optional_count(payload.get("registered_consumers")),
+        live_consumers=_optional_count(payload.get("live_consumers")),
+        state=state,
+        observed_at=observed_at,
+        transitioned_at=transitioned_at,
+    )
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
+def _finite_timestamp(value: Any) -> float:
+    if not _finite_number(value):
+        raise ValueError("timestamp must be a finite number")
+    ts = float(value)
+    if ts <= 0:
+        raise ValueError("timestamp must be positive")
+    return ts
+
+
+def _optional_count(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("count must be an int or null")
+    return value
 
 
 @dataclass
@@ -122,6 +258,27 @@ class ProviderStreamHealthTracker:
     def __init__(self, dwell_seconds: float = DEFAULT_STRANDED_DWELL_SECONDS) -> None:
         self._dwell_seconds = dwell_seconds
         self._tracked: dict[tuple[str, str], _Tracked] = {}
+
+    def has_state(self, provider: str, stream: str) -> bool:
+        """Return True if this identity has already been evaluated or restored."""
+        return (provider, stream) in self._tracked
+
+    def restore_committed(self, health: ProviderStreamHealth) -> bool:
+        """Seed in-memory state from a validated committed STRANDED snapshot.
+
+        Returns True only when the identity was empty and *health* is
+        STRANDED. ``candidate_since`` is deliberately left unset: a
+        committed transition time is not an in-progress dwell candidate.
+        HEALTHY / UNKNOWN snapshots are ignored so they cannot bypass dwell
+        after a restart.
+        """
+        if health.state is not StreamHealthState.STRANDED:
+            return False
+        identity = (health.provider, health.stream)
+        if identity in self._tracked:
+            return False
+        self._tracked[identity] = _Tracked(health=health, candidate_since=None)
+        return True
 
     def evaluate(
         self,
