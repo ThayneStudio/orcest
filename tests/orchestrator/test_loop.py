@@ -5479,3 +5479,243 @@ def test_fast_caller_spares_legacy_heartbeat_during_rolling_upgrade(
     heartbeats = fake_redis_client.hgetall(_ISSUE_DISCOVERY_PROJECTS_KEY)
     assert "legacy" in heartbeats, "fast caller pruned a legacy-format heartbeat"
     assert "dead" not in heartbeats
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap degradation under Redis noeviction OOM (#611)
+# ---------------------------------------------------------------------------
+
+
+def _oom_error():
+    import redis as redis_py
+
+    oom_cls = getattr(redis_py.exceptions, "OutOfMemoryError", redis_py.ResponseError)
+    return oom_cls("OOM command not allowed when used memory > maxmemory")
+
+
+def test_ensure_consumer_group_or_defer_existing_group_no_write(mocker):
+    """An existing group is confirmed without issuing a write, even under OOM."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _ensure_consumer_group_or_defer
+
+    redis_client = MagicMock()
+    redis_client.ensure_consumer_group.return_value = None  # read-first, no OOM raised
+
+    result = _ensure_consumer_group_or_defer(
+        redis_client, "tasks:claude", "orcest-workers", logging.getLogger("test")
+    )
+
+    assert result is True
+    redis_client.ensure_consumer_group.assert_called_once_with("tasks:claude", "orcest-workers")
+
+
+def test_ensure_consumer_group_or_defer_missing_group_oom_defers():
+    """A missing group's creation OOM defers instead of raising."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _ensure_consumer_group_or_defer
+
+    redis_client = MagicMock()
+    redis_client.ensure_consumer_group.side_effect = _oom_error()
+
+    result = _ensure_consumer_group_or_defer(
+        redis_client, "tasks:claude", "orcest-workers", logging.getLogger("test")
+    )
+
+    assert result is False
+
+
+def test_ensure_consumer_group_or_defer_non_oom_raises():
+    """Wrong-type/ACL/protocol failures remain fatal, not deferred."""
+    from unittest.mock import MagicMock
+
+    import redis as redis_py
+
+    from orcest.orchestrator.loop import _ensure_consumer_group_or_defer
+
+    redis_client = MagicMock()
+    redis_client.ensure_consumer_group.side_effect = redis_py.ResponseError(
+        "WRONGTYPE Operation against a key holding the wrong kind of value"
+    )
+
+    with pytest.raises(redis_py.ResponseError, match="WRONGTYPE"):
+        _ensure_consumer_group_or_defer(
+            redis_client, "tasks:claude", "orcest-workers", logging.getLogger("test")
+        )
+
+
+def test_retry_pending_consumer_groups_recovers_after_oom():
+    """A deferred group is retried and drops out of the pending list on success."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_pending_consumer_groups
+
+    redis_client = MagicMock()
+    redis_client.ensure_consumer_group.side_effect = _oom_error()
+    pending = [(redis_client, "tasks:claude", "orcest-workers")]
+
+    still_pending = _retry_pending_consumer_groups(pending, logging.getLogger("test"))
+    assert still_pending == pending
+
+    redis_client.ensure_consumer_group.side_effect = None
+    redis_client.ensure_consumer_group.return_value = None
+    still_pending = _retry_pending_consumer_groups(still_pending, logging.getLogger("test"))
+    assert still_pending == []
+
+
+def test_retry_pending_provider_account_backfill_defers_on_oom(mocker):
+    """Classified Redis OOM during backfill defers rather than raising."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_pending_provider_account_backfill
+
+    mocker.patch(
+        "orcest.orchestrator.loop._backfill_retained_task_provider_accounts",
+        side_effect=_oom_error(),
+    )
+
+    completed = _retry_pending_provider_account_backfill(
+        MagicMock(), [], [], {}, 300, logging.getLogger("test")
+    )
+
+    assert completed is False
+
+
+def test_retry_pending_provider_account_backfill_succeeds(mocker):
+    """A completed backfill (including a no-op pass) reports done."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_pending_provider_account_backfill
+
+    mocker.patch(
+        "orcest.orchestrator.loop._backfill_retained_task_provider_accounts",
+        return_value=0,
+    )
+
+    completed = _retry_pending_provider_account_backfill(
+        MagicMock(), [], [], {}, 300, logging.getLogger("test")
+    )
+
+    assert completed is True
+
+
+def test_retry_pending_provider_account_backfill_non_oom_raises(mocker):
+    """A non-OOM backfill failure propagates instead of being deferred."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_pending_provider_account_backfill
+
+    mocker.patch(
+        "orcest.orchestrator.loop._backfill_retained_task_provider_accounts",
+        side_effect=ValueError("malformed retained task"),
+    )
+
+    with pytest.raises(ValueError, match="malformed retained task"):
+        _retry_pending_provider_account_backfill(
+            MagicMock(), [], [], {}, 300, logging.getLogger("test")
+        )
+
+
+def test_retry_deferred_bootstrap_work_keeps_consumer_group_pending_on_non_oom(mocker):
+    """A stuck deferred consumer-group retry cannot block the poll cycle."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_deferred_bootstrap_work
+
+    pending = [(MagicMock(), "tasks:claude", "orcest-workers")]
+    mocker.patch(
+        "orcest.orchestrator.loop._retry_pending_consumer_groups",
+        side_effect=ValueError("broken acl"),
+    )
+
+    still_pending, backfill_pending = _retry_deferred_bootstrap_work(
+        pending,
+        False,
+        MagicMock(),
+        [],
+        [],
+        {},
+        300,
+        logging.getLogger("test"),
+    )
+
+    assert still_pending == pending
+    assert backfill_pending is False
+
+
+def test_retry_deferred_bootstrap_work_keeps_backfill_pending_on_non_oom(mocker):
+    """A stuck deferred backfill retry cannot block the poll cycle."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_deferred_bootstrap_work
+
+    mocker.patch(
+        "orcest.orchestrator.loop._retry_pending_provider_account_backfill",
+        side_effect=ValueError("malformed retained task"),
+    )
+
+    still_pending, backfill_pending = _retry_deferred_bootstrap_work(
+        [],
+        True,
+        MagicMock(),
+        [],
+        [],
+        {},
+        300,
+        logging.getLogger("test"),
+    )
+
+    assert still_pending == []
+    assert backfill_pending is True
+
+
+def test_backfill_provider_account_oom_propagates_for_deferral(fake_redis_client, mocker):
+    """A Redis OOM while persisting a backfilled mapping propagates raw.
+
+    This is what lets ``_retry_pending_provider_account_backfill`` classify it
+    and defer the whole pass instead of the backfill loop silently swallowing
+    the failure (as the live task-registration path does) and only ever
+    surfacing a generic "no mapping written" symptom.
+    """
+    from orcest.orchestrator.loop import _backfill_retained_task_provider_accounts
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.models import Task, TaskType
+    from orcest.shared.providers import ProviderEntry
+
+    entry = ProviderEntry(provider="grok", credential="config-blob")
+    project = ProjectConfig(
+        repo="owner/testrepo",
+        token="fake-token",
+        claude_tokens=[],
+        key_prefix="test",
+        providers=[entry],
+    )
+    task = Task.create(
+        task_type=TaskType.FIX_PR,
+        repo=project.repo,
+        token=project.token,
+        resource_type="pr",
+        resource_id=91,
+        prompt="fix it",
+        key_prefix=project.key_prefix,
+        provider="grok",
+        credential="config-blob",
+        task_id="oom-during-backfill",
+    )
+    task_redis = RedisClient.from_client(fake_redis_client.client, key_prefix="shared")
+    legacy_fields = task.to_dict()
+    legacy_fields.pop("provider_account")
+    task_redis.xadd("tasks:grok", legacy_fields)
+
+    mocker.patch.object(fake_redis_client._client, "set", side_effect=_oom_error())
+
+    with pytest.raises(type(_oom_error())):
+        _backfill_retained_task_provider_accounts(
+            task_redis,
+            ["tasks:grok"],
+            [(project, fake_redis_client)],
+            {project.key_prefix: ProviderPool([entry])},
+            ttl_seconds=300,
+            logger=logging.getLogger("test"),
+        )
