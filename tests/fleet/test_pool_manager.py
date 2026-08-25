@@ -11,6 +11,7 @@ from orcest.fleet.pool_manager import (
     REAP_REASON_DONE_CLEANUP,
     REAP_REASON_ORPHAN_PEL,
     PoolManager,
+    ReapFence,
 )
 
 pytestmark = pytest.mark.unit
@@ -2894,6 +2895,40 @@ class TestReconcileStaleRedis:
         manager._reconcile_stale_redis()
 
         redis.hdel.assert_called_once_with("pool:active", "301")
+
+    def test_stale_idle_entry_clears_reap_fence(self):
+        """Idle stale cleanup releases in-memory per-VM reap telemetry."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.return_value = []
+        redis._idle_set = {"300"}
+        redis.hgetall.return_value = {}
+        manager._reap_fences[300] = ReapFence(
+            vm_id=300,
+            reason="ceiling",
+            killed_at_unix=100000.0,
+            elapsed_at_kill_seconds=100.0,
+        )
+
+        manager._reconcile_stale_redis()
+
+        assert 300 not in manager._reap_fences
+
+    def test_stale_active_entry_clears_reap_fence(self):
+        """Active stale cleanup releases in-memory per-VM reap telemetry."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.return_value = []
+        redis._idle_set = set()
+        redis.hgetall.return_value = {"301": "1000.0"}
+        manager._reap_fences[301] = ReapFence(
+            vm_id=301,
+            reason="ceiling",
+            killed_at_unix=100000.0,
+            elapsed_at_kill_seconds=100.0,
+        )
+
+        manager._reconcile_stale_redis()
+
+        assert 301 not in manager._reap_fences
 
     def test_stale_exact_slot_releases_process_local_allocation(self):
         """An externally deleted mixed-profile slot can be allocated again."""

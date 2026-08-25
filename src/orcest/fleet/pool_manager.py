@@ -1741,6 +1741,7 @@ class PoolManager:
                     self._redis.srem(_POOL_IDLE_KEY, str(vm_id))
                     self._allocated_vmids.discard(vm_id)
                     self._owned_provisioning_vmids.discard(vm_id)
+                    self._reap_fences.pop(vm_id, None)
                 except Exception:
                     logger.error(
                         "Failed to remove stale idle entry VM %d from Redis",
@@ -1764,6 +1765,7 @@ class PoolManager:
                     self._redis.hdel(_POOL_ACTIVE_KEY, str(vm_id))
                     self._allocated_vmids.discard(vm_id)
                     self._owned_provisioning_vmids.discard(vm_id)
+                    self._reap_fences.pop(vm_id, None)
                 except Exception:
                     logger.error(
                         "Failed to remove stale active entry VM %d from Redis",
