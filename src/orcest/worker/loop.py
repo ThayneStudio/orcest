@@ -62,7 +62,7 @@ from orcest.shared.output_streams import (
     OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
     iter_capped_output_fields,
 )
-from orcest.shared.redis_client import ConsumerGroupInspection, RedisClient, is_redis_oom_error
+from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.liveness_tracker import LivenessTracker
@@ -343,8 +343,10 @@ def _ensure_worker_consumer_groups(
 ) -> bool:
     """Ensure worker task consumer groups, retrying Redis maxmemory OOM only.
 
-    Missing groups require ``XGROUP CREATE ... MKSTREAM``, which Redis rejects
-    under ``maxmemory-policy noeviction`` while over limit.  Retrying this one
+    Each stream/group pair is delegated to ``ensure_consumer_group``, the
+    single read-before-write boundary (``XINFO GROUPS`` then optional
+    ``XGROUP CREATE ... MKSTREAM``).  Redis rejects that create under
+    ``maxmemory-policy noeviction`` while over limit.  Retrying this one
     classified write rejection in-process prevents systemd start-limit
     exhaustion.  Inspection, protocol, ACL/auth, wrong-type, and malformed
     response failures remain immediate startup errors.
@@ -356,8 +358,6 @@ def _ensure_worker_consumer_groups(
     while not abort.is_set():
         try:
             for stream in streams:
-                if redis.inspect_consumer_group(stream, group) is ConsumerGroupInspection.EXISTS:
-                    continue
                 redis.ensure_consumer_group(stream, group)
         except redis_py.ResponseError as exc:
             if not _is_redis_maxmemory_oom(exc):
