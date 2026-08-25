@@ -423,9 +423,7 @@ def test_xadd_capped_expire_rejects_zero_maxlen(fake_redis_client):
 
 def test_xadd_capped_expire_rejects_empty_fields(fake_redis_client):
     with pytest.raises(ValueError, match="fields must be a non-empty dict"):
-        fake_redis_client.xadd_capped_expire(
-            "output:worker-1", {}, maxlen=2000, ttl_seconds=3600
-        )
+        fake_redis_client.xadd_capped_expire("output:worker-1", {}, maxlen=2000, ttl_seconds=3600)
 
 
 def test_xadd_capped_expire_rejects_non_positive_ttl(fake_redis_client):
