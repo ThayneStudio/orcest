@@ -52,6 +52,7 @@ from orcest.shared.models import (
 from orcest.shared.provider_stream_health import (
     ProviderStreamHealth,
     ProviderStreamHealthTracker,
+    parse_committed_stranded_snapshot,
     stream_health_snapshot_key,
 )
 from orcest.shared.redis_client import RedisClient
@@ -109,13 +110,14 @@ _IDLE_LIVENESS_BREAKER_LIMIT = 2
 _ACTIVITY_KEY_PREFIX = "workers:activity:"
 
 # Global (cross-project, unprefixed) canonical per-stream health snapshots
-# (issue #613, extended by #639). PoolManager is the single writer; keys are
-# ``provider-stream-health:{provider}:pr`` and ``...:issue`` via
-# ``stream_health_snapshot_key``. ``orcest status`` and the live dashboard
-# only ever consume those keys, never recompute health.
+# (issue #613, extended by #639; restart restore in #636). PoolManager is
+# the single writer; keys are ``provider-stream-health:{provider}:pr`` and
+# ``...:issue`` via ``stream_health_snapshot_key``. ``orcest status`` and
+# the live dashboard only ever consume those keys, never recompute health.
 # TTL comfortably longer than one reconcile interval so a snapshot survives
 # normal polling gaps but expires (rather than lying stale forever) if the
-# pool manager stops publishing entirely.
+# pool manager stops publishing entirely. After a process restart only a
+# validated committed STRANDED snapshot may seed the in-memory tracker.
 _STREAM_HEALTH_TTL_SECONDS = 900
 
 # VM naming convention
@@ -2880,6 +2882,11 @@ class PoolManager:
 
         A read failure or unexpected exception for one stream must not
         skip the other stream or abort the rest of reconciliation.
+
+        On the first pass after process start, a valid committed STRANDED
+        snapshot may seed the tracker so a still-stranded stream is not
+        muted behind a fresh dwell. Current stream inputs are always read
+        before that seed is allowed to affect what is published.
         """
         if not self._pool.stream_health_enabled:
             return
@@ -2911,6 +2918,7 @@ class PoolManager:
         pending, lag, registered, live, read_error = self._read_stream_health_inputs(
             stream, heartbeat_cache
         )
+        self._restore_committed_stream_health(provider, stream, now, issue=issue)
         snapshot, transition = self._stream_health_tracker.evaluate(
             provider,
             stream,
@@ -2941,6 +2949,91 @@ class PoolManager:
                 provider,
                 snapshot.live_consumers,
             )
+
+    def _restore_committed_stream_health(
+        self,
+        provider: str,
+        stream: str,
+        now: float,
+        *,
+        issue: bool,
+    ) -> None:
+        """Best-effort seed of committed STRANDED state after a restart.
+
+        Invalid, stale, HEALTHY, and unreadable snapshots are treated as
+        absent so dwell still applies. Redis failures here must never abort
+        evaluation of the current stream inputs.
+
+        SECURITY: this path is forgeable under the shared-credential threat
+        model. All workers share one Redis password (accepted risk, 2026-06
+        audit), so a principal that can SET ``provider-stream-health:*`` can
+        plant a versioned STRANDED snapshot and, after the next PoolManager
+        restart, bypass dwell for that stream. Validation (version, identity,
+        TTL, timestamp order/freshness) rejects accidental junk; it is not
+        authentication. The forge is strictly weaker than what the shared
+        password already grants (full queue/lock/result read-write). Real
+        remediation is per-worker Redis ACLs, tracked separately.
+        """
+        if self._stream_health_tracker.has_state(provider, stream):
+            return
+        try:
+            key = stream_health_snapshot_key(provider, issue=issue)
+            record = self._read_stream_health_snapshot_record(key)
+            if record is None:
+                return
+            payload, ttl_seconds = record
+            if payload is None:
+                return
+            try:
+                data = json.loads(payload)
+            except (TypeError, ValueError):
+                return
+            snapshot = parse_committed_stranded_snapshot(
+                data,
+                expected_provider=provider,
+                expected_stream=stream,
+                now=now,
+                ttl_seconds=ttl_seconds,
+                max_age_seconds=float(_STREAM_HEALTH_TTL_SECONDS),
+            )
+            if snapshot is None:
+                return
+            self._stream_health_tracker.restore_committed(snapshot)
+        except Exception:
+            logger.warning(
+                "Failed to restore stream health for provider %s stream=%s; "
+                "continuing from in-memory state",
+                provider,
+                stream,
+                exc_info=True,
+            )
+
+    def _read_stream_health_snapshot_record(self, key: str) -> tuple[str | None, int] | None:
+        """Return ``(payload, ttl_seconds)`` for *key*, or ``None`` on Redis failure.
+
+        A missing key is ``(None, ttl)`` with Redis TTL ``-2``. A persistent
+        key (no expire) is a payload paired with TTL ``-1``; the parser
+        treats both as absent. A Redis exception is ``None`` so the caller
+        falls back to dwell rather than aborting reconciliation.
+        """
+        try:
+            pipe = self._redis.client.pipeline(transaction=False)
+            pipe.get(key)
+            pipe.ttl(key)
+            raw, ttl = pipe.execute()
+        except Exception:
+            logger.warning(
+                "Failed to read stream health snapshot %s; continuing without restore",
+                key,
+                exc_info=True,
+            )
+            return None
+        payload = None if raw is None else str(raw)
+        try:
+            ttl_seconds = int(ttl)
+        except (TypeError, ValueError):
+            return None
+        return payload, ttl_seconds
 
     def _read_stream_health_inputs(
         self, stream: str, heartbeat_cache: dict[str, bool | None]
