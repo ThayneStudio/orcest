@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, call as mock_call, patch
 
 import pytest
+import redis as redis_py
 
 from orcest.shared.config import RedisConfig, RunnerConfig, WorkerConfig
 from orcest.shared.credential_handoff import CREDENTIAL_CHECKPOINT_TTL_SECONDS
@@ -31,8 +32,10 @@ from orcest.shared.output_streams import (
     iter_capped_output_fields,
     output_streams_worst_case_bytes,
 )
+from orcest.shared.redis_client import ConsumerGroupInspection
 from orcest.worker.loop import (
     _CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX,
+    _GROUP_BOOTSTRAP_MAX_BACKOFF_SECONDS,
     _HANDOFF_FINGERPRINT_FIELD,
     _HANDOFF_MARKER_TTL_SECONDS,
     _RESULT_PUBLISH_BACKOFF,
@@ -52,6 +55,7 @@ from orcest.worker.loop import (
     _credential_checkpoint_key,
     _dead_letter_task,
     _drain_pending_tasks_raw,
+    _ensure_worker_consumer_groups,
     _execute_task,
     _handoff_marker_key,
     _handoff_result_until_terminal,
@@ -71,6 +75,11 @@ from orcest.worker.workspace import WorkspaceError
 # ---------------------------------------------------------------------------
 # Helpers / fixtures local to this module
 # ---------------------------------------------------------------------------
+
+
+def _redis_oom_error() -> redis_py.ResponseError:
+    oom_cls = getattr(redis_py.exceptions, "OutOfMemoryError", redis_py.ResponseError)
+    return oom_cls("OOM command not allowed when used memory > maxmemory")
 
 
 @pytest.fixture
@@ -188,6 +197,158 @@ def test_wait_for_redis_aborts_during_backoff():
 
     assert _wait_for_redis(redis, logging.getLogger("test.redis-wait"), abort) is False
     redis.health_check.assert_called_once()
+
+
+@pytest.mark.unit
+def test_consumer_group_bootstrap_retries_oom_then_succeeds(mocker):
+    """Redis maxmemory OOM during group creation recovers in one process."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.side_effect = [
+        ConsumerGroupInspection.MISSING,
+        ConsumerGroupInspection.MISSING,
+        ConsumerGroupInspection.MISSING,
+        ConsumerGroupInspection.MISSING,
+    ]
+    redis.ensure_consumer_group.side_effect = [_redis_oom_error(), None, None]
+    wait = mocker.patch("orcest.worker.loop.threading.Event.wait", return_value=False)
+
+    assert (
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude", "tasks:issue:claude"),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+        is True
+    )
+
+    assert redis.ensure_consumer_group.call_count == 3
+    wait.assert_called_once_with(timeout=1)
+
+
+@pytest.mark.unit
+def test_consumer_group_bootstrap_repeated_oom_waits_until_shutdown(mocker):
+    """Repeated maxmemory OOM stays in-process and exits only on shutdown."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
+    redis.ensure_consumer_group.side_effect = _redis_oom_error()
+    waits: list[int] = []
+
+    def stop_after_three_waits(timeout):
+        waits.append(timeout)
+        return len(waits) == 3
+
+    mocker.patch("orcest.worker.loop.threading.Event.wait", side_effect=stop_after_three_waits)
+
+    assert (
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude",),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+        is False
+    )
+
+    assert redis.ensure_consumer_group.call_count == 3
+    assert waits == [1, 2, 4]
+
+
+@pytest.mark.unit
+def test_consumer_group_bootstrap_caps_backoff_at_sixty_seconds(mocker):
+    """OOM retry backoff is exponential but capped at 60 seconds."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
+    redis.ensure_consumer_group.side_effect = _redis_oom_error()
+    waits: list[int] = []
+
+    def stop_after_cap_seen(timeout):
+        waits.append(timeout)
+        return len(waits) == 8
+
+    mocker.patch("orcest.worker.loop.threading.Event.wait", side_effect=stop_after_cap_seen)
+
+    assert (
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude",),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+        is False
+    )
+
+    assert max(waits) == _GROUP_BOOTSTRAP_MAX_BACKOFF_SECONDS
+    assert waits[-2:] == [60, 60]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error",
+    [
+        redis_py.ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        redis_py.ResponseError("NOPERM this user has no permissions"),
+        redis_py.AuthenticationError("invalid username-password pair"),
+    ],
+)
+def test_consumer_group_bootstrap_non_oom_errors_fail_fast(error):
+    """Wrong type, ACL, and auth failures are not retried as memory pressure."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
+    redis.ensure_consumer_group.side_effect = error
+
+    with pytest.raises(type(error)):
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude",),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+
+    redis.ensure_consumer_group.assert_called_once()
+
+
+@pytest.mark.unit
+def test_consumer_group_bootstrap_existing_groups_do_not_write():
+    """Existing groups pass inspection without attempting a Redis write."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.EXISTS
+    redis.ensure_consumer_group.side_effect = _redis_oom_error()
+
+    assert (
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude", "tasks:issue:claude"),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+        is True
+    )
+
+    redis.ensure_consumer_group.assert_not_called()
+
+
+@pytest.mark.unit
+def test_consumer_group_bootstrap_malformed_inspection_fails_fast():
+    """Malformed inspection responses remain startup errors."""
+    redis = MagicMock()
+    redis.inspect_consumer_group.side_effect = TypeError("xinfo_groups returned str")
+
+    with pytest.raises(TypeError, match="xinfo_groups returned str"):
+        _ensure_worker_consumer_groups(
+            redis,
+            ("tasks:claude",),
+            CONSUMER_GROUP,
+            logging.getLogger("test.group-bootstrap"),
+            threading.Event(),
+        )
+
+    redis.ensure_consumer_group.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1350,6 +1511,7 @@ class TestRunWorker:
         """
         mock_redis = MagicMock()
         mock_redis.health_check.return_value = True
+        mock_redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
         mock_redis.ensure_consumer_group.return_value = None
         mock_redis.ensure_consumer_group_raw.return_value = None
         mock_redis.xack.return_value = 1
@@ -1485,6 +1647,82 @@ class TestRunWorker:
         result_fields = results_calls[0][0][1]
         assert result_fields["status"] == ResultStatus.COMPLETED.value
         assert result_fields["task_id"] == sample_task.id
+
+    def test_worker_consumer_group_oom_recovers_in_same_process(
+        self, mocker, worker_config, sample_task
+    ):
+        """A missing group plus Redis maxmemory OOM retries before consuming work."""
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+        mock_redis.ensure_consumer_group.side_effect = [_redis_oom_error(), None, None]
+        wait_patch = mocker.patch("orcest.worker.loop.threading.Event.wait", return_value=False)
+
+        run_worker(worker_config)
+
+        assert mock_redis.ensure_consumer_group.call_count == 3
+        wait_patch.assert_any_call(timeout=1)
+        mocks["runner"].run.assert_called_once()
+
+    def test_worker_consumer_group_repeated_oom_waits_for_shutdown(self, mocker, worker_config):
+        """Repeated group-creation OOM does not exit; shutdown interrupts the wait."""
+        mock_redis = self._build_mock_redis()
+        heartbeat_cls = MagicMock()
+        self._setup_run_worker(mocker, worker_config, mock_redis, heartbeat_mock=heartbeat_cls)
+        mock_redis.ensure_consumer_group.side_effect = _redis_oom_error()
+        waits: list[int] = []
+
+        def stop_after_two_waits(timeout):
+            waits.append(timeout)
+            return len(waits) == 2
+
+        mocker.patch("orcest.worker.loop.threading.Event.wait", side_effect=stop_after_two_waits)
+
+        run_worker(worker_config)
+
+        assert mock_redis.ensure_consumer_group.call_count == 2
+        assert waits == [1, 2]
+        mock_redis.xreadgroup.assert_not_called()
+        heartbeat_cls.assert_not_called()
+        assert not any(
+            call.args and str(call.args[0]).startswith("workers:heartbeat:")
+            for call in mock_redis.set_ex.call_args_list
+        )
+
+    def test_worker_consumer_group_existing_at_maxmemory_starts(
+        self, mocker, worker_config, sample_task
+    ):
+        """Existing groups pass read-first inspection without a write."""
+        mock_redis = self._build_mock_redis()
+        mock_redis.inspect_consumer_group.return_value = ConsumerGroupInspection.EXISTS
+        mock_redis.ensure_consumer_group.side_effect = _redis_oom_error()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        mocks["runner"].run.return_value = _success_runner_result()
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+
+        run_worker(worker_config)
+
+        mock_redis.ensure_consumer_group.assert_not_called()
+        mocks["runner"].run.assert_called_once()
+
+    def test_worker_consumer_group_non_oom_startup_error_fails_fast(
+        self, mocker, worker_config
+    ):
+        """Non-OOM consumer-group bootstrap errors remain loud startup failures."""
+        mock_redis = self._build_mock_redis()
+        self._setup_run_worker(mocker, worker_config, mock_redis)
+        mock_redis.ensure_consumer_group.side_effect = redis_py.ResponseError(
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
+        wait_patch = mocker.patch("orcest.worker.loop.threading.Event.wait", return_value=False)
+
+        with pytest.raises(redis_py.ResponseError, match="WRONGTYPE"):
+            run_worker(worker_config)
+
+        mock_redis.ensure_consumer_group.assert_called_once()
+        mock_redis.xreadgroup.assert_not_called()
+        wait_patch.assert_not_called()
 
     def test_worker_rejects_task_from_wrong_provider_stream(
         self, mocker, worker_config, sample_task
