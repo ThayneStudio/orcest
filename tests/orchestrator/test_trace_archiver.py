@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import fakeredis
@@ -16,9 +17,13 @@ from orcest.orchestrator.trace_archiver import (
     _CURSOR_FILENAME,
     _CURSOR_HASH_KEY,
     _CURSOR_STATE_VERSION,
+    _RETAIN_NEWEST,
+    StreamCursor,
     TraceArchiver,
     _entry_id_to_iso,
+    _entry_id_tuple,
     cursor_state_path,
+    persist_cursor_state_file,
 )
 from orcest.shared.output_streams import iter_capped_output_fields
 from orcest.shared.redis_client import RedisClient
@@ -859,3 +864,270 @@ class TestArchiverCursorDurability:
         assert archiver.health_error is not None
         assert archiver.committed_last_id("output:w1") is None
         assert _count_in_archive(archive_root, "version-skip-payload") == 0
+
+
+def _stream_ids(redis_client: RedisClient, stream: str) -> list[str]:
+    return [entry_id for entry_id, _ in redis_client.xrange(stream)]
+
+
+def _enqueue_task_with_lines(
+    redis_client: RedisClient,
+    n_lines: int,
+    *,
+    stream: str = "output:w1",
+    task_id: str = "t-trim",
+) -> list[str]:
+    ids = [
+        _xadd(
+            redis_client,
+            stream,
+            {"type": "task_start", "task_id": task_id, "repo": "owner/r"},
+        )
+    ]
+    for i in range(n_lines):
+        ids.append(_xadd(redis_client, stream, {"line": f"payload-{i}"}))
+    ids.append(
+        _xadd(
+            redis_client,
+            stream,
+            {"type": "task_end", "task_id": task_id, "status": "completed"},
+        )
+    )
+    return ids
+
+
+def _hours_ago_iso(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestArchiverTrimAndCursorGC:
+    def test_retains_newest_tail_after_durable_archive(
+        self, fake_redis_client, logger, archive_root
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        archiver._pump_output_streams()
+
+        remaining = _stream_ids(fake_redis_client, "output:w1")
+        assert len(remaining) == _RETAIN_NEWEST
+        assert remaining == ids[-_RETAIN_NEWEST:]
+        assert archiver.committed_last_id("output:w1") == ids[-1]
+
+    def test_does_not_trim_past_committed_cursor(self, fake_redis_client, logger, archive_root):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archived = _enqueue_task_with_lines(fake_redis_client, 5, task_id="t-early")
+        archiver._pump_output_streams()
+        cursor = archiver.committed_last_id("output:w1")
+        assert cursor == archived[-1]
+
+        extras = [
+            _xadd(fake_redis_client, "output:w1", {"line": f"unarchived-{i}"}) for i in range(200)
+        ]
+        archiver._trim_archived_stream("output:w1")
+
+        remaining = _stream_ids(fake_redis_client, "output:w1")
+        assert cursor in remaining
+        cursor_tuple = _entry_id_tuple(cursor)
+        assert cursor_tuple is not None
+        for entry_id in remaining:
+            parsed = _entry_id_tuple(entry_id)
+            assert parsed is not None
+            assert parsed >= cursor_tuple
+        assert extras[-1] in remaining
+        assert len(remaining) > _RETAIN_NEWEST
+
+    def test_disabled_archiver_does_not_trim(self, fake_redis_client, logger, archive_root):
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        archiver = TraceArchiver(
+            redis=fake_redis_client,
+            archive_path=None,
+            repo_to_project={"owner/r": "myproj"},
+            logger=logger,
+        )
+        archiver.start()
+        assert archiver._thread is None
+        archiver._trim_archived_stream("output:w1")
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_skipped_entry_does_not_trim(self, fake_redis_client, logger, archive_root):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = [_xadd(fake_redis_client, "output:w1", {"line": f"orphan-{i}"}) for i in range(200)]
+        archiver._pump_output_streams()
+        assert archiver.committed_last_id("output:w1") == ids[-1]
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_open_failure_does_not_trim(self, fake_redis_client, logger, archive_root, monkeypatch):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+
+        def fail_open(_path: Path):
+            raise OSError("open failed")
+
+        monkeypatch.setattr(archiver, "_open_archive_file", fail_open)
+        archiver._pump_output_streams()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_write_failure_does_not_trim(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        orig = archiver._append_archive_text
+
+        def fail_write(handle, text: str) -> None:
+            if "payload-0" in text:
+                raise OSError("write failed")
+            orig(handle, text)
+
+        monkeypatch.setattr(archiver, "_append_archive_text", fail_write)
+        archiver._pump_output_streams()
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_fsync_failure_does_not_trim(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+
+        def fail_fsync(_handle) -> None:
+            raise OSError("fsync failed")
+
+        monkeypatch.setattr(archiver, "_fsync_archive", fail_fsync)
+        archiver._pump_output_streams()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_cursor_persist_failure_does_not_trim(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+
+        def fail_write(_fd: int, _data: bytes) -> None:
+            raise OSError("cursor temp write failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_write_fd", fail_write)
+        archiver._pump_output_streams()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_corrupt_cursor_does_not_trim(self, fake_redis_client, logger, archive_root):
+        state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not-json", encoding="utf-8")
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+
+    def test_oom_compatible_trim_when_redis_refuses_writes(
+        self, fake_redis_client, logger, archive_root
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        _refuse_redis_writes(fake_redis_client)
+        archiver._pump_output_streams()
+        remaining = _stream_ids(fake_redis_client, "output:w1")
+        assert remaining == ids[-_RETAIN_NEWEST:]
+        assert _count_in_archive(archive_root, "payload-199") == 1
+
+    def test_trim_failure_retries_without_blocking_archival(
+        self, fake_redis_client, logger, archive_root, monkeypatch, caplog
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        orig = fake_redis_client.xtrim_minid
+        calls = {"n": 0}
+
+        def fail_trim(stream: str, minid: str) -> int:
+            calls["n"] += 1
+            raise redis.ResponseError("OOM command not allowed when used memory > 'maxmemory'")
+
+        monkeypatch.setattr(fake_redis_client, "xtrim_minid", fail_trim)
+        with caplog.at_level(logging.WARNING):
+            archiver._pump_output_streams()
+            archiver._pump_output_streams()
+        assert _count_in_archive(archive_root, "payload-199") == 1
+        assert _stream_ids(fake_redis_client, "output:w1") == ids
+        assert caplog.text.count("trim failed") == 1
+
+        monkeypatch.setattr(fake_redis_client, "xtrim_minid", orig)
+        archiver._pump_output_streams()
+        remaining = _stream_ids(fake_redis_client, "output:w1")
+        assert remaining == ids[-_RETAIN_NEWEST:]
+        assert calls["n"] >= 2
+
+    def test_late_dashboard_attach_reads_retained_tail(
+        self, fake_redis_client, logger, archive_root
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        ids = _enqueue_task_with_lines(fake_redis_client, 200)
+        archiver._pump_output_streams()
+
+        # Dashboard live-tail starts from 0-0 on first attach.
+        attached = fake_redis_client.xread_after("output:w1", "0-0", count=500)
+        attached_ids = [entry_id for entry_id, _ in attached]
+        assert attached_ids == ids[-_RETAIN_NEWEST:]
+        payloads = [fields.get("line", "") for _, fields in attached]
+        assert "payload-199" in payloads
+        assert "payload-0" not in payloads
+
+    def test_stale_absent_cursor_gc_after_32_hours(self, fake_redis_client, logger, archive_root):
+        gone = "output:gone"
+        fake_redis_client.hset(_CURSOR_HASH_KEY, gone, "1-0")
+        fake_redis_client.hset(_CURSOR_HASH_KEY, "output:w1", "2-0")
+        persist_cursor_state_file(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix),
+            {
+                gone: StreamCursor(last_id="1-0", last_seen=_hours_ago_iso(33)),
+                "output:w1": StreamCursor(last_id="2-0", last_seen=_hours_ago_iso(33)),
+            },
+        )
+        live_id = _xadd(fake_redis_client, "output:w1", {"line": "still-here"})
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+
+        state = json.loads(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix).read_text()
+        )
+        assert gone not in state["streams"]
+        assert "output:w1" in state["streams"]
+        assert fake_redis_client.hget(_CURSOR_HASH_KEY, gone) is None
+        assert fake_redis_client.hget(_CURSOR_HASH_KEY, "output:w1") == "2-0"
+        assert live_id in _stream_ids(fake_redis_client, "output:w1")
+
+    def test_cursor_gc_waits_full_32_hours(self, fake_redis_client, logger, archive_root):
+        gone = "output:gone"
+        fake_redis_client.hset(_CURSOR_HASH_KEY, gone, "1-0")
+        persist_cursor_state_file(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix),
+            {gone: StreamCursor(last_id="1-0", last_seen=_hours_ago_iso(31))},
+        )
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+        state = json.loads(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix).read_text()
+        )
+        assert gone in state["streams"]
+        assert fake_redis_client.hget(_CURSOR_HASH_KEY, gone) == "1-0"
+
+    def test_live_idle_stream_cursor_is_not_gc_even_if_last_seen_is_old(
+        self, fake_redis_client, logger, archive_root
+    ):
+        stream = "output:idle"
+        entry_id = _xadd(fake_redis_client, stream, {"line": "idle-tail"})
+        persist_cursor_state_file(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix),
+            {stream: StreamCursor(last_id=entry_id, last_seen=_hours_ago_iso(40))},
+        )
+        fake_redis_client.hset(_CURSOR_HASH_KEY, stream, entry_id)
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+        state = json.loads(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix).read_text()
+        )
+        assert stream in state["streams"]
+        assert fake_redis_client.hget(_CURSOR_HASH_KEY, stream) == entry_id
+        assert _stream_ids(fake_redis_client, stream) == [entry_id]
