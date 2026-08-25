@@ -324,11 +324,19 @@ variables in this order (see `_PROVIDER_ENV_CANDIDATES` in
 
 | Provider | Env vars (first non-empty wins)                                  |
 | -------- | ---------------------------------------------------------------- |
-| `claude` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                   |
-| `clauder` | `CLAUDER_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+| `claude` | `CLAUDE_CODE_OAUTH_TOKEN`                                        |
+| `clauder` | `CLAUDER_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`                     |
 | `grok`   | `XAI_API_KEY`, `GROK_API_KEY`, `XAI_API_TOKEN`                   |
 | `codex`  | `CODEX_API_KEY`, `OPENAI_API_KEY`                                |
 | *any*    | falls back to `<PROVIDER>_TOKEN`, `<PROVIDER>_API_KEY`, `<PROVIDER>_KEY` |
+
+`ANTHROPIC_API_KEY` is **not** a supported Claude runtime credential.
+Workers inject the task credential as `CLAUDE_CODE_OAUTH_TOKEN`, and the
+task schema does not carry authentication kind, so an API key cannot be
+relabeled as an OAuth token. A Claude-enabled path that only has
+`ANTHROPIC_API_KEY` fails validation with a migration instruction. An
+unrelated `ANTHROPIC_API_KEY` in the environment does not fail
+non-Claude providers.
 
 The orchestrator only registers and round-robins providers; **workers
 own execution**. To add a new provider end-to-end (worker registry +
@@ -355,12 +363,16 @@ Top-level keys (from `WorkerConfig`):
 | Variable                                                 | Required when                                            |
 | -------------------------------------------------------- | -------------------------------------------------------- |
 | `GITHUB_TOKEN`                                           | `github.token` is empty in YAML.                         |
-| `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)       | A `claude` provider entry has no inline `credential`.    |
-| `CLAUDER_API_KEY` (checked before `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) | A `clauder` provider entry has no inline `credential`. |
+| `CLAUDE_CODE_OAUTH_TOKEN`                                | A `claude` provider entry has no inline `credential`.    |
+| `CLAUDER_API_KEY` (checked before `CLAUDE_CODE_OAUTH_TOKEN`) | A `clauder` provider entry has no inline `credential`. |
 | `XAI_API_KEY` / `GROK_API_KEY` / `XAI_API_TOKEN`         | A `grok` provider entry has no inline `credential`.     |
 | `CODEX_API_KEY` (or `OPENAI_API_KEY`)                    | A `codex` provider entry has no inline `credential`.    |
 | `ORCEST_REDIS_*`                                         | Used by `orcest pool-manage` inside the Compose stack.   |
 | `ORCEST_TRACE_ARCHIVE_ROOT`                              | Override the trace archive root used by `orcest trace`.  |
+
+Claude runtime credentials are OAuth tokens. The Actions-review secret
+and the fleet runtime tokens are **two separate planes** — see
+[Credential planes](#credential-planes).
 
 ## Quickstart (local single-project test)
 
@@ -438,6 +450,38 @@ The single source of truth for the whole fleet is a YAML file on the
 Proxmox host at `/etc/orcest/config.yaml` (see
 `src/orcest/fleet/config.py`). `orcest fleet` subcommands are invoked
 from the Proxmox host and reach the orchestrator over SSH.
+
+## Credential planes
+
+Claude Code OAuth tokens (`CLAUDE_CODE_OAUTH_TOKEN`) are the supported
+Claude runtime credential. There are **two separate credential planes**.
+They may contain different tokens and rotation schedules, and they are
+**not** synchronized.
+
+### Actions review plane
+
+The repository GitHub Actions secret named `CLAUDE_CODE_OAUTH_TOKEN`
+exists for review automation only. It is consumed by
+`.github/workflows/claude-review.yml` and the manually dispatched
+`.github/workflows/claude-review-usage.yml`. Keep that secret for those
+workflows.
+
+That Actions secret does **not** satisfy or feed fleet runtime
+deployment. Production/test deploys are not performed by GitHub
+Actions, and the secret must not be copied into PVE.
+
+### Fleet runtime plane
+
+Operators stage a verified source bundle and run fleet commands over
+SSH through `root@pve-test.lab.prefixa.net`. Runtime provider
+credentials come from the root-owned, mode-`0600`
+`/etc/orcest/config.yaml` (`claude_oauth_tokens` or
+`provider_credentials.claude`). `orcest fleet update` generates
+protected per-project `.env` files containing
+`CLAUDE_CODE_OAUTH_TOKEN` on the orchestrator VM.
+
+The protected PVE file is the deployment source of truth for runtime
+credentials. GitHub Actions does not deploy those values.
 
 ## Fleet commands
 

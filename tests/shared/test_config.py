@@ -5,12 +5,14 @@ from pathlib import Path
 import pytest
 
 from orcest.shared.config import (
+    _PROVIDER_ENV_CANDIDATES,
     ProjectConfig,
     RunnerConfig,
     build_redis_config,
     load_orchestrator_config,
     load_worker_config,
 )
+from orcest.shared.models import is_claude_provider
 from orcest.shared.providers import ProviderEntry
 
 # ---------------------------------------------------------------------------
@@ -1312,3 +1314,170 @@ def test_providers_dedup_within_single_list_first_wins(tmp_path: Path):
     # the other one is present
     other = next(e for e in grok_entries if e.credential == "other-creds")
     assert other.cli_binary is None
+
+
+# -- Claude OAuth credential contract (#535) -----------------------------------
+
+_CLAUDE_API_KEY_MIGRATION_RE = r"ANTHROPIC_API_KEY is not a supported Claude runtime credential"
+
+
+def test_claude_provider_env_candidates_are_oauth_only():
+    """Claude runtime resolution must not treat ANTHROPIC_API_KEY as a credential."""
+    assert "ANTHROPIC_API_KEY" not in _PROVIDER_ENV_CANDIDATES["claude"]
+    assert "ANTHROPIC_API_KEY" not in _PROVIDER_ENV_CANDIDATES["clauder"]
+    assert _PROVIDER_ENV_CANDIDATES["claude"] == ["CLAUDE_CODE_OAUTH_TOKEN"]
+    assert _PROVIDER_ENV_CANDIDATES["clauder"][0:2] == [
+        "CLAUDER_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ]
+
+
+def test_load_orchestrator_config_claude_oauth_token_from_env(tmp_path: Path, monkeypatch):
+    """Explicit CLAUDE_CODE_OAUTH_TOKEN fills a credential-empty claude provider."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-from-env")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\n"
+        "providers:\n"
+        "  - provider: claude\n"
+        "    credential: ''\n"
+        "    model: claude-sonnet\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    entry = next(e for e in config.projects[0].providers if e.provider == "claude")
+    assert entry.credential == "oauth-from-env"
+    assert entry.model == "claude-sonnet"
+
+
+def test_load_orchestrator_config_legacy_claude_tokens_oauth_env(tmp_path: Path, monkeypatch):
+    """Legacy synthesis still resolves CLAUDE_CODE_OAUTH_TOKEN without a providers list."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "legacy-oauth-from-env")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.projects[0].claude_tokens == ["legacy-oauth-from-env"]
+    claude_entries = [e for e in config.projects[0].providers if e.provider == "claude"]
+    assert len(claude_entries) == 1
+    assert claude_entries[0].credential == "legacy-oauth-from-env"
+
+
+def test_load_orchestrator_config_oauth_wins_over_anthropic_api_key(tmp_path: Path, monkeypatch):
+    """A present OAuth token is used even if ANTHROPIC_API_KEY is also set."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-wins")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-be-used")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nproviders:\n  - provider: claude\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    entry = next(e for e in config.projects[0].providers if e.provider == "claude")
+    assert entry.credential == "oauth-wins"
+
+
+def test_load_orchestrator_config_claude_old_key_only_raises_migration_error(
+    tmp_path: Path, monkeypatch
+):
+    """Claude-enabled old-key-only config fails with an explicit migration instruction."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-legacy-only")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nproviders:\n  - provider: claude\n")
+
+    with pytest.raises(ValueError, match=_CLAUDE_API_KEY_MIGRATION_RE) as exc_info:
+        load_orchestrator_config(cfg_file)
+
+    message = str(exc_info.value)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in message
+    assert "sk-ant-legacy-only" not in message
+
+
+def test_load_orchestrator_config_implicit_claude_old_key_only_raises(tmp_path: Path, monkeypatch):
+    """Default Claude path with only ANTHROPIC_API_KEY is not treated as credential-free."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-legacy-only")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    with pytest.raises(ValueError, match=_CLAUDE_API_KEY_MIGRATION_RE):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_clauder_old_key_only_raises_migration_error(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-legacy-only")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nproviders:\n  - provider: clauder\n")
+
+    with pytest.raises(ValueError, match=_CLAUDE_API_KEY_MIGRATION_RE):
+        load_orchestrator_config(cfg_file)
+
+
+def test_load_orchestrator_config_unrelated_anthropic_key_does_not_fail_grok(
+    tmp_path: Path, monkeypatch
+):
+    """ANTHROPIC_API_KEY in the environment must not fail a non-Claude provider."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-unrelated")
+    monkeypatch.setenv("XAI_API_KEY", "grok-from-env")
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nproviders:\n  - provider: grok\n    model: grok-3\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    grok_e = next(e for e in config.projects[0].providers if e.provider == "grok")
+    assert grok_e.credential == "grok-from-env"
+    assert not any(is_claude_provider(e.provider) for e in config.projects[0].providers)
+
+
+def test_load_worker_config_unrelated_anthropic_key_does_not_fail(tmp_path: Path, monkeypatch):
+    """Worker configs without Claude providers ignore an unrelated API key."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-unrelated")
+    cfg_file = tmp_path / "worker.yaml"
+    cfg_file.write_text("worker_id: worker-1\nbackend: grok\n")
+
+    config = load_worker_config(cfg_file)
+
+    assert config.backend == "grok"
+    assert config.providers == []
+
+
+def test_docs_and_examples_agree_with_oauth_only_claude_contract():
+    """README, env examples, and rollout guidance must not advertise API-key auth."""
+    repo = Path(__file__).resolve().parents[2]
+    candidates = _PROVIDER_ENV_CANDIDATES["claude"] + _PROVIDER_ENV_CANDIDATES["clauder"]
+    assert "ANTHROPIC_API_KEY" not in candidates
+
+    env_example = (repo / "provision" / "env.example").read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN=" in env_example
+    assert "ANTHROPIC_API_KEY=" not in env_example
+
+    orch_env = (repo / "provision" / "env.orchestrator.example").read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in orch_env
+    assert "ANTHROPIC_API_KEY=" not in orch_env
+
+    example_yaml = (repo / "config" / "orchestrator.example.yaml").read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in example_yaml
+    assert "ANTHROPIC_API_KEY" not in example_yaml or "not ANTHROPIC_API_KEY" in example_yaml
+
+    readme = (repo / "README.md").read_text()
+    assert "| `claude` | `CLAUDE_CODE_OAUTH_TOKEN`" in readme
+    assert "or `ANTHROPIC_API_KEY`" not in readme
+    assert "Credential planes" in readme
+    assert "Actions review plane" in readme
+    assert "Fleet runtime plane" in readme
+    assert "/etc/orcest/config.yaml" in readme
+    assert "must not be copied into PVE" in readme
+    assert "root@pve-test.lab.prefixa.net" in readme
+    assert "claude-review.yml" in readme
+
+    rollout = (repo / "docs" / "rollout-multi-provider.md").read_text()
+    rollout_flat = " ".join(rollout.split())
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in rollout
+    assert "Actions review plane" in rollout
+    assert "Fleet runtime plane" in rollout
+    assert "not a supported fallback" in rollout
+    assert "must not copy that secret into PVE" in rollout_flat
