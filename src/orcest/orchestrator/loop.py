@@ -1387,6 +1387,60 @@ def _retry_pending_provider_account_backfill(
     return True
 
 
+def _retry_deferred_bootstrap_work(
+    pending_consumer_groups: list[tuple[RedisClient, str, str]],
+    backfill_pending: bool,
+    task_redis: RedisClient,
+    backfill_streams: list[str],
+    project_clients: list[tuple[ProjectConfig, RedisClient]],
+    token_pools: dict[str, ProviderPool],
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> tuple[list[tuple[RedisClient, str, str]], bool]:
+    """Retry startup work deferred by Redis OOM without blocking polling.
+
+    The initial startup pass remains fail-fast for non-OOM errors. Once a
+    classified Redis OOM has moved work into the steady-state loop, retry
+    failures are isolated here: the failed item stays pending, the failure is
+    logged with traceback, and the normal poll cycle still runs for the fleet.
+    """
+    if pending_consumer_groups:
+        try:
+            pending_consumer_groups = _retry_pending_consumer_groups(
+                pending_consumer_groups, logger
+            )
+        except Exception as exc:
+            logger.error(
+                "Deferred consumer-group retry failed; leaving group creation "
+                "pending and continuing poll cycle: %s",
+                exc,
+                exc_info=True,
+            )
+
+    if backfill_pending:
+        try:
+            backfill_pending = not _retry_pending_provider_account_backfill(
+                task_redis,
+                backfill_streams,
+                project_clients,
+                token_pools,
+                ttl_seconds,
+                logger,
+            )
+        except Exception as exc:
+            logger.error(
+                "Deferred provider-account backfill retry failed; leaving "
+                "backfill pending and continuing poll cycle: %s",
+                exc,
+                exc_info=True,
+            )
+        else:
+            if not backfill_pending:
+                logger.info("Provider-account backfill completed after Redis OOM recovery")
+
+    return pending_consumer_groups, backfill_pending
+
+
 def run_orchestrator(config: OrchestratorConfig) -> None:
     """Main orchestrator entry point. Polls GitHub in a loop."""
     logger = setup_logging("orchestrator", "main")
@@ -1572,25 +1626,16 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
-            # Retry any startup work deferred by Redis noeviction OOM. Both
-            # helpers only swallow the classified OOM rejection; any other
-            # failure propagates into this same try/except like a normal
-            # poll-cycle error instead of being retried silently forever.
-            if pending_consumer_groups:
-                pending_consumer_groups = _retry_pending_consumer_groups(
-                    pending_consumer_groups, logger
-                )
-            if backfill_pending:
-                backfill_pending = not _retry_pending_provider_account_backfill(
-                    task_redis,
-                    backfill_streams,
-                    project_clients,
-                    token_pools,
-                    pending_task_ttl,
-                    logger,
-                )
-                if not backfill_pending:
-                    logger.info("Provider-account backfill completed after Redis OOM recovery")
+            pending_consumer_groups, backfill_pending = _retry_deferred_bootstrap_work(
+                pending_consumer_groups,
+                backfill_pending,
+                task_redis,
+                backfill_streams,
+                project_clients,
+                token_pools,
+                pending_task_ttl,
+                logger,
+            )
 
             _poll_cycle(
                 config,

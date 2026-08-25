@@ -5617,6 +5617,59 @@ def test_retry_pending_provider_account_backfill_non_oom_raises(mocker):
         )
 
 
+def test_retry_deferred_bootstrap_work_keeps_consumer_group_pending_on_non_oom(mocker):
+    """A stuck deferred consumer-group retry cannot block the poll cycle."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_deferred_bootstrap_work
+
+    pending = [(MagicMock(), "tasks:claude", "orcest-workers")]
+    mocker.patch(
+        "orcest.orchestrator.loop._retry_pending_consumer_groups",
+        side_effect=ValueError("broken acl"),
+    )
+
+    still_pending, backfill_pending = _retry_deferred_bootstrap_work(
+        pending,
+        False,
+        MagicMock(),
+        [],
+        [],
+        {},
+        300,
+        logging.getLogger("test"),
+    )
+
+    assert still_pending == pending
+    assert backfill_pending is False
+
+
+def test_retry_deferred_bootstrap_work_keeps_backfill_pending_on_non_oom(mocker):
+    """A stuck deferred backfill retry cannot block the poll cycle."""
+    from unittest.mock import MagicMock
+
+    from orcest.orchestrator.loop import _retry_deferred_bootstrap_work
+
+    mocker.patch(
+        "orcest.orchestrator.loop._retry_pending_provider_account_backfill",
+        side_effect=ValueError("malformed retained task"),
+    )
+
+    still_pending, backfill_pending = _retry_deferred_bootstrap_work(
+        [],
+        True,
+        MagicMock(),
+        [],
+        [],
+        {},
+        300,
+        logging.getLogger("test"),
+    )
+
+    assert still_pending == []
+    assert backfill_pending is True
+
+
 def test_backfill_provider_account_oom_propagates_for_deferral(fake_redis_client, mocker):
     """A Redis OOM while persisting a backfilled mapping propagates raw.
 
