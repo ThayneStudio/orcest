@@ -1706,9 +1706,7 @@ class TestRunWorker:
         mock_redis.ensure_consumer_group.assert_not_called()
         mocks["runner"].run.assert_called_once()
 
-    def test_worker_consumer_group_non_oom_startup_error_fails_fast(
-        self, mocker, worker_config
-    ):
+    def test_worker_consumer_group_non_oom_startup_error_fails_fast(self, mocker, worker_config):
         """Non-OOM consumer-group bootstrap errors remain loud startup failures."""
         mock_redis = self._build_mock_redis()
         self._setup_run_worker(mocker, worker_config, mock_redis)
