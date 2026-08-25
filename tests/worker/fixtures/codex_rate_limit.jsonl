@@ -1,3 +1,4 @@
-{"type":"thread.started","thread_id":"019e5221-fake-7401-rate-limit"}
+# provenance: synthetic 0.149.1-shaped turn.failed for CodexRunner.detect_exhaustion; not a live capture (no deterministic way to force a 429).
+{"type":"thread.started","thread_id":"synthetic-codex-rate-limit"}
 {"type":"turn.started"}
 {"type":"turn.failed","error":{"message":"Internal error: exceeded retry limit, last status: 429 Too Many Requests"}}

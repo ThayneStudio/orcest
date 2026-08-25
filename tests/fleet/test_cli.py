@@ -990,12 +990,18 @@ def _mock_proxmox_client(mocker):
     return mock_px
 
 
+def _codex_version_line() -> str:
+    from orcest.fleet.cloud_init import _CODEX_VERSION
+
+    return f"codex-cli {_CODEX_VERSION}"
+
+
 def _successful_provider_cli_probe(host, user, cmd, timeout=60):
     """Return realistic per-binary output for template smoke-check callers."""
     if "grok" in cmd:
         output = "grok 0.1.216"
     elif "codex" in cmd:
-        output = "codex-cli 0.131.0"
+        output = _codex_version_line()
     else:
         output = "claude 1.2.3"
     return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
@@ -1498,7 +1504,7 @@ class TestVerifyProviderClis:
             if "grok" in cmd:
                 output = "grok 0.1.216"
             elif "codex" in cmd:
-                output = "codex-cli 0.131.0"
+                output = _codex_version_line()
             else:
                 output = "claude 1.2.3"
             return mocker.MagicMock(returncode=0, stdout=output, stderr="")
@@ -1538,7 +1544,7 @@ class TestVerifyProviderClis:
             if "grok" in cmd:
                 output = "grok 0.1.216"
             elif "codex" in cmd:
-                output = "codex-cli 0.131.0"
+                output = _codex_version_line()
             else:
                 output = "claude 1.2.3"
             return mocker.MagicMock(returncode=0, stdout=output, stderr="")
@@ -1566,7 +1572,7 @@ class TestVerifyProviderClis:
             elif "grok" in cmd:
                 output = "grok 0.1.216"
             elif "codex" in cmd:
-                output = "codex-cli 0.131.0"
+                output = _codex_version_line()
             else:
                 output = "claude 1.2.3"
             return mocker.MagicMock(returncode=0, stdout=output, stderr="")
@@ -1579,10 +1585,11 @@ class TestVerifyProviderClis:
         from rich.console import Console
 
         from orcest.fleet.cli import _verify_provider_clis
+        from orcest.fleet.cloud_init import _CODEX_VERSION
 
         def fake_ssh(host, user, cmd, timeout=60):
             if "codex" in cmd:
-                output = "codex-cli 0.130.0\nUpdate available: 0.131.0"
+                output = f"codex-cli 0.148.0\nUpdate available: {_CODEX_VERSION}"
             elif "grok" in cmd:
                 output = "grok 0.1.216"
             else:

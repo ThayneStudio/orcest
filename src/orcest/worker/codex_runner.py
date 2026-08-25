@@ -1,15 +1,16 @@
 """OpenAI Codex CLI runner.
 
 Drives the ``codex exec`` non-interactive subcommand and parses its
-``--experimental-json`` event stream. Verified live against codex-cli 0.131.0;
-stdout carries this event vocabulary (one JSON object per line):
+documented ``--json`` event stream (``--experimental-json`` is a hidden
+alias of the same flag). Verified against codex-cli 0.149.1; stdout
+carries this event vocabulary (one JSON object per line):
 
     {"type":"thread.started","thread_id":"..."}
     {"type":"turn.started"}
     {"type":"item.started","item":{"id":"...","type":"file_change"|"command_execution"|...,"status":"in_progress",...}}
     {"type":"item.completed","item":{"id":"...","type":"agent_message"|"file_change"|"command_execution"|"reasoning",...,
                                      "text":"..." (when agent_message)}}
-    {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N,...}}
+    {"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,"cache_write_input_tokens":N,"output_tokens":N,"reasoning_output_tokens":N}}
     {"type":"turn.failed","error":{"message":"..."}}      # error path
     {"type":"error","message":"..."}                       # also seen
 
@@ -86,7 +87,7 @@ def _remove_stale_codex_auth(home_dir: Path) -> None:
 
 
 def _iter_events(stdout: str) -> Iterator[dict]:
-    """Yield parsed JSON event dicts from codex --experimental-json stdout."""
+    """Yield parsed JSON event dicts from ``codex exec --json`` stdout."""
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -169,7 +170,7 @@ class CodexRunner(_BaseCliRunner):
         cmd = [
             binary,
             "exec",
-            "--experimental-json",
+            "--json",
             "--sandbox",
             "danger-full-access",
             "--dangerously-bypass-approvals-and-sandbox",

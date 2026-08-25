@@ -101,10 +101,11 @@ _GROK_VERSION = "0.1.216"
 _GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af"
 
 # OpenAI Codex CLI — published as an npm package (@openai/codex). Pinned so
-# template rebakes are reproducible; the experimental JSON event vocabulary
+# template rebakes are reproducible; the ``codex exec --json`` event vocabulary
 # parsed by CodexRunner (tests/worker/test_codex_runner.py) is tied to this
-# version, so re-validate fixtures + parser on bump.
-_CODEX_VERSION = "0.131.0"
+# version, so re-validate fixtures + parser on bump. 0.149.1 is the first pin
+# that accepts ``max`` / ``ultra`` reasoning effort (0.131.0 rejected ``max``).
+_CODEX_VERSION = "0.149.1"
 
 # Anthropic Claude Code CLI — published as an npm package. Pinned for the same
 # reason as the others, plus one specific to this provider: the interactive

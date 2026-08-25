@@ -1,0 +1,5 @@
+# provenance: synthetic 0.149.1-shaped turn.failed for CodexRunner.detect_exhaustion (quota); not a live capture.
+{"type":"thread.started","thread_id":"synthetic-codex-exhaustion"}
+{"type":"turn.started"}
+{"type":"error","message":"quota exceeded for this organization"}
+{"type":"turn.failed","error":{"message":"quota exceeded for this organization"}}

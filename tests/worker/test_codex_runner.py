@@ -1,9 +1,16 @@
 """Unit tests for CodexRunner — parsing, exhaustion/overload detection, and
-the Path B (ChatGPT OAuth blob) credential hooks. Fixtures in
-tests/worker/fixtures/codex_*.jsonl were captured from a live codex-cli
-0.131.0 run; codex_rate_limit.jsonl is a synthetic turn.failed sample
-matching the documented 429 message shape (no easy way to force a real
-rate-limit during dev)."""
+the Path B (ChatGPT OAuth blob) credential hooks.
+
+Fixture provenance (also labeled in-file):
+- ``codex_simple_reply.jsonl`` / ``codex_tool_use.jsonl``: 0.149.1 JSONL
+  contract (``codex exec --json``; rust-v0.149.1 ``exec_events.rs``).
+  Authenticated live recapture is #620.
+- ``codex_failure.jsonl``: captured from ``@openai/codex@0.149.1``
+  ``codex exec --json`` (unauthenticated 401).
+- ``codex_rate_limit.jsonl``, ``codex_overload.jsonl``,
+  ``codex_exhaustion.jsonl``, ``codex_auth_*.json``: synthetic, labeled
+  ``# provenance: synthetic`` in the fixture files.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +24,49 @@ from orcest.worker.codex_runner import CodexRunner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+CAPTURED_JSONL = (
+    "codex_simple_reply.jsonl",
+    "codex_tool_use.jsonl",
+    "codex_failure.jsonl",
+)
+SYNTHETIC_FIXTURES = (
+    "codex_rate_limit.jsonl",
+    "codex_overload.jsonl",
+    "codex_exhaustion.jsonl",
+    "codex_auth_original.json",
+    "codex_auth_refreshed.json",
+)
+
 
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text()
+
+
+def _json_body(name: str) -> str:
+    """Return fixture contents with provenance comment lines stripped."""
+    return "\n".join(
+        line for line in _fixture(name).splitlines() if not line.lstrip().startswith("#")
+    ).strip()
+
+
+# ---------------------------------------------------------------------------
+# Pin / flag / provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_synthetic_fixtures_label_provenance() -> None:
+    for name in SYNTHETIC_FIXTURES:
+        first = next(line for line in _fixture(name).splitlines() if line.strip())
+        assert first.startswith("# provenance: synthetic"), name
+
+
+@pytest.mark.unit
+def test_captured_jsonl_fixtures_label_provenance() -> None:
+    for name in CAPTURED_JSONL:
+        first = next(line for line in _fixture(name).splitlines() if line.strip())
+        assert first.startswith("# provenance:"), name
+        assert "0.149.1" in first, name
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +84,8 @@ def test_prompt_via_stdin_is_true() -> None:
 def test_build_argv_codex_exec_with_stdin_dash() -> None:
     argv = CodexRunner().build_argv("codex", "PROMPT-WONT-APPEAR", "gpt-5-codex", Path("/wd"))
     assert argv[:2] == ["codex", "exec"]
-    assert "--experimental-json" in argv
+    assert "--json" in argv
+    assert "--experimental-json" not in argv
     assert "--sandbox" in argv and "danger-full-access" in argv
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "--skip-git-repo-check" in argv
@@ -61,14 +109,41 @@ def test_build_argv_never_contains_prompt_or_credential() -> None:
     assert not any(a.startswith("sk-") or a.startswith("{") for a in argv)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("effort", ["max", "ultra", "xhigh", "custom-effort"])
+def test_build_argv_does_not_add_reasoning_effort_flag(effort: str) -> None:
+    """Codex 0.149.1 accepts ``max`` / ``ultra`` / unknown custom strings via
+    ``config.toml`` or ``-c model_reasoning_effort=...``. Orcest must not add
+    its own reasoning-effort flag that would reject them."""
+    argv = CodexRunner().build_argv("codex", "p", "gpt-5-codex", Path("/wd"))
+    joined = " ".join(argv)
+    assert "--reasoning-effort" not in argv
+    assert "model_reasoning_effort" not in joined
+    assert effort not in argv
+
+
 # ---------------------------------------------------------------------------
-# Output parsing (real fixtures)
+# Output parsing (0.149.1 fixtures)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 def test_extract_summary_simple_reply() -> None:
     assert CodexRunner().extract_summary(_fixture("codex_simple_reply.jsonl")) == "codex hello"
+
+
+@pytest.mark.unit
+def test_extract_summary_ignores_reasoning_items() -> None:
+    summary = CodexRunner().extract_summary(_fixture("codex_simple_reply.jsonl"))
+    assert summary == "codex hello"
+    assert "short greeting" not in summary
+
+
+@pytest.mark.unit
+def test_extract_agent_text_excludes_reasoning_items() -> None:
+    text = CodexRunner().extract_agent_text(_fixture("codex_simple_reply.jsonl"))
+    assert text == "codex hello"
+    assert "short greeting" not in text
 
 
 @pytest.mark.unit
@@ -98,12 +173,66 @@ def test_extract_summary_ignores_non_agent_message_items() -> None:
     out = _fixture("codex_tool_use.jsonl")
     text = CodexRunner().extract_agent_text(out)
     assert "file_change" not in text
+    assert "command_execution" not in text
     assert "in_progress" not in text
+
+
+@pytest.mark.unit
+def test_extract_summary_ordinary_failure_has_no_agent_message() -> None:
+    assert CodexRunner().extract_summary(_fixture("codex_failure.jsonl")) == "No summary available"
+    assert CodexRunner().extract_agent_text(_fixture("codex_failure.jsonl")) == ""
 
 
 @pytest.mark.unit
 def test_extract_summary_empty_output() -> None:
     assert CodexRunner().extract_summary("") == "No summary available"
+
+
+@pytest.mark.unit
+def test_provenance_comments_are_ignored_by_parser() -> None:
+    assert CodexRunner().extract_summary(_fixture("codex_simple_reply.jsonl")) == "codex hello"
+    assert "# provenance" not in CodexRunner().extract_agent_text(_fixture("codex_tool_use.jsonl"))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("effort", ["max", "ultra", "custom-effort"])
+def test_parser_accepts_custom_reasoning_effort_strings(effort: str) -> None:
+    """Reasoning items that mention custom effort strings must not break
+    summary extraction or be mistaken for exhaustion/overload."""
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "reasoning", "text": f"effort={effort}"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_1", "type": "agent_message", "text": "ok"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 1,
+                        "reasoning_output_tokens": 0,
+                    },
+                }
+            ),
+        ]
+    )
+    assert CodexRunner().extract_summary(stdout) == "ok"
+    assert effort not in CodexRunner().extract_summary(stdout)
+    assert CodexRunner().detect_exhaustion(stdout, "") == (False, 0)
+    assert CodexRunner().detect_overload(stdout, "") is False
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +266,47 @@ def test_needs_human_detected_in_agent_message() -> None:
     assert reason == "rotate the auth blob"
 
 
+@pytest.mark.unit
+def test_needs_human_not_triggered_by_reasoning_or_error_items() -> None:
+    from orcest.worker._runner_base import _check_needs_human
+
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "x"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "i0",
+                        "type": "reasoning",
+                        "text": "Maybe emit NEEDS_HUMAN: ignore me",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "i1",
+                        "type": "error",
+                        "message": "NEEDS_HUMAN: not agent text",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "i2", "type": "agent_message", "text": "All done."},
+                }
+            ),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+    )
+    flag, _ = _check_needs_human(CodexRunner().extract_agent_text(stdout))
+    assert flag is False
+
+
 # ---------------------------------------------------------------------------
 # Exhaustion / overload detection
 # ---------------------------------------------------------------------------
@@ -152,6 +322,13 @@ def test_detect_exhaustion_429_in_turn_failed() -> None:
 
 
 @pytest.mark.unit
+def test_detect_exhaustion_quota_fixture() -> None:
+    exhausted, resets_at = CodexRunner().detect_exhaustion(_fixture("codex_exhaustion.jsonl"), "")
+    assert exhausted is True
+    assert resets_at == 0
+
+
+@pytest.mark.unit
 def test_detect_exhaustion_from_stderr_rate_limit() -> None:
     exhausted, _ = CodexRunner().detect_exhaustion("", "rate limit exceeded; retry later")
     assert exhausted is True
@@ -161,6 +338,12 @@ def test_detect_exhaustion_from_stderr_rate_limit() -> None:
 def test_detect_exhaustion_clean_output_is_false() -> None:
     assert CodexRunner().detect_exhaustion(_fixture("codex_simple_reply.jsonl"), "") == (False, 0)
     assert CodexRunner().detect_exhaustion(_fixture("codex_tool_use.jsonl"), "") == (False, 0)
+    assert CodexRunner().detect_exhaustion(_fixture("codex_failure.jsonl"), "") == (False, 0)
+
+
+@pytest.mark.unit
+def test_detect_overload_5xx_fixture() -> None:
+    assert CodexRunner().detect_overload(_fixture("codex_overload.jsonl"), "") is True
 
 
 @pytest.mark.unit
@@ -186,6 +369,8 @@ def test_detect_overload_does_not_match_generic_internal_error() -> None:
 @pytest.mark.unit
 def test_detect_overload_clean_output_is_false() -> None:
     assert CodexRunner().detect_overload(_fixture("codex_tool_use.jsonl"), "") is False
+    assert CodexRunner().detect_overload(_fixture("codex_failure.jsonl"), "") is False
+    assert CodexRunner().detect_overload(_fixture("codex_rate_limit.jsonl"), "") is False
 
 
 # ---------------------------------------------------------------------------
@@ -318,13 +503,9 @@ def test_prepare_credential_empty_removes_stale_oauth_file(tmp_path) -> None:
 
 @pytest.mark.unit
 def test_extract_credential_update_detects_refresh(tmp_path) -> None:
+    original = _json_body("codex_auth_original.json")
+    refreshed = _json_body("codex_auth_refreshed.json")
     auth = tmp_path / "auth.json"
-    original = json.dumps(
-        {"auth_mode": "chatgpt", "tokens": {"access_token": "old", "refresh_token": "rt"}}
-    )
-    refreshed = json.dumps(
-        {"auth_mode": "chatgpt", "tokens": {"access_token": "new", "refresh_token": "rt"}}
-    )
     auth.write_text(refreshed)
     assert CodexRunner().extract_credential_update(auth, original) == refreshed
 

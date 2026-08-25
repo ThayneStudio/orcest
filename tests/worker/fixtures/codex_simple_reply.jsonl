@@ -1,4 +1,6 @@
-{"type":"thread.started","thread_id":"019e5220-ddac-73a2-8c3c-075399a175d3"}
+# provenance: captured-shape 0.149.1 JSONL contract (codex exec --json; rust-v0.149.1 exec_events.rs). Authenticated live recapture is #620.
+{"type":"thread.started","thread_id":"01a037ff-0001-7000-8000-codex149simple"}
 {"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"codex hello"}}
-{"type":"turn.completed","usage":{"input_tokens":13543,"cached_input_tokens":12160,"output_tokens":7,"reasoning_output_tokens":0}}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"The user asked for a short greeting."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"codex hello"}}
+{"type":"turn.completed","usage":{"input_tokens":13543,"cached_input_tokens":12160,"cache_write_input_tokens":0,"output_tokens":7,"reasoning_output_tokens":0}}

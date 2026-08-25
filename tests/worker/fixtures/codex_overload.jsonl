@@ -1,0 +1,4 @@
+# provenance: synthetic 0.149.1-shaped turn.failed for CodexRunner.detect_overload; not a live capture.
+{"type":"thread.started","thread_id":"synthetic-codex-overload"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"API error (status 503 Service Unavailable)"}}

@@ -1,0 +1,2 @@
+# provenance: synthetic Codex 0.149.1 ~/.codex/auth.json after in-place ChatGPT token refresh; not a live capture.
+{"auth_mode":"chatgpt","tokens":{"access_token":"access-new","refresh_token":"rt","account_id":"acct"}}
