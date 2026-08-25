@@ -16,6 +16,8 @@ import time
 import uuid
 from typing import Any, Callable
 
+import redis
+
 from orcest.orchestrator import gh
 from orcest.orchestrator.deployment import DeploymentError, run_deployment
 from orcest.orchestrator.event_relay import EventRelay
@@ -74,7 +76,7 @@ from orcest.shared.models import (
     task_stream_name,
 )
 from orcest.shared.providers import ProviderEntry
-from orcest.shared.redis_client import RedisClient
+from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
@@ -429,8 +431,14 @@ def _persist_task_provider_account_key(
     account_key: str,
     ttl_seconds: int,
     logger: logging.Logger,
+    reraise_oom: bool = False,
 ) -> bool:
-    """Persist a validated, non-secret task -> account mapping."""
+    """Persist a validated, non-secret task -> account mapping.
+
+    ``reraise_oom`` lets the retained-task backfill (which must let classified
+    Redis OOM propagate so its caller can defer the whole pass) opt out of the
+    normal best-effort swallow used by live task registration.
+    """
     try:
         # One expiring key per task makes value+TTL atomic and prevents active
         # projects from extending orphaned mappings in a shared hash forever.
@@ -440,7 +448,9 @@ def _persist_task_provider_account_key(
             ttl=max(1, int(ttl_seconds)),
         )
         return True
-    except Exception:
+    except Exception as exc:
+        if reraise_oom and is_redis_oom_error(exc):
+            raise
         logger.debug(
             "Failed to persist provider account mapping for task %s",
             task_id,
@@ -467,7 +477,10 @@ def _backfill_retained_task_provider_accounts(
 
     Redis scan/read failures propagate so startup fails closed and retries while
     the old task entries remain available. Malformed, unknown, or ambiguously
-    routed task entries are skipped without persisting a mapping.
+    routed task entries are skipped without persisting a mapping. Classified
+    Redis maxmemory OOM from persisting a mapping also propagates (rather than
+    being swallowed like the live task-registration path) so the caller can
+    defer the whole pass to the main loop instead of refusing to start.
     """
     routes: dict[tuple[str, str], tuple[RedisClient, ProviderPool]] = {}
     ambiguous_routes: set[tuple[str, str]] = set()
@@ -528,6 +541,7 @@ def _backfill_retained_task_provider_accounts(
                     account_key,
                     ttl_seconds,
                     logger,
+                    reraise_oom=True,
                 )
                 if not stored:
                     raise _RetryableResultError(
@@ -1285,6 +1299,94 @@ def _load_fleet_repo_to_project_map(logger: logging.Logger) -> dict[str, str]:
     return {}
 
 
+def _ensure_consumer_group_or_defer(
+    redis_client: RedisClient,
+    stream: str,
+    group: str,
+    logger: logging.Logger,
+) -> bool:
+    """Ensure one consumer group, deferring classified Redis OOM instead of raising.
+
+    ``RedisClient.ensure_consumer_group`` is read-first (XINFO GROUPS before
+    XGROUP CREATE), so an existing group never issues a write and can never be
+    rejected here. Only a genuinely missing group's ``XGROUP CREATE`` can hit
+    Redis ``noeviction`` OOM; that rejection is deferred for retry once Redis
+    accepts writes again instead of crash-looping startup. Wrong type, ACL,
+    authentication, protocol, and other non-OOM failures propagate unchanged.
+
+    Returns True once the group is confirmed to exist, False if creation was
+    deferred.
+    """
+    try:
+        redis_client.ensure_consumer_group(stream, group)
+        return True
+    except redis.ResponseError as exc:
+        if not is_redis_oom_error(exc):
+            raise
+        logger.warning(
+            "Redis maxmemory OOM while creating consumer group %r on stream %r; "
+            "deferring to main loop retry",
+            group,
+            stream,
+        )
+        return False
+
+
+def _retry_pending_consumer_groups(
+    pending: list[tuple[RedisClient, str, str]],
+    logger: logging.Logger,
+) -> list[tuple[RedisClient, str, str]]:
+    """Retry deferred consumer-group creation. Returns the still-pending subset.
+
+    A non-OOM failure on retry propagates (surfacing through the caller's
+    normal poll-cycle error logging) rather than being folded into an
+    indefinite silent retry.
+    """
+    still_pending: list[tuple[RedisClient, str, str]] = []
+    for redis_client, stream, group in pending:
+        if _ensure_consumer_group_or_defer(redis_client, stream, group, logger):
+            logger.info(
+                "Consumer group %r on stream %r created after Redis OOM recovery",
+                group,
+                stream,
+            )
+        else:
+            still_pending.append((redis_client, stream, group))
+    return still_pending
+
+
+def _retry_pending_provider_account_backfill(
+    task_redis: RedisClient,
+    task_streams: list[str],
+    project_clients: list[tuple[ProjectConfig, RedisClient]],
+    token_pools: dict[str, ProviderPool],
+    ttl_seconds: int,
+    logger: logging.Logger,
+) -> bool:
+    """Run (or retry) the retained-task provider-account backfill once.
+
+    Returns True once the pass completes (including a no-op pass with nothing
+    to backfill), False if it was deferred by classified Redis OOM. Any
+    non-OOM failure propagates so the caller applies its own policy (refuse to
+    start on the first attempt, surface loudly via poll-cycle logging on a
+    later retry).
+    """
+    try:
+        _backfill_retained_task_provider_accounts(
+            task_redis,
+            task_streams,
+            project_clients,
+            token_pools,
+            ttl_seconds,
+            logger,
+        )
+    except redis.ResponseError as exc:
+        if not is_redis_oom_error(exc):
+            raise
+        return False
+    return True
+
+
 def run_orchestrator(config: OrchestratorConfig) -> None:
     """Main orchestrator entry point. Polls GitHub in a loop."""
     logger = setup_logging("orchestrator", "main")
@@ -1302,13 +1404,45 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     # Build per-project Redis clients once; reuse across all poll cycles
     project_clients = _build_project_clients(config, redis)
 
-    # Ensure consumer groups for shared task streams (so workers don't race)
+    # Trace archiver: tails output:* streams to per-task files on
+    # config.trace_archive_path. Started before any startup operation that can
+    # issue a Redis denyoom write (consumer-group creation, provider-account
+    # backfill below), so archival is already running when Redis noeviction
+    # OOM defers that work into the main loop instead of crash-looping
+    # startup. Start silently disables when path is unset, so it's safe to
+    # construct unconditionally.
+    repo_to_project = {p.repo: p.key_prefix for p in config.projects if p.repo and p.key_prefix}
+    # Best-effort enrichment from fleet config (mounted into the container by
+    # docker-compose.yml when the trace archive is enabled). Each per-project
+    # orchestrator only sees its own ProjectConfig; the fleet config carries
+    # ALL projects so traces from other projects get the right key_prefix
+    # subdirectory instead of falling to the ``unknown/`` bucket.
+    repo_to_project.update(_load_fleet_repo_to_project_map(logger))
+    trace_archiver = TraceArchiver(
+        redis=redis,
+        archive_path=config.trace_archive_path,
+        repo_to_project=repo_to_project,
+        logger=logger,
+    )
+    trace_archiver.start()
+
+    # Ensure consumer groups for shared task streams (so workers don't race).
+    # Read-first (XINFO GROUPS before XGROUP CREATE), so an existing group
+    # needs no write; only a genuinely missing group's creation can be
+    # rejected under Redis noeviction OOM, in which case it is deferred to the
+    # main loop for retry instead of crash-looping startup. Non-OOM failures
+    # still propagate here and terminate startup.
+    pending_consumer_groups: list[tuple[RedisClient, str, str]] = []
     for stream in _configured_task_streams(config) + _configured_task_streams(config, issue=True):
-        task_redis.ensure_consumer_group(stream, CONSUMER_GROUP)
+        if not _ensure_consumer_group_or_defer(task_redis, stream, CONSUMER_GROUP, logger):
+            pending_consumer_groups.append((task_redis, stream, CONSUMER_GROUP))
 
     # Ensure consumer group for results stream (per-project)
     for _, project_redis in project_clients:
-        project_redis.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+        if not _ensure_consumer_group_or_defer(
+            project_redis, RESULTS_STREAM, RESULTS_GROUP, logger
+        ):
+            pending_consumer_groups.append((project_redis, RESULTS_STREAM, RESULTS_GROUP))
 
     # Create per-project provider pools (generalized from legacy TokenPool).
     # Prefer the rich-but-lean ProjectConfig.providers (populated by config load with
@@ -1368,12 +1502,16 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
     # non-secret mappings before any result is consumed or ACKed and before any
     # acknowledged task entry can be trimmed. Overrides are loaded first so a
     # retained task carrying the current rotated blob can still be matched to
-    # its original configured account anchor.
+    # its original configured account anchor. A classified Redis noeviction
+    # OOM defers this pass to the main loop for retry instead of refusing to
+    # start; any other failure still refuses to start as before.
+    backfill_streams = _configured_task_streams(
+        config, token_pools=token_pools
+    ) + _configured_task_streams(config, issue=True, token_pools=token_pools)
     try:
-        _backfill_retained_task_provider_accounts(
+        backfill_pending = not _retry_pending_provider_account_backfill(
             task_redis,
-            _configured_task_streams(config, token_pools=token_pools)
-            + _configured_task_streams(config, issue=True, token_pools=token_pools),
+            backfill_streams,
             project_clients,
             token_pools,
             pending_task_ttl,
@@ -1386,6 +1524,11 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
             exc_info=True,
         )
         sys.exit(1)
+    if backfill_pending:
+        logger.warning(
+            "Redis maxmemory OOM while backfilling retained task provider accounts; "
+            "deferring to main loop retry"
+        )
 
     # Graceful shutdown
     shutdown = False
@@ -1397,24 +1540,6 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
-
-    # Trace archiver: tails output:* streams to per-task files on
-    # config.trace_archive_path. Start silently disables when path is unset,
-    # so it's safe to construct unconditionally.
-    repo_to_project = {p.repo: p.key_prefix for p in config.projects if p.repo and p.key_prefix}
-    # Best-effort enrichment from fleet config (mounted into the container by
-    # docker-compose.yml when the trace archive is enabled). Each per-project
-    # orchestrator only sees its own ProjectConfig; the fleet config carries
-    # ALL projects so traces from other projects get the right key_prefix
-    # subdirectory instead of falling to the ``unknown/`` bucket.
-    repo_to_project.update(_load_fleet_repo_to_project_map(logger))
-    trace_archiver = TraceArchiver(
-        redis=redis,
-        archive_path=config.trace_archive_path,
-        repo_to_project=repo_to_project,
-        logger=logger,
-    )
-    trace_archiver.start()
 
     # Event relay: drains the events spool to the monitor ingest listener.
     # Start silently disables when monitor_ingest_url is unset, so it's safe
@@ -1447,6 +1572,26 @@ def run_orchestrator(config: OrchestratorConfig) -> None:
 
     while not shutdown:
         try:
+            # Retry any startup work deferred by Redis noeviction OOM. Both
+            # helpers only swallow the classified OOM rejection; any other
+            # failure propagates into this same try/except like a normal
+            # poll-cycle error instead of being retried silently forever.
+            if pending_consumer_groups:
+                pending_consumer_groups = _retry_pending_consumer_groups(
+                    pending_consumer_groups, logger
+                )
+            if backfill_pending:
+                backfill_pending = not _retry_pending_provider_account_backfill(
+                    task_redis,
+                    backfill_streams,
+                    project_clients,
+                    token_pools,
+                    pending_task_ttl,
+                    logger,
+                )
+                if not backfill_pending:
+                    logger.info("Provider-account backfill completed after Redis OOM recovery")
+
             _poll_cycle(
                 config,
                 redis,
