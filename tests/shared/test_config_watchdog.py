@@ -215,5 +215,6 @@ def test_pool_config_defaults_25200_and_300():
     pool = PoolConfig()
     assert pool.max_task_duration == 25200
     assert pool.activity_stale_after == 300
+    assert pool.activity_stale_min_elapsed == 600
     # Invariant: force-kill ceiling must exceed the runner's own timeout.
     assert pool.max_task_duration > RunnerConfig().timeout

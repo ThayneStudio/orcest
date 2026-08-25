@@ -227,7 +227,9 @@ every worker unconditionally — to be absent too, and a live worker without
 the watchdog still writes that heartbeat. So an absent activity record with
 a present heartbeat is read as "alive, just not running the watchdog," not
 "dead," and the VM is left alone below the ceiling exactly like the
-pre-watchdog reaper.
+pre-watchdog reaper. The same path also requires elapsed time of at least
+`activity_stale_min_elapsed` (default 600s) so a just-assigned VM cannot
+be destroyed before it has had a chance to write either Redis key.
 
 Every change here touches the three deploy layers the same way the rest of
 orcest does: host CLI (`pip`/`pipx install -e .` or equivalent), `orcest

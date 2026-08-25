@@ -715,6 +715,31 @@ class TestMaxTaskDurationDefault:
         cfg = load_config(path)
         assert cfg.pool.activity_stale_after == 300
 
+    def test_activity_stale_min_elapsed_default(self):
+        assert PoolConfig().activity_stale_min_elapsed == 600
+
+    def test_load_legacy_config_activity_stale_min_elapsed_default(self, tmp_path):
+        """A config without an explicit activity_stale_min_elapsed gets 600s."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        cfg = load_config(path)
+        assert cfg.pool.activity_stale_min_elapsed == 600
+
+    def test_load_config_activity_stale_min_elapsed_override(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2, "activity_stale_min_elapsed": 120}}))
+        cfg = load_config(path)
+        assert cfg.pool.activity_stale_min_elapsed == 120
+
+    def test_round_trip_activity_stale_min_elapsed(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(pool=PoolConfig(size=2, activity_stale_min_elapsed=120))
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert loaded.pool.activity_stale_min_elapsed == 120
+
     def test_watchdog_enabled_default_true(self):
         # C1a: the fleet-level rollback lever defaults on.
         assert PoolConfig().watchdog_enabled is True

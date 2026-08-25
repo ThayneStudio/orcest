@@ -219,6 +219,16 @@ class PoolConfig:
     # the pre-watchdog reaper (see spec §6 and fleet/pool_manager.py's
     # _activity_reap_reason).
     activity_stale_after: int = 300
+    # Minimum pool:active elapsed seconds before an absent-or-stale
+    # activity record (plus a missing liveness heartbeat and pending
+    # work) can destroy a VM. Distinct from activity_stale_after, which
+    # ages the activity *record*; this ages the *task*. Below the floor,
+    # a young VM may not have written either Redis key yet, so missing
+    # activity + heartbeat is not proof of death. needs_reap and the
+    # max_task_duration ceiling bypass this floor. Default 600s matches
+    # WatchdogConfig.startup_grace so the reaper does not outrun the
+    # worker's own bootstrap window.
+    activity_stale_min_elapsed: int = 600
     # Fleet-level activity-watchdog rollback lever (final review, C1a).
     # Rendered into every newly-cloned worker's ``worker.yaml`` as
     # ``runner.watchdog.enabled`` (see ``cloud_init.render_clone_userdata``).
@@ -640,6 +650,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         worker_profiles=worker_profiles,
         max_task_duration=pl.get("max_task_duration", 25200),
         activity_stale_after=pl.get("activity_stale_after", 300),
+        activity_stale_min_elapsed=pl.get("activity_stale_min_elapsed", 600),
         watchdog_enabled=bool(pl.get("watchdog_enabled", True)),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
@@ -746,6 +757,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             ],
             "max_task_duration": config.pool.max_task_duration,
             "activity_stale_after": config.pool.activity_stale_after,
+            "activity_stale_min_elapsed": config.pool.activity_stale_min_elapsed,
             "watchdog_enabled": config.pool.watchdog_enabled,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,

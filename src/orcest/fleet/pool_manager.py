@@ -1316,10 +1316,11 @@ class PoolManager:
         below the ceiling: ``needs_reap == "1"`` fires immediately; an
         absent-or-stale record fires only when the worker's liveness
         heartbeat is also absent (proving the process itself is gone, not
-        just quiet on activity reporting -- see ``_activity_reap_reason``)
-        and the consumer still holds pending stream entries. A fresh
-        activity record blocks destruction below the ceiling regardless of
-        elapsed time.
+        just quiet on activity reporting -- see ``_activity_reap_reason``),
+        the consumer still holds pending stream entries, and elapsed time
+        is at least ``activity_stale_min_elapsed``. A fresh activity
+        record blocks destruction below the ceiling regardless of elapsed
+        time.
         """
         try:
             active = self._redis.hgetall(_POOL_ACTIVE_KEY)
@@ -1390,6 +1391,7 @@ class PoolManager:
                 activity_reason = self._activity_reap_reason(
                     vm_id,
                     now,
+                    elapsed=elapsed,
                     activity_stale_infra_fault=activity_stale_infra_fault,
                     heartbeat_cache=heartbeat_cache,
                 )
@@ -1500,6 +1502,7 @@ class PoolManager:
         vm_id: int,
         now: float,
         *,
+        elapsed: float,
         activity_stale_infra_fault: bool = False,
         heartbeat_cache: dict[str, bool | None] | None = None,
     ) -> str | None:
@@ -1508,7 +1511,7 @@ class PoolManager:
 
         ``needs_reap == "1"`` fires immediately -- the watchdog already
         latched a kill decision for this task, so the record is trustworthy
-        as-is.
+        as-is. The elapsed-time floor below does not apply.
 
         An absent-or-stale record is different: by itself it is NOT proof of
         death. ``watchdog.enabled: false`` (the ship-dark stage and the
@@ -1526,8 +1529,10 @@ class PoolManager:
         is left to the ceiling exactly like the pre-watchdog reaper. Only
         once both the record is absent-or-stale AND the heartbeat is
         provably gone does a pending stream entry (proving there is a task
-        to recover, not an idle worker) trigger destruction. A fresh record
-        blocks destruction outright: returns ``None``.
+        to recover, not an idle worker) trigger destruction -- and only
+        after *elapsed* reaches ``activity_stale_min_elapsed``. Below that
+        floor a young VM may simply not have written either Redis key yet.
+        A fresh record blocks destruction outright: returns ``None``.
         """
         worker_id = self._vm_id_to_worker_id(vm_id)
         key = f"{_ACTIVITY_KEY_PREFIX}{worker_id}"
@@ -1561,6 +1566,13 @@ class PoolManager:
             return REAP_REASON_NEEDS_REAP
 
         if not self._activity_record_is_stale(record, now):
+            return None
+
+        if elapsed < self._pool.activity_stale_min_elapsed:
+            # Missing activity + heartbeat is not proof of death this early:
+            # a just-assigned worker may not have written either key yet.
+            # needs_reap already returned above; the duration ceiling is
+            # handled in _health_check before this method is called.
             return None
 
         if activity_stale_infra_fault:
