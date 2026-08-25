@@ -10,9 +10,11 @@ archiver concatenates those parts so the ``.jsonl`` is the original
 stream-json, not the Redis-sized fragments.
 
 Progress is a versioned per-project state file on the archive volume, not
-a Redis hash. Redis ``trace_archiver:cursors`` is read once to seed a
-missing local file and is never written by the active pump. A cursor is
-committed only after the archive file has been flushed and fsynced.
+a Redis hash. Cursor files live under the hidden
+``.orcest-archiver-cursors/v2`` tree, outside the ``unknown/YYYY/MM/DD``
+unmapped-trace namespace. Redis ``trace_archiver:cursors`` is read once to
+seed a missing local file and is never written by the active pump. A cursor
+is committed only after the archive file has been flushed and fsynced.
 
 After a committed cursor advance, the archiver issues ``XTRIM MINID`` at
 the older of that cursor and the 128th-newest stream entry so archived
@@ -37,6 +39,7 @@ import os
 import re
 import threading
 import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -48,7 +51,9 @@ from orcest.shared.redis_client import RedisClient
 
 _CURSOR_HASH_KEY = "trace_archiver:cursors"
 _CURSOR_FILENAME = ".orcest-archiver-state.json"
-_CURSOR_STATE_VERSION = 1
+_CURSOR_STATE_VERSION = 2
+_CURSOR_ROOT_DIR = ".orcest-archiver-cursors"
+_CURSOR_NAMESPACE_VERSION = "v2"
 _ALIVE_FILENAME = ".orcest_archiver_alive"
 _WRITABILITY_RECHECK_SECONDS = 60
 _SLEEP_BETWEEN_PASSES_SECONDS = 1.0
@@ -117,14 +122,44 @@ def _parse_last_seen(value: str) -> datetime | None:
 
 
 def cursor_state_path(archive_path: Path, project: str) -> Path:
-    """Return the per-project cursor state file path."""
-    return archive_path / project / _CURSOR_FILENAME
+    """Return the collision-free cursor state path for ``project`` key prefix."""
+    return (
+        archive_path
+        / _CURSOR_ROOT_DIR
+        / _CURSOR_NAMESPACE_VERSION
+        / _cursor_namespace(project)
+        / _CURSOR_FILENAME
+    )
 
 
-def _project_dirname(key_prefix: str) -> str:
+def legacy_cursor_state_path(archive_path: Path, project: str) -> Path:
+    """Return the pre-v2 cursor path used for migration only."""
+    return archive_path / _legacy_project_dirname(project) / _CURSOR_FILENAME
+
+
+def _cursor_namespace(key_prefix: str) -> str:
+    if not key_prefix:
+        return "empty"
+    return "b64_" + urlsafe_b64encode(key_prefix.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _legacy_project_dirname(key_prefix: str) -> str:
     if _TASK_ID_RE.match(key_prefix):
         return key_prefix
     return _DEFAULT_PROJECT
+
+
+def _decode_cursor_namespace(namespace: str) -> str | None:
+    if namespace == "empty":
+        return ""
+    if not namespace.startswith("b64_"):
+        return None
+    encoded = namespace[4:]
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        return urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def _write_fd(fd: int, data: bytes) -> None:
@@ -179,16 +214,7 @@ class CursorStateError(Exception):
     """Local cursor state is unusable; advancement is disabled."""
 
 
-def _parse_cursor_state(raw: str) -> dict[str, StreamCursor]:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise CursorStateError(f"cursor state is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise CursorStateError("cursor state must be a JSON object")
-    version = data.get("version")
-    if version != _CURSOR_STATE_VERSION:
-        raise CursorStateError(f"unsupported cursor state version {version!r}")
+def _parse_stream_cursors(data: dict[str, Any]) -> dict[str, StreamCursor]:
     streams = data.get("streams")
     if not isinstance(streams, dict):
         raise CursorStateError("cursor state 'streams' must be an object")
@@ -208,9 +234,55 @@ def _parse_cursor_state(raw: str) -> dict[str, StreamCursor]:
     return parsed
 
 
-def _encode_cursor_state(streams: dict[str, StreamCursor]) -> str:
+def _load_cursor_json(raw: str) -> dict[str, Any]:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CursorStateError(f"cursor state is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CursorStateError("cursor state must be a JSON object")
+    return data
+
+
+def _parse_cursor_state(raw: str, *, key_prefix: str, namespace: str) -> dict[str, StreamCursor]:
+    data = _load_cursor_json(raw)
+    version = data.get("version")
+    if version != _CURSOR_STATE_VERSION:
+        raise CursorStateError(f"unsupported cursor state version {version!r}")
+    identity = data.get("identity")
+    if not isinstance(identity, dict):
+        raise CursorStateError("cursor state 'identity' must be an object")
+    persisted_prefix = identity.get("key_prefix")
+    persisted_namespace = identity.get("namespace")
+    if persisted_prefix != key_prefix or persisted_namespace != namespace:
+        raise CursorStateError(
+            "cursor state identity mismatch: "
+            f"expected key_prefix={key_prefix!r} namespace={namespace!r}, "
+            f"found key_prefix={persisted_prefix!r} namespace={persisted_namespace!r}"
+        )
+    decoded = _decode_cursor_namespace(namespace)
+    if decoded != key_prefix:
+        raise CursorStateError("cursor namespace does not decode to this key prefix")
+    return _parse_stream_cursors(data)
+
+
+def _parse_legacy_cursor_state(raw: str) -> dict[str, StreamCursor]:
+    data = _load_cursor_json(raw)
+    version = data.get("version")
+    if version != 1:
+        raise CursorStateError(f"unsupported legacy cursor state version {version!r}")
+    return _parse_stream_cursors(data)
+
+
+def _encode_cursor_state(
+    streams: dict[str, StreamCursor], *, key_prefix: str, namespace: str
+) -> str:
     payload = {
         "version": _CURSOR_STATE_VERSION,
+        "identity": {
+            "key_prefix": key_prefix,
+            "namespace": namespace,
+        },
         "streams": {
             name: {"last_id": cursor.last_id, "last_seen": cursor.last_seen}
             for name, cursor in sorted(streams.items())
@@ -219,7 +291,13 @@ def _encode_cursor_state(streams: dict[str, StreamCursor]) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
-def persist_cursor_state_file(path: Path, streams: dict[str, StreamCursor]) -> None:
+def persist_cursor_state_file(
+    path: Path,
+    streams: dict[str, StreamCursor],
+    *,
+    key_prefix: str,
+    namespace: str | None = None,
+) -> None:
     """Atomically persist cursor state with fsync of the file and parent dir.
 
     Order: create temp in the final file's directory; write and fsync the
@@ -227,7 +305,11 @@ def persist_cursor_state_file(path: Path, streams: dict[str, StreamCursor]) -> N
     The file is created with mode ``0600``.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _encode_cursor_state(streams).encode("utf-8")
+    if namespace is None:
+        namespace = _cursor_namespace(key_prefix)
+    payload = _encode_cursor_state(streams, key_prefix=key_prefix, namespace=namespace).encode(
+        "utf-8"
+    )
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
     try:
@@ -279,7 +361,8 @@ class TraceArchiver:
         self._archiver_paused = False
         self._last_writability_check: float = 0.0
         self._line_assembler = OutputLineAssembler()
-        self._project = _project_dirname(redis.key_prefix)
+        self._key_prefix = redis.key_prefix
+        self._cursor_namespace = _cursor_namespace(self._key_prefix)
         self._committed: dict[str, StreamCursor] = {}
         self._resume_from: dict[str, str] = {}
         self._written_highwater: dict[str, str] = {}
@@ -374,7 +457,7 @@ class TraceArchiver:
     def _cursor_path(self) -> Path | None:
         if self._archive_path is None:
             return None
-        return cursor_state_path(self._archive_path, self._project)
+        return cursor_state_path(self._archive_path, self._key_prefix)
 
     def _set_health_error(self, message: str, *, exc_info: bool = False) -> None:
         self._health_error = message
@@ -390,7 +473,9 @@ class TraceArchiver:
         if path.exists():
             try:
                 raw = path.read_text(encoding="utf-8")
-                self._committed = _parse_cursor_state(raw)
+                self._committed = _parse_cursor_state(
+                    raw, key_prefix=self._key_prefix, namespace=self._cursor_namespace
+                )
             except (OSError, CursorStateError) as exc:
                 self._cursor_corrupt = True
                 self._committed = {}
@@ -399,7 +484,48 @@ class TraceArchiver:
                     f"refusing to advance or replay: {exc}"
                 )
             return
+        if not self._migrate_legacy_cursor_state(path):
+            return
         self._seed_cursors_from_legacy_hash(path)
+
+    def _migrate_legacy_cursor_state(self, new_path: Path) -> bool:
+        legacy_path = legacy_cursor_state_path(self._archive_path or Path(), self._key_prefix)
+        if not legacy_path.exists():
+            return True
+        legacy_dir = _legacy_project_dirname(self._key_prefix)
+        if legacy_dir == _DEFAULT_PROJECT:
+            self._cursor_corrupt = True
+            self._committed = {}
+            self._set_health_error(
+                "Ambiguous legacy trace-archiver cursor state found at "
+                f"{legacy_path}. The old 'unknown' cursor namespace can belong to "
+                "multiple key prefixes, including empty and dotted prefixes. "
+                "Refusing to archive or trim until an operator manually recovers it: "
+                "inspect the legacy state and trace history, then either move the "
+                f"verified cursor to {new_path} with identity key_prefix="
+                f"{self._key_prefix!r} or remove the ambiguous legacy file after "
+                "choosing a safe replay point."
+            )
+            return False
+        try:
+            legacy = _parse_legacy_cursor_state(legacy_path.read_text(encoding="utf-8"))
+            persist_cursor_state_file(
+                new_path,
+                legacy,
+                key_prefix=self._key_prefix,
+                namespace=self._cursor_namespace,
+            )
+        except (OSError, CursorStateError) as exc:
+            self._cursor_corrupt = True
+            self._committed = {}
+            self._set_health_error(
+                f"Trace archiver legacy cursor migration from {legacy_path} to "
+                f"{new_path} failed before the new state was durable; refusing to "
+                f"archive or trim: {exc}"
+            )
+            return False
+        self._committed = legacy
+        return False
 
     def _seed_cursors_from_legacy_hash(self, path: Path) -> None:
         try:
@@ -422,17 +548,20 @@ class TraceArchiver:
         if not seeded:
             return
         try:
-            persist_cursor_state_file(path, seeded)
-        except OSError as exc:
-            self._logger.warning(
-                "Failed to persist seeded cursor state at %s; using in-memory "
-                "seed for this process only: %s",
+            persist_cursor_state_file(
                 path,
-                exc,
+                seeded,
+                key_prefix=self._key_prefix,
+                namespace=self._cursor_namespace,
+            )
+        except OSError as exc:
+            self._cursor_corrupt = True
+            self._committed = {}
+            self._set_health_error(
+                f"Cursor seed persist failed at {path}; refusing to use non-durable "
+                f"legacy cursor seed: {exc}",
                 exc_info=True,
             )
-            self._set_health_error(f"Cursor seed persist failed at {path}: {exc}")
-            self._resume_from = {name: cursor.last_id for name, cursor in seeded.items()}
             return
         self._committed = seeded
 
@@ -459,7 +588,12 @@ class TraceArchiver:
             raise RuntimeError("cursor persist requested without an archive path")
         snapshot = dict(self._committed)
         snapshot[stream] = StreamCursor(last_id=entry_id, last_seen=_now_iso())
-        persist_cursor_state_file(path, snapshot)
+        persist_cursor_state_file(
+            path,
+            snapshot,
+            key_prefix=self._key_prefix,
+            namespace=self._cursor_namespace,
+        )
         self._committed = snapshot
         if self._health_error and not self._cursor_corrupt:
             self._health_error = None
@@ -544,7 +678,12 @@ class TraceArchiver:
             return
         snapshot = {name: cursor for name, cursor in self._committed.items() if name not in stale}
         try:
-            persist_cursor_state_file(path, snapshot)
+            persist_cursor_state_file(
+                path,
+                snapshot,
+                key_prefix=self._key_prefix,
+                namespace=self._cursor_namespace,
+            )
         except OSError as exc:
             self._logger.warning(
                 "Failed to persist pruned cursor state at %s; leaving stale records: %s",

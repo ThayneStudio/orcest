@@ -20,9 +20,11 @@ from orcest.orchestrator.trace_archiver import (
     _RETAIN_NEWEST,
     StreamCursor,
     TraceArchiver,
+    _cursor_namespace,
     _entry_id_to_iso,
     _entry_id_tuple,
     cursor_state_path,
+    legacy_cursor_state_path,
     persist_cursor_state_file,
 )
 from orcest.shared.output_streams import iter_capped_output_fields
@@ -198,6 +200,10 @@ class TestArchiverHappyPath:
         assert state_path.exists()
         first_state = json.loads(state_path.read_text())
         assert first_state["version"] == _CURSOR_STATE_VERSION
+        assert first_state["identity"] == {
+            "key_prefix": fake_redis_client.key_prefix,
+            "namespace": _cursor_namespace(fake_redis_client.key_prefix),
+        }
         first_cursor = first_state["streams"]["output:w1"]["last_id"]
         assert first_cursor
         assert first_state["streams"]["output:w1"]["last_seen"]
@@ -317,14 +323,14 @@ class TestArchiverSecurity:
                 },
             )
         archiver._pump_output_streams()
-        # No project subdirs, no rogue files outside archive_root anywhere.
-        # The per-project cursor state directory is the only allowed entry.
+        # No project trace subdirs, no rogue files outside archive_root anywhere.
+        # The hidden cursor state tree is the only allowed entry.
         contents = {p.name for p in archive_root.iterdir()}
-        assert contents == {fake_redis_client.key_prefix}, (
+        assert contents == {".orcest-archiver-cursors"}, (
             f"unexpected entries under archive root: {contents}"
         )
-        cursor_dir = archive_root / fake_redis_client.key_prefix
-        assert {p.name for p in cursor_dir.iterdir()} == {_CURSOR_FILENAME}
+        cursor = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        assert cursor.exists()
 
     def test_archived_files_are_mode_0o600(self, fake_redis_client, logger, archive_root):
         archiver = TraceArchiver(
@@ -540,6 +546,23 @@ def _refuse_redis_writes(redis_client: RedisClient) -> None:
     redis_client.xadd_capped = boom  # type: ignore[method-assign]
 
 
+def _write_legacy_cursor_state(path: Path, streams: dict[str, StreamCursor]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "streams": {
+                    name: {"last_id": cursor.last_id, "last_seen": cursor.last_seen}
+                    for name, cursor in sorted(streams.items())
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _start_and_line(
     redis_client: RedisClient,
     *,
@@ -575,6 +598,28 @@ def _commit_start_then_enqueue_line(
 
 
 class TestArchiverCursorDurability:
+    def test_cursor_namespace_is_unique_and_traversal_safe(self, archive_root):
+        prefixes = [
+            "",
+            "alpha",
+            "alpha.beta",
+            "gamma.delta",
+            "alpha:beta",
+            "../escape",
+            ".",
+            "..",
+            "a/b",
+        ]
+
+        paths = [cursor_state_path(archive_root, prefix) for prefix in prefixes]
+
+        assert len(paths) == len(set(paths))
+        for path in paths:
+            assert path.name == _CURSOR_FILENAME
+            assert path.is_relative_to(archive_root)
+            assert path.parent.parent.name == "v2"
+            assert ".." not in path.relative_to(archive_root).parts
+
     def test_redis_write_refusal_does_not_duplicate_on_retry(
         self, fake_redis_client, logger, archive_root
     ):
@@ -771,6 +816,54 @@ class TestArchiverCursorDurability:
         assert _count_in_archive(archive_root, payload) == 1
         assert archiver.committed_last_id("output:w1") == line_id
 
+    def test_legacy_local_state_migrates_before_restart(
+        self, fake_redis_client, logger, archive_root
+    ):
+        old_path = legacy_cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        _write_legacy_cursor_state(
+            old_path,
+            {"output:w1": StreamCursor(last_id="123-4", last_seen=_hours_ago_iso(1))},
+        )
+
+        first = _archiver(fake_redis_client, logger, archive_root)
+        first._pump_output_streams()
+
+        new_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        assert new_path.exists()
+        state = json.loads(new_path.read_text())
+        assert state["version"] == _CURSOR_STATE_VERSION
+        assert state["identity"]["key_prefix"] == fake_redis_client.key_prefix
+        assert state["streams"]["output:w1"]["last_id"] == "123-4"
+        assert first.committed_last_id("output:w1") == "123-4"
+
+        old_path.write_text("ignored after durable migration\n", encoding="utf-8")
+        second = _archiver(fake_redis_client, logger, archive_root)
+        second._pump_output_streams()
+        assert second.committed_last_id("output:w1") == "123-4"
+
+    def test_interrupted_legacy_migration_fails_closed(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        old_path = legacy_cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        _write_legacy_cursor_state(
+            old_path,
+            {"output:w1": StreamCursor(last_id="123-4", last_seen=_hours_ago_iso(1))},
+        )
+        _start_and_line(fake_redis_client, line="must-not-archive-during-migration-failure")
+
+        def fail_replace(_src: Path, _dst: Path) -> None:
+            raise OSError("rename failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_replace_file", fail_replace)
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+
+        assert archiver.health_error is not None
+        assert "migration" in archiver.health_error.lower()
+        assert archiver.committed_last_id("output:w1") is None
+        assert not cursor_state_path(archive_root, fake_redis_client.key_prefix).exists()
+        assert _count_in_archive(archive_root, "must-not-archive-during-migration-failure") == 0
+
     def test_legacy_hash_seeds_local_state_once(self, fake_redis_client, logger, archive_root):
         fake_redis_client.hset(_CURSOR_HASH_KEY, "output:w1", "123-4")
         archiver = _archiver(fake_redis_client, logger, archive_root)
@@ -779,6 +872,7 @@ class TestArchiverCursorDurability:
         state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
         state = json.loads(state_path.read_text())
         assert state["version"] == _CURSOR_STATE_VERSION
+        assert state["identity"]["key_prefix"] == fake_redis_client.key_prefix
         assert state["streams"]["output:w1"]["last_id"] == "123-4"
         assert state["streams"]["output:w1"]["last_seen"]
         assert archiver.committed_last_id("output:w1") == "123-4"
@@ -802,10 +896,12 @@ class TestArchiverCursorDurability:
         )
         assert state["streams"]["output:w1"]["last_id"] == "5-0"
 
-    def test_project_namespaces_do_not_share_cursors(self, fake_redis_server, logger, archive_root):
+    def test_dotted_project_namespaces_do_not_share_cursors(
+        self, fake_redis_server, logger, archive_root
+    ):
         shared = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
-        redis_a = RedisClient.from_client(shared, key_prefix="projA")
-        redis_b = RedisClient.from_client(shared, key_prefix="projB")
+        redis_a = RedisClient.from_client(shared, key_prefix="alpha.beta")
+        redis_b = RedisClient.from_client(shared, key_prefix="gamma.delta")
         redis_a.hset(_CURSOR_HASH_KEY, "output:w1", "10-0")
         redis_b.hset(_CURSOR_HASH_KEY, "output:w1", "20-0")
 
@@ -814,13 +910,55 @@ class TestArchiverCursorDurability:
         archiver_a._pump_output_streams()
         archiver_b._pump_output_streams()
 
-        path_a = cursor_state_path(archive_root, "projA")
-        path_b = cursor_state_path(archive_root, "projB")
+        path_a = cursor_state_path(archive_root, "alpha.beta")
+        path_b = cursor_state_path(archive_root, "gamma.delta")
         assert path_a != path_b
         assert json.loads(path_a.read_text())["streams"]["output:w1"]["last_id"] == "10-0"
         assert json.loads(path_b.read_text())["streams"]["output:w1"]["last_id"] == "20-0"
         assert archiver_a.committed_last_id("output:w1") == "10-0"
         assert archiver_b.committed_last_id("output:w1") == "20-0"
+
+    def test_ambiguous_legacy_unknown_state_fails_closed(
+        self, fake_redis_server, logger, archive_root
+    ):
+        old_path = legacy_cursor_state_path(archive_root, "alpha.beta")
+        _write_legacy_cursor_state(
+            old_path,
+            {"output:w1": StreamCursor(last_id="999-0", last_seen=_hours_ago_iso(1))},
+        )
+        shared = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+        redis_client = RedisClient.from_client(shared, key_prefix="alpha.beta")
+        _start_and_line(redis_client, line="ambiguous-legacy-must-not-archive")
+
+        archiver = _archiver(redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+
+        assert archiver.health_error is not None
+        assert "ambiguous legacy" in archiver.health_error.lower()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _count_in_archive(archive_root, "ambiguous-legacy-must-not-archive") == 0
+        assert _stream_ids(redis_client, "output:w1")
+
+    def test_identity_mismatch_blocks_foreign_cursor_and_trim(
+        self, fake_redis_server, logger, archive_root
+    ):
+        shared = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+        redis_client = RedisClient.from_client(shared, key_prefix="gamma.delta")
+        ids = _enqueue_task_with_lines(redis_client, 200)
+        foreign_path = cursor_state_path(archive_root, "gamma.delta")
+        persist_cursor_state_file(
+            foreign_path,
+            {"output:w1": StreamCursor(last_id=ids[-1], last_seen=_hours_ago_iso(1))},
+            key_prefix="alpha.beta",
+        )
+
+        archiver = _archiver(redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+
+        assert archiver.health_error is not None
+        assert "identity mismatch" in archiver.health_error.lower()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _stream_ids(redis_client, "output:w1") == ids
 
     def test_corrupt_state_disables_advancement_and_does_not_replay(
         self, fake_redis_client, logger, archive_root, caplog
@@ -1084,6 +1222,7 @@ class TestArchiverTrimAndCursorGC:
                 gone: StreamCursor(last_id="1-0", last_seen=_hours_ago_iso(33)),
                 "output:w1": StreamCursor(last_id="2-0", last_seen=_hours_ago_iso(33)),
             },
+            key_prefix=fake_redis_client.key_prefix,
         )
         live_id = _xadd(fake_redis_client, "output:w1", {"line": "still-here"})
         archiver = _archiver(fake_redis_client, logger, archive_root)
@@ -1104,6 +1243,7 @@ class TestArchiverTrimAndCursorGC:
         persist_cursor_state_file(
             cursor_state_path(archive_root, fake_redis_client.key_prefix),
             {gone: StreamCursor(last_id="1-0", last_seen=_hours_ago_iso(31))},
+            key_prefix=fake_redis_client.key_prefix,
         )
         archiver = _archiver(fake_redis_client, logger, archive_root)
         archiver._pump_output_streams()
@@ -1121,6 +1261,7 @@ class TestArchiverTrimAndCursorGC:
         persist_cursor_state_file(
             cursor_state_path(archive_root, fake_redis_client.key_prefix),
             {stream: StreamCursor(last_id=entry_id, last_seen=_hours_ago_iso(40))},
+            key_prefix=fake_redis_client.key_prefix,
         )
         fake_redis_client.hset(_CURSOR_HASH_KEY, stream, entry_id)
         archiver = _archiver(fake_redis_client, logger, archive_root)
