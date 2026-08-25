@@ -1,7 +1,10 @@
-{"type":"thread.started","thread_id":"019e5221-3655-74a1-9071-311918520ba2"}
+# provenance: captured-shape 0.149.1 JSONL contract (codex exec --json; rust-v0.149.1 exec_events.rs). Authenticated live recapture is #620.
+{"type":"thread.started","thread_id":"01a037ff-0002-7000-8000-codex149tooluse"}
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll create `CODEX.txt` in the current workspace with exactly the requested content."}}
-{"type":"item.started","item":{"id":"item_1","type":"file_change","changes":[{"path":"/tmp/codex-cap/CODEX.txt","kind":"add"}],"status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"/tmp/codex-cap/CODEX.txt","kind":"add"}],"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Done."}}
-{"type":"turn.completed","usage":{"input_tokens":27201,"cached_input_tokens":25344,"output_tokens":61,"reasoning_output_tokens":0}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'printf requested > CODEX.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'printf requested > CODEX.txt'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/codex-cap/CODEX.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/codex-cap/CODEX.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}
+{"type":"turn.completed","usage":{"input_tokens":27201,"cached_input_tokens":25344,"cache_write_input_tokens":0,"output_tokens":61,"reasoning_output_tokens":0}}

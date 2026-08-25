@@ -1,0 +1,7 @@
+# provenance: captured 2026-08-25 from @openai/codex@0.149.1 `codex exec --json` (unauthenticated 401). cf-ray/request-id redacted; reconnect spam collapsed.
+{"type":"thread.started","thread_id":"01a037ff-461e-7963-af20-209c19ebf0d1"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header)"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Falling back from WebSockets to HTTPS transport. unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}
+{"type":"error","message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}
+{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}
