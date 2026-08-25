@@ -10,7 +10,8 @@ destruction outright. Destruction below the ceiling only fires when:
 - the record is absent-or-stale AND the worker's liveness heartbeat
   (``workers:heartbeat:{worker_id}``, written by every worker regardless of
   watchdog config -- see ``worker/loop.py``) is ALSO absent AND the consumer
-  still holds pending stream entries.
+  still holds pending stream entries AND elapsed time is at least
+  ``activity_stale_min_elapsed`` (default 600s).
 
 Fix round 1 (CRITICAL): an absent-or-stale activity record is *not* by
 itself proof of death -- ``watchdog.enabled: false`` (the ship-dark stage
@@ -20,6 +21,12 @@ tracker. Only when the heartbeat is *also* absent does an absent/stale
 activity record mean anything; a present heartbeat means "alive, just not
 running the watchdog" and is left to the ceiling exactly like the
 pre-watchdog reaper.
+
+Issue #615: missing activity + heartbeat is still not proof of death on a
+young VM. A just-assigned worker may not have written either Redis key yet,
+so ``activity_stale`` waits until elapsed reaches
+``activity_stale_min_elapsed``. ``needs_reap`` and the absolute duration
+ceiling bypass that floor.
 
 The ceiling itself is unconditional: ``elapsed > max_task_duration`` always
 destroys, regardless of how fresh the activity record or heartbeat are.
@@ -36,6 +43,7 @@ import time
 
 import pytest
 
+from orcest.fleet.config import PoolConfig
 from orcest.fleet.pool_manager import PoolManager
 from orcest.shared.events import EVENTS_STREAM
 from orcest.shared.models import CONSUMER_GROUP, Task, TaskType
@@ -46,6 +54,9 @@ pytestmark = pytest.mark.unit
 
 _WORKER_ID = "orcest-worker-305"
 _ACTIVITY_KEY = f"workers:activity:{_WORKER_ID}"
+# Elapsed times relative to PoolConfig.activity_stale_min_elapsed (600s).
+_BELOW_FLOOR = 10
+_PAST_FLOOR = PoolConfig().activity_stale_min_elapsed + 1
 
 
 def _build(fake_redis_client, max_task_duration: int = 25200):
@@ -144,14 +155,16 @@ class TestActivityAwareHealthCheck:
         self, fake_redis_client
     ):
         """When every active worker's Redis-backed liveness records disappear
-        together, young VMs are not destroyed on activity_stale. That pattern
-        is one shared Redis failure domain, not independent confirmation that
-        every worker died."""
+        together, VMs past the activity_stale elapsed floor are still not
+        destroyed on activity_stale. That pattern is one shared Redis
+        failure domain, not independent confirmation that every worker
+        died. Elapsed is past the floor so this does not hide behind the
+        #615 young-task guard."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 153))
-        rc.hset("pool:active", "306", str(now - 182))
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
+        rc.hset("pool:active", "306", str(now - (_PAST_FLOOR + 20)))
         _claim_pending_task(rc, "orcest-worker-305")
         _claim_pending_task(rc, "orcest-worker-306")
 
@@ -174,8 +187,24 @@ class TestActivityAwareHealthCheck:
         proxmox.stop_vm.assert_called_once_with(305)
         proxmox.destroy_vm.assert_called_once_with(305)
 
+    def test_ceiling_bypasses_activity_stale_elapsed_floor(self, fake_redis_client):
+        """The absolute duration ceiling is not gated by
+        activity_stale_min_elapsed: a VM past max_task_duration is destroyed
+        even when elapsed is still below the activity_stale floor."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=100)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - 150))  # past ceiling 100, below floor 600
+        _write_activity_record(rc, needs_reap=False, last_liveness_ts=now)
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+
     def test_needs_reap_flag_destroys_immediately(self, fake_redis_client):
-        """needs_reap == "1" fires immediately, well below the ceiling."""
+        """needs_reap == "1" fires immediately, well below the ceiling
+        and well below activity_stale_min_elapsed."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
@@ -187,32 +216,49 @@ class TestActivityAwareHealthCheck:
         proxmox.stop_vm.assert_called_once_with(305)
         proxmox.destroy_vm.assert_called_once_with(305)
 
-    def test_absent_record_with_pending_entries_destroys(self, fake_redis_client):
-        """True worker death: no activity record (worker died before ever
-        reporting, or its TTL already expired) AND no liveness heartbeat
-        (nobody -- not even a non-watchdog worker -- is renewing it, so the
-        process itself is gone) combined with a pending stream entry proves
-        there is a task to recover -- destroy."""
+    def test_young_single_active_vm_missing_liveness_not_destroyed(self, fake_redis_client):
+        """Issue #615: a young single active VM with no activity record and
+        no heartbeat is not destroyed. Missing inferred liveness this early
+        is expected -- the worker may not have written either key yet."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "305", str(now - _BELOW_FLOOR))
         _claim_pending_task(rc, _WORKER_ID)
-        # No activity record and no heartbeat written for _WORKER_ID -- the
-        # worker process is provably gone, not just quiet on activity.
 
         manager._health_check()
 
-        proxmox.stop_vm.assert_called_once_with(305)
-        proxmox.destroy_vm.assert_called_once_with(305)
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
 
-    def test_absent_record_without_pending_entries_not_destroyed(self, fake_redis_client):
-        """No activity record and no pending stream entries: could just be an
-        idle worker whose watchdog hasn't ticked yet. Leave it alone."""
+    def test_young_mixed_fleet_one_missing_heartbeat_not_destroyed(self, fake_redis_client):
+        """Issue #615: in a mixed fleet, a young VM whose heartbeat is the
+        only one missing is still not activity_stale-destroyed. The
+        correlated-heartbeat-loss guard does not apply (a peer heartbeat is
+        present), so only the elapsed floor keeps this VM alive."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "305", str(now - _BELOW_FLOOR))
+        rc.hset("pool:active", "306", str(now - _BELOW_FLOOR))
+        _write_heartbeat(rc, "orcest-worker-306")
+        _claim_pending_task(rc, "orcest-worker-305")
+        _claim_pending_task(rc, "orcest-worker-306")
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_not_called()
+        proxmox.destroy_vm.assert_not_called()
+
+    def test_absent_record_without_pending_entries_not_destroyed(self, fake_redis_client):
+        """No activity record and no pending stream entries: could just be an
+        idle worker whose watchdog hasn't ticked yet. Leave it alone.
+        Elapsed is past the floor so this does not hide behind the young-task
+        guard."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
         # No activity record, no claimed task.
 
         manager._health_check()
@@ -235,7 +281,7 @@ class TestActivityAwareHealthCheck:
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
         _write_heartbeat(rc, _WORKER_ID)
         _claim_pending_task(rc, _WORKER_ID)
         # No activity record written -- watchdog is "disabled".
@@ -246,17 +292,39 @@ class TestActivityAwareHealthCheck:
         proxmox.destroy_vm.assert_not_called()
 
     def test_true_worker_death_no_record_no_heartbeat_pending_destroys(self, fake_redis_client):
-        """True worker death, stated explicitly and independent of default
-        mock/fixture state: no activity record AND no liveness heartbeat AND
-        a pending stream entry -- the process is provably gone and there is
-        work to recover. Destroy with reason "activity_stale"."""
+        """True worker death past the elapsed floor: no activity record AND
+        no liveness heartbeat AND a pending stream entry -- the process is
+        provably gone and there is work to recover. Destroy with reason
+        "activity_stale"."""
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
         _claim_pending_task(rc, _WORKER_ID)
         assert rc.get(f"workers:heartbeat:{_WORKER_ID}") is None
         assert rc.hgetall_raw(_ACTIVITY_KEY) == {}
+
+        manager._health_check()
+
+        proxmox.stop_vm.assert_called_once_with(305)
+        proxmox.destroy_vm.assert_called_once_with(305)
+        reaped = _reaped_events(rc)
+        assert len(reaped) == 1
+        assert reaped[0]["data"]["reason"] == "activity_stale"
+
+    def test_mixed_fleet_one_missing_heartbeat_after_floor_destroys(self, fake_redis_client):
+        """Issue #615: the same mixed-fleet evidence that was ignored below
+        the floor becomes actionable after it. Only the worker whose
+        heartbeat is missing is destroyed; the peer with a live heartbeat
+        is left to the ceiling."""
+        rc = fake_redis_client
+        manager, proxmox = _build(rc, max_task_duration=25200)
+        now = time.time()
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
+        rc.hset("pool:active", "306", str(now - _PAST_FLOOR))
+        _write_heartbeat(rc, "orcest-worker-306")
+        _claim_pending_task(rc, "orcest-worker-305")
+        _claim_pending_task(rc, "orcest-worker-306")
 
         manager._health_check()
 
@@ -274,7 +342,7 @@ class TestActivityAwareHealthCheck:
         rc = fake_redis_client
         manager, proxmox = _build(rc, max_task_duration=25200)
         now = time.time()
-        rc.hset("pool:active", "305", str(now - 10))
+        rc.hset("pool:active", "305", str(now - _PAST_FLOOR))
         stale_ts = now - 10000  # activity_stale_after default is 300s
         _write_activity_record(rc, needs_reap=False, last_liveness_ts=stale_ts)
         _write_heartbeat(rc, _WORKER_ID)
@@ -314,7 +382,7 @@ class TestActivityAwareHealthCheck:
 
         # activity_stale: no activity record at all, but a pending stream entry.
         stale_mgr, _p3 = _build(rc, max_task_duration=25200)
-        rc.hset("pool:active", "307", str(now - 10))
+        rc.hset("pool:active", "307", str(now - _PAST_FLOOR))
         _claim_pending_task(rc, "orcest-worker-307")
         stale_mgr._health_check()
 
