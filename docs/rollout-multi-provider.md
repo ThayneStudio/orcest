@@ -51,7 +51,7 @@ Follow this order to minimize risk. Claude-only operation is unaffected until yo
      ```yaml
      providers:
        - provider: claude
-         credential: ""          # falls back to CLAUDE_CODE_OAUTH_TOKEN (or env)
+         credential: ""          # falls back to CLAUDE_CODE_OAUTH_TOKEN only
          model: claude-3-5-sonnet-20241022
        - provider: grok
          credential: ""          # falls back to XAI_API_KEY (or env)
@@ -143,6 +143,34 @@ before rollout.
 - `XAI_API_KEY=...` (or `GROK_API_KEY`) for grok, and analogous `{UPPER}_API_KEY` for future providers
 
 These land in the orchestrator's Docker `.env` so that `providers:` entries with empty `credential` can fall back at config load time.
+
+Claude runtime credentials are OAuth tokens only. `ANTHROPIC_API_KEY` is
+not a supported fallback: workers inject the task credential as
+`CLAUDE_CODE_OAUTH_TOKEN`, so resolving an API key and relabeling it as
+an OAuth token is not a valid compatibility contract. A Claude-enabled
+config that only has `ANTHROPIC_API_KEY` fails validation with a
+migration instruction; an unrelated `ANTHROPIC_API_KEY` in the
+environment does not fail non-Claude providers.
+
+### Credential planes (Actions review vs fleet runtime)
+
+These planes are separate. They may hold different tokens and rotation
+schedules, and they are not synchronized.
+
+- **Actions review plane.** The repository Actions secret named
+  `CLAUDE_CODE_OAUTH_TOKEN` is consumed by
+  `.github/workflows/claude-review.yml` and the manually dispatched
+  `claude-review-usage.yml`. Keep it for those review workflows. GitHub
+  Actions does not deploy the fleet and must not copy that secret into
+  PVE.
+- **Fleet runtime plane.** Operators SSH to
+  `root@pve-test.lab.prefixa.net`, stage a verified source bundle, and
+  run `orcest fleet` commands. Runtime credentials come from the
+  root-owned, mode-`0600` `/etc/orcest/config.yaml`
+  (`claude_oauth_tokens` or `provider_credentials.claude`). `fleet
+  update` generates protected per-project `.env` files containing
+  `CLAUDE_CODE_OAUTH_TOKEN` on the orchestrator VM. That PVE file is the
+  deployment source of truth.
 
 ### Fleet Credential Multiplicity
 

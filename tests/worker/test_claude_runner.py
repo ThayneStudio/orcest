@@ -317,6 +317,29 @@ def test_build_env_no_env_var_name():
     assert "sk-ant-oat01-test" not in env.values()
 
 
+@pytest.mark.unit
+def test_build_env_does_not_forward_anthropic_api_key(monkeypatch):
+    """ANTHROPIC_API_KEY must not leak into a Claude subprocess environment."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-leak")
+    env = _build_env("ghp_test", credential="oauth-token", env_var_name="CLAUDE_CODE_OAUTH_TOKEN")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "sk-ant-must-not-leak" not in env.values()
+
+
+@pytest.mark.unit
+def test_build_env_does_not_cross_expose_provider_secrets(monkeypatch):
+    """A grok subprocess must not inherit Claude secrets from the parent env."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-leak")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-must-not-leak")
+    env = _build_env("ghp_test", credential="xai-key", env_var_name="XAI_API_KEY")
+    assert env["XAI_API_KEY"] == "xai-key"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "sk-ant-must-not-leak" not in env.values()
+    assert "oauth-must-not-leak" not in env.values()
+
+
 # ---------------------------------------------------------------------------
 # Command arguments
 # ---------------------------------------------------------------------------

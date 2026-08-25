@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from orcest.shared.models import require_valid_provider_name
+from orcest.shared.models import is_claude_provider, require_valid_provider_name
 from orcest.shared.providers import ProviderEntry
 
 
@@ -337,16 +337,77 @@ def _validate_watchdog_config(wd: WatchdogConfig) -> None:
 # from YAML). These are prepended to the generic {PROVIDER}_TOKEN/_API_KEY/_KEY
 # fallbacks. Adding a new provider here keeps the logic data-driven/future-proof
 # without touching the if-ladder.
+#
+# Claude runtime credentials are OAuth tokens only. Workers inject the task
+# credential as CLAUDE_CODE_OAUTH_TOKEN; ANTHROPIC_API_KEY is not a valid
+# fallback because the task schema does not carry authentication kind.
 _PROVIDER_ENV_CANDIDATES: dict[str, list[str]] = {
     "grok": ["XAI_API_KEY", "GROK_API_KEY", "XAI_API_TOKEN"],
-    "claude": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-    "clauder": ["CLAUDER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    "claude": ["CLAUDE_CODE_OAUTH_TOKEN"],
+    "clauder": ["CLAUDER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
     # codex exec specifically reads CODEX_API_KEY (NOT OPENAI_API_KEY) for
     # headless API auth; OPENAI_API_KEY is kept as a last-resort fallback
     # for env-resolution only (the worker still injects CODEX_API_KEY since
     # that's the recipe env_var).
     "codex": ["CODEX_API_KEY", "OPENAI_API_KEY"],
 }
+
+_LEGACY_CLAUDE_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_CLAUDE_OAUTH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKENS")
+
+
+def _claude_api_key_migration_error(context: str) -> ValueError:
+    """Return the scoped error for Claude configs that only have an API key."""
+    return ValueError(
+        f"{context}: ANTHROPIC_API_KEY is not a supported Claude runtime "
+        "credential. Workers inject task credentials under "
+        "CLAUDE_CODE_OAUTH_TOKEN, and the task schema does not carry "
+        "authentication kind, so an API key cannot be relabeled as an OAuth "
+        "token. Set CLAUDE_CODE_OAUTH_TOKEN (fleet runtime: "
+        "orgs.*.claude_oauth_tokens or provider_credentials.claude in the "
+        "root-owned mode-0600 /etc/orcest/config.yaml). The GitHub Actions "
+        "secret named CLAUDE_CODE_OAUTH_TOKEN is a separate review-workflow "
+        "plane and is not deployed to PVE."
+    )
+
+
+def _env_nonempty(name: str) -> bool:
+    value = os.environ.get(name)
+    return bool(value and str(value).strip())
+
+
+def _legacy_anthropic_api_key_present() -> bool:
+    return _env_nonempty(_LEGACY_CLAUDE_API_KEY_ENV)
+
+
+def _claude_oauth_env_present() -> bool:
+    return any(_env_nonempty(name) for name in _CLAUDE_OAUTH_ENV_VARS)
+
+
+def _reject_legacy_anthropic_api_key_for_claude_projects(
+    projects: list[ProjectConfig],
+    default_runner: str,
+) -> None:
+    """Fail Claude-enabled configs that only have ANTHROPIC_API_KEY.
+
+    An unrelated ANTHROPIC_API_KEY must not fail non-Claude providers.
+    Explicit OAuth env vars, legacy claude_tokens, and inline credentials
+    all win over the migration error.
+    """
+    if not _legacy_anthropic_api_key_present() or _claude_oauth_env_present():
+        return
+
+    for proj in projects:
+        has_claude_credential = any(token.strip() for token in proj.claude_tokens) or any(
+            is_claude_provider(entry.provider) and entry.credential.strip()
+            for entry in proj.providers
+        )
+        if has_claude_credential:
+            continue
+        implicit_claude = is_claude_provider(default_runner) and not proj.providers
+        declared_claude = any(is_claude_provider(entry.provider) for entry in proj.providers)
+        if implicit_claude or declared_claude:
+            raise _claude_api_key_migration_error(f"project '{proj.repo}'")
 
 
 def _parse_provider_entry(raw: dict[str, Any], context: str) -> ProviderEntry:
@@ -385,6 +446,10 @@ def _parse_provider_entry(raw: dict[str, Any], context: str) -> ProviderEntry:
                 break
 
         if not credential:
+            if is_claude_provider(provider) and _legacy_anthropic_api_key_present():
+                raise _claude_api_key_migration_error(
+                    f"Provider entry at {context} for '{provider}'"
+                )
             raise ValueError(
                 f"Provider entry at {context} for '{provider}' is missing 'credential' "
                 f"(not present in YAML and no matching env var among {candidates[:3]}... was set)"
@@ -720,6 +785,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         os.environ.get("ORCEST_DEFAULT_RUNNER", raw.get("default_runner", "claude")),
         "default_runner",
     )
+    _reject_legacy_anthropic_api_key_for_claude_projects(projects, default_runner)
 
     # Max attempts per PR before labeling needs-human
     max_attempts = _safe_int(raw.get("max_attempts", 3), "max_attempts")
