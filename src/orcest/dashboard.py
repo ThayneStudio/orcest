@@ -22,7 +22,14 @@ from rich.markup import escape as rich_escape
 
 from orcest.shared.models import DEAD_LETTER_STREAM
 from orcest.shared.output_streams import is_output_continuation
+from orcest.shared.provider_stream_health import ProviderStreamHealth
 from orcest.shared.redis_client import RedisClient
+
+# Global (cross-project, unprefixed) key prefix PoolManager publishes canonical
+# per-provider stream-health snapshots under. Must match
+# fleet/pool_manager.py's _STREAM_HEALTH_KEY_PREFIX -- this module only ever
+# reads that published state, it never recomputes health itself.
+_STREAM_HEALTH_KEY_PREFIX = "provider-stream-health:"
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +91,8 @@ class SystemSnapshot:
     dead_letter_entries: list[DeadLetterEntry] = field(default_factory=list)
     provider_health: dict[str, dict[str, int]] = field(default_factory=dict)
     # Task 8: per-provider counters e.g. "claude": {"exhausted_skip": N, "rebake..."}
+    stream_health: list[ProviderStreamHealth] = field(default_factory=list)
+    # issue #613: canonical stranded-stream snapshots published by PoolManager.
 
 
 def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
@@ -247,6 +256,24 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     except Exception:
         logger.debug("Failed to collect provider health counters", exc_info=True)
 
+    # Stream health (issue #613): read-only consumer of PoolManager's
+    # canonical, unprefixed per-provider state key. This CLI never
+    # recomputes stranded-stream health, only renders what was published.
+    stream_health: list[ProviderStreamHealth] = []
+    try:
+        for raw_key in redis.client.scan_iter(match=f"{_STREAM_HEALTH_KEY_PREFIX}*"):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+            raw_value = redis.get_raw(key)
+            if raw_value is None:
+                continue
+            try:
+                stream_health.append(ProviderStreamHealth.from_dict(json.loads(raw_value)))
+            except (TypeError, ValueError, KeyError):
+                logger.debug("Malformed stream health record at %s", key)
+    except Exception:
+        logger.debug("Failed to collect provider stream health", exc_info=True)
+    stream_health.sort(key=lambda h: h.provider)
+
     return SystemSnapshot(  # noqa: E501
         redis_ok=True,
         fetched_at=datetime.now(timezone.utc),
@@ -259,6 +286,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         attempt_counts=attempt_counts,
         dead_letter_entries=dead_letter_entries,
         provider_health=provider_health,
+        stream_health=stream_health,
     )
 
 

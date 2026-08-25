@@ -11,6 +11,7 @@ instances could clash.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -46,6 +47,11 @@ from orcest.shared.models import (
     ResultStatus,
     Task,
     TaskResult,
+    task_stream_name,
+)
+from orcest.shared.provider_stream_health import (
+    ProviderStreamHealth,
+    ProviderStreamHealthTracker,
 )
 from orcest.shared.redis_client import RedisClient
 
@@ -100,6 +106,15 @@ _IDLE_LIVENESS_BREAKER_LIMIT = 2
 # tracker (see worker/liveness_tracker.py's _write_activity_record). Read here
 # with hgetall_raw -- never auto-prefixed -- to land in the same keyspace.
 _ACTIVITY_KEY_PREFIX = "workers:activity:"
+
+# Global (cross-project, unprefixed) canonical per-provider stream-health
+# snapshot (issue #613). PoolManager is the single writer; ``orcest status``
+# and any other reader only ever consume this key, never recompute health.
+_STREAM_HEALTH_KEY_PREFIX = "provider-stream-health:"
+# TTL comfortably longer than one reconcile interval so a snapshot survives
+# normal polling gaps but expires (rather than lying stale forever) if the
+# pool manager stops publishing entirely.
+_STREAM_HEALTH_TTL_SECONDS = 900
 
 # VM naming convention
 _VM_NAME_PREFIX = "orcest-worker-"
@@ -166,6 +181,9 @@ class PoolManager:
         self._idle_liveness_write_healthy_since: float | None = None
         self._idle_liveness_breaker_events: dict[str, list[float]] = {}
         self._idle_liveness_breaker_open: dict[str, bool] = {}
+        self._stream_health_tracker = ProviderStreamHealthTracker(
+            dwell_seconds=float(self._pool.stream_health_dwell_seconds)
+        )
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -196,6 +214,7 @@ class PoolManager:
             self._health_check()
             self._reconcile_stale_redis()
             self._sweep_orphan_pel()
+            self._check_stream_health()
         except Exception:
             logger.error("Reconciliation pass failed", exc_info=True)
 
@@ -2841,6 +2860,158 @@ class PoolManager:
         if worker_id not in cache:
             cache[worker_id] = self._worker_heartbeat_present(worker_id)
         return cache[worker_id]
+
+    # ── stranded provider-stream detection (issue #613) ─────────
+
+    def _check_stream_health(self) -> None:
+        """Compose and publish a health snapshot for every configured provider.
+
+        A provider stream is stranded when it carries pending/lag work but
+        has zero heartbeat-backed live consumers. This is a continuous
+        dwell-based detector, not a one-shot deploy gate: it uses the
+        fleet's configured provider backends (``self._pool.worker_backends()``)
+        rather than a hard-coded stream prefix or a rollout revision gate,
+        so it keeps working long after any particular rollout is over.
+        """
+        if not self._pool.stream_health_enabled:
+            return
+        now = time.time()
+        heartbeat_cache: dict[str, bool | None] = {}
+        for provider in sorted(self._pool.worker_backends()):
+            try:
+                self._check_one_provider_stream_health(provider, now, heartbeat_cache)
+            except Exception:
+                logger.error("Stream health check failed for provider %s", provider, exc_info=True)
+
+    def _check_one_provider_stream_health(
+        self, provider: str, now: float, heartbeat_cache: dict[str, bool | None]
+    ) -> None:
+        stream = self._fq_task_stream(task_stream_name(provider))
+        pending, lag, registered, live, read_error = self._read_stream_health_inputs(
+            stream, heartbeat_cache
+        )
+        snapshot, transition = self._stream_health_tracker.evaluate(
+            provider,
+            stream,
+            now=now,
+            pending=pending,
+            lag=lag,
+            registered_consumers=registered,
+            live_consumers=live,
+            read_error=read_error,
+        )
+        self._publish_stream_health(snapshot)
+        if transition == "stranded":
+            logger.error(
+                "Provider stream %s (provider=%s) is stranded: pending=%s lag=%s "
+                "registered_consumers=%s live_consumers=%s -- work is queued but no "
+                "consumer has a live worker heartbeat",
+                stream,
+                provider,
+                snapshot.pending,
+                snapshot.lag,
+                snapshot.registered_consumers,
+                snapshot.live_consumers,
+            )
+        elif transition == "recovered":
+            logger.info(
+                "Provider stream %s (provider=%s) recovered: live_consumers=%s",
+                stream,
+                provider,
+                snapshot.live_consumers,
+            )
+
+    def _read_stream_health_inputs(
+        self, stream: str, heartbeat_cache: dict[str, bool | None]
+    ) -> tuple[int | None, int | None, int | None, int | None, bool]:
+        """Return (pending, lag, registered_consumers, live_consumers, read_error).
+
+        A missing stream, or a stream with no ``workers`` consumer group yet,
+        is empty/healthy -- never a read error and never stranded (unless the
+        group-less stream already has undelivered entries, in which case
+        those entries are definitionally unconsumed). Any genuine Redis
+        failure or malformed reply is a read error: the caller must preserve
+        whatever state was last known rather than guess.
+        """
+        try:
+            raw_type = self._redis.client.type(stream)
+            key_type = raw_type.decode() if isinstance(raw_type, bytes) else str(raw_type)
+        except Exception:
+            return None, None, None, None, True
+
+        if key_type == "none":
+            return 0, 0, 0, 0, False
+        if key_type != "stream":
+            return None, None, None, None, True
+
+        try:
+            groups = self._redis.xinfo_groups_raw(stream)
+        except redis.ResponseError as exc:
+            if _is_missing_stream_or_group_error(exc):
+                return 0, 0, 0, 0, False
+            return None, None, None, None, True
+        except Exception:
+            return None, None, None, None, True
+
+        worker_groups = [g for g in groups if g.get("name") == CONSUMER_GROUP]
+        if not worker_groups:
+            try:
+                entries = int(cast(Any, self._redis.client.xlen(stream)))
+            except Exception:
+                return None, None, None, None, True
+            return entries, 0, 0, 0, False
+
+        pending = 0
+        lag = 0
+        registered = 0
+        live = 0
+        for group in worker_groups:
+            pending_raw = group.get("pending")
+            lag_raw = group.get("lag")
+            if pending_raw is None or lag_raw is None:
+                return None, None, None, None, True
+            try:
+                pending += int(pending_raw)
+                lag += max(int(lag_raw), 0)
+            except (TypeError, ValueError):
+                return None, None, None, None, True
+
+            try:
+                consumers = self._redis.xinfo_consumers_raw(stream, CONSUMER_GROUP)
+            except redis.ResponseError as exc:
+                if _is_missing_stream_or_group_error(exc):
+                    consumers = []
+                else:
+                    return None, None, None, None, True
+            except Exception:
+                return None, None, None, None, True
+
+            for consumer in consumers:
+                name = consumer.get("name")
+                if not isinstance(name, str) or not name:
+                    return None, None, None, None, True
+                registered += 1
+                # An unreadable heartbeat (None) does not count as live --
+                # "registered consumers without live worker heartbeats do
+                # not count as live" applies equally to an unknown answer.
+                if self._probe_worker_heartbeat(name, heartbeat_cache):
+                    live += 1
+
+        return pending, lag, registered, live, False
+
+    def _publish_stream_health(self, snapshot: ProviderStreamHealth) -> None:
+        try:
+            self._redis.set_ex_raw(
+                f"{_STREAM_HEALTH_KEY_PREFIX}{snapshot.provider}",
+                json.dumps(snapshot.to_dict()),
+                _STREAM_HEALTH_TTL_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to publish stream health state for provider %s",
+                snapshot.provider,
+                exc_info=True,
+            )
 
     def _live_vm_ids(self) -> set[int] | None:
         """VMIDs currently tracked as idle/active and present in Proxmox.

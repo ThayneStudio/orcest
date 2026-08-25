@@ -773,6 +773,49 @@ class TestMaxTaskDurationDefault:
 
         assert loaded.pool.watchdog_enabled is False
 
+    def test_stream_health_enabled_default_true(self):
+        assert PoolConfig().stream_health_enabled is True
+
+    def test_stream_health_dwell_seconds_default_300(self):
+        assert PoolConfig().stream_health_dwell_seconds == 300
+
+    def test_load_legacy_config_stream_health_defaults(self, tmp_path):
+        """A config without explicit stream_health_* keys gets the defaults."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({"pool": {"size": 2}}))
+        cfg = load_config(path)
+        assert cfg.pool.stream_health_enabled is True
+        assert cfg.pool.stream_health_dwell_seconds == 300
+
+    def test_load_config_stream_health_overrides(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.dump(
+                {
+                    "pool": {
+                        "size": 2,
+                        "stream_health_enabled": False,
+                        "stream_health_dwell_seconds": 60,
+                    }
+                }
+            )
+        )
+        cfg = load_config(path)
+        assert cfg.pool.stream_health_enabled is False
+        assert cfg.pool.stream_health_dwell_seconds == 60
+
+    def test_round_trip_stream_health_disabled(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            pool=PoolConfig(size=2, stream_health_enabled=False, stream_health_dwell_seconds=45)
+        )
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert loaded.pool.stream_health_enabled is False
+        assert loaded.pool.stream_health_dwell_seconds == 45
+
     def test_round_trip_monitor_ingest_credentials(self, tmp_path):
         path = tmp_path / "config.yaml"
         original = FleetConfig(

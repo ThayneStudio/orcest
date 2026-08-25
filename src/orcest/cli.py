@@ -21,6 +21,7 @@ from orcest.shared.models import (
     DEAD_LETTER_STREAM,
     REDACTED_FIELDS,
 )
+from orcest.shared.provider_stream_health import StreamHealthState
 
 if TYPE_CHECKING:
     from orcest.shared.config import RedisConfig
@@ -546,6 +547,44 @@ def _status_once(redis: RedisClient) -> None:
                     str(m.get("rebake_required_failures", 0)),
                 )
             console.print(ph_table)
+
+    # issue #613: render PoolManager's canonical stranded-stream snapshots.
+    # This CLI never recomputes stream health, only displays what was published.
+    stream_health = getattr(snapshot, "stream_health", None)
+    if stream_health:
+        stranded = [h for h in stream_health if h.state == StreamHealthState.STRANDED]
+        for h in stranded:
+            console.print(
+                f"[bold red]STRANDED[/bold red] provider stream {h.stream!r} "
+                f"(provider={h.provider}): pending={h.pending} lag={h.lag} "
+                f"registered_consumers={h.registered_consumers} "
+                f"live_consumers={h.live_consumers} -- work is queued but no consumer "
+                "has a live worker heartbeat"
+            )
+        state_labels = {
+            StreamHealthState.STRANDED: "[bold red]stranded[/bold red]",
+            StreamHealthState.HEALTHY: "[green]healthy[/green]",
+            StreamHealthState.UNKNOWN: "[dim]unknown[/dim]",
+        }
+        sh_table = Table(title="Provider Stream Health")
+        sh_table.add_column("Provider", style="cyan")
+        sh_table.add_column("Stream", style="magenta")
+        sh_table.add_column("State")
+        sh_table.add_column("Pending", style="yellow")
+        sh_table.add_column("Lag", style="yellow")
+        sh_table.add_column("Registered", style="green")
+        sh_table.add_column("Live", style="green")
+        for h in stream_health:
+            sh_table.add_row(
+                h.provider,
+                h.stream,
+                state_labels[h.state],
+                "?" if h.pending is None else str(h.pending),
+                "?" if h.lag is None else str(h.lag),
+                "?" if h.registered_consumers is None else str(h.registered_consumers),
+                "?" if h.live_consumers is None else str(h.live_consumers),
+            )
+        console.print(sh_table)
 
     console.print()
 
