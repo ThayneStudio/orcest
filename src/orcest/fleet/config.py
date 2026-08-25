@@ -239,6 +239,13 @@ class PoolConfig:
     # roll it out fleet-wide. Existing already-cloned workers keep whatever
     # value their own user-data was rendered with until they're replaced.
     watchdog_enabled: bool = True
+    # Continuous stranded-provider-stream detector (issue #613): PoolManager
+    # alerts when a configured provider stream carries pending/lag work but
+    # has zero heartbeat-backed live consumers, after a
+    # stream_health_dwell_seconds dwell. Disabling only turns off the
+    # detector/alert; it never affects reaping or task scheduling.
+    stream_health_enabled: bool = True
+    stream_health_dwell_seconds: int = 300
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
     # Image-integrity verification for the template cloud image (M5-infra).
     # By default the bake fetches the image's published ``SHA256SUMS`` +
@@ -652,6 +659,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         activity_stale_after=pl.get("activity_stale_after", 300),
         activity_stale_min_elapsed=pl.get("activity_stale_min_elapsed", 600),
         watchdog_enabled=bool(pl.get("watchdog_enabled", True)),
+        stream_health_enabled=bool(pl.get("stream_health_enabled", True)),
+        stream_health_dwell_seconds=pl.get("stream_health_dwell_seconds", 300),
         snippet_storage=pl.get("snippet_storage", "local"),
         expected_image_sha256=str(pl.get("expected_image_sha256", "") or ""),
         expected_image_gpg_key=str(
@@ -759,6 +768,8 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "activity_stale_after": config.pool.activity_stale_after,
             "activity_stale_min_elapsed": config.pool.activity_stale_min_elapsed,
             "watchdog_enabled": config.pool.watchdog_enabled,
+            "stream_health_enabled": config.pool.stream_health_enabled,
+            "stream_health_dwell_seconds": config.pool.stream_health_dwell_seconds,
             "snippet_storage": config.pool.snippet_storage,
             "expected_image_sha256": config.pool.expected_image_sha256,
             "expected_image_gpg_key": config.pool.expected_image_gpg_key,
