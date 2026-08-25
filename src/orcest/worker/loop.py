@@ -62,7 +62,7 @@ from orcest.shared.output_streams import (
     OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
     iter_capped_output_fields,
 )
-from orcest.shared.redis_client import RedisClient
+from orcest.shared.redis_client import ConsumerGroupInspection, RedisClient
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.liveness_tracker import LivenessTracker
@@ -126,6 +126,8 @@ _STARTUP_PING_RETRIES = 10
 _STARTUP_PING_BACKOFF = (1, 2, 4, 8, 10, 10, 10, 10, 10)
 if len(_STARTUP_PING_BACKOFF) != _STARTUP_PING_RETRIES - 1:
     raise ValueError("_STARTUP_PING_BACKOFF must have exactly _STARTUP_PING_RETRIES - 1 entries")
+_GROUP_BOOTSTRAP_INITIAL_BACKOFF_SECONDS = 1
+_GROUP_BOOTSTRAP_MAX_BACKOFF_SECONDS = 60
 
 _FAILURE_CONCLUSIONS = frozenset(
     {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
@@ -326,6 +328,68 @@ def _wait_for_redis(
             )
             if abort.wait(timeout=sleep_s):
                 return False
+    return False
+
+
+def _is_redis_maxmemory_oom(error: BaseException) -> bool:
+    """Return True for Redis noeviction/maxmemory OOM write rejections."""
+    if not isinstance(error, redis_py.ResponseError):
+        return False
+    oom_cls = getattr(redis_py.exceptions, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(error, oom_cls):
+        return True
+    text = str(error).lower()
+    return "oom" in text and "maxmemory" in text
+
+
+def _ensure_worker_consumer_groups(
+    redis: RedisClient,
+    streams: tuple[str, ...],
+    group: str,
+    logger: logging.Logger,
+    abort_event: threading.Event | None = None,
+) -> bool:
+    """Ensure worker task consumer groups, retrying Redis maxmemory OOM only.
+
+    Missing groups require ``XGROUP CREATE ... MKSTREAM``, which Redis rejects
+    under ``maxmemory-policy noeviction`` while over limit.  Retrying this one
+    classified write rejection in-process prevents systemd start-limit
+    exhaustion.  Inspection, protocol, ACL/auth, wrong-type, and malformed
+    response failures remain immediate startup errors.
+    """
+    abort = abort_event if abort_event is not None else threading.Event()
+    delay = _GROUP_BOOTSTRAP_INITIAL_BACKOFF_SECONDS
+    attempts = 0
+
+    while not abort.is_set():
+        try:
+            for stream in streams:
+                if redis.inspect_consumer_group(stream, group) is ConsumerGroupInspection.EXISTS:
+                    continue
+                redis.ensure_consumer_group(stream, group)
+        except redis_py.ResponseError as exc:
+            if not _is_redis_maxmemory_oom(exc):
+                raise
+            attempts += 1
+            if attempts == 1:
+                logger.warning(
+                    "Redis maxmemory OOM while creating worker consumer group(s); "
+                    "retrying in-process"
+                )
+            elif attempts & (attempts - 1) == 0:
+                logger.warning(
+                    "Redis still rejecting worker consumer-group creation at maxmemory "
+                    "after %d attempts; next retry in %ds",
+                    attempts,
+                    delay,
+                )
+            if abort.wait(timeout=delay):
+                return False
+            delay = min(delay * 2, _GROUP_BOOTSTRAP_MAX_BACKOFF_SECONDS)
+            continue
+        if attempts:
+            logger.info("Worker consumer groups available after %d OOM retry attempt(s)", attempts)
+        return True
     return False
 
 
@@ -1097,9 +1161,18 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         )
         sys.exit(1)
 
-    # Ensure consumer groups exist on shared streams
-    redis.ensure_consumer_group(pr_stream, CONSUMER_GROUP)
-    redis.ensure_consumer_group(issue_stream, CONSUMER_GROUP)
+    # Ensure consumer groups exist on shared streams.  A missing group may need
+    # a Redis write; retry only maxmemory OOM so startup survives noeviction
+    # pressure without hiding configuration/protocol errors.
+    if not _ensure_worker_consumer_groups(
+        redis,
+        (pr_stream, issue_stream),
+        CONSUMER_GROUP,
+        logger,
+        terminal_abort_event,
+    ):
+        logger.info("Consumer-group bootstrap stopped by shutdown request")
+        return
 
     # Drain pending tasks from previous worker lifecycle.
     pr_drain_complete, pr_drained = _drain_pending_tasks_raw(
