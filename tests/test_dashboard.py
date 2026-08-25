@@ -1,9 +1,11 @@
 """Unit tests for the dashboard data-fetching and formatting layers."""
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
+import time
 
 import pytest
 import redis as redis_lib
@@ -16,7 +18,9 @@ from orcest.dashboard import (
     discover_workers,
     fetch_snapshot,
     format_stream_json_line,
+    run_dashboard,
 )
+from orcest.shared.provider_stream_health import ProviderStreamHealth, StreamHealthState
 
 
 def test_empty_redis_returns_valid_snapshot(fake_redis_client):
@@ -590,6 +594,217 @@ class TestFetchSnapshotConsumerGroups:
         group = snap.consumer_groups[0]
         assert group.stream == "tasks:claude"
         assert group.name == "workers"
+
+
+# ---------------------------------------------------------------------------
+# Tests for fetch_snapshot provider stream health (issue #640)
+# ---------------------------------------------------------------------------
+
+
+def _stream_health(provider, stream, state, **overrides):
+    now = time.time()
+    defaults = dict(
+        provider=provider,
+        stream=stream,
+        pending=3,
+        lag=1,
+        registered_consumers=2,
+        live_consumers=0 if state == StreamHealthState.STRANDED else 2,
+        state=state,
+        observed_at=now,
+        transitioned_at=now - 400,
+    )
+    defaults.update(overrides)
+    return ProviderStreamHealth(**defaults)
+
+
+def _publish_stream_health(redis, provider, stream, state, **overrides):
+    health = _stream_health(provider, stream, state, **overrides)
+    redis.client.set(f"provider-stream-health:{provider}", json.dumps(health.to_dict()))
+    return health
+
+
+class TestFetchSnapshotStreamHealth:
+    """PoolManager's canonical stream-health snapshots feed the dashboard
+    read-only -- this only exercises collection, never recomputes health."""
+
+    def test_healthy_record_included(self, fake_redis_client):
+        _publish_stream_health(
+            fake_redis_client, "claude", "tasks:claude", StreamHealthState.HEALTHY
+        )
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert len(snap.stream_health) == 1
+        assert snap.stream_health[0].provider == "claude"
+        assert snap.stream_health[0].state == StreamHealthState.HEALTHY
+
+    def test_stranded_record_included(self, fake_redis_client):
+        _publish_stream_health(fake_redis_client, "xai", "tasks:xai", StreamHealthState.STRANDED)
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert len(snap.stream_health) == 1
+        assert snap.stream_health[0].state == StreamHealthState.STRANDED
+        assert snap.stream_health[0].live_consumers == 0
+
+    def test_malformed_json_skipped(self, fake_redis_client):
+        fake_redis_client.client.set("provider-stream-health:broken", "{not json")
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert snap.stream_health == []
+
+    def test_missing_required_field_skipped(self, fake_redis_client):
+        fake_redis_client.client.set(
+            "provider-stream-health:incomplete", json.dumps({"provider": "claude"})
+        )
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert snap.stream_health == []
+
+    def test_unsupported_state_value_skipped(self, fake_redis_client):
+        health = _stream_health("claude", "tasks:claude", StreamHealthState.HEALTHY).to_dict()
+        health["state"] = "degraded"
+        fake_redis_client.client.set("provider-stream-health:claude", json.dumps(health))
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert snap.stream_health == []
+
+    def test_multiple_providers_sorted_by_provider(self, fake_redis_client):
+        _publish_stream_health(fake_redis_client, "xai", "tasks:xai", StreamHealthState.HEALTHY)
+        _publish_stream_health(
+            fake_redis_client, "claude", "tasks:claude", StreamHealthState.HEALTHY
+        )
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert [h.provider for h in snap.stream_health] == ["claude", "xai"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for live dashboard rendering of provider stream health (issue #640)
+# ---------------------------------------------------------------------------
+
+
+def _run_async(coro):
+    """Drive a Textual pilot scenario without a pytest-asyncio plugin."""
+    return asyncio.run(coro)
+
+
+def _build_dashboard_app(redis, refresh_interval=3.0):
+    """Construct run_dashboard's Textual App without entering its blocking
+    App.run() loop, so tests can drive it headlessly via run_test()."""
+    from textual.app import App
+
+    captured = {}
+    original_run = App.run
+
+    def _capture_run(self):
+        captured["app"] = self
+
+    App.run = _capture_run
+    try:
+        run_dashboard(redis, refresh_interval=refresh_interval)
+    finally:
+        App.run = original_run
+    return captured["app"]
+
+
+class TestDashboardStreamHealthRendering:
+    """Live TUI rendering of canonical provider stream-health snapshots."""
+
+    def test_stranded_state_shows_prominent_banner(self, fake_redis_client):
+        from textual.widgets import DataTable, Static
+
+        _publish_stream_health(fake_redis_client, "xai", "tasks:xai", StreamHealthState.STRANDED)
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" in banner.classes
+                table = app.query_one("#stream-health-table", DataTable)
+                assert table.row_count == 1
+
+        _run_async(scenario())
+
+    def test_healthy_state_hides_banner(self, fake_redis_client):
+        from textual.widgets import Static
+
+        _publish_stream_health(
+            fake_redis_client, "claude", "tasks:claude", StreamHealthState.HEALTHY
+        )
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" not in banner.classes
+
+        _run_async(scenario())
+
+    def test_multiple_providers_and_streams_render_without_collision(self, fake_redis_client):
+        from textual.widgets import DataTable, Static
+
+        _publish_stream_health(
+            fake_redis_client, "claude", "tasks:claude", StreamHealthState.HEALTHY
+        )
+        _publish_stream_health(fake_redis_client, "xai", "tasks:xai", StreamHealthState.STRANDED)
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                table = app.query_one("#stream-health-table", DataTable)
+                assert table.row_count == 2
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" in banner.classes
+
+        _run_async(scenario())
+
+    def test_stranded_stream_disappears_on_refresh(self, fake_redis_client):
+        from textual.widgets import DataTable, Static
+
+        _publish_stream_health(fake_redis_client, "xai", "tasks:xai", StreamHealthState.STRANDED)
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" in banner.classes
+
+                fake_redis_client.client.delete("provider-stream-health:xai")
+                app.action_refresh()
+                await pilot.pause()
+
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" not in banner.classes
+                table = app.query_one("#stream-health-table", DataTable)
+                assert table.row_count == 1  # placeholder "--" row, stream gone
+
+        _run_async(scenario())
+
+    def test_malformed_record_treated_as_unavailable_not_crash(self, fake_redis_client):
+        from textual.widgets import DataTable, Static
+
+        fake_redis_client.client.set("provider-stream-health:broken", "{not json")
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" not in banner.classes
+                table = app.query_one("#stream-health-table", DataTable)
+                assert table.row_count == 1  # placeholder row, no crash
+
+        _run_async(scenario())
 
 
 # ---------------------------------------------------------------------------

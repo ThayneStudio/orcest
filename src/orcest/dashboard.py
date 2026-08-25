@@ -22,7 +22,7 @@ from rich.markup import escape as rich_escape
 
 from orcest.shared.models import DEAD_LETTER_STREAM
 from orcest.shared.output_streams import is_output_continuation
-from orcest.shared.provider_stream_health import ProviderStreamHealth
+from orcest.shared.provider_stream_health import ProviderStreamHealth, StreamHealthState
 from orcest.shared.redis_client import RedisClient
 
 # Global (cross-project, unprefixed) key prefix PoolManager publishes canonical
@@ -458,6 +458,16 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
         #health-bar.disconnected {
             background: $error;
         }
+        #stream-health-banner {
+            height: auto;
+            background: $error;
+            color: $text;
+            padding: 0 1;
+            display: none;
+        }
+        #stream-health-banner.visible {
+            display: block;
+        }
         .section-title {
             text-style: bold;
             color: $text;
@@ -515,9 +525,12 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             yield Static("", id="health-bar")
+            yield Static("", id="stream-health-banner")
             with VerticalScroll(id="overview-container"):
                 yield Static("Queue Depths", classes="section-title")
                 yield DataTable(id="queues-table")
+                yield Static("Provider Stream Health", classes="section-title")
+                yield DataTable(id="stream-health-table")
                 yield Static("Active Locks", classes="section-title")
                 yield DataTable(id="locks-table")
                 yield Static(
@@ -537,6 +550,19 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
         def on_mount(self) -> None:
             queues = self.query_one("#queues-table", DataTable)
             queues.add_columns("Stream", "Pending")
+
+            stream_health = self.query_one("#stream-health-table", DataTable)
+            stream_health.add_columns(
+                "Provider",
+                "Stream",
+                "State",
+                "Pending",
+                "Lag",
+                "Registered",
+                "Live",
+                "Observed",
+                "Since",
+            )
 
             locks = self.query_one("#locks-table", DataTable)
             locks.add_columns("PR", "Worker", "TTL")
@@ -602,6 +628,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
             queues.add_row(DEAD_LETTER_STREAM, dl_text)
+
+            self._update_stream_health(snapshot)
 
             # Active locks
             locks_table = self.query_one("#locks-table", DataTable)
@@ -678,6 +706,54 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
                     )
             else:
                 dl_table.add_row("--", "--", "--", "--", "No dead-lettered tasks")
+
+        def _update_stream_health(self, snapshot: SystemSnapshot) -> None:
+            """Render PoolManager's canonical provider stream-health snapshots.
+
+            This dashboard never recomputes stranded-stream health, it only
+            displays what was already published to Redis (issue #613/#640).
+            """
+            now_ts = snapshot.fetched_at.timestamp()
+            state_styles = {
+                StreamHealthState.STRANDED: "bold red",
+                StreamHealthState.HEALTHY: "green",
+                StreamHealthState.UNKNOWN: "dim",
+            }
+
+            table = self.query_one("#stream-health-table", DataTable)
+            table.clear()
+            if snapshot.stream_health:
+                for h in snapshot.stream_health:
+                    table.add_row(
+                        rich_escape(h.provider),
+                        rich_escape(h.stream),
+                        Text(h.state.value.upper(), style=state_styles.get(h.state, "white")),
+                        "?" if h.pending is None else str(h.pending),
+                        "?" if h.lag is None else str(h.lag),
+                        "?" if h.registered_consumers is None else str(h.registered_consumers),
+                        "?" if h.live_consumers is None else str(h.live_consumers),
+                        _format_duration(int(max(now_ts - h.observed_at, 0))) + " ago",
+                        _format_duration(int(max(now_ts - h.transitioned_at, 0))) + " ago",
+                    )
+            else:
+                table.add_row("--", "--", "--", "--", "--", "--", "--", "--", "--")
+
+            banner = self.query_one("#stream-health-banner", Static)
+            stranded = [h for h in snapshot.stream_health if h.state == StreamHealthState.STRANDED]
+            if stranded:
+                lines = [
+                    f"STRANDED provider stream {rich_escape(h.stream)!r} "
+                    f"(provider={rich_escape(h.provider)}): pending={h.pending} lag={h.lag} "
+                    f"registered_consumers={h.registered_consumers} "
+                    f"live_consumers={h.live_consumers} -- work is queued but no consumer "
+                    "has a live worker heartbeat"
+                    for h in stranded
+                ]
+                banner.update("\n".join(lines))
+                banner.add_class("visible")
+            else:
+                banner.update("")
+                banner.remove_class("visible")
 
         def _update_worker_output(self) -> None:
             """Read new output entries from the current worker's stream."""
