@@ -7,10 +7,21 @@ import logging
 import os
 from pathlib import Path
 
+import fakeredis
 import pytest
+import redis
 
-from orcest.orchestrator.trace_archiver import TraceArchiver, _entry_id_to_iso
+from orcest.orchestrator import trace_archiver as trace_archiver_mod
+from orcest.orchestrator.trace_archiver import (
+    _CURSOR_FILENAME,
+    _CURSOR_HASH_KEY,
+    _CURSOR_STATE_VERSION,
+    TraceArchiver,
+    _entry_id_to_iso,
+    cursor_state_path,
+)
 from orcest.shared.output_streams import iter_capped_output_fields
+from orcest.shared.redis_client import RedisClient
 
 
 @pytest.fixture
@@ -178,9 +189,14 @@ class TestArchiverHappyPath:
         _xadd(fake_redis_client, "output:w1", {"line": "line-a"})
         archiver._pump_output_streams()
 
-        cursors_first = fake_redis_client.hgetall("trace_archiver:cursors")
-        assert "output:w1" in cursors_first
-        first_cursor = cursors_first["output:w1"]
+        state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        assert state_path.exists()
+        first_state = json.loads(state_path.read_text())
+        assert first_state["version"] == _CURSOR_STATE_VERSION
+        first_cursor = first_state["streams"]["output:w1"]["last_id"]
+        assert first_cursor
+        assert first_state["streams"]["output:w1"]["last_seen"]
+        assert fake_redis_client.hgetall(_CURSOR_HASH_KEY) == {}
 
         # Add new entries; cursor must advance.
         _xadd(fake_redis_client, "output:w1", {"line": "line-b"})
@@ -191,8 +207,9 @@ class TestArchiverHappyPath:
         )
         archiver._pump_output_streams()
 
-        cursors_second = fake_redis_client.hgetall("trace_archiver:cursors")
-        assert cursors_second["output:w1"] != first_cursor
+        second_state = json.loads(state_path.read_text())
+        assert second_state["streams"]["output:w1"]["last_id"] != first_cursor
+        assert fake_redis_client.hgetall(_CURSOR_HASH_KEY) == {}
 
         # Both lines made it to the file.
         jsonl = next(archive_root.rglob("t-1.jsonl"))
@@ -296,8 +313,13 @@ class TestArchiverSecurity:
             )
         archiver._pump_output_streams()
         # No project subdirs, no rogue files outside archive_root anywhere.
+        # The per-project cursor state directory is the only allowed entry.
         contents = {p.name for p in archive_root.iterdir()}
-        assert contents == set(), f"unexpected entries under archive root: {contents}"
+        assert contents == {fake_redis_client.key_prefix}, (
+            f"unexpected entries under archive root: {contents}"
+        )
+        cursor_dir = archive_root / fake_redis_client.key_prefix
+        assert {p.name for p in cursor_dir.iterdir()} == {_CURSOR_FILENAME}
 
     def test_archived_files_are_mode_0o600(self, fake_redis_client, logger, archive_root):
         archiver = TraceArchiver(
@@ -322,7 +344,8 @@ class TestArchiverSecurity:
         jsonl = next(archive_root.rglob("secure-task.jsonl"))
         meta = jsonl.with_suffix(".meta.json")
         idx = archive_root / "index" / "by-task-id" / "se" / "secure-task"
-        for f in (jsonl, meta, idx):
+        cursor = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        for f in (jsonl, meta, idx, cursor):
             mode = f.stat().st_mode & 0o777
             assert mode == 0o600, f"{f} has perms {oct(mode)}, expected 0o600"
 
@@ -476,3 +499,363 @@ class TestArchiverChunkReassembly:
         jsonl = next(archive_root.rglob("t-err.jsonl"))
         records = [json.loads(line) for line in jsonl.read_text().splitlines() if line]
         assert records == [{"stderr": original}]
+
+
+def _archiver(redis_client, logger, archive_root, repo_to_project=None) -> TraceArchiver:
+    archiver = TraceArchiver(
+        redis=redis_client,
+        archive_path=str(archive_root),
+        repo_to_project=repo_to_project or {"owner/r": "myproj"},
+        logger=logger,
+    )
+    archiver._probe_writability()
+    return archiver
+
+
+def _count_in_archive(archive_root: Path, needle: str) -> int:
+    count = 0
+    for path in archive_root.rglob("*"):
+        if path.is_file():
+            try:
+                count += path.read_text(encoding="utf-8").count(needle)
+            except OSError:
+                continue
+    return count
+
+
+def _refuse_redis_writes(redis_client: RedisClient) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise redis.ResponseError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis_client.hset = boom  # type: ignore[method-assign]
+    redis_client.hdel = boom  # type: ignore[method-assign]
+    redis_client.set = boom  # type: ignore[method-assign]
+    redis_client.delete = boom  # type: ignore[method-assign]
+    redis_client.xadd = boom  # type: ignore[method-assign]
+    redis_client.xadd_capped = boom  # type: ignore[method-assign]
+
+
+def _start_and_line(
+    redis_client: RedisClient,
+    *,
+    stream: str = "output:w1",
+    task_id: str = "t-dur",
+    line: str = "unique-payload",
+) -> None:
+    _xadd(
+        redis_client,
+        stream,
+        {"type": "task_start", "task_id": task_id, "repo": "owner/r"},
+    )
+    _xadd(redis_client, stream, {"line": line})
+
+
+def _commit_start_then_enqueue_line(
+    redis_client: RedisClient,
+    archiver: TraceArchiver,
+    line: str,
+    *,
+    stream: str = "output:w1",
+    task_id: str = "t-dur",
+) -> tuple[str, str]:
+    """Commit task_start, then enqueue a line that has not been persisted yet."""
+    start_id = _xadd(
+        redis_client,
+        stream,
+        {"type": "task_start", "task_id": task_id, "repo": "owner/r"},
+    )
+    archiver._pump_output_streams()
+    line_id = _xadd(redis_client, stream, {"line": line})
+    return start_id, line_id
+
+
+class TestArchiverCursorDurability:
+    def test_redis_write_refusal_does_not_duplicate_on_retry(
+        self, fake_redis_client, logger, archive_root
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "redis-write-refusal-payload"
+        _start_and_line(fake_redis_client, line=payload)
+        _refuse_redis_writes(fake_redis_client)
+
+        archiver._pump_output_streams()
+        archiver._pump_output_streams()
+
+        assert _count_in_archive(archive_root, payload) == 1
+        state = json.loads(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix).read_text()
+        )
+        assert "output:w1" in state["streams"]
+        assert archiver.committed_last_id("output:w1") == state["streams"]["output:w1"]["last_id"]
+
+    def test_archive_open_failure_does_not_commit_cursor(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        _start_and_line(fake_redis_client, line="open-fail-payload")
+
+        def fail_open(_path: Path):
+            raise OSError("open failed")
+
+        monkeypatch.setattr(archiver, "_open_archive_file", fail_open)
+        archiver._pump_output_streams()
+
+        assert archiver.committed_last_id("output:w1") is None
+        assert archiver.health_error is not None
+        assert "open-fail-payload" not in "".join(
+            p.read_text(encoding="utf-8") for p in archive_root.rglob("*.jsonl")
+        )
+
+    def test_archive_write_failure_does_not_commit_past_unwritten_entry(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "write-fail-payload"
+        _start_and_line(fake_redis_client, line=payload)
+
+        orig = archiver._append_archive_text
+
+        def fail_write(handle, text: str) -> None:
+            if "write-fail-payload" in text:
+                raise OSError("write failed")
+            orig(handle, text)
+
+        monkeypatch.setattr(archiver, "_append_archive_text", fail_write)
+        archiver._pump_output_streams()
+
+        assert payload not in "".join(
+            p.read_text(encoding="utf-8") for p in archive_root.rglob("*.jsonl")
+        )
+        committed = archiver.committed_last_id("output:w1")
+        assert committed is not None
+        # task_start committed; the line that failed to write did not.
+        start_id, line_id = [eid for eid, _ in fake_redis_client.xread_after("output:w1", "0-0")]
+        assert committed == start_id
+        assert committed != line_id
+        assert archiver.health_error is not None
+
+    def test_archive_flush_failure_does_not_commit_cursor(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "flush-fail-payload"
+        _start_and_line(fake_redis_client, line=payload)
+
+        def fail_flush(_handle) -> None:
+            raise OSError("flush failed")
+
+        monkeypatch.setattr(archiver, "_flush_archive", fail_flush)
+        archiver._pump_output_streams()
+
+        assert archiver.committed_last_id("output:w1") is None
+        assert archiver.health_error is not None
+        assert "flush" in archiver.health_error.lower() or "archive failed" in (
+            archiver.health_error.lower()
+        )
+
+    def test_archive_fsync_failure_does_not_commit_cursor(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "fsync-fail-payload"
+        _start_and_line(fake_redis_client, line=payload)
+
+        def fail_fsync(_handle) -> None:
+            raise OSError("fsync failed")
+
+        monkeypatch.setattr(archiver, "_fsync_archive", fail_fsync)
+        archiver._pump_output_streams()
+
+        assert archiver.committed_last_id("output:w1") is None
+        assert archiver.health_error is not None
+
+    def test_cursor_temp_write_failure_halts_without_commit(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "cursor-write-fail-payload"
+        start_id, line_id = _commit_start_then_enqueue_line(fake_redis_client, archiver, payload)
+
+        def fail_write(_fd: int, _data: bytes) -> None:
+            raise OSError("cursor temp write failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_write_fd", fail_write)
+        archiver._pump_output_streams()
+
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == start_id
+        assert archiver.committed_last_id("output:w1") != line_id
+        assert archiver.health_error is not None
+
+    def test_cursor_temp_fsync_failure_halts_without_commit(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "cursor-fsync-fail-payload"
+        start_id, line_id = _commit_start_then_enqueue_line(fake_redis_client, archiver, payload)
+
+        def fail_fsync(_fd: int) -> None:
+            raise OSError("cursor temp fsync failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_fsync_fd", fail_fsync)
+        archiver._pump_output_streams()
+
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == start_id
+        assert archiver.committed_last_id("output:w1") != line_id
+        assert archiver.health_error is not None
+
+    def test_cursor_rename_failure_halts_without_commit(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "cursor-rename-fail-payload"
+        start_id, line_id = _commit_start_then_enqueue_line(fake_redis_client, archiver, payload)
+
+        def fail_replace(_src: Path, _dst: Path) -> None:
+            raise OSError("cursor rename failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_replace_file", fail_replace)
+        archiver._pump_output_streams()
+
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == start_id
+        assert archiver.committed_last_id("output:w1") != line_id
+        assert archiver.health_error is not None
+
+    def test_cursor_directory_fsync_failure_halts_without_commit(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "cursor-dir-fsync-fail-payload"
+        start_id, line_id = _commit_start_then_enqueue_line(fake_redis_client, archiver, payload)
+
+        def fail_dir_fsync(_directory: Path) -> None:
+            raise OSError("directory fsync failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_fsync_directory", fail_dir_fsync)
+        archiver._pump_output_streams()
+
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == start_id
+        assert archiver.committed_last_id("output:w1") != line_id
+        assert archiver.health_error is not None
+
+    def test_same_process_retry_does_not_duplicate_content(
+        self, fake_redis_client, logger, archive_root, monkeypatch
+    ):
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        payload = "same-process-retry-payload"
+        start_id, line_id = _commit_start_then_enqueue_line(fake_redis_client, archiver, payload)
+        orig_write = trace_archiver_mod._write_fd
+        persist_calls = {"n": 0}
+
+        def fail_write(fd: int, data: bytes) -> None:
+            persist_calls["n"] += 1
+            raise OSError("cursor persist failed")
+
+        monkeypatch.setattr(trace_archiver_mod, "_write_fd", fail_write)
+        archiver._pump_output_streams()
+        archiver._pump_output_streams()
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == start_id
+        assert persist_calls["n"] >= 2
+
+        monkeypatch.setattr(trace_archiver_mod, "_write_fd", orig_write)
+        archiver._pump_output_streams()
+        assert _count_in_archive(archive_root, payload) == 1
+        assert archiver.committed_last_id("output:w1") == line_id
+
+    def test_legacy_hash_seeds_local_state_once(self, fake_redis_client, logger, archive_root):
+        fake_redis_client.hset(_CURSOR_HASH_KEY, "output:w1", "123-4")
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+
+        state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        state = json.loads(state_path.read_text())
+        assert state["version"] == _CURSOR_STATE_VERSION
+        assert state["streams"]["output:w1"]["last_id"] == "123-4"
+        assert state["streams"]["output:w1"]["last_seen"]
+        assert archiver.committed_last_id("output:w1") == "123-4"
+        # Legacy hash is left in place; this change does not own cursor GC.
+        assert fake_redis_client.hget(_CURSOR_HASH_KEY, "output:w1") == "123-4"
+
+    def test_stale_legacy_hash_is_ignored_after_local_state_exists(
+        self, fake_redis_client, logger, archive_root
+    ):
+        fake_redis_client.hset(_CURSOR_HASH_KEY, "output:w1", "5-0")
+        first = _archiver(fake_redis_client, logger, archive_root)
+        first._pump_output_streams()
+        assert first.committed_last_id("output:w1") == "5-0"
+
+        fake_redis_client.hset(_CURSOR_HASH_KEY, "output:w1", "999-0")
+        second = _archiver(fake_redis_client, logger, archive_root)
+        second._pump_output_streams()
+        assert second.committed_last_id("output:w1") == "5-0"
+        state = json.loads(
+            cursor_state_path(archive_root, fake_redis_client.key_prefix).read_text()
+        )
+        assert state["streams"]["output:w1"]["last_id"] == "5-0"
+
+    def test_project_namespaces_do_not_share_cursors(self, fake_redis_server, logger, archive_root):
+        shared = fakeredis.FakeRedis(server=fake_redis_server, decode_responses=True)
+        redis_a = RedisClient.from_client(shared, key_prefix="projA")
+        redis_b = RedisClient.from_client(shared, key_prefix="projB")
+        redis_a.hset(_CURSOR_HASH_KEY, "output:w1", "10-0")
+        redis_b.hset(_CURSOR_HASH_KEY, "output:w1", "20-0")
+
+        archiver_a = _archiver(redis_a, logger, archive_root)
+        archiver_b = _archiver(redis_b, logger, archive_root)
+        archiver_a._pump_output_streams()
+        archiver_b._pump_output_streams()
+
+        path_a = cursor_state_path(archive_root, "projA")
+        path_b = cursor_state_path(archive_root, "projB")
+        assert path_a != path_b
+        assert json.loads(path_a.read_text())["streams"]["output:w1"]["last_id"] == "10-0"
+        assert json.loads(path_b.read_text())["streams"]["output:w1"]["last_id"] == "20-0"
+        assert archiver_a.committed_last_id("output:w1") == "10-0"
+        assert archiver_b.committed_last_id("output:w1") == "20-0"
+
+    def test_corrupt_state_disables_advancement_and_does_not_replay(
+        self, fake_redis_client, logger, archive_root, caplog
+    ):
+        state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not-json", encoding="utf-8")
+
+        payload = "corrupt-state-payload"
+        _start_and_line(fake_redis_client, line=payload)
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        with caplog.at_level(logging.ERROR):
+            archiver._pump_output_streams()
+            archiver._pump_output_streams()
+
+        assert archiver.health_error is not None
+        assert "corrupt" in archiver.health_error.lower()
+        assert "corrupt" in caplog.text.lower()
+        assert archiver.committed_last_id("output:w1") is None
+        assert _count_in_archive(archive_root, payload) == 0
+        assert state_path.read_text(encoding="utf-8") == "{not-json"
+
+    def test_unsupported_version_is_corrupt_not_skipped(
+        self, fake_redis_client, logger, archive_root
+    ):
+        state_path = cursor_state_path(archive_root, fake_redis_client.key_prefix)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 99,
+                    "streams": {"output:w1": {"last_id": "1-0", "last_seen": "t"}},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _start_and_line(fake_redis_client, line="version-skip-payload")
+        archiver = _archiver(fake_redis_client, logger, archive_root)
+        archiver._pump_output_streams()
+        assert archiver.health_error is not None
+        assert archiver.committed_last_id("output:w1") is None
+        assert _count_in_archive(archive_root, "version-skip-payload") == 0
