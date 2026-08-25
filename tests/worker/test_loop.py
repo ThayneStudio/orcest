@@ -32,7 +32,6 @@ from orcest.shared.output_streams import (
     iter_capped_output_fields,
     output_streams_worst_case_bytes,
 )
-from orcest.shared.redis_client import ConsumerGroupInspection
 from orcest.worker.loop import (
     _CREDENTIAL_DIAGNOSTIC_HANDOFF_PREFIX,
     _GROUP_BOOTSTRAP_MAX_BACKOFF_SECONDS,
@@ -203,12 +202,6 @@ def test_wait_for_redis_aborts_during_backoff():
 def test_consumer_group_bootstrap_retries_oom_then_succeeds(mocker):
     """Redis maxmemory OOM during group creation recovers in one process."""
     redis = MagicMock()
-    redis.inspect_consumer_group.side_effect = [
-        ConsumerGroupInspection.MISSING,
-        ConsumerGroupInspection.MISSING,
-        ConsumerGroupInspection.MISSING,
-        ConsumerGroupInspection.MISSING,
-    ]
     redis.ensure_consumer_group.side_effect = [_redis_oom_error(), None, None]
     wait = mocker.patch("orcest.worker.loop.threading.Event.wait", return_value=False)
 
@@ -223,7 +216,12 @@ def test_consumer_group_bootstrap_retries_oom_then_succeeds(mocker):
         is True
     )
 
-    assert redis.ensure_consumer_group.call_count == 3
+    assert redis.ensure_consumer_group.call_args_list == [
+        mock_call("tasks:claude", CONSUMER_GROUP),
+        mock_call("tasks:claude", CONSUMER_GROUP),
+        mock_call("tasks:issue:claude", CONSUMER_GROUP),
+    ]
+    redis.inspect_consumer_group.assert_not_called()
     wait.assert_called_once_with(timeout=1)
 
 
@@ -231,7 +229,6 @@ def test_consumer_group_bootstrap_retries_oom_then_succeeds(mocker):
 def test_consumer_group_bootstrap_repeated_oom_waits_until_shutdown(mocker):
     """Repeated maxmemory OOM stays in-process and exits only on shutdown."""
     redis = MagicMock()
-    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
     redis.ensure_consumer_group.side_effect = _redis_oom_error()
     waits: list[int] = []
 
@@ -260,7 +257,6 @@ def test_consumer_group_bootstrap_repeated_oom_waits_until_shutdown(mocker):
 def test_consumer_group_bootstrap_caps_backoff_at_sixty_seconds(mocker):
     """OOM retry backoff is exponential but capped at 60 seconds."""
     redis = MagicMock()
-    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
     redis.ensure_consumer_group.side_effect = _redis_oom_error()
     waits: list[int] = []
 
@@ -297,7 +293,6 @@ def test_consumer_group_bootstrap_caps_backoff_at_sixty_seconds(mocker):
 def test_consumer_group_bootstrap_non_oom_errors_fail_fast(error):
     """Wrong type, ACL, and auth failures are not retried as memory pressure."""
     redis = MagicMock()
-    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
     redis.ensure_consumer_group.side_effect = error
 
     with pytest.raises(type(error)):
@@ -313,11 +308,9 @@ def test_consumer_group_bootstrap_non_oom_errors_fail_fast(error):
 
 
 @pytest.mark.unit
-def test_consumer_group_bootstrap_existing_groups_do_not_write():
-    """Existing groups pass inspection without attempting a Redis write."""
+def test_consumer_group_bootstrap_delegates_each_stream_to_ensure():
+    """Worker bootstrap calls ensure_consumer_group once per stream/group."""
     redis = MagicMock()
-    redis.inspect_consumer_group.return_value = ConsumerGroupInspection.EXISTS
-    redis.ensure_consumer_group.side_effect = _redis_oom_error()
 
     assert (
         _ensure_worker_consumer_groups(
@@ -330,14 +323,18 @@ def test_consumer_group_bootstrap_existing_groups_do_not_write():
         is True
     )
 
-    redis.ensure_consumer_group.assert_not_called()
+    assert redis.ensure_consumer_group.call_args_list == [
+        mock_call("tasks:claude", CONSUMER_GROUP),
+        mock_call("tasks:issue:claude", CONSUMER_GROUP),
+    ]
+    redis.inspect_consumer_group.assert_not_called()
 
 
 @pytest.mark.unit
 def test_consumer_group_bootstrap_malformed_inspection_fails_fast():
-    """Malformed inspection responses remain startup errors."""
+    """Malformed inspection responses from ensure remain startup errors."""
     redis = MagicMock()
-    redis.inspect_consumer_group.side_effect = TypeError("xinfo_groups returned str")
+    redis.ensure_consumer_group.side_effect = TypeError("xinfo_groups returned str")
 
     with pytest.raises(TypeError, match="xinfo_groups returned str"):
         _ensure_worker_consumer_groups(
@@ -348,7 +345,7 @@ def test_consumer_group_bootstrap_malformed_inspection_fails_fast():
             threading.Event(),
         )
 
-    redis.ensure_consumer_group.assert_not_called()
+    redis.ensure_consumer_group.assert_called_once_with("tasks:claude", CONSUMER_GROUP)
 
 
 # ---------------------------------------------------------------------------
@@ -1513,7 +1510,6 @@ class TestRunWorker:
         """
         mock_redis = MagicMock()
         mock_redis.health_check.return_value = True
-        mock_redis.inspect_consumer_group.return_value = ConsumerGroupInspection.MISSING
         mock_redis.ensure_consumer_group.return_value = None
         mock_redis.ensure_consumer_group_raw.return_value = None
         mock_redis.xack.return_value = 1
@@ -1663,7 +1659,12 @@ class TestRunWorker:
 
         run_worker(worker_config)
 
-        assert mock_redis.ensure_consumer_group.call_count == 3
+        assert mock_redis.ensure_consumer_group.call_args_list == [
+            mock_call("tasks:claude", CONSUMER_GROUP),
+            mock_call("tasks:claude", CONSUMER_GROUP),
+            mock_call("tasks:issue:claude", CONSUMER_GROUP),
+        ]
+        mock_redis.inspect_consumer_group.assert_not_called()
         wait_patch.assert_any_call(timeout=1)
         mocks["runner"].run.assert_called_once()
 
@@ -1695,17 +1696,19 @@ class TestRunWorker:
     def test_worker_consumer_group_existing_at_maxmemory_starts(
         self, mocker, worker_config, sample_task
     ):
-        """Existing groups pass read-first inspection without a write."""
+        """Existing groups still start via ensure_consumer_group (read-first, no write)."""
         mock_redis = self._build_mock_redis()
-        mock_redis.inspect_consumer_group.return_value = ConsumerGroupInspection.EXISTS
-        mock_redis.ensure_consumer_group.side_effect = _redis_oom_error()
         mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
         mocks["runner"].run.return_value = _success_runner_result()
         self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
 
         run_worker(worker_config)
 
-        mock_redis.ensure_consumer_group.assert_not_called()
+        assert mock_redis.ensure_consumer_group.call_args_list == [
+            mock_call("tasks:claude", CONSUMER_GROUP),
+            mock_call("tasks:issue:claude", CONSUMER_GROUP),
+        ]
+        mock_redis.inspect_consumer_group.assert_not_called()
         mocks["runner"].run.assert_called_once()
 
     def test_worker_consumer_group_non_oom_startup_error_fails_fast(self, mocker, worker_config):
