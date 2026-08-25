@@ -12,9 +12,11 @@ import pytest
 
 from orcest.shared.provider_stream_health import (
     STREAM_HEALTH_KEY_PREFIX,
+    STREAM_HEALTH_SNAPSHOT_VERSION,
     ProviderStreamHealth,
     ProviderStreamHealthTracker,
     StreamHealthState,
+    parse_committed_stranded_snapshot,
     stream_health_snapshot_key,
 )
 
@@ -201,8 +203,26 @@ class TestSerialization:
             observed_at=123.0,
             transitioned_at=100.0,
         )
-        restored = ProviderStreamHealth.from_dict(health.to_dict())
+        payload = health.to_dict()
+        assert payload["version"] == STREAM_HEALTH_SNAPSHOT_VERSION
+        restored = ProviderStreamHealth.from_dict(payload)
         assert restored == health
+
+    def test_from_dict_still_accepts_unversioned_display_records(self):
+        payload = {
+            "provider": "claude",
+            "stream": "test:tasks:claude",
+            "pending": 1,
+            "lag": 0,
+            "registered_consumers": 1,
+            "live_consumers": 0,
+            "state": "stranded",
+            "observed_at": 123.0,
+            "transitioned_at": 100.0,
+        }
+        restored = ProviderStreamHealth.from_dict(payload)
+        assert restored.state == StreamHealthState.STRANDED
+        assert restored.provider == "claude"
 
 
 class TestSnapshotKeys:
@@ -466,3 +486,217 @@ class TestIndependentStreams:
         assert pr.state == StreamHealthState.STRANDED
         assert pr_transition == "stranded"
         assert issue.state == StreamHealthState.UNKNOWN
+
+
+def _stranded_health(**overrides) -> ProviderStreamHealth:
+    fields = dict(
+        provider="claude",
+        stream=_PR_STREAM,
+        pending=3,
+        lag=1,
+        registered_consumers=1,
+        live_consumers=0,
+        state=StreamHealthState.STRANDED,
+        observed_at=1100.0,
+        transitioned_at=1000.0,
+    )
+    fields.update(overrides)
+    return ProviderStreamHealth(**fields)
+
+
+def _parse(payload, **overrides):
+    kwargs = dict(
+        expected_provider="claude",
+        expected_stream=_PR_STREAM,
+        now=1200.0,
+        ttl_seconds=900,
+        max_age_seconds=900.0,
+    )
+    kwargs.update(overrides)
+    return parse_committed_stranded_snapshot(payload, **kwargs)
+
+
+class TestParseCommittedStrandedSnapshot:
+    def test_valid_stranded_snapshot_is_returned(self):
+        health = _stranded_health()
+        parsed = _parse(health.to_dict())
+        assert parsed == health
+
+    def test_healthy_snapshot_is_absent(self):
+        payload = _stranded_health(state=StreamHealthState.HEALTHY).to_dict()
+        assert _parse(payload) is None
+
+    def test_unknown_snapshot_is_absent(self):
+        payload = _stranded_health(state=StreamHealthState.UNKNOWN).to_dict()
+        assert _parse(payload) is None
+
+    def test_missing_payload_is_absent(self):
+        assert _parse(None) is None
+
+    def test_malformed_payload_is_absent(self):
+        assert _parse("{not json") is None
+        assert _parse(["stranded"]) is None
+        assert _parse({"version": 1}) is None
+
+    def test_expired_and_non_expiring_ttl_are_absent(self):
+        payload = _stranded_health().to_dict()
+        assert _parse(payload, ttl_seconds=0) is None
+        assert _parse(payload, ttl_seconds=-1) is None
+        assert _parse(payload, ttl_seconds=-2) is None
+        assert _parse(payload, ttl_seconds=True) is None
+
+    def test_identity_mismatch_is_absent(self):
+        payload = _stranded_health().to_dict()
+        assert _parse(payload, expected_provider="xai") is None
+        assert _parse(payload, expected_stream=_ISSUE_STREAM) is None
+        swapped = dict(payload)
+        swapped["provider"] = "xai"
+        assert _parse(swapped) is None
+        swapped = dict(payload)
+        swapped["stream"] = _ISSUE_STREAM
+        assert _parse(swapped) is None
+
+    def test_unsupported_version_is_absent(self):
+        payload = _stranded_health().to_dict()
+        missing = dict(payload)
+        missing.pop("version")
+        assert _parse(missing) is None
+        payload["version"] = 2
+        assert _parse(payload) is None
+        payload["version"] = 0
+        assert _parse(payload) is None
+        payload["version"] = 1.0
+        assert _parse(payload) is None
+        payload["version"] = True
+        assert _parse(payload) is None
+
+    def test_non_finite_timestamps_are_absent(self):
+        payload = _stranded_health().to_dict()
+        for field in ("observed_at", "transitioned_at"):
+            for value in (float("nan"), float("inf"), float("-inf"), None, "1000"):
+                bad = dict(payload)
+                bad[field] = value
+                assert _parse(bad) is None
+
+    def test_future_timestamps_are_absent(self):
+        payload = _stranded_health(observed_at=1300.0, transitioned_at=1000.0).to_dict()
+        assert _parse(payload, now=1200.0) is None
+        payload = _stranded_health(observed_at=1100.0, transitioned_at=1250.0).to_dict()
+        assert _parse(payload, now=1200.0) is None
+
+    def test_reversed_timestamps_are_absent(self):
+        payload = _stranded_health(observed_at=1000.0, transitioned_at=1100.0).to_dict()
+        assert _parse(payload) is None
+
+    def test_stale_observed_at_is_absent(self):
+        payload = _stranded_health(observed_at=200.0, transitioned_at=100.0).to_dict()
+        assert _parse(payload, now=1200.0, max_age_seconds=900.0) is None
+
+    def test_old_transitioned_at_is_allowed_when_observed_at_is_fresh(self):
+        health = _stranded_health(observed_at=1100.0, transitioned_at=10.0)
+        parsed = _parse(health.to_dict(), now=1200.0, max_age_seconds=900.0)
+        assert parsed is not None
+        assert parsed.transitioned_at == 10.0
+
+
+class TestRestoreCommitted:
+    def test_still_stranded_retains_state_and_transition_time(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        health = _stranded_health()
+        assert tracker.restore_committed(health) is True
+        snapshot, transition = _evaluate(
+            tracker, now=1200.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert snapshot.state == StreamHealthState.STRANDED
+        assert transition is None
+        assert snapshot.transitioned_at == 1000.0
+        assert snapshot.pending == 3
+
+    def test_recovered_inputs_emit_one_recovery(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        tracker.restore_committed(_stranded_health())
+        snapshot, transition = _evaluate(
+            tracker, now=1200.0, pending=3, registered_consumers=1, live_consumers=1
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        assert transition == "recovered"
+        assert snapshot.transitioned_at == 1200.0
+
+        snapshot, transition = _evaluate(
+            tracker, now=1201.0, pending=3, registered_consumers=1, live_consumers=1
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        assert transition is None
+        assert snapshot.transitioned_at == 1200.0
+
+    def test_unreadable_inputs_keep_stranded_with_unknown_metrics(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        tracker.restore_committed(_stranded_health())
+        snapshot, transition = _evaluate(
+            tracker,
+            now=1200.0,
+            pending=None,
+            lag=None,
+            registered_consumers=None,
+            live_consumers=None,
+            read_error=True,
+        )
+        assert snapshot.state == StreamHealthState.STRANDED
+        assert transition is None
+        assert snapshot.pending is None
+        assert snapshot.lag is None
+        assert snapshot.transitioned_at == 1000.0
+
+    def test_healthy_snapshot_does_not_restore_dwell_candidate(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        healthy = _stranded_health(
+            state=StreamHealthState.HEALTHY, live_consumers=1, transitioned_at=500.0
+        )
+        assert tracker.restore_committed(healthy) is False
+        assert tracker.has_state("claude", _PR_STREAM) is False
+
+        snapshot, transition = _evaluate(
+            tracker, now=1200.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        assert transition is None
+        snapshot, transition = _evaluate(
+            tracker, now=1499.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        snapshot, transition = _evaluate(
+            tracker, now=1500.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert snapshot.state == StreamHealthState.STRANDED
+        assert transition == "stranded"
+        assert snapshot.transitioned_at == 1500.0
+
+    def test_restore_does_not_overwrite_existing_state(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        _evaluate(tracker, now=0.0, pending=0, live_consumers=1)
+        assert tracker.restore_committed(_stranded_health()) is False
+        snapshot, transition = _evaluate(
+            tracker, now=1200.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        assert transition is None
+
+    def test_restore_does_not_leak_between_streams(self):
+        tracker = ProviderStreamHealthTracker(dwell_seconds=300)
+        tracker.restore_committed(_stranded_health())
+        snapshot, transition = _evaluate(
+            tracker,
+            now=1200.0,
+            stream=_ISSUE_STREAM,
+            pending=3,
+            registered_consumers=1,
+            live_consumers=0,
+        )
+        assert snapshot.state == StreamHealthState.HEALTHY
+        assert transition is None
+        pr, pr_transition = _evaluate(
+            tracker, now=1200.0, pending=3, registered_consumers=1, live_consumers=0
+        )
+        assert pr.state == StreamHealthState.STRANDED
+        assert pr_transition is None
+        assert pr.transitioned_at == 1000.0
