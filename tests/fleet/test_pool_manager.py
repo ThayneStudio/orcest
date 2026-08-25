@@ -11,6 +11,7 @@ from orcest.fleet.pool_manager import (
     REAP_REASON_DONE_CLEANUP,
     REAP_REASON_ORPHAN_PEL,
     PoolManager,
+    ReapFence,
 )
 
 pytestmark = pytest.mark.unit
@@ -1982,21 +1983,25 @@ class TestHealthCheckReapCoordination:
         """No late worker write can race Redis recovery after timeout detection."""
         import time as _time
 
+        from orcest.fleet.pool_manager import _StopVmOutcome
+
         manager, _proxmox = self._build(fake_redis_client)
         fake_redis_client.hset("pool:active", "305", str(_time.time() - 99999))
         events: list[str] = []
 
         def stopped(_vm_id):
             events.append("stopped")
-            return True
+            return _StopVmOutcome(stopped=True, confirmed_transition=True)
 
-        def coordinated(_vm_id, reason=None, elapsed_seconds=None):
+        def coordinated(_vm_id, reason=None, elapsed_seconds=None, killed_at_unix=None):
             assert events == ["stopped"]
+            assert elapsed_seconds is not None
+            assert killed_at_unix is not None
             events.append("redis-coordinated")
             return True
 
         with (
-            patch.object(manager, "_stop_vm", side_effect=stopped),
+            patch.object(manager, "_stop_vm_with_outcome", side_effect=stopped),
             patch.object(manager, "_coordinate_reaped_vm", side_effect=coordinated),
             patch.object(
                 manager,
@@ -2012,10 +2017,16 @@ class TestHealthCheckReapCoordination:
         """Failure to fence a live writer preserves all Redis recovery state."""
         import time as _time
 
+        from orcest.fleet.pool_manager import _StopVmOutcome
+
         manager, _proxmox = self._build(fake_redis_client)
         fake_redis_client.hset("pool:active", "305", str(_time.time() - 99999))
         with (
-            patch.object(manager, "_stop_vm", return_value=False),
+            patch.object(
+                manager,
+                "_stop_vm_with_outcome",
+                return_value=_StopVmOutcome(stopped=False, confirmed_transition=False),
+            ),
             patch.object(manager, "_coordinate_reaped_vm") as coordinate,
             patch.object(manager, "_destroy_stopped_vm") as destroy,
         ):
@@ -2884,6 +2895,40 @@ class TestReconcileStaleRedis:
         manager._reconcile_stale_redis()
 
         redis.hdel.assert_called_once_with("pool:active", "301")
+
+    def test_stale_idle_entry_clears_reap_fence(self):
+        """Idle stale cleanup releases in-memory per-VM reap telemetry."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.return_value = []
+        redis._idle_set = {"300"}
+        redis.hgetall.return_value = {}
+        manager._reap_fences[300] = ReapFence(
+            vm_id=300,
+            reason="ceiling",
+            killed_at_unix=100000.0,
+            elapsed_at_kill_seconds=100.0,
+        )
+
+        manager._reconcile_stale_redis()
+
+        assert 300 not in manager._reap_fences
+
+    def test_stale_active_entry_clears_reap_fence(self):
+        """Active stale cleanup releases in-memory per-VM reap telemetry."""
+        manager, proxmox, redis = _make_manager()
+        proxmox.list_vms.return_value = []
+        redis._idle_set = set()
+        redis.hgetall.return_value = {"301": "1000.0"}
+        manager._reap_fences[301] = ReapFence(
+            vm_id=301,
+            reason="ceiling",
+            killed_at_unix=100000.0,
+            elapsed_at_kill_seconds=100.0,
+        )
+
+        manager._reconcile_stale_redis()
+
+        assert 301 not in manager._reap_fences
 
     def test_stale_exact_slot_releases_process_local_allocation(self):
         """An externally deleted mixed-profile slot can be allocated again."""
