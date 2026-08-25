@@ -20,7 +20,12 @@ from orcest.dashboard import (
     format_stream_json_line,
     run_dashboard,
 )
-from orcest.shared.provider_stream_health import ProviderStreamHealth, StreamHealthState
+from orcest.shared.provider_stream_health import (
+    STREAM_HEALTH_KEY_PREFIX,
+    ProviderStreamHealth,
+    StreamHealthState,
+    stream_health_snapshot_key,
+)
 
 
 def test_empty_redis_returns_valid_snapshot(fake_redis_client):
@@ -596,6 +601,111 @@ class TestFetchSnapshotConsumerGroups:
         assert group.name == "workers"
 
 
+def _put_stream_health(rc, health: ProviderStreamHealth, *, issue: bool) -> None:
+    rc.set_ex_raw(
+        stream_health_snapshot_key(health.provider, issue=issue),
+        json.dumps(health.to_dict()),
+        900,
+    )
+
+
+def _sample_health(
+    *,
+    provider: str = "claude",
+    stream: str,
+    state: StreamHealthState = StreamHealthState.HEALTHY,
+    pending: int | None = 0,
+) -> ProviderStreamHealth:
+    return ProviderStreamHealth(
+        provider=provider,
+        stream=stream,
+        pending=pending,
+        lag=0,
+        registered_consumers=0,
+        live_consumers=0,
+        state=state,
+        observed_at=1.0,
+        transitioned_at=1.0,
+    )
+
+
+class TestFetchSnapshotStreamHealthIdentities:
+    """Issue #639: snapshot discovery must surface both stream identities."""
+
+    def test_discovers_pr_and_issue_identities(self, fake_redis_client):
+        pr = _sample_health(stream="test:tasks:claude", pending=0)
+        issue = _sample_health(
+            stream="test:tasks:issue:claude",
+            state=StreamHealthState.STRANDED,
+            pending=2,
+        )
+        _put_stream_health(fake_redis_client, pr, issue=False)
+        _put_stream_health(fake_redis_client, issue, issue=True)
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        by_stream = {h.stream: h for h in snap.stream_health}
+        assert set(by_stream) == {pr.stream, issue.stream}
+        assert by_stream[pr.stream].state == StreamHealthState.HEALTHY
+        assert by_stream[issue.stream].state == StreamHealthState.STRANDED
+        assert by_stream[issue.stream].pending == 2
+        assert [h.stream for h in snap.stream_health] == sorted([pr.stream, issue.stream])
+
+    def test_malformed_record_does_not_drop_sibling(self, fake_redis_client):
+        valid = _sample_health(
+            stream="test:tasks:claude",
+            state=StreamHealthState.STRANDED,
+            pending=1,
+        )
+        _put_stream_health(fake_redis_client, valid, issue=False)
+        fake_redis_client.set_ex_raw(
+            stream_health_snapshot_key("claude", issue=True),
+            "{not-json",
+            900,
+        )
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert len(snap.stream_health) == 1
+        assert snap.stream_health[0].stream == valid.stream
+        assert snap.stream_health[0].state == StreamHealthState.STRANDED
+
+    def test_malformed_pr_does_not_drop_issue(self, fake_redis_client):
+        valid = _sample_health(stream="test:tasks:issue:claude", pending=0)
+        fake_redis_client.set_ex_raw(
+            stream_health_snapshot_key("claude"),
+            json.dumps({"provider": "claude"}),
+            900,
+        )
+        _put_stream_health(fake_redis_client, valid, issue=True)
+
+        snap = fetch_snapshot(fake_redis_client)
+
+        assert len(snap.stream_health) == 1
+        assert snap.stream_health[0].stream == valid.stream
+
+    def test_scan_prefix_matches_kind_suffixed_keys(self, fake_redis_client):
+        pr_key = stream_health_snapshot_key("claude")
+        issue_key = stream_health_snapshot_key("claude", issue=True)
+        assert pr_key.startswith(STREAM_HEALTH_KEY_PREFIX)
+        assert issue_key.startswith(STREAM_HEALTH_KEY_PREFIX)
+        _put_stream_health(
+            fake_redis_client, _sample_health(stream="test:tasks:claude"), issue=False
+        )
+        _put_stream_health(
+            fake_redis_client,
+            _sample_health(stream="test:tasks:issue:claude"),
+            issue=True,
+        )
+
+        scanned = {
+            k.decode() if isinstance(k, bytes) else str(k)
+            for k in fake_redis_client.client.scan_iter(match=f"{STREAM_HEALTH_KEY_PREFIX}*")
+        }
+        assert pr_key in scanned
+        assert issue_key in scanned
+
+
 # ---------------------------------------------------------------------------
 # Tests for fetch_snapshot provider stream health (issue #640)
 # ---------------------------------------------------------------------------
@@ -618,13 +728,16 @@ def _stream_health(provider, stream, state, **overrides):
     return ProviderStreamHealth(**defaults)
 
 
-def _publish_stream_health(redis, provider, stream, state, **overrides):
+def _publish_stream_health(redis, provider, stream, state, *, issue=False, **overrides):
     health = _stream_health(provider, stream, state, **overrides)
-    redis.client.set(f"provider-stream-health:{provider}", json.dumps(health.to_dict()))
+    redis.client.set(
+        stream_health_snapshot_key(provider, issue=issue),
+        json.dumps(health.to_dict()),
+    )
     return health
 
 
-class TestFetchSnapshotStreamHealth:
+class TestFetchSnapshotProviderStreamHealth:
     """PoolManager's canonical stream-health snapshots feed the dashboard
     read-only -- this only exercises collection, never recomputes health."""
 
@@ -657,7 +770,7 @@ class TestFetchSnapshotStreamHealth:
 
     def test_missing_required_field_skipped(self, fake_redis_client):
         fake_redis_client.client.set(
-            "provider-stream-health:incomplete", json.dumps({"provider": "claude"})
+            stream_health_snapshot_key("claude"), json.dumps({"provider": "claude"})
         )
 
         snap = fetch_snapshot(fake_redis_client)
@@ -667,7 +780,7 @@ class TestFetchSnapshotStreamHealth:
     def test_unsupported_state_value_skipped(self, fake_redis_client):
         health = _stream_health("claude", "tasks:claude", StreamHealthState.HEALTHY).to_dict()
         health["state"] = "degraded"
-        fake_redis_client.client.set("provider-stream-health:claude", json.dumps(health))
+        fake_redis_client.client.set(stream_health_snapshot_key("claude"), json.dumps(health))
 
         snap = fetch_snapshot(fake_redis_client)
 
@@ -779,7 +892,7 @@ class TestDashboardStreamHealthRendering:
                 banner = app.query_one("#stream-health-banner", Static)
                 assert "visible" in banner.classes
 
-                fake_redis_client.client.delete("provider-stream-health:xai")
+                fake_redis_client.client.delete(stream_health_snapshot_key("xai"))
                 app.action_refresh()
                 await pilot.pause()
 

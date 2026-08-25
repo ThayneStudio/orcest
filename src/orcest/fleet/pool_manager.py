@@ -52,6 +52,7 @@ from orcest.shared.models import (
 from orcest.shared.provider_stream_health import (
     ProviderStreamHealth,
     ProviderStreamHealthTracker,
+    stream_health_snapshot_key,
 )
 from orcest.shared.redis_client import RedisClient
 
@@ -107,10 +108,11 @@ _IDLE_LIVENESS_BREAKER_LIMIT = 2
 # with hgetall_raw -- never auto-prefixed -- to land in the same keyspace.
 _ACTIVITY_KEY_PREFIX = "workers:activity:"
 
-# Global (cross-project, unprefixed) canonical per-provider stream-health
-# snapshot (issue #613). PoolManager is the single writer; ``orcest status``
-# and any other reader only ever consume this key, never recompute health.
-_STREAM_HEALTH_KEY_PREFIX = "provider-stream-health:"
+# Global (cross-project, unprefixed) canonical per-stream health snapshots
+# (issue #613, extended by #639). PoolManager is the single writer; keys are
+# ``provider-stream-health:{provider}:pr`` and ``...:issue`` via
+# ``stream_health_snapshot_key``. ``orcest status`` and the live dashboard
+# only ever consume those keys, never recompute health.
 # TTL comfortably longer than one reconcile interval so a snapshot survives
 # normal polling gaps but expires (rather than lying stale forever) if the
 # pool manager stops publishing entirely.
@@ -2864,29 +2866,48 @@ class PoolManager:
     # ── stranded provider-stream detection (issue #613) ─────────
 
     def _check_stream_health(self) -> None:
-        """Compose and publish a health snapshot for every configured provider.
+        """Compose and publish a health snapshot for every configured stream.
 
-        A provider stream is stranded when it carries pending/lag work but
-        has zero heartbeat-backed live consumers. This is a continuous
-        dwell-based detector, not a one-shot deploy gate: it uses the
-        fleet's configured provider backends (``self._pool.worker_backends()``)
-        rather than a hard-coded stream prefix or a rollout revision gate,
-        so it keeps working long after any particular rollout is over.
+        Workers consume both ``tasks:{provider}`` and
+        ``tasks:issue:{provider}``. Each is evaluated independently so a
+        stranded member cannot be hidden by a healthy sibling. A provider
+        stream is stranded when it carries pending/lag work but has zero
+        heartbeat-backed live consumers. This is a continuous dwell-based
+        detector, not a one-shot deploy gate: it uses the fleet's configured
+        provider backends (``self._pool.worker_backends()``) rather than a
+        hard-coded stream prefix or a rollout revision gate, so it keeps
+        working long after any particular rollout is over.
+
+        A read failure or unexpected exception for one stream must not
+        skip the other stream or abort the rest of reconciliation.
         """
         if not self._pool.stream_health_enabled:
             return
         now = time.time()
         heartbeat_cache: dict[str, bool | None] = {}
         for provider in sorted(self._pool.worker_backends()):
-            try:
-                self._check_one_provider_stream_health(provider, now, heartbeat_cache)
-            except Exception:
-                logger.error("Stream health check failed for provider %s", provider, exc_info=True)
+            for issue in (False, True):
+                try:
+                    self._check_one_provider_stream_health(
+                        provider, now, heartbeat_cache, issue=issue
+                    )
+                except Exception:
+                    logger.error(
+                        "Stream health check failed for provider %s stream=%s",
+                        provider,
+                        task_stream_name(provider, issue=issue),
+                        exc_info=True,
+                    )
 
     def _check_one_provider_stream_health(
-        self, provider: str, now: float, heartbeat_cache: dict[str, bool | None]
+        self,
+        provider: str,
+        now: float,
+        heartbeat_cache: dict[str, bool | None],
+        *,
+        issue: bool,
     ) -> None:
-        stream = self._fq_task_stream(task_stream_name(provider))
+        stream = self._fq_task_stream(task_stream_name(provider, issue=issue))
         pending, lag, registered, live, read_error = self._read_stream_health_inputs(
             stream, heartbeat_cache
         )
@@ -2900,7 +2921,7 @@ class PoolManager:
             live_consumers=live,
             read_error=read_error,
         )
-        self._publish_stream_health(snapshot)
+        self._publish_stream_health(snapshot, issue=issue)
         if transition == "stranded":
             logger.error(
                 "Provider stream %s (provider=%s) is stranded: pending=%s lag=%s "
@@ -2999,17 +3020,18 @@ class PoolManager:
 
         return pending, lag, registered, live, False
 
-    def _publish_stream_health(self, snapshot: ProviderStreamHealth) -> None:
+    def _publish_stream_health(self, snapshot: ProviderStreamHealth, *, issue: bool) -> None:
         try:
             self._redis.set_ex_raw(
-                f"{_STREAM_HEALTH_KEY_PREFIX}{snapshot.provider}",
+                stream_health_snapshot_key(snapshot.provider, issue=issue),
                 json.dumps(snapshot.to_dict()),
                 _STREAM_HEALTH_TTL_SECONDS,
             )
         except Exception:
             logger.warning(
-                "Failed to publish stream health state for provider %s",
+                "Failed to publish stream health state for provider %s stream=%s",
                 snapshot.provider,
+                snapshot.stream,
                 exc_info=True,
             )
 
