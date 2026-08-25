@@ -47,7 +47,7 @@ fi
 
 # Install the version whose JSON event protocol is covered by CodexRunner's
 # parser fixtures. Authentication is injected per task; no credential is baked.
-CODEX_VERSION="0.131.0"
+CODEX_VERSION="0.149.1"
 installed_codex_version="$(codex --version 2>/dev/null | awk '{print $NF}' || true)"
 if [ "${installed_codex_version}" != "${CODEX_VERSION}" ]; then
     echo "Installing Codex CLI ${CODEX_VERSION}..."
