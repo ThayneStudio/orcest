@@ -62,7 +62,7 @@ from orcest.shared.output_streams import (
     OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
     iter_capped_output_fields,
 )
-from orcest.shared.redis_client import ConsumerGroupInspection, RedisClient
+from orcest.shared.redis_client import ConsumerGroupInspection, RedisClient, is_redis_oom_error
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
 from orcest.worker.liveness_tracker import LivenessTracker
@@ -331,15 +331,7 @@ def _wait_for_redis(
     return False
 
 
-def _is_redis_maxmemory_oom(error: BaseException) -> bool:
-    """Return True for Redis noeviction/maxmemory OOM write rejections."""
-    if not isinstance(error, redis_py.ResponseError):
-        return False
-    oom_cls = getattr(redis_py.exceptions, "OutOfMemoryError", None)
-    if oom_cls is not None and isinstance(error, oom_cls):
-        return True
-    text = str(error).lower()
-    return "oom" in text and "maxmemory" in text
+_is_redis_maxmemory_oom = is_redis_oom_error
 
 
 def _ensure_worker_consumer_groups(

@@ -26,6 +26,22 @@ class ConsumerGroupInspection(str, Enum):
     MISSING = "missing"
 
 
+def is_redis_oom_error(error: BaseException) -> bool:
+    """Return True for a classified Redis noeviction/maxmemory OOM write rejection.
+
+    Shared by orchestrator and worker startup so both apply the identical retry
+    policy: only this classified write rejection is retried, everything else
+    (wrong type, ACL, authentication, protocol, malformed response) stays fatal.
+    """
+    if not isinstance(error, redis.ResponseError):
+        return False
+    oom_cls = getattr(redis.exceptions, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(error, oom_cls):
+        return True
+    text = str(error).lower()
+    return "oom" in text and "maxmemory" in text
+
+
 _ROUND_ROBIN_TURN_SCRIPT = r"""
 local current = redis.call("GET", KEYS[1])
 if current then
