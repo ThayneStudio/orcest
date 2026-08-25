@@ -62,6 +62,7 @@ def test_ensure_consumer_group_existing_group_does_not_write(fake_redis_client, 
     group = "test-group"
     fake_redis_client.client.xadd("test:test-stream", {"k": "v"})
     fake_redis_client.client.xgroup_create("test:test-stream", group, id="0")
+    xinfo = mocker.spy(fake_redis_client._client, "xinfo_groups")
     create = mocker.patch.object(
         fake_redis_client._client,
         "xgroup_create",
@@ -70,6 +71,7 @@ def test_ensure_consumer_group_existing_group_does_not_write(fake_redis_client, 
 
     fake_redis_client.ensure_consumer_group(stream, group)
 
+    xinfo.assert_called_once_with("test:test-stream")
     create.assert_not_called()
     assert fake_redis_client.inspect_consumer_group(stream, group) is ConsumerGroupInspection.EXISTS
 
@@ -89,7 +91,7 @@ def test_inspect_consumer_group_absent_stream_maps_to_missing(fake_redis_client,
 
 def test_ensure_consumer_group_absent_stream_creates_with_mkstream(fake_redis_client, mocker):
     """Missing streams still use XGROUP CREATE ... MKSTREAM."""
-    mocker.patch.object(
+    xinfo = mocker.patch.object(
         fake_redis_client._client,
         "xinfo_groups",
         side_effect=_redis.ResponseError("ERR no such key"),
@@ -98,14 +100,15 @@ def test_ensure_consumer_group_absent_stream_creates_with_mkstream(fake_redis_cl
 
     fake_redis_client.ensure_consumer_group("test-stream", "test-group")
 
+    xinfo.assert_called_once_with("test:test-stream")
     create.assert_called_once_with(
         name="test:test-stream", groupname="test-group", id="0", mkstream=True
     )
 
 
 def test_ensure_consumer_group_missing_group_creates(fake_redis_client, mocker):
-    """Streams without the requested group use the creation path."""
-    mocker.patch.object(
+    """Streams without the requested group inspect once, then create."""
+    xinfo = mocker.patch.object(
         fake_redis_client._client,
         "xinfo_groups",
         return_value=[{"name": "other-group"}],
@@ -114,6 +117,7 @@ def test_ensure_consumer_group_missing_group_creates(fake_redis_client, mocker):
 
     fake_redis_client.ensure_consumer_group("test-stream", "test-group")
 
+    xinfo.assert_called_once_with("test:test-stream")
     create.assert_called_once_with(
         name="test:test-stream", groupname="test-group", id="0", mkstream=True
     )
