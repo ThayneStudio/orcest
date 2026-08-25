@@ -16,6 +16,8 @@ import os
 import signal
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, cast
 
 import redis
@@ -99,6 +101,20 @@ _ACTIVITY_KEY_PREFIX = "workers:activity:"
 _VM_NAME_PREFIX = "orcest-worker-"
 
 
+@dataclass(frozen=True)
+class ReapFence:
+    vm_id: int
+    reason: str
+    killed_at_unix: float
+    elapsed_at_kill_seconds: float
+
+
+@dataclass(frozen=True)
+class _StopVmOutcome:
+    stopped: bool
+    confirmed_transition: bool
+
+
 def _is_missing_stream_or_group_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "no such key" in text or "nogroup" in text or "no such consumer group" in text
@@ -141,6 +157,7 @@ class PoolManager:
         # success, and keep test doubles/inventory lag from reusing an ID.
         self._owned_provisioning_vmids: set[int] = set()
         self._allocated_vmids: set[int] = set()
+        self._reap_fences: dict[int, ReapFence] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -603,14 +620,23 @@ class PoolManager:
 
     def _stop_vm(self, vm_id: int) -> bool:
         """Stop a worker VM without touching Redis tracking."""
+        return self._stop_vm_with_outcome(vm_id).stopped
+
+    def _stop_vm_with_outcome(self, vm_id: int) -> _StopVmOutcome:
+        """Stop a worker VM and report whether this call confirmed the stop.
+
+        ``confirmed_transition`` is false when the stop command failed but a
+        follow-up status read proves the VM was already stopped. That case can
+        happen after a pool-manager restart, so kill-time fields are unknown.
+        """
         try:
             is_template = self._is_template_vmid(vm_id)
         except Exception:
             logger.error("Refusing to stop VM %d: template identity is unavailable", vm_id)
-            return False
+            return _StopVmOutcome(stopped=False, confirmed_transition=False)
         if is_template:
             logger.error("Refusing to stop template VM %d through a worker lifecycle path", vm_id)
-            return False
+            return _StopVmOutcome(stopped=False, confirmed_transition=False)
         if not self._is_destroyable_vm_id(vm_id):
             logger.error(
                 "Refusing to stop VM %d: outside configured worker VMID range "
@@ -620,7 +646,7 @@ class PoolManager:
                 self._pool.vm_id_start,
                 self._pool.vm_id_end or "open",
             )
-            return False
+            return _StopVmOutcome(stopped=False, confirmed_transition=False)
         try:
             self._proxmox.stop_vm(vm_id)
             # Brief wait for VM to stop before destroying
@@ -628,23 +654,26 @@ class PoolManager:
             while time.monotonic() < deadline:
                 try:
                     if self._proxmox.get_vm_status(vm_id) == "stopped":
-                        return True
+                        return _StopVmOutcome(stopped=True, confirmed_transition=True)
                 except Exception:
-                    return False
+                    return _StopVmOutcome(stopped=False, confirmed_transition=False)
                 time.sleep(1)
             try:
                 if self._proxmox.get_vm_status(vm_id) == "stopped":
-                    return True
+                    return _StopVmOutcome(stopped=True, confirmed_transition=True)
             except Exception:
                 pass
             logger.error("VM %d did not reach stopped state before timeout", vm_id)
-            return False
+            return _StopVmOutcome(stopped=False, confirmed_transition=False)
         except Exception:
             logger.warning("Failed to stop VM %d (may already be stopped)", vm_id)
             try:
-                return self._proxmox.get_vm_status(vm_id) == "stopped"
+                return _StopVmOutcome(
+                    stopped=self._proxmox.get_vm_status(vm_id) == "stopped",
+                    confirmed_transition=False,
+                )
             except Exception:
-                return False
+                return _StopVmOutcome(stopped=False, confirmed_transition=False)
 
     def _destroy_vm(self, vm_id: int) -> bool:
         """Stop and destroy a VM, remove from tracking sets.
@@ -732,6 +761,7 @@ class PoolManager:
             # _next_vm_id also reads) remain the safety net for reuse.
             self._owned_provisioning_vmids.discard(vm_id)
             self._allocated_vmids.discard(vm_id)
+        self._reap_fences.pop(vm_id, None)
         return True
 
     def _read_template_pointer(self) -> int | None:
@@ -1277,6 +1307,7 @@ class PoolManager:
             # its verification failed. Durable Redis state is retried next pass.
             self._owned_provisioning_vmids.discard(vm_id)
             self._allocated_vmids.discard(vm_id)
+        self._reap_fences.pop(vm_id, None)
         return True
 
     def _health_check(self) -> None:
@@ -1378,7 +1409,8 @@ class PoolManager:
             # state. Otherwise it can publish a late success/rotation while
             # the reaper concurrently publishes failure and ACKs its source.
             # A stopped VM also bounds billing while Redis recovery retries.
-            if not self._stop_vm(vm_id):
+            stop_outcome = self._stop_vm_with_outcome(vm_id)
+            if not stop_outcome.stopped:
                 logger.warning(
                     "VM %d marked for force-destroy (reason=%s) but could not be "
                     "stopped; preserving Redis state for retry",
@@ -1386,9 +1418,24 @@ class PoolManager:
                     reason,
                 )
                 continue
+            fence = self._reap_fences.get(vm_id)
+            if fence is None and stop_outcome.confirmed_transition:
+                fence = ReapFence(
+                    vm_id=vm_id,
+                    reason=reason,
+                    killed_at_unix=now,
+                    elapsed_at_kill_seconds=elapsed,
+                )
+                self._reap_fences[vm_id] = fence
+            event_reason = fence.reason if fence is not None else reason
+            event_elapsed = fence.elapsed_at_kill_seconds if fence is not None else None
+            event_killed_at = fence.killed_at_unix if fence is not None else None
             try:
                 coordinated = self._coordinate_reaped_vm(
-                    vm_id, reason=reason, elapsed_seconds=elapsed
+                    vm_id,
+                    reason=event_reason,
+                    elapsed_seconds=event_elapsed,
+                    killed_at_unix=event_killed_at,
                 )
             except Exception:
                 logger.error(
@@ -1694,6 +1741,7 @@ class PoolManager:
                     self._redis.srem(_POOL_IDLE_KEY, str(vm_id))
                     self._allocated_vmids.discard(vm_id)
                     self._owned_provisioning_vmids.discard(vm_id)
+                    self._reap_fences.pop(vm_id, None)
                 except Exception:
                     logger.error(
                         "Failed to remove stale idle entry VM %d from Redis",
@@ -1717,6 +1765,7 @@ class PoolManager:
                     self._redis.hdel(_POOL_ACTIVE_KEY, str(vm_id))
                     self._allocated_vmids.discard(vm_id)
                     self._owned_provisioning_vmids.discard(vm_id)
+                    self._reap_fences.pop(vm_id, None)
                 except Exception:
                     logger.error(
                         "Failed to remove stale active entry VM %d from Redis",
@@ -2025,7 +2074,11 @@ class PoolManager:
     # ── reap coordination (H2-conc) ──────────────────────────
 
     def _coordinate_reaped_vm(
-        self, vm_id: int, reason: str, elapsed_seconds: float | None = None
+        self,
+        vm_id: int,
+        reason: str,
+        elapsed_seconds: float | None = None,
+        killed_at_unix: float | None = None,
     ) -> bool:
         """Recover orchestrator-visible state for a force-reaped worker VM.
 
@@ -2047,11 +2100,11 @@ class PoolManager:
         breach or an activity-watchdog signal and must not report
         ``ceiling``, ``needs_reap`` or ``activity_stale``.
 
-        ``elapsed_seconds`` is the max-task-duration overrun computed by
-        ``_health_check``, when this call originates there. Other callers
-        don't track a task's elapsed runtime, so it defaults to ``None`` and
-        is omitted from the emitted event's data entirely (never reported as
-        ``0.0``, which would misleadingly imply an instant reap).
+        ``elapsed_seconds`` and ``killed_at_unix`` are frozen values captured
+        by ``_health_check`` when this process first confirmed the VM stopped.
+        Other callers, and restarted managers that find an already-stopped VM
+        without an in-memory fence, leave them as ``None`` so the emitted event
+        omits unknown fields rather than fabricating kill-time telemetry.
         """
         consumer = self._vm_id_to_worker_id(vm_id)
         task_streams, discovery_complete = self._task_streams_with_discovery_status()
@@ -2169,7 +2222,13 @@ class PoolManager:
                 # republishes here as a transient FAILED result, shadowing what
                 # would otherwise be a permanent STALLED classification upstream.
                 # Rare and accepted -- the retry this produces is harmless.
-                if not self._publish_reaped_failure(task, consumer, reason, elapsed_seconds):
+                if not self._publish_reaped_failure(
+                    task,
+                    consumer,
+                    reason,
+                    elapsed_seconds,
+                    killed_at_unix,
+                ):
                     unrecovered_entries = True
                     continue
                 self._clear_reaped_pending_marker(task)
@@ -2381,7 +2440,12 @@ class PoolManager:
         return "matches" if metadata.task_id == task.id else "different"
 
     def _publish_reaped_failure(
-        self, task: Task, worker_id: str, reason: str, elapsed_seconds: float | None = None
+        self,
+        task: Task,
+        worker_id: str,
+        reason: str,
+        elapsed_seconds: float | None = None,
+        killed_at_unix: float | None = None,
     ) -> bool:
         """Publish a transient-FAILED result so the orchestrator re-enqueues."""
         result = TaskResult(
@@ -2416,7 +2480,7 @@ class PoolManager:
                 exc_info=True,
             )
             return False
-        self._emit_reaped_event(task, worker_id, reason, elapsed_seconds)
+        self._emit_reaped_event(task, worker_id, reason, elapsed_seconds, killed_at_unix)
         return True
 
     def _event_publisher_for(self, key_prefix: str | None) -> EventPublisher:
@@ -2439,19 +2503,29 @@ class PoolManager:
         return publisher
 
     def _emit_reaped_event(
-        self, task: Task, worker_id: str, reason: str, elapsed_seconds: float | None
+        self,
+        task: Task,
+        worker_id: str,
+        reason: str,
+        elapsed_seconds: float | None,
+        killed_at_unix: float | None = None,
     ) -> None:
         """Spool a task.reaped event. Never raises (EventPublisher swallows).
 
-        ``elapsed_seconds`` is omitted from the event data entirely when
-        unknown (rather than reported as ``0.0``), since ``0.0`` would
-        misleadingly imply an instant reap.
+        ``elapsed_seconds`` and ``killed_at`` are omitted from the event data
+        entirely when unknown. The envelope ``time`` remains the event
+        construction time; ``killed_at`` is the frozen VM stop confirmation
+        time when this process observed it.
         """
         try:
             publisher = self._event_publisher_for(task.key_prefix)
             data: dict[str, Any] = {"reason": reason}
             if elapsed_seconds is not None:
                 data["elapsed_seconds"] = elapsed_seconds
+            if killed_at_unix is not None:
+                data["killed_at"] = datetime.fromtimestamp(killed_at_unix, timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
             publisher.publish(
                 make_event(
                     "net.orcest.task.reaped",
