@@ -14,6 +14,15 @@ a Redis hash. Redis ``trace_archiver:cursors`` is read once to seed a
 missing local file and is never written by the active pump. A cursor is
 committed only after the archive file has been flushed and fsynced.
 
+After a committed cursor advance, the archiver issues ``XTRIM MINID`` at
+the older of that cursor and the 128th-newest stream entry so archived
+prefix entries can be reclaimed under Redis ``noeviction`` while a tail
+stays available for late dashboard attach. Trim is skipped when archival
+is disabled, an entry was skipped, local cursor persist failed, or cursor
+state is corrupt. Trim failures are retried on later passes and warn only
+on state transitions. Local cursor records for streams absent longer than
+32 hours are pruned, along with the matching legacy Redis hash fields.
+
 Orcest is filesystem-agnostic: the archiver only knows about a writable
 directory. ``OrchestratorConfig.trace_archive_path`` being ``None`` is the
 documented "fall back to Redis logging" mode — :meth:`TraceArchiver.start`
@@ -29,7 +38,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import IO, Any
@@ -46,6 +55,11 @@ _SLEEP_BETWEEN_PASSES_SECONDS = 1.0
 _XREAD_COUNT = 500
 _FILE_MODE = 0o600  # archived files contain verbatim model output; restrict to owner
 _DEFAULT_PROJECT = "unknown"
+# Keep this many newest entries after a durable trim so a late dashboard
+# attach still has a live tail. Must stay well under OUTPUT_STREAM_MAXLEN.
+_RETAIN_NEWEST = 128
+_STALE_CURSOR_AGE = timedelta(hours=32)
+_LAST_SEEN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # task_id is worker-supplied and used to construct filesystem paths. Reject
 # anything outside a strict allowlist so a hostile or buggy task_id cannot
@@ -55,7 +69,7 @@ _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(_LAST_SEEN_FORMAT)
 
 
 def _entry_id_to_iso(entry_id: str) -> str:
@@ -84,6 +98,22 @@ def _id_at_or_before(candidate: str, highwater: str) -> bool:
     if parsed_candidate is None or parsed_highwater is None:
         return False
     return parsed_candidate <= parsed_highwater
+
+
+def _older_entry_id(left: str, right: str) -> str | None:
+    """Return the older of two Redis stream ids, or None if either is malformed."""
+    parsed_left = _entry_id_tuple(left)
+    parsed_right = _entry_id_tuple(right)
+    if parsed_left is None or parsed_right is None:
+        return None
+    return left if parsed_left <= parsed_right else right
+
+
+def _parse_last_seen(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, _LAST_SEEN_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def cursor_state_path(archive_path: Path, project: str) -> Path:
@@ -256,6 +286,7 @@ class TraceArchiver:
         self._cursors_loaded = False
         self._cursor_corrupt = False
         self._health_error: str | None = None
+        self._trim_failing: set[str] = set()
 
     @property
     def health_error(self) -> str | None:
@@ -433,6 +464,106 @@ class TraceArchiver:
         if self._health_error and not self._cursor_corrupt:
             self._health_error = None
 
+    def _trim_minid(self, stream: str) -> str | None:
+        """Return the exclusive-lower MINID bound, or None if trim is unsafe.
+
+        The bound is the older of the committed durable cursor and the
+        128th-newest stream entry. XTRIM MINID keeps that id and everything
+        newer, so a late dashboard attach still sees at least 128 entries
+        and trim cannot walk past unarchived data.
+        """
+        if self._archive_path is None or self._archiver_paused or self._cursor_corrupt:
+            return None
+        cursor_id = self.committed_last_id(stream)
+        if cursor_id is None:
+            return None
+        try:
+            newest = self._redis.xrevrange(stream, count=_RETAIN_NEWEST)
+        except Exception:
+            return None
+        if len(newest) < _RETAIN_NEWEST:
+            return None
+        tail_id = newest[-1][0]
+        return _older_entry_id(cursor_id, tail_id)
+
+    def _note_trim_failure(self, stream: str, exc: BaseException) -> None:
+        if stream in self._trim_failing:
+            return
+        self._trim_failing.add(stream)
+        self._logger.warning(
+            "Trace archiver trim failed for %s; will retry without blocking archival: %s",
+            stream,
+            exc,
+        )
+
+    def _note_trim_success(self, stream: str) -> None:
+        if stream not in self._trim_failing:
+            return
+        self._trim_failing.discard(stream)
+        self._logger.info("Trace archiver trim recovered for %s", stream)
+
+    def _trim_archived_stream(self, stream: str) -> None:
+        """XTRIM MINID using only the committed durable cursor plus the tail.
+
+        Failures are retried on later passes and must not halt archival.
+        """
+        minid = self._trim_minid(stream)
+        if minid is None:
+            return
+        try:
+            self._redis.xtrim_minid(stream, minid)
+        except Exception as exc:
+            self._note_trim_failure(stream, exc)
+            return
+        self._note_trim_success(stream)
+
+    def _gc_stale_cursors(self, live_streams: set[str]) -> None:
+        """Drop local (and legacy Redis) cursor records for long-absent streams."""
+        if self._cursor_corrupt or self._archive_path is None:
+            return
+        now = datetime.now(timezone.utc)
+        stale: list[str] = []
+        for name, cursor in self._committed.items():
+            if name in live_streams:
+                continue
+            try:
+                if self._redis.exists(name):
+                    continue
+            except Exception:
+                continue
+            last_seen = _parse_last_seen(cursor.last_seen)
+            if last_seen is None:
+                continue
+            if now - last_seen <= _STALE_CURSOR_AGE:
+                continue
+            stale.append(name)
+        if not stale:
+            return
+        path = self._cursor_path()
+        if path is None:
+            return
+        snapshot = {name: cursor for name, cursor in self._committed.items() if name not in stale}
+        try:
+            persist_cursor_state_file(path, snapshot)
+        except OSError as exc:
+            self._logger.warning(
+                "Failed to persist pruned cursor state at %s; leaving stale records: %s",
+                path,
+                exc,
+                exc_info=True,
+            )
+            return
+        self._committed = snapshot
+        try:
+            self._redis.hdel(_CURSOR_HASH_KEY, *stale)
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to remove legacy cursor hash fields %s: %s",
+                stale,
+                exc,
+                exc_info=True,
+            )
+
     def _pump_output_streams(self) -> None:
         self._ensure_cursors_loaded()
         if self._cursor_corrupt:
@@ -442,11 +573,11 @@ class TraceArchiver:
             )
             return
         streams = self._redis.scan_iter(match="output:*")
+        self._gc_stale_cursors(set(streams))
         for stream in streams:
             last_id = self._xread_last_id(stream)
             entries = self._redis.xread_after(stream, last_id, count=_XREAD_COUNT)
-            if not entries:
-                continue
+            trim_ok = True
             for entry_id, fields in entries:
                 skip_append = self._already_written(stream, entry_id)
                 try:
@@ -460,6 +591,7 @@ class TraceArchiver:
                     )
                     result = _EntryResult(_ArchiveStatus.FAILED, appended=False)
                 if result.status == _ArchiveStatus.FAILED:
+                    trim_ok = False
                     if result.appended or skip_append:
                         self._mark_written(stream, entry_id)
                     self._set_health_error(
@@ -467,11 +599,14 @@ class TraceArchiver:
                         "halting this stream without advancing the committed cursor"
                     )
                     break
+                if result.status == _ArchiveStatus.SKIPPED:
+                    trim_ok = False
                 if result.status == _ArchiveStatus.ARCHIVED or result.appended:
                     self._mark_written(stream, entry_id)
                 try:
                     self._persist_stream_cursor(stream, entry_id)
                 except Exception as exc:
+                    trim_ok = False
                     if result.status == _ArchiveStatus.ARCHIVED or result.appended:
                         self._mark_written(stream, entry_id)
                     self._set_health_error(
@@ -480,6 +615,10 @@ class TraceArchiver:
                         exc_info=True,
                     )
                     break
+            # Trim cannot outrun archive-file and cursor fsync, and is unsafe
+            # after a skip, drop, or local persist failure.
+            if trim_ok:
+                self._trim_archived_stream(stream)
 
     def _process_entry(
         self,
