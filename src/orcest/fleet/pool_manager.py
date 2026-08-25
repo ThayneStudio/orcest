@@ -2955,11 +2955,16 @@ class PoolManager:
 
         worker_groups = [g for g in groups if g.get("name") == CONSUMER_GROUP]
         if not worker_groups:
+            # No consumer group means Redis has neither a PEL nor a
+            # group-reported lag for this stream -- these entries were never
+            # delivered. Report them as synthetic undelivered-lag (not
+            # ``pending``) so stranding detection still sees them as queued
+            # work without implying Redis itself reported group lag.
             try:
                 entries = int(cast(Any, self._redis.client.xlen(stream)))
             except Exception:
                 return None, None, None, None, True
-            return entries, 0, 0, 0, False
+            return 0, entries, 0, 0, False
 
         pending = 0
         lag = 0

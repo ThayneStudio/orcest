@@ -221,6 +221,94 @@ class TestRedisReadFailure:
         assert state["pending"] is None
 
 
+class TestGroupLessStreamSyntheticLag:
+    """Issue #635: a stream with no ``workers`` consumer group has never
+    delivered any entry, so Redis has neither a PEL nor group lag for it.
+    Those entries must surface as synthetic lag, not as ``pending``."""
+
+    def _add_raw_entries(self, rc, count: int) -> None:
+        for _ in range(count):
+            task = Task.create(
+                task_type=TaskType.FIX_CI,
+                repo="owner/repo",
+                token="ghp_x",
+                resource_type="pr",
+                resource_id=1,
+                prompt="fix",
+                branch="fix-branch",
+                key_prefix="test",
+            )
+            rc.xadd("tasks:claude", task.to_dict())
+
+    def test_group_less_stream_reports_synthetic_lag_not_pending(self, fake_redis_client):
+        rc = fake_redis_client
+        self._add_raw_entries(rc, 2)
+
+        manager, _ = _build(rc)
+        manager._check_stream_health()
+        state = _read_state(rc)
+        assert state["pending"] == 0
+        assert state["lag"] == 2
+        assert state["registered_consumers"] == 0
+        assert state["live_consumers"] == 0
+
+    def test_group_less_stream_strands_after_dwell_with_no_live_consumer(
+        self, fake_redis_client, monkeypatch
+    ):
+        rc = fake_redis_client
+        self._add_raw_entries(rc, 1)
+
+        manager, _ = _build(rc, dwell_seconds=300)
+        now = time.time()
+        monkeypatch.setattr(time, "time", lambda: now)
+        manager._check_stream_health()
+        assert _read_state(rc)["state"] == "healthy"
+
+        monkeypatch.setattr(time, "time", lambda: now + 300)
+        manager._check_stream_health()
+        state = _read_state(rc)
+        assert state["state"] == "stranded"
+        assert state["pending"] == 0
+        assert state["lag"] == 1
+
+    def test_missing_stream_stays_zero_work_and_non_stranded(self, fake_redis_client):
+        manager, _ = _build(fake_redis_client)
+        manager._check_stream_health()
+        state = _read_state(fake_redis_client)
+        assert state["state"] == "healthy"
+        assert state["pending"] == 0
+        assert state["lag"] == 0
+
+    def test_xlen_failure_is_a_read_error_not_healthy_zero_work(self, fake_redis_client, mocker):
+        rc = fake_redis_client
+        self._add_raw_entries(rc, 1)
+        mocker.patch.object(rc.client, "xlen", side_effect=RuntimeError("redis down"))
+
+        manager, _ = _build(rc)
+        manager._check_stream_health()
+        state = _read_state(rc)
+        assert state["state"] == "unknown"
+        assert state["pending"] is None
+        assert state["lag"] is None
+
+    def test_grouped_stream_regression_pending_still_reported_as_pending(
+        self, fake_redis_client
+    ):
+        """A grouped stream's undelivered entries remain Redis-reported
+        group lag, not synthetic lag, and delivered-but-unacked entries
+        remain pending -- this codepath must be untouched by #635."""
+        rc = fake_redis_client
+        _add_undelivered_entry(rc)
+        _claim(rc)
+
+        manager, _ = _build(rc)
+        manager._check_stream_health()
+        state = _read_state(rc)
+        assert state["pending"] == 1
+        assert state["lag"] == 0
+        assert state["registered_consumers"] == 1
+
+
 class TestStateTTL:
     def test_published_state_has_a_ttl(self, fake_redis_client):
         rc = fake_redis_client
