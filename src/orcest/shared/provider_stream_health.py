@@ -7,6 +7,16 @@ transition owner: it reads Redis, feeds the raw numbers into
 ``ProviderStreamHealthTracker.evaluate``, and publishes the resulting
 snapshot. This module performs no I/O and takes an explicit clock so the
 state machine can be tested without a real Redis or wall-clock sleeps.
+
+Each provider has two independently evaluated streams -- the PR-task
+stream (``tasks:{provider}``) and the issue-task stream
+(``tasks:issue:{provider}``). Tracker state is keyed by
+``(provider, stream)`` so dwell timers, ``transitioned_at``, and health
+cannot leak between those members. Published snapshots use
+``stream_health_snapshot_key`` (``provider-stream-health:{provider}:pr``
+and ``...:issue``) rather than a provider-only key, so a stranded member
+cannot be overwritten or hidden by its sibling. There is no provider-level
+aggregate: consumers render the per-stream snapshots as published.
 """
 
 from __future__ import annotations
@@ -20,7 +30,26 @@ from typing import Any, Literal
 # reconcile pass racing a fresh claim) must not page anyone.
 DEFAULT_STRANDED_DWELL_SECONDS = 300.0
 
+# Global (cross-project, unprefixed) snapshot key prefix. PoolManager is
+# the single writer; ``orcest status`` and the live dashboard only ever
+# consume keys under this prefix, never recompute health.
+STREAM_HEALTH_KEY_PREFIX = "provider-stream-health:"
+STREAM_HEALTH_KIND_PR = "pr"
+STREAM_HEALTH_KIND_ISSUE = "issue"
+
 TransitionKind = Literal["stranded", "recovered"] | None
+
+
+def stream_health_snapshot_key(provider: str, *, issue: bool = False) -> str:
+    """Return the unprefixed Redis key for one provider stream-health snapshot.
+
+    Keys are ``provider-stream-health:{provider}:pr`` and
+    ``provider-stream-health:{provider}:issue``. Provider names cannot
+    contain ``:`` (see ``require_valid_provider_name``), so a PR key
+    cannot collide with an issue key or with a different provider.
+    """
+    kind = STREAM_HEALTH_KIND_ISSUE if issue else STREAM_HEALTH_KIND_PR
+    return f"{STREAM_HEALTH_KEY_PREFIX}{provider}:{kind}"
 
 
 class StreamHealthState(str, Enum):
@@ -31,7 +60,7 @@ class StreamHealthState(str, Enum):
 
 @dataclass(frozen=True)
 class ProviderStreamHealth:
-    """Canonical per-provider stream health snapshot."""
+    """Canonical per-stream health snapshot for one provider task stream."""
 
     provider: str
     stream: str
@@ -78,17 +107,21 @@ class _Tracked:
 
 
 class ProviderStreamHealthTracker:
-    """Per-provider dwell tracking carried across reconcile passes.
+    """Per-stream dwell tracking carried across reconcile passes.
 
-    One instance lives for the life of the owning process. A Redis read
-    error for a pass must never fabricate a recovery or reset a dwell
-    timer already in progress, so ``evaluate`` leaves both the published
-    state and the candidate-since timer untouched on ``read_error=True``.
+    One instance lives for the life of the owning process. State is keyed
+    by ``(provider, stream)`` so the PR-task and issue-task streams of the
+    same provider keep independent health, dwell candidates, and
+    ``transitioned_at`` values. A Redis read error for a pass must never
+    fabricate a recovery or reset a dwell timer already in progress, so
+    ``evaluate`` leaves both the published state and the candidate-since
+    timer untouched on ``read_error=True``. A read error (or missing
+    evaluation) for one stream does not touch any other stream's state.
     """
 
     def __init__(self, dwell_seconds: float = DEFAULT_STRANDED_DWELL_SECONDS) -> None:
         self._dwell_seconds = dwell_seconds
-        self._tracked: dict[str, _Tracked] = {}
+        self._tracked: dict[tuple[str, str], _Tracked] = {}
 
     def evaluate(
         self,
@@ -102,7 +135,8 @@ class ProviderStreamHealthTracker:
         live_consumers: int | None,
         read_error: bool,
     ) -> tuple[ProviderStreamHealth, TransitionKind]:
-        prior = self._tracked.get(provider)
+        identity = (provider, stream)
+        prior = self._tracked.get(identity)
         prior_health = prior.health if prior else None
         prior_state = prior_health.state if prior_health else StreamHealthState.UNKNOWN
         candidate_since = prior.candidate_since if prior else None
@@ -120,7 +154,7 @@ class ProviderStreamHealthTracker:
                 observed_at=now,
                 transitioned_at=transitioned_at,
             )
-            self._tracked[provider] = _Tracked(health=snapshot, candidate_since=candidate_since)
+            self._tracked[identity] = _Tracked(health=snapshot, candidate_since=candidate_since)
             return snapshot, None
 
         has_work = (pending or 0) > 0 or (lag or 0) > 0
@@ -162,5 +196,5 @@ class ProviderStreamHealthTracker:
             observed_at=now,
             transitioned_at=transitioned_at,
         )
-        self._tracked[provider] = _Tracked(health=snapshot, candidate_since=candidate_since)
+        self._tracked[identity] = _Tracked(health=snapshot, candidate_since=candidate_since)
         return snapshot, transition

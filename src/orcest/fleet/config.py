@@ -239,11 +239,12 @@ class PoolConfig:
     # roll it out fleet-wide. Existing already-cloned workers keep whatever
     # value their own user-data was rendered with until they're replaced.
     watchdog_enabled: bool = True
-    # Continuous stranded-provider-stream detector (issue #613): PoolManager
-    # alerts when a configured provider stream carries pending/lag work but
-    # has zero heartbeat-backed live consumers, after a
-    # stream_health_dwell_seconds dwell. Disabling only turns off the
-    # detector/alert; it never affects reaping or task scheduling.
+    # Continuous stranded-provider-stream detector (issue #613/#639):
+    # PoolManager alerts when a configured provider PR-task or issue-task
+    # stream carries pending/lag work but has zero heartbeat-backed live
+    # consumers, after a stream_health_dwell_seconds dwell. Each stream is
+    # evaluated independently. Disabling only turns off the detector/alert;
+    # it never affects reaping or task scheduling.
     stream_health_enabled: bool = True
     stream_health_dwell_seconds: int = 300
     snippet_storage: str = "local"  # storage for cloud-init snippets (auto-detected)
