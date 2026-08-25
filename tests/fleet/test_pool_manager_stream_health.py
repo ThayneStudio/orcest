@@ -291,9 +291,7 @@ class TestGroupLessStreamSyntheticLag:
         assert state["pending"] is None
         assert state["lag"] is None
 
-    def test_grouped_stream_regression_pending_still_reported_as_pending(
-        self, fake_redis_client
-    ):
+    def test_grouped_stream_regression_pending_still_reported_as_pending(self, fake_redis_client):
         """A grouped stream's undelivered entries remain Redis-reported
         group lag, not synthetic lag, and delivered-but-unacked entries
         remain pending -- this codepath must be untouched by #635."""
