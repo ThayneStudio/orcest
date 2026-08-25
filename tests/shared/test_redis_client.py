@@ -357,6 +357,139 @@ def test_xadd_capped_rejects_empty_fields(fake_redis_client):
         fake_redis_client.xadd_capped("output:worker-1", {}, maxlen=2000)
 
 
+# --- xadd_capped_expire (#604) ---
+
+
+def test_xadd_capped_expire_sets_ttl_on_new_stream(fake_redis_client):
+    """A successful first append always leaves a positive TTL."""
+    stream = "output:worker-1"
+    entry_id = fake_redis_client.xadd_capped_expire(
+        stream, {"line": "hello"}, maxlen=2000, ttl_seconds=3600
+    )
+    assert isinstance(entry_id, str)
+    assert len(entry_id) > 0
+    assert fake_redis_client.xlen(stream) == 1
+    ttl = fake_redis_client.ttl(stream)
+    assert 0 < ttl <= 3600
+
+
+def test_xadd_capped_expire_refreshes_ttl_on_existing_stream(fake_redis_client):
+    """A second append to an already-TTL'd stream refreshes the TTL."""
+    stream = "output:worker-1"
+    fake_redis_client.xadd_capped_expire(stream, {"line": "one"}, maxlen=2000, ttl_seconds=3600)
+    fake_redis_client.client.expire(fake_redis_client._prefixed(stream), 5)
+    assert fake_redis_client.ttl(stream) <= 5
+
+    fake_redis_client.xadd_capped_expire(stream, {"line": "two"}, maxlen=2000, ttl_seconds=3600)
+
+    assert fake_redis_client.xlen(stream) == 2
+    ttl = fake_redis_client.ttl(stream)
+    assert 5 < ttl <= 3600
+
+
+def test_xadd_capped_expire_raw_uses_fully_qualified_key(fake_redis_client):
+    """xadd_capped_expire_raw writes and expires the exact key given, unprefixed."""
+    fq_stream = "projectA:output:worker-1"
+    entry_id = fake_redis_client.xadd_capped_expire_raw(
+        fq_stream, {"line": "hello"}, maxlen=2000, ttl_seconds=3600
+    )
+    assert isinstance(entry_id, str)
+    assert len(entry_id) > 0
+    assert fake_redis_client.client.xlen(fq_stream) == 1
+    ttl = fake_redis_client.client.ttl(fq_stream)
+    assert 0 < ttl <= 3600
+    # Must not land under the client's default prefix.
+    assert fake_redis_client.xlen("output:worker-1") == 0
+
+
+def test_xadd_capped_expire_exact_trim(fake_redis_client):
+    """approximate=False trims the stream to exactly maxlen, same as xadd_capped."""
+    stream = "output:worker-1"
+    maxlen = 10
+    for i in range(30):
+        fake_redis_client.xadd_capped_expire(
+            stream, {"line": f"line-{i}"}, maxlen=maxlen, ttl_seconds=3600, approximate=False
+        )
+    assert fake_redis_client.xlen(stream) == maxlen
+    assert 0 < fake_redis_client.ttl(stream) <= 3600
+
+
+def test_xadd_capped_expire_rejects_zero_maxlen(fake_redis_client):
+    with pytest.raises(ValueError, match="maxlen must be positive"):
+        fake_redis_client.xadd_capped_expire(
+            "output:worker-1", {"line": "x"}, maxlen=0, ttl_seconds=3600
+        )
+
+
+def test_xadd_capped_expire_rejects_empty_fields(fake_redis_client):
+    with pytest.raises(ValueError, match="fields must be a non-empty dict"):
+        fake_redis_client.xadd_capped_expire("output:worker-1", {}, maxlen=2000, ttl_seconds=3600)
+
+
+def test_xadd_capped_expire_rejects_non_positive_ttl(fake_redis_client):
+    with pytest.raises(ValueError, match="ttl_seconds must be positive"):
+        fake_redis_client.xadd_capped_expire(
+            "output:worker-1", {"line": "x"}, maxlen=2000, ttl_seconds=0
+        )
+
+
+def test_xadd_capped_expire_is_one_round_trip(fake_redis_client, mocker):
+    """The append+TTL happens as a single EVAL command, not separate XADD/EXPIRE calls."""
+    spy = mocker.spy(fake_redis_client._client, "execute_command")
+
+    fake_redis_client.xadd_capped_expire(
+        "output:worker-1", {"line": "hello"}, maxlen=2000, ttl_seconds=3600
+    )
+
+    assert spy.call_count == 1
+    assert spy.call_args[0][0] == "EVAL"
+
+
+def test_xadd_capped_expire_chunked_lines_each_get_one_round_trip(fake_redis_client, mocker):
+    """Multiple chunked entries each cost exactly one round trip."""
+    spy = mocker.spy(fake_redis_client._client, "execute_command")
+    stream = "output:worker-1"
+
+    for i in range(3):
+        fake_redis_client.xadd_capped_expire(
+            stream,
+            {"line": f"chunk-{i}", "part": str(i), "parts": "3"},
+            maxlen=2000,
+            ttl_seconds=3600,
+        )
+
+    assert spy.call_count == 3
+    assert all(call.args[0] == "EVAL" for call in spy.call_args_list)
+    assert fake_redis_client.xlen(stream) == 3
+
+
+def test_xadd_capped_expire_failure_leaves_no_partial_state(fake_redis_client, mocker):
+    """Append failure leaves neither a partial key nor a misleading success result."""
+    stream = "output:worker-1"
+    mocker.patch.object(fake_redis_client._client, "eval", side_effect=_oom_error())
+
+    with pytest.raises(_redis.ResponseError, match="OOM"):
+        fake_redis_client.xadd_capped_expire(
+            stream, {"line": "hello"}, maxlen=2000, ttl_seconds=3600
+        )
+
+    assert fake_redis_client.xlen(stream) == 0
+    assert fake_redis_client.ttl(stream) == -2  # key does not exist
+
+
+def test_xadd_capped_expire_raw_failure_leaves_no_partial_state(fake_redis_client, mocker):
+    """Same failure guarantee for the fully-qualified (raw) path."""
+    fq_stream = "projectA:output:worker-1"
+    mocker.patch.object(fake_redis_client._client, "eval", side_effect=_oom_error())
+
+    with pytest.raises(_redis.ResponseError, match="OOM"):
+        fake_redis_client.xadd_capped_expire_raw(
+            fq_stream, {"line": "hello"}, maxlen=2000, ttl_seconds=3600
+        )
+
+    assert fake_redis_client.client.xlen(fq_stream) == 0
+
+
 def test_xread_after_returns_new_entries(fake_redis_client):
     """xread_after returns entries after the given ID."""
     stream = "output:worker-1"
