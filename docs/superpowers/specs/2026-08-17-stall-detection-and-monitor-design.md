@@ -248,6 +248,13 @@ regardless of elapsed time below the ceiling.
 > fleet or during a rolling image upgrade. Corroborating with the heartbeat
 > (already used by the orphan-PEL sweep) distinguishes "watchdog quiet" from
 > "process gone."
+>
+> **(amended post-implementation, issue #615)** The same path also requires
+> the VM's `pool:active` elapsed time to be at least
+> `activity_stale_min_elapsed` (default 600s). Below that floor, missing
+> activity plus missing heartbeat is not enough to infer a dead task — a
+> young VM may not have written either Redis key yet. `needs_reap` and
+> `elapsed > max_task_duration` bypass the floor.
 
 > **(amended post-implementation)** The `task.reaped` event's `data.reason`
 > field (§8) uses the honest, implementation-level vocabulary
@@ -462,6 +469,7 @@ fleet_health:
 pool:
   max_task_duration: 25200
   activity_stale_after: 300
+  activity_stale_min_elapsed: 600
 
 # monitor config (monitor.yaml / env)
 readers:
