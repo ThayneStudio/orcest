@@ -1375,7 +1375,8 @@ class TestIdleHeartbeatLiveness:
         proxmox.stop_vm.assert_not_called()
         proxmox.destroy_vm.assert_not_called()
         assert manager._idle_missing_heartbeat_since == {300: 1000.0}
-        redis.set_ex_raw.assert_any_call("pool:write-health", "1000", ttl=600)
+        redis.set_ex.assert_any_call("pool:write-health", "1000", ttl=600)
+        redis.set_ex_raw.assert_not_called()
 
     @patch("orcest.fleet.pool_manager.time")
     def test_replaces_idle_vm_after_continuous_writable_missing_dwell(self, mock_time):
@@ -1409,7 +1410,7 @@ class TestIdleHeartbeatLiveness:
     def test_write_failure_resets_complete_idle_dwell(self, mock_time):
         manager, proxmox, redis = _make_manager()
         redis._idle_set = {"300"}
-        redis.set_ex_raw.side_effect = [None, ConnectionError("OOM"), None, None]
+        redis.set_ex.side_effect = [None, ConnectionError("OOM"), None, None]
         mock_time.time.side_effect = [1000.0, 1200.0, 1400.0, 1699.0]
 
         manager._replace_idle_workers_missing_heartbeat()
@@ -1466,6 +1467,42 @@ class TestIdleHeartbeatLiveness:
         manager._replace_idle_workers_missing_heartbeat()
 
         assert manager._idle_liveness_breaker_open["codex:codex:"] is False
+
+    @patch("orcest.fleet.pool_manager.time")
+    def test_out_of_range_idle_vmid_does_not_abort_liveness_pass(self, mock_time):
+        """A stale pool:idle member below vm_id_start must not raise into reconcile()."""
+        manager, proxmox, redis = _make_manager()
+        redis._idle_set = {"299", "300"}
+        mock_time.time.side_effect = [1000.0, 1301.0, 1301.0]
+        mock_time.monotonic.side_effect = [0, 100]
+
+        manager._replace_idle_workers_missing_heartbeat()
+        manager._replace_idle_workers_missing_heartbeat()
+
+        proxmox.stop_vm.assert_called_once_with(300)
+        proxmox.destroy_vm.assert_called_once_with(300)
+        assert "299" in redis._idle_set
+        assert 299 not in manager._idle_missing_heartbeat_since
+
+    @patch("orcest.fleet.pool_manager.time")
+    def test_per_vm_heartbeat_read_failure_does_not_reset_global_dwell(self, mock_time):
+        """A single EXISTS blip must not wipe write-health or other VMs' dwell."""
+        manager, proxmox, redis = _make_manager()
+        redis._idle_set = {"300", "301"}
+        redis.exists.side_effect = [
+            False,  # 300 pass 1
+            False,  # 301 pass 1
+            ConnectionError("blip"),  # 300 pass 2
+            False,  # 301 pass 2
+        ]
+        mock_time.time.side_effect = [1000.0, 1200.0]
+
+        manager._replace_idle_workers_missing_heartbeat()
+        manager._replace_idle_workers_missing_heartbeat()
+
+        assert manager._idle_liveness_write_healthy_since == 1000.0
+        assert manager._idle_missing_heartbeat_since == {300: 1000.0, 301: 1000.0}
+        proxmox.stop_vm.assert_not_called()
 
 
 # ── _fill_pool ───────────────────────────────────────────────
