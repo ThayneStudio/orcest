@@ -2326,11 +2326,21 @@ def _publish_task_output(
     # the verbatim archive; live-tail only needs the first chunk.
     for entry in iter_capped_output_fields(fields):
         if raw_stream:
-            redis.xadd_capped_raw(stream, entry, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
-            redis.expire_raw(stream, _OUTPUT_STREAM_TTL_SECONDS)
+            redis.xadd_capped_expire_raw(
+                stream,
+                entry,
+                maxlen=_OUTPUT_STREAM_MAXLEN,
+                ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
+                approximate=False,
+            )
         else:
-            redis.xadd_capped(stream, entry, maxlen=_OUTPUT_STREAM_MAXLEN, approximate=False)
-            redis.expire(stream, _OUTPUT_STREAM_TTL_SECONDS)
+            redis.xadd_capped_expire(
+                stream,
+                entry,
+                maxlen=_OUTPUT_STREAM_MAXLEN,
+                ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
+                approximate=False,
+            )
 
 
 def _execute_task(

@@ -61,6 +61,17 @@ return encoded
 """
 
 
+_XADD_CAPPED_EXPIRE_SCRIPT = r"""
+local xargs = {}
+for i = 4, #ARGV do
+  table.insert(xargs, ARGV[i])
+end
+local entry_id = redis.call('XADD', KEYS[1], 'MAXLEN', ARGV[1], ARGV[2], '*', unpack(xargs))
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return entry_id
+"""
+
+
 class RedisClient:
     """Redis connection with stream helper methods."""
 
@@ -270,6 +281,84 @@ class RedisClient:
             approximate=approximate,
         )
         return entry_id
+
+    def _xadd_capped_expire(
+        self,
+        fq_stream: str,
+        fields: dict[str, str],
+        maxlen: int,
+        ttl_seconds: int,
+        *,
+        approximate: bool,
+    ) -> str:
+        if maxlen < 1:
+            raise ValueError(f"maxlen must be positive, got {maxlen}")
+        if not fields:
+            raise ValueError("fields must be a non-empty dict")
+        if ttl_seconds < 1:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
+        trim_op = "~" if approximate else "="
+        flattened_fields = [item for pair in fields.items() for item in pair]
+        entry_id = cast(
+            str,
+            self._client.eval(
+                _XADD_CAPPED_EXPIRE_SCRIPT,
+                1,
+                fq_stream,
+                trim_op,
+                str(maxlen),
+                str(ttl_seconds),
+                *flattened_fields,
+            ),
+        )
+        return entry_id
+
+    def xadd_capped_expire(
+        self,
+        stream: str,
+        fields: dict[str, str],
+        maxlen: int,
+        ttl_seconds: int,
+        *,
+        approximate: bool = True,
+    ) -> str:
+        """Atomically XADD (MAXLEN-capped) and EXPIRE a stream in one round trip.
+
+        Runs as a single Lua script server-side, so a fresh stream always ends
+        up with a TTL and a failed append can never leave a keyed stream with
+        no expiry -- there is no gap between the two commands for a crash or
+        network failure to land in.
+
+        Args:
+            stream: Stream name.
+            fields: Field dict to add.
+            maxlen: Maximum stream length. Must be positive.
+            ttl_seconds: TTL to set on the stream key after the append. Must
+                be positive.
+            approximate: When True (default), use Redis ``MAXLEN ~`` for cheaper
+                trimming. When False, trim exactly to ``maxlen``.
+        """
+        return self._xadd_capped_expire(
+            self._prefixed(stream), fields, maxlen, ttl_seconds, approximate=approximate
+        )
+
+    def xadd_capped_expire_raw(
+        self,
+        fq_stream: str,
+        fields: dict[str, str],
+        maxlen: int,
+        ttl_seconds: int,
+        *,
+        approximate: bool = True,
+    ) -> str:
+        """Same as ``xadd_capped_expire`` but for a fully-qualified stream name.
+
+        Used by multi-project workers that need to publish to streams with
+        different prefixes than the client's own prefix.
+        """
+        return self._xadd_capped_expire(
+            fq_stream, fields, maxlen, ttl_seconds, approximate=approximate
+        )
 
     def xread_after(
         self,

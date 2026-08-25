@@ -947,7 +947,7 @@ class TestExecuteTask:
         mock_runner.run.side_effect = run_with_output
 
         mock_redis = MagicMock()
-        mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xadd_capped_expire.return_value = "1-0"
 
         result = _execute_task(
             sample_task,
@@ -962,13 +962,13 @@ class TestExecuteTask:
 
         # Verify the callback published the line to Redis during execution
         stream = f"output:{local_worker_config.worker_id}"
-        mock_redis.xadd_capped.assert_any_call(
+        mock_redis.xadd_capped_expire.assert_any_call(
             stream,
             {"line": '{"role": "assistant"}\n', "task_id": sample_task.id},
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
         )
-        mock_redis.expire.assert_any_call(stream, _OUTPUT_STREAM_TTL_SECONDS)
 
     def test_stderr_callback_publishes_task_id_to_redis(
         self, local_worker_config, sample_task, mock_workspace
@@ -985,7 +985,7 @@ class TestExecuteTask:
         mock_runner.run.side_effect = run_with_stderr
 
         mock_redis = MagicMock()
-        mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xadd_capped_expire.return_value = "1-0"
 
         result = _execute_task(
             sample_task,
@@ -997,14 +997,12 @@ class TestExecuteTask:
         )
 
         assert result.status == ResultStatus.COMPLETED
-        mock_redis.xadd_capped.assert_any_call(
+        mock_redis.xadd_capped_expire.assert_any_call(
             f"output:{local_worker_config.worker_id}",
             {"line": "warning\n", "stream": "stderr", "task_id": sample_task.id},
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
-        )
-        mock_redis.expire.assert_any_call(
-            f"output:{local_worker_config.worker_id}", _OUTPUT_STREAM_TTL_SECONDS
         )
 
     def test_task_start_end_markers(self, local_worker_config, sample_task, mock_workspace):
@@ -1013,7 +1011,7 @@ class TestExecuteTask:
         mock_runner.run.return_value = _success_runner_result()
 
         mock_redis = MagicMock()
-        mock_redis.xadd_capped.return_value = "1-0"
+        mock_redis.xadd_capped_expire.return_value = "1-0"
 
         result = _execute_task(
             sample_task,
@@ -1027,10 +1025,11 @@ class TestExecuteTask:
         assert result.status == ResultStatus.COMPLETED
 
         stream = f"output:{local_worker_config.worker_id}"
-        # Filter to the output stream only: xadd_capped is also used to spool
-        # task lifecycle events (net.orcest.task.*) onto a separate "events"
-        # stream on the same mock, which would otherwise interleave here.
-        calls = [c for c in mock_redis.xadd_capped.call_args_list if c[0][0] == stream]
+        # xadd_capped_expire is only used for the output stream; task
+        # lifecycle events (net.orcest.task.*) go through xadd_capped on a
+        # separate "events" stream on the same mock, so no filtering is
+        # needed here beyond the stream-name check.
+        calls = [c for c in mock_redis.xadd_capped_expire.call_args_list if c[0][0] == stream]
 
         # First call should be task_start marker
         first_call_args = calls[0][0]
@@ -1070,7 +1069,7 @@ class TestExecuteTask:
 
         mock_runner.run.side_effect = run_with_output
         mock_redis = MagicMock()
-        mock_redis.xadd_capped_raw.return_value = "1-0"
+        mock_redis.xadd_capped_expire_raw.return_value = "1-0"
 
         result = _execute_task(
             task,
@@ -1083,7 +1082,7 @@ class TestExecuteTask:
 
         assert result.status == ResultStatus.COMPLETED
         stream = f"projectA:output:{local_worker_config.worker_id}"
-        mock_redis.xadd_capped_raw.assert_any_call(
+        mock_redis.xadd_capped_expire_raw.assert_any_call(
             stream,
             {
                 "type": "task_start",
@@ -1097,21 +1096,24 @@ class TestExecuteTask:
                 "branch": "fix-ci",
             },
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
         )
-        mock_redis.xadd_capped_raw.assert_any_call(
+        mock_redis.xadd_capped_expire_raw.assert_any_call(
             stream,
             {"line": "line one\n", "task_id": task.id},
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
         )
-        mock_redis.xadd_capped_raw.assert_any_call(
+        mock_redis.xadd_capped_expire_raw.assert_any_call(
             stream,
             {"line": "warning\n", "stream": "stderr", "task_id": task.id},
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
         )
-        mock_redis.xadd_capped_raw.assert_any_call(
+        mock_redis.xadd_capped_expire_raw.assert_any_call(
             stream,
             {
                 "type": "task_end",
@@ -1120,9 +1122,9 @@ class TestExecuteTask:
                 "worker_id": local_worker_config.worker_id,
             },
             maxlen=_OUTPUT_STREAM_MAXLEN,
+            ttl_seconds=_OUTPUT_STREAM_TTL_SECONDS,
             approximate=False,
         )
-        mock_redis.expire_raw.assert_any_call(stream, _OUTPUT_STREAM_TTL_SECONDS)
         output_calls = [
             call
             for call in mock_redis.xadd_capped.call_args_list
@@ -1178,12 +1180,12 @@ class TestExecuteTask:
         mock_redis = MagicMock()
 
         # task_start marker succeeds, then all output lines fail
-        def xadd_capped_side_effect(stream, data, **kwargs):
+        def xadd_capped_expire_side_effect(stream, data, **kwargs):
             if "line" in data:
                 raise ConnectionError("Redis down")
             return "1-0"
 
-        mock_redis.xadd_capped.side_effect = xadd_capped_side_effect
+        mock_redis.xadd_capped_expire.side_effect = xadd_capped_expire_side_effect
 
         with caplog.at_level(logging.WARNING):
             result = _execute_task(
@@ -1222,12 +1224,12 @@ class TestExecuteTask:
 
         mock_redis = MagicMock()
 
-        def xadd_capped_side_effect(stream, data, **kwargs):
+        def xadd_capped_expire_side_effect(stream, data, **kwargs):
             if "line" in data:
                 raise ConnectionError("Redis down")
             return "1-0"
 
-        mock_redis.xadd_capped.side_effect = xadd_capped_side_effect
+        mock_redis.xadd_capped_expire.side_effect = xadd_capped_expire_side_effect
 
         with caplog.at_level(logging.WARNING):
             result = _execute_task(
@@ -1308,13 +1310,13 @@ class TestExecuteTask:
         # Fail on task_start marker, succeed on everything else
         first_call = [True]
 
-        def xadd_capped_side_effect(stream, data, **kwargs):
+        def xadd_capped_expire_side_effect(stream, data, **kwargs):
             if first_call[0] and data.get("type") == "task_start":
                 first_call[0] = False
                 raise ConnectionError("Redis unavailable")
             return "1-0"
 
-        mock_redis.xadd_capped.side_effect = xadd_capped_side_effect
+        mock_redis.xadd_capped_expire.side_effect = xadd_capped_expire_side_effect
 
         result = _execute_task(
             sample_task,
