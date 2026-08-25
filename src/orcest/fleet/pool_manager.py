@@ -58,6 +58,7 @@ _POOL_DRAINING_KEY = "pool:draining"
 _POOL_DONE_PREFIX = "pool:done:"
 _POOL_PROVISIONING_KEY = "pool:provisioning"
 _POOL_AMBIGUOUS_CLONES_KEY = "pool:ambiguous-clones"
+_POOL_WRITE_HEALTH_KEY = "pool:write-health"
 _WORKER_HEARTBEAT_PREFIX = "workers:heartbeat:"
 # Workers can block on the issue stream for up to five seconds. A drain lease
 # must be visible for longer than that before the final PEL check.
@@ -92,6 +93,9 @@ REAP_REASON_ORPHAN_PEL = "orphan_pel"
 # (or initialised from `pool.template_vm_id` on first run for backward compat).
 _POOL_CURRENT_TEMPLATE_KEY = "pool:current_template_vmid"
 _PENDING_READ_BATCH_SIZE = 100
+_IDLE_HEARTBEAT_DWELL_SECONDS = 300.0
+_IDLE_LIVENESS_BREAKER_WINDOW_SECONDS = 15 * 60.0
+_IDLE_LIVENESS_BREAKER_LIMIT = 2
 # Global (cross-project, unprefixed) hash written by the worker-side liveness
 # tracker (see worker/liveness_tracker.py's _write_activity_record). Read here
 # with hgetall_raw -- never auto-prefixed -- to land in the same keyspace.
@@ -158,6 +162,10 @@ class PoolManager:
         self._owned_provisioning_vmids: set[int] = set()
         self._allocated_vmids: set[int] = set()
         self._reap_fences: dict[int, ReapFence] = {}
+        self._idle_missing_heartbeat_since: dict[int, float] = {}
+        self._idle_liveness_write_healthy_since: float | None = None
+        self._idle_liveness_breaker_events: dict[str, list[float]] = {}
+        self._idle_liveness_breaker_open: dict[str, bool] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -182,6 +190,7 @@ class PoolManager:
             # suppresses cloning entirely.
             ambiguous_blocked = self._reconcile_ambiguous_clones()
             provisioning_blocked = self._retry_provisioning_cleanups()
+            self._replace_idle_workers_missing_heartbeat()
             if ambiguous_blocked is not None and provisioning_blocked is not None:
                 self._fill_pool(blocked_vmids=ambiguous_blocked | provisioning_blocked)
             self._health_check()
@@ -286,6 +295,274 @@ class PoolManager:
                     exc_info=True,
                 )
 
+    def _replace_idle_workers_missing_heartbeat(self) -> None:
+        """Replace idle VMs whose worker liveness heartbeat never appears.
+
+        The decision is gated by a SET EX sentinel in the same Redis keyspace
+        (auto-prefixed) and command class as worker heartbeat writes. If that
+        write class is failing, heartbeat absence is unknown and the complete
+        dwell restarts after recovery.
+        """
+        now = time.time()
+        try:
+            self._redis.set_ex(_POOL_WRITE_HEALTH_KEY, str(int(now)), ttl=600)
+        except Exception:
+            self._reset_idle_liveness_dwell(
+                "Redis heartbeat-class write failed; idle heartbeat absence is unknown"
+            )
+            return
+
+        if self._idle_liveness_write_healthy_since is None:
+            self._idle_liveness_write_healthy_since = now
+            logger.info("Redis heartbeat-class writes recovered; idle heartbeat dwell restarted")
+
+        try:
+            idle_members = self._redis.smembers(_POOL_IDLE_KEY)
+        except Exception:
+            logger.warning(
+                "Failed to read idle pool state; skipping idle heartbeat liveness check",
+                exc_info=True,
+            )
+            return
+
+        idle_vmids: set[int] = set()
+        for member in idle_members:
+            try:
+                idle_vmids.add(int(member))
+            except (ValueError, TypeError):
+                continue
+
+        for vm_id in set(self._idle_missing_heartbeat_since) - idle_vmids:
+            logger.info(
+                "VM %d left pool:idle; clearing missing-heartbeat dwell state",
+                vm_id,
+            )
+            self._idle_missing_heartbeat_since.pop(vm_id, None)
+
+        self._refresh_idle_liveness_breakers(now)
+
+        write_dwell = now - self._idle_liveness_write_healthy_since
+        for vm_id in sorted(idle_vmids):
+            if not self._pool.contains_worker_vmid(vm_id):
+                logger.warning(
+                    "Skipping idle heartbeat liveness for VM %d: outside configured "
+                    "worker VMID range [%s, %s]",
+                    vm_id,
+                    self._pool.vm_id_start,
+                    self._pool.vm_id_end or "open",
+                )
+                self._idle_missing_heartbeat_since.pop(vm_id, None)
+                continue
+
+            worker_id = self._vm_id_to_worker_id(vm_id)
+            heartbeat_present = self._worker_heartbeat_present(worker_id)
+            if heartbeat_present is None:
+                logger.warning(
+                    "heartbeat read failed for idle VM %d; absence is unknown; "
+                    "leaving other idle VMs' dwell state intact",
+                    vm_id,
+                )
+                continue
+            if heartbeat_present:
+                if vm_id in self._idle_missing_heartbeat_since:
+                    logger.info(
+                        "VM %d published worker heartbeat; clearing missing-heartbeat dwell state",
+                        vm_id,
+                    )
+                self._idle_missing_heartbeat_since.pop(vm_id, None)
+                continue
+
+            missing_since = self._idle_missing_heartbeat_since.setdefault(vm_id, now)
+            missing_dwell = now - missing_since
+            if (
+                write_dwell < _IDLE_HEARTBEAT_DWELL_SECONDS
+                or missing_dwell < _IDLE_HEARTBEAT_DWELL_SECONDS
+            ):
+                continue
+
+            profile_key = self._idle_liveness_profile_key(vm_id)
+            if profile_key is None:
+                continue
+            if not self._idle_liveness_breaker_allows(profile_key, now):
+                continue
+
+            logger.warning(
+                "VM %d has been idle without a worker heartbeat for %.0fs after %.0fs "
+                "of healthy Redis heartbeat writes; replacing it",
+                vm_id,
+                missing_dwell,
+                write_dwell,
+            )
+            if self._drain_and_destroy_idle_vm(vm_id, log_context="idle heartbeat replacement"):
+                self._idle_missing_heartbeat_since.pop(vm_id, None)
+                self._record_idle_liveness_replacement(profile_key, now)
+
+    def _reset_idle_liveness_dwell(self, message: str) -> None:
+        had_state = self._idle_liveness_write_healthy_since is not None or bool(
+            self._idle_missing_heartbeat_since
+        )
+        self._idle_liveness_write_healthy_since = None
+        self._idle_missing_heartbeat_since.clear()
+        if had_state:
+            logger.warning("%s; restarted idle heartbeat dwell for all idle VMs", message)
+
+    def _idle_liveness_profile_key(self, vm_id: int) -> str | None:
+        if not self._pool.contains_worker_vmid(vm_id):
+            return None
+        try:
+            profile = self._pool.worker_profile_for_vmid(vm_id)
+        except ValueError:
+            logger.warning(
+                "Skipping idle heartbeat liveness for VM %d: worker profile is unavailable",
+                vm_id,
+                exc_info=True,
+            )
+            return None
+        return f"{profile.backend}:{profile.runner_type}:{profile.runner_mode}"
+
+    def _refresh_idle_liveness_breakers(self, now: float) -> None:
+        for profile_key in list(self._idle_liveness_breaker_events):
+            self._idle_liveness_breaker_events[profile_key] = [
+                ts
+                for ts in self._idle_liveness_breaker_events[profile_key]
+                if now - ts < _IDLE_LIVENESS_BREAKER_WINDOW_SECONDS
+            ]
+            if (
+                self._idle_liveness_breaker_open.get(profile_key)
+                and len(self._idle_liveness_breaker_events[profile_key])
+                < _IDLE_LIVENESS_BREAKER_LIMIT
+            ):
+                self._idle_liveness_breaker_open[profile_key] = False
+                logger.warning(
+                    "Idle heartbeat replacement breaker cleared for profile %s",
+                    profile_key,
+                )
+
+    def _idle_liveness_breaker_allows(self, profile_key: str, now: float) -> bool:
+        events = [
+            ts
+            for ts in self._idle_liveness_breaker_events.get(profile_key, [])
+            if now - ts < _IDLE_LIVENESS_BREAKER_WINDOW_SECONDS
+        ]
+        self._idle_liveness_breaker_events[profile_key] = events
+        if len(events) < _IDLE_LIVENESS_BREAKER_LIMIT:
+            return True
+        if not self._idle_liveness_breaker_open.get(profile_key):
+            self._idle_liveness_breaker_open[profile_key] = True
+            logger.warning(
+                "Idle heartbeat replacement breaker opened for profile %s "
+                "(%d replacements in %d seconds)",
+                profile_key,
+                _IDLE_LIVENESS_BREAKER_LIMIT,
+                int(_IDLE_LIVENESS_BREAKER_WINDOW_SECONDS),
+            )
+        return False
+
+    def _record_idle_liveness_replacement(self, profile_key: str, now: float) -> None:
+        events = self._idle_liveness_breaker_events.setdefault(profile_key, [])
+        events.append(now)
+
+    def _drain_and_destroy_idle_vm(self, vm_id: int, *, log_context: str) -> bool:
+        """Reserve an idle VM, quiesce, stop, and destroy it.
+
+        Shared by excess-idle fill, profiled layout drain, and idle-heartbeat
+        replacement so the post-stop pending-check retry and restore semantics
+        cannot drift.
+
+        Returns True if the VM was destroyed or queued for destroy retry.
+        Returns False if the drain was skipped or aborted and the VM restored.
+        """
+        worker_id = self._vm_id_to_worker_id(vm_id)
+        pending_consumers, pending_complete = self._consumers_with_pending_status()
+        if not pending_complete:
+            logger.warning(
+                "Skipping drain of VM %d (%s): pending-task state is unavailable",
+                vm_id,
+                log_context,
+            )
+            return False
+        if worker_id in pending_consumers:
+            logger.info(
+                "Skipping drain of VM %d (%s): it has a pending task "
+                "(claimed since active-detection ran this pass)",
+                vm_id,
+                log_context,
+            )
+            return False
+        # Reserve the worker before the final PEL check. Workers honor
+        # pool:draining before every XREADGROUP, which closes the race
+        # where an idle VM claimed work after our earlier snapshot.
+        try:
+            pipe = self._redis.pipeline()
+            pipe.srem(_POOL_IDLE_KEY, str(vm_id))
+            pipe.sadd(_POOL_DRAINING_KEY, worker_id)
+            pipe.execute()
+        except Exception:
+            logger.warning(
+                "Failed to reserve VM %d for draining (%s)",
+                vm_id,
+                log_context,
+                exc_info=True,
+            )
+            return False
+
+        time.sleep(_DRAIN_QUIESCE_SECONDS)
+        pending_consumers, pending_complete = self._consumers_with_pending_status()
+        if not pending_complete or worker_id in pending_consumers:
+            logger.info(
+                "Skipping drain of VM %d (%s): it claimed a task or final pending-state "
+                "inspection failed",
+                vm_id,
+                log_context,
+            )
+            try:
+                pipe = self._redis.pipeline()
+                pipe.srem(_POOL_DRAINING_KEY, worker_id)
+                pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(time.time()))
+                pipe.execute()
+            except Exception:
+                logger.error(
+                    "Failed to restore busy VM %d after drain race (%s)",
+                    vm_id,
+                    log_context,
+                    exc_info=True,
+                )
+            return False
+
+        logger.info("Draining VM %d (%s)", vm_id, log_context)
+        if not self._stop_vm(vm_id):
+            self._restore_worker_after_failed_drain(vm_id, worker_id)
+            return False
+        # Once stopped, no new claim is possible. This post-stop PEL
+        # check is the actual destruction commit point.
+        pending_consumers, pending_complete = self._post_stop_pending_status()
+        if not pending_complete:
+            logger.warning(
+                "Restarting drained VM %d (%s) and marking it active: post-stop "
+                "pending-state inspection failed after retries; the health "
+                "check will reap it once it exceeds max_task_duration, or "
+                "once its activity record and liveness heartbeat both go "
+                "stale/absent while work is still pending",
+                vm_id,
+                log_context,
+            )
+            self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
+            return False
+        if worker_id in pending_consumers and not self._coordinate_reaped_vm(
+            vm_id, reason=REAP_REASON_DRAIN_RACE
+        ):
+            logger.warning(
+                "Leaving drained VM %d (%s): late task claim could not be recovered",
+                vm_id,
+                log_context,
+            )
+            self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
+            return False
+        if self._destroy_stopped_vm(vm_id):
+            return True
+        self._mark_pending_destroy(vm_id)
+        return True
+
     def _fill_pool(self, blocked_vmids: set[int] | None = None) -> None:
         """Adjust pool to target size: clone new VMs or drain idle excess.
 
@@ -343,85 +620,8 @@ class PoolManager:
                     vm_id = int(member)
                 except (ValueError, TypeError):
                     continue
-                worker_id = self._vm_id_to_worker_id(vm_id)
-                pending_consumers, pending_complete = self._consumers_with_pending_status()
-                if not pending_complete:
-                    logger.warning(
-                        "Skipping drain of VM %d: pending-task state is unavailable",
-                        vm_id,
-                    )
-                    continue
-                if worker_id in pending_consumers:
-                    logger.info(
-                        "Skipping drain of VM %d: it has a pending task "
-                        "(claimed since active-detection ran this pass)",
-                        vm_id,
-                    )
-                    continue
-                # Reserve the worker before the final PEL check. Workers honor
-                # pool:draining before every XREADGROUP, which closes the race
-                # where an idle VM claimed work after our earlier snapshot.
-                try:
-                    pipe = self._redis.pipeline()
-                    pipe.srem(_POOL_IDLE_KEY, str(vm_id))
-                    pipe.sadd(_POOL_DRAINING_KEY, worker_id)
-                    pipe.execute()
-                except Exception:
-                    logger.warning("Failed to reserve VM %d for draining", vm_id, exc_info=True)
-                    continue
-                time.sleep(_DRAIN_QUIESCE_SECONDS)
-                pending_consumers, pending_complete = self._consumers_with_pending_status()
-                if not pending_complete or worker_id in pending_consumers:
-                    logger.info(
-                        "Skipping drain of VM %d: it claimed a task or final pending-state "
-                        "inspection failed",
-                        vm_id,
-                    )
-                    try:
-                        pipe = self._redis.pipeline()
-                        pipe.srem(_POOL_DRAINING_KEY, worker_id)
-                        pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(time.time()))
-                        pipe.execute()
-                    except Exception:
-                        logger.error(
-                            "Failed to restore busy VM %d after drain race", vm_id, exc_info=True
-                        )
-                    continue
-                logger.info("Draining excess idle VM %d", vm_id)
-                if not self._stop_vm(vm_id):
-                    self._restore_worker_after_failed_drain(vm_id, worker_id)
-                    continue
-                # Once stopped, no new claim is possible. This post-stop PEL
-                # check is the actual destruction commit point.
-                pending_consumers, pending_complete = self._post_stop_pending_status()
-                if not pending_complete:
-                    logger.warning(
-                        "Restarting drained VM %d and marking it active: post-stop "
-                        "pending-state inspection failed after retries; the health "
-                        "check will reap it once it exceeds max_task_duration, or "
-                        "once its activity record and liveness heartbeat both go "
-                        "stale/absent while work is still pending",
-                        vm_id,
-                    )
-                    self._restore_worker_after_failed_drain(
-                        vm_id, worker_id, restart=True, active=True
-                    )
-                    continue
-                if worker_id in pending_consumers and not self._coordinate_reaped_vm(
-                    vm_id, reason=REAP_REASON_DRAIN_RACE
-                ):
-                    logger.warning(
-                        "Leaving drained VM %d: late task claim could not be recovered",
-                        vm_id,
-                    )
-                    self._restore_worker_after_failed_drain(
-                        vm_id, worker_id, restart=True, active=True
-                    )
-                    continue
-                if self._destroy_stopped_vm(vm_id):
+                if self._drain_and_destroy_idle_vm(vm_id, log_context="excess idle"):
                     drained += 1
-                else:
-                    self._mark_pending_destroy(vm_id)
 
     def _fill_profiled_pool(self, blocked_vmids: set[int] | None = None) -> None:
         """Reconcile heterogeneous workers to deterministic VMID/profile slots."""
@@ -492,78 +692,8 @@ class PoolManager:
         """Drain the supplied out-of-layout idle workers in deterministic order."""
         drained = 0
         for vm_id in idle_vmids:
-            worker_id = self._vm_id_to_worker_id(vm_id)
-            pending_consumers, pending_complete = self._consumers_with_pending_status()
-            if not pending_complete:
-                logger.warning(
-                    "Skipping drain of VM %d: pending-task state is unavailable",
-                    vm_id,
-                )
-                continue
-            if worker_id in pending_consumers:
-                logger.info(
-                    "Skipping drain of VM %d: it has a pending task "
-                    "(claimed since active-detection ran this pass)",
-                    vm_id,
-                )
-                continue
-            try:
-                pipe = self._redis.pipeline()
-                pipe.srem(_POOL_IDLE_KEY, str(vm_id))
-                pipe.sadd(_POOL_DRAINING_KEY, worker_id)
-                pipe.execute()
-            except Exception:
-                logger.warning("Failed to reserve VM %d for draining", vm_id, exc_info=True)
-                continue
-            time.sleep(_DRAIN_QUIESCE_SECONDS)
-            pending_consumers, pending_complete = self._consumers_with_pending_status()
-            if not pending_complete or worker_id in pending_consumers:
-                logger.info(
-                    "Skipping drain of VM %d: it claimed a task or final pending-state "
-                    "inspection failed",
-                    vm_id,
-                )
-                try:
-                    pipe = self._redis.pipeline()
-                    pipe.srem(_POOL_DRAINING_KEY, worker_id)
-                    pipe.hset(_POOL_ACTIVE_KEY, str(vm_id), str(time.time()))
-                    pipe.execute()
-                except Exception:
-                    logger.error(
-                        "Failed to restore busy VM %d after drain race", vm_id, exc_info=True
-                    )
-                continue
-            logger.info("Draining out-of-layout idle VM %d", vm_id)
-            if not self._stop_vm(vm_id):
-                self._restore_worker_after_failed_drain(vm_id, worker_id)
-                continue
-            # Once stopped, no new claim is possible. This post-stop PEL
-            # check is the actual destruction commit point.
-            pending_consumers, pending_complete = self._post_stop_pending_status()
-            if not pending_complete:
-                logger.warning(
-                    "Restarting drained VM %d and marking it active: post-stop "
-                    "pending-state inspection failed after retries; the health "
-                    "check will reap it once it exceeds max_task_duration, or "
-                    "once its activity record and liveness heartbeat both go "
-                    "stale/absent while work is still pending",
-                    vm_id,
-                )
-                self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
-                continue
-            if worker_id in pending_consumers and not self._coordinate_reaped_vm(
-                vm_id, reason=REAP_REASON_DRAIN_RACE
-            ):
-                logger.warning(
-                    "Leaving drained VM %d: late task claim could not be recovered",
-                    vm_id,
-                )
-                self._restore_worker_after_failed_drain(vm_id, worker_id, restart=True, active=True)
-                continue
-            if self._destroy_stopped_vm(vm_id):
+            if self._drain_and_destroy_idle_vm(vm_id, log_context="out-of-layout idle"):
                 drained += 1
-            else:
-                self._mark_pending_destroy(vm_id)
         return drained
 
     def _mark_pending_destroy(self, vm_id: int) -> None:
@@ -1931,8 +2061,9 @@ class PoolManager:
     def _post_stop_pending_status(self) -> tuple[set[str], bool]:
         """Post-stop pending check with a bounded retry on incomplete reads.
 
-        Called at the destruction commit point of both drain loops, after the
-        VM is provably stopped (so no new claim can appear between attempts).
+        Called at the destruction commit point of ``_drain_and_destroy_idle_vm``,
+        after the VM is provably stopped (so no new claim can appear between
+        attempts).
         The incomplete branch there is expensive — it restarts the VM and
         files it into ``pool:active``, which nothing transitions back to
         idle — so a transient Redis failure gets a few quick retries before
