@@ -548,7 +548,7 @@ def _status_once(redis: RedisClient) -> None:
                 )
             console.print(ph_table)
 
-    # issue #613: render PoolManager's canonical stranded-stream snapshots.
+    # issue #613/#639: render PoolManager's canonical per-stream snapshots.
     # This CLI never recomputes stream health, only displays what was published.
     stream_health = getattr(snapshot, "stream_health", None)
     if stream_health:
