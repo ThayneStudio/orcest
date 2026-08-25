@@ -251,6 +251,18 @@ class TestGenerateEnvFile:
 
         assert "CLAUDER_API_KEY='clauder-oauth-token'" in env
 
+    def test_generate_env_file_emits_claude_oauth_token_not_anthropic_api_key(self):
+        """Fleet runtime .env files use CLAUDE_CODE_OAUTH_TOKEN, never ANTHROPIC_API_KEY."""
+        env = generate_env_file(
+            github_token="t",
+            key_prefix="p",
+            project_name="p",
+            claude_tokens=["oauth-from-fleet"],
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN='oauth-from-fleet'" in env
+        assert "CLAUDE_CODE_OAUTH_TOKENS='oauth-from-fleet'" in env
+        assert "ANTHROPIC_API_KEY" not in env
+
 
 class TestGenerateOrchestratorConfig:
     def test_basic_structure(self):

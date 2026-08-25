@@ -44,7 +44,7 @@ labels:
 #
 providers:
   - provider: claude
-    credential: ""                 # falls back via _PROVIDER_ENV_CANDIDATES or CLAUDE_CODE_OAUTH_TOKEN
+    credential: ""                 # falls back to CLAUDE_CODE_OAUTH_TOKEN (not ANTHROPIC_API_KEY)
     model: claude-3-5-sonnet-20241022
   # - provider: grok
   #   credential: ""               # falls back to XAI_API_KEY / GROK_API_KEY (see config.py)
