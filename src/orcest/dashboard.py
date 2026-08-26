@@ -419,6 +419,23 @@ def _format_duration(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+def _format_stranded_stream_banner(h: ProviderStreamHealth) -> str:
+    """Rich-markup warning for a stranded provider stream.
+
+    ``repr()`` runs first so the quoted stream name is a Python literal, then
+    ``rich_escape`` makes that literal safe for markup. Escaping first and then
+    applying ``!r`` doubles backslashes (e.g. ``tasks:xai\\\\[test\\\\]``) and
+    can re-expose brackets to Rich markup parsing.
+    """
+    return (
+        f"STRANDED provider stream {rich_escape(repr(h.stream))} "
+        f"(provider={rich_escape(h.provider)}): pending={h.pending} lag={h.lag} "
+        f"registered_consumers={h.registered_consumers} "
+        f"live_consumers={h.live_consumers} -- work is queued but no consumer "
+        "has a live worker heartbeat"
+    )
+
+
 def truncate(s: str, n: int = 60) -> str:
     """Truncate string to at most n characters (including '...' suffix)."""
     return s[: n - 3] + "..." if len(s) > n else s
@@ -746,14 +763,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             banner = self.query_one("#stream-health-banner", Static)
             stranded = [h for h in snapshot.stream_health if h.state == StreamHealthState.STRANDED]
             if stranded:
-                lines = [
-                    f"STRANDED provider stream {rich_escape(h.stream)!r} "
-                    f"(provider={rich_escape(h.provider)}): pending={h.pending} lag={h.lag} "
-                    f"registered_consumers={h.registered_consumers} "
-                    f"live_consumers={h.live_consumers} -- work is queued but no consumer "
-                    "has a live worker heartbeat"
-                    for h in stranded
-                ]
+                lines = [_format_stranded_stream_banner(h) for h in stranded]
                 banner.update("\n".join(lines))
                 banner.add_class("visible")
             else:
