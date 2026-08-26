@@ -809,7 +809,7 @@ class TestRestartRestore:
         manager._check_stream_health()
         assert _read_state(rc)["state"] == "healthy"
 
-    def test_redis_restore_read_failure_does_not_abort_or_bypass_dwell(
+    def test_redis_restore_read_failure_does_not_abort_or_clobber_snapshot(
         self, fake_redis_client, monkeypatch, mocker
     ):
         rc = fake_redis_client
@@ -826,8 +826,11 @@ class TestRestartRestore:
         )
         monkeypatch.setattr(time, "time", lambda: now)
         manager._check_stream_health()
-        assert _read_state(rc)["state"] == "healthy"
-        assert _read_state(rc, issue=True)["state"] == "healthy"
+        state = _read_state(rc)
+        assert state["state"] == "stranded"
+        assert state["transitioned_at"] == health.transitioned_at
+        assert _read_state(rc, issue=True) is None
+        assert manager._stream_health_tracker.has_state("claude", "test:tasks:claude") is False
 
     def test_restore_read_failure_on_pr_still_evaluates_issue(
         self, fake_redis_client, monkeypatch, mocker
@@ -847,4 +850,87 @@ class TestRestartRestore:
         mocker.patch.object(manager, "_read_stream_health_snapshot_record", side_effect=_read)
         manager._check_stream_health()
         assert _read_state(rc, issue=True)["state"] == "stranded"
+        assert _read_state(rc) is None
+
+    def test_transient_restore_read_failure_retries_committed_snapshot(
+        self, fake_redis_client, monkeypatch, mocker
+    ):
+        rc = fake_redis_client
+        _strand(rc, _WORKER_ID, issue=False)
+
+        manager, _ = _build(rc, dwell_seconds=0)
+        now = 1_700_000_000.0
+        monkeypatch.setattr(time, "time", lambda: now)
+        manager._check_stream_health()
+        first = _read_state(rc)
+        assert first["state"] == "stranded"
+        transitioned_at = first["transitioned_at"]
+
+        restarted, _ = _build(rc, dwell_seconds=300)
+        real = restarted._read_stream_health_snapshot_record
+        fail_pr = {"value": True}
+
+        def _read(key: str):
+            if fail_pr["value"] and key == stream_health_snapshot_key("claude"):
+                return None
+            return real(key)
+
+        mocker.patch.object(restarted, "_read_stream_health_snapshot_record", side_effect=_read)
+        monkeypatch.setattr(time, "time", lambda: now + 10)
+        restarted._check_stream_health()
+        blip = _read_state(rc)
+        assert blip["state"] == "stranded"
+        assert blip["transitioned_at"] == transitioned_at
+        assert restarted._stream_health_tracker.has_state("claude", "test:tasks:claude") is False
+
+        fail_pr["value"] = False
+        monkeypatch.setattr(time, "time", lambda: now + 20)
+        restarted._check_stream_health()
+        restored = _read_state(rc)
+        assert restored["state"] == "stranded"
+        assert restored["transitioned_at"] == transitioned_at
+        assert restored["pending"] == 1
+        assert _read_state(rc, issue=True)["state"] == "healthy"
+
+    def test_restore_retry_gives_up_after_freshness_window(
+        self, fake_redis_client, monkeypatch, mocker
+    ):
+        rc = fake_redis_client
+        _strand(rc, _WORKER_ID, issue=False)
+        now = 1_700_000_000.0
+        health = _stranded_snapshot(observed_at=now - 10, transitioned_at=now - 400)
+        _put_committed_snapshot(rc, health)
+
+        manager, _ = _build(rc, dwell_seconds=300)
+        real = manager._read_stream_health_snapshot_record
+        fail = {"value": True}
+        reads = {"n": 0}
+
+        def _read(key: str):
+            reads["n"] += 1
+            if fail["value"]:
+                return None
+            return real(key)
+
+        mocker.patch.object(manager, "_read_stream_health_snapshot_record", side_effect=_read)
+        monkeypatch.setattr(time, "time", lambda: now)
+        manager._check_stream_health()
+        assert _read_state(rc)["state"] == "stranded"
+        reads_after_first = reads["n"]
+        assert reads_after_first >= 1
+
+        monkeypatch.setattr(time, "time", lambda: now + _STREAM_HEALTH_TTL_SECONDS)
+        manager._check_stream_health()
+        assert _read_state(rc)["state"] == "stranded"
+        assert reads["n"] > reads_after_first
+
+        monkeypatch.setattr(time, "time", lambda: now + _STREAM_HEALTH_TTL_SECONDS + 1)
+        manager._check_stream_health()
         assert _read_state(rc)["state"] == "healthy"
+        reads_after_give_up = reads["n"]
+
+        fail["value"] = False
+        monkeypatch.setattr(time, "time", lambda: now + _STREAM_HEALTH_TTL_SECONDS + 2)
+        manager._check_stream_health()
+        assert _read_state(rc)["state"] == "healthy"
+        assert reads["n"] == reads_after_give_up
