@@ -13,6 +13,7 @@ import redis as redis_lib
 from orcest.dashboard import (
     DeadLetterEntry,
     _format_duration,
+    _format_stranded_stream_banner,
     _format_ttl,
     _status_style,
     discover_workers,
@@ -916,6 +917,53 @@ class TestDashboardStreamHealthRendering:
                 assert "visible" not in banner.classes
                 table = app.query_one("#stream-health-table", DataTable)
                 assert table.row_count == 1  # placeholder row, no crash
+
+        _run_async(scenario())
+
+    def test_stranded_banner_quotes_then_escapes_bracketed_stream_names(self):
+        """repr() first, then rich_escape, so [ and ] stay quoted literals.
+
+        The previous ``rich_escape(h.stream)!r`` order doubled backslashes
+        (``tasks:xai\\\\[test\\\\]``) and could re-expose brackets to Rich
+        markup parsing (issue #644).
+        """
+        from rich.markup import escape as rich_escape
+        from rich.text import Text
+
+        stream = "tasks:xai[test]"
+        health = _stream_health("xai", stream, StreamHealthState.STRANDED)
+
+        markup = _format_stranded_stream_banner(health)
+
+        assert rich_escape(repr(stream)) in markup
+        assert f"{rich_escape(stream)!r}" not in markup
+        assert r"\\[" not in markup
+        assert r"\\]" not in markup
+
+        plain = Text.from_markup(markup).plain
+        assert repr(stream) in plain
+        assert r"\[" not in plain
+        assert r"\]" not in plain
+
+    def test_stranded_stream_name_with_brackets_renders_cleanly(self, fake_redis_client):
+        from textual.widgets import Static
+
+        stream = "tasks:xai[test]"
+        health = _publish_stream_health(
+            fake_redis_client, "xai", stream, StreamHealthState.STRANDED
+        )
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                banner = app.query_one("#stream-health-banner", Static)
+                assert "visible" in banner.classes
+                expected = _format_stranded_stream_banner(health)
+                assert expected in banner.content
+                assert repr(stream) in str(banner.visual)
+                assert r"\[" not in str(banner.visual)
+                assert r"\\[" not in banner.content
 
         _run_async(scenario())
 
