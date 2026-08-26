@@ -117,7 +117,8 @@ _ACTIVITY_KEY_PREFIX = "workers:activity:"
 # TTL comfortably longer than one reconcile interval so a snapshot survives
 # normal polling gaps but expires (rather than lying stale forever) if the
 # pool manager stops publishing entirely. After a process restart only a
-# validated committed STRANDED snapshot may seed the in-memory tracker.
+# validated committed STRANDED snapshot may seed the in-memory tracker,
+# retried after a transient Redis read until this freshness window elapses.
 _STREAM_HEALTH_TTL_SECONDS = 900
 
 # VM naming convention
@@ -188,6 +189,11 @@ class PoolManager:
         self._stream_health_tracker = ProviderStreamHealthTracker(
             dwell_seconds=float(self._pool.stream_health_dwell_seconds)
         )
+        # Per-identity timestamp of the first post-restart restore attempt.
+        # evaluate() must not suppress retries: a transient Redis read
+        # failure retries until Redis is readable or this age exceeds the
+        # snapshot freshness window (_STREAM_HEALTH_TTL_SECONDS).
+        self._stream_health_restore_first_attempt: dict[tuple[str, str], float] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -2886,7 +2892,10 @@ class PoolManager:
         On the first pass after process start, a valid committed STRANDED
         snapshot may seed the tracker so a still-stranded stream is not
         muted behind a fresh dwell. Current stream inputs are always read
-        before that seed is allowed to affect what is published.
+        before that seed is allowed to affect what is published. A
+        transient Redis read failure does not record local tracker state
+        or publish over the committed snapshot; restore is retried until
+        Redis is readable or the snapshot freshness window has passed.
         """
         if not self._pool.stream_health_enabled:
             return
@@ -2918,7 +2927,8 @@ class PoolManager:
         pending, lag, registered, live, read_error = self._read_stream_health_inputs(
             stream, heartbeat_cache
         )
-        self._restore_committed_stream_health(provider, stream, now, issue=issue)
+        if not self._restore_committed_stream_health(provider, stream, now, issue=issue):
+            return
         snapshot, transition = self._stream_health_tracker.evaluate(
             provider,
             stream,
@@ -2957,12 +2967,21 @@ class PoolManager:
         now: float,
         *,
         issue: bool,
-    ) -> None:
+    ) -> bool:
         """Best-effort seed of committed STRANDED state after a restart.
 
-        Invalid, stale, HEALTHY, and unreadable snapshots are treated as
+        Returns True when this identity's restore decision is complete and
+        evaluation may proceed. Returns False when a transient Redis read
+        failure should be retried later without recording tracker state or
+        publishing over the committed snapshot.
+
+        Invalid, stale, HEALTHY, and missing snapshots are treated as
         absent so dwell still applies. Redis failures here must never abort
-        evaluation of the current stream inputs.
+        evaluation of other streams.
+
+        Restore retries until Redis is readable or the snapshot freshness
+        window has passed, so a blip on the first pass cannot permanently
+        suppress a still-valid committed STRANDED snapshot.
 
         SECURITY: this path is forgeable under the shared-credential threat
         model. All workers share one Redis password (accepted risk, 2026-06
@@ -2975,19 +2994,29 @@ class PoolManager:
         remediation is per-worker Redis ACLs, tracked separately.
         """
         if self._stream_health_tracker.has_state(provider, stream):
-            return
+            return True
+        identity = (provider, stream)
+        first_attempt = self._stream_health_restore_first_attempt.setdefault(identity, now)
+        if now - first_attempt > float(_STREAM_HEALTH_TTL_SECONDS):
+            logger.warning(
+                "Giving up stream health restore for provider %s stream=%s after "
+                "freshness window; continuing from in-memory state",
+                provider,
+                stream,
+            )
+            return True
         try:
             key = stream_health_snapshot_key(provider, issue=issue)
             record = self._read_stream_health_snapshot_record(key)
             if record is None:
-                return
+                return False
             payload, ttl_seconds = record
             if payload is None:
-                return
+                return True
             try:
                 data = json.loads(payload)
             except (TypeError, ValueError):
-                return
+                return True
             snapshot = parse_committed_stranded_snapshot(
                 data,
                 expected_provider=provider,
@@ -2997,16 +3026,18 @@ class PoolManager:
                 max_age_seconds=float(_STREAM_HEALTH_TTL_SECONDS),
             )
             if snapshot is None:
-                return
+                return True
             self._stream_health_tracker.restore_committed(snapshot)
+            return True
         except Exception:
             logger.warning(
                 "Failed to restore stream health for provider %s stream=%s; "
-                "continuing from in-memory state",
+                "will retry until Redis is readable or the freshness window elapses",
                 provider,
                 stream,
                 exc_info=True,
             )
+            return False
 
     def _read_stream_health_snapshot_record(self, key: str) -> tuple[str | None, int] | None:
         """Return ``(payload, ttl_seconds)`` for *key*, or ``None`` on Redis failure.
@@ -3014,7 +3045,8 @@ class PoolManager:
         A missing key is ``(None, ttl)`` with Redis TTL ``-2``. A persistent
         key (no expire) is a payload paired with TTL ``-1``; the parser
         treats both as absent. A Redis exception is ``None`` so the caller
-        falls back to dwell rather than aborting reconciliation.
+        can retry restore rather than treating the snapshot as absent or
+        aborting reconciliation.
         """
         try:
             pipe = self._redis.client.pipeline(transaction=False)
@@ -3023,7 +3055,7 @@ class PoolManager:
             raw, ttl = pipe.execute()
         except Exception:
             logger.warning(
-                "Failed to read stream health snapshot %s; continuing without restore",
+                "Failed to read stream health snapshot %s; restore will retry",
                 key,
                 exc_info=True,
             )
