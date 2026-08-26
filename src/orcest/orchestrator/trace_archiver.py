@@ -121,20 +121,20 @@ def _parse_last_seen(value: str) -> datetime | None:
         return None
 
 
-def cursor_state_path(archive_path: Path, project: str) -> Path:
-    """Return the collision-free cursor state path for ``project`` key prefix."""
+def cursor_state_path(archive_path: Path, key_prefix: str) -> Path:
+    """Return the collision-free cursor state path for a raw Redis key prefix."""
     return (
         archive_path
         / _CURSOR_ROOT_DIR
         / _CURSOR_NAMESPACE_VERSION
-        / _cursor_namespace(project)
+        / _cursor_namespace(key_prefix)
         / _CURSOR_FILENAME
     )
 
 
-def legacy_cursor_state_path(archive_path: Path, project: str) -> Path:
-    """Return the pre-v2 cursor path used for migration only."""
-    return archive_path / _legacy_project_dirname(project) / _CURSOR_FILENAME
+def legacy_cursor_state_path(archive_path: Path, key_prefix: str) -> Path:
+    """Return the pre-v2 cursor path for a raw Redis key prefix, used for migration only."""
+    return archive_path / _legacy_project_dirname(key_prefix) / _CURSOR_FILENAME
 
 
 def _cursor_namespace(key_prefix: str) -> str:
