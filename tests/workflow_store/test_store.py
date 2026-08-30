@@ -331,8 +331,17 @@ def test_transaction_fault_injection_boundaries_and_wal_recovery(tmp_path: Path)
         assert recovered.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
         assert recovered.conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
 
+        ack_delivered = False
+
+        def mark_ack() -> None:
+            nonlocal ack_delivered
+            ack_delivered = True
+
         with pytest.raises(TransactionFault):
-            with recovered.transaction(fault=FaultInjectionPoint.BEFORE_RESPONSE_ACK):
+            with recovered.transaction(
+                fault=FaultInjectionPoint.BEFORE_RESPONSE_ACK,
+                before_response_ack=mark_ack,
+            ):
                 recovered.record_durable_operation(
                     operation_id=OPERATION_ID,
                     operation_kind="test-operation",
@@ -343,6 +352,7 @@ def test_transaction_fault_injection_boundaries_and_wal_recovery(tmp_path: Path)
                     response_payload={"ok": True, "replayed": False},
                     response_http_status=200,
                 )
+        assert ack_delivered is False
         replayed = recovered.record_durable_operation(
             operation_id=OPERATION_ID,
             operation_kind="test-operation",

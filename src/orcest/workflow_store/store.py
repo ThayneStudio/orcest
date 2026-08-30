@@ -817,10 +817,10 @@ class RunStore:
             committed = True
             if fault is FaultInjectionPoint.AFTER_COMMIT:
                 raise TransactionFault(FaultInjectionPoint.AFTER_COMMIT.value)
-            if before_response_ack is not None:
-                before_response_ack()
             if fault is FaultInjectionPoint.BEFORE_RESPONSE_ACK:
                 raise TransactionFault(FaultInjectionPoint.BEFORE_RESPONSE_ACK.value)
+            if before_response_ack is not None:
+                before_response_ack()
         except Exception:
             if not committed:
                 self.conn.rollback()
