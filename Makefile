@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration test-stress check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock lock-dev check-lock-dev build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit test-integration test-stress check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint lint-check typecheck format lock lock-dev check-lock-dev check-fast check-full build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
 PIP_COMPILE_CMD ?= pip-compile
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
@@ -78,6 +78,8 @@ audit-dashboard: check-dashboard-tracked
 # Compatibility entry point: unit tests, then managed Redis-backed suites,
 # then dashboard. Each Redis-backed target gets its own invocation-scoped
 # Compose project; nothing here starts or stops docker-compose.redis.yml.
+# Prefer check-fast / check-full for the canonical DAG; this target does not
+# run lint-check or typecheck.
 test:
 	$(MAKE) test-unit
 	$(MAKE) test-integration
@@ -92,9 +94,18 @@ test-integration:
 test-stress:
 	python3 -m tests.harness.supervisor python3 -m pytest -m stress --cov=src/orcest --cov-report=term-missing
 
+# Fast local aggregate. No Redis, dashboard, or image builds.
+check-fast: lint-check typecheck test-unit
+
+# Full local aggregate: check-fast plus managed Redis suites and dashboard.
+# Root/dashboard image builds and dashboard Compose/image smokes stay CI-only
+# until their tags and ports are worktree-safe.
+check-full: check-fast test-integration test-stress test-dashboard
+
 # Manual-development helpers for the shared docker-compose.redis.yml service.
-# Correctness targets (test, test-unit, test-integration, test-stress, test-dashboard)
-# must not depend on these.
+# Correctness targets (test, test-unit, test-integration, test-stress,
+# test-dashboard, lint-check, typecheck, check-fast, check-full) must not
+# depend on these.
 redis-up:
 	docker compose -f docker-compose.redis.yml up -d redis
 	@echo "Waiting for Redis..."
@@ -106,6 +117,13 @@ redis-down:
 
 lint:
 	ruff check src/ tests/
+
+lint-check:
+	ruff check src/ tests/
+	ruff format --check src/ tests/
+
+typecheck:
+	mypy src/
 
 format:
 	ruff format src/ tests/

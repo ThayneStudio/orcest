@@ -46,8 +46,7 @@ jobs:
       - run: pip install -r requirements-dev.lock
       - run: pip install --no-deps --no-build-isolation -e .
       - run: make check-lock-dev
-      - run: ruff check src/ tests/
-      - run: ruff format --check src/ tests/
+      - run: make lint-check
 
   typecheck:
     runs-on: [self-hosted, linux]
@@ -72,7 +71,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -r requirements-dev.lock
       - run: pip install --no-deps --no-build-isolation -e .
-      - run: mypy src/
+      - run: make typecheck
 
   test:
     runs-on: [self-hosted, linux]
@@ -97,7 +96,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -r requirements-dev.lock
       - run: pip install --no-deps --no-build-isolation -e .
-      - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x --cov=src/orcest --cov-report=term-missing
+      - run: make test-unit
 
   dashboard:
     runs-on: [self-hosted, linux]
@@ -163,7 +162,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -r requirements-dev.lock
       - run: pip install --no-deps --no-build-isolation -e .
-      - run: python3 -m tests.harness.supervisor python3 -m pytest -m integration -x
+      - run: make test-integration
 
   docker:
     runs-on: [self-hosted, linux]
