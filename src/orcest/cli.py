@@ -14,6 +14,7 @@ import redis as redis_lib
 from rich.console import Console
 from rich.table import Table
 
+from orcest.cli_project import project as project_cli
 from orcest.dashboard import fetch_snapshot, truncate
 from orcest.fleet.cli import fleet
 from orcest.shared.models import (
@@ -1411,6 +1412,7 @@ def monitor_cmd(config_path: str) -> None:
 
 
 main.add_command(fleet)
+main.add_command(project_cli)
 
 
 # ── check commands ──────────────────────────────────────────

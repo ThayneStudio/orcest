@@ -57,6 +57,8 @@ __all__ = [
     "domain_digest",
     "generic_domain_digest",
     "bare_canonical_digest",
+    "CONFIG_BUNDLE_DOMAIN_LINE",
+    "config_bundle_hash",
     "WORKFLOW_BLOB_DOMAIN",
     "workflow_blob_digest",
     "CAPABILITY_PUBLIC_KEY_DOMAIN",
@@ -153,6 +155,29 @@ def generic_domain_digest(domain_tag: str, value: Any) -> str:
 
 
 # --- Explicit byte-level formulas from the wiki -----------------------------
+
+CONFIG_BUNDLE_DOMAIN_LINE = "orcest-config-bundle/v1\n"
+
+
+def config_bundle_hash(normalized_bundle_json: Any) -> str:
+    """The repository-configuration workflow hash (``docs/wiki/repository-configuration.md``,
+    "Normalization and bundle hash").
+
+    This is the one exception to the two shapes described in this module's
+    docstring: the wiki's exact formula prepends a literal newline-terminated
+    domain line to the canonical JSON bytes with no ``0x00`` separator and no
+    length prefix, rather than either :func:`domain_digest`'s or
+    :func:`generic_domain_digest`'s envelope::
+
+        "sha256:" + lowercase_hex(
+          SHA256(UTF8("orcest-config-bundle/v1\\n") || canonical_json_bytes)
+        )
+    """
+    payload = CONFIG_BUNDLE_DOMAIN_LINE.encode("utf-8") + canonical_json_bytes(
+        normalized_bundle_json
+    )
+    return content_digest(payload)
+
 
 WORKFLOW_BLOB_DOMAIN = "orcest-workflow-blob-v1"
 
