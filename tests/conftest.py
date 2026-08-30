@@ -1,9 +1,7 @@
 """Shared fixtures for all test modules."""
 
-import os
 import sys
 import types
-from urllib.parse import urlparse
 
 import fakeredis
 import pytest
@@ -21,6 +19,13 @@ from orcest.shared.config import (
 )
 from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
+from tests.harness.proof import (
+    RedisProofError,
+    assert_invocation_proof,
+    require_test_redis_proof,
+    setup_real_redis_client,
+    teardown_real_redis_client,
+)
 
 # --- Marker registration ---
 
@@ -217,72 +222,60 @@ def gh_mock(mocker):
 # --- Real Redis fixtures (shared by integration and stress tests) ---
 
 
-def _get_redis_url():
-    return os.environ.get("ORCEST_TEST_REDIS_URL", "redis://localhost:6379/15")
-
-
-def _parse_redis_url(url: str) -> dict:
-    """Parse a Redis URL into host/port/db/password components."""
-    parsed = urlparse(url)
-    return {
-        "host": parsed.hostname or "localhost",
-        "port": parsed.port or 6379,
-        "db": int(parsed.path.lstrip("/") or "15"),
-        "password": parsed.password,
-    }
-
-
 @pytest.fixture(scope="session")
 def _check_redis():
-    """Skip all integration/stress tests if Redis is not available."""
-    url = _get_redis_url()
-    r = redis.from_url(url)
+    """Fail closed unless this invocation's Redis URL and nonce are proven."""
     try:
-        r.ping()
-    except redis.ConnectionError:
-        pytest.skip("Real Redis not available. Start Redis or set ORCEST_TEST_REDIS_URL.")
-    finally:
-        r.close()
+        url, nonce, _parts = require_test_redis_proof()
+        assert_invocation_proof(url, nonce)
+        r = redis.from_url(url)
+        try:
+            r.ping()
+        finally:
+            r.close()
+    except RedisProofError as exc:
+        pytest.fail(str(exc))
+    except redis.RedisError as exc:
+        pytest.fail(f"Test Redis is unreachable: {exc}")
 
 
 @pytest.fixture
 def real_redis_client(_check_redis):
-    """RedisClient connected to real Redis DB 15, flushed per test."""
-    url = _get_redis_url()
-    parsed = _parse_redis_url(url)
-    config = RedisConfig(
-        host=parsed["host"],
-        port=parsed["port"],
-        db=parsed["db"],
-        password=parsed["password"],
-        key_prefix="",
-    )
-    client = RedisClient(config)
-    client.client.flushdb()
-    yield client
-    client.client.flushdb()
-    client.close()
+    """RedisClient connected to the invocation-scoped test Redis, flushed per test."""
+    try:
+        client, url, nonce = setup_real_redis_client()
+    except RedisProofError as exc:
+        pytest.fail(str(exc))
+    try:
+        yield client
+    finally:
+        try:
+            teardown_real_redis_client(client, url, nonce)
+        except RedisProofError as exc:
+            pytest.fail(str(exc))
 
 
 @pytest.fixture
 def make_real_redis_client(_check_redis):
     """Factory for creating additional real Redis clients (same DB)."""
-    url = _get_redis_url()
-    parsed = _parse_redis_url(url)
+    _url, _nonce, parsed = require_test_redis_proof()
     clients: list[RedisClient] = []
 
     def factory():
-        config = RedisConfig(
-            host=parsed["host"],
-            port=parsed["port"],
-            db=parsed["db"],
-            password=parsed["password"],
-            key_prefix="",
+        c = RedisClient(
+            RedisConfig(
+                host=parsed["host"],
+                port=parsed["port"],
+                db=parsed["db"],
+                password=parsed["password"],
+                key_prefix="",
+            )
         )
-        c = RedisClient(config)
         clients.append(c)
         return c
 
-    yield factory
-    for c in clients:
-        c.close()
+    try:
+        yield factory
+    finally:
+        for c in clients:
+            c.close()
