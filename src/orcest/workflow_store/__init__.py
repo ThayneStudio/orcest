@@ -1,4 +1,14 @@
-"""SQLite Workflow-Control v1 run-store substrate."""
+"""Workflow-Control v1 persistence: SQLite run-store and durable object stores.
+
+This package is the persistence boundary for Workflow-Control v1. It contains
+the SQLite single-writer run-store substrate plus content-addressed Workflow
+Blobs and Candidates and a controller-only Secret Store. SQLite may reference
+objects only after the object stores have made the exact bytes durable. Redis
+is never authority for these bytes, and secret values never enter SQLite,
+Redis, logs, or ordinary API bodies.
+
+See ``docs/wiki/architecture.md`` and ``docs/wiki/persistence-and-recovery.md``.
+"""
 
 from orcest.workflow_store.store import (
     DEFAULT_REDUCER_VERSION,
@@ -23,6 +33,23 @@ from orcest.workflow_store.store import (
     WriterLockError,
     open_read_only,
 )
+from orcest.workflow_store.v1.blobs import WorkflowBlobRecord, WorkflowBlobStore
+from orcest.workflow_store.v1.candidates import CandidateObjectRecord, CandidateObjectStore
+from orcest.workflow_store.v1.errors import (
+    DurableStoreError,
+    IntegrityConflictError,
+    LayoutError,
+    ObjectNotFoundError,
+    QuotaExceededError,
+    StorageLockError,
+)
+from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
+from orcest.workflow_store.v1.secrets import (
+    SecretReference,
+    SecretStagingHandle,
+    SecretStore,
+    SecretVersionHandle,
+)
 
 __all__ = [
     "DEFAULT_REDUCER_VERSION",
@@ -46,4 +73,21 @@ __all__ = [
     "TransactionFault",
     "WriterLockError",
     "open_read_only",
+    "WorkflowBlobRecord",
+    "WorkflowBlobStore",
+    "CandidateObjectRecord",
+    "CandidateObjectStore",
+    "DurableStoreError",
+    "IntegrityConflictError",
+    "LayoutError",
+    "ObjectNotFoundError",
+    "QuotaExceededError",
+    "StorageLockError",
+    "ControlLayout",
+    "QuotaConfig",
+    "StorageLock",
+    "SecretReference",
+    "SecretStagingHandle",
+    "SecretStore",
+    "SecretVersionHandle",
 ]
