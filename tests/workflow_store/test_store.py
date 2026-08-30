@@ -10,6 +10,8 @@ import pytest
 
 from orcest.workflow_contract.v1.digest import request_digest
 from orcest.workflow_store import (
+    DEFAULT_REDUCER_VERSION,
+    SUPPORTED_REDUCER_VERSIONS,
     CasMismatchError,
     FaultInjectionPoint,
     IdempotencyConflictError,
@@ -25,7 +27,7 @@ OUTBOX_ID = "33333333-3333-3333-3333-333333333333"
 PROJECTION_ID = "44444444-4444-4444-4444-444444444444"
 OPERATION_ID = "55555555-5555-5555-5555-555555555555"
 IDEMPOTENCY_KEY = "66666666-6666-6666-6666-666666666666"
-REDUCER_VERSION = "workflow-control-v1/reducer-0"
+REDUCER_VERSION = DEFAULT_REDUCER_VERSION
 
 pytestmark = pytest.mark.unit
 
@@ -42,6 +44,64 @@ def _create_run(store: RunStore, run_id: str = RUN_ID) -> None:
         state="ADMITTED",
         reducer_version=REDUCER_VERSION,
     )
+
+
+def test_default_reducer_version_is_an_explicit_supported_constant() -> None:
+    assert DEFAULT_REDUCER_VERSION == "workflow-control-v1/reducer-0"
+    assert DEFAULT_REDUCER_VERSION in SUPPORTED_REDUCER_VERSIONS
+
+
+def test_create_run_defaults_to_explicit_reducer_version(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            store.create_run(
+                run_id=RUN_ID,
+                project_id="project-a",
+                work_item_key="work-1",
+                state="ADMITTED",
+            )
+        row = store.conn.execute(
+            "SELECT reducer_version FROM runs WHERE run_id = ?",
+            (RUN_ID,),
+        ).fetchone()
+        assert row[0] == DEFAULT_REDUCER_VERSION
+
+
+def test_schema_migration_rolls_back_as_one_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = RunStore._open_connection
+
+    class _FailOnUserVersion:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+
+        def execute(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+            if isinstance(sql, str) and sql.startswith("PRAGMA user_version="):
+                raise sqlite3.OperationalError("injected migration failure")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._conn, name)
+
+    def open_and_wrap(self: RunStore) -> _FailOnUserVersion:
+        return _FailOnUserVersion(real_open(self))
+
+    monkeypatch.setattr(RunStore, "_open_connection", open_and_wrap)
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        RunStore(tmp_path, verify_local_filesystem=False)
+
+    conn = sqlite3.connect(tmp_path / "workflow.db")
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "runs" not in tables
+        assert "schema_migrations" not in tables
+        assert "controller_mode" not in tables
+    finally:
+        conn.close()
 
 
 def test_startup_sets_sqlite_profile_and_bootstrap_mode(tmp_path: Path) -> None:

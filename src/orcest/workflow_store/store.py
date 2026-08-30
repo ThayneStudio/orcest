@@ -28,7 +28,8 @@ from orcest.workflow_contract.v1.digest import (
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 
 SCHEMA_VERSION = 1
-SUPPORTED_REDUCER_VERSIONS = frozenset({"workflow-control-v1/reducer-0"})
+DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
+SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
 
 _FORBIDDEN_STATE_FS = {
@@ -724,9 +725,12 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        self.conn.execute("BEGIN EXCLUSIVE")
+        # Connection.executescript() issues COMMIT first whenever a transaction
+        # is already open (sqlite3 documented behavior, independent of
+        # isolation_level). BEGIN EXCLUSIVE therefore has to live inside the
+        # script so DDL, seed rows, and the user_version bump share one txn.
         try:
-            self.conn.executescript(_SCHEMA)
+            self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                 "VALUES (?, ?, ?)",
@@ -829,7 +833,7 @@ class RunStore:
         project_id: str,
         work_item_key: str,
         state: str,
-        reducer_version: str = next(iter(SUPPORTED_REDUCER_VERSIONS)),
+        reducer_version: str = DEFAULT_REDUCER_VERSION,
         specification_generation: int = 1,
     ) -> None:
         require_lowercase_uuid(run_id, field="run_id")

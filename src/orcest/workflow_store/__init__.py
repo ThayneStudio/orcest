@@ -1,6 +1,7 @@
 """SQLite Workflow-Control v1 run-store substrate."""
 
 from orcest.workflow_store.store import (
+    DEFAULT_REDUCER_VERSION,
     SCHEMA_VERSION,
     SUPPORTED_REDUCER_VERSIONS,
     CasMismatchError,
@@ -23,6 +24,7 @@ from orcest.workflow_store.store import (
 )
 
 __all__ = [
+    "DEFAULT_REDUCER_VERSION",
     "SCHEMA_VERSION",
     "SUPPORTED_REDUCER_VERSIONS",
     "CasMismatchError",
