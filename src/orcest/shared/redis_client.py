@@ -718,6 +718,16 @@ class RedisClient:
         result: int = self._client.hset(self._prefixed(key), field, value)  # type: ignore[assignment]
         return result
 
+    def hset_mapping(self, key: str, mapping: dict[str, str]) -> int:
+        """HSET key field value [field value ...] in a single round trip.
+
+        No-ops (and issues no command) when ``mapping`` is empty.
+        """
+        if not mapping:
+            return 0
+        result: int = self._client.hset(self._prefixed(key), mapping=mapping)  # type: ignore[assignment]
+        return result
+
     def hset_json_if_newer(
         self,
         key: str,

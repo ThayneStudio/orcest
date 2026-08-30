@@ -153,8 +153,7 @@ def _record_issue_delivery_shadow_evidence(
             verification.issue_number,
             task_id,
         )
-        for field, value in verification.to_shadow_fields().items():
-            redis.hset(key, field, value)
+        redis.hset_mapping(key, verification.to_shadow_fields())
         redis.expire(key, _ISSUE_DELIVERY_EVIDENCE_TTL_SECONDS)
         counter_key = _issue_delivery_counter_key(verification.error_kind, verification.reason)
         count = redis.incr(counter_key)
@@ -1743,6 +1742,7 @@ def _poll_cycle(
                 token_pool=pool,
                 max_transient_failures=config.max_transient_failures,
                 shared_credential_redis=task_redis,
+                issue_delivery_verifier_enabled=config.issue_delivery_verifier.enabled,
             )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
@@ -2786,6 +2786,7 @@ def _consume_results_for_project(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
+    issue_delivery_verifier_enabled: bool = True,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -2827,6 +2828,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
+                    issue_delivery_verifier_enabled=issue_delivery_verifier_enabled,
                 )
                 logger.info(f"Recovered pending result {entry_id}")
             except _RetryableResultError as exc:
@@ -2886,6 +2888,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
+                    issue_delivery_verifier_enabled=issue_delivery_verifier_enabled,
                 )
             except _RetryableResultError as exc:
                 logger.warning(
@@ -2925,6 +2928,7 @@ def _handle_result(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
+    issue_delivery_verifier_enabled: bool = True,
 ) -> None:
     """Process a single task result.
 
@@ -3212,44 +3216,49 @@ def _handle_result(
     # task successes.
     if result.status == ResultStatus.COMPLETED:
         if is_issue:
-            try:
-                verification = verify_issue_delivery(
-                    repo,
-                    resource_id,
-                    result.branch or "",
-                    result.snapshot_head_sha,
-                    token,
-                )
-            except Exception as exc:
-                verification = DeliveryVerification(
-                    verified=False,
-                    error_kind=DeliveryErrorKind.TRANSPORT,
-                    reason=DeliveryFailureReason.GH_TRANSPORT_ERROR,
-                    repo=repo,
-                    issue_number=resource_id,
-                    default_branch="",
-                    default_branch_oid="",
-                    expected_head_ref=result.branch or "",
-                    expected_head_oid=result.snapshot_head_sha,
-                    live_head_oid="",
-                    complete=False,
-                    message=f"unexpected verifier failure: {exc}",
-                )
-            _record_issue_delivery_shadow_evidence(redis, verification, result.task_id, logger)
-            if verification.verified:
-                logger.info(
-                    "Issue #%d delivery verifier found PR evidence on %s",
-                    resource_id,
-                    result.branch or "<missing-branch>",
+            if not issue_delivery_verifier_enabled:
+                logger.debug(
+                    "Issue #%d delivery verifier disabled by config; skipping", resource_id
                 )
             else:
-                logger.warning(
-                    "Issue #%d delivery verifier could not verify handoff (%s/%s): %s",
-                    resource_id,
-                    verification.error_kind.value,
-                    verification.reason.value,
-                    verification.message,
-                )
+                try:
+                    verification = verify_issue_delivery(
+                        repo,
+                        resource_id,
+                        result.branch or "",
+                        result.snapshot_head_sha,
+                        token,
+                    )
+                except Exception as exc:
+                    verification = DeliveryVerification(
+                        verified=False,
+                        error_kind=DeliveryErrorKind.TRANSPORT,
+                        reason=DeliveryFailureReason.GH_TRANSPORT_ERROR,
+                        repo=repo,
+                        issue_number=resource_id,
+                        default_branch="",
+                        default_branch_oid="",
+                        expected_head_ref=result.branch or "",
+                        expected_head_oid=result.snapshot_head_sha,
+                        live_head_oid="",
+                        complete=False,
+                        message=f"unexpected verifier failure: {exc}",
+                    )
+                _record_issue_delivery_shadow_evidence(redis, verification, result.task_id, logger)
+                if verification.verified:
+                    logger.info(
+                        "Issue #%d delivery verifier found PR evidence on %s",
+                        resource_id,
+                        result.branch or "<missing-branch>",
+                    )
+                else:
+                    logger.warning(
+                        "Issue #%d delivery verifier could not verify handoff (%s/%s): %s",
+                        resource_id,
+                        verification.error_kind.value,
+                        verification.reason.value,
+                        verification.message,
+                    )
             try:
                 clear_issue_attempts(redis, repo, resource_id)
             except Exception as exc:

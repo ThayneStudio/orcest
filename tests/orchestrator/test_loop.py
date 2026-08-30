@@ -1370,9 +1370,12 @@ def test_consume_results_completed_issue_records_delivery_shadow_evidence(
     )
     assert evidence["verified"] == "1"
     assert evidence["candidate_pr_count"] == "0"
-    assert fake_redis_client.get(
-        _issue_delivery_counter_key(DeliveryErrorKind.NONE, DeliveryFailureReason.VERIFIED)
-    ) == "1"
+    assert (
+        fake_redis_client.get(
+            _issue_delivery_counter_key(DeliveryErrorKind.NONE, DeliveryFailureReason.VERIFIED)
+        )
+        == "1"
+    )
     gh_mock.remove_issue_label.assert_called_once()
 
 

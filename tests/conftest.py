@@ -187,9 +187,7 @@ def gh_mock(mocker):
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
     if "orcest.orchestrator.loop" in sys.modules:
-        ns.verify_issue_delivery = mocker.patch(
-            "orcest.orchestrator.loop.verify_issue_delivery"
-        )
+        ns.verify_issue_delivery = mocker.patch("orcest.orchestrator.loop.verify_issue_delivery")
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
     ns.has_issue_comment_marker.return_value = False
     if hasattr(ns, "verify_issue_delivery"):
