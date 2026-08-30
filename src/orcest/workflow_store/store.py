@@ -777,8 +777,7 @@ class RunStore:
         versions = {
             row[0]
             for row in self.conn.execute(
-                "SELECT reducer_version FROM runs "
-                "UNION SELECT reducer_version FROM transitions"
+                "SELECT reducer_version FROM runs UNION SELECT reducer_version FROM transitions"
             )
         }
         unsupported = versions - self._supported_reducer_versions

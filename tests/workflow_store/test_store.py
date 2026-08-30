@@ -279,9 +279,9 @@ def test_fk_unique_sequence_and_cas_violations_are_atomic(tmp_path: Path) -> Non
                     payload={"rev": 2},
                 )
                 store.conn.execute("UPDATE runs SET state = 'PLANNING' WHERE run_id = ?", (RUN_ID,))
-        state = store.conn.execute(
-            "SELECT state FROM runs WHERE run_id = ?", (RUN_ID,)
-        ).fetchone()[0]
+        state = store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (RUN_ID,)).fetchone()[
+            0
+        ]
         assert state == "ADMITTED"
 
 
@@ -305,22 +305,28 @@ def test_source_unique_insert_and_immutable_fact_replay(tmp_path: Path) -> None:
                 payload={"cursor": 1},
             )
         with store.transaction():
-            assert store.insert_immutable_fact(
-                fact_kind="timer",
-                fact_id="timer-1",
-                source_kind="TIMER_FACT",
-                source_id="timer:run:1",
-                payload_digest=_digest({"timer": 1}),
-                payload={"timer": 1},
-            ) == fact
-            assert store.insert_source_unique_record(
-                source_kind="INTERNAL",
-                source_id="cursor:1",
-                record_kind="continuation",
-                record_id="cont-1",
-                payload_digest=_digest({"cursor": 1}),
-                payload={"cursor": 1},
-            ) == record
+            assert (
+                store.insert_immutable_fact(
+                    fact_kind="timer",
+                    fact_id="timer-1",
+                    source_kind="TIMER_FACT",
+                    source_id="timer:run:1",
+                    payload_digest=_digest({"timer": 1}),
+                    payload={"timer": 1},
+                )
+                == fact
+            )
+            assert (
+                store.insert_source_unique_record(
+                    source_kind="INTERNAL",
+                    source_id="cursor:1",
+                    record_kind="continuation",
+                    record_id="cont-1",
+                    payload_digest=_digest({"cursor": 1}),
+                    payload={"cursor": 1},
+                )
+                == record
+            )
 
 
 def test_unsupported_schema_can_fail_closed_as_maintenance(tmp_path: Path) -> None:
@@ -348,8 +354,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
         with store.transaction():
             _create_run(store)
         store.conn.execute(
-            "UPDATE runs SET reducer_version = 'workflow-control-v1/reducer-999' "
-            "WHERE run_id = ?",
+            "UPDATE runs SET reducer_version = 'workflow-control-v1/reducer-999' WHERE run_id = ?",
             (RUN_ID,),
         )
 
