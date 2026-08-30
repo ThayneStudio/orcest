@@ -2139,6 +2139,7 @@ def _task_result(
     needs_human_reason: str = "",
     credential_update: str = "",
     credential_update_minted_at: float = 0.0,
+    snapshot_head_sha: str | None = None,
 ) -> TaskResult:
     return TaskResult(
         task_id=task.id,
@@ -2151,7 +2152,9 @@ def _task_result(
         summary=summary,
         duration_seconds=duration_seconds,
         rate_limit_resets_at=rate_limit_resets_at,
-        snapshot_head_sha=task.snapshot_head_sha,
+        snapshot_head_sha=(
+            task.snapshot_head_sha if snapshot_head_sha is None else snapshot_head_sha
+        ),
         decision_reason=task.decision_reason,
         snapshot_failed_checks=task.snapshot_failed_checks,
         snapshot_review_thread_ids=task.snapshot_review_thread_ids,
@@ -2593,13 +2596,26 @@ def _execute_task(
         ):
             summary = f"{TRANSIENT_SUMMARY_PREFIX}{summary}"
 
+        result_branch = task.branch
+        result_head_sha = task.snapshot_head_sha
+        if status == ResultStatus.COMPLETED and task.resource_type == "issue":
+            result_branch = task.expected_branch or task.branch
+            try:
+                result_head_sha = workspace.current_head_sha()
+            except Exception:
+                logger.debug(
+                    "Could not capture final issue branch SHA for task %s",
+                    task.id,
+                    exc_info=True,
+                )
+
         publish_task_end(status, summary)
 
         return _task_result(
             task,
             config,
             status,
-            task.branch,
+            result_branch,
             summary,
             duration,
             rate_limit_resets_at=runner_result.rate_limit_resets_at,
@@ -2607,6 +2623,7 @@ def _execute_task(
             needs_human_reason=runner_result.needs_human_reason,
             credential_update=runner_result.credential_update or "",
             credential_update_minted_at=runner_result.credential_update_minted_at,
+            snapshot_head_sha=result_head_sha,
         )
 
     except Exception as e:

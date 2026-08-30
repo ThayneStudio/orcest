@@ -105,6 +105,18 @@ class DeploymentConfig:
 
 
 @dataclass
+class IssueDeliveryVerifierConfig:
+    """Read-only GitHub issue delivery verification (post-completion check).
+
+    ``enabled: false`` is the rollback lever: it skips the verifier call and
+    its shadow-evidence recording entirely, reproducing pre-verifier behavior
+    on the completed-issue result path.
+    """
+
+    enabled: bool = True
+
+
+@dataclass
 class OrchestratorConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     github: GithubConfig = field(default_factory=GithubConfig)
@@ -165,6 +177,11 @@ class OrchestratorConfig:
     # Default 0 ships in observation mode -- an operator opts into
     # autonomous kills by setting a positive per-hour budget.
     max_kills_per_hour: int = 0
+    # Read-only GitHub issue delivery verifier (YAML block
+    # `issue_delivery_verifier:`), run on the completed-issue result path.
+    issue_delivery_verifier: IssueDeliveryVerifierConfig = field(
+        default_factory=IssueDeliveryVerifierConfig
+    )
 
 
 @dataclass
@@ -839,6 +856,15 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             f"when health_check_url is set, got {deployment_config.health_check_timeout}"
         )
 
+    # Read-only GitHub issue delivery verifier
+    issue_delivery_verifier_raw = _safe_dict(raw, "issue_delivery_verifier")
+    issue_delivery_verifier_config = IssueDeliveryVerifierConfig(
+        enabled=_safe_bool(
+            issue_delivery_verifier_raw.get("enabled", True),
+            "issue_delivery_verifier.enabled",
+        ),
+    )
+
     # Seconds a pending check can be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds = _safe_int(
         raw.get("stale_pending_timeout_seconds", 7200), "stale_pending_timeout_seconds"
@@ -930,6 +956,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         pressure_window=pressure_window,
         pressure_hold=pressure_hold,
         max_kills_per_hour=max_kills_per_hour,
+        issue_delivery_verifier=issue_delivery_verifier_config,
     )
 
     # Validate required fields
