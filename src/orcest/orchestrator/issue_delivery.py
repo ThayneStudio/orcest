@@ -51,6 +51,7 @@ ACTIVE_JOBS_KEY = "issue:verification:active"
 UNVERIFIABLE_INDEX_KEY = "issue:verification:unverifiable"
 QUARANTINE_KEY = "issue:result:quarantine"
 METRICS_KEY = "issue:delivery:metrics"
+GC_DUE_INDEX_KEY = "issue:delivery:gc:due"
 
 ROUTE_COMPLETED_VERIFY = "completed_verify"
 ROUTE_NONSUCCESS = "nonsuccess"
@@ -1262,9 +1263,11 @@ def _generation_cleanup(
 
 
 def _remove_barrier(redis: RedisClient, job: VerificationJob) -> None:
+    member = job_member(job.repo, job.issue_number, job.generation)
     redis.delete(make_issue_dispatch_barrier_key(job.repo, job.issue_number))
-    redis.srem(ACTIVE_JOBS_KEY, job_member(job.repo, job.issue_number, job.generation))
-    redis.zrem(DUE_INDEX_KEY, job_member(job.repo, job.issue_number, job.generation))
+    redis.srem(ACTIVE_JOBS_KEY, member)
+    redis.zrem(DUE_INDEX_KEY, member)
+    redis.zadd(GC_DUE_INDEX_KEY, {member: now_seconds()})
 
 
 def _transition_job(
@@ -1297,7 +1300,13 @@ def _transition_job(
 def gc_issue_delivery_state(
     redis: RedisClient, repo: str, issue_number: int, generation: int
 ) -> bool:
-    """Collect delivery state only when it is terminal and unreferenced."""
+    """Collect delivery state only when it is terminal and unreferenced.
+
+    The dispatch barrier is already removed by ``_remove_barrier`` on the
+    transition into ``BARRIER_REMOVED``, so only the job hash, the admission
+    ledger entry, and the result-ref key -- all ``PERSIST``ed, no TTL --
+    remain to collect here.
+    """
     job = get_verification_job(redis, repo, issue_number, generation)
     job_key = make_issue_verification_job_key(repo, issue_number, generation)
     barrier_key = make_issue_dispatch_barrier_key(repo, issue_number)
@@ -1313,7 +1322,39 @@ def gc_issue_delivery_state(
         redis.persist(make_issue_admission_key(job.task_id))
         redis.persist(result_key)
         return False
-    return False
+    redis.delete(job_key, result_key, make_issue_admission_key(job.task_id))
+    return True
+
+
+def process_due_delivery_state_gc(
+    redis: RedisClient,
+    repo: str,
+    *,
+    now: NowFn = now_seconds,
+    batch_size: int = 200,
+) -> int:
+    """Collect delivery state for generations queued by ``_remove_barrier``.
+
+    ``_remove_barrier`` queues a job's member into ``GC_DUE_INDEX_KEY`` the
+    moment its saga reaches ``BARRIER_REMOVED``, independent of when this is
+    called -- so state stays readable for as long as nothing sweeps this
+    index, and callers can defer sweeping without racing saga completion.
+    """
+    current = now()
+    due_members = redis.zrangebyscore(GC_DUE_INDEX_KEY, "-inf", current, start=0, num=batch_size)
+    collected = 0
+    for member in due_members:
+        parsed = parse_job_member(member)
+        if parsed is None:
+            redis.zrem(GC_DUE_INDEX_KEY, member)
+            continue
+        job_repo, issue_number, generation = parsed
+        if job_repo != repo:
+            continue
+        if gc_issue_delivery_state(redis, job_repo, issue_number, generation):
+            collected += 1
+        redis.zrem(GC_DUE_INDEX_KEY, member)
+    return collected
 
 
 def delivery_state_blocks_old_orchestrator_rollback(redis: RedisClient) -> list[str]:

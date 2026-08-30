@@ -29,6 +29,7 @@ from orcest.orchestrator.issue_delivery import (
     admit_completed_verification_job,
     admit_issue_result,
     apply_admission_conflict,
+    process_due_delivery_state_gc,
     process_due_verification_jobs,
     reconcile_verification_due_index,
 )
@@ -1733,6 +1734,14 @@ def _poll_cycle(
             except Exception:
                 logger.error(
                     "Failed to process issue delivery verification for %s",
+                    project.repo,
+                    exc_info=True,
+                )
+            try:
+                process_due_delivery_state_gc(project_redis, project.repo)
+            except Exception:
+                logger.error(
+                    "Failed to collect terminal issue delivery state for %s",
                     project.repo,
                     exc_info=True,
                 )

@@ -13,6 +13,7 @@ from orcest.orchestrator.github_delivery_verifier import (
 from orcest.orchestrator.issue_delivery import (
     ACTIVE_JOBS_KEY,
     DUE_INDEX_KEY,
+    GC_DUE_INDEX_KEY,
     METRICS_KEY,
     QUARANTINE_KEY,
     ROUTE_COMPLETED_VERIFY,
@@ -32,6 +33,7 @@ from orcest.orchestrator.issue_delivery import (
     has_issue_dispatch_barrier,
     job_member,
     list_quarantined_conflicts,
+    process_due_delivery_state_gc,
     process_due_verification_jobs,
     reconcile_verification_due_index,
     result_fingerprint,
@@ -44,6 +46,7 @@ from orcest.orchestrator.issue_ops import (
 from orcest.orchestrator.issue_publication import (
     make_issue_admission_key,
     make_issue_dispatch_barrier_key,
+    make_issue_result_ref_key,
     make_issue_retry_record_key,
     make_issue_verification_job_key,
     reserve_issue_publication,
@@ -323,6 +326,34 @@ def test_scheduler_verifies_and_runs_saga(fake_redis_client, mocker):
     remove_issue_label.assert_called_once()
     metrics = get_delivery_metrics(fake_redis_client)
     assert metrics["verified"] == "1"
+
+
+def test_barrier_removed_state_is_queued_for_gc_and_collected(fake_redis_client, mocker):
+    _admit_completed(fake_redis_client)
+    mocker.patch("orcest.orchestrator.gh.remove_issue_label")
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0),
+        stream_redis=fake_redis_client,
+        now=lambda: 2_000.0,
+        observe=lambda *a, **k: _observation(),
+    )
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, 1)
+    assert job is not None
+    assert job.saga_phase is SagaPhase.BARRIER_REMOVED
+
+    member = job_member(REPO, ISSUE, 1)
+    assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, member) is not None
+
+    collected = process_due_delivery_state_gc(fake_redis_client, REPO)
+    assert collected == 1
+    assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, member) is None
+    assert get_verification_job(fake_redis_client, REPO, ISSUE, 1) is None
+    assert not fake_redis_client.exists(make_issue_admission_key("task-659"))
+    assert not fake_redis_client.exists(make_issue_result_ref_key(REPO, ISSUE, 1))
 
 
 def test_echo_mismatch_still_verifies(fake_redis_client, mocker):

@@ -841,7 +841,9 @@ class RedisClient:
 
     def zscore(self, key: str, member: str) -> float | None:
         """ZSCORE key member."""
-        result = self._client.zscore(self._prefixed(key), member)
+        result: float | None = self._client.zscore(  # type: ignore[assignment]
+            self._prefixed(key), member
+        )
         return float(result) if result is not None else None
 
     def zcard(self, key: str) -> int:
