@@ -283,3 +283,24 @@ def test_storage_lock_excludes_other_holder(tmp_path: Path) -> None:
         a.release()
     assert b.acquire(blocking=False) is True
     b.release()
+
+
+def test_storage_lock_reentrant_shortcut_is_thread_owned(tmp_path: Path) -> None:
+    layout = ControlLayout(root=tmp_path / "control")
+    layout.initialize()
+    lock = StorageLock(layout.storage_lock_path)
+
+    assert lock.acquire(blocking=True) is True
+    results: list[bool] = []
+    thread = threading.Thread(target=lambda: results.append(lock.acquire(blocking=False)))
+    thread.start()
+    thread.join(timeout=5)
+    try:
+        assert results == [False]
+    finally:
+        lock.release()
+
+    assert lock.acquire(blocking=True) is True
+    assert lock.acquire(blocking=False) is True
+    lock.release()
+    lock.release()

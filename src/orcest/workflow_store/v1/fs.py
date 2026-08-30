@@ -62,7 +62,7 @@ _PATH_THREAD_LOCKS: dict[str, threading.Lock] = {}
 def _thread_lock_for(path: Path) -> threading.Lock:
     """One in-process lock per storage.lock path so concurrent writers serialize.
 
-    Re-entry is tracked per ``StorageLock`` instance (``_depth``), not via
+    Re-entry is tracked by owning thread per ``StorageLock`` instance, not via
     ``RLock``, so a second instance on the same path cannot sneak in on the
     same thread.
     """
@@ -462,13 +462,17 @@ class StorageLock:
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._thread = _thread_lock_for(self._path)
+        self._state = threading.Lock()
         self._fd: int | None = None
+        self._owner: int | None = None
         self._depth = 0
 
     def acquire(self, *, blocking: bool = True) -> bool:
-        if self._depth > 0:
-            self._depth += 1
-            return True
+        current_thread = threading.get_ident()
+        with self._state:
+            if self._owner == current_thread:
+                self._depth += 1
+                return True
         if not self._thread.acquire(blocking=blocking):
             return False
         flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
@@ -485,28 +489,38 @@ class StorageLock:
             os.close(fd)
             self._thread.release()
             raise
-        self._fd = fd
-        self._depth = 1
+        with self._state:
+            self._fd = fd
+            self._owner = current_thread
+            self._depth = 1
         return True
 
     def release(self) -> None:
-        if self._depth < 1:
-            raise StorageLockError("storage.lock is not held")
-        if self._depth == 1:
+        current_thread = threading.get_ident()
+        with self._state:
+            if self._depth < 1:
+                raise StorageLockError("storage.lock is not held")
+            if self._owner != current_thread:
+                raise StorageLockError("storage.lock is held by another thread")
+            if self._depth > 1:
+                self._depth -= 1
+                return
             fd = self._fd
-            self._fd = None
-            try:
-                if fd is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
-            finally:
+
+        try:
+            if fd is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+        finally:
+            with self._state:
+                self._fd = None
+                self._owner = None
                 self._depth = 0
-                self._thread.release()
-            return
-        self._depth -= 1
+            self._thread.release()
 
     def held(self) -> bool:
-        return self._depth > 0
+        with self._state:
+            return self._depth > 0
 
     def __enter__(self) -> StorageLock:
         if not self.acquire(blocking=True):
