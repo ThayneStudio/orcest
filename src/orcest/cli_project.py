@@ -21,6 +21,7 @@ Canonical output/exit contract for ``lint``/``explain``/``simulate``:
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -43,15 +44,22 @@ _EXIT_ENVIRONMENT = 2
 
 
 def _resolve_repo_root() -> str:
-    import subprocess
-
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=10
-    )
-    if result.returncode != 0:
-        raise click.ClickException(
-            "not inside a git repository (git rev-parse --show-toplevel failed)"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=10
         )
+    except FileNotFoundError as exc:
+        click.echo("error: the 'git' executable was not found on PATH", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    except subprocess.TimeoutExpired as exc:
+        click.echo("error: git rev-parse --show-toplevel timed out", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    if result.returncode != 0:
+        click.echo(
+            "error: not inside a git repository (git rev-parse --show-toplevel failed)",
+            err=True,
+        )
+        raise SystemExit(_EXIT_ENVIRONMENT)
     return result.stdout.decode("utf-8").strip()
 
 

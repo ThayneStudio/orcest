@@ -9,7 +9,12 @@ import subprocess
 import pytest
 from click.testing import CliRunner
 
+from orcest import cli_project
 from orcest.cli import main
+
+
+def _captured_stderr(result) -> str:
+    return getattr(result, "stderr", None) or result.output
 
 
 @pytest.fixture
@@ -131,3 +136,40 @@ def test_lint_without_revision_or_origin_fails_closed(runner, tmp_path) -> None:
 
         result = runner.invoke(main, ["project", "lint"])
         assert result.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["project", "init"],
+        ["project", "lint", "--revision", "HEAD"],
+        ["project", "explain", "--revision", "HEAD"],
+        ["project", "simulate", "--revision", "HEAD", "--event", "fixture.json"],
+    ],
+)
+def test_project_commands_report_non_repo_as_environment_error(runner, tmp_path, args) -> None:
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        with open("fixture.json", "w") as f:
+            f.write(json.dumps({"trigger": "ADMIT", "payload": {}}))
+
+        result = runner.invoke(main, args)
+        assert result.exit_code == 2
+        if getattr(result, "stdout", None) is not None:
+            assert result.stdout == ""
+        assert (
+            "error: not inside a git repository (git rev-parse --show-toplevel failed)"
+            in _captured_stderr(result)
+        )
+
+
+def test_project_lint_reports_missing_git_as_environment_error(runner, monkeypatch) -> None:
+    def raise_missing_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(cli_project.subprocess, "run", raise_missing_git)
+
+    result = runner.invoke(main, ["project", "lint", "--revision", "HEAD"])
+    assert result.exit_code == 2
+    if getattr(result, "stdout", None) is not None:
+        assert result.stdout == ""
+    assert "error: the 'git' executable was not found on PATH" in _captured_stderr(result)
