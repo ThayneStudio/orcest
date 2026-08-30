@@ -694,6 +694,10 @@ class RedisClient:
         """EXPIRE key seconds."""
         return bool(self._client.expire(self._prefixed(key), seconds))
 
+    def persist(self, key: str) -> bool:
+        """PERSIST key. Removes any TTL so wall-clock expiry cannot delete it."""
+        return bool(self._client.persist(self._prefixed(key)))
+
     def ttl(self, key: str) -> int:
         """TTL key."""
         result: int = self._client.ttl(self._prefixed(key))  # type: ignore[assignment]
