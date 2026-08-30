@@ -82,6 +82,27 @@ def test_empty_issue_list(issue_gh_mock, fake_redis_client, label_config):
     assert results == []
 
 
+def test_skip_when_delivery_barrier_present(issue_gh_mock, fake_redis_client, label_config):
+    """A nonterminal verification job blocks rediscovery independent of pending TTL."""
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+
+    issue_number = 3
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=issue_number, labels=[{"name": label_config.ready}]),
+    ]
+    fake_redis_client.set_value(make_issue_dispatch_barrier_key(REPO, issue_number), "1|1")
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_VERIFYING
+
+
 def test_skip_usage_cooldown_when_active(issue_gh_mock, fake_redis_client, label_config):
     """An issue with an active USAGE_EXHAUSTED cooldown is not re-enqueued."""
     issue_number = 2

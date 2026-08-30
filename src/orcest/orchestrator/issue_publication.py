@@ -4,8 +4,8 @@ Issue publication spans project Redis (generation, pending marker, attempt
 counter, expected outcome) and the shared task-stream Redis (XADD). A lost
 XADD reply must not roll back reserved state or append a duplicate entry.
 
-This module owns the publication and expected-outcome contract. Completion
-handling and ``orcest:ready`` removal are intentionally unchanged.
+This module owns the publication and expected-outcome contract. Issue
+completion is gated by durable delivery verification (``issue_delivery``).
 """
 
 from __future__ import annotations
@@ -235,6 +235,21 @@ def make_issue_verification_job_key(repo: str, issue_number: int, generation: in
 def make_issue_retry_record_key(repo: str, issue_number: int, generation: int) -> str:
     """Project-Redis key later retry-context storage uses as a GC reference."""
     return f"issue:{repo}:{issue_number}:retry:{generation}"
+
+
+def make_issue_admission_key(task_id: str) -> str:
+    """Per-task first-payload CAS ledger for issue results."""
+    return f"issue:admission:{task_id}"
+
+
+def make_issue_dispatch_barrier_key(repo: str, issue_number: int) -> str:
+    """Issue-level dispatch barrier independent of pending-marker TTL."""
+    return f"issue:{repo}:{issue_number}:dispatch-barrier"
+
+
+def make_issue_delivery_cooldown_key(repo: str, issue_number: int) -> str:
+    """Cooldown after ineffective delivery before the next generation may dispatch."""
+    return f"issue:{repo}:{issue_number}:delivery_cooldown"
 
 
 def expected_head_owner(repo: str) -> str:

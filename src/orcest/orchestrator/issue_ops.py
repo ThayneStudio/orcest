@@ -36,6 +36,8 @@ class IssueAction(str, Enum):
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"
+    SKIP_DELIVERY_COOLDOWN = "skip_delivery_cooldown"
+    SKIP_VERIFYING = "skip_verifying"  # Durable delivery verification is in flight
     SKIP_DEPENDENCY = "skip_dependency"  # One or more prerequisite issues still open
 
 
@@ -120,7 +122,9 @@ def discover_actionable_issues(
     2. Skip if terminal orcest label present (blocked/needs-human)
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if usage-exhausted cooldown is active
-    5. Skip if max attempts reached
+    5. Skip if a nonterminal delivery-verification job holds the dispatch barrier
+    6. Skip if ineffective-delivery cooldown is active
+    7. Skip if max attempts reached
     6. Skip if task already in flight (attempts > 0 with a pending marker)
     7. Clear orphaned attempts (attempts > 0 without a pending marker)
     8. Skip if task already pending in the queue
@@ -128,6 +132,11 @@ def discover_actionable_issues(
     10. Skip if any body-declared blocker issue is still open
     11. Everything else -> ENQUEUE_IMPLEMENT
     """
+    from orcest.orchestrator.issue_delivery import (
+        has_delivery_retry_cooldown,
+        has_issue_dispatch_barrier,
+    )
+
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
 
@@ -184,6 +193,30 @@ def discover_actionable_issues(
                     title=title,
                     body=body,
                     action=IssueAction.SKIP_USAGE_COOLDOWN,
+                    labels=issue_labels,
+                )
+            )
+            continue
+
+        if has_issue_dispatch_barrier(redis, repo, number):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_VERIFYING,
+                    labels=issue_labels,
+                )
+            )
+            continue
+
+        if has_delivery_retry_cooldown(redis, repo, number):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_DELIVERY_COOLDOWN,
                     labels=issue_labels,
                 )
             )

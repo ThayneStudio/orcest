@@ -39,6 +39,9 @@ _TYPE_SUFFIXES = (
     "task.activity",
     "fleet.pressure",
     "fleet.kill_limit",
+    "issue.result.admitted",
+    "issue.delivery.phase",
+    "issue.delivery.alert",
 )
 EVENT_TYPES: frozenset[str] = frozenset("net.orcest." + s for s in _TYPE_SUFFIXES)
 
@@ -66,8 +69,13 @@ def make_event(
     worker_id: str = "",
     provider: str = "",
     data: dict[str, Any] | None = None,
+    event_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build a v1 envelope. ``data`` extras are merged after identity fields."""
+    """Build a v1 envelope. ``data`` extras are merged after identity fields.
+
+    ``event_id`` is optional. When omitted a random UUID is used. Callers that
+    must replay without duplicating ingest should pass a deterministic id.
+    """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
     if data:
@@ -91,7 +99,7 @@ def make_event(
     if data:
         payload.update(data)
     return {
-        "id": str(uuid.uuid4()),
+        "id": event_id or str(uuid.uuid4()),
         "source": f"urn:orcest:{source_project}",
         "type": event_type,
         "subject": task_id,

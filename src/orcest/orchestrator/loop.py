@@ -23,11 +23,14 @@ from orcest.orchestrator.deployment import DeploymentError, run_deployment
 from orcest.orchestrator.event_relay import EventRelay
 from orcest.orchestrator.fleet_health import FleetHealthMonitor
 from orcest.orchestrator.gh import GhRateLimitError
-from orcest.orchestrator.github_delivery_verifier import (
-    DeliveryErrorKind,
-    DeliveryFailureReason,
-    DeliveryVerification,
-    verify_issue_delivery,
+from orcest.orchestrator.issue_delivery import (
+    ROUTE_COMPLETED_VERIFY,
+    AdmissionKind,
+    admit_completed_verification_job,
+    admit_issue_result,
+    apply_admission_conflict,
+    process_due_verification_jobs,
+    reconcile_verification_due_index,
 )
 from orcest.orchestrator.issue_ops import (
     IssueAction,
@@ -60,7 +63,12 @@ from orcest.orchestrator.task_publisher import (
 )
 from orcest.orchestrator.trace_archiver import TraceArchiver
 from orcest.orchestrator.usage_check import get_token_reset_time
-from orcest.shared.config import LabelConfig, OrchestratorConfig, ProjectConfig
+from orcest.shared.config import (
+    IssueDeliveryVerifierConfig,
+    LabelConfig,
+    OrchestratorConfig,
+    ProjectConfig,
+)
 from orcest.shared.coordination import (
     clear_backoff,
     clear_pending_task_if_matches,
@@ -94,8 +102,6 @@ RESULTS_GROUP = "orchestrator"
 # credential_refresh_failures incremented when an OAuth provider reports an unusable
 # refreshed credential blob, e.g. Grok JSON without a refresh_token.
 _PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"  # aggregate for compat
-_ISSUE_DELIVERY_EVIDENCE_TTL_SECONDS = 14 * 24 * 3600
-_ISSUE_DELIVERY_COUNTER_TTL_SECONDS = 30 * 24 * 3600
 _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
@@ -129,42 +135,6 @@ _LEGACY_HEARTBEAT_STALE_FLOOR = 180
 
 class _RetryableResultError(RuntimeError):
     """Result handling failed before its durable side effects committed."""
-
-
-def _issue_delivery_evidence_key(repo: str, issue_number: int, task_id: str) -> str:
-    safe_repo = repo.replace("/", ":")
-    return f"issue_delivery_verifier:{safe_repo}:{issue_number}:{task_id}"
-
-
-def _issue_delivery_counter_key(kind: DeliveryErrorKind, reason: DeliveryFailureReason) -> str:
-    return f"issue_delivery_verifier:{kind.value}:{reason.value}"
-
-
-def _record_issue_delivery_shadow_evidence(
-    redis: RedisClient,
-    verification: DeliveryVerification,
-    task_id: str,
-    logger: logging.Logger,
-) -> None:
-    """Best-effort bounded evidence for the read-only issue delivery verifier."""
-    try:
-        key = _issue_delivery_evidence_key(
-            verification.repo,
-            verification.issue_number,
-            task_id,
-        )
-        redis.hset_mapping(key, verification.to_shadow_fields())
-        redis.expire(key, _ISSUE_DELIVERY_EVIDENCE_TTL_SECONDS)
-        counter_key = _issue_delivery_counter_key(verification.error_kind, verification.reason)
-        count = redis.incr(counter_key)
-        if count == 1:
-            redis.expire(counter_key, _ISSUE_DELIVERY_COUNTER_TTL_SECONDS)
-    except Exception:
-        logger.debug(
-            "Failed to record issue delivery verifier shadow evidence for issue #%d",
-            verification.issue_number,
-            exc_info=True,
-        )
 
 
 def _configured_task_providers(
@@ -1742,10 +1712,30 @@ def _poll_cycle(
                 token_pool=pool,
                 max_transient_failures=config.max_transient_failures,
                 shared_credential_redis=task_redis,
-                issue_delivery_verifier_enabled=config.issue_delivery_verifier.enabled,
+                issue_delivery_verifier=config.issue_delivery_verifier,
             )
         except Exception:
             logger.error("Failed to consume results for %s", project.repo, exc_info=True)
+
+    if config.issue_delivery_verifier.enabled:
+        for project, project_redis in project_clients:
+            try:
+                reconcile_verification_due_index(project_redis)
+                process_due_verification_jobs(
+                    project_redis,
+                    project.repo,
+                    project.token,
+                    config.labels,
+                    config.issue_delivery_verifier,
+                    stream_redis=task_redis,
+                    logger_=logger.getChild(project.repo),
+                )
+            except Exception:
+                logger.error(
+                    "Failed to process issue delivery verification for %s",
+                    project.repo,
+                    exc_info=True,
+                )
 
     # M1-conc: reclaim delivered+ACKed task entries (which carry plaintext
     # GitHub PAT + provider credential) once per poll cycle. xtrim_acked_entries
@@ -2752,6 +2742,12 @@ def _poll_project(
             )
         elif issue_state.action == IssueAction.SKIP_QUEUED:
             logger.debug(f"Issue #{issue_state.number}: task already queued, skipping")
+        elif issue_state.action == IssueAction.SKIP_VERIFYING:
+            logger.debug(f"Issue #{issue_state.number}: delivery verification in flight, skipping")
+        elif issue_state.action == IssueAction.SKIP_DELIVERY_COOLDOWN:
+            logger.debug(
+                f"Issue #{issue_state.number}: ineffective-delivery cooldown active, skipping"
+            )
         elif issue_state.action == IssueAction.SKIP_LOCKED:
             logger.debug(f"Issue #{issue_state.number}: locked, skipping")
         elif issue_state.action == IssueAction.SKIP_ACTIVE:
@@ -2786,7 +2782,7 @@ def _consume_results_for_project(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
-    issue_delivery_verifier_enabled: bool = True,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> None:
     """Consume any pending results from workers for a single project.
 
@@ -2828,7 +2824,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
-                    issue_delivery_verifier_enabled=issue_delivery_verifier_enabled,
+                    issue_delivery_verifier=issue_delivery_verifier,
                 )
                 logger.info(f"Recovered pending result {entry_id}")
             except _RetryableResultError as exc:
@@ -2888,7 +2884,7 @@ def _consume_results_for_project(
                     token_pool=token_pool,
                     max_transient_failures=max_transient_failures,
                     shared_credential_redis=shared_credential_redis,
-                    issue_delivery_verifier_enabled=issue_delivery_verifier_enabled,
+                    issue_delivery_verifier=issue_delivery_verifier,
                 )
             except _RetryableResultError as exc:
                 logger.warning(
@@ -2928,7 +2924,7 @@ def _handle_result(
     token_pool: ProviderPool | None = None,
     max_transient_failures: int = 5,
     shared_credential_redis: RedisClient | None = None,
-    issue_delivery_verifier_enabled: bool = True,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> None:
     """Process a single task result.
 
@@ -3202,6 +3198,36 @@ def _handle_result(
         _release_provider_task_tracking()
         return
 
+    verifier_config = issue_delivery_verifier or IssueDeliveryVerifierConfig()
+
+    if is_issue and verifier_config.enabled:
+        try:
+            admission = admit_issue_result(redis, repo, result, logger_=logger)
+        except Exception as exc:
+            raise _RetryableResultError(
+                f"failed to admit issue result for #{resource_id}: {exc}"
+            ) from exc
+        if admission.kind is AdmissionKind.CONFLICT:
+            try:
+                apply_admission_conflict(redis, repo, result, admission, logger_=logger)
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to apply issue-result conflict for #{resource_id}: {exc}"
+                ) from exc
+            _commit_result_side_effects()
+            return
+        if admission.route == ROUTE_COMPLETED_VERIFY:
+            try:
+                admit_completed_verification_job(
+                    redis, repo, result, admission, verifier_config, logger_=logger
+                )
+            except Exception as exc:
+                raise _RetryableResultError(
+                    f"failed to admit verification job for issue #{resource_id}: {exc}"
+                ) from exc
+            _commit_result_side_effects()
+            return
+
     # Select the right GitHub functions based on resource type
     _add_label = gh.add_issue_label if is_issue else gh.add_label
     _post_comment = gh.post_issue_comment if is_issue else gh.post_comment
@@ -3216,49 +3242,10 @@ def _handle_result(
     # task successes.
     if result.status == ResultStatus.COMPLETED:
         if is_issue:
-            if not issue_delivery_verifier_enabled:
-                logger.debug(
-                    "Issue #%d delivery verifier disabled by config; skipping", resource_id
-                )
-            else:
-                try:
-                    verification = verify_issue_delivery(
-                        repo,
-                        resource_id,
-                        result.branch or "",
-                        result.snapshot_head_sha,
-                        token,
-                    )
-                except Exception as exc:
-                    verification = DeliveryVerification(
-                        verified=False,
-                        error_kind=DeliveryErrorKind.TRANSPORT,
-                        reason=DeliveryFailureReason.GH_TRANSPORT_ERROR,
-                        repo=repo,
-                        issue_number=resource_id,
-                        default_branch="",
-                        default_branch_oid="",
-                        expected_head_ref=result.branch or "",
-                        expected_head_oid=result.snapshot_head_sha,
-                        live_head_oid="",
-                        complete=False,
-                        message=f"unexpected verifier failure: {exc}",
-                    )
-                _record_issue_delivery_shadow_evidence(redis, verification, result.task_id, logger)
-                if verification.verified:
-                    logger.info(
-                        "Issue #%d delivery verifier found PR evidence on %s",
-                        resource_id,
-                        result.branch or "<missing-branch>",
-                    )
-                else:
-                    logger.warning(
-                        "Issue #%d delivery verifier could not verify handoff (%s/%s): %s",
-                        resource_id,
-                        verification.error_kind.value,
-                        verification.reason.value,
-                        verification.message,
-                    )
+            logger.debug(
+                "Issue #%d delivery verifier disabled by config; completing immediately",
+                resource_id,
+            )
             try:
                 clear_issue_attempts(redis, repo, resource_id)
             except Exception as exc:
