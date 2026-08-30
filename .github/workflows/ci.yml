@@ -41,9 +41,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
+      - run: make check-lock-dev
       - run: ruff check src/ tests/
       - run: ruff format --check src/ tests/
 
@@ -66,9 +68,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: mypy src/
 
   test:
@@ -90,9 +93,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: pytest tests/ --ignore=tests/integration --ignore=tests/stress -m unit -x --cov=src/orcest --cov-report=term-missing
 
   dashboard:
@@ -165,9 +169,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.lock', 'requirements-dev.lock', 'requirements-dev-toolchain.txt') }}
           restore-keys: ${{ runner.os }}-pip-
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements-dev.lock
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: pytest tests/integration -x
 
   docker:
