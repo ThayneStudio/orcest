@@ -386,6 +386,40 @@ class TestExecuteTask:
         )
         mock_workspace.cleanup.assert_called_once()
 
+    def test_completed_issue_result_reports_expected_branch_and_final_sha(
+        self, local_worker_config, mock_workspace
+    ):
+        """Issue completion metadata gives the orchestrator an exact verifier boundary."""
+        task = Task.create(
+            task_type=TaskType.IMPLEMENT_ISSUE,
+            repo="owner/repo",
+            token="test-token-loop",
+            resource_type="issue",
+            resource_id=657,
+            prompt="Implement issue",
+            branch=None,
+            expected_branch="issue-657-work",
+        )
+        mock_workspace.current_head_sha.return_value = "f" * 40
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = _success_runner_result()
+        mock_redis = MagicMock()
+        mock_redis.xadd_capped.return_value = "1-0"
+
+        result = _execute_task(
+            task,
+            local_worker_config,
+            mock_runner,
+            mock_workspace,
+            mock_redis,
+            logging.getLogger("test"),
+        )
+
+        assert result.status == ResultStatus.COMPLETED
+        assert result.branch == "issue-657-work"
+        assert result.snapshot_head_sha == "f" * 40
+        mock_workspace.setup.assert_called_once_with(task.repo, None, task.token)
+
     def test_worker_handles_runner_failure(self, local_worker_config, sample_task, mock_workspace):
         """_execute_task returns a FAILED TaskResult when the runner fails."""
         mock_runner = MagicMock()
