@@ -193,13 +193,17 @@ src/orcest/
 
 ## Installation
 
-Orcest requires **Python 3.12 or newer**. Clone the repo and install in
-editable mode:
+Orcest development uses **Python 3.12**, `pip==24.0`, and
+`pip-tools==7.5.2` to regenerate the development lock. Clone the repo
+and install the locked development environment in editable mode:
 
 ```bash
 git clone https://github.com/ThayneStudio/orcest.git
 cd orcest
-pip install -e ".[dev]"
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.lock
+python -m pip install --no-deps --no-build-isolation -e .
 ```
 
 Available extras:
@@ -222,7 +226,9 @@ The `Makefile` provides the canonical developer targets:
 | `make lint`                          | `ruff check src/ tests/`                                                                                  |
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
 | `make redis-up` / `make redis-down`  | Manage the test Redis container directly.                                                                 |
-| `make lock`                          | Regenerate `requirements.lock` via `pip-compile`.                                                         |
+| `make lock`                          | Regenerate the runtime `requirements.lock` via `pip-compile`.                                             |
+| `make lock-dev`                      | Regenerate `requirements-dev.lock` from the `dev` extra and PEP 517 build requirements, constrained by the runtime lock. |
+| `make check-lock-dev`                | Regenerate `requirements-dev.lock` into a temporary file and compare it with the committed lock.           |
 | `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
 | `make audit-dashboard`               | Runs `npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL)` on its own. Kept out of `test-dashboard` (and non-blocking in CI) so a new registry advisory cannot fail an unrelated PR. |
 | `make build-dashboard`               | Builds the dashboard in the pinned Node Docker image.                                                      |
@@ -385,7 +391,10 @@ GitHub repo. It is **not** a production deploy — for that, see
    ```bash
    git clone https://github.com/ThayneStudio/orcest.git
    cd orcest
-   pip install -e ".[dev]"
+   python3.12 -m venv .venv
+   . .venv/bin/activate
+   python -m pip install -r requirements-dev.lock
+   python -m pip install --no-deps --no-build-isolation -e .
    ```
 2. **Start Redis.**
    ```bash

@@ -1,5 +1,6 @@
-.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock lock-dev check-lock-dev build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
+PIP_COMPILE_CMD ?= pip-compile
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
 DASHBOARD_ENV ?= /opt/orcest/.dashboard.env
 DASHBOARD_NODE_VERSION ?= $(shell cat dashboard/.node-version)
@@ -98,6 +99,16 @@ format:
 
 lock:
 	pip-compile pyproject.toml --output-file requirements.lock --strip-extras
+
+lock-dev:
+	$(PIP_COMPILE_CMD) pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file requirements-dev.lock --strip-extras --allow-unsafe --no-header
+
+check-lock-dev:
+	@tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	cp requirements-dev.lock "$$tmp" && \
+	$(PIP_COMPILE_CMD) --quiet pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file "$$tmp" --strip-extras --allow-unsafe --no-header && \
+	diff -u requirements-dev.lock "$$tmp"
 
 build-dashboard: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm run build)
