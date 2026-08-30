@@ -10,6 +10,11 @@ import time
 
 import pytest
 
+from orcest.orchestrator.github_delivery_verifier import (
+    DeliveryErrorKind,
+    DeliveryFailureReason,
+    DeliveryVerification,
+)
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
     has_usage_exhausted_cooldown as has_issue_usage_exhausted_cooldown,
@@ -28,6 +33,8 @@ from orcest.orchestrator.loop import (
     _is_merge_conflict_error,
     _is_required_checks_expected_error,
     _is_stale_head_error,
+    _issue_delivery_counter_key,
+    _issue_delivery_evidence_key,
     _make_review_rerun_failure_cooldown_key,
     _mark_usage_exhausted_token,
     _merge_status_indicates_conflict,
@@ -1313,6 +1320,59 @@ def test_consume_results_completed_issue_clears_attempts(
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    gh_mock.remove_issue_label.assert_called_once()
+
+
+def test_consume_results_completed_issue_records_delivery_shadow_evidence(
+    fake_redis_client, orchestrator_config, gh_mock
+):
+    """Completed issue tasks write verifier evidence without changing existing side effects."""
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    repo = orchestrator_config.github.repo
+    issue_number = 44
+    verification = DeliveryVerification(
+        verified=True,
+        error_kind=DeliveryErrorKind.NONE,
+        reason=DeliveryFailureReason.VERIFIED,
+        repo=repo,
+        issue_number=issue_number,
+        default_branch="master",
+        default_branch_oid="b" * 40,
+        expected_head_ref="issue-44-work",
+        expected_head_oid="a" * 40,
+        live_head_oid="a" * 40,
+        complete=True,
+        message="verified",
+    )
+    gh_mock.verify_issue_delivery.return_value = verification
+
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        branch="issue-44-work",
+        snapshot_head_sha="a" * 40,
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    gh_mock.verify_issue_delivery.assert_called_once_with(
+        repo,
+        issue_number,
+        "issue-44-work",
+        "a" * 40,
+        orchestrator_config.github.token,
+    )
+    evidence = fake_redis_client.hgetall(
+        _issue_delivery_evidence_key(repo, issue_number, result.task_id)
+    )
+    assert evidence["verified"] == "1"
+    assert evidence["candidate_pr_count"] == "0"
+    assert fake_redis_client.get(
+        _issue_delivery_counter_key(DeliveryErrorKind.NONE, DeliveryFailureReason.VERIFIED)
+    ) == "1"
     gh_mock.remove_issue_label.assert_called_once()
 
 

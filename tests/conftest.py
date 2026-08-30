@@ -1,6 +1,7 @@
 """Shared fixtures for all test modules."""
 
 import os
+import sys
 import types
 from urllib.parse import urlparse
 
@@ -185,8 +186,33 @@ def gh_mock(mocker):
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
+    if "orcest.orchestrator.loop" in sys.modules:
+        ns.verify_issue_delivery = mocker.patch(
+            "orcest.orchestrator.loop.verify_issue_delivery"
+        )
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
     ns.has_issue_comment_marker.return_value = False
+    if hasattr(ns, "verify_issue_delivery"):
+        from orcest.orchestrator.github_delivery_verifier import (
+            DeliveryErrorKind,
+            DeliveryFailureReason,
+            DeliveryVerification,
+        )
+
+        ns.verify_issue_delivery.return_value = DeliveryVerification(
+            verified=False,
+            error_kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANONICAL_CLOSING_REFERENCE,
+            repo="owner/testrepo",
+            issue_number=0,
+            default_branch="",
+            default_branch_oid="",
+            expected_head_ref="",
+            expected_head_oid="",
+            live_head_oid="",
+            complete=False,
+            message="test default",
+        )
     return ns
 
 

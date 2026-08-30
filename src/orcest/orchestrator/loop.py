@@ -23,6 +23,12 @@ from orcest.orchestrator.deployment import DeploymentError, run_deployment
 from orcest.orchestrator.event_relay import EventRelay
 from orcest.orchestrator.fleet_health import FleetHealthMonitor
 from orcest.orchestrator.gh import GhRateLimitError
+from orcest.orchestrator.github_delivery_verifier import (
+    DeliveryErrorKind,
+    DeliveryFailureReason,
+    DeliveryVerification,
+    verify_issue_delivery,
+)
 from orcest.orchestrator.issue_ops import (
     IssueAction,
     clear_attempts as clear_issue_attempts,
@@ -88,6 +94,8 @@ RESULTS_GROUP = "orchestrator"
 # credential_refresh_failures incremented when an OAuth provider reports an unusable
 # refreshed credential blob, e.g. Grok JSON without a refresh_token.
 _PROVIDER_EXHAUSTED_SKIP_KEY = "providers:exhausted_skip"  # aggregate for compat
+_ISSUE_DELIVERY_EVIDENCE_TTL_SECONDS = 14 * 24 * 3600
+_ISSUE_DELIVERY_COUNTER_TTL_SECONDS = 30 * 24 * 3600
 _PROVIDER_EXHAUSTED_SKIP_TTL_SECONDS = 24 * 3600  # 24 hours
 _REBAKE_REQUIRED_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
 _CREDENTIAL_REFRESH_FAILURES_TTL_SECONDS = 24 * 3600  # 24 hours
@@ -121,6 +129,43 @@ _LEGACY_HEARTBEAT_STALE_FLOOR = 180
 
 class _RetryableResultError(RuntimeError):
     """Result handling failed before its durable side effects committed."""
+
+
+def _issue_delivery_evidence_key(repo: str, issue_number: int, task_id: str) -> str:
+    safe_repo = repo.replace("/", ":")
+    return f"issue_delivery_verifier:{safe_repo}:{issue_number}:{task_id}"
+
+
+def _issue_delivery_counter_key(kind: DeliveryErrorKind, reason: DeliveryFailureReason) -> str:
+    return f"issue_delivery_verifier:{kind.value}:{reason.value}"
+
+
+def _record_issue_delivery_shadow_evidence(
+    redis: RedisClient,
+    verification: DeliveryVerification,
+    task_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Best-effort bounded evidence for the read-only issue delivery verifier."""
+    try:
+        key = _issue_delivery_evidence_key(
+            verification.repo,
+            verification.issue_number,
+            task_id,
+        )
+        for field, value in verification.to_shadow_fields().items():
+            redis.hset(key, field, value)
+        redis.expire(key, _ISSUE_DELIVERY_EVIDENCE_TTL_SECONDS)
+        counter_key = _issue_delivery_counter_key(verification.error_kind, verification.reason)
+        count = redis.incr(counter_key)
+        if count == 1:
+            redis.expire(counter_key, _ISSUE_DELIVERY_COUNTER_TTL_SECONDS)
+    except Exception:
+        logger.debug(
+            "Failed to record issue delivery verifier shadow evidence for issue #%d",
+            verification.issue_number,
+            exc_info=True,
+        )
 
 
 def _configured_task_providers(
@@ -3167,6 +3212,44 @@ def _handle_result(
     # task successes.
     if result.status == ResultStatus.COMPLETED:
         if is_issue:
+            try:
+                verification = verify_issue_delivery(
+                    repo,
+                    resource_id,
+                    result.branch or "",
+                    result.snapshot_head_sha,
+                    token,
+                )
+            except Exception as exc:
+                verification = DeliveryVerification(
+                    verified=False,
+                    error_kind=DeliveryErrorKind.TRANSPORT,
+                    reason=DeliveryFailureReason.GH_TRANSPORT_ERROR,
+                    repo=repo,
+                    issue_number=resource_id,
+                    default_branch="",
+                    default_branch_oid="",
+                    expected_head_ref=result.branch or "",
+                    expected_head_oid=result.snapshot_head_sha,
+                    live_head_oid="",
+                    complete=False,
+                    message=f"unexpected verifier failure: {exc}",
+                )
+            _record_issue_delivery_shadow_evidence(redis, verification, result.task_id, logger)
+            if verification.verified:
+                logger.info(
+                    "Issue #%d delivery verifier found PR evidence on %s",
+                    resource_id,
+                    result.branch or "<missing-branch>",
+                )
+            else:
+                logger.warning(
+                    "Issue #%d delivery verifier could not verify handoff (%s/%s): %s",
+                    resource_id,
+                    verification.error_kind.value,
+                    verification.reason.value,
+                    verification.message,
+                )
             try:
                 clear_issue_attempts(redis, repo, resource_id)
             except Exception as exc:
