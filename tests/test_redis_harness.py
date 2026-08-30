@@ -210,8 +210,22 @@ def test_makefile_correctness_targets_do_not_use_shared_redis() -> None:
     stress_block = _makefile_target(makefile, "test-stress")
     unit_block = _makefile_target(makefile, "test-unit")
     dashboard_block = _makefile_target(makefile, "test-dashboard")
+    lint_check_block = _makefile_target(makefile, "lint-check")
+    typecheck_block = _makefile_target(makefile, "typecheck")
+    check_fast_block = _makefile_target(makefile, "check-fast")
+    check_full_block = _makefile_target(makefile, "check-full")
 
-    for block in (test_block, integration_block, stress_block, unit_block, dashboard_block):
+    for block in (
+        test_block,
+        integration_block,
+        stress_block,
+        unit_block,
+        dashboard_block,
+        lint_check_block,
+        typecheck_block,
+        check_fast_block,
+        check_full_block,
+    ):
         assert "redis-up" not in block
         assert "redis-down" not in block
         assert "docker-compose.redis.yml" not in block

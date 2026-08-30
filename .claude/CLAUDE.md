@@ -32,23 +32,29 @@ src/orcest/
 ## Development
 
 ```bash
-# Install in dev mode
-pip install -e ".[dev]"
+# Install in dev mode (locked)
+python -m pip install -r requirements-dev.lock
+python -m pip install --no-deps --no-build-isolation -e .
 
-# Run all tests (unit, then invocation-scoped integration/stress Redis, then dashboard)
+# Fast local aggregate: lint-check + typecheck + unit tests
+make check-fast
+
+# Full local aggregate: check-fast + integration + stress + dashboard
+# Does not include CI-only image builds or dashboard Compose/image smokes.
+make check-full
+
+# Compatibility: unit, then invocation-scoped integration/stress Redis, then dashboard
 make test
 
-# Run unit tests only (no Redis needed)
+# Individual leaves
+make lint-check
+make typecheck
 make test-unit
-
-# Redis-backed suites (each run gets its own Compose project and port)
 make test-integration
 make test-stress
+make test-dashboard
 
-# Lint
-make lint
-
-# Format
+# Format (applies changes)
 make format
 ```
 

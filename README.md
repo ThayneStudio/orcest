@@ -221,9 +221,14 @@ The `Makefile` provides the canonical developer targets:
 
 | Target                               | What it does                                                                                              |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `make lint-check`                    | `ruff check src/ tests/` and `ruff format --check src/ tests/`.                                           |
+| `make typecheck`                     | `mypy src/`.                                                                                              |
 | `make test-unit`                     | Runs only tests marked `unit` (uses `fakeredis` / mocks; no external services required).                  |
 | `make test-integration`              | Starts an invocation-scoped Redis and runs `pytest -m integration` (including inline markers outside `tests/integration/`). |
 | `make test-stress`                   | Starts an invocation-scoped Redis and runs `pytest -m stress`.                                            |
+| `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
+| `make check-fast`                    | Aggregate of `lint-check`, `typecheck`, and `test-unit`.                                                   |
+| `make check-full`                    | Aggregate of `check-fast`, `test-integration`, `test-stress`, and `test-dashboard`. Does not include CI-only image builds or dashboard Compose/image smokes. |
 | `make test`                          | Compatibility entry point: `test-unit`, managed `test-integration`, managed `test-stress`, then `test-dashboard`. Stops on the first failing phase. |
 | `make lint`                          | `ruff check src/ tests/`                                                                                  |
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
@@ -231,7 +236,6 @@ The `Makefile` provides the canonical developer targets:
 | `make lock`                          | Regenerate the runtime `requirements.lock` via `pip-compile`.                                             |
 | `make lock-dev`                      | Regenerate `requirements-dev.lock` from the `dev` extra and PEP 517 build requirements, constrained by the runtime lock. |
 | `make check-lock-dev`                | Regenerate `requirements-dev.lock` into a temporary file and compare it with the committed lock.           |
-| `make test-dashboard`                | Runs dashboard install, typecheck, tests, build, and bundle-runtime check in the pinned Node Docker image. |
 | `make audit-dashboard`               | Runs `npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL)` on its own. Kept out of `test-dashboard` (and non-blocking in CI) so a new registry advisory cannot fail an unrelated PR. |
 | `make build-dashboard`               | Builds the dashboard in the pinned Node Docker image.                                                      |
 | `make smoke-dashboard-compose`       | Builds the dashboard Compose stack with an authenticated Redis container and verifies `/api/ready`.        |
