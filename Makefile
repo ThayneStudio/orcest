@@ -106,6 +106,7 @@ lock-dev:
 check-lock-dev:
 	@tmp=$$(mktemp); \
 	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	cp requirements-dev.lock "$$tmp"; \
 	$(PIP_COMPILE_CMD) --quiet pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file "$$tmp" --strip-extras --allow-unsafe --no-header; \
 	diff -u requirements-dev.lock "$$tmp"
 
