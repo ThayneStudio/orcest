@@ -38,8 +38,11 @@ def test_makefile_dev_lock_targets_are_non_mutating_and_constrained() -> None:
     assert "--no-header" in makefile
     assert "requirements-dev.lock" in makefile
     assert "mktemp" in makefile
-    assert 'cp requirements-dev.lock "$$tmp"' in makefile
+    assert 'cp requirements-dev.lock "$$tmp" &&' in makefile
+    assert '--output-file "$$tmp" --strip-extras --allow-unsafe --no-header &&' in makefile
     assert 'diff -u requirements-dev.lock "$$tmp"' in makefile
+    assert 'cp requirements-dev.lock "$$tmp";' not in makefile
+    assert '--output-file "$$tmp" --strip-extras --allow-unsafe --no-header;' not in makefile
 
 
 def test_ci_installs_locked_dev_environment_without_dependency_resolution() -> None:
