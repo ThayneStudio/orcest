@@ -41,7 +41,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orcest.workflow_store.v1.errors import (
-    DurableStoreError,
     IntegrityConflictError,
     LayoutError,
     QuotaExceededError,
@@ -178,7 +177,13 @@ def mkdir_durable(path: Path, *, stop: Path, mode: int = DIR_MODE) -> None:
 
 
 def write_exclusive_file(path: Path, data: bytes, *, mode: int = FILE_MODE) -> None:
-    """O_EXCL create, write all bytes, fchmod, fsync-file, close. Unlinks on failure."""
+    """O_EXCL create, write all bytes, fchmod, fsync-file, close, fsync-dir.
+
+    Unlinks on a write/fchmod/fsync-file failure. The parent directory is
+    fsynced after a successful close so a crash cannot drop the new dirent
+    (and, for files like the Secret Store integrity key, silently recreate
+    a different object on the next start).
+    """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -198,6 +203,7 @@ def write_exclusive_file(path: Path, data: bytes, *, mode: int = FILE_MODE) -> N
             pass
         raise
     os.close(fd)
+    fsync_dir(path.parent)
 
 
 def read_exact_file(path: Path, *, max_bytes: int) -> bytes:
@@ -207,7 +213,10 @@ def read_exact_file(path: Path, *, max_bytes: int) -> bytes:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise IntegrityConflictError("object file is missing") from exc
     try:
         st = os.fstat(fd)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
@@ -251,17 +260,12 @@ def promote_no_clobber(
     incoming_dir: Path,
     store_root: Path,
     expected: bytes,
-    on_mismatch: str = "conflict",
 ) -> PromoteResult:
     """Link ``incoming`` onto ``dest`` without replacement, then fsync directories.
 
     If ``dest`` already exists, reopen it through the trusted path and require
     exact byte identity. A mismatch fails closed and never clobbers ``dest``.
-    ``on_mismatch`` is ``conflict`` (raise) or ``quarantine`` (caller handles
-    the incoming file after the exception).
     """
-    if on_mismatch not in {"conflict", "quarantine"}:
-        raise DurableStoreError("invalid on_mismatch")
     mkdir_durable(dest.parent, stop=store_root)
     try:
         no_clobber_link(incoming, dest)

@@ -174,3 +174,55 @@ def test_write_before_reference_failure_has_no_live_ref(secret_store: SecretStor
     )
     assert live == [handle.attestation_id]
     assert secret_store.read_value(secret_id, 1) == SECRET
+
+
+def test_missing_integrity_meta_is_integrity_conflict_not_oserror(
+    secret_store: SecretStore, layout: object
+) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    secret_id = _secret_id()
+    secret_store.put_version(secret_id, 1, SECRET)
+    meta = layout.secrets_root / secret_id / "integrity" / "1"
+    meta.unlink()
+    with pytest.raises(IntegrityConflictError, match="integrity metadata"):
+        secret_store.verify(secret_id, 1)
+    with pytest.raises(IntegrityConflictError, match="integrity metadata"):
+        secret_store.read_value(secret_id, 1)
+
+
+def test_value_without_meta_is_repaired_on_retry(secret_store: SecretStore, layout: object) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    secret_id = _secret_id()
+    secret_store.put_version(secret_id, 1, SECRET)
+    meta = layout.secrets_root / secret_id / "integrity" / "1"
+    meta.unlink()
+    with pytest.raises(IntegrityConflictError):
+        secret_store.verify(secret_id, 1)
+    repaired = secret_store.put_version(secret_id, 1, SECRET)
+    assert secret_store.read_value(secret_id, 1) == SECRET
+    assert repaired.byte_length == len(SECRET)
+    assert secret_store.verify(secret_id, 1).attestation_id == repaired.attestation_id
+
+
+def test_meta_without_value_completes_on_retry(secret_store: SecretStore, layout: object) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    secret_id = _secret_id()
+    first = secret_store.put_version(secret_id, 1, SECRET)
+    dest = layout.secrets_root / secret_id / "versions" / "1"
+    dest.unlink()
+    with pytest.raises(ObjectNotFoundError):
+        secret_store.verify(secret_id, 1)
+    second = secret_store.put_version(secret_id, 1, SECRET)
+    assert secret_store.read_value(secret_id, 1) == SECRET
+    assert second.attestation_id == first.attestation_id
+
+
+def test_promote_missing_staging_is_not_found(secret_store: SecretStore) -> None:
+    with pytest.raises(ObjectNotFoundError, match="staged secret"):
+        secret_store.promote_version(staging_id=_secret_id(), secret_id=_secret_id(), version=1)

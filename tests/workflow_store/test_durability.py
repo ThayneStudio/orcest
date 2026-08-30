@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from orcest.workflow_store.v1 import fs as fs_mod
 from orcest.workflow_store.v1.blobs import WorkflowBlobStore
 from orcest.workflow_store.v1.candidates import CandidateObjectStore
 from orcest.workflow_store.v1.errors import IntegrityConflictError, QuotaExceededError
@@ -221,6 +222,53 @@ def test_concurrent_identical_blob_writers_are_idempotent(tmp_path: Path) -> Non
     assert errors == []
     assert len(set(results)) == 1
     assert sum(1 for _ in store.iter_objects()) == 1
+
+
+def test_write_exclusive_file_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "exclusive"
+    parent.mkdir()
+    synced: list[Path] = []
+    real = fs_mod.fsync_dir
+
+    def spy(path: Path) -> None:
+        synced.append(Path(path).resolve())
+        real(path)
+
+    monkeypatch.setattr(fs_mod, "fsync_dir", spy)
+    target = parent / "created.bin"
+    fs_mod.write_exclusive_file(target, b"exclusive-bytes")
+    assert parent.resolve() in synced
+    assert target.read_bytes() == b"exclusive-bytes"
+
+
+def test_integrity_key_create_fsyncs_secrets_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = ControlLayout(root=tmp_path / "control")
+    layout.initialize()
+    synced: list[Path] = []
+    real = fs_mod.fsync_dir
+
+    def spy(path: Path) -> None:
+        synced.append(Path(path).resolve())
+        real(path)
+
+    monkeypatch.setattr(fs_mod, "fsync_dir", spy)
+    monkeypatch.setattr("orcest.workflow_store.v1.secrets.fsync_dir", spy)
+    SecretStore(
+        layout,
+        quota=QuotaConfig(min_free_bytes=0, max_object_bytes=1024),
+        lock=StorageLock(layout.storage_lock_path),
+    )
+    assert layout.secrets_root.resolve() in synced
+    assert (layout.secrets_root / "integrity.key").is_file()
+
+
+def test_read_exact_file_missing_is_integrity_conflict(tmp_path: Path) -> None:
+    with pytest.raises(IntegrityConflictError, match="object file is missing"):
+        fs_mod.read_exact_file(tmp_path / "absent.bin", max_bytes=32)
 
 
 def test_storage_lock_excludes_other_holder(tmp_path: Path) -> None:

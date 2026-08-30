@@ -5,10 +5,12 @@ integrity tags, and unkeyed secret-derived digests never enter SQLite,
 Redis, logs, exception messages, or ordinary API bodies. SQLite may store
 only the opaque attestation UUID returned here.
 
-Write-before-reference: the immutable version file and its controller-only
-integrity metadata are fsynced and no-clobber promoted under ``storage.lock``
-before the optional reference callback (the later SQLite Secret Version
-insert) runs.
+Write-before-reference: the controller-only integrity metadata is made
+durable first, then the immutable version file, both via no-clobber
+promotion under ``storage.lock``, before the optional reference callback
+(the later SQLite Secret Version insert) runs. A crash cannot leave a live
+reference to missing bytes, and ``dest`` existing implies metadata is
+already durable.
 """
 
 from __future__ import annotations
@@ -159,6 +161,9 @@ class SecretStore:
             write_exclusive_file(self._key_path, os.urandom(INTEGRITY_KEY_BYTES), mode=FILE_MODE)
         except FileExistsError:
             pass
+        # Persist the dirent even if we found a key from a previous start that
+        # fsynced the file but crashed before the directory fsync.
+        fsync_dir(self._root)
         key = read_exact_file(self._key_path, max_bytes=INTEGRITY_KEY_BYTES)
         if len(key) != INTEGRITY_KEY_BYTES:
             raise IntegrityConflictError("secret store integrity key has the wrong length")
@@ -182,7 +187,6 @@ class SecretStore:
             free_space=self._free_space,
         )
         staged = trusted_join(self._incoming, staging_id)
-        os.rename(incoming, staged)
         authenticator = secret_staging_attestation(
             self._integrity_key, staging_id=staging_id, secret_bytes=value
         )
@@ -194,6 +198,8 @@ class SecretStore:
         }
         meta_path = trusted_join(self._incoming, f"{staging_id}.integrity")
         write_exclusive_file(meta_path, canonical_json_bytes(meta), mode=FILE_MODE)
+        fsync_dir(self._incoming)
+        os.rename(incoming, staged)
         fsync_dir(self._incoming)
         return SecretStagingHandle(
             staging_id=staging_id, byte_length=len(value), attestation_id=attestation_id
@@ -243,6 +249,10 @@ class SecretStore:
                 precheck()
             staged_path = trusted_join(self._incoming, staging_id)
             meta_path = trusted_join(self._incoming, f"{staging_id}.integrity")
+            if not staged_path.is_file():
+                raise ObjectNotFoundError("staged secret is not installed")
+            if not meta_path.is_file():
+                raise IntegrityConflictError("staged secret integrity metadata is missing")
             value = read_exact_file(staged_path, max_bytes=self._quota.max_object_bytes)
             meta = _load_integrity_meta(meta_path, max_bytes=self._quota.max_object_bytes)
             expected = secret_staging_attestation(
@@ -292,6 +302,8 @@ class SecretStore:
         meta_dest = self._integrity_path(secret_id, version)
         if not dest.is_file():
             raise ObjectNotFoundError("secret version is not installed")
+        if not meta_dest.is_file():
+            raise IntegrityConflictError("secret version integrity metadata is missing")
         value = read_exact_file(dest, max_bytes=self._quota.max_object_bytes)
         meta = _load_integrity_meta(meta_dest, max_bytes=self._quota.max_object_bytes)
         expected = secret_version_integrity_tag(
@@ -353,16 +365,6 @@ class SecretStore:
         authenticator = secret_version_integrity_tag(
             self._integrity_key, secret_id=secret_id, version=version, secret_bytes=value
         )
-        if dest.exists():
-            existing = self.verify(secret_id, version)
-            existing_bytes = read_exact_file(dest, max_bytes=self._quota.max_object_bytes)
-            if existing_bytes != value:
-                raise IntegrityConflictError("secret version already exists with different bytes")
-            try:
-                os.unlink(staged_path)
-            except FileNotFoundError:
-                pass
-            return existing
         mkdir_durable(dest.parent, stop=self._root)
         mkdir_durable(meta_dest.parent, stop=self._root)
         meta_body = canonical_json_bytes(
@@ -374,7 +376,48 @@ class SecretStore:
                 "authenticator": authenticator,
             }
         )
-        tmp_meta = write_incoming_bytes(
+        if dest.is_file():
+            existing_bytes = read_exact_file(dest, max_bytes=self._quota.max_object_bytes)
+            if existing_bytes != value:
+                raise IntegrityConflictError("secret version already exists with different bytes")
+            if not meta_dest.is_file():
+                # Crash after dest, before meta (or meta dirent lost). Repair
+                # by establishing metadata for the already-durable bytes.
+                self._promote_integrity_file(meta_dest, meta_body)
+            try:
+                os.unlink(staged_path)
+            except FileNotFoundError:
+                pass
+            return self.verify(secret_id, version)
+        # dest is the completeness marker: make meta durable first so a crash
+        # cannot leave a value that verify()/retry cannot read.
+        if meta_dest.is_file():
+            existing_meta = _load_integrity_meta(meta_dest, max_bytes=self._quota.max_object_bytes)
+            tag = existing_meta.get("authenticator")
+            if not isinstance(tag, str) or not hmac.compare_digest(authenticator, tag):
+                raise IntegrityConflictError(
+                    "secret version integrity metadata does not match value"
+                )
+            if _require_int(existing_meta.get("byte_length"), field="byte_length") != len(value):
+                raise IntegrityConflictError("secret version length mismatch")
+            if (
+                str(existing_meta.get("secret_id", "")) != secret_id
+                or _require_int(existing_meta.get("version"), field="version") != version
+            ):
+                raise IntegrityConflictError("secret version identity mismatch")
+        else:
+            self._promote_integrity_file(meta_dest, meta_body)
+        promote_no_clobber(
+            incoming=staged_path,
+            dest=dest,
+            incoming_dir=self._incoming,
+            store_root=self._root,
+            expected=value,
+        )
+        return self.verify(secret_id, version)
+
+    def _promote_integrity_file(self, dest: Path, meta_body: bytes) -> None:
+        incoming = write_incoming_bytes(
             self._incoming,
             meta_body,
             store_root=self._root,
@@ -383,20 +426,12 @@ class SecretStore:
             free_space=self._free_space,
         )
         promote_no_clobber(
-            incoming=staged_path,
+            incoming=incoming,
             dest=dest,
-            incoming_dir=self._incoming,
-            store_root=self._root,
-            expected=value,
-        )
-        promote_no_clobber(
-            incoming=tmp_meta,
-            dest=meta_dest,
             incoming_dir=self._incoming,
             store_root=self._root,
             expected=meta_body,
         )
-        return self.verify(secret_id, version)
 
     def _version_path(self, secret_id: str, version: int) -> Path:
         return trusted_join(self._root, secret_id, "versions", str(version))
@@ -406,6 +441,8 @@ class SecretStore:
 
 
 def _load_integrity_meta(path: Path, *, max_bytes: int) -> dict[str, object]:
+    if not path.is_file():
+        raise IntegrityConflictError("integrity metadata is missing")
     raw = read_exact_file(path, max_bytes=max_bytes)
     text = raw.decode("utf-8")
     # Round-trip through canonical JSON so unknown/unordered fields fail closed
