@@ -1,0 +1,92 @@
+[
+  {
+    "name": "workflow_blob_digest_config_json",
+    "fn": "workflow_blob_digest",
+    "args": {
+      "media_kind": "CONFIG_JSON",
+      "normalized_bytes_hex": "7b226b6579223a2276616c7565227d"
+    },
+    "expected_digest": "sha256:6a81756ed3792bcf06ae2f005fb8fa50f963d2e7c767ef00df9c1017e13ab4b2"
+  },
+  {
+    "name": "workflow_blob_digest_policy_json_same_bytes",
+    "fn": "workflow_blob_digest",
+    "args": {
+      "media_kind": "POLICY_JSON",
+      "normalized_bytes_hex": "7b226b6579223a2276616c7565227d"
+    },
+    "expected_digest": "sha256:ca9662068b5f3f37f9f02d221931b4330a55831fbadd1a8cf3a9af053eb1963e"
+  },
+  {
+    "name": "capability_public_key_digest_ed25519",
+    "fn": "capability_public_key_digest",
+    "args": {
+      "public_verification_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "signature_algorithm": "ED25519"
+    },
+    "expected_digest": "sha256:9a7d8120c99ec71d20a78ef7bad66523cae5ae78a7e2d4dda71079e38903b9bb"
+  },
+  {
+    "name": "launch_capability_claims_digest_example",
+    "fn": "launch_capability_claims_digest",
+    "args": {
+      "canonical_claims": {
+        "protocol": "orcest.launch-capability/1",
+        "jti": "11111111-1111-1111-1111-111111111111",
+        "attempt_id": "22222222-2222-2222-2222-222222222222",
+        "activity_id": "33333333-3333-3333-3333-333333333333",
+        "generation": 1,
+        "worker_id": "worker-1",
+        "worker_session_id": "session-1",
+        "launch_nonce_id": "44444444-4444-4444-4444-444444444444",
+        "runner_principal_id": "runner-1",
+        "runner_registration_revision": 1,
+        "capability_signing_key_id": "55555555-5555-5555-5555-555555555555",
+        "signature_algorithm": "ED25519",
+        "issued_at_ms": 1700000000000,
+        "execution_deadline_ms": 1700003600000,
+        "launch_attestation_audience": "https://controller.example/api/v1/launch-attestations"
+      }
+    },
+    "expected_digest": "sha256:f9c3dad9eb83653095ee0d9399e88d959a0235db9a8843220112b29e6d919340"
+  },
+  {
+    "name": "subject_refs_digest_example",
+    "fn": "subject_refs_digest",
+    "args": {
+      "subject_refs": [
+        "snapshot:overall",
+        "plan:requirement:tests-pass",
+        "plan:requirement:docs-updated"
+      ]
+    },
+    "expected_digest": "sha256:c1e0889f00e7c4720392bd785bf986b6f84ae6b75359911e16fb1a5213474c12"
+  },
+  {
+    "name": "review_assignment_digest_review_example",
+    "fn": "review_assignment_digest",
+    "args": {
+      "assignment_kind": "REVIEW",
+      "panel_round": 1,
+      "reviewer_slot": "reviewer-1",
+      "adjudication_round": null,
+      "adjudicator_slot": null,
+      "role": "reviewer",
+      "subject_refs_digest": "sha256:c1e0889f00e7c4720392bd785bf986b6f84ae6b75359911e16fb1a5213474c12",
+      "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "disputed_finding_ids_digest": null
+    },
+    "expected_digest": "sha256:b19eae6d4d376f78278f8beacc5b3ef7d4d10d24ae322eb89eb4192d47cdaf52"
+  },
+  {
+    "name": "health_scope_digest_forge_example",
+    "fn": "health_scope_digest",
+    "args": {
+      "scope_identity": {
+        "scope_kind": "FORGE",
+        "forge_instance_id": "66666666-6666-6666-6666-666666666666"
+      }
+    },
+    "expected_digest": "sha256:ba61b0338287b615bf5c2786185ead5f007f81aa2f791d860c57eb89eb4e4218"
+  }
+]
