@@ -222,10 +222,12 @@ The `Makefile` provides the canonical developer targets:
 | Target                               | What it does                                                                                              |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `make test-unit`                     | Runs only tests marked `unit` (uses `fakeredis` / mocks; no external services required).                  |
-| `make test`                          | Starts Redis, runs pytest, then `make test-dashboard` if pytest passes, tears Redis down, and exits with the first failing phase. |
+| `make test-integration`              | Starts an invocation-scoped Redis and runs `pytest -m integration` (including inline markers outside `tests/integration/`). |
+| `make test-stress`                   | Starts an invocation-scoped Redis and runs `pytest -m stress`.                                            |
+| `make test`                          | Compatibility entry point: `test-unit`, managed `test-integration`, managed `test-stress`, then `test-dashboard`. Stops on the first failing phase. |
 | `make lint`                          | `ruff check src/ tests/`                                                                                  |
 | `make format`                        | `ruff format src/ tests/`                                                                                 |
-| `make redis-up` / `make redis-down`  | Manage the test Redis container directly.                                                                 |
+| `make redis-up` / `make redis-down`  | Manual helpers for the shared `docker-compose.redis.yml` service used by local orchestrator development. Not used by correctness targets. |
 | `make lock`                          | Regenerate the runtime `requirements.lock` via `pip-compile`.                                             |
 | `make lock-dev`                      | Regenerate `requirements-dev.lock` from the `dev` extra and PEP 517 build requirements, constrained by the runtime lock. |
 | `make check-lock-dev`                | Regenerate `requirements-dev.lock` into a temporary file and compare it with the committed lock.           |

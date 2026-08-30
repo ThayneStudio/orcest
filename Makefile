@@ -1,4 +1,4 @@
-.PHONY: test test-unit check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock lock-dev check-lock-dev build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
+.PHONY: test test-unit test-integration test-stress check-dashboard-tracked check-dashboard-release-revision check-dashboard-clean-copy test-dashboard audit-dashboard redis-up redis-down lint format lock lock-dev check-lock-dev build-dashboard smoke-dashboard-image smoke-dashboard-compose dev-dashboard check-dashboard-remote-paths preflight-dashboard-remote sync-dashboard-remote sync-dashboard-remote-unlocked deploy-dashboard deploy-dashboard-remote
 
 PIP_COMPILE_CMD ?= pip-compile
 DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
@@ -75,13 +75,26 @@ test-dashboard: check-dashboard-tracked
 audit-dashboard: check-dashboard-tracked
 	$(call DASHBOARD_RUN_IN_CLEAN_COPY,npm ci && npm audit --audit-level=$(DASHBOARD_AUDIT_LEVEL))
 
-# All tests — starts Redis, runs everything, stops Redis
-test: redis-up
-	pytest -v --cov=src/orcest --cov-report=term-missing; ret=$$?; \
-	if [ $$ret -eq 0 ]; then $(MAKE) test-dashboard; ret=$$?; fi; \
-	$(MAKE) redis-down; exit $$ret
+# Compatibility entry point: unit tests, then managed Redis-backed suites,
+# then dashboard. Each Redis-backed target gets its own invocation-scoped
+# Compose project; nothing here starts or stops docker-compose.redis.yml.
+test:
+	$(MAKE) test-unit
+	$(MAKE) test-integration
+	$(MAKE) test-stress
+	$(MAKE) test-dashboard
 
-# Start Redis in Docker for integration/stress tests
+# Real-Redis tests, including inline @pytest.mark.integration outside tests/integration/.
+test-integration:
+	python3 -m tests.harness.supervisor python3 -m pytest -m integration --cov=src/orcest --cov-report=term-missing
+
+# High-concurrency real-Redis tests, including inline @pytest.mark.stress.
+test-stress:
+	python3 -m tests.harness.supervisor python3 -m pytest -m stress --cov=src/orcest --cov-report=term-missing
+
+# Manual-development helpers for the shared docker-compose.redis.yml service.
+# Correctness targets (test, test-unit, test-integration, test-stress, test-dashboard)
+# must not depend on these.
 redis-up:
 	docker compose -f docker-compose.redis.yml up -d redis
 	@echo "Waiting for Redis..."
