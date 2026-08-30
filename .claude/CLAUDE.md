@@ -35,11 +35,15 @@ src/orcest/
 # Install in dev mode
 pip install -e ".[dev]"
 
-# Run all tests (starts Redis via Docker, runs everything, stops Redis)
+# Run all tests (unit, then invocation-scoped integration/stress Redis, then dashboard)
 make test
 
 # Run unit tests only (no Redis needed)
 make test-unit
+
+# Redis-backed suites (each run gets its own Compose project and port)
+make test-integration
+make test-stress
 
 # Lint
 make lint

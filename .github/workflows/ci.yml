@@ -142,16 +142,6 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Checkout repository
         run: |
@@ -173,7 +163,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - run: pip install -r requirements-dev.lock
       - run: pip install --no-deps --no-build-isolation -e .
-      - run: pytest tests/integration -x
+      - run: python3 -m tests.harness.supervisor python3 -m pytest -m integration -x
 
   docker:
     runs-on: [self-hosted, linux]
