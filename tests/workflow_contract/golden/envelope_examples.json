@@ -1,0 +1,180 @@
+[
+  {
+    "name": "controller_maintenance_error",
+    "source": "domain-model.md Controller Mode and Operation section",
+    "body": {
+      "protocol": "orcest.error/1",
+      "code": "CONTROLLER_MAINTENANCE",
+      "retryable": true,
+      "message": "controller is in maintenance mode",
+      "retry_after_seconds": 60
+    }
+  },
+  {
+    "name": "candidate_upload_expired",
+    "source": "domain-model.md Candidate Upload section",
+    "body": {
+      "protocol": "orcest.candidate-upload-expired/1",
+      "upload_id": "11111111-1111-1111-1111-111111111111",
+      "state": "EXPIRED",
+      "code": "UPLOAD_EXPIRED",
+      "expires_at_ms": 1787778000000
+    }
+  },
+  {
+    "name": "launch_accepted_available",
+    "source": "domain-model.md Launch Attestation section",
+    "body": {
+      "protocol": "orcest.launch-accepted/1",
+      "launch_attestation_id": "22222222-2222-2222-2222-222222222222",
+      "attempt_id": "33333333-3333-3333-3333-333333333333",
+      "status": "AVAILABLE",
+      "provider": {
+        "provider": "exact-provider",
+        "model": "exact-model",
+        "provider_account_ref": "non-secret-account-ref",
+        "secret_id": "44444444-4444-4444-4444-444444444444",
+        "version": 7,
+        "material": "sensitive-attempt-scoped-opaque-value"
+      }
+    }
+  },
+  {
+    "name": "launch_accepted_expired",
+    "source": "domain-model.md Launch Attestation section (EXPIRED branch)",
+    "body": {
+      "protocol": "orcest.launch-accepted/1",
+      "launch_attestation_id": "22222222-2222-2222-2222-222222222222",
+      "attempt_id": "33333333-3333-3333-3333-333333333333",
+      "status": "EXPIRED",
+      "provider": null
+    }
+  },
+  {
+    "name": "evidence_wake",
+    "source": "domain-model.md Wait Condition section",
+    "body": {
+      "protocol": "orcest.evidence-wake/1",
+      "project_id": "55555555-5555-5555-5555-555555555555",
+      "target_kind": "WORK_ITEM",
+      "target_id": "owner/repo#42",
+      "minimum_observation_sequence": 1,
+      "allowed_observation_kinds": ["WORK_ITEM_SNAPSHOT"],
+      "predicate_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  {
+    "name": "storage_restoration_accepted",
+    "source": "domain-model.md Storage Restoration Operation section",
+    "body": {
+      "protocol": "orcest.storage-restoration-accepted/1",
+      "operation_id": "66666666-6666-6666-6666-666666666666",
+      "state": "PENDING",
+      "object_kind": "WORKFLOW_BLOB",
+      "object_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "name": "management_result",
+    "source": "domain-model.md Management Command section",
+    "body": {
+      "protocol": "orcest.management-result/1",
+      "command_id": "77777777-7777-7777-7777-777777777777",
+      "run_id": "88888888-8888-8888-8888-888888888888",
+      "kind": "CANCEL",
+      "outcome": "ACCEPTED",
+      "result_transition_sequence": 42,
+      "human_resolution_id": null,
+      "replayed": false
+    }
+  },
+  {
+    "name": "secret_provision_accepted",
+    "source": "domain-model.md Secret Provision Operation section",
+    "body": {
+      "protocol": "orcest.secret-provision-accepted/1",
+      "secret_provision_operation_id": "99999999-9999-9999-9999-999999999999",
+      "state": "PENDING",
+      "secret_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "target_version": 1
+    }
+  },
+  {
+    "name": "secret_provision_result_completed",
+    "source": "domain-model.md Secret Provision Operation section",
+    "body": {
+      "protocol": "orcest.secret-provision-result/1",
+      "secret_provision_operation_id": "99999999-9999-9999-9999-999999999999",
+      "state": "COMPLETED",
+      "secret_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "target_version": 1,
+      "secret_version_key": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1",
+      "new_version": 1,
+      "credential_rotation_receipt_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    }
+  },
+  {
+    "name": "secret_provision_result_rejected",
+    "source": "domain-model.md Secret Provision Operation section",
+    "body": {
+      "protocol": "orcest.secret-provision-result/1",
+      "secret_provision_operation_id": "99999999-9999-9999-9999-999999999999",
+      "state": "REJECTED",
+      "secret_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "target_version": 1,
+      "rejection_code": "CAS_LOST"
+    }
+  },
+  {
+    "name": "credential_rotation_result_applied",
+    "source": "domain-model.md Credential Rotation Request section",
+    "body": {
+      "protocol": "orcest.credential-rotation-result/1",
+      "credential_rotation_request_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "disposition": "APPLIED",
+      "secret_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "expected_prior_version": 3,
+      "current_version": 4,
+      "accepted_version": 4,
+      "credential_rotation_receipt_id": "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    }
+  },
+  {
+    "name": "credential_rotation_result_cas_lost",
+    "source": "domain-model.md Credential Rotation Request section",
+    "body": {
+      "protocol": "orcest.credential-rotation-result/1",
+      "credential_rotation_request_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "disposition": "CAS_LOST",
+      "secret_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "expected_prior_version": 3,
+      "current_version": 4
+    }
+  },
+  {
+    "name": "controller_mode_result_succeeded",
+    "source": "domain-model.md Controller Mode and Operation section",
+    "body": {
+      "protocol_version": "orcest.controller-mode-result/1",
+      "controller_mode_operation_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+      "operation_kind": "SET_MODE",
+      "status": "SUCCEEDED",
+      "replayed": false,
+      "mode_revision": 2,
+      "mode": "RUNNING",
+      "dispatch_paused_intake_policy": null
+    }
+  },
+  {
+    "name": "controller_mode_result_rejected",
+    "source": "domain-model.md Controller Mode and Operation section",
+    "body": {
+      "protocol_version": "orcest.controller-mode-result/1",
+      "controller_mode_operation_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+      "operation_kind": "SET_MODE",
+      "status": "REJECTED",
+      "replayed": false,
+      "rejection_code": "CAS_LOST"
+    }
+  }
+]
