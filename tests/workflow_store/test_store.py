@@ -68,6 +68,86 @@ def test_create_run_defaults_to_explicit_reducer_version(tmp_path: Path) -> None
         assert row[0] == DEFAULT_REDUCER_VERSION
 
 
+def test_create_run_replay_is_idempotent(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            _create_run(store)
+        with store.transaction():
+            _create_run(store)
+        assert store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_create_run_replay_after_transition_is_idempotent(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            _create_run(store)
+            transition = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state="ADMITTED",
+                trigger_kind="ADMIT",
+                trigger_id="admit-source-1",
+                next_state="PLANNING",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest({"source": 1}),
+                specification_generation=1,
+            )
+        with store.transaction():
+            _create_run(store)
+            replayed = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state="ADMITTED",
+                trigger_kind="ADMIT",
+                trigger_id="admit-source-1",
+                next_state="PLANNING",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest({"source": 1}),
+                specification_generation=1,
+            )
+        assert replayed == transition
+        assert store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (RUN_ID,)).fetchone()[
+            0
+        ] == "PLANNING"
+        assert store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_create_run_replay_conflicts_on_run_identity_mismatch(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            _create_run(store)
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.create_run(
+                    run_id=RUN_ID,
+                    project_id="project-b",
+                    work_item_key="work-1",
+                    state="ADMITTED",
+                    reducer_version=REDUCER_VERSION,
+                )
+
+
+def test_create_run_conflicts_on_active_work_item_mismatch(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            store.create_run(
+                run_id=RUN_ID,
+                project_id="project-a",
+                work_item_key="work-1",
+                state="ADMITTED",
+                reducer_version=REDUCER_VERSION,
+            )
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.create_run(
+                    run_id="77777777-7777-7777-7777-777777777777",
+                    project_id="project-a",
+                    work_item_key="work-1",
+                    state="ADMITTED",
+                    reducer_version=REDUCER_VERSION,
+                )
+
+
 def test_schema_migration_rolls_back_as_one_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

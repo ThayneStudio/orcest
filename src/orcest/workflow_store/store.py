@@ -840,6 +840,22 @@ class RunStore:
         if reducer_version not in self._supported_reducer_versions:
             raise ReducerVersionError(f"unsupported reducer version {reducer_version!r}")
         enums.parse_enum("run.state", state)
+        existing = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if existing is not None:
+            if (
+                existing["project_id"] == project_id
+                and existing["work_item_key"] == work_item_key
+                and existing["reducer_version"] == reducer_version
+            ):
+                return
+            raise IdempotencyConflictError("run id was reused with different content")
+        active_existing = self.conn.execute(
+            "SELECT run_id FROM runs WHERE project_id = ? AND work_item_key = ? "
+            "AND terminal_outcome IS NULL",
+            (project_id, work_item_key),
+        ).fetchone()
+        if active_existing is not None:
+            raise IdempotencyConflictError("work item already has an active run")
         now = _now_ms()
         self.conn.execute(
             "INSERT INTO runs(run_id, project_id, work_item_key, specification_generation, "
