@@ -1,7 +1,7 @@
 # Workflow Control v1 — GitHub Issue Manifest
 
-**Status:** Proposed; no GitHub issues or milestones have been created or
-modified.
+**Status:** Filed 2026-08-30. Documentation PR #666, milestone
+`Workflow Control v1`, tracking epic #667, and leaves #668 through #698.
 
 **Source specification:** `docs/wiki/` as accepted in
 `docs/wiki/spec-writing-plan.md` on 2026-08-27 and hardened by the recorded
@@ -21,9 +21,47 @@ does not weaken or reinterpret the normative wiki.
 - [x] Draft the issue graph, coverage table, and filing dry-run.
 - [x] Gate 2: after receiving the manifest, the user explicitly directed Orcest
   to continue and create the GitHub issues.
-- [ ] File every issue in topological order and verify both dependency encodings.
+- [x] File every issue in topological order and verify both dependency encodings.
 - [ ] Report the pull request and filed issue URLs, then stop without starting
   implementation.
+
+## Filed issue map
+
+Tracking epic: [#667](https://github.com/ThayneStudio/orcest/issues/667).
+
+| Manifest ID | GitHub issue |
+| --- | --- |
+| V1-01 | [#668](https://github.com/ThayneStudio/orcest/issues/668) |
+| V1-02 | [#669](https://github.com/ThayneStudio/orcest/issues/669) |
+| V1-03 | [#670](https://github.com/ThayneStudio/orcest/issues/670) |
+| V1-04 | [#671](https://github.com/ThayneStudio/orcest/issues/671) |
+| V1-05 | [#672](https://github.com/ThayneStudio/orcest/issues/672) |
+| V1-06 | [#673](https://github.com/ThayneStudio/orcest/issues/673) |
+| V1-07 | [#674](https://github.com/ThayneStudio/orcest/issues/674) |
+| V1-08 | [#675](https://github.com/ThayneStudio/orcest/issues/675) |
+| V1-09 | [#676](https://github.com/ThayneStudio/orcest/issues/676) |
+| V1-10 | [#677](https://github.com/ThayneStudio/orcest/issues/677) |
+| V1-11 | [#678](https://github.com/ThayneStudio/orcest/issues/678) |
+| V1-12 | [#679](https://github.com/ThayneStudio/orcest/issues/679) |
+| V1-13 | [#680](https://github.com/ThayneStudio/orcest/issues/680) |
+| V1-14 | [#681](https://github.com/ThayneStudio/orcest/issues/681) |
+| V1-15 | [#682](https://github.com/ThayneStudio/orcest/issues/682) |
+| V1-16 | [#683](https://github.com/ThayneStudio/orcest/issues/683) |
+| V1-17 | [#684](https://github.com/ThayneStudio/orcest/issues/684) |
+| V1-18 | [#685](https://github.com/ThayneStudio/orcest/issues/685) |
+| V1-19 | [#686](https://github.com/ThayneStudio/orcest/issues/686) |
+| V1-20 | [#687](https://github.com/ThayneStudio/orcest/issues/687) |
+| V1-21 | [#688](https://github.com/ThayneStudio/orcest/issues/688) |
+| V1-22 | [#689](https://github.com/ThayneStudio/orcest/issues/689) |
+| V1-23 | [#690](https://github.com/ThayneStudio/orcest/issues/690) |
+| V1-24 | [#691](https://github.com/ThayneStudio/orcest/issues/691) |
+| V1-25 | [#692](https://github.com/ThayneStudio/orcest/issues/692) |
+| V1-26 | [#693](https://github.com/ThayneStudio/orcest/issues/693) |
+| V1-27 | [#694](https://github.com/ThayneStudio/orcest/issues/694) |
+| V1-28 | [#695](https://github.com/ThayneStudio/orcest/issues/695) |
+| V1-29 | [#696](https://github.com/ThayneStudio/orcest/issues/696) |
+| V1-30 | [#697](https://github.com/ThayneStudio/orcest/issues/697) |
+| V1-31 | [#698](https://github.com/ThayneStudio/orcest/issues/698) |
 
 ## Filing prerequisites
 
