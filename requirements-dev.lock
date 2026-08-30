@@ -1,0 +1,201 @@
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.14.2
+    # via
+    #   httpx
+    #   starlette
+ast-serialize==0.8.0
+    # via mypy
+build==1.6.0
+    # via
+    #   orcest (pyproject.toml)
+    #   pip-tools
+certifi==2026.5.20
+    # via
+    #   -c requirements.lock
+    #   httpcore
+    #   httpx
+    #   requests
+charset-normalizer==3.4.7
+    # via
+    #   -c requirements.lock
+    #   requests
+click==8.3.1
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+    #   pip-tools
+    #   uvicorn
+coverage==7.16.0
+    # via pytest-cov
+fakeredis==2.37.1
+    # via orcest (pyproject.toml)
+fastapi==0.141.1
+    # via orcest (pyproject.toml)
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via orcest (pyproject.toml)
+idna==3.18
+    # via
+    #   -c requirements.lock
+    #   anyio
+    #   httpx
+    #   requests
+iniconfig==2.3.0
+    # via pytest
+librt==0.15.0
+    # via mypy
+linkify-it-py==2.1.0
+    # via
+    #   -c requirements.lock
+    #   markdown-it-py
+lupa==2.8
+    # via fakeredis
+markdown-it-py==4.0.0
+    # via
+    #   -c requirements.lock
+    #   mdit-py-plugins
+    #   rich
+    #   textual
+mdit-py-plugins==0.5.0
+    # via
+    #   -c requirements.lock
+    #   textual
+mdurl==0.1.2
+    # via
+    #   -c requirements.lock
+    #   markdown-it-py
+mypy==2.3.1
+    # via orcest (pyproject.toml)
+mypy-extensions==1.1.0
+    # via mypy
+packaging==26.3
+    # via
+    #   build
+    #   pytest
+    #   setuptools-scm
+    #   vcs-versioning
+    #   wheel
+pathspec==1.1.1
+    # via mypy
+pip-tools==7.5.2
+    # via
+    #   -c requirements-dev-toolchain.txt
+    #   orcest (pyproject.toml)
+platformdirs==4.9.2
+    # via
+    #   -c requirements.lock
+    #   textual
+pluggy==1.6.0
+    # via
+    #   pytest
+    #   pytest-cov
+proxmoxer==2.3.0
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+pydantic==2.13.5
+    # via fastapi
+pydantic-core==2.46.5
+    # via pydantic
+pygments==2.19.2
+    # via
+    #   -c requirements.lock
+    #   pytest
+    #   rich
+    #   textual
+pyproject-hooks==1.2.0
+    # via
+    #   build
+    #   pip-tools
+pytest==9.1.1
+    # via
+    #   orcest (pyproject.toml)
+    #   pytest-cov
+    #   pytest-mock
+    #   pytest-timeout
+pytest-cov==7.1.0
+    # via orcest (pyproject.toml)
+pytest-mock==3.15.1
+    # via orcest (pyproject.toml)
+pytest-timeout==2.4.0
+    # via orcest (pyproject.toml)
+pyyaml==6.0.3
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+redis==7.2.1
+    # via
+    #   -c requirements.lock
+    #   fakeredis
+    #   orcest (pyproject.toml)
+requests==2.34.2
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+rich==14.3.3
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+    #   textual
+ruff==0.16.5
+    # via orcest (pyproject.toml)
+setuptools-scm==10.2.1
+    # via orcest (pyproject.toml::build-system.requires)
+sortedcontainers==2.4.0
+    # via fakeredis
+starlette==1.6.0
+    # via fastapi
+textual==8.0.1
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
+types-pyyaml==6.0.12.20260815
+    # via orcest (pyproject.toml)
+typing-extensions==4.15.0
+    # via
+    #   -c requirements.lock
+    #   anyio
+    #   fastapi
+    #   mypy
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   textual
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+uc-micro-py==2.0.0
+    # via
+    #   -c requirements.lock
+    #   linkify-it-py
+urllib3==2.7.0
+    # via
+    #   -c requirements.lock
+    #   requests
+uvicorn==0.52.4
+    # via orcest (pyproject.toml)
+vcs-versioning==2.3.1
+    # via setuptools-scm
+wheel==0.48.0
+    # via pip-tools
+
+# The following packages are considered to be unsafe in a requirements file:
+pip==24.0
+    # via
+    #   -c requirements-dev-toolchain.txt
+    #   pip-tools
+setuptools==84.0.0
+    # via
+    #   orcest (pyproject.toml::build-system.requires)
+    #   pip-tools
+    #   setuptools-scm
