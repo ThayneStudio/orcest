@@ -892,6 +892,7 @@ class RunStore:
                 and row.reducer_version == reducer_version
                 and row.input_digest == input_digest
                 and row.specification_generation == specification_generation
+                and row.admit_base_observation_id == admit_base_observation_id
             ):
                 return row
             raise IdempotencyConflictError("transition trigger was already consumed differently")
@@ -951,7 +952,12 @@ class RunStore:
         ).fetchone()
         if existing is not None:
             row = _row_to_fact(existing)
-            if row.payload_digest == payload_digest and row.payload_json == payload_json:
+            if (
+                row.payload_digest == payload_digest
+                and row.payload_json == payload_json
+                and row.source_kind == source_kind
+                and row.source_id == source_id
+            ):
                 return row
             raise IdempotencyConflictError("immutable fact id was reused with different content")
         source_existing = None
@@ -962,7 +968,12 @@ class RunStore:
             ).fetchone()
         if source_existing is not None:
             row = _row_to_fact(source_existing)
-            if row.payload_digest == payload_digest and row.payload_json == payload_json:
+            if (
+                row.payload_digest == payload_digest
+                and row.payload_json == payload_json
+                and row.fact_kind == fact_kind
+                and row.fact_id == fact_id
+            ):
                 return row
             raise IdempotencyConflictError("source identity already produced a different fact")
         now = _now_ms()
@@ -1044,7 +1055,14 @@ class RunStore:
         ).fetchone()
         if existing is not None:
             row = _row_to_outbox(existing)
-            if row.payload_json == payload_json and row.protocol_version == protocol_version:
+            if (
+                row.payload_json == payload_json
+                and row.protocol_version == protocol_version
+                and row.attempt_id == attempt_id
+                and row.attempt_generation == attempt_generation
+                and row.publication_id == publication_id
+                and row.effect_generation == effect_generation
+            ):
                 return row
             raise IdempotencyConflictError("outbox source was reused with different content")
         now = _now_ms()
@@ -1103,6 +1121,11 @@ class RunStore:
             if (
                 row.run_id == run_id
                 and row.transition_sequence == transition_sequence
+                and row.kind == kind
+                and row.target_kind == target_kind
+                and row.target_id == target_id
+                and row.publication_id == publication_id
+                and row.effect_generation == effect_generation
                 and row.payload_digest == payload_digest
                 and row.payload_json == payload_json
             ):

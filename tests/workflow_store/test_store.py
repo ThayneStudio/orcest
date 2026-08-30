@@ -15,6 +15,7 @@ from orcest.workflow_store import (
     CasMismatchError,
     FaultInjectionPoint,
     IdempotencyConflictError,
+    ReducerVersionError,
     RunStore,
     SchemaVersionError,
     TransactionFault,
@@ -232,6 +233,58 @@ def test_replay_returns_committed_transition_and_outbox_without_duplicates(tmp_p
         assert store.conn.execute("SELECT COUNT(*) FROM projection_outbox").fetchone()[0] == 1
 
 
+def test_append_transition_replay_conflicts_on_admit_base_observation_id(
+    tmp_path: Path,
+) -> None:
+    observation_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    observation_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    payload = {"source": 1}
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            _create_run(store)
+            original = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state="ADMITTED",
+                trigger_kind="ADMIT",
+                trigger_id="admit-source-1",
+                next_state="PLANNING",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest(payload),
+                specification_generation=1,
+                admit_base_observation_id=observation_a,
+            )
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.append_transition(
+                    run_id=RUN_ID,
+                    transition_id=TRANSITION_ID,
+                    prior_state="ADMITTED",
+                    trigger_kind="ADMIT",
+                    trigger_id="admit-source-1",
+                    next_state="PLANNING",
+                    reducer_version=REDUCER_VERSION,
+                    input_digest=_digest(payload),
+                    specification_generation=1,
+                    admit_base_observation_id=observation_b,
+                )
+        with store.transaction():
+            replayed = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state="ADMITTED",
+                trigger_kind="ADMIT",
+                trigger_id="admit-source-1",
+                next_state="PLANNING",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest(payload),
+                specification_generation=1,
+                admit_base_observation_id=observation_a,
+            )
+        assert replayed == original
+        assert replayed.admit_base_observation_id == observation_a
+
+
 def test_transition_consumption_is_generation_independent(tmp_path: Path) -> None:
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
@@ -387,6 +440,92 @@ def test_source_unique_insert_and_immutable_fact_replay(tmp_path: Path) -> None:
                 )
                 == record
             )
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.insert_immutable_fact(
+                    fact_kind="timer",
+                    fact_id="timer-1",
+                    source_kind="TIMER_FACT",
+                    source_id="timer:run:other",
+                    payload_digest=_digest({"timer": 1}),
+                    payload={"timer": 1},
+                )
+
+
+def test_projection_outbox_replay_conflicts_on_immutable_identity(tmp_path: Path) -> None:
+    payload = {"state": "PLANNING"}
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            _create_run(store)
+            transition = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state="ADMITTED",
+                trigger_kind="ADMIT",
+                trigger_id="admit-source-1",
+                next_state="PLANNING",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest({"source": 1}),
+                specification_generation=1,
+            )
+            store.insert_projection_outbox(
+                projection_outbox_id=PROJECTION_ID,
+                run_id=RUN_ID,
+                transition_sequence=transition.transition_sequence,
+                kind="RUN_STATUS",
+                target_kind="WORK_ITEM",
+                target_id="work-1",
+                payload_digest=_digest(payload),
+                payload=payload,
+                idempotency_key="run-status:work-1:1",
+                next_delivery_at_ms=0,
+            )
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.insert_projection_outbox(
+                    projection_outbox_id=PROJECTION_ID,
+                    run_id=RUN_ID,
+                    transition_sequence=transition.transition_sequence,
+                    kind="RUN_STATUS",
+                    target_kind="CHANGE_REQUEST",
+                    target_id="work-1",
+                    payload_digest=_digest(payload),
+                    payload=payload,
+                    idempotency_key="run-status:work-1:1",
+                    next_delivery_at_ms=0,
+                )
+
+
+def test_outbox_replay_conflicts_on_effect_binding(tmp_path: Path) -> None:
+    payload = {"activity": 1}
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            store.insert_outbox(
+                outbox_id=OUTBOX_ID,
+                source_kind="ACTIVITY",
+                source_id="activity-1",
+                destination="redis:worker",
+                protocol_version="worker-envelope-v1",
+                payload_digest=_digest(payload),
+                payload=payload,
+                next_delivery_at_ms=0,
+                publication_id="pub-1",
+                effect_generation=1,
+            )
+        with pytest.raises(IdempotencyConflictError):
+            with store.transaction():
+                store.insert_outbox(
+                    outbox_id=OUTBOX_ID,
+                    source_kind="ACTIVITY",
+                    source_id="activity-1",
+                    destination="redis:worker",
+                    protocol_version="worker-envelope-v1",
+                    payload_digest=_digest(payload),
+                    payload=payload,
+                    next_delivery_at_ms=0,
+                    publication_id="pub-2",
+                    effect_generation=1,
+                )
 
 
 def test_unsupported_schema_can_fail_closed_as_maintenance(tmp_path: Path) -> None:
@@ -409,6 +548,19 @@ def test_unsupported_schema_can_fail_closed_as_maintenance(tmp_path: Path) -> No
         store.close()
 
 
+def test_create_run_rejects_unsupported_reducer_version(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with pytest.raises(ReducerVersionError, match="unsupported reducer version"):
+            with store.transaction():
+                store.create_run(
+                    run_id=RUN_ID,
+                    project_id="project-a",
+                    work_item_key="work-1",
+                    state="ADMITTED",
+                    reducer_version="workflow-control-v1/reducer-999",
+                )
+
+
 def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Path) -> None:
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
@@ -417,6 +569,9 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
             "UPDATE runs SET reducer_version = 'workflow-control-v1/reducer-999' WHERE run_id = ?",
             (RUN_ID,),
         )
+
+    with pytest.raises(ReducerVersionError):
+        RunStore(tmp_path, verify_local_filesystem=False)
 
     store = RunStore.open_maintenance(tmp_path, verify_local_filesystem=False)
     try:
