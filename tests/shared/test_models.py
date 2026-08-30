@@ -491,3 +491,34 @@ def test_task_attempt_roundtrip_and_legacy_default():
     # legacy payload without the key
     del d["attempt"]
     assert Task.from_dict(d).attempt == 0
+
+
+def test_task_expected_branch_and_issue_generation_roundtrip():
+    original = _make_task(
+        task_type=TaskType.IMPLEMENT_ISSUE,
+        resource_type="issue",
+        branch=None,
+        expected_branch="issue-42-fix-the-widget",
+        issue_generation=7,
+    )
+    assert original.branch is None
+    d = original.to_dict()
+    assert d["branch"] == ""
+    assert d["expected_branch"] == "issue-42-fix-the-widget"
+    assert d["issue_generation"] == "7"
+    rebuilt = Task.from_dict(d)
+    assert rebuilt.branch is None
+    assert rebuilt.expected_branch == original.expected_branch
+    assert rebuilt.issue_generation == 7
+    assert rebuilt.prompt == original.prompt
+
+
+def test_task_legacy_payload_omits_expected_branch_and_generation():
+    task = _make_task()
+    d = task.to_dict()
+    del d["expected_branch"]
+    del d["issue_generation"]
+    rebuilt = Task.from_dict(d)
+    assert rebuilt.expected_branch is None
+    assert rebuilt.issue_generation is None
+    assert rebuilt.branch == task.branch

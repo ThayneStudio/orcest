@@ -1275,24 +1275,26 @@ def test_publish_issue_task_stamps_attempt_from_issue_counter(gh_mock, fake_redi
         default_runner="claude",
     )
 
-    # attempt is stamped BEFORE the publish-time increment, so it should
-    # reflect the two prior attempts already recorded.
-    assert task.attempt == 2
+    # Reservation increments the issue counter atomically, so this task is
+    # attempt 3 (two prior + this publication).
+    assert task is not None
+    assert task.attempt == 3
+    assert task.issue_generation == 1
     # The PR-side counter (which the bug read from) stays at 0 for an issue.
     assert get_total_attempt_count(fake_redis_client, "test-org/test-repo", 803) == 0
 
 
-def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
+def test_publish_issue_and_notify_skips_xadd_on_reserve_failure(
     gh_mock,
     fake_redis_client,
     mocker,
     caplog,
 ):
-    """When increment_issue_attempts raises, _publish_issue_and_notify returns
-    early and the task is NOT published to Redis (Option A)."""
+    """When reservation raises, _publish_issue_and_notify returns early and
+    the task is NOT published to Redis."""
     _setup_gh_defaults(gh_mock)
     mocker.patch(
-        "orcest.orchestrator.task_publisher.increment_issue_attempts",
+        "orcest.orchestrator.task_publisher.reserve_issue_publication",
         side_effect=ConnectionError("Redis down"),
     )
     issue_state = IssueState(
@@ -1312,17 +1314,18 @@ def test_publish_issue_and_notify_skips_xadd_on_increment_failure(
             default_runner="claude",
         )
 
+    assert task is None
     # Task should NOT be published to Redis
     entries = fake_redis_client.client.xrange(fake_redis_client._prefixed("tasks:issue:claude"))
-    assert not any(f["id"] == task.id for _, f in entries)
+    assert entries == []
 
-    # Pending marker should be cleared so the issue can be retried immediately
+    # Pending marker should be absent so the issue can be retried immediately
     pending_key = fake_redis_client._prefixed("pending:issue:test-org/test-repo:801")
     assert fake_redis_client.client.get(pending_key) is None
 
     # Error should be logged with skip rationale
     error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("Failed to increment attempt counter" in m for m in error_msgs)
+    assert any("Failed to reserve publication" in m for m in error_msgs)
     assert any("skipping publish" in m for m in error_msgs)
 
 
@@ -1779,6 +1782,12 @@ def test_issue_task_redis_receives_xadd(gh_mock, fake_redis_server):
     project_entries = project_fake.xrange("project-b:tasks:issue:claude")
     assert len(shared_entries) == 1
     assert len(project_entries) == 0
+    pending_key = project_fake.get("project-b:pending:issue:test-org/test-repo:10")
+    assert pending_key is not None
+    generation = project_fake.get("project-b:issue:test-org/test-repo:10:generation")
+    assert generation == "1"
+    task_id = shared_entries[0][1]["id"]
+    assert shared_fake.get(f"shared:task-receipt:{task_id}") == shared_entries[0][0]
 
 
 def test_issue_task_routes_to_selected_provider_stream(gh_mock, fake_redis_client):
@@ -1930,10 +1939,11 @@ def test_render_issue_prompt_does_not_embed_raw_title_in_shell_command():
 def test_publish_issue_xadd_failure_rolls_back_one_attempt_not_whole_budget(
     gh_mock,
     fake_redis_client,
+    mocker,
 ):
-    """When the issue stream xadd fails, exactly ONE attempt is rolled back,
-    not the entire counter -- so repeated Redis flaps cannot defeat the
-    max-attempts guard (mirrors the PR rollback path)."""
+    """When the issue stream xadd fails before append, exactly ONE attempt is
+    rolled back, not the entire counter -- so repeated Redis flaps cannot
+    defeat the max-attempts guard (mirrors the PR rollback path)."""
     from orcest.orchestrator.issue_ops import (
         get_attempt_count as get_issue_attempt_count,
         increment_attempts as increment_issue_attempts,
@@ -1947,34 +1957,25 @@ def test_publish_issue_xadd_failure_rolls_back_one_attempt_not_whole_budget(
     increment_issue_attempts(fake_redis_client, repo, 555)
     assert get_issue_attempt_count(fake_redis_client, repo, 555) == 2
 
-    # Make the issue-stream xadd raise (Redis flap after the in-publish increment).
-    original_xadd = fake_redis_client.xadd
-
-    def broken_xadd(stream, fields):
-        if "tasks:issue:" in stream:
-            raise ConnectionError("Redis down during xadd")
-        return original_xadd(stream, fields)
-
-    fake_redis_client.xadd = broken_xadd
-    try:
-        issue_state = IssueState(
-            number=555,
-            title="Flaky issue",
-            body="body",
-            action=IssueAction.ENQUEUE_IMPLEMENT,
-            labels=[],
+    mocker.patch(
+        "orcest.orchestrator.task_publisher.xadd_task_idempotent",
+        side_effect=ConnectionError("Redis down during xadd"),
+    )
+    issue_state = IssueState(
+        number=555,
+        title="Flaky issue",
+        body="body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+    with pytest.raises(ConnectionError):
+        publish_issue_task(
+            issue_state=issue_state,
+            repo=repo,
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
         )
-        with pytest.raises(ConnectionError):
-            publish_issue_task(
-                issue_state=issue_state,
-                repo=repo,
-                token="fake-token",
-                redis=fake_redis_client,
-                default_runner="claude",
-            )
-    finally:
-        fake_redis_client.xadd = original_xadd
 
-    # _publish_issue_and_notify incremented to 3 then must roll back exactly one
-    # -> 2 (the pre-publish value). The buggy clear_issue_attempts() would zero it.
+    # Reservation incremented to 3 then rolled back exactly one -> 2.
     assert get_issue_attempt_count(fake_redis_client, repo, 555) == 2

@@ -130,6 +130,11 @@ class Task:
     # later OAuth rotation.
     provider_account: str = ""
     attempt: int = 0  # orchestrator cross-SHA total-attempt counter at enqueue (spec §8)
+    # Orchestrator-owned issue-delivery contract. ``branch`` remains the worker
+    # checkout ref (None = default branch). These fields must not be copied into
+    # ``branch`` or workers will clone a not-yet-created issue branch.
+    expected_branch: str | None = None
+    issue_generation: int | None = None
 
     def __post_init__(self) -> None:
         require_valid_provider_name(self.provider)
@@ -175,6 +180,10 @@ class Task:
             "model": self.model or "",
             "provider_account": self.provider_account,
             "attempt": str(self.attempt),
+            "expected_branch": self.expected_branch or "",
+            "issue_generation": (
+                "" if self.issue_generation is None else str(self.issue_generation)
+            ),
         }
 
     @classmethod
@@ -228,6 +237,8 @@ class Task:
             model=model_in,
             provider_account=data.get("provider_account", ""),
             attempt=int(data.get("attempt", "0") or "0"),
+            expected_branch=data.get("expected_branch") or None,
+            issue_generation=_optional_int(data.get("issue_generation", "")),
         )
 
     @classmethod
@@ -258,6 +269,8 @@ class Task:
         task_id: str | None = None,
         provider_account: str = "",
         attempt: int = 0,
+        expected_branch: str | None = None,
+        issue_generation: int | None = None,
     ) -> "Task":
         """Factory with auto-generated ID and timestamp.
 
@@ -296,6 +309,8 @@ class Task:
             model=model,
             provider_account=provider_account,
             attempt=attempt,
+            expected_branch=expected_branch,
+            issue_generation=issue_generation,
         )
 
     def to_safe_dict(self) -> dict[str, str]:
@@ -435,6 +450,12 @@ class TaskResult:
             credential_update_minted_at=float(data.get("credential_update_minted_at", "0")),
             provider_account=data.get("provider_account", ""),
         )
+
+
+def _optional_int(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    return int(raw)
 
 
 def _json_list(raw: str) -> list[str]:

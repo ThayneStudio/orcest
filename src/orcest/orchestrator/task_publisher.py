@@ -14,8 +14,17 @@ from orcest.orchestrator import gh
 from orcest.orchestrator.ci_triage import CIFailureType, classify_ci_failure
 from orcest.orchestrator.issue_ops import (
     IssueState,
-    get_attempt_count as get_issue_attempt_count,
-    increment_attempts as increment_issue_attempts,
+)
+from orcest.orchestrator.issue_publication import (
+    AmbiguousTaskPublishError,
+    expected_branch_name,
+    expected_head_owner,
+    hash_prompt_inputs,
+    mark_issue_ambiguous,
+    mark_issue_published,
+    reserve_issue_publication,
+    rollback_prepared_issue_publication,
+    xadd_task_idempotent,
 )
 from orcest.orchestrator.pr_ops import (
     PRState,
@@ -888,14 +897,24 @@ def publish_issue_task(
     2. Publish to Redis stream
     3. Post comment on issue
     """
+    expected_branch = expected_branch_name(issue_state.number, issue_state.title)
     prompt = _render_issue_prompt(
         issue_number=issue_state.number,
         issue_title=issue_state.title,
         issue_body=issue_state.body,
         repo=repo,
+        expected_branch=expected_branch,
     )
 
     resolved_provider = _resolve_task_provider(provider, default_runner)
+    head_owner = expected_head_owner(repo)
+    prompt_hash = hash_prompt_inputs(
+        repo=repo,
+        issue_number=issue_state.number,
+        issue_title=issue_state.title,
+        issue_body=issue_state.body,
+        expected_branch=expected_branch,
+    )
 
     task = Task.create(
         task_type=TaskType.IMPLEMENT_ISSUE,
@@ -912,7 +931,7 @@ def publish_issue_task(
         model=model,
         task_id=task_id,
         provider_account=provider_account,
-        attempt=get_issue_attempt_count(redis, repo, issue_state.number),
+        expected_branch=expected_branch,
     )
 
     published = _publish_issue_and_notify(
@@ -925,6 +944,9 @@ def publish_issue_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         task_redis=task_redis,
+        prompt_input_hash=prompt_hash,
+        expected_head_owner=head_owner,
+        expected_branch=expected_branch,
     )
 
     return task if published else None
@@ -940,70 +962,93 @@ def _publish_issue_and_notify(
     pending_task_ttl: int = _DEFAULT_PENDING_TASK_TTL,
     logger: logging.Logger | None = None,
     task_redis: RedisClient | None = None,
+    prompt_input_hash: str = "",
+    expected_head_owner: str = "",
+    expected_branch: str = "",
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility on the issue.
 
     Returns True if the task was actually published, False if skipped.
+
+    Reservation (generation, task id, prompt hash, expected head, attempt,
+    pending marker) happens atomically in project Redis *before* the stream
+    write. Stream publication is idempotent by task id. Only failures proven
+    to occur before the append are rolled back; a lost XADD reply is
+    reconciled through the stream-side receipt and never blindly undone.
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
 
-    # Claim the pending-task slot atomically (SET NX EX). `created_at` matters
-    # beyond bookkeeping: without it the dashboard cannot measure the marker's
-    # real age and has to infer it from the remaining TTL, an inference that is
-    # only sound when its configured TTL matches the orchestrator's. Stamping it
-    # here (as the PR path already does) keeps stuck-task detection on the
-    # reliable branch.
-    if not set_pending_task(
-        redis,
-        task.repo,
-        "issue",
-        issue_state.number,
-        task.id,
-        ttl=pending_task_ttl,
-        created_at=task.created_at.isoformat(),
-    ):
+    try:
+        reservation = reserve_issue_publication(
+            redis,
+            repo=repo,
+            issue_number=issue_state.number,
+            task_id=task.id,
+            prompt_input_hash=prompt_input_hash,
+            expected_head_owner=expected_head_owner,
+            expected_branch=expected_branch or (task.expected_branch or ""),
+            pending_ttl=pending_task_ttl,
+            created_at=task.created_at.isoformat(),
+        )
+    except Exception:
+        _log.error(
+            f"Failed to reserve publication for issue #{issue_state.number} "
+            f"before publishing task {task.id}; skipping publish",
+            exc_info=True,
+        )
+        return False
+
+    if reservation is None:
         _log.info(f"Pending task already exists for issue #{issue_state.number}, skipping publish")
         return False
 
-    # Increment attempt count BEFORE publishing to Redis (same rationale as
-    # _publish_and_notify: prevents unbounded retries on orchestrator crash).
+    task.attempt = reservation.attempt
+    task.issue_generation = reservation.generation
+    task.expected_branch = reservation.expected_branch
+
+    stream_redis = task_redis or redis
+    tasks_stream = task_stream_name(task.provider or default_runner, issue=True)
     try:
-        increment_issue_attempts(redis, repo, issue_state.number)
-    except Exception:
+        stream_id = xadd_task_idempotent(stream_redis, tasks_stream, task.to_dict(), task.id)
+    except AmbiguousTaskPublishError:
         _log.error(
-            f"Failed to increment attempt counter for issue #{issue_state.number} "
-            f"before publishing task {task.id} to Redis; skipping publish to "
-            f"avoid an un-counted attempt — will retry next poll cycle",
+            f"Ambiguous publication outcome for task {task.id} "
+            f"(issue #{issue_state.number}); preserving reserved state",
             exc_info=True,
         )
-        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
-        return False
-
-    # Publish to issue-specific stream (shared across all projects, lower priority than PR tasks)
-    stream_redis = task_redis or redis
-    try:
-        tasks_stream = task_stream_name(task.provider or default_runner, issue=True)
-        stream_redis.xadd(tasks_stream, task.to_dict())
+        mark_issue_ambiguous(redis, repo, issue_state.number, reservation.generation, _log)
+        raise
     except Exception:
         _log.error(
             f"Failed to publish task {task.id} for issue #{issue_state.number} to Redis",
             exc_info=True,
         )
-        _rollback_issue_attempt_increment(redis, repo, issue_state.number, _log)
-        _clear_pending_safe(redis, task.repo, "issue", issue_state.number, _log, task.id)
+        rolled_back = rollback_prepared_issue_publication(
+            redis, repo, issue_state.number, reservation.generation, task.id
+        )
+        if not rolled_back:
+            _log.warning(
+                "Pre-publish rollback did not apply for issue #%d generation %d task %s; "
+                "preserving reserved state",
+                issue_state.number,
+                reservation.generation,
+                task.id,
+            )
         raise
 
+    mark_issue_published(
+        redis,
+        repo,
+        issue_state.number,
+        reservation.generation,
+        tasks_stream,
+        stream_id,
+    )
     _emit_enqueued(redis, task)
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")
     return True
-
-
-def _slugify(text: str, max_len: int = 40) -> str:
-    """Convert text to a branch-name-safe slug."""
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug[:max_len].rstrip("-")
 
 
 def _render_issue_prompt(
@@ -1011,9 +1056,10 @@ def _render_issue_prompt(
     issue_title: str,
     issue_body: str,
     repo: str,
+    expected_branch: str | None = None,
 ) -> str:
     """Render the prompt for implementing a GitHub issue."""
-    branch_name = f"issue-{issue_number}-{_slugify(issue_title)}"
+    branch_name = expected_branch or expected_branch_name(issue_number, issue_title)
 
     sections: list[str] = [
         f"# Implement Issue #{issue_number}: {issue_title}",
