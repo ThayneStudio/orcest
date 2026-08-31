@@ -34,7 +34,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CONTROLLER_MODE_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -646,8 +646,8 @@ CREATE TABLE IF NOT EXISTS controller_mode (
     OR (mode != 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NULL)
   ),
   CHECK (
-    maintenance_prior_dispatch_paused_intake_policy IS NULL
-    OR maintenance_prior_mode = 'DISPATCH_PAUSED'
+    (maintenance_prior_dispatch_paused_intake_policy IS NOT NULL)
+    = (maintenance_prior_mode = 'DISPATCH_PAUSED')
   )
 );
 
@@ -989,6 +989,115 @@ ALTER TABLE transitions_v2 RENAME TO transitions;
 PRAGMA foreign_keys=ON;
 """
 
+_V2_TO_V3 = f"""
+PRAGMA foreign_keys=OFF;
+CREATE TABLE controller_mode_operations_v3 (
+  controller_mode_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  operation_kind TEXT NOT NULL CHECK (
+    operation_kind IN ({_sql_in(_enum_values("controller_mode_operation.operation_kind"))})
+  ),
+  expected_mode_revision INTEGER NOT NULL CHECK (expected_mode_revision >= 0),
+  expected_mode TEXT CHECK (expected_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  requested_mode TEXT CHECK (
+    requested_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  requested_dispatch_paused_intake_policy TEXT
+    CHECK (requested_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  backup_manifest_digest TEXT,
+  backup_prior_mode TEXT CHECK (
+    backup_prior_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  backup_prior_dispatch_paused_intake_policy TEXT
+    CHECK (backup_prior_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("controller_mode_operation.status"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IN ({_sql_in(_enum_values("controller_mode_operation.rejection_code"))})
+  ),
+  result_mode_revision INTEGER CHECK (result_mode_revision > 0),
+  result_mode TEXT CHECK (result_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  result_dispatch_paused_intake_policy TEXT
+    CHECK (result_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
+  CHECK ((status = 'SUCCEEDED' AND rejection_code IS NULL)
+    OR (status = 'REJECTED' AND rejection_code IS NOT NULL))
+);
+INSERT INTO controller_mode_operations_v3 (
+  controller_mode_operation_id, protocol_version, operation_kind,
+  expected_mode_revision, expected_mode, requested_mode,
+  requested_dispatch_paused_intake_policy, authenticated_principal_id,
+  authorization_context_digest, request_digest, status, rejection_code,
+  result_mode_revision, result_mode, result_dispatch_paused_intake_policy,
+  response_http_status, response_json, response_digest, completed_at_ms
+)
+SELECT
+  controller_mode_operation_id, protocol_version, operation_kind,
+  expected_mode_revision, expected_mode, requested_mode,
+  requested_dispatch_paused_intake_policy, authenticated_principal_id,
+  authorization_context_digest, request_digest, status, rejection_code,
+  result_mode_revision, result_mode, result_dispatch_paused_intake_policy,
+  response_http_status, response_json, response_digest, completed_at_ms
+FROM controller_mode_operations;
+CREATE TABLE controller_mode_v3 (
+  controller_id TEXT PRIMARY KEY CHECK (controller_id = '{CONTROLLER_ID}'),
+  mode_revision INTEGER NOT NULL CHECK (mode_revision >= 0),
+  mode TEXT CHECK (mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  dispatch_paused_intake_policy TEXT
+    CHECK (dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  maintenance_prior_mode TEXT CHECK (
+    maintenance_prior_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  maintenance_prior_dispatch_paused_intake_policy TEXT
+    CHECK (maintenance_prior_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  last_operation_id TEXT,
+  FOREIGN KEY (last_operation_id)
+    REFERENCES controller_mode_operations(controller_mode_operation_id) ON DELETE RESTRICT,
+  CHECK ((mode_revision = 0 AND mode IS NULL) OR (mode_revision > 0 AND mode IS NOT NULL)),
+  CHECK (
+    (mode = 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NOT NULL)
+    OR (mode IS NULL AND dispatch_paused_intake_policy IS NULL)
+    OR (mode != 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NULL)
+  ),
+  CHECK (
+    (maintenance_prior_dispatch_paused_intake_policy IS NOT NULL)
+    = (maintenance_prior_mode = 'DISPATCH_PAUSED')
+  )
+);
+INSERT INTO controller_mode_v3 (
+  controller_id, mode_revision, mode, dispatch_paused_intake_policy,
+  maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy,
+  last_operation_id
+)
+SELECT
+  controller_id, mode_revision, mode, dispatch_paused_intake_policy,
+  maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy,
+  last_operation_id
+FROM controller_mode;
+DROP TABLE controller_mode;
+DROP TABLE controller_mode_operations;
+ALTER TABLE controller_mode_operations_v3 RENAME TO controller_mode_operations;
+ALTER TABLE controller_mode_v3 RENAME TO controller_mode;
+PRAGMA foreign_keys=ON;
+"""
+
 
 class RunStore:
     """Controller-owned SQLite store with an exclusive process writer lock."""
@@ -1120,7 +1229,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1}:
+        if current not in {0, 1, 2}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -1129,6 +1238,14 @@ class RunStore:
         # is already open (sqlite3 documented behavior, independent of
         # isolation_level). BEGIN EXCLUSIVE therefore has to live inside the
         # script so DDL, seed rows, and the user_version bump share one txn.
+        #
+        # PRAGMA foreign_keys is a no-op once a transaction is open (SQLite
+        # only honors it in autocommit mode), so the table-rebuild scripts'
+        # own "PRAGMA foreign_keys=OFF;" lines can't actually suspend
+        # enforcement for the BEGIN EXCLUSIVE they run inside. Toggle it here,
+        # before that transaction starts, so DROP TABLE on a table still
+        # carrying real rows referenced by another table's FK doesn't fail.
+        self.conn.execute("PRAGMA foreign_keys=OFF")
         try:
             if current == 0:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
@@ -1137,16 +1254,33 @@ class RunStore:
                     "VALUES (?, ?, ?)",
                     (SCHEMA_VERSION, "workflow-control-v1-base-store", _now_ms()),
                 )
-            else:
+            elif current == 1:
                 # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): pre-existing
-                # tables from a real version-1 database are left untouched, and the
-                # capability-key tables this version adds get created before
-                # _V1_TO_V2 rebuilds runs/transitions.
+                # tables from a real version-1 database are left untouched, and every
+                # table this version added (controller_mode, controller_mode_operations,
+                # the capability-key tables) gets created fresh in its final shape
+                # before _V1_TO_V2 rebuilds runs/transitions.
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V1_TO_V2)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (SCHEMA_VERSION, "workflow-control-v1-reducer-ledger", _now_ms()),
+                )
+            else:
+                # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): a real version-2
+                # database already has controller_mode/controller_mode_operations, so
+                # only the capability-key tables get created here; _V2_TO_V3 then
+                # rebuilds controller_mode_operations (three new columns) and
+                # controller_mode (bidirectional maintenance_prior_* CHECK) in place.
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V2_TO_V3)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-controller-mode-and-key-gates",
+                        _now_ms(),
+                    ),
                 )
             self.conn.execute(
                 "INSERT OR IGNORE INTO controller_mode"
@@ -1166,6 +1300,8 @@ class RunStore:
         except Exception:
             self.conn.rollback()
             raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def _startup_checks(self) -> None:
         try:
@@ -1592,8 +1728,6 @@ class RunStore:
         if requested_mode is None or not requested_policy_ok:
             return "TRANSITION_NOT_ALLOWED"
         if operation_kind == "INITIALIZE":
-            if expected_mode_revision != 0 or expected_mode is not None:
-                return "ALREADY_INITIALIZED"
             if requested_mode != "MAINTENANCE":
                 return "TRANSITION_NOT_ALLOWED"
             return None
@@ -1615,9 +1749,8 @@ class RunStore:
             if expected_mode == "MAINTENANCE":
                 if requested_mode != "MAINTENANCE" or requested_dispatch_paused_intake_policy:
                     return "TRANSITION_NOT_ALLOWED"
-                if (
-                    backup_prior_dispatch_paused_intake_policy is not None
-                    and backup_prior_mode != "DISPATCH_PAUSED"
+                if (backup_prior_dispatch_paused_intake_policy is not None) != (
+                    backup_prior_mode == "DISPATCH_PAUSED"
                 ):
                     return "TRANSITION_NOT_ALLOWED"
                 return None
@@ -1881,6 +2014,12 @@ class RunStore:
                 != register_public_key_digest
                 or not private_key_proof_valid
             ):
+                return "INTEGRITY_CONFLICT"
+            digest_collision = self.conn.execute(
+                "SELECT 1 FROM capability_signing_keys WHERE public_key_digest = ?",
+                (register_public_key_digest,),
+            ).fetchone()
+            if digest_collision is not None:
                 return "INTEGRITY_CONFLICT"
             return None
         if any(

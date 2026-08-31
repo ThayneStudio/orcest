@@ -1170,7 +1170,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1197,3 +1197,180 @@ def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -
         row = store.get_run(RUN_ID)
         assert row is not None
         assert row.specification_generation == 0
+
+
+def _write_v2_shaped_database(db_path: Path) -> None:
+    """Recreate a pre-#717 schema-version-2 workflow.db (no capability-key
+    tables, controller_mode_operations lacking the backup_* columns)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (
+              version INTEGER PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              applied_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE controller_mode_operations (
+              controller_mode_operation_id TEXT PRIMARY KEY,
+              protocol_version TEXT NOT NULL,
+              operation_kind TEXT NOT NULL,
+              expected_mode_revision INTEGER NOT NULL,
+              expected_mode TEXT,
+              requested_mode TEXT,
+              requested_dispatch_paused_intake_policy TEXT,
+              authenticated_principal_id TEXT NOT NULL,
+              authorization_context_digest TEXT NOT NULL,
+              request_digest TEXT NOT NULL,
+              status TEXT NOT NULL,
+              rejection_code TEXT,
+              result_mode_revision INTEGER,
+              result_mode TEXT,
+              result_dispatch_paused_intake_policy TEXT,
+              response_http_status INTEGER NOT NULL,
+              response_json TEXT NOT NULL,
+              response_digest TEXT NOT NULL,
+              completed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE controller_mode (
+              controller_id TEXT PRIMARY KEY,
+              mode_revision INTEGER NOT NULL,
+              mode TEXT,
+              dispatch_paused_intake_policy TEXT,
+              maintenance_prior_mode TEXT,
+              maintenance_prior_dispatch_paused_intake_policy TEXT,
+              last_operation_id TEXT
+            );
+            CREATE TABLE runs (
+              run_id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              work_item_key TEXT NOT NULL,
+              specification_generation INTEGER NOT NULL,
+              state TEXT NOT NULL,
+              terminal_outcome TEXT,
+              reducer_version TEXT NOT NULL,
+              current_revision INTEGER NOT NULL DEFAULT 0,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE transitions (
+              run_id TEXT NOT NULL,
+              transition_sequence INTEGER NOT NULL,
+              transition_id TEXT NOT NULL UNIQUE,
+              prior_state TEXT NOT NULL,
+              trigger_kind TEXT NOT NULL,
+              trigger_id TEXT NOT NULL,
+              admit_base_observation_id TEXT,
+              next_state TEXT NOT NULL,
+              reducer_version TEXT NOT NULL,
+              input_digest TEXT NOT NULL,
+              specification_generation INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              PRIMARY KEY (run_id, transition_sequence)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO controller_mode_operations VALUES ("
+            "'12345678-1234-4234-9234-123456789abc', 'orcest.controller-mode-operation/1', "
+            "'INITIALIZE', 0, NULL, 'MAINTENANCE', NULL, 'bootstrap-service', "
+            "'sha256:" + "a" * 64 + "', 'sha256:" + "b" * 64 + "', 'SUCCEEDED', NULL, "
+            "1, 'MAINTENANCE', NULL, 200, '{}', 'sha256:" + "c" * 64 + "', 0)"
+        )
+        conn.execute(
+            "INSERT INTO controller_mode VALUES ("
+            "'ORCEST_V1', 1, 'MAINTENANCE', NULL, NULL, NULL, "
+            "'12345678-1234-4234-9234-123456789abc')"
+        )
+        conn.execute("PRAGMA user_version=2")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v2_database_migrates_capability_tables_and_backup_columns(tmp_path: Path) -> None:
+    _write_v2_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in (
+            "capability_key_registry",
+            "capability_key_operations",
+            "capability_signing_keys",
+            "capability_issuance_audit",
+        ):
+            assert expected_table in tables
+
+        columns = {
+            row[1] for row in store.conn.execute("PRAGMA table_info(controller_mode_operations)")
+        }
+        assert {
+            "backup_manifest_digest",
+            "backup_prior_mode",
+            "backup_prior_dispatch_paused_intake_policy",
+        } <= columns
+
+        preserved = store.conn.execute(
+            "SELECT operation_kind, status FROM controller_mode_operations "
+            "WHERE controller_mode_operation_id = ?",
+            ("12345678-1234-4234-9234-123456789abc",),
+        ).fetchone()
+        assert tuple(preserved) == ("INITIALIZE", "SUCCEEDED")
+
+        mode = store.conn.execute("SELECT mode, mode_revision FROM controller_mode").fetchone()
+        assert tuple(mode) == ("MAINTENANCE", 1)
+
+        registry = store.conn.execute(
+            "SELECT registry_revision FROM capability_key_registry"
+        ).fetchone()
+        assert tuple(registry) == (0,)
+
+
+def test_capability_key_register_rejects_reused_digest_under_new_key_id(
+    tmp_path: Path,
+) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _register_key(store)
+        public_key = _public_key(1)
+        result = store.apply_capability_key_operation(
+            capability_key_operation_id=KEY_OP_ID_2,
+            kind="REGISTER",
+            expected_registry_revision=1,
+            expected_issuance_key_id=None,
+            target_capability_signing_key_id=KEY_ID_2,
+            register_public_verification_key=public_key,
+            register_public_key_digest=capability_public_key_digest(public_key),
+            register_private_signing_secret_ref=f"secret:{KEY_ID_2}:1",
+            register_not_before_ms=0,
+            private_key_proof_valid=True,
+            authenticated_principal_id="key-operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+        assert result.status == "REJECTED"
+        assert result.rejection_code == "INTEGRITY_CONFLICT"
+        assert store.get_capability_signing_key(KEY_ID_2) is None
+
+
+def test_controller_mode_restore_backup_rejects_asymmetric_prior_policy(
+    tmp_path: Path,
+) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _initialize_mode(store)
+        illegal = store.apply_controller_mode_operation(
+            controller_mode_operation_id="aaaaaaaa-1111-4111-9111-aaaaaaaaaaaa",
+            operation_kind="RESTORE_BACKUP",
+            expected_mode_revision=1,
+            expected_mode="MAINTENANCE",
+            requested_mode="MAINTENANCE",
+            authenticated_principal_id="storage-reconciler",
+            authorization_context_digest=AUTHZ_DIGEST,
+            backup_manifest_digest=_digest({"backup": 1}),
+            backup_prior_mode="DISPATCH_PAUSED",
+            backup_prior_dispatch_paused_intake_policy=None,
+        )
+        assert illegal.status == "REJECTED"
+        assert illegal.rejection_code == "TRANSITION_NOT_ALLOWED"
