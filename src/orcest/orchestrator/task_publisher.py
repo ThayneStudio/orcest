@@ -26,6 +26,12 @@ from orcest.orchestrator.issue_publication import (
     rollback_prepared_issue_publication,
     xadd_task_idempotent,
 )
+from orcest.orchestrator.issue_retry import (
+    IssueRetryContext,
+    load_latest_issue_retry_context,
+    render_issue_retry_prompt_section,
+    same_repo_expected_ref_allowed,
+)
 from orcest.orchestrator.pr_ops import (
     PRState,
     get_total_attempt_count,
@@ -898,22 +904,34 @@ def publish_issue_task(
     3. Post comment on issue
     """
     expected_branch = expected_branch_name(issue_state.number, issue_state.title)
+    retry_context = load_latest_issue_retry_context(redis, repo, issue_state.number)
+    if retry_context is not None and same_repo_expected_ref_allowed(
+        repo, retry_context.expected_head_owner, retry_context.expected_ref
+    ):
+        expected_branch = retry_context.expected_ref
+    else:
+        retry_context = None
     prompt = _render_issue_prompt(
         issue_number=issue_state.number,
         issue_title=issue_state.title,
         issue_body=issue_state.body,
         repo=repo,
         expected_branch=expected_branch,
+        retry_context=retry_context,
     )
 
     resolved_provider = _resolve_task_provider(provider, default_runner)
     head_owner = expected_head_owner(repo)
+    retry_json = ""
+    if retry_context is not None:
+        retry_json = retry_context.to_canonical_json()
     prompt_hash = hash_prompt_inputs(
         repo=repo,
         issue_number=issue_state.number,
         issue_title=issue_state.title,
         issue_body=issue_state.body,
         expected_branch=expected_branch,
+        retry_context_json=retry_json,
     )
 
     task = Task.create(
@@ -1057,38 +1075,87 @@ def _render_issue_prompt(
     issue_body: str,
     repo: str,
     expected_branch: str | None = None,
+    retry_context: IssueRetryContext | None = None,
 ) -> str:
     """Render the prompt for implementing a GitHub issue."""
     branch_name = expected_branch or expected_branch_name(issue_number, issue_title)
+    if retry_context is not None and retry_context.remote_ref_exists:
+        checkout_instruction = (
+            f"2. Resume the authoritative same-repository ref `{branch_name}` "
+            "by continuing on the checked-out expected branch. Do not create a "
+            "different branch and do not trust a provider-claimed name. Run "
+            "`git branch --show-current` to confirm: if it reports the default "
+            f"branch instead of `{branch_name}` (the expected ref was deleted "
+            "after this task was queued), create it fresh instead: "
+            f"`git checkout -b {branch_name}`."
+        )
+    elif retry_context is not None:
+        checkout_instruction = (
+            f"2. Create the snapshotted expected branch: `git checkout -b {branch_name}`. "
+            "No authoritative expected remote ref exists; do not trust a previous "
+            "provider-claimed branch name."
+        )
+    else:
+        checkout_instruction = f"2. Create a new branch: `git checkout -b {branch_name}`"
+
+    if retry_context is not None and retry_context.pr_number is not None:
+        pr_instruction = (
+            f"8. Continue the existing pull request `{retry_context.pr_url}` "
+            f"(#{retry_context.pr_number}) with `--head {branch_name}`. Do not open "
+            f"another PR. Ensure it canonically closes this issue (`Closes #{issue_number}`). "
+            "If you must pass `--title`, write a concise title yourself; do not copy "
+            "the issue title verbatim."
+        )
+    else:
+        pr_instruction = (
+            f"8. Open a PR with `gh pr create --repo {repo} --head {branch_name} "
+            f'--body "Closes #{issue_number}"`. Choose a concise PR title that '
+            f"describes your change and pass it with `--title` (write the title "
+            f"yourself; do not copy the issue title verbatim)."
+        )
+
+    if retry_context is not None and retry_context.remote_ref_exists:
+        workspace_line = (
+            "You start on the default branch. Resume only the authoritative "
+            f"same-repository expected ref `{branch_name}` if the worker was "
+            "able to check it out; if the ref was deleted after this task was "
+            "queued, you will still be on the default branch and should "
+            "create it fresh instead (see below)."
+        )
+    else:
+        workspace_line = "You are on the default branch."
 
     sections: list[str] = [
         f"# Implement Issue #{issue_number}: {issue_title}",
         "",
-        "You are on the default branch.",
+        workspace_line,
         "",
         "## Issue Description",
         "",
         issue_body or "(No description provided.)",
         "",
-        "## Instructions",
-        "",
-        "1. Read the issue description carefully.",
-        f"2. Create a new branch: `git checkout -b {branch_name}`",
-        "3. Read the repo's CLAUDE.md (if it exists) for project conventions.",
-        "4. Implement the requested changes.",
-        "5. Run the project's linter and tests to verify your changes.",
-        "6. Commit your changes with a descriptive message referencing the issue.",
-        f"7. Push the branch: `git push -u origin {branch_name}`",
-        f"8. Open a PR with `gh pr create --repo {repo} --head {branch_name} "
-        f'--body "Closes #{issue_number}"`. Choose a concise PR title that '
-        f"describes your change and pass it with `--title` (write the title "
-        f"yourself; do not copy the issue title verbatim).",
-        "",
-        "Important:",
-        "- Make minimal, focused changes.",
-        "- Do NOT close the issue directly -- the PR will close it on merge.",
-        "- Do NOT call `gh pr review` -- you are not authorized to change review status.",
     ]
+    if retry_context is not None:
+        sections.extend([render_issue_retry_prompt_section(retry_context), ""])
+    sections.extend(
+        [
+            "## Instructions",
+            "",
+            "1. Read the issue description carefully.",
+            checkout_instruction,
+            "3. Read the repo's CLAUDE.md (if it exists) for project conventions.",
+            "4. Implement the requested changes.",
+            "5. Run the project's linter and tests to verify your changes.",
+            "6. Commit your changes with a descriptive message referencing the issue.",
+            f"7. Push the branch: `git push -u origin {branch_name}`",
+            pr_instruction,
+            "",
+            "Important:",
+            "- Make minimal, focused changes.",
+            "- Do NOT close the issue directly -- the PR will close it on merge.",
+            "- Do NOT call `gh pr review` -- you are not authorized to change review status.",
+        ]
+    )
 
     return "\n".join(sections)
 
