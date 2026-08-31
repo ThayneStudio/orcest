@@ -1266,8 +1266,13 @@ def _observe_pre_schema_handoff(
                     _default, _default_oid, live_oid = _fetch_repository_boundary(
                         repo, token, pr.head_ref_name
                     )
-                except _VerificationAbort:
-                    continue
+                except _VerificationAbort as exc:
+                    if (
+                        exc.kind is DeliveryErrorKind.NOT_FOUND
+                        and exc.reason is DeliveryFailureReason.HEAD_REF_NOT_FOUND
+                    ):
+                        continue
+                    raise
                 live_oids[pr.head_ref_name] = live_oid
             live_oid = live_oids[pr.head_ref_name]
             if candidate_qualifies(

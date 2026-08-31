@@ -811,7 +811,16 @@ def process_due_verification_jobs(
             )
             processed += 1
         elif job.state in TERMINAL_VERIFICATION_STATES:
-            _resume_saga(redis, job, token, labels, config, stream_redis=stream_redis, logger_=log)
+            _resume_saga(
+                redis,
+                job,
+                token,
+                labels,
+                config,
+                stream_redis=stream_redis,
+                now=now,
+                logger_=log,
+            )
             processed += 1
     active = redis.smembers(ACTIVE_JOBS_KEY)
     for member in active:
@@ -825,7 +834,16 @@ def process_due_verification_jobs(
             job.state in TERMINAL_VERIFICATION_STATES
             and job.saga_phase is not SagaPhase.BARRIER_REMOVED
         ):
-            _resume_saga(redis, job, token, labels, config, stream_redis=stream_redis, logger_=log)
+            _resume_saga(
+                redis,
+                job,
+                token,
+                labels,
+                config,
+                stream_redis=stream_redis,
+                now=now,
+                logger_=log,
+            )
             processed += 1
     emit_delivery_alerts(redis, config, now=now, logger_=log)
     return processed
@@ -932,7 +950,14 @@ def _observe_and_transition(
         refreshed = get_verification_job(redis, job.repo, job.issue_number, job.generation)
         if refreshed is not None:
             _resume_saga(
-                redis, refreshed, token, labels, config, stream_redis=stream_redis, logger_=logger_
+                redis,
+                refreshed,
+                token,
+                labels,
+                config,
+                stream_redis=stream_redis,
+                now=now,
+                logger_=logger_,
             )
         return
 
@@ -1011,7 +1036,14 @@ def _observe_and_transition(
     refreshed = get_verification_job(redis, job.repo, job.issue_number, job.generation)
     if refreshed is not None:
         _resume_saga(
-            redis, refreshed, token, labels, config, stream_redis=stream_redis, logger_=logger_
+            redis,
+            refreshed,
+            token,
+            labels,
+            config,
+            stream_redis=stream_redis,
+            now=now,
+            logger_=logger_,
         )
 
 
@@ -1046,12 +1078,13 @@ def _resume_saga(
     config: IssueDeliveryVerifierConfig,
     *,
     stream_redis: RedisClient | None,
+    now: NowFn,
     logger_: logging.Logger,
 ) -> None:
     if job.state is VerificationState.VERIFIED:
-        _advance_verified_saga(redis, job, token, labels, stream_redis, logger_)
+        _advance_verified_saga(redis, job, token, labels, stream_redis, now, logger_)
     elif job.state is VerificationState.INEFFECTIVE:
-        _advance_ineffective_saga(redis, job, config, stream_redis, logger_)
+        _advance_ineffective_saga(redis, job, config, stream_redis, now, logger_)
 
 
 def _advance_verified_saga(
@@ -1060,6 +1093,7 @@ def _advance_verified_saga(
     token: str,
     labels: LabelConfig,
     stream_redis: RedisClient | None,
+    now: NowFn,
     logger_: logging.Logger,
 ) -> None:
     current = get_verification_job(redis, job.repo, job.issue_number, job.generation)
@@ -1152,6 +1186,7 @@ def _advance_verified_saga(
             VerificationState.VERIFIED,
             SagaPhase.GENERATION_CLEANED,
             SagaPhase.BARRIER_REMOVED,
+            now=now,
         ):
             _emit_job_event(
                 redis,
@@ -1166,6 +1201,7 @@ def _advance_ineffective_saga(
     job: VerificationJob,
     config: IssueDeliveryVerifierConfig,
     stream_redis: RedisClient | None,
+    now: NowFn,
     logger_: logging.Logger,
 ) -> None:
     current = get_verification_job(redis, job.repo, job.issue_number, job.generation)
@@ -1183,8 +1219,9 @@ def _advance_ineffective_saga(
         )
         job = get_verification_job(redis, job.repo, job.issue_number, job.generation) or job
     if job.saga_phase is SagaPhase.TERMINAL_PERSISTED:
+        current_time = now()
         cooldown = max(0, config.ineffective_cooldown_seconds)
-        cooldown_until = now_seconds() + cooldown
+        cooldown_until = current_time + cooldown
         retry_key = make_issue_retry_record_key(job.repo, job.issue_number, job.generation)
         redis.hset_mapping(
             retry_key,
@@ -1193,7 +1230,7 @@ def _advance_ineffective_saga(
                 "generation": str(job.generation),
                 "task_id": job.task_id,
                 "cooldown_until": f"{cooldown_until:.3f}",
-                "created_at": f"{now_seconds():.3f}",
+                "created_at": f"{current_time:.3f}",
             },
         )
         redis.persist(retry_key)
@@ -1259,6 +1296,7 @@ def _advance_ineffective_saga(
             VerificationState.INEFFECTIVE,
             SagaPhase.GENERATION_CLEANED,
             SagaPhase.BARRIER_REMOVED,
+            now=now,
         ):
             _emit_job_event(
                 redis,
@@ -1294,8 +1332,11 @@ def _remove_barrier(
     new_state: VerificationState,
     expected_phase: SagaPhase,
     new_phase: SagaPhase,
+    *,
+    now: NowFn,
     extra: dict[str, str] | None = None,
 ) -> bool:
+    current = now()
     member = job_member(job.repo, job.issue_number, job.generation)
     flattened: list[str] = []
     for key, value in (extra or {}).items():
@@ -1315,7 +1356,7 @@ def _remove_barrier(
         expected_phase.value,
         new_phase.value,
         member,
-        f"{now_seconds():.3f}",
+        f"{current:.3f}",
         *flattened,
     )
     return _as_int(response) == 1

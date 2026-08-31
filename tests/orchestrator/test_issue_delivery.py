@@ -443,6 +443,7 @@ def test_grace_keeps_mismatch_pending(fake_redis_client):
 
 def test_grace_expiry_becomes_ineffective(fake_redis_client):
     _admit_completed(fake_redis_client)
+    now = 1_040.0
     process_due_verification_jobs(
         fake_redis_client,
         REPO,
@@ -450,7 +451,7 @@ def test_grace_expiry_becomes_ineffective(fake_redis_client):
         LabelConfig(),
         _config(grace_seconds=30, ineffective_cooldown_seconds=20),
         stream_redis=fake_redis_client,
-        now=lambda: 1_040.0,
+        now=lambda: now,
         observe=lambda *a, **k: _observation(
             verified=False,
             kind=DeliveryErrorKind.MISMATCH,
@@ -461,7 +462,10 @@ def test_grace_expiry_becomes_ineffective(fake_redis_client):
     job = get_verification_job(fake_redis_client, REPO, ISSUE, 1)
     assert job.state is VerificationState.INEFFECTIVE
     assert job.saga_phase is SagaPhase.BARRIER_REMOVED
-    assert fake_redis_client.exists(make_issue_retry_record_key(REPO, ISSUE, 1))
+    retry_record = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert retry_record["created_at"] == f"{now:.3f}"
+    assert retry_record["cooldown_until"] == f"{now + 20:.3f}"
+    assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, job_member(REPO, ISSUE, 1)) == now
     assert not has_issue_dispatch_barrier(fake_redis_client, REPO, ISSUE)
 
 

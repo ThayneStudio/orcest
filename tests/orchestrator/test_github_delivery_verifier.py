@@ -95,6 +95,34 @@ def _prs_payload(nodes: list[dict], *, has_next: bool = False, cursor: str | Non
     )
 
 
+def _pre_schema_timeline_payload(
+    nodes: list[dict],
+    *,
+    default_branch: str = "master",
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "nameWithOwner": REPO,
+                    "defaultBranchRef": {
+                        "name": default_branch,
+                        "target": {"oid": "b" * 40},
+                    },
+                    "issue": {
+                        "timelineItems": {
+                            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                            "nodes": nodes,
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+
 def _closing_payload(
     nodes: list[dict],
     *,
@@ -390,3 +418,20 @@ def test_observe_does_not_require_claimed_oid(mocker):
     result = observe_issue_handoff(REPO, ISSUE, BRANCH, TOKEN, expected_head_owner="acme")
     assert result.verified is True
     assert result.echo_mismatch is False
+
+
+def test_pre_schema_transient_boundary_failure_is_retryable(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[
+            _pre_schema_timeline_payload([_pr_node(10)]),
+            GhCliError("failed", stderr="connection reset by peer"),
+        ],
+    )
+
+    result = observe_issue_handoff(REPO, ISSUE, "", TOKEN, pre_schema=True)
+
+    assert result.verified is False
+    assert result.error_kind == DeliveryErrorKind.TRANSPORT
+    assert result.reason == DeliveryFailureReason.GH_TRANSPORT_ERROR
+    assert result.complete is False
