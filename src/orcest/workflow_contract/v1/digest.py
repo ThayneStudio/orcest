@@ -41,6 +41,7 @@ directly -- every sha256 content digest is produced here.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 import struct
 from collections.abc import Iterable, Mapping, Sequence
@@ -78,6 +79,14 @@ __all__ = [
     "request_digest",
     "response_digest",
     "specification_digest",
+    "hmac_sha256",
+    "hmac_sha256_hex",
+    "SECRET_VERSION_INTEGRITY_DOMAIN",
+    "secret_version_integrity_preimage",
+    "secret_version_integrity_tag",
+    "SECRET_STAGING_ATTESTATION_DOMAIN",
+    "secret_staging_attestation_preimage",
+    "secret_staging_attestation",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -349,3 +358,119 @@ def response_digest(response_json: Any) -> str:
             "response_digest preimage must exclude the transport-only 'replayed' field"
         )
     return generic_domain_digest("orcest-response-v1", response_json)
+
+
+# --- Keyed integrity authenticators (Secret Store only) ---------------------
+#
+# Persistence requires a domain-separated keyed authenticator over the
+# canonical Secret Version key and exact stored bytes, using a controller-only
+# Secret Store integrity key. The resulting tag MUST remain inside the Secret
+# Store: SQLite may store only an opaque attestation UUID, never the tag, an
+# unkeyed secret-derived digest, or the secret bytes.
+
+
+def hmac_sha256(key: bytes, payload: bytes) -> bytes:
+    """HMAC-SHA256(key, payload) as raw bytes.
+
+    The Secret Store uses this instead of an unkeyed SHA-256 of secret bytes so
+    that ordinary database pages, Redis payloads, and logs cannot be grepped
+    for a secret by hashing candidate values.
+    """
+    if not isinstance(key, (bytes, bytearray)) or not key:
+        raise ValueError("HMAC key must be non-empty bytes")
+    if not isinstance(payload, (bytes, bytearray)):
+        raise TypeError(f"HMAC payload must be bytes, got {type(payload)!r}")
+    return hmac.new(bytes(key), bytes(payload), "sha256").digest()
+
+
+def hmac_sha256_hex(key: bytes, payload: bytes) -> str:
+    return hmac_sha256(key, payload).hex()
+
+
+SECRET_VERSION_INTEGRITY_DOMAIN = "orcest-secret-version-v1"
+
+
+def secret_version_integrity_preimage(
+    *, secret_id: str, version: int, secret_bytes: bytes
+) -> bytes:
+    """Preimage for the Secret Version keyed integrity authenticator.
+
+    ``ascii("orcest-secret-version-v1") || 0x00 || ascii(secret_id) || 0x00 ||
+    uint64_be(version) || uint64_be(byte_length) || secret_bytes``
+    """
+    if not isinstance(secret_id, str) or not secret_id:
+        raise ValueError("secret_id must be a non-empty string")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ValueError(f"version must be a positive integer, got {version!r}")
+    if not isinstance(secret_bytes, (bytes, bytearray)):
+        raise TypeError(f"secret_bytes must be bytes, got {type(secret_bytes)!r}")
+    return b"".join(
+        (
+            SECRET_VERSION_INTEGRITY_DOMAIN.encode("ascii"),
+            b"\x00",
+            secret_id.encode("ascii"),
+            b"\x00",
+            _u64_be(version),
+            _u64_be(len(secret_bytes)),
+            bytes(secret_bytes),
+        )
+    )
+
+
+def secret_version_integrity_tag(
+    integrity_key: bytes,
+    *,
+    secret_id: str,
+    version: int,
+    secret_bytes: bytes,
+) -> str:
+    """Return the lowercase-hex keyed integrity tag for one Secret Version.
+
+    This value is controller-only Secret Store metadata. It is not a content
+    digest and MUST NOT be written to SQLite, Redis, logs, or API bodies.
+    """
+    return hmac_sha256_hex(
+        integrity_key,
+        secret_version_integrity_preimage(
+            secret_id=secret_id, version=version, secret_bytes=secret_bytes
+        ),
+    )
+
+
+SECRET_STAGING_ATTESTATION_DOMAIN = "orcest-secret-staging-v1"
+
+
+def secret_staging_attestation_preimage(*, staging_id: str, secret_bytes: bytes) -> bytes:
+    """Preimage for an operation-bound Secret Store staging attestation.
+
+    ``ascii("orcest-secret-staging-v1") || 0x00 || ascii(staging_id) || 0x00 ||
+    uint64_be(byte_length) || secret_bytes``
+    """
+    if not isinstance(staging_id, str) or not staging_id:
+        raise ValueError("staging_id must be a non-empty string")
+    if not isinstance(secret_bytes, (bytes, bytearray)):
+        raise TypeError(f"secret_bytes must be bytes, got {type(secret_bytes)!r}")
+    return b"".join(
+        (
+            SECRET_STAGING_ATTESTATION_DOMAIN.encode("ascii"),
+            b"\x00",
+            staging_id.encode("ascii"),
+            b"\x00",
+            _u64_be(len(secret_bytes)),
+            bytes(secret_bytes),
+        )
+    )
+
+
+def secret_staging_attestation(
+    integrity_key: bytes, *, staging_id: str, secret_bytes: bytes
+) -> str:
+    """Keyed equality attestation for staged secret bytes.
+
+    Proves byte identity for a staging id without an unkeyed digest of the
+    secret. The hex tag stays in Secret Store incoming metadata.
+    """
+    return hmac_sha256_hex(
+        integrity_key,
+        secret_staging_attestation_preimage(staging_id=staging_id, secret_bytes=secret_bytes),
+    )
