@@ -364,6 +364,99 @@ def retry_context_from_hash(repo: str, data: Mapping[str, str]) -> IssueRetryCon
         return None
 
 
+def _safe_ts(value: float) -> str:
+    try:
+        formatted = _format_ts(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return "0.000"
+    if not _TIMESTAMP_RE.fullmatch(formatted):
+        return "0.000"
+    return formatted
+
+
+def _budget_retry_hash(
+    *,
+    repo: str,
+    task_id: str,
+    generation: int,
+    expected_ref: str,
+    expected_head_owner: str,
+    remote_head_oid: str,
+    pr_number: int | None,
+    reason_code: str,
+    created_at: float,
+    cooldown_until: float,
+) -> dict[str, str]:
+    """Allowlisted hash fields for attempt-budget accounting.
+
+    Invalid owner/ref/oid/PR values are dropped so they cannot be rendered
+    into a later prompt. The hash still exists so
+    ``count_ineffective_delivery_generations`` keeps the generation.
+    """
+    owner = expected_head_owner.strip()
+    ref = expected_ref.strip()
+    if not same_repo_expected_ref_allowed(repo, owner, ref):
+        owner = ""
+        ref = ""
+    oid = remote_head_oid.strip()
+    if oid and not is_safe_oid(oid):
+        oid = ""
+    number = ""
+    url = ""
+    parsed = _parse_int(pr_number, default=None)
+    if parsed is not None and parsed >= 1:
+        try:
+            url = canonical_pull_url(repo, parsed)
+            number = str(parsed)
+        except RetryContextBoundError:
+            number = ""
+            url = ""
+    reason = reason_code.strip().lower()
+    if not _REASON_RE.fullmatch(reason):
+        reason = "ineffective_delivery"
+    stored_task = task_id if _TASK_ID_RE.fullmatch(task_id) else ""
+    gen = generation if generation >= 1 else 0
+    return {
+        "schema_version": str(RETRY_CONTEXT_SCHEMA_VERSION),
+        "task_id": stored_task,
+        "generation": str(gen),
+        "expected_ref": ref,
+        "expected_head_owner": owner,
+        "remote_head_oid": oid,
+        "pr_number": number,
+        "pr_url": url,
+        "reason_code": reason,
+        "created_at": _safe_ts(created_at),
+        "cooldown_until": _safe_ts(cooldown_until),
+    }
+
+
+def _store_retry_hash(
+    redis: RedisClient,
+    repo: str,
+    issue_number: int,
+    generation: int,
+    mapping: Mapping[str, str],
+    *,
+    cooldown_ttl_seconds: int,
+) -> bool:
+    flattened: list[str] = []
+    for field in HASH_FIELDS:
+        flattened.extend((field, mapping.get(field, "")))
+    response = redis.client.eval(
+        _STORE_SCRIPT,
+        4,
+        redis._prefixed(make_issue_generation_key(repo, issue_number)),
+        redis._prefixed(make_issue_retry_record_key(repo, issue_number, generation)),
+        redis._prefixed(make_issue_retry_latest_key(repo, issue_number)),
+        redis._prefixed(make_issue_delivery_cooldown_key(repo, issue_number)),
+        str(generation),
+        str(max(0, int(cooldown_ttl_seconds))),
+        *flattened,
+    )
+    return _eval_ok(response)
+
+
 def store_issue_retry_context(
     redis: RedisClient,
     repo: str,
@@ -379,22 +472,59 @@ def store_issue_retry_context(
     payload = context.to_canonical_json()
     if len(payload.encode("utf-8")) > RETRY_CONTEXT_MAX_BYTES:
         raise RetryContextBoundError("retry context exceeds 4 KiB")
-    mapping = context.to_hash()
-    flattened: list[str] = []
-    for field in HASH_FIELDS:
-        flattened.extend((field, mapping[field]))
-    response = redis.client.eval(
-        _STORE_SCRIPT,
-        4,
-        redis._prefixed(make_issue_generation_key(repo, issue_number)),
-        redis._prefixed(make_issue_retry_record_key(repo, issue_number, context.generation)),
-        redis._prefixed(make_issue_retry_latest_key(repo, issue_number)),
-        redis._prefixed(make_issue_delivery_cooldown_key(repo, issue_number)),
-        str(context.generation),
-        str(max(0, int(cooldown_ttl_seconds))),
-        *flattened,
+    return _store_retry_hash(
+        redis,
+        repo,
+        issue_number,
+        context.generation,
+        context.to_hash(),
+        cooldown_ttl_seconds=cooldown_ttl_seconds,
     )
-    return _eval_ok(response)
+
+
+def store_issue_retry_budget_record(
+    redis: RedisClient,
+    repo: str,
+    issue_number: int,
+    *,
+    task_id: str,
+    generation: int,
+    expected_ref: str = "",
+    expected_head_owner: str = "",
+    remote_head_oid: str = "",
+    pr_number: int | None = None,
+    reason_code: str,
+    created_at: float,
+    cooldown_until: float,
+    cooldown_ttl_seconds: int,
+) -> bool:
+    """Persist a retry hash even when resume context fails ref/owner checks.
+
+    ``build_issue_retry_context`` rejects empty or cross-repo refs, which is
+    reachable when a job's copied expected outcome is missing. Attempt
+    accounting still needs the generation hash (and cooldown CAS) so an
+    INEFFECTIVE delivery cannot reset ``max_attempts``.
+    """
+    mapping = _budget_retry_hash(
+        repo=repo,
+        task_id=task_id,
+        generation=generation,
+        expected_ref=expected_ref,
+        expected_head_owner=expected_head_owner,
+        remote_head_oid=remote_head_oid,
+        pr_number=pr_number,
+        reason_code=reason_code,
+        created_at=created_at,
+        cooldown_until=cooldown_until,
+    )
+    return _store_retry_hash(
+        redis,
+        repo,
+        issue_number,
+        generation,
+        mapping,
+        cooldown_ttl_seconds=cooldown_ttl_seconds,
+    )
 
 
 def load_issue_retry_context(

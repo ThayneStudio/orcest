@@ -26,6 +26,7 @@ from orcest.orchestrator.issue_retry import (
     render_issue_retry_prompt_section,
     retry_context_from_hash,
     same_repo_expected_ref_allowed,
+    store_issue_retry_budget_record,
     store_issue_retry_context,
 )
 from orcest.orchestrator.task_publisher import _render_issue_prompt, publish_issue_task
@@ -160,6 +161,84 @@ def test_unexpected_owner_or_ref_rejected():
             created_at=1.0,
             cooldown_until=2.0,
         )
+
+
+def test_budget_record_persists_when_ref_unbound(fake_redis_client: RedisClient):
+    """Empty owner/ref cannot resume, but the generation hash must still exist."""
+    _seed_generation(fake_redis_client, 1)
+    assert store_issue_retry_budget_record(
+        fake_redis_client,
+        REPO,
+        ISSUE,
+        task_id="task-660",
+        generation=1,
+        expected_ref="",
+        expected_head_owner="",
+        reason_code="ineffective_delivery",
+        created_at=1_000.0,
+        cooldown_until=1_000.0,
+        cooldown_ttl_seconds=0,
+    )
+    data = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert data["generation"] == "1"
+    assert data["task_id"] == "task-660"
+    assert data["reason_code"] == "ineffective_delivery"
+    assert data["created_at"] == "1000.000"
+    assert data["cooldown_until"] == "1000.000"
+    assert data["expected_ref"] == ""
+    assert data["expected_head_owner"] == ""
+    assert load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE) is None
+    assert not fake_redis_client.exists(make_issue_delivery_cooldown_key(REPO, ISSUE))
+    assert fake_redis_client.get(make_issue_retry_latest_key(REPO, ISSUE)) == "1"
+
+
+def test_budget_record_drops_cross_repo_owner(fake_redis_client: RedisClient):
+    _seed_generation(fake_redis_client, 1)
+    assert store_issue_retry_budget_record(
+        fake_redis_client,
+        REPO,
+        ISSUE,
+        task_id="task-660",
+        generation=1,
+        expected_ref=REF,
+        expected_head_owner="attacker",
+        remote_head_oid=OID,
+        pr_number=12,
+        reason_code="no_candidate_pr",
+        created_at=1_000.0,
+        cooldown_until=1_020.0,
+        cooldown_ttl_seconds=20,
+    )
+    data = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert data["expected_ref"] == ""
+    assert data["expected_head_owner"] == ""
+    assert data["remote_head_oid"] == OID
+    assert data["pr_number"] == "12"
+    assert load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE) is None
+    assert fake_redis_client.get(make_issue_delivery_cooldown_key(REPO, ISSUE)) == "1"
+
+
+def test_budget_record_respects_generation_cas(fake_redis_client: RedisClient):
+    _seed_generation(fake_redis_client, 2)
+    newer = _context(generation=2, task_id="task-newer", pr_number=9)
+    assert store_issue_retry_context(fake_redis_client, REPO, ISSUE, newer, cooldown_ttl_seconds=30)
+    assert not store_issue_retry_budget_record(
+        fake_redis_client,
+        REPO,
+        ISSUE,
+        task_id="task-stale",
+        generation=1,
+        expected_ref="",
+        expected_head_owner="",
+        reason_code="ineffective_delivery",
+        created_at=1.0,
+        cooldown_until=2.0,
+        cooldown_ttl_seconds=5,
+    )
+    loaded = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert loaded is not None
+    assert loaded.task_id == "task-newer"
+    assert not fake_redis_client.exists(make_issue_retry_record_key(REPO, ISSUE, 1))
 
 
 def test_store_and_load_latest(fake_redis_client: RedisClient):

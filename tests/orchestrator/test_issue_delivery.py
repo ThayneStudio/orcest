@@ -555,6 +555,67 @@ def _observe_no_handoff(*_args: object, **_kwargs: object) -> HandoffObservation
     )
 
 
+def test_ineffective_unbound_retry_context_still_counts_generation(
+    fake_redis_client, label_config, mocker
+):
+    """RetryContextBoundError must still persist the generation retry hash.
+
+    Empty expected_head_owner rejects resume context, and with
+    ``ineffective_cooldown_seconds == 0`` there is no cooldown key either.
+    The hash is what keeps INEFFECTIVE generations in the attempt budget.
+    """
+    _admit_completed(fake_redis_client)
+    fake_redis_client.hset(
+        make_issue_verification_job_key(REPO, ISSUE, 1),
+        "expected_head_owner",
+        "",
+    )
+    now = 1_040.0
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=0),
+        stream_redis=fake_redis_client,
+        now=lambda: now,
+        observe=_observe_no_handoff,
+    )
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, 1)
+    assert job.state is VerificationState.INEFFECTIVE
+    assert job.saga_phase is SagaPhase.BARRIER_REMOVED
+    retry_record = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert retry_record["generation"] == "1"
+    assert retry_record["task_id"] == "task-659"
+    assert retry_record["reason_code"] == DeliveryFailureReason.NO_CANDIDATE_PR.value
+    assert retry_record["created_at"] == f"{now:.3f}"
+    assert retry_record["cooldown_until"] == f"{now:.3f}"
+    assert retry_record["expected_ref"] == ""
+    assert retry_record["expected_head_owner"] == ""
+    assert load_issue_retry_context(fake_redis_client, REPO, ISSUE, 1) is None
+    assert not fake_redis_client.exists(make_issue_delivery_cooldown_key(REPO, ISSUE))
+    assert count_ineffective_delivery_generations(fake_redis_client, REPO, ISSUE) == 1
+
+    mocker.patch(
+        "orcest.orchestrator.gh.list_labeled_issues",
+        return_value=[
+            {
+                "number": ISSUE,
+                "title": "x",
+                "body": "",
+                "labels": [{"name": "orcest:ready"}],
+            }
+        ],
+    )
+    fake_redis_client.delete(make_pending_task_key(REPO, "issue", ISSUE))
+    clear_attempts(fake_redis_client, REPO, ISSUE)
+    actions = discover_actionable_issues(
+        REPO, TOKEN, fake_redis_client, label_config, max_attempts=1
+    )
+    assert get_attempt_count(fake_redis_client, REPO, ISSUE) == 0
+    assert actions[0].action is IssueAction.SKIP_MAX_ATTEMPTS
+
+
 def test_count_ineffective_delivery_generations_walks_prior_gens(fake_redis_client):
     fake_redis_client.set_value(make_issue_generation_key(REPO, ISSUE), "4")
     for gen in (1, 3):

@@ -43,6 +43,7 @@ from orcest.orchestrator.issue_retry import (
     RetryContextBoundError,
     build_issue_retry_context,
     clear_issue_retry_context,
+    store_issue_retry_budget_record,
     store_issue_retry_context,
 )
 from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
@@ -1381,20 +1382,28 @@ def _advance_ineffective_saga(
             )
         except RetryContextBoundError:
             logger_.warning(
-                "Bounded retry context rejected for %s#%d gen %d",
+                "Bounded retry context rejected for %s#%d gen %d; "
+                "storing budget retry record without resume context",
                 job.repo,
                 job.issue_number,
                 job.generation,
                 exc_info=True,
             )
-            if cooldown > 0 and get_issue_generation(redis, job.repo, job.issue_number) == (
-                job.generation
-            ):
-                redis.set_ex(
-                    make_issue_delivery_cooldown_key(job.repo, job.issue_number),
-                    str(job.generation),
-                    cooldown,
-                )
+            store_issue_retry_budget_record(
+                redis,
+                job.repo,
+                job.issue_number,
+                task_id=job.task_id,
+                generation=job.generation,
+                expected_ref=job.expected_branch,
+                expected_head_owner=job.expected_head_owner,
+                remote_head_oid=job.live_head_oid,
+                pr_number=pr_number,
+                reason_code=job.reason or "ineffective_delivery",
+                created_at=current_time,
+                cooldown_until=cooldown_until,
+                cooldown_ttl_seconds=cooldown,
+            )
         if _transition_job(
             redis,
             job,
