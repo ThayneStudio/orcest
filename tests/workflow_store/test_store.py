@@ -1170,7 +1170,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1429,6 +1429,13 @@ _SECRET_PROVISION_TABLES = (
     "secret_provision_checkpoints",
 )
 
+_PROJECT_REGISTRATION_TABLES = (
+    "forge_instances",
+    "forge_observation_schedules",
+    "project_registration_operations",
+    "projects",
+)
+
 
 def _write_v3_shaped_database(db_path: Path) -> None:
     """Build a real v4 database, then strip it back to the v3 shape: every
@@ -1437,9 +1444,9 @@ def _write_v3_shaped_database(db_path: Path) -> None:
         pass
     conn = sqlite3.connect(db_path)
     try:
-        for table in _SECRET_PROVISION_TABLES:
+        for table in _SECRET_PROVISION_TABLES + _PROJECT_REGISTRATION_TABLES:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 4")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 4")
         conn.execute("PRAGMA user_version=3")
         conn.commit()
     finally:
@@ -1546,3 +1553,32 @@ def test_controller_mode_restore_backup_rejects_asymmetric_prior_policy(
         )
         assert illegal.status == "REJECTED"
         assert illegal.rejection_code == "TRANSITION_NOT_ALLOWED"
+
+
+def _write_v4_shaped_database(db_path: Path) -> None:
+    """Build a real current database, then strip project-registration tables
+    and roll ``user_version`` back to 4."""
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in _PROJECT_REGISTRATION_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 5")
+        conn.execute("PRAGMA user_version=4")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v4_database_migrates_project_registration_tables(tmp_path: Path) -> None:
+    _write_v4_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _PROJECT_REGISTRATION_TABLES:
+            assert expected_table in tables

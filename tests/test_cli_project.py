@@ -47,6 +47,7 @@ def test_project_help(runner) -> None:
     assert "lint" in result.output
     assert "explain" in result.output
     assert "simulate" in result.output
+    assert "onboard" in result.output
 
 
 def test_init_lint_explain_simulate_round_trip(runner, tmp_path) -> None:

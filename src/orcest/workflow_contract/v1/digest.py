@@ -93,6 +93,7 @@ __all__ = [
     "checkpoint_digest",
     "affected_run_ids_digest",
     "failure_evidence_digest",
+    "resolution_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -408,6 +409,17 @@ def affected_run_ids_digest(member_rows: Sequence[Mapping[str, Any]]) -> str:
     leaves must reuse so the formula never diverges by call site.
     """
     return generic_domain_digest("orcest-affected-run-ids-v1", list(member_rows))
+
+
+def resolution_digest(resolution: Any) -> str:
+    """Internal Project Registration ``resolution_digest``.
+
+    Covers the request/authorization digests, installation/account binding,
+    resolved forge/repository/base identities, conditional Secret References,
+    and the successful discovery-Schedule identity. Never returned publicly
+    and MUST NOT be folded into ``response_digest``.
+    """
+    return generic_domain_digest("orcest-project-registration-resolution-v1", resolution)
 
 
 def failure_evidence_digest(evidence: Any) -> str:

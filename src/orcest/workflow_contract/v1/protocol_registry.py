@@ -13,13 +13,12 @@ Literals whose full wire schema is spelled out in the wiki (worker-protocol
 request/response tables, or an explicit domain-model.md terminal-body
 description/JSON example) are given a complete field schema. A handful of
 literals are owned by another document not in scope for this issue (the Plan
-and Diagnosis Result schemas in the planning contract, the Project
-Registration success body in the repository-configuration contract) or are
-embedded object shapes rather than standalone envelopes (the launch
-capability claims); those are registered with their discriminant field only,
-as an explicit extension point for the leaf issue that implements that
-endpoint -- extending them here (never by hard-coding the literal elsewhere)
-is exactly what keeps this the one registry.
+and Diagnosis Result schemas in the planning contract) or are embedded object
+shapes rather than standalone envelopes (the launch capability claims); those
+are registered with their discriminant field only, as an explicit extension
+point for the leaf issue that implements that endpoint -- extending them here
+(never by hard-coding the literal elsewhere) is exactly what keeps this the
+one registry.
 """
 
 from __future__ import annotations
@@ -30,12 +29,20 @@ from typing import Any
 from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.digest import is_valid_content_digest
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid
-from orcest.workflow_contract.v1.protocol import Field, ProtocolValidationError, register_envelope
+from orcest.workflow_contract.v1.protocol import (
+    Field,
+    ProtocolValidationError,
+    Schema,
+    register_envelope,
+)
 
 CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
 CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
 CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
+ERROR_PROTOCOL = "orcest.error/1"
+PROJECT_REGISTRATION_PROTOCOL = "orcest.project-registration/1"
+PROJECT_REGISTRATION_RESULT_PROTOCOL = "orcest.project-registration-result/1"
 SECRET_PROVISION_REQUEST_PROTOCOL = "orcest.secret-provision/1"
 SECRET_PROVISION_ACCEPTED_PROTOCOL = "orcest.secret-provision-accepted/1"
 SECRET_PROVISION_RESULT_PROTOCOL = "orcest.secret-provision-result/1"
@@ -45,6 +52,9 @@ __all__ = [
     "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
     "CONTROLLER_MODE_OPERATION_PROTOCOL",
     "CONTROLLER_MODE_RESULT_PROTOCOL",
+    "ERROR_PROTOCOL",
+    "PROJECT_REGISTRATION_PROTOCOL",
+    "PROJECT_REGISTRATION_RESULT_PROTOCOL",
     "SECRET_PROVISION_REQUEST_PROTOCOL",
     "SECRET_PROVISION_ACCEPTED_PROTOCOL",
     "SECRET_PROVISION_RESULT_PROTOCOL",
@@ -65,6 +75,12 @@ def _is_nonneg_int(value: Any) -> None:
     _is_int(value)
     if value < 0:
         raise ValueError("must be a nonnegative integer")
+
+
+def _is_positive_int(value: Any) -> None:
+    _is_int(value)
+    if value < 1:
+        raise ValueError("must be a positive integer")
 
 
 def _is_str(value: Any) -> None:
@@ -102,9 +118,11 @@ def _require(condition: bool, message: str) -> None:
 # ---------------------------------------------------------------------------
 
 register_envelope(
-    "orcest.error/1",
+    ERROR_PROTOCOL,
     {
-        "code": Field(enum=_enum_values(enums.WorkerProtocolErrorCode) | {"ATTEMPT_STALE"}),
+        "code": Field(
+            enum=_enum_values(enums.WorkerProtocolErrorCode) | {"ATTEMPT_STALE", "CAS_LOST"}
+        ),
         "retryable": Field(validator=_is_bool),
         "message": Field(required=False, validator=_is_str),
         "retry_after_seconds": Field(required=False, nullable=True, validator=_is_nonneg_int),
@@ -204,26 +222,140 @@ register_envelope(CAPABILITY_KEY_OPERATION_PROTOCOL, {})
 
 
 # ---------------------------------------------------------------------------
-# Project Registration -- REJECTED body is exact; SUCCEEDED body is owned by
-# the repository-configuration contract (not fetched by this issue).
+# Project Registration -- request and public result bodies from
+# repository-configuration.md / domain-model.md.
 # ---------------------------------------------------------------------------
 
+_COMMIT_ID_SCHEMA = Schema(
+    fields={
+        "object_format": Field(validator=_is_nonempty_str),
+        "oid": Field(validator=_is_nonempty_str),
+    }
+)
+
+_REGISTRATION_FORGE_SCHEMA = Schema(
+    fields={
+        "adapter_kind": Field(enum=_enum_values(enums.ForgeAdapterKind)),
+        "canonical_origin": Field(validator=_is_nonempty_str),
+        "installation_or_account_ref": Field(validator=_is_nonempty_str),
+        "repository_locator": Field(validator=_is_nonempty_str),
+    }
+)
+
+_DIAGNOSTIC_SCHEMA = Schema(
+    fields={
+        "code": Field(validator=_is_nonempty_str),
+        "message": Field(validator=_is_str),
+        "path": Field(validator=_is_str),
+    }
+)
+
+_READINESS_SCHEMA = Schema(
+    fields={
+        "ready": Field(validator=_is_bool),
+        "diagnostics": Field(item_schema=_DIAGNOSTIC_SCHEMA),
+    }
+)
+
+
+def _project_registration_request_invariant(value: Mapping[str, Any]) -> None:
+    project_id = value.get("project_id")
+    expected = value.get("expected_registration_revision")
+    if project_id is None:
+        _require(expected is None, "REGISTER requires expected_registration_revision = null")
+    else:
+        _require(
+            isinstance(expected, int) and not isinstance(expected, bool) and expected >= 1,
+            "REVALIDATE requires a positive expected_registration_revision",
+        )
+
+
+def _project_registration_result_invariant(value: Mapping[str, Any]) -> None:
+    status = value.get("status")
+    success_fields = (
+        "project_id",
+        "registration_revision",
+        "registration_state",
+        "forge_instance_id",
+        "installation_or_account_ref",
+        "repository_external_id",
+        "repository_locator",
+        "default_ref",
+        "trusted_base_commit",
+        "workflow_hash",
+        "policy_hash",
+        "trusted_base_policy_ref",
+        "budget_policy_ref",
+        "budget_reset_window_ref",
+        "readiness",
+    )
+    if status == "SUCCEEDED":
+        _require(value.get("rejection_code") is None, "SUCCEEDED must not carry rejection_code")
+        _require(value.get("diagnostics") is None, "SUCCEEDED must not carry diagnostics")
+        for field_name in success_fields:
+            _require(value.get(field_name) is not None, f"SUCCEEDED requires {field_name}")
+    elif status == "REJECTED":
+        _require(value.get("rejection_code") is not None, "REJECTED requires a rejection_code")
+        _require(value.get("diagnostics") is not None, "REJECTED requires diagnostics")
+        for field_name in success_fields:
+            _require(value.get(field_name) is None, f"REJECTED must not carry {field_name}")
+
+
 register_envelope(
-    "orcest.project-registration-result/1",
+    PROJECT_REGISTRATION_PROTOCOL,
     {
         "idempotency_key": Field(validator=_is_uuid),
+        "project_id": Field(required=True, nullable=True, validator=_is_uuid),
+        "expected_registration_revision": Field(
+            required=True, nullable=True, validator=_is_positive_int
+        ),
+        "forge": Field(schema=_REGISTRATION_FORGE_SCHEMA),
+        "requested_default_ref": Field(validator=_is_nonempty_str),
+        "trusted_base_policy_ref": Field(validator=_is_nonempty_str),
+        "budget_policy_ref": Field(validator=_is_nonempty_str),
+        "budget_reset_window_ref": Field(validator=_is_nonempty_str),
+    },
+    protocol_field="protocol",
+    object_validator=_project_registration_request_invariant,
+)
+register_envelope(
+    PROJECT_REGISTRATION_RESULT_PROTOCOL,
+    {
+        "idempotency_key": Field(validator=_is_uuid),
+        "replayed": Field(validator=_is_bool),
         "mode": Field(enum=_enum_values(enums.ProjectRegistrationOperationMode)),
         "status": Field(enum=_enum_values(enums.ProjectRegistrationOperationStatus)),
-        "replayed": Field(validator=_is_bool),
+        "project_id": Field(required=False, nullable=True, validator=_is_uuid),
+        "registration_revision": Field(required=False, nullable=True, validator=_is_positive_int),
+        "registration_state": Field(
+            required=False,
+            nullable=True,
+            enum=_enum_values(enums.ProjectRegistrationState),
+        ),
+        "forge_instance_id": Field(required=False, nullable=True, validator=_is_uuid),
+        "installation_or_account_ref": Field(
+            required=False, nullable=True, validator=_is_nonempty_str
+        ),
+        "repository_external_id": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "repository_locator": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "default_ref": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "trusted_base_commit": Field(required=False, nullable=True, schema=_COMMIT_ID_SCHEMA),
+        "workflow_hash": Field(required=False, nullable=True, validator=_is_digest),
+        "policy_hash": Field(required=False, nullable=True, validator=_is_digest),
+        "trusted_base_policy_ref": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "budget_policy_ref": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "budget_reset_window_ref": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "readiness": Field(required=False, nullable=True, schema=_READINESS_SCHEMA),
         "rejection_code": Field(
             required=False,
             nullable=True,
             enum=_enum_values(enums.ProjectRegistrationOperationRejectionCode),
         ),
-        "diagnostics": Field(required=False, nullable=True),
+        "diagnostics": Field(required=False, nullable=True, item_schema=_DIAGNOSTIC_SCHEMA),
     },
+    protocol_field="protocol",
+    object_validator=_project_registration_result_invariant,
 )
-register_envelope("orcest.project-registration/1", {})
 
 
 # ---------------------------------------------------------------------------
