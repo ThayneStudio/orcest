@@ -180,6 +180,76 @@ def test_no_rebase_without_branch(mocker, tmp_path):
 
 
 @pytest.mark.unit
+def test_resume_expected_ref_fetches_and_checks_out(mocker, tmp_path):
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN)
+    mock_run.reset_mock()
+    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work") is True
+    fetch_args = mock_run.call_args_list[0][0][0]
+    assert fetch_args[:4] == ["git", "-C", str(ws.path), "fetch"]
+    assert "origin" in fetch_args
+    assert "refs/heads/issue-660-work:refs/remotes/origin/issue-660-work" in fetch_args
+    checkout_args = mock_run.call_args_list[1][0][0]
+    assert "checkout" in checkout_args
+    assert "-B" in checkout_args
+    assert "issue-660-work" in checkout_args
+    assert "origin/issue-660-work" in checkout_args
+
+
+@pytest.mark.unit
+def test_resume_expected_ref_missing_remote_stays_on_default(mocker, tmp_path):
+    def _run(args, **_kwargs):
+        if "fetch" in args:
+            raise subprocess.CalledProcessError(
+                returncode=128,
+                cmd=args,
+                stderr="fatal: couldn't find remote ref refs/heads/issue-660-work",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    mock_run = mocker.patch("orcest.worker.workspace.subprocess.run", side_effect=_run)
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN)
+    mock_run.reset_mock()
+    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work") is False
+    assert all("checkout" not in call[0][0] for call in mock_run.call_args_list)
+
+
+@pytest.mark.unit
+def test_resume_rejects_unexpected_owner(mocker, tmp_path):
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN)
+    mock_run.reset_mock()
+    with pytest.raises(WorkspaceError, match="unexpected owner"):
+        ws.resume_expected_ref(REPO, "attacker", "issue-660-work")
+    mock_run.assert_not_called()
+
+
+@pytest.mark.unit
+def test_resume_rejects_unexpected_ref(mocker, tmp_path):
+    mock_run = mocker.patch(
+        "orcest.worker.workspace.subprocess.run",
+        return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    )
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN)
+    mock_run.reset_mock()
+    with pytest.raises(WorkspaceError, match="unexpected ref"):
+        ws.resume_expected_ref(REPO, "acme", "../etc/passwd")
+    with pytest.raises(WorkspaceError, match="unexpected ref"):
+        ws.resume_expected_ref(REPO, "acme", "-sneaky")
+    mock_run.assert_not_called()
+
+
+@pytest.mark.unit
 def test_cleanup_removes_directory(tmp_path):
     """cleanup() removes the workspace temp directory."""
     # Simulate what setup() does: create a temp dir under base_dir

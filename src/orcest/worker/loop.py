@@ -2458,6 +2458,15 @@ def _execute_task(
 
         logger.info(f"Cloning {task.repo} (branch: {task.branch or 'default'})")
         work_dir = workspace.setup(task.repo, task.branch, task.token)
+        if task.resource_type == "issue" and task.expected_branch and task.branch is None:
+            owner, _sep, _name = task.repo.partition("/")
+            resumed = workspace.resume_expected_ref(task.repo, owner, task.expected_branch)
+            if resumed:
+                logger.info(
+                    "Resumed expected ref %s for issue task %s",
+                    task.expected_branch,
+                    task.id,
+                )
         if task.resource_type == "pr" and task.snapshot_head_sha:
             workspace_head_sha = workspace.current_head_sha()
             if workspace_head_sha != task.snapshot_head_sha:
