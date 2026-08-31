@@ -372,6 +372,12 @@ def test_echo_mismatch_still_verifies(fake_redis_client, mocker):
     assert job.state is VerificationState.VERIFIED
     assert job.echo_mismatch is True
     assert get_delivery_metrics(fake_redis_client)["echo_mismatch"] == "1"
+    echo_events = [
+        e
+        for e in _events(fake_redis_client)
+        if e["type"].endswith("delivery.phase") and e["data"].get("alert") == "echo_mismatch"
+    ]
+    assert len(echo_events) == 1
     process_due_verification_jobs(
         fake_redis_client,
         REPO,
@@ -382,6 +388,12 @@ def test_echo_mismatch_still_verifies(fake_redis_client, mocker):
         observe=lambda *a, **k: _observation(echo_mismatch=True),
     )
     assert get_delivery_metrics(fake_redis_client)["echo_mismatch"] == "1"
+    echo_events = [
+        e
+        for e in _events(fake_redis_client)
+        if e["type"].endswith("delivery.phase") and e["data"].get("alert") == "echo_mismatch"
+    ]
+    assert len(echo_events) == 1
 
 
 def test_ambiguity_increments_once(fake_redis_client, mocker):
@@ -627,6 +639,20 @@ def test_unverifiable_survives_ttl_and_blocks_dispatch(fake_redis_client, label_
     actions = discover_actionable_issues(REPO, TOKEN, fake_redis_client, label_config)
     assert actions[0].action is IssueAction.SKIP_VERIFYING
     assert result.task_id
+
+
+def test_gc_due_member_stays_until_state_is_collected(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    member = job_member(REPO, ISSUE, 1)
+    fake_redis_client.zadd(GC_DUE_INDEX_KEY, {member: 1.0})
+
+    collected = process_due_delivery_state_gc(fake_redis_client, REPO, now=lambda: 2_000.0)
+
+    assert collected == 0
+    assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, member) is not None
+    assert "1 delivery GC job(s)" in delivery_state_blocks_old_orchestrator_rollback(
+        fake_redis_client
+    )
 
 
 def test_events_are_secret_free(fake_redis_client, mocker):

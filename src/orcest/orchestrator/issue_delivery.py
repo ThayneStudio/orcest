@@ -189,6 +189,33 @@ redis.call("PERSIST", KEYS[1])
 return 1
 """
 
+_BARRIER_REMOVAL_SCRIPT = r"""
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return -2
+end
+local state = redis.call("HGET", KEYS[1], "state")
+local phase = redis.call("HGET", KEYS[1], "saga_phase")
+if state ~= ARGV[1] then
+    return 0
+end
+if phase ~= ARGV[3] then
+    return 0
+end
+if state == "verified" and ARGV[2] ~= "verified" then
+    return -1
+end
+redis.call("HSET", KEYS[1], "state", ARGV[2], "saga_phase", ARGV[4])
+for i = 7, #ARGV, 2 do
+    redis.call("HSET", KEYS[1], ARGV[i], ARGV[i + 1])
+end
+redis.call("PERSIST", KEYS[1])
+redis.call("DEL", KEYS[2])
+redis.call("SREM", KEYS[3], ARGV[5])
+redis.call("ZREM", KEYS[4], ARGV[5])
+redis.call("ZADD", KEYS[5], ARGV[6], ARGV[5])
+return 1
+"""
+
 
 def now_seconds() -> float:
     """Wall-clock seconds; tests patch this to advance time."""
@@ -867,7 +894,7 @@ def _observe_and_transition(
         "message": observation.message[:500],
     }
     if observation.echo_mismatch:
-        _incr_metric_once(redis, job, "echo_mismatch", "echo_mismatch")
+        _incr_metric_once(redis, job, "echo_mismatch_metric", "echo_mismatch")
         _emit_job_event(
             redis,
             job,
@@ -1118,21 +1145,20 @@ def _advance_verified_saga(
             )
         job = get_verification_job(redis, job.repo, job.issue_number, job.generation) or job
     if job.saga_phase is SagaPhase.GENERATION_CLEANED:
-        _remove_barrier(redis, job)
-        _transition_job(
+        if _remove_barrier(
             redis,
             job,
             VerificationState.VERIFIED,
             VerificationState.VERIFIED,
             SagaPhase.GENERATION_CLEANED,
             SagaPhase.BARRIER_REMOVED,
-        )
-        _emit_job_event(
-            redis,
-            job,
-            "barrier_removed",
-            {"phase": SagaPhase.BARRIER_REMOVED.value, "state": "verified"},
-        )
+        ):
+            _emit_job_event(
+                redis,
+                job,
+                "barrier_removed",
+                {"phase": SagaPhase.BARRIER_REMOVED.value, "state": "verified"},
+            )
 
 
 def _advance_ineffective_saga(
@@ -1226,21 +1252,20 @@ def _advance_ineffective_saga(
             )
         job = get_verification_job(redis, job.repo, job.issue_number, job.generation) or job
     if job.saga_phase is SagaPhase.GENERATION_CLEANED:
-        _remove_barrier(redis, job)
-        _transition_job(
+        if _remove_barrier(
             redis,
             job,
             VerificationState.INEFFECTIVE,
             VerificationState.INEFFECTIVE,
             SagaPhase.GENERATION_CLEANED,
             SagaPhase.BARRIER_REMOVED,
-        )
-        _emit_job_event(
-            redis,
-            job,
-            "barrier_removed",
-            {"phase": SagaPhase.BARRIER_REMOVED.value, "state": "ineffective"},
-        )
+        ):
+            _emit_job_event(
+                redis,
+                job,
+                "barrier_removed",
+                {"phase": SagaPhase.BARRIER_REMOVED.value, "state": "ineffective"},
+            )
 
 
 def _generation_cleanup(
@@ -1262,12 +1287,38 @@ def _generation_cleanup(
         )
 
 
-def _remove_barrier(redis: RedisClient, job: VerificationJob) -> None:
+def _remove_barrier(
+    redis: RedisClient,
+    job: VerificationJob,
+    expected_state: VerificationState,
+    new_state: VerificationState,
+    expected_phase: SagaPhase,
+    new_phase: SagaPhase,
+    extra: dict[str, str] | None = None,
+) -> bool:
     member = job_member(job.repo, job.issue_number, job.generation)
-    redis.delete(make_issue_dispatch_barrier_key(job.repo, job.issue_number))
-    redis.srem(ACTIVE_JOBS_KEY, member)
-    redis.zrem(DUE_INDEX_KEY, member)
-    redis.zadd(GC_DUE_INDEX_KEY, {member: now_seconds()})
+    flattened: list[str] = []
+    for key, value in (extra or {}).items():
+        flattened.extend((key, value))
+    response = redis.client.eval(
+        _BARRIER_REMOVAL_SCRIPT,
+        5,
+        redis._prefixed(
+            make_issue_verification_job_key(job.repo, job.issue_number, job.generation)
+        ),
+        redis._prefixed(make_issue_dispatch_barrier_key(job.repo, job.issue_number)),
+        redis._prefixed(ACTIVE_JOBS_KEY),
+        redis._prefixed(DUE_INDEX_KEY),
+        redis._prefixed(GC_DUE_INDEX_KEY),
+        expected_state.value,
+        new_state.value,
+        expected_phase.value,
+        new_phase.value,
+        member,
+        f"{now_seconds():.3f}",
+        *flattened,
+    )
+    return _as_int(response) == 1
 
 
 def _transition_job(
@@ -1302,10 +1353,10 @@ def gc_issue_delivery_state(
 ) -> bool:
     """Collect delivery state only when it is terminal and unreferenced.
 
-    The dispatch barrier is already removed by ``_remove_barrier`` on the
-    transition into ``BARRIER_REMOVED``, so only the job hash, the admission
-    ledger entry, and the result-ref key -- all ``PERSIST``ed, no TTL --
-    remain to collect here.
+    The dispatch barrier is atomically removed by ``_remove_barrier`` while
+    transitioning into ``BARRIER_REMOVED``, so only the job hash, the admission
+    ledger entry, and the result-ref key -- all ``PERSIST``ed, no TTL -- remain
+    to collect here.
     """
     job = get_verification_job(redis, repo, issue_number, generation)
     job_key = make_issue_verification_job_key(repo, issue_number, generation)
@@ -1335,10 +1386,11 @@ def process_due_delivery_state_gc(
 ) -> int:
     """Collect delivery state for generations queued by ``_remove_barrier``.
 
-    ``_remove_barrier`` queues a job's member into ``GC_DUE_INDEX_KEY`` the
-    moment its saga reaches ``BARRIER_REMOVED``, independent of when this is
-    called -- so state stays readable for as long as nothing sweeps this
-    index, and callers can defer sweeping without racing saga completion.
+    ``_remove_barrier`` atomically queues a job's member into
+    ``GC_DUE_INDEX_KEY`` as its saga reaches ``BARRIER_REMOVED``, independent of
+    when this is called -- so state stays readable for as long as collection
+    keeps failing, and callers can defer sweeping without racing saga
+    completion.
     """
     current = now()
     due_members = redis.zrangebyscore(GC_DUE_INDEX_KEY, "-inf", current, start=0, num=batch_size)
@@ -1353,7 +1405,7 @@ def process_due_delivery_state_gc(
             continue
         if gc_issue_delivery_state(redis, job_repo, issue_number, generation):
             collected += 1
-        redis.zrem(GC_DUE_INDEX_KEY, member)
+            redis.zrem(GC_DUE_INDEX_KEY, member)
     return collected
 
 
@@ -1372,6 +1424,9 @@ def delivery_state_blocks_old_orchestrator_rollback(redis: RedisClient) -> list[
     quarantined = redis.llen(QUARANTINE_KEY)
     if quarantined:
         reasons.append(f"{quarantined} quarantined conflicting result(s)")
+    gc_due = redis.zcard(GC_DUE_INDEX_KEY)
+    if gc_due:
+        reasons.append(f"{gc_due} delivery GC job(s)")
     return reasons
 
 

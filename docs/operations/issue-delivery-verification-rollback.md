@@ -53,6 +53,8 @@ resume due membership via the reconciler.
 ## In-process disable
 
 `issue_delivery_verifier.enabled: false` restores immediate `orcest:ready`
-removal on completed issue results. That is not a substitute for the drain
-above if in-flight jobs already exist; disable it only after the same pause
-and drain, or on a fleet that never admitted verification jobs.
+removal only for newly consumed completed issue results. It does not process or
+clear existing verification jobs or dispatch barriers, so any in-flight job can
+keep issue discovery blocked while verification processing is disabled. Disable
+it only after the same pause and drain, or on a fleet that never admitted
+verification jobs.

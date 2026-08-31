@@ -109,8 +109,9 @@ class IssueDeliveryVerifierConfig:
     """Durable GitHub issue delivery verification (enforcing completion gate).
 
     ``enabled: false`` restores the pre-gate completed-issue path (immediate
-    ``orcest:ready`` removal). Rolling the orchestrator binary back still
-    requires draining or quarantining in-flight verification jobs; see
+    ``orcest:ready`` removal) only for newly consumed results. It does not
+    process or clear existing verification jobs and dispatch barriers, so
+    disable only after draining or quarantining in-flight delivery state; see
     ``docs/operations/issue-delivery-verification-rollback.md``.
     """
 
