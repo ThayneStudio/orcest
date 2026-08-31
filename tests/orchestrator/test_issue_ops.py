@@ -103,6 +103,36 @@ def test_skip_when_delivery_barrier_present(issue_gh_mock, fake_redis_client, la
     assert results[0].action == IssueAction.SKIP_VERIFYING
 
 
+def test_skip_when_delivery_barrier_present_and_verifier_disabled(
+    issue_gh_mock, fake_redis_client, label_config, caplog
+):
+    """A dispatch barrier still blocks discovery when the verifier is disabled,
+    but a warning is logged so the stuck state is not silent."""
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+    from orcest.shared.config import IssueDeliveryVerifierConfig
+
+    issue_number = 4
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=issue_number, labels=[{"name": label_config.ready}]),
+    ]
+    fake_redis_client.set_value(make_issue_dispatch_barrier_key(REPO, issue_number), "1|1")
+
+    with caplog.at_level("WARNING"):
+        results = discover_actionable_issues(
+            repo=REPO,
+            token=TOKEN,
+            redis=fake_redis_client,
+            label_config=label_config,
+            issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+        )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_VERIFYING
+    assert any(
+        "issue_delivery_verifier.enabled is false" in record.message for record in caplog.records
+    )
+
+
 def test_skip_usage_cooldown_when_active(issue_gh_mock, fake_redis_client, label_config):
     """An issue with an active USAGE_EXHAUSTED cooldown is not re-enqueued."""
     issue_number = 2

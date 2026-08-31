@@ -2700,6 +2700,7 @@ def _poll_project(
                 redis=project_redis,
                 label_config=labels,
                 max_attempts=config.max_attempts,
+                issue_delivery_verifier=config.issue_delivery_verifier,
             )
         except Exception as e:
             logger.error(f"Issue discovery failed: {e}", exc_info=True)

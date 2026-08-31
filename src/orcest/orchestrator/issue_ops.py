@@ -16,7 +16,7 @@ from orcest.orchestrator.issue_deps import (
     open_blockers,
     parse_blocker_refs,
 )
-from orcest.shared.config import LabelConfig
+from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
 from orcest.shared.coordination import make_issue_lock_key, make_pending_task_key
 from orcest.shared.redis_client import RedisClient
 
@@ -114,6 +114,7 @@ def discover_actionable_issues(
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> list[IssueState]:
     """Discover issues labeled `orcest:ready` that need implementation.
 
@@ -123,6 +124,8 @@ def discover_actionable_issues(
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if usage-exhausted cooldown is active
     5. Skip if a nonterminal delivery-verification job holds the dispatch barrier
+       (logs a warning if issue_delivery_verifier.enabled is false, since the
+       barrier is then no longer being processed or cleared)
     6. Skip if ineffective-delivery cooldown is active
     7. Skip if max attempts reached
     8. Skip if task already in flight (attempts > 0 with a pending marker)
@@ -137,6 +140,7 @@ def discover_actionable_issues(
         has_issue_dispatch_barrier,
     )
 
+    verifier_config = issue_delivery_verifier or IssueDeliveryVerifierConfig()
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
 
@@ -199,6 +203,16 @@ def discover_actionable_issues(
             continue
 
         if has_issue_dispatch_barrier(redis, repo, number):
+            if not verifier_config.enabled:
+                logger.warning(
+                    "Issue #%d in %s has an in-flight delivery-verification dispatch "
+                    "barrier but issue_delivery_verifier.enabled is false, so it is not "
+                    "being processed or cleared; discovery stays blocked until the "
+                    "barrier is drained. See "
+                    "docs/operations/issue-delivery-verification-rollback.md.",
+                    number,
+                    repo,
+                )
             results.append(
                 IssueState(
                     number=number,
