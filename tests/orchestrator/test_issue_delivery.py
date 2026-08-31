@@ -36,6 +36,7 @@ from orcest.orchestrator.issue_delivery import (
     list_quarantined_conflicts,
     process_due_delivery_state_gc,
     process_due_verification_jobs,
+    quarantine_job_admission_mismatch,
     reconcile_verification_due_index,
     result_fingerprint,
 )
@@ -281,6 +282,46 @@ def test_atomic_job_and_due_index_and_replay(fake_redis_client):
     assert job.expected_head_owner == "owner"
 
 
+def test_job_admission_mismatch_is_quarantined(fake_redis_client):
+    first = _result(task_id="legacy-task-1", branch="")
+    first_decision = admit_issue_result(fake_redis_client, REPO, first, now=lambda: 1_000.0)
+    assert first_decision.pre_schema is True
+    assert first_decision.generation == 0
+    assert (
+        admit_completed_verification_job(
+            fake_redis_client, REPO, first, first_decision, _config(), now=lambda: 1_000.0
+        )
+        is True
+    )
+
+    second = _result(task_id="legacy-task-2", branch="")
+    second_decision = admit_issue_result(fake_redis_client, REPO, second, now=lambda: 1_001.0)
+    assert second_decision.pre_schema is True
+    assert second_decision.generation == 0
+    assert (
+        admit_completed_verification_job(
+            fake_redis_client, REPO, second, second_decision, _config(), now=lambda: 1_001.0
+        )
+        is None
+    )
+
+    quarantine_job_admission_mismatch(
+        fake_redis_client, REPO, second, second_decision, now=lambda: 1_002.0
+    )
+
+    items = list_quarantined_conflicts(fake_redis_client)
+    assert items[0]["task_id"] == "legacy-task-2"
+    assert items[0]["generation"] == 0
+    assert items[0]["reason"] == "verification_job_mismatch"
+    events = [
+        e
+        for e in _events(fake_redis_client)
+        if e["type"].endswith("delivery.alert")
+        and e["data"].get("alert") == "verification_job_mismatch"
+    ]
+    assert len(events) == 1
+
+
 def test_pending_survives_marker_and_stream_expiry(fake_redis_client, label_config, mocker):
     _admit_completed(fake_redis_client)
     fake_redis_client.delete(f"pending_task:{REPO}:issue:{ISSUE}")
@@ -415,6 +456,13 @@ def test_ambiguity_increments_once(fake_redis_client, mocker):
         observe=lambda *a, **k: _observation(ambiguous=True, selected_number=4),
     )
     assert get_delivery_metrics(fake_redis_client)["ambiguity"] == "1"
+    ambiguity_events = [
+        e
+        for e in _events(fake_redis_client)
+        if e["type"].endswith("delivery.phase") and e["data"].get("alert") == "ambiguous_handoff"
+    ]
+    assert len(ambiguity_events) == 1
+    assert ambiguity_events[0]["data"]["selected_pr_number"] == "4"
     process_due_verification_jobs(
         fake_redis_client,
         REPO,
@@ -425,6 +473,12 @@ def test_ambiguity_increments_once(fake_redis_client, mocker):
         observe=lambda *a, **k: _observation(ambiguous=True, selected_number=4),
     )
     assert get_delivery_metrics(fake_redis_client)["ambiguity"] == "1"
+    ambiguity_events = [
+        e
+        for e in _events(fake_redis_client)
+        if e["type"].endswith("delivery.phase") and e["data"].get("alert") == "ambiguous_handoff"
+    ]
+    assert len(ambiguity_events) == 1
 
 
 def test_grace_keeps_mismatch_pending(fake_redis_client):

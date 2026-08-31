@@ -725,7 +725,7 @@ class RedisClient:
         """
         if not mapping:
             return 0
-        result: int = self._client.hset(self._prefixed(key), mapping=mapping)  # type: ignore[assignment]
+        result: int = self._client.hset(self._prefixed(key), mapping=mapping)  # type: ignore[assignment,arg-type]
         return result
 
     def hset_json_if_newer(

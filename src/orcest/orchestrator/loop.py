@@ -31,6 +31,7 @@ from orcest.orchestrator.issue_delivery import (
     apply_admission_conflict,
     process_due_delivery_state_gc,
     process_due_verification_jobs,
+    quarantine_job_admission_mismatch,
     reconcile_verification_due_index,
 )
 from orcest.orchestrator.issue_ops import (
@@ -3228,13 +3229,23 @@ def _handle_result(
             return
         if admission.route == ROUTE_COMPLETED_VERIFY:
             try:
-                admit_completed_verification_job(
+                job_admitted = admit_completed_verification_job(
                     redis, repo, result, admission, verifier_config, logger_=logger
                 )
             except Exception as exc:
                 raise _RetryableResultError(
                     f"failed to admit verification job for issue #{resource_id}: {exc}"
                 ) from exc
+            if job_admitted is None:
+                try:
+                    quarantine_job_admission_mismatch(
+                        redis, repo, result, admission, logger_=logger
+                    )
+                except Exception as exc:
+                    raise _RetryableResultError(
+                        "failed to quarantine verification job admission mismatch "
+                        f"for issue #{resource_id}: {exc}"
+                    ) from exc
             _commit_result_side_effects()
             return
 

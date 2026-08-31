@@ -2387,6 +2387,52 @@ def test_completed_issue_does_not_call_github_during_result_admission(
     )
 
 
+def test_completed_issue_job_admission_mismatch_is_quarantined(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A pre-schema generation-0 job collision is alerted before ACK."""
+    from orcest.orchestrator.issue_delivery import (
+        get_verification_job,
+        list_quarantined_conflicts,
+    )
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 93
+    first = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-1",
+        branch="",
+    )
+    second = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-2",
+        branch="",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, first.to_dict())
+    fake_redis_client.xadd(RESULTS_STREAM, second.to_dict())
+
+    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+
+    assert get_verification_job(fake_redis_client, repo, issue_number, 0) is not None
+    items = list_quarantined_conflicts(fake_redis_client)
+    assert items[0]["task_id"] == "legacy-completed-2"
+    assert items[0]["reason"] == "verification_job_mismatch"
+    gh_mock.remove_issue_label.assert_not_called()
+    assert (
+        fake_redis_client.client.xpending(
+            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
+        )["pending"]
+        == 0
+    )
+
+
 def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
     fake_redis_client,
     orchestrator_config,

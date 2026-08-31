@@ -579,8 +579,11 @@ def admit_completed_verification_job(
     *,
     now: NowFn = now_seconds,
     logger_: logging.Logger | None = None,
-) -> bool:
-    """Atomically create or validate the verification job and due-index entry."""
+) -> bool | None:
+    """Atomically create or validate the verification job and due-index entry.
+
+    Returns ``None`` when the job key belongs to another task/generation.
+    """
     log = logger_ or logger
     generation = decision.generation
     if generation < 1:
@@ -634,7 +637,7 @@ def admit_completed_verification_job(
             result.resource_id,
             generation,
         )
-        return False
+        return None
     created_job = status == 1
     if created_job:
         _flag_event(redis, job_key, "admitted")
@@ -708,11 +711,62 @@ def apply_admission_conflict(
     )
 
 
+def quarantine_job_admission_mismatch(
+    redis: RedisClient,
+    repo: str,
+    result: TaskResult,
+    decision: AdmissionDecision,
+    *,
+    now: NowFn = now_seconds,
+    logger_: logging.Logger | None = None,
+) -> None:
+    """Quarantine an admitted result that cannot own its verification job key."""
+    log = logger_ or logger
+    generation = decision.generation
+    if generation < 1:
+        generation = 0
+    _quarantine_result(
+        redis,
+        result,
+        decision,
+        alert="verification_job_mismatch",
+        generation=generation,
+        now=now,
+    )
+    log.warning(
+        "Quarantined issue result for task %s after verification job mismatch "
+        "for %s#%d generation %d",
+        result.task_id,
+        repo,
+        result.resource_id,
+        generation,
+    )
+
+
 def _quarantine_conflict(
     redis: RedisClient,
     result: TaskResult,
     decision: AdmissionDecision,
     *,
+    now: NowFn,
+) -> None:
+    _quarantine_result(
+        redis,
+        result,
+        decision,
+        alert="quarantined_conflict",
+        generation=decision.generation,
+        now=now,
+    )
+
+
+def _quarantine_result(
+    redis: RedisClient,
+    result: TaskResult,
+    decision: AdmissionDecision,
+    *,
+    alert: str,
+    generation: int,
     now: NowFn,
 ) -> None:
     record = json.dumps(
@@ -723,7 +777,8 @@ def _quarantine_conflict(
             "existing_fingerprint": decision.existing_fingerprint,
             "existing_status": decision.status,
             "existing_route": decision.route,
-            "generation": decision.generation,
+            "generation": generation,
+            "reason": alert,
             "at": f"{now():.3f}",
         },
         separators=(",", ":"),
@@ -738,7 +793,7 @@ def _quarantine_conflict(
         result.task_id,
         result.repo or "",
         result.resource_id,
-        {"alert": "quarantined_conflict", "generation": decision.generation},
+        {"alert": alert, "generation": generation},
         event_key=f"quarantine:{result_fingerprint(result)}",
     )
 
@@ -952,6 +1007,12 @@ def _observe_and_transition(
         )
     if observation.ambiguous:
         _incr_metric_once(redis, job, "ambiguity", "ambiguity")
+        _emit_job_event(
+            redis,
+            job,
+            "ambiguous_handoff",
+            {"alert": "ambiguous_handoff", "selected_pr_number": extra["selected_pr_number"]},
+        )
     if observation.verified:
         if _transition_job(
             redis,
