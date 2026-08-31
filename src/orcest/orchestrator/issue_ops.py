@@ -16,7 +16,7 @@ from orcest.orchestrator.issue_deps import (
     open_blockers,
     parse_blocker_refs,
 )
-from orcest.shared.config import LabelConfig
+from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
 from orcest.shared.coordination import make_issue_lock_key, make_pending_task_key
 from orcest.shared.redis_client import RedisClient
 
@@ -36,6 +36,8 @@ class IssueAction(str, Enum):
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"
+    SKIP_DELIVERY_COOLDOWN = "skip_delivery_cooldown"
+    SKIP_VERIFYING = "skip_verifying"  # Durable delivery verification is in flight
     SKIP_DEPENDENCY = "skip_dependency"  # One or more prerequisite issues still open
 
 
@@ -112,6 +114,7 @@ def discover_actionable_issues(
     redis: RedisClient,
     label_config: LabelConfig,
     max_attempts: int = 3,
+    issue_delivery_verifier: IssueDeliveryVerifierConfig | None = None,
 ) -> list[IssueState]:
     """Discover issues labeled `orcest:ready` that need implementation.
 
@@ -120,14 +123,27 @@ def discover_actionable_issues(
     2. Skip if terminal orcest label present (blocked/needs-human)
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if usage-exhausted cooldown is active
-    5. Skip if max attempts reached
-    6. Skip if task already in flight (attempts > 0 with a pending marker)
-    7. Clear orphaned attempts (attempts > 0 without a pending marker)
-    8. Skip if task already pending in the queue
-    9. Skip if any GitHub-native blocked-by dependency is still open
-    10. Skip if any body-declared blocker issue is still open
-    11. Everything else -> ENQUEUE_IMPLEMENT
+    5. Skip if a nonterminal delivery-verification job holds the dispatch barrier
+       (logs a warning if issue_delivery_verifier.enabled is false, since the
+       barrier is then no longer being processed or cleared)
+    6. Skip if ineffective-delivery cooldown is active
+    7. Skip if max attempts reached (issue attempt hash or INEFFECTIVE
+       delivery-verification generations, whichever is larger)
+    8. Skip if task already in flight (attempts > 0 with a pending marker)
+    9. Clear orphaned attempts (attempts > 0 without a pending marker and
+       without INEFFECTIVE delivery history for this issue)
+    10. Skip if task already pending in the queue
+    11. Skip if any GitHub-native blocked-by dependency is still open
+    12. Skip if any body-declared blocker issue is still open
+    13. Everything else -> ENQUEUE_IMPLEMENT
     """
+    from orcest.orchestrator.issue_delivery import (
+        count_ineffective_delivery_generations,
+        has_delivery_retry_cooldown,
+        has_issue_dispatch_barrier,
+    )
+
+    verifier_config = issue_delivery_verifier or IssueDeliveryVerifierConfig()
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
 
@@ -189,11 +205,52 @@ def discover_actionable_issues(
             )
             continue
 
+        if has_issue_dispatch_barrier(redis, repo, number):
+            if not verifier_config.enabled:
+                logger.warning(
+                    "Issue #%d in %s has an in-flight delivery-verification dispatch "
+                    "barrier but issue_delivery_verifier.enabled is false, so it is not "
+                    "being processed or cleared; discovery stays blocked until the "
+                    "barrier is drained. See "
+                    "docs/operations/issue-delivery-verification-rollback.md.",
+                    number,
+                    repo,
+                )
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_VERIFYING,
+                    labels=issue_labels,
+                )
+            )
+            continue
+
+        if has_delivery_retry_cooldown(redis, repo, number):
+            results.append(
+                IssueState(
+                    number=number,
+                    title=title,
+                    body=body,
+                    action=IssueAction.SKIP_DELIVERY_COOLDOWN,
+                    labels=issue_labels,
+                )
+            )
+            continue
+
         # Attempts are retry budget, not proof of active work. If Redis has
-        # attempts but no pending marker, clear the orphaned budget before
-        # enforcing max attempts so GitHub-source-of-truth work cannot get stuck.
+        # attempts but no pending marker, that is usually a crash-orphan and
+        # we clear it so GitHub-source-of-truth work cannot get stuck.
+        # INEFFECTIVE delivery verification is not an orphan: admission
+        # clears the pending marker (and workers delete the attempts hash)
+        # long before the saga resolves, so those generations must keep
+        # counting toward max_attempts.
+        ineffective_generations = count_ineffective_delivery_generations(
+            redis, repo, number, limit=max_attempts
+        )
         attempt_count = get_attempt_count(redis, repo, number)
-        if attempt_count > 0 and not redis.exists(pending_key):
+        if attempt_count > 0 and not redis.exists(pending_key) and ineffective_generations == 0:
             logger.info(
                 "Issue #%d has %d attempt(s) but no pending task marker; "
                 "clearing orphaned attempts",
@@ -204,11 +261,12 @@ def discover_actionable_issues(
             attempt_count = 0
 
         # Skip if task already in flight or max attempts reached
-        if attempt_count >= max_attempts:
+        spent_attempts = max(attempt_count, ineffective_generations)
+        if spent_attempts >= max_attempts:
             logger.warning(
                 "Issue #%d has reached %d attempts (max %d), skipping",
                 number,
-                attempt_count,
+                spent_attempts,
                 max_attempts,
             )
             results.append(

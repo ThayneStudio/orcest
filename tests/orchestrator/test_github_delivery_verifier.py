@@ -6,8 +6,12 @@ import json
 
 from orcest.orchestrator.gh import GhCliError, GhRateLimitError
 from orcest.orchestrator.github_delivery_verifier import (
+    CandidatePullRequest,
+    ClosingIssueReference,
     DeliveryErrorKind,
     DeliveryFailureReason,
+    candidate_qualifies,
+    observe_issue_handoff,
     verify_issue_delivery,
 )
 
@@ -85,6 +89,34 @@ def _prs_payload(nodes: list[dict], *, has_next: bool = False, cursor: str | Non
                         "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
                         "nodes": nodes,
                     }
+                }
+            }
+        }
+    )
+
+
+def _pre_schema_timeline_payload(
+    nodes: list[dict],
+    *,
+    default_branch: str = "master",
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "nameWithOwner": REPO,
+                    "defaultBranchRef": {
+                        "name": default_branch,
+                        "target": {"oid": "b" * 40},
+                    },
+                    "issue": {
+                        "timelineItems": {
+                            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                            "nodes": nodes,
+                        }
+                    },
                 }
             }
         }
@@ -292,3 +324,114 @@ def test_shadow_fields_are_bounded_and_secret_free():
     assert TOKEN not in json.dumps(fields)
     assert fields["reason"] == DeliveryFailureReason.HEAD_OID_MISMATCH.value
     assert len(fields["message"]) <= 500
+
+
+def _candidate(**overrides: object) -> CandidatePullRequest:
+    fields = {
+        "number": 10,
+        "url": f"https://github.com/{REPO}/pull/10",
+        "state": "OPEN",
+        "is_draft": False,
+        "base_repository": REPO,
+        "base_ref_name": "master",
+        "head_repository": REPO,
+        "head_ref_name": BRANCH,
+        "head_oid": OID,
+        "closing_issues_references": (
+            ClosingIssueReference(
+                repository=REPO,
+                number=ISSUE,
+                url=f"https://github.com/{REPO}/issues/{ISSUE}",
+            ),
+        ),
+    }
+    fields.update(overrides)
+    return CandidatePullRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_candidate_qualifies_and_rejects_handoff_shapes():
+    kwargs = {
+        "repo": REPO,
+        "issue_number": ISSUE,
+        "expected_head_owner": "acme",
+        "expected_head_ref": BRANCH,
+        "default_branch": "master",
+        "live_head_oid": OID,
+    }
+    assert candidate_qualifies(_candidate(), **kwargs)
+    assert not candidate_qualifies(_candidate(state="CLOSED"), **kwargs)
+    assert not candidate_qualifies(_candidate(is_draft=True), **kwargs)
+    assert not candidate_qualifies(_candidate(base_repository="other/repo"), **kwargs)
+    assert not candidate_qualifies(_candidate(head_repository="fork/widgets"), **kwargs)
+    assert not candidate_qualifies(_candidate(head_ref_name="wrong-branch"), **kwargs)
+    assert not candidate_qualifies(_candidate(base_ref_name="develop"), **kwargs)
+    assert not candidate_qualifies(_candidate(head_oid=""), **kwargs)
+    assert not candidate_qualifies(_candidate(head_oid="c" * 40), **kwargs)
+    assert not candidate_qualifies(
+        _candidate(
+            closing_issues_references=(
+                ClosingIssueReference(repository=REPO, number=1, url="https://x"),
+            )
+        ),
+        **kwargs,
+    )
+
+
+def test_observe_selects_lowest_pr_and_treats_echo_as_diagnostic(mocker):
+    second = _pr_node(12)
+    first = _pr_node(7)
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[_repo_payload(), _prs_payload([second, first])],
+    )
+
+    result = observe_issue_handoff(
+        REPO,
+        ISSUE,
+        BRANCH,
+        TOKEN,
+        expected_head_owner="acme",
+        claimed_head_oid="d" * 40,
+        claimed_branch="other-branch",
+    )
+
+    assert result.verified is True
+    assert result.echo_mismatch is True
+    assert result.ambiguous is True
+    assert result.selected_pr is not None
+    assert result.selected_pr.number == 7
+    assert [pr.number for pr in result.qualifying_prs] == [7, 12]
+
+
+def test_observe_empty_expected_ref_is_complete_mismatch():
+    result = observe_issue_handoff(REPO, ISSUE, "", TOKEN)
+    assert result.verified is False
+    assert result.complete is True
+    assert result.reason == DeliveryFailureReason.HEAD_REF_NOT_FOUND
+
+
+def test_observe_does_not_require_claimed_oid(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[_repo_payload(), _prs_payload([_pr_node(3)])],
+    )
+    result = observe_issue_handoff(REPO, ISSUE, BRANCH, TOKEN, expected_head_owner="acme")
+    assert result.verified is True
+    assert result.echo_mismatch is False
+
+
+def test_pre_schema_transient_boundary_failure_is_retryable(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        side_effect=[
+            _pre_schema_timeline_payload([_pr_node(10)]),
+            GhCliError("failed", stderr="connection reset by peer"),
+        ],
+    )
+
+    result = observe_issue_handoff(REPO, ISSUE, "", TOKEN, pre_schema=True)
+
+    assert result.verified is False
+    assert result.error_kind == DeliveryErrorKind.TRANSPORT
+    assert result.reason == DeliveryFailureReason.GH_TRANSPORT_ERROR
+    assert result.complete is False

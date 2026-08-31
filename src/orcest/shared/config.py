@@ -106,14 +106,23 @@ class DeploymentConfig:
 
 @dataclass
 class IssueDeliveryVerifierConfig:
-    """Read-only GitHub issue delivery verification (post-completion check).
+    """Durable GitHub issue delivery verification (enforcing completion gate).
 
-    ``enabled: false`` is the rollback lever: it skips the verifier call and
-    its shadow-evidence recording entirely, reproducing pre-verifier behavior
-    on the completed-issue result path.
+    ``enabled: false`` restores the pre-gate completed-issue path (immediate
+    ``orcest:ready`` removal) only for newly consumed results. It does not
+    process or clear existing verification jobs and dispatch barriers, so
+    disable only after draining or quarantining in-flight delivery state; see
+    ``docs/operations/issue-delivery-verification-rollback.md``.
     """
 
     enabled: bool = True
+    grace_seconds: int = 60
+    backoff_initial_seconds: int = 10
+    backoff_max_seconds: int = 300
+    scheduler_batch_size: int = 20
+    oldest_pending_alert_seconds: int = 1800
+    page_cap: int = 50
+    ineffective_cooldown_seconds: int = 60
 
 
 @dataclass
@@ -856,14 +865,67 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             f"when health_check_url is set, got {deployment_config.health_check_timeout}"
         )
 
-    # Read-only GitHub issue delivery verifier
+    # Durable GitHub issue delivery verifier
     issue_delivery_verifier_raw = _safe_dict(raw, "issue_delivery_verifier")
+    _idv_defaults = IssueDeliveryVerifierConfig()
     issue_delivery_verifier_config = IssueDeliveryVerifierConfig(
         enabled=_safe_bool(
-            issue_delivery_verifier_raw.get("enabled", True),
+            issue_delivery_verifier_raw.get("enabled", _idv_defaults.enabled),
             "issue_delivery_verifier.enabled",
         ),
+        grace_seconds=_safe_int(
+            issue_delivery_verifier_raw.get("grace_seconds", _idv_defaults.grace_seconds),
+            "issue_delivery_verifier.grace_seconds",
+        ),
+        backoff_initial_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "backoff_initial_seconds", _idv_defaults.backoff_initial_seconds
+            ),
+            "issue_delivery_verifier.backoff_initial_seconds",
+        ),
+        backoff_max_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "backoff_max_seconds", _idv_defaults.backoff_max_seconds
+            ),
+            "issue_delivery_verifier.backoff_max_seconds",
+        ),
+        scheduler_batch_size=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "scheduler_batch_size", _idv_defaults.scheduler_batch_size
+            ),
+            "issue_delivery_verifier.scheduler_batch_size",
+        ),
+        oldest_pending_alert_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "oldest_pending_alert_seconds", _idv_defaults.oldest_pending_alert_seconds
+            ),
+            "issue_delivery_verifier.oldest_pending_alert_seconds",
+        ),
+        page_cap=_safe_int(
+            issue_delivery_verifier_raw.get("page_cap", _idv_defaults.page_cap),
+            "issue_delivery_verifier.page_cap",
+        ),
+        ineffective_cooldown_seconds=_safe_int(
+            issue_delivery_verifier_raw.get(
+                "ineffective_cooldown_seconds", _idv_defaults.ineffective_cooldown_seconds
+            ),
+            "issue_delivery_verifier.ineffective_cooldown_seconds",
+        ),
     )
+    if issue_delivery_verifier_config.grace_seconds < 0:
+        raise ValueError("issue_delivery_verifier.grace_seconds must be >= 0")
+    if issue_delivery_verifier_config.backoff_initial_seconds < 1:
+        raise ValueError("issue_delivery_verifier.backoff_initial_seconds must be >= 1")
+    if issue_delivery_verifier_config.backoff_max_seconds < 1:
+        raise ValueError("issue_delivery_verifier.backoff_max_seconds must be >= 1")
+    if issue_delivery_verifier_config.scheduler_batch_size < 1:
+        raise ValueError("issue_delivery_verifier.scheduler_batch_size must be >= 1")
+    if issue_delivery_verifier_config.oldest_pending_alert_seconds < 1:
+        raise ValueError("issue_delivery_verifier.oldest_pending_alert_seconds must be >= 1")
+    if issue_delivery_verifier_config.page_cap < 1:
+        raise ValueError("issue_delivery_verifier.page_cap must be >= 1")
+    if issue_delivery_verifier_config.ineffective_cooldown_seconds < 0:
+        raise ValueError("issue_delivery_verifier.ineffective_cooldown_seconds must be >= 0")
 
     # Seconds a pending check can be stuck before being re-triggered (default 2 hours)
     stale_pending_timeout_seconds = _safe_int(
