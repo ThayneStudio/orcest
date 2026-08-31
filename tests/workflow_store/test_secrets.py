@@ -192,6 +192,48 @@ def test_missing_integrity_meta_is_integrity_conflict_not_oserror(
         secret_store.read_value(secret_id, 1)
 
 
+def test_version_integrity_meta_missing_identity_fails_closed(
+    secret_store: SecretStore, layout: object
+) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    secret_id = _secret_id()
+    secret_store.put_version(secret_id, 1, SECRET)
+    meta_path = layout.secrets_root / secret_id / "integrity" / "1"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["secret_id"]
+    del meta["version"]
+    meta_path.write_text(json.dumps(meta, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+    meta_path.chmod(FILE_MODE)
+
+    with pytest.raises(IntegrityConflictError, match="integrity metadata is missing fields"):
+        secret_store.verify(secret_id, 1)
+    with pytest.raises(IntegrityConflictError, match="integrity metadata is missing fields"):
+        secret_store.read_value(secret_id, 1)
+
+
+def test_staging_integrity_meta_missing_identity_fails_closed(
+    secret_store: SecretStore, layout: object
+) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    staging = secret_store.stage(SECRET)
+    meta_path = layout.secrets_root / "incoming" / f"{staging.staging_id}.integrity"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["staging_id"]
+    meta_path.write_text(json.dumps(meta, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+    meta_path.chmod(FILE_MODE)
+
+    with pytest.raises(IntegrityConflictError, match="integrity metadata is missing fields"):
+        secret_store.promote_version(
+            staging_id=staging.staging_id,
+            secret_id=_secret_id(),
+            version=1,
+        )
+
+
 def test_value_without_meta_is_repaired_on_retry(secret_store: SecretStore, layout: object) -> None:
     from orcest.workflow_store.v1.fs import ControlLayout
 

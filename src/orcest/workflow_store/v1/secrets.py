@@ -22,6 +22,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from orcest.workflow_contract.v1.canonical import canonical_json_bytes, canonical_json_text
 from orcest.workflow_contract.v1.digest import (
@@ -254,7 +255,9 @@ class SecretStore:
             if not meta_path.is_file():
                 raise IntegrityConflictError("staged secret integrity metadata is missing")
             value = read_exact_file(staged_path, max_bytes=self._quota.max_object_bytes)
-            meta = _load_integrity_meta(meta_path, max_bytes=self._quota.max_object_bytes)
+            meta = _load_integrity_meta(
+                meta_path, max_bytes=self._quota.max_object_bytes, kind="staging"
+            )
             expected = secret_staging_attestation(
                 self._integrity_key, staging_id=staging_id, secret_bytes=value
             )
@@ -265,6 +268,8 @@ class SecretStore:
                 raise IntegrityConflictError("staged secret integrity attestation mismatch")
             if _require_int(meta["byte_length"], field="byte_length") != len(value):
                 raise IntegrityConflictError("staged secret length mismatch")
+            if str(meta["staging_id"]) != staging_id:
+                raise IntegrityConflictError("staged secret identity mismatch")
             handle = self._install_version_locked(
                 secret_id=secret_id,
                 version=version,
@@ -305,7 +310,9 @@ class SecretStore:
         if not meta_dest.is_file():
             raise IntegrityConflictError("secret version integrity metadata is missing")
         value = read_exact_file(dest, max_bytes=self._quota.max_object_bytes)
-        meta = _load_integrity_meta(meta_dest, max_bytes=self._quota.max_object_bytes)
+        meta = _load_integrity_meta(
+            meta_dest, max_bytes=self._quota.max_object_bytes, kind="version"
+        )
         expected = secret_version_integrity_tag(
             self._integrity_key, secret_id=secret_id, version=version, secret_bytes=value
         )
@@ -392,7 +399,9 @@ class SecretStore:
         # dest is the completeness marker: make meta durable first so a crash
         # cannot leave a value that verify()/retry cannot read.
         if meta_dest.is_file():
-            existing_meta = _load_integrity_meta(meta_dest, max_bytes=self._quota.max_object_bytes)
+            existing_meta = _load_integrity_meta(
+                meta_dest, max_bytes=self._quota.max_object_bytes, kind="version"
+            )
             tag = existing_meta.get("authenticator")
             if not isinstance(tag, str) or not hmac.compare_digest(authenticator, tag):
                 raise IntegrityConflictError(
@@ -440,7 +449,9 @@ class SecretStore:
         return trusted_join(self._root, secret_id, "integrity", str(version))
 
 
-def _load_integrity_meta(path: Path, *, max_bytes: int) -> dict[str, object]:
+def _load_integrity_meta(
+    path: Path, *, max_bytes: int, kind: Literal["staging", "version"]
+) -> dict[str, object]:
     if not path.is_file():
         raise IntegrityConflictError("integrity metadata is missing")
     raw = read_exact_file(path, max_bytes=max_bytes)
@@ -453,19 +464,15 @@ def _load_integrity_meta(path: Path, *, max_bytes: int) -> dict[str, object]:
         raise IntegrityConflictError("integrity metadata is not JSON") from exc
     if not isinstance(parsed, dict):
         raise IntegrityConflictError("integrity metadata is not an object")
-    allowed = {
-        "secret_id",
-        "version",
-        "byte_length",
-        "attestation_id",
-        "authenticator",
-        "staging_id",
+    allowed_by_kind = {
+        "staging": {"staging_id", "byte_length", "attestation_id", "authenticator"},
+        "version": {"secret_id", "version", "byte_length", "attestation_id", "authenticator"},
     }
+    allowed = allowed_by_kind[kind]
     extra = set(parsed) - allowed
     if extra:
         raise IntegrityConflictError("integrity metadata has unknown fields")
-    required_common = {"byte_length", "attestation_id", "authenticator"}
-    if not required_common.issubset(parsed):
+    if not allowed.issubset(parsed):
         raise IntegrityConflictError("integrity metadata is missing fields")
     # Re-canonicalize so a future reader can compare exact bytes if needed.
     canonical_json_text(parsed)
