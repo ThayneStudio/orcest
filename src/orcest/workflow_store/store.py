@@ -27,10 +27,11 @@ from orcest.workflow_contract.v1.digest import (
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
+PRIOR_STATE_NONE = "NONE"
 
 _FORBIDDEN_STATE_FS = {
     "9p",
@@ -92,6 +93,20 @@ class MaintenanceMode:
     dispatch_enabled: bool = False
     receipt_acceptance_enabled: bool = False
     publication_enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecord:
+    run_id: str
+    project_id: str
+    work_item_key: str
+    specification_generation: int
+    state: str
+    terminal_outcome: str | None
+    reducer_version: str
+    current_revision: int
+    created_at_ms: int
+    updated_at_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +227,21 @@ def _response_digest_preimage(value: Any) -> Any:
     stripped = dict(value)
     stripped.pop("replayed")
     return stripped
+
+
+def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    return RunRecord(
+        run_id=row["run_id"],
+        project_id=row["project_id"],
+        work_item_key=row["work_item_key"],
+        specification_generation=row["specification_generation"],
+        state=row["state"],
+        terminal_outcome=row["terminal_outcome"],
+        reducer_version=row["reducer_version"],
+        current_revision=row["current_revision"],
+        created_at_ms=row["created_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
+    )
 
 
 def _row_to_transition(row: sqlite3.Row) -> Transition:
@@ -460,7 +490,7 @@ CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
   work_item_key TEXT NOT NULL,
-  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
   state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("run.state"))})),
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
@@ -478,7 +508,10 @@ CREATE TABLE IF NOT EXISTS transitions (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
   transition_sequence INTEGER NOT NULL CHECK (transition_sequence > 0),
   transition_id TEXT NOT NULL UNIQUE,
-  prior_state TEXT NOT NULL CHECK (prior_state IN ({_sql_in(_enum_values("run.state"))})),
+  prior_state TEXT NOT NULL CHECK (
+    prior_state = '{PRIOR_STATE_NONE}'
+    OR prior_state IN ({_sql_in(_enum_values("run.state"))})
+  ),
   trigger_kind TEXT NOT NULL CHECK (
     trigger_kind IN ({_sql_in(_enum_values("transition.trigger_kind"))})
   ),
@@ -487,7 +520,7 @@ CREATE TABLE IF NOT EXISTS transitions (
   next_state TEXT NOT NULL CHECK (next_state IN ({_sql_in(_enum_values("run.state"))})),
   reducer_version TEXT NOT NULL,
   input_digest TEXT NOT NULL,
-  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
   created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
   PRIMARY KEY (run_id, transition_sequence),
   UNIQUE (run_id, trigger_kind, trigger_id)
@@ -592,6 +625,54 @@ CREATE TABLE IF NOT EXISTS durable_operations (
   committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms >= 0),
   UNIQUE (principal_id, idempotency_key)
 );
+"""
+
+_V1_TO_V2 = f"""
+PRAGMA foreign_keys=OFF;
+CREATE TABLE runs_v2 (
+  run_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  work_item_key TEXT NOT NULL,
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
+  state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("run.state"))})),
+  terminal_outcome TEXT CHECK (
+    terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
+  ),
+  reducer_version TEXT NOT NULL,
+  current_revision INTEGER NOT NULL DEFAULT 0 CHECK (current_revision >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
+);
+INSERT INTO runs_v2 SELECT * FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v2 RENAME TO runs;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_work_item
+ON runs(project_id, work_item_key) WHERE terminal_outcome IS NULL;
+CREATE TABLE transitions_v2 (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  transition_sequence INTEGER NOT NULL CHECK (transition_sequence > 0),
+  transition_id TEXT NOT NULL UNIQUE,
+  prior_state TEXT NOT NULL CHECK (
+    prior_state = '{PRIOR_STATE_NONE}'
+    OR prior_state IN ({_sql_in(_enum_values("run.state"))})
+  ),
+  trigger_kind TEXT NOT NULL CHECK (
+    trigger_kind IN ({_sql_in(_enum_values("transition.trigger_kind"))})
+  ),
+  trigger_id TEXT NOT NULL,
+  admit_base_observation_id TEXT,
+  next_state TEXT NOT NULL CHECK (next_state IN ({_sql_in(_enum_values("run.state"))})),
+  reducer_version TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  PRIMARY KEY (run_id, transition_sequence),
+  UNIQUE (run_id, trigger_kind, trigger_id)
+);
+INSERT INTO transitions_v2 SELECT * FROM transitions;
+DROP TABLE transitions;
+ALTER TABLE transitions_v2 RENAME TO transitions;
+PRAGMA foreign_keys=ON;
 """
 
 
@@ -725,24 +806,37 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
+        if current not in {0, 1}:
+            raise SchemaVersionError(
+                f"unsupported workflow.db schema version {current}; "
+                f"supported version is {SCHEMA_VERSION}"
+            )
         # Connection.executescript() issues COMMIT first whenever a transaction
         # is already open (sqlite3 documented behavior, independent of
         # isolation_level). BEGIN EXCLUSIVE therefore has to live inside the
         # script so DDL, seed rows, and the user_version bump share one txn.
         try:
-            self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
-                "VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, "workflow-control-v1-base-store", _now_ms()),
-            )
-            self.conn.execute(
-                "INSERT OR IGNORE INTO controller_mode"
-                "(controller_id, mode_revision, mode, dispatch_paused_intake_policy, "
-                "maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy, "
-                "last_operation_id) VALUES (?, 0, NULL, NULL, NULL, NULL, NULL)",
-                (CONTROLLER_ID,),
-            )
+            if current == 0:
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (SCHEMA_VERSION, "workflow-control-v1-base-store", _now_ms()),
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO controller_mode"
+                    "(controller_id, mode_revision, mode, dispatch_paused_intake_policy, "
+                    "maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy, "
+                    "last_operation_id) VALUES (?, 0, NULL, NULL, NULL, NULL, NULL)",
+                    (CONTROLLER_ID,),
+                )
+            else:
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V1_TO_V2)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (SCHEMA_VERSION, "workflow-control-v1-reducer-ledger", _now_ms()),
+                )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
         except Exception:
@@ -839,6 +933,8 @@ class RunStore:
         require_lowercase_uuid(run_id, field="run_id")
         if reducer_version not in self._supported_reducer_versions:
             raise ReducerVersionError(f"unsupported reducer version {reducer_version!r}")
+        if specification_generation < 0:
+            raise ValueError("specification_generation must be nonnegative")
         enums.parse_enum("run.state", state)
         existing = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if existing is not None:
@@ -889,7 +985,8 @@ class RunStore:
     ) -> Transition:
         require_lowercase_uuid(run_id, field="run_id")
         require_lowercase_uuid(transition_id, field="transition_id")
-        enums.parse_enum("run.state", prior_state)
+        if prior_state != PRIOR_STATE_NONE:
+            enums.parse_enum("run.state", prior_state)
         enums.parse_enum("transition.trigger_kind", trigger_kind)
         enums.parse_enum("run.state", next_state)
         _require_digest(input_digest, field="input_digest")
@@ -1282,3 +1379,54 @@ class RunStore:
         ).fetchone()
         assert row is not None
         return _row_to_operation(row)
+
+    def get_run(self, run_id: str) -> RunRecord | None:
+        row = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return None if row is None else _row_to_run(row)
+
+    def get_transition_by_trigger(
+        self, run_id: str, trigger_kind: str, trigger_id: str
+    ) -> Transition | None:
+        row = self.conn.execute(
+            "SELECT * FROM transitions WHERE run_id = ? AND trigger_kind = ? AND trigger_id = ?",
+            (run_id, trigger_kind, trigger_id),
+        ).fetchone()
+        return None if row is None else _row_to_transition(row)
+
+    def list_transitions(self, run_id: str) -> list[Transition]:
+        rows = self.conn.execute(
+            "SELECT * FROM transitions WHERE run_id = ? ORDER BY transition_sequence",
+            (run_id,),
+        ).fetchall()
+        return [_row_to_transition(row) for row in rows]
+
+    def set_terminal_outcome(self, run_id: str, terminal_outcome: str) -> None:
+        enums.parse_enum("run.terminal_outcome", terminal_outcome)
+        now = _now_ms()
+        cur = self.conn.execute(
+            "UPDATE runs SET terminal_outcome = ?, updated_at_ms = ? WHERE run_id = ?",
+            (terminal_outcome, now, run_id),
+        )
+        if cur.rowcount != 1:
+            raise RunStoreError(f"run {run_id!r} was not updated")
+
+    def get_revisioned_object(
+        self, object_kind: str, object_id: str
+    ) -> tuple[int, str, str] | None:
+        row = self.conn.execute(
+            "SELECT revision, payload_digest, payload_json FROM revisioned_objects "
+            "WHERE object_kind = ? AND object_id = ?",
+            (object_kind, object_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["revision"]), str(row["payload_digest"]), str(row["payload_json"])
+
+    def get_source_unique_record(
+        self, source_kind: str, source_id: str
+    ) -> SourceUniqueRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM source_unique_records WHERE source_kind = ? AND source_id = ?",
+            (source_kind, source_id),
+        ).fetchone()
+        return None if row is None else _row_to_source_record(row)
