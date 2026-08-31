@@ -56,7 +56,19 @@ def _missing_remote_ref(stderr: str) -> bool:
 
 
 def _transient_fetch_error(stderr: str) -> bool:
+    """Return True when git fetch failed for a retryable connectivity reason.
+
+    Git wraps every origin HTTP failure as ``unable to access``, including
+    permanently revoked or under-scoped tokens (``returned error: 403``).
+    Those must stay non-transient: the worker retries transient
+    WorkspaceErrors without burning an attempt slot, matching ``clone()``
+    which only marks the timeout path retryable.
+    """
     text = stderr.lower()
+    # HTTP 4xx (401/403/404/...) is a client/auth failure, not a blip.
+    # "error: 4" matches git/libcurl's "returned error: 403" wording.
+    if "error: 4" in text:
+        return False
     return any(
         token in text
         for token in (

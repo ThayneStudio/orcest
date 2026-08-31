@@ -249,6 +249,75 @@ def test_resume_rejects_unexpected_ref(mocker, tmp_path):
     mock_run.assert_not_called()
 
 
+def _resume_fetch_error(mocker, tmp_path, stderr: str) -> WorkspaceError:
+    def _run(args, **_kwargs):
+        if "fetch" in args:
+            raise subprocess.CalledProcessError(returncode=128, cmd=args, stderr=stderr)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    mocker.patch("orcest.worker.workspace.subprocess.run", side_effect=_run)
+    ws = Workspace(str(tmp_path))
+    ws.setup(REPO, None, TOKEN)
+    with pytest.raises(WorkspaceError) as exc_info:
+        ws.resume_expected_ref(REPO, "acme", "issue-660-work")
+    return exc_info.value
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "The requested URL returned error: 403"
+        ),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "The requested URL returned error: 401"
+        ),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "The requested URL returned error: 404"
+        ),
+    ],
+)
+def test_resume_http_4xx_is_not_transient(mocker, tmp_path, stderr):
+    """Auth/client HTTP failures wrapped as 'unable to access' are permanent."""
+    error = _resume_fetch_error(mocker, tmp_path, stderr)
+    assert "git fetch failed" in str(error)
+    assert error.transient is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "Could not resolve host: github.com"
+        ),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "Recv failure: Connection reset by peer"
+        ),
+        ("fatal: unable to access 'https://github.com/acme/widgets.git/': SSL connection timeout"),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "Failed to connect to github.com port 443: Connection timed out"
+        ),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "The requested URL returned error: 502"
+        ),
+    ],
+)
+def test_resume_connectivity_failure_is_transient(mocker, tmp_path, stderr):
+    """DNS/TLS/5xx fetch failures remain retryable connectivity errors."""
+    error = _resume_fetch_error(mocker, tmp_path, stderr)
+    assert "git fetch failed" in str(error)
+    assert error.transient is True
+
+
 @pytest.mark.unit
 def test_cleanup_removes_directory(tmp_path):
     """cleanup() removes the workspace temp directory."""
