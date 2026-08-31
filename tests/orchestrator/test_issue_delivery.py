@@ -25,6 +25,7 @@ from orcest.orchestrator.issue_delivery import (
     admit_completed_verification_job,
     admit_issue_result,
     apply_admission_conflict,
+    count_ineffective_delivery_generations,
     delivery_state_blocks_old_orchestrator_rollback,
     gc_issue_delivery_state,
     get_admission,
@@ -40,18 +41,23 @@ from orcest.orchestrator.issue_delivery import (
 )
 from orcest.orchestrator.issue_ops import (
     IssueAction,
+    clear_attempts,
     discover_actionable_issues,
+    get_attempt_count,
     increment_attempts,
 )
 from orcest.orchestrator.issue_publication import (
     make_issue_admission_key,
+    make_issue_delivery_cooldown_key,
     make_issue_dispatch_barrier_key,
+    make_issue_generation_key,
     make_issue_result_ref_key,
     make_issue_retry_record_key,
     make_issue_verification_job_key,
     reserve_issue_publication,
 )
 from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
+from orcest.shared.coordination import make_pending_task_key
 from orcest.shared.events import EVENTS_STREAM
 from orcest.shared.models import ResultStatus, TaskResult
 from orcest.shared.redis_client import RedisClient
@@ -467,6 +473,73 @@ def test_grace_expiry_becomes_ineffective(fake_redis_client):
     assert retry_record["cooldown_until"] == f"{now + 20:.3f}"
     assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, job_member(REPO, ISSUE, 1)) == now
     assert not has_issue_dispatch_barrier(fake_redis_client, REPO, ISSUE)
+
+
+def _observe_no_handoff(*_args: object, **_kwargs: object) -> HandoffObservation:
+    return _observation(
+        verified=False,
+        kind=DeliveryErrorKind.MISMATCH,
+        reason=DeliveryFailureReason.NO_CANDIDATE_PR,
+        selected_number=None,
+    )
+
+
+def test_count_ineffective_delivery_generations_walks_prior_gens(fake_redis_client):
+    fake_redis_client.set_value(make_issue_generation_key(REPO, ISSUE), "4")
+    for gen in (1, 3):
+        fake_redis_client.hset_mapping(
+            make_issue_retry_record_key(REPO, ISSUE, gen),
+            {"reason": "ineffective_delivery", "generation": str(gen)},
+        )
+    assert count_ineffective_delivery_generations(fake_redis_client, REPO, ISSUE) == 2
+    assert count_ineffective_delivery_generations(fake_redis_client, REPO, ISSUE, limit=1) == 1
+
+
+def test_ineffective_loop_exhausts_max_attempts_after_pending_and_attempts_cleared(
+    fake_redis_client, label_config, mocker
+):
+    """COMPLETED without a qualifying PR cannot refresh max_attempts every generation.
+
+    Admission clears the pending marker, and workers delete the issue attempts
+    hash on terminal cleanup. After INEFFECTIVE + cooldown, discovery must still
+    count those generations against the retry budget.
+    """
+    mocker.patch(
+        "orcest.orchestrator.gh.list_labeled_issues",
+        return_value=[
+            {
+                "number": ISSUE,
+                "title": "x",
+                "body": "",
+                "labels": [{"name": "orcest:ready"}],
+            }
+        ],
+    )
+    for i in range(3):
+        _admit_completed(fake_redis_client, _result(task_id=f"task-ineffective-{i}"))
+        fake_redis_client.delete(make_pending_task_key(REPO, "issue", ISSUE))
+        clear_attempts(fake_redis_client, REPO, ISSUE)
+        process_due_verification_jobs(
+            fake_redis_client,
+            REPO,
+            TOKEN,
+            LabelConfig(),
+            _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+            stream_redis=fake_redis_client,
+            now=lambda: 2_000.0 + i,
+            observe=_observe_no_handoff,
+        )
+        fake_redis_client.delete(make_issue_delivery_cooldown_key(REPO, ISSUE))
+        process_due_delivery_state_gc(fake_redis_client, REPO, now=lambda: 3_000.0 + i)
+        actions = discover_actionable_issues(
+            REPO, TOKEN, fake_redis_client, label_config, max_attempts=3
+        )
+        assert get_attempt_count(fake_redis_client, REPO, ISSUE) == 0
+        if i < 2:
+            assert actions[0].action is IssueAction.ENQUEUE_IMPLEMENT
+        else:
+            assert actions[0].action is IssueAction.SKIP_MAX_ATTEMPTS
+    assert count_ineffective_delivery_generations(fake_redis_client, REPO, ISSUE) == 3
 
 
 def test_transport_backoff_and_auth_unverifiable(fake_redis_client):

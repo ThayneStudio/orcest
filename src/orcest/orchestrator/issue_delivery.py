@@ -374,6 +374,37 @@ def has_delivery_retry_cooldown(
     return cooldown_until > now()
 
 
+def count_ineffective_delivery_generations(
+    redis: RedisClient,
+    repo: str,
+    issue_number: int,
+    *,
+    limit: int | None = None,
+) -> int:
+    """Count INEFFECTIVE verification generations that still have retry records.
+
+    Each COMPLETED admission clears the pending-task marker long before the
+    saga resolves, and workers delete the issue attempts hash on terminal
+    cleanup. Discovery therefore cannot treat a missing pending marker as
+    "orphaned budget" when an INEFFECTIVE generation exists -- that is how
+    a provider that always reports COMPLETED without a qualifying PR would
+    reset ``max_attempts`` every cooldown. Retry records have no TTL and
+    are the durable generation history for this budget.
+    """
+    generation = get_issue_generation(redis, repo, issue_number)
+    if generation < 1:
+        return 0
+    start = generation
+    stop = max(1, generation - _GENERATION_WALK_CAP + 1)
+    count = 0
+    for gen in range(start, stop - 1, -1):
+        if redis.exists(make_issue_retry_record_key(repo, issue_number, gen)):
+            count += 1
+            if limit is not None and count >= limit:
+                return count
+    return count
+
+
 def get_admission(redis: RedisClient, task_id: str) -> IssueResultAdmission | None:
     data = redis.hgetall(make_issue_admission_key(task_id))
     if not data or not data.get("fingerprint"):

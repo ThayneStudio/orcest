@@ -318,6 +318,99 @@ def test_orphaned_active_issue_clears_attempts_and_enqueues(
     assert get_attempt_count(fake_redis_client, REPO, 14) == 0
 
 
+def _seed_ineffective_generations(redis, issue_number: int, generations: int) -> None:
+    """Record durable INEFFECTIVE retry history without a live pending marker."""
+    from orcest.orchestrator.issue_publication import (
+        make_issue_generation_key,
+        make_issue_retry_record_key,
+    )
+
+    redis.set_value(make_issue_generation_key(REPO, issue_number), str(generations))
+    for gen in range(1, generations + 1):
+        redis.hset_mapping(
+            make_issue_retry_record_key(REPO, issue_number, gen),
+            {
+                "reason": "ineffective_delivery",
+                "generation": str(gen),
+                "task_id": f"task-{gen}",
+                "cooldown_until": "0",
+                "created_at": "0",
+            },
+        )
+
+
+def test_ineffective_history_preserves_attempt_budget(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """INEFFECTIVE history is not an orphaned counter; keep the attempt budget."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=16, labels=[]),
+    ]
+    increment_attempts(fake_redis_client, REPO, 16)
+    increment_attempts(fake_redis_client, REPO, 16)
+    _seed_ineffective_generations(fake_redis_client, 16, generations=1)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert get_attempt_count(fake_redis_client, REPO, 16) == 2
+
+
+def test_prior_generation_ineffective_history_preserves_attempts(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """Retry records on older generations still prevent an attempt-budget reset."""
+    from orcest.orchestrator.issue_publication import make_issue_generation_key
+
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=17, labels=[]),
+    ]
+    increment_attempts(fake_redis_client, REPO, 17)
+    _seed_ineffective_generations(fake_redis_client, 17, generations=1)
+    # A later reservation that crashed after incrementing generation.
+    fake_redis_client.set_value(make_issue_generation_key(REPO, 17), "2")
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert results[0].action == IssueAction.ENQUEUE_IMPLEMENT
+    assert get_attempt_count(fake_redis_client, REPO, 17) == 1
+
+
+def test_ineffective_generations_exhaust_max_attempts_without_attempt_hash(
+    issue_gh_mock, fake_redis_client, label_config
+):
+    """Worker/admission clearing the attempts hash must not refresh max_attempts."""
+    issue_gh_mock.return_value = [
+        _make_issue_data(number=18, labels=[]),
+    ]
+    _seed_ineffective_generations(fake_redis_client, 18, generations=3)
+
+    results = discover_actionable_issues(
+        repo=REPO,
+        token=TOKEN,
+        redis=fake_redis_client,
+        label_config=label_config,
+        max_attempts=3,
+    )
+
+    assert len(results) == 1
+    assert results[0].action == IssueAction.SKIP_MAX_ATTEMPTS
+    assert get_attempt_count(fake_redis_client, REPO, 18) == 0
+
+
 def test_issue_without_attempts_or_pending_task_still_enqueues(
     issue_gh_mock, fake_redis_client, label_config
 ):

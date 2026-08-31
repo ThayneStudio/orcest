@@ -127,15 +127,18 @@ def discover_actionable_issues(
        (logs a warning if issue_delivery_verifier.enabled is false, since the
        barrier is then no longer being processed or cleared)
     6. Skip if ineffective-delivery cooldown is active
-    7. Skip if max attempts reached
+    7. Skip if max attempts reached (issue attempt hash or INEFFECTIVE
+       delivery-verification generations, whichever is larger)
     8. Skip if task already in flight (attempts > 0 with a pending marker)
-    9. Clear orphaned attempts (attempts > 0 without a pending marker)
+    9. Clear orphaned attempts (attempts > 0 without a pending marker and
+       without INEFFECTIVE delivery history for this issue)
     10. Skip if task already pending in the queue
     11. Skip if any GitHub-native blocked-by dependency is still open
     12. Skip if any body-declared blocker issue is still open
     13. Everything else -> ENQUEUE_IMPLEMENT
     """
     from orcest.orchestrator.issue_delivery import (
+        count_ineffective_delivery_generations,
         has_delivery_retry_cooldown,
         has_issue_dispatch_barrier,
     )
@@ -237,10 +240,17 @@ def discover_actionable_issues(
             continue
 
         # Attempts are retry budget, not proof of active work. If Redis has
-        # attempts but no pending marker, clear the orphaned budget before
-        # enforcing max attempts so GitHub-source-of-truth work cannot get stuck.
+        # attempts but no pending marker, that is usually a crash-orphan and
+        # we clear it so GitHub-source-of-truth work cannot get stuck.
+        # INEFFECTIVE delivery verification is not an orphan: admission
+        # clears the pending marker (and workers delete the attempts hash)
+        # long before the saga resolves, so those generations must keep
+        # counting toward max_attempts.
+        ineffective_generations = count_ineffective_delivery_generations(
+            redis, repo, number, limit=max_attempts
+        )
         attempt_count = get_attempt_count(redis, repo, number)
-        if attempt_count > 0 and not redis.exists(pending_key):
+        if attempt_count > 0 and not redis.exists(pending_key) and ineffective_generations == 0:
             logger.info(
                 "Issue #%d has %d attempt(s) but no pending task marker; "
                 "clearing orphaned attempts",
@@ -251,11 +261,12 @@ def discover_actionable_issues(
             attempt_count = 0
 
         # Skip if task already in flight or max attempts reached
-        if attempt_count >= max_attempts:
+        spent_attempts = max(attempt_count, ineffective_generations)
+        if spent_attempts >= max_attempts:
             logger.warning(
                 "Issue #%d has reached %d attempts (max %d), skipping",
                 number,
-                attempt_count,
+                spent_attempts,
                 max_attempts,
             )
             results.append(
