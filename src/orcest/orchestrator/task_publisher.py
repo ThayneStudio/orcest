@@ -1083,7 +1083,11 @@ def _render_issue_prompt(
         checkout_instruction = (
             f"2. Resume the authoritative same-repository ref `{branch_name}` "
             "by continuing on the checked-out expected branch. Do not create a "
-            "different branch and do not trust a provider-claimed name."
+            "different branch and do not trust a provider-claimed name. Run "
+            "`git branch --show-current` to confirm: if it reports the default "
+            f"branch instead of `{branch_name}` (the expected ref was deleted "
+            "after this task was queued), create it fresh instead: "
+            f"`git checkout -b {branch_name}`."
         )
     elif retry_context is not None:
         checkout_instruction = (
@@ -1113,7 +1117,10 @@ def _render_issue_prompt(
     if retry_context is not None and retry_context.remote_ref_exists:
         workspace_line = (
             "You start on the default branch. Resume only the authoritative "
-            f"same-repository expected ref `{branch_name}`."
+            f"same-repository expected ref `{branch_name}` if the worker was "
+            "able to check it out; if the ref was deleted after this task was "
+            "queued, you will still be on the default branch and should "
+            "create it fresh instead (see below)."
         )
     else:
         workspace_line = "You are on the default branch."

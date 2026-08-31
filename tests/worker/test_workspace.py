@@ -188,16 +188,20 @@ def test_resume_expected_ref_fetches_and_checks_out(mocker, tmp_path):
     ws = Workspace(str(tmp_path))
     ws.setup(REPO, None, TOKEN)
     mock_run.reset_mock()
-    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work") is True
+    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work", TOKEN) is True
     fetch_args = mock_run.call_args_list[0][0][0]
     assert fetch_args[:4] == ["git", "-C", str(ws.path), "fetch"]
     assert "origin" in fetch_args
     assert "refs/heads/issue-660-work:refs/remotes/origin/issue-660-work" in fetch_args
+    fetch_env = mock_run.call_args_list[0][1]["env"]
+    assert fetch_env["GITHUB_TOKEN"] == TOKEN
     checkout_args = mock_run.call_args_list[1][0][0]
     assert "checkout" in checkout_args
     assert "-B" in checkout_args
     assert "issue-660-work" in checkout_args
     assert "origin/issue-660-work" in checkout_args
+    checkout_env = mock_run.call_args_list[1][1]["env"]
+    assert checkout_env["GITHUB_TOKEN"] == TOKEN
 
 
 @pytest.mark.unit
@@ -215,7 +219,7 @@ def test_resume_expected_ref_missing_remote_stays_on_default(mocker, tmp_path):
     ws = Workspace(str(tmp_path))
     ws.setup(REPO, None, TOKEN)
     mock_run.reset_mock()
-    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work") is False
+    assert ws.resume_expected_ref(REPO, "acme", "issue-660-work", TOKEN) is False
     assert all("checkout" not in call[0][0] for call in mock_run.call_args_list)
 
 
@@ -229,7 +233,7 @@ def test_resume_rejects_unexpected_owner(mocker, tmp_path):
     ws.setup(REPO, None, TOKEN)
     mock_run.reset_mock()
     with pytest.raises(WorkspaceError, match="unexpected owner"):
-        ws.resume_expected_ref(REPO, "attacker", "issue-660-work")
+        ws.resume_expected_ref(REPO, "attacker", "issue-660-work", TOKEN)
     mock_run.assert_not_called()
 
 
@@ -243,9 +247,9 @@ def test_resume_rejects_unexpected_ref(mocker, tmp_path):
     ws.setup(REPO, None, TOKEN)
     mock_run.reset_mock()
     with pytest.raises(WorkspaceError, match="unexpected ref"):
-        ws.resume_expected_ref(REPO, "acme", "../etc/passwd")
+        ws.resume_expected_ref(REPO, "acme", "../etc/passwd", TOKEN)
     with pytest.raises(WorkspaceError, match="unexpected ref"):
-        ws.resume_expected_ref(REPO, "acme", "-sneaky")
+        ws.resume_expected_ref(REPO, "acme", "-sneaky", TOKEN)
     mock_run.assert_not_called()
 
 
@@ -259,7 +263,7 @@ def _resume_fetch_error(mocker, tmp_path, stderr: str) -> WorkspaceError:
     ws = Workspace(str(tmp_path))
     ws.setup(REPO, None, TOKEN)
     with pytest.raises(WorkspaceError) as exc_info:
-        ws.resume_expected_ref(REPO, "acme", "issue-660-work")
+        ws.resume_expected_ref(REPO, "acme", "issue-660-work", TOKEN)
     return exc_info.value
 
 
@@ -309,10 +313,14 @@ def test_resume_http_4xx_is_not_transient(mocker, tmp_path, stderr):
             "fatal: unable to access 'https://github.com/acme/widgets.git/': "
             "The requested URL returned error: 502"
         ),
+        (
+            "fatal: unable to access 'https://github.com/acme/widgets.git/': "
+            "The requested URL returned error: 429"
+        ),
     ],
 )
 def test_resume_connectivity_failure_is_transient(mocker, tmp_path, stderr):
-    """DNS/TLS/5xx fetch failures remain retryable connectivity errors."""
+    """DNS/TLS/5xx/429 fetch failures remain retryable connectivity errors."""
     error = _resume_fetch_error(mocker, tmp_path, stderr)
     assert "git fetch failed" in str(error)
     assert error.transient is True

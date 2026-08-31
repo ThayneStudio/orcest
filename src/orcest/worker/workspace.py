@@ -6,6 +6,7 @@ state leakage between tasks.
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -65,9 +66,10 @@ def _transient_fetch_error(stderr: str) -> bool:
     which only marks the timeout path retryable.
     """
     text = stderr.lower()
-    # HTTP 4xx (401/403/404/...) is a client/auth failure, not a blip.
-    # "error: 4" matches git/libcurl's "returned error: 403" wording.
-    if "error: 4" in text:
+    # HTTP 401/403/404 is a client/auth failure, not a blip. Matched as
+    # explicit codes (not a bare "error: 4" prefix) so 429 (rate-limited,
+    # retryable) doesn't get misclassified as permanent.
+    if any(f"error: {code}" in text for code in ("401", "403", "404")):
         return False
     return any(
         token in text
@@ -261,7 +263,9 @@ class Workspace:
             raise WorkspaceError("failed to read workspace HEAD SHA") from exc
         return result.stdout.strip()
 
-    def resume_expected_ref(self, repo: str, expected_owner: str, expected_ref: str) -> bool:
+    def resume_expected_ref(
+        self, repo: str, expected_owner: str, expected_ref: str, token: str
+    ) -> bool:
         """Fetch and check out *expected_ref* from a default-branch workspace.
 
         Only the authoritative same-repository owner/ref is resumed. An
@@ -269,11 +273,18 @@ class Workspace:
         remote ref returns False and leaves the default-branch checkout in
         place.
 
+        Args:
+            token: GitHub PAT for the fetch. ``setup()`` strips the clone
+                token out of ``.git/config``, so this call must supply its
+                own credential -- it does not inherit one from the daemon's
+                own environment.
+
         Returns:
             True when the expected ref was fetched and checked out.
         """
         repo_dir = self.path
         _assert_same_repo_expected_ref(repo, expected_owner, expected_ref)
+        env = {**os.environ, "GITHUB_TOKEN": token}
         fetch_spec = f"refs/heads/{expected_ref}:refs/remotes/origin/{expected_ref}"
         try:
             subprocess.run(
@@ -290,6 +301,7 @@ class Workspace:
                 capture_output=True,
                 text=True,
                 timeout=_FETCH_TIMEOUT_SECONDS,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise WorkspaceError(
@@ -326,6 +338,7 @@ class Workspace:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=env,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             detail = ""

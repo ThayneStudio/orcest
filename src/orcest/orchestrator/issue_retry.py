@@ -466,6 +466,10 @@ def render_issue_retry_prompt_section(context: IssueRetryContext) -> str:
             [
                 "An authoritative same-repository remote ref exists. Continue on",
                 f"`{context.expected_ref}` and do not create a different branch.",
+                "If the ref was deleted after this record was stored and the",
+                "workspace is still on the default branch, create",
+                f"`{context.expected_ref}` fresh instead of trusting a previous",
+                "provider-claimed branch name.",
             ]
         )
         if context.pr_number is not None:

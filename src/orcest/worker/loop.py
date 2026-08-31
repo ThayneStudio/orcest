@@ -2460,7 +2460,9 @@ def _execute_task(
         work_dir = workspace.setup(task.repo, task.branch, task.token)
         if task.resource_type == "issue" and task.expected_branch and task.branch is None:
             owner, _sep, _name = task.repo.partition("/")
-            resumed = workspace.resume_expected_ref(task.repo, owner, task.expected_branch)
+            resumed = workspace.resume_expected_ref(
+                task.repo, owner, task.expected_branch, task.token
+            )
             if resumed:
                 logger.info(
                     "Resumed expected ref %s for issue task %s",

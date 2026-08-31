@@ -223,11 +223,14 @@ def test_prompt_resumes_expected_branch_and_partial_pr():
     inner = prompt.split("```json", 1)[1].split("```", 1)[0].strip()
     parsed = json.loads(inner)
     assert parsed == ctx.to_canonical_dict()
-    assert f"git checkout -b {REF}" not in prompt
     assert f"Resume the authoritative same-repository ref `{REF}`" in prompt
     assert ctx.pr_url in prompt
     assert "Do not open another PR" in prompt
     assert "provider-claimed" in prompt
+    # Fallback instruction covers the expected ref having been deleted
+    # after the retry record was stored but before this task dispatched.
+    assert f"git checkout -b {REF}" in prompt
+    assert "git branch --show-current" in prompt
 
 
 def test_prompt_creates_snapshotted_branch_when_remote_missing():
@@ -255,6 +258,15 @@ def test_render_section_does_not_trust_provider_claims_without_remote():
     assert REF in section
 
 
+def test_render_section_covers_ref_deleted_after_storage():
+    section = render_issue_retry_prompt_section(_context())
+    assert "An authoritative same-repository remote ref exists" in section
+    assert "do not create a different branch" in section
+    assert "If the ref was deleted after this record was stored" in section
+    assert "fresh instead of trusting a previous" in section
+    assert REF in section
+
+
 def test_publish_issue_task_embeds_retry_context(fake_redis_client: RedisClient):
     _seed_generation(fake_redis_client, 1)
     ctx = _context()
@@ -278,5 +290,4 @@ def test_publish_issue_task_embeds_retry_context(fake_redis_client: RedisClient)
     assert task.branch is None
     assert "```json" in task.prompt
     assert ctx.pr_url in task.prompt
-    assert f"git checkout -b {REF}" not in task.prompt
     assert "Resume the authoritative same-repository ref" in task.prompt
