@@ -135,6 +135,25 @@ def test_generation_install_does_not_plan_work() -> None:
     assert reduction.pending_continuation.kind == "INTERNAL"
 
 
+def test_head_advanced_forge_observation_advances_to_pr_remediating() -> None:
+    view = default_view("PR_MONITORING", "FORGE_OBSERVATION")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="FORGE_OBSERVATION",
+            trigger_id="obs-head-1",
+            facts={"kind": "CHANGE_REQUEST_HEAD", "head_advanced": True},
+        ),
+    )
+    assert reduction.kind is ReductionKind.ADVANCE
+    assert reduction.next_state == "PR_REMEDIATING"
+    assert reduction.reason_code == "HEAD_ADVANCED"
+    assert reduction.same_state is False
+    assert reduction.emits_semantic_work is True
+    assert any(activity.kind == "IMPORT" for activity in reduction.planned_activities)
+    assert reduction.consume_forge_observation_ids == ("obs-head-1",)
+
+
 def test_stale_health_fanout_does_not_change_state() -> None:
     view = default_view("BUILDING", "HEALTH_OBSERVATION")
     reduction = reduce(

@@ -880,7 +880,7 @@ def _handle_forge_observation(view: RunView, trigger: Trigger) -> Reduction | No
         return _reduction(
             view,
             trigger,
-            kind=ReductionKind.SUPERSEDED,
+            kind=ReductionKind.ADVANCE,
             next_state="PR_REMEDIATING",
             reason_code="HEAD_ADVANCED",
             plan="IMPORT",
