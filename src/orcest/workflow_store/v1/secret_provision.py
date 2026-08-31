@@ -89,7 +89,16 @@ def provision_or_adopt_secret(
         # identity conflict): the staged bytes never became a live reference.
         secret_store.quarantine_staging(staging.staging_id)
         return accepted
-    return _install(run_store, secret_store, accepted, staging_id=staging.staging_id)
+    winning_staging_id = accepted.secret_store_staging_receipt_id
+    assert winning_staging_id is not None
+    if winning_staging_id != staging.staging_id:
+        # Another caller's begin_secret_provision_operation() won the race for
+        # this operation id: our own staging never became the referenced one
+        # and must not be handed to _install, or a genuine-bytes-mismatch
+        # replay would silently install this call's bytes instead of raising
+        # SecretProvisionReplayConflictError.
+        secret_store.quarantine_staging(staging.staging_id)
+    return _install(run_store, secret_store, accepted, staging_id=winning_staging_id)
 
 
 def reconcile_pending_secret_provision_operation(
