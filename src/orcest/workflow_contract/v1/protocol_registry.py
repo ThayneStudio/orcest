@@ -32,7 +32,17 @@ from orcest.workflow_contract.v1.digest import is_valid_content_digest
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid
 from orcest.workflow_contract.v1.protocol import Field, ProtocolValidationError, register_envelope
 
-__all__: list[str] = []
+CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
+CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
+CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
+CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
+
+__all__ = [
+    "CAPABILITY_KEY_OPERATION_PROTOCOL",
+    "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
+    "CONTROLLER_MODE_OPERATION_PROTOCOL",
+    "CONTROLLER_MODE_RESULT_PROTOCOL",
+]
 
 
 def _is_bool(value: Any) -> None:
@@ -121,7 +131,7 @@ def _controller_mode_result_invariant(value: Mapping[str, Any]) -> None:
 
 
 register_envelope(
-    "orcest.controller-mode-result/1",
+    CONTROLLER_MODE_RESULT_PROTOCOL,
     {
         "controller_mode_operation_id": Field(validator=_is_uuid),
         "operation_kind": Field(enum=_enum_values(enums.ControllerModeOperationKind)),
@@ -140,7 +150,7 @@ register_envelope(
     },
     object_validator=_controller_mode_result_invariant,
 )
-register_envelope("orcest.controller-mode-operation/1", {})
+register_envelope(CONTROLLER_MODE_OPERATION_PROTOCOL, {})
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +178,7 @@ def _capability_key_result_invariant(value: Mapping[str, Any]) -> None:
 
 
 register_envelope(
-    "orcest.capability-key-operation-result/1",
+    CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     {
         "capability_key_operation_id": Field(validator=_is_uuid),
         "kind": Field(enum=_enum_values(enums.CapabilityKeyOperationKind)),
@@ -184,7 +194,7 @@ register_envelope(
     },
     object_validator=_capability_key_result_invariant,
 )
-register_envelope("orcest.capability-key-operation/1", {})
+register_envelope(CAPABILITY_KEY_OPERATION_PROTOCOL, {})
 
 
 # ---------------------------------------------------------------------------
