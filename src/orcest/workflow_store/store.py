@@ -2817,7 +2817,10 @@ class RunStore:
                 and provider_account_ref is None
             )
         if owner_scope_kind == "PROJECT":
-            return purpose in ("FORGE_API", "SOURCE_READ", "PUBLICATION")
+            return (
+                purpose in ("FORGE_API", "SOURCE_READ", "PUBLICATION")
+                and provider_account_ref is None
+            )
         return False
 
     def _validate_secret_provision_operation(

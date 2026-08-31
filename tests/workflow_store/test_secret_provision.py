@@ -282,6 +282,42 @@ def test_owner_purpose_matrix_violation_is_integrity_conflict(
     assert result.response_http_status == 409
 
 
+def test_project_scope_requires_no_provider_account_ref(
+    run_store: RunStore, secret_store: SecretStore
+) -> None:
+    _select_capability_key(run_store)
+    secret_id = str(uuid.uuid4())
+
+    result = _provision(
+        run_store,
+        secret_store,
+        operation_id=str(uuid.uuid4()),
+        secret_id=secret_id,
+        secret_bytes=b"project-scope",
+        owner_scope_kind="PROJECT",
+        owner_scope_id="project-1",
+        provider_account_ref="installation-1",
+    )
+    assert result.state == "REJECTED"
+    assert result.rejection_code == "INTEGRITY_CONFLICT"
+
+    accepted = _provision(
+        run_store,
+        secret_store,
+        operation_id=str(uuid.uuid4()),
+        secret_id=secret_id,
+        secret_bytes=b"project-scope",
+        owner_scope_kind="PROJECT",
+        owner_scope_id="project-1",
+        provider_account_ref=None,
+    )
+    assert accepted.state == "COMPLETED"
+    current = run_store.get_secret_current_version(secret_id)
+    assert current is not None
+    assert current.owner_scope_kind == "PROJECT"
+    assert current.provider_account_ref is None
+
+
 def test_rotation_cannot_relabel_purpose_or_owner(
     run_store: RunStore, secret_store: SecretStore
 ) -> None:
@@ -485,6 +521,8 @@ def test_integrity_conflict_when_installed_bytes_differ_at_same_target(
     assert rejected.rejection_code == "INTEGRITY_CONFLICT"
     assert rejected.response_http_status == 409
     assert secret_store.read_value(secret_id, 1) == b"already-here"
+    assert not (secret_store._incoming / staging.staging_id).exists()
+    assert not (secret_store._incoming / f"{staging.staging_id}.integrity").exists()
 
 
 def test_stage0_capability_signing_key_is_provisionable_before_any_active_key(

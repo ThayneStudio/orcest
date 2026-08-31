@@ -152,12 +152,14 @@ def _install(
             reference=_reference,
         )
     except ObjectNotFoundError as exc:
+        secret_store.quarantine_staging(staging_id)
         return run_store.fail_secret_provision_operation(
             secret_provision_operation_id=operation_id,
             rejection_code="STAGED_OBJECT_INVALID",
             failure_evidence_digest=_evidence_digest(operation_id, "STAGED_OBJECT_INVALID", exc),
         )
     except IntegrityConflictError as exc:
+        secret_store.quarantine_staging(staging_id)
         return run_store.fail_secret_provision_operation(
             secret_provision_operation_id=operation_id,
             rejection_code="INTEGRITY_CONFLICT",
