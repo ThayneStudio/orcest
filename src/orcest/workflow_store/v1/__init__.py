@@ -11,6 +11,11 @@ from orcest.workflow_store.v1.errors import (
     StorageLockError,
 )
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
+from orcest.workflow_store.v1.secret_provision import (
+    SecretProvisionReplayConflictError,
+    provision_or_adopt_secret,
+    reconcile_pending_secret_provision_operation,
+)
 from orcest.workflow_store.v1.secrets import (
     SecretReference,
     SecretStagingHandle,
@@ -36,4 +41,7 @@ __all__ = [
     "SecretStagingHandle",
     "SecretStore",
     "SecretVersionHandle",
+    "SecretProvisionReplayConflictError",
+    "provision_or_adopt_secret",
+    "reconcile_pending_secret_provision_operation",
 ]

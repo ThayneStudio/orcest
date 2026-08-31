@@ -89,6 +89,10 @@ __all__ = [
     "secret_staging_attestation",
     "transition_digest",
     "activity_idempotency_digest",
+    "receipt_digest",
+    "checkpoint_digest",
+    "affected_run_ids_digest",
+    "failure_evidence_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -382,6 +386,35 @@ def activity_idempotency_digest(fields: Mapping[str, Any]) -> str:
 def transition_digest(fields: Mapping[str, Any]) -> str:
     """Digest of normalized reducer inputs and outputs (``transition_digest``)."""
     return generic_domain_digest("orcest-transition-v1", fields)
+
+
+def receipt_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of complete canonical Credential Rotation Receipt provenance (``receipt_digest``)."""
+    return generic_domain_digest("orcest-credential-rotation-receipt-v1", fields)
+
+
+def checkpoint_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of normalized Secret Provision Checkpoint fields (``checkpoint_digest``)."""
+    return generic_domain_digest("orcest-secret-provision-checkpoint-v1", fields)
+
+
+def affected_run_ids_digest(member_rows: Sequence[Mapping[str, Any]]) -> str:
+    """Digest of a Secret Version's frozen active-Run membership (``affected_run_ids_digest``).
+
+    Required even when the membership is empty (no Run currently waits on this
+    Secret). The exact byte-sorted ``(secret_id, version, run_ordinal, run_id)``
+    membership rows are owned by the Wait Condition / Human Boundary fanout leaf;
+    this leaf only ever freezes the empty set, via the same named function later
+    leaves must reuse so the formula never diverges by call site.
+    """
+    return generic_domain_digest("orcest-affected-run-ids-v1", list(member_rows))
+
+
+def failure_evidence_digest(evidence: Any) -> str:
+    """Digest of complete canonical non-secret failure evidence (a Checkpoint's
+    ``failure_evidence_digest``). ``evidence`` MUST NOT contain secret bytes,
+    a reusable Secret Store locator, or a secret-derived unkeyed digest."""
+    return generic_domain_digest("orcest-failure-evidence-v1", evidence)
 
 
 def response_digest(response_json: Any) -> str:
