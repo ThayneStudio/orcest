@@ -338,14 +338,8 @@ def _handle_internal(view: RunView, trigger: Trigger) -> Reduction | None:
     except (TypeError, ValueError):
         return None
     if view.pending_internal_sequence is not None and entering != view.pending_internal_sequence:
-        if (
-            view.latest_staffing_recheck_transition_sequence is not None
-            and entering != view.latest_staffing_recheck_transition_sequence
-        ):
+        if view.latest_staffing_recheck_transition_sequence != entering:
             return None
-        if view.pending_internal_sequence != entering:
-            if view.latest_staffing_recheck_transition_sequence != entering:
-                return None
     winner = arbitrate_internal_continuation(view, entering)
     if winner is ContinuationWinner.CANCELLATION:
         if view.publication_state in {"CHANGE_REQUEST_OBSERVED", "ACTIVE"}:

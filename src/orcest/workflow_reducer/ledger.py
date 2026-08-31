@@ -12,12 +12,10 @@ from orcest.workflow_contract.v1.digest import (
     activity_idempotency_digest,
     bare_canonical_digest,
     request_digest,
-    transition_digest,
 )
 from orcest.workflow_contract.v1.protocol import known_protocol_literals
 from orcest.workflow_reducer.reduce import reduce
 from orcest.workflow_reducer.types import (
-    PRIOR_STATE_NONE,
     ActivityView,
     AppliedReduction,
     PlannedActivity,
@@ -220,8 +218,6 @@ def _activity_key(
             "semantic_input_digest": semantic,
             "candidate_id": planned.candidate_id,
             "forge_observation_id": planned.forge_observation_id,
-            "change_request_head_observation_id": None,
-            "observed_change_request_head": None,
             "role": planned.role,
             "repair_cycle": planned.repair_cycle,
             "recovery_cycle": planned.recovery_cycle,
@@ -324,18 +320,8 @@ def apply(
             "trigger_kind": trigger.kind,
             "trigger_id": trigger.trigger_id,
             "facts": dict(trigger.facts),
-            "prior_state": (
-                working.prior_state if working.prior_state != PRIOR_STATE_NONE else view.prior_state
-            ),
+            "prior_state": reduction.prior_state,
             "reason_code": reduction.reason_code,
-        }
-    )
-    _ = transition_digest(
-        {
-            "input_digest": input_digest,
-            "next_state": reduction.next_state,
-            "reason_code": reduction.reason_code,
-            "planned_kinds": [item.kind for item in reduction.planned_activities],
         }
     )
     transition = store.append_transition(

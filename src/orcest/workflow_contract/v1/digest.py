@@ -359,8 +359,6 @@ _ACTIVITY_IDEMPOTENCY_FIELDS = (
     "semantic_input_digest",
     "candidate_id",
     "forge_observation_id",
-    "change_request_head_observation_id",
-    "observed_change_request_head",
     "role",
     "repair_cycle",
     "recovery_cycle",

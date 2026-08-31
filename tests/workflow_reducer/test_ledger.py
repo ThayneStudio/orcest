@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from orcest.workflow_contract.v1.digest import request_digest
 from orcest.workflow_reducer.contract import default_view
 from orcest.workflow_reducer.ledger import apply, load_view
 from orcest.workflow_reducer.types import Trigger
@@ -46,6 +47,20 @@ def test_admit_spec_supersede_internal_are_three_transitions(tmp_path: Path) -> 
         assert admitted.transition.prior_state == "NONE"
         assert admitted.transition.next_state == "ADMITTED"
         assert admitted.transition.specification_generation == 0
+        assert admitted.transition.input_digest == request_digest(
+            {
+                "trigger_kind": "ADMIT",
+                "trigger_id": "obs-work-1",
+                "facts": {
+                    "snapshot_id": "22222222-2222-2222-2222-222222222222",
+                    "base_observation_id": "obs-base-1",
+                    "project_id": "project-a",
+                    "work_item_key": "work-1",
+                },
+                "prior_state": "NONE",
+                "reason_code": "ADMIT",
+            }
+        )
         view = load_view(store, RUN_ID)
         assert view is not None
         assert view.pending_snapshot_id == "22222222-2222-2222-2222-222222222222"
