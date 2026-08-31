@@ -419,6 +419,9 @@ class TestExecuteTask:
         assert result.branch == "issue-657-work"
         assert result.snapshot_head_sha == "f" * 40
         mock_workspace.setup.assert_called_once_with(task.repo, None, task.token)
+        mock_workspace.resume_expected_ref.assert_called_once_with(
+            task.repo, "owner", "issue-657-work", task.token
+        )
 
     def test_worker_handles_runner_failure(self, local_worker_config, sample_task, mock_workspace):
         """_execute_task returns a FAILED TaskResult when the runner fails."""

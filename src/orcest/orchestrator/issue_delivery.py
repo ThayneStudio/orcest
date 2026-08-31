@@ -24,6 +24,7 @@ from orcest.orchestrator.github_delivery_verifier import (
     DeliveryErrorKind,
     DeliveryFailureReason,
     HandoffObservation,
+    normalize_head_ref,
     observe_issue_handoff,
 )
 from orcest.orchestrator.issue_ops import clear_attempts as clear_issue_attempts
@@ -37,6 +38,13 @@ from orcest.orchestrator.issue_publication import (
     make_issue_result_ref_key,
     make_issue_retry_record_key,
     make_issue_verification_job_key,
+)
+from orcest.orchestrator.issue_retry import (
+    RetryContextBoundError,
+    build_issue_retry_context,
+    clear_issue_retry_context,
+    store_issue_retry_budget_record,
+    store_issue_retry_context,
 )
 from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
 from orcest.shared.events import EventPublisher, make_event
@@ -258,6 +266,8 @@ class VerificationJob:
     echo_mismatch: bool = False
     ambiguous: bool = False
     event_flags: str = ""
+    live_head_oid: str = ""
+    partial_pr_number: str = ""
 
 
 @dataclass(frozen=True)
@@ -340,6 +350,30 @@ def _as_float(value: str | None, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _partial_pr_number(observation: HandoffObservation, job: VerificationJob) -> str:
+    """Lowest open same-repository PR on the expected ref, even if it is draft."""
+    expected = normalize_head_ref(job.expected_branch)
+    numbers: list[int] = []
+    for pr in observation.candidate_prs:
+        if pr.number < 1:
+            continue
+        if pr.state.upper() != "OPEN":
+            continue
+        if pr.head_repository != job.repo:
+            continue
+        if normalize_head_ref(pr.head_ref_name) != expected:
+            continue
+        numbers.append(pr.number)
+    selected = observation.selected_pr
+    if selected is not None and selected.number >= 1 and selected.head_repository == job.repo:
+        if (
+            selected.state.upper() == "OPEN"
+            and normalize_head_ref(selected.head_ref_name) == expected
+        ):
+            numbers.append(selected.number)
+    return str(min(numbers)) if numbers else ""
 
 
 def has_issue_dispatch_barrier(redis: RedisClient, repo: str, issue_number: int) -> bool:
@@ -469,6 +503,8 @@ def get_verification_job(
         echo_mismatch=data.get("echo_mismatch", "0") == "1",
         ambiguous=data.get("ambiguous", "0") == "1",
         event_flags=flags,
+        live_head_oid=data.get("live_head_oid", ""),
+        partial_pr_number=data.get("partial_pr_number", ""),
     )
 
 
@@ -995,6 +1031,7 @@ def _observe_and_transition(
             "" if observation.selected_pr is None else str(observation.selected_pr.number)
         ),
         "live_head_oid": observation.live_head_oid,
+        "partial_pr_number": _partial_pr_number(observation, job),
         "message": observation.message[:500],
     }
     if observation.echo_mismatch:
@@ -1231,6 +1268,7 @@ def _advance_verified_saga(
     if job.saga_phase is SagaPhase.LABEL_MUTATED:
         try:
             clear_issue_attempts(redis, job.repo, job.issue_number)
+            clear_issue_retry_context(redis, job.repo, job.issue_number, job.generation)
         except Exception:
             logger_.warning(
                 "Failed to clear attempts after VERIFIED for issue #%d",
@@ -1314,23 +1352,57 @@ def _advance_ineffective_saga(
         current_time = now()
         cooldown = max(0, config.ineffective_cooldown_seconds)
         cooldown_until = current_time + cooldown
-        retry_key = make_issue_retry_record_key(job.repo, job.issue_number, job.generation)
-        redis.hset_mapping(
-            retry_key,
-            {
-                "reason": job.reason or "ineffective_delivery",
-                "generation": str(job.generation),
-                "task_id": job.task_id,
-                "cooldown_until": f"{cooldown_until:.3f}",
-                "created_at": f"{current_time:.3f}",
-            },
-        )
-        redis.persist(retry_key)
-        if cooldown > 0:
-            redis.set_ex(
-                make_issue_delivery_cooldown_key(job.repo, job.issue_number),
-                "1",
-                cooldown,
+        pr_number = None
+        if job.partial_pr_number:
+            try:
+                parsed = int(job.partial_pr_number)
+            except (TypeError, ValueError):
+                parsed = 0
+            if parsed >= 1:
+                pr_number = parsed
+        try:
+            context = build_issue_retry_context(
+                repo=job.repo,
+                task_id=job.task_id,
+                generation=job.generation,
+                expected_ref=job.expected_branch,
+                expected_head_owner=job.expected_head_owner,
+                remote_head_oid=job.live_head_oid,
+                pr_number=pr_number,
+                reason_code=job.reason or "ineffective_delivery",
+                created_at=current_time,
+                cooldown_until=cooldown_until,
+            )
+            store_issue_retry_context(
+                redis,
+                job.repo,
+                job.issue_number,
+                context,
+                cooldown_ttl_seconds=cooldown,
+            )
+        except RetryContextBoundError:
+            logger_.warning(
+                "Bounded retry context rejected for %s#%d gen %d; "
+                "storing budget retry record without resume context",
+                job.repo,
+                job.issue_number,
+                job.generation,
+                exc_info=True,
+            )
+            store_issue_retry_budget_record(
+                redis,
+                job.repo,
+                job.issue_number,
+                task_id=job.task_id,
+                generation=job.generation,
+                expected_ref=job.expected_branch,
+                expected_head_owner=job.expected_head_owner,
+                remote_head_oid=job.live_head_oid,
+                pr_number=pr_number,
+                reason_code=job.reason or "ineffective_delivery",
+                created_at=current_time,
+                cooldown_until=cooldown_until,
+                cooldown_ttl_seconds=cooldown,
             )
         if _transition_job(
             redis,

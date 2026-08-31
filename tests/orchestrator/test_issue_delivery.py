@@ -6,6 +6,8 @@ import json
 import logging
 
 from orcest.orchestrator.github_delivery_verifier import (
+    CandidatePullRequest,
+    ClosingIssueReference,
     DeliveryErrorKind,
     DeliveryFailureReason,
     HandoffObservation,
@@ -53,9 +55,15 @@ from orcest.orchestrator.issue_publication import (
     make_issue_dispatch_barrier_key,
     make_issue_generation_key,
     make_issue_result_ref_key,
+    make_issue_retry_latest_key,
     make_issue_retry_record_key,
     make_issue_verification_job_key,
     reserve_issue_publication,
+)
+from orcest.orchestrator.issue_retry import (
+    clear_issue_retry_context,
+    load_issue_retry_context,
+    load_latest_issue_retry_context,
 )
 from orcest.shared.config import IssueDeliveryVerifierConfig, LabelConfig
 from orcest.shared.coordination import make_pending_task_key
@@ -117,12 +125,10 @@ def _observation(
     ambiguous: bool = False,
     selected_number: int | None = 10,
     message: str = "ok",
+    live_head_oid: str = OID,
+    candidate_prs: tuple[CandidatePullRequest, ...] | None = None,
+    head_repository: str = REPO,
 ) -> HandoffObservation:
-    from orcest.orchestrator.github_delivery_verifier import (
-        CandidatePullRequest,
-        ClosingIssueReference,
-    )
-
     selected = None
     qualifying = ()
     if selected_number is not None:
@@ -133,7 +139,7 @@ def _observation(
             is_draft=False,
             base_repository=REPO,
             base_ref_name="master",
-            head_repository=REPO,
+            head_repository=head_repository,
             head_ref_name=BRANCH,
             head_oid=OID,
             closing_issues_references=(
@@ -141,6 +147,7 @@ def _observation(
             ),
         )
         qualifying = (selected,)
+    prs = qualifying if candidate_prs is None else candidate_prs
     return HandoffObservation(
         verified=verified,
         error_kind=kind,
@@ -151,13 +158,13 @@ def _observation(
         default_branch_oid="b" * 40,
         expected_head_ref=BRANCH,
         claimed_head_oid=OID,
-        live_head_oid=OID,
+        live_head_oid=live_head_oid,
         complete=complete,
         echo_mismatch=echo_mismatch,
         ambiguous=ambiguous,
         selected_pr=selected,
         qualifying_prs=qualifying,
-        candidate_prs=qualifying,
+        candidate_prs=prs,
         message=message,
     )
 
@@ -525,6 +532,16 @@ def test_grace_expiry_becomes_ineffective(fake_redis_client):
     retry_record = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
     assert retry_record["created_at"] == f"{now:.3f}"
     assert retry_record["cooldown_until"] == f"{now + 20:.3f}"
+    context = load_issue_retry_context(fake_redis_client, REPO, ISSUE, 1)
+    assert context is not None
+    assert context.task_id == "task-659"
+    assert context.generation == 1
+    assert context.expected_ref == BRANCH
+    assert context.expected_head_owner == "owner"
+    assert context.reason_code == DeliveryFailureReason.NO_CANDIDATE_PR.value
+    assert "title" not in retry_record
+    assert "body" not in retry_record
+    assert "summary" not in retry_record
     assert fake_redis_client.zscore(GC_DUE_INDEX_KEY, job_member(REPO, ISSUE, 1)) == now
     assert not has_issue_dispatch_barrier(fake_redis_client, REPO, ISSUE)
 
@@ -536,6 +553,67 @@ def _observe_no_handoff(*_args: object, **_kwargs: object) -> HandoffObservation
         reason=DeliveryFailureReason.NO_CANDIDATE_PR,
         selected_number=None,
     )
+
+
+def test_ineffective_unbound_retry_context_still_counts_generation(
+    fake_redis_client, label_config, mocker
+):
+    """RetryContextBoundError must still persist the generation retry hash.
+
+    Empty expected_head_owner rejects resume context, and with
+    ``ineffective_cooldown_seconds == 0`` there is no cooldown key either.
+    The hash is what keeps INEFFECTIVE generations in the attempt budget.
+    """
+    _admit_completed(fake_redis_client)
+    fake_redis_client.hset(
+        make_issue_verification_job_key(REPO, ISSUE, 1),
+        "expected_head_owner",
+        "",
+    )
+    now = 1_040.0
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=0),
+        stream_redis=fake_redis_client,
+        now=lambda: now,
+        observe=_observe_no_handoff,
+    )
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, 1)
+    assert job.state is VerificationState.INEFFECTIVE
+    assert job.saga_phase is SagaPhase.BARRIER_REMOVED
+    retry_record = fake_redis_client.hgetall(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert retry_record["generation"] == "1"
+    assert retry_record["task_id"] == "task-659"
+    assert retry_record["reason_code"] == DeliveryFailureReason.NO_CANDIDATE_PR.value
+    assert retry_record["created_at"] == f"{now:.3f}"
+    assert retry_record["cooldown_until"] == f"{now:.3f}"
+    assert retry_record["expected_ref"] == ""
+    assert retry_record["expected_head_owner"] == ""
+    assert load_issue_retry_context(fake_redis_client, REPO, ISSUE, 1) is None
+    assert not fake_redis_client.exists(make_issue_delivery_cooldown_key(REPO, ISSUE))
+    assert count_ineffective_delivery_generations(fake_redis_client, REPO, ISSUE) == 1
+
+    mocker.patch(
+        "orcest.orchestrator.gh.list_labeled_issues",
+        return_value=[
+            {
+                "number": ISSUE,
+                "title": "x",
+                "body": "",
+                "labels": [{"name": "orcest:ready"}],
+            }
+        ],
+    )
+    fake_redis_client.delete(make_pending_task_key(REPO, "issue", ISSUE))
+    clear_attempts(fake_redis_client, REPO, ISSUE)
+    actions = discover_actionable_issues(
+        REPO, TOKEN, fake_redis_client, label_config, max_attempts=1
+    )
+    assert get_attempt_count(fake_redis_client, REPO, ISSUE) == 0
+    assert actions[0].action is IssueAction.SKIP_MAX_ATTEMPTS
 
 
 def test_count_ineffective_delivery_generations_walks_prior_gens(fake_redis_client):
@@ -843,3 +921,194 @@ def test_oldest_pending_alert(fake_redis_client, caplog):
     )
     assert "Oldest PENDING" in caplog.text
     assert get_delivery_metrics(fake_redis_client).get("oldest_pending_alerts") == "1"
+
+
+def _draft_pr(
+    *,
+    number: int = 4,
+    head_repository: str = REPO,
+    state: str = "OPEN",
+) -> CandidatePullRequest:
+    return CandidatePullRequest(
+        number=number,
+        url=f"https://evil.example/{head_repository}/pull/{number}",
+        state=state,
+        is_draft=True,
+        base_repository=REPO,
+        base_ref_name="master",
+        head_repository=head_repository,
+        head_ref_name=BRANCH,
+        head_oid=OID,
+        closing_issues_references=(),
+    )
+
+
+def test_ineffective_retry_record_resumes_partial_pr(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=lambda *a, **k: _observation(
+            verified=False,
+            kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANDIDATE_PR,
+            selected_number=None,
+            live_head_oid=OID,
+            candidate_prs=(_draft_pr(number=8), _draft_pr(number=4)),
+        ),
+    )
+    context = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert context is not None
+    assert context.remote_head_oid == OID
+    assert context.pr_number == 4
+    assert context.pr_url == f"https://github.com/{REPO}/pull/4"
+    dumped = context.to_canonical_json()
+    assert "evil.example" not in dumped
+    assert "is_draft" not in dumped
+
+
+def test_ineffective_retry_context_ignores_closed_partial_pr(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=lambda *a, **k: _observation(
+            verified=False,
+            kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANDIDATE_PR,
+            selected_number=None,
+            live_head_oid=OID,
+            candidate_prs=(_draft_pr(number=4, state="CLOSED"), _draft_pr(number=8)),
+        ),
+    )
+    context = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert context is not None
+    assert context.pr_number == 8
+    assert context.pr_url == f"https://github.com/{REPO}/pull/8"
+
+
+def test_fork_pr_is_not_stored_in_retry_context(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=lambda *a, **k: _observation(
+            verified=False,
+            kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANDIDATE_PR,
+            selected_number=None,
+            live_head_oid=OID,
+            candidate_prs=(_draft_pr(number=9, head_repository="attacker/fork"),),
+        ),
+    )
+    context = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert context is not None
+    assert context.pr_number is None
+    assert context.pr_url == ""
+
+
+def test_verified_clears_matching_retry_context_and_cooldown(fake_redis_client, mocker):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=_observe_no_handoff,
+    )
+    assert load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE) is not None
+    assert fake_redis_client.exists(make_issue_delivery_cooldown_key(REPO, ISSUE))
+    mocker.patch("orcest.orchestrator.gh.remove_issue_label")
+    fake_redis_client.delete(make_pending_task_key(REPO, "issue", ISSUE))
+    result = _result(task_id="task-verified-2", branch=BRANCH)
+    gen = _publish(fake_redis_client, result.task_id, BRANCH)
+    assert gen == 2
+    decision = admit_issue_result(fake_redis_client, REPO, result, now=lambda: 2_000.0)
+    assert decision.generation == 2
+    assert admit_completed_verification_job(
+        fake_redis_client, REPO, result, decision, _config(grace_seconds=0), now=lambda: 2_000.0
+    )
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0),
+        stream_redis=fake_redis_client,
+        now=lambda: 2_010.0,
+        observe=lambda *a, **k: _observation(),
+    )
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, 2)
+    assert job.state is VerificationState.VERIFIED
+    assert job.saga_phase is SagaPhase.BARRIER_REMOVED
+    assert load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE) is None
+    assert not fake_redis_client.exists(make_issue_retry_record_key(REPO, ISSUE, 1))
+    assert not fake_redis_client.exists(make_issue_delivery_cooldown_key(REPO, ISSUE))
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0),
+        stream_redis=fake_redis_client,
+        now=lambda: 2_011.0,
+        observe=lambda *a, **k: _observation(),
+    )
+    assert load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE) is None
+
+
+def test_stale_verified_clear_does_not_drop_newer_retry(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=_observe_no_handoff,
+    )
+    fake_redis_client.set_value(make_issue_generation_key(REPO, ISSUE), "2")
+    fake_redis_client.set_value(make_issue_retry_latest_key(REPO, ISSUE), "2")
+    fake_redis_client.hset_mapping(
+        make_issue_retry_record_key(REPO, ISSUE, 2),
+        {
+            "schema_version": "1",
+            "task_id": "task-newer",
+            "generation": "2",
+            "expected_ref": BRANCH,
+            "expected_head_owner": "owner",
+            "remote_head_oid": OID,
+            "pr_number": "6",
+            "pr_url": f"https://github.com/{REPO}/pull/6",
+            "reason_code": "no_candidate_pr",
+            "created_at": "2000.000",
+            "cooldown_until": "2020.000",
+        },
+    )
+    fake_redis_client.set_ex(make_issue_delivery_cooldown_key(REPO, ISSUE), "2", 30)
+    assert not clear_issue_retry_context(fake_redis_client, REPO, ISSUE, 1)
+    newer = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert newer is not None
+    assert newer.generation == 2
+    assert newer.task_id == "task-newer"
+    assert fake_redis_client.get(make_issue_delivery_cooldown_key(REPO, ISSUE)) == "2"

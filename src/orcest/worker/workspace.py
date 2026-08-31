@@ -6,6 +6,8 @@ state leakage between tasks.
 """
 
 import logging
+import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +18,71 @@ logger = logging.getLogger(__name__)
 # Timeout for git clone operations (seconds). Prevents the worker from
 # hanging indefinitely on network issues.
 _CLONE_TIMEOUT_SECONDS = 300
+_FETCH_TIMEOUT_SECONDS = 120
+_OWNER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$")
+
+
+def _assert_same_repo_expected_ref(repo: str, expected_owner: str, expected_ref: str) -> None:
+    """Reject an owner or ref that is not the same-repository expected head."""
+    if not _REPO_RE.fullmatch(repo):
+        raise WorkspaceError(f"refusing to resume unexpected repository {repo!r}")
+    owner, _sep, _name = repo.partition("/")
+    if expected_owner != owner or not _OWNER_RE.fullmatch(expected_owner):
+        raise WorkspaceError(f"refusing to resume unexpected owner {expected_owner!r}")
+    if not _is_safe_git_ref(expected_ref):
+        raise WorkspaceError(f"refusing to resume unexpected ref {expected_ref!r}")
+
+
+def _is_safe_git_ref(ref: str) -> bool:
+    if not ref or not _REF_RE.fullmatch(ref):
+        return False
+    if ".." in ref or "//" in ref or "@{" in ref:
+        return False
+    if ref.endswith(".lock") or ref.endswith("/") or ref.endswith("."):
+        return False
+    if ref.startswith("/") or ref.startswith("-"):
+        return False
+    if any(ord(char) < 32 for char in ref):
+        return False
+    return True
+
+
+def _missing_remote_ref(stderr: str) -> bool:
+    text = stderr.lower()
+    if "couldn't find remote ref" in text:
+        return True
+    return "remote ref" in text and "not found" in text
+
+
+def _transient_fetch_error(stderr: str) -> bool:
+    """Return True when git fetch failed for a retryable connectivity reason.
+
+    Git wraps every origin HTTP failure as ``unable to access``, including
+    permanently revoked or under-scoped tokens (``returned error: 403``).
+    Those must stay non-transient: the worker retries transient
+    WorkspaceErrors without burning an attempt slot, matching ``clone()``
+    which only marks the timeout path retryable.
+    """
+    text = stderr.lower()
+    # HTTP 401/403/404 is a client/auth failure, not a blip. Matched as
+    # explicit codes (not a bare "error: 4" prefix) so 429 (rate-limited,
+    # retryable) doesn't get misclassified as permanent.
+    if any(f"error: {code}" in text for code in ("401", "403", "404")):
+        return False
+    return any(
+        token in text
+        for token in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "could not resolve host",
+            "unable to access",
+            "ssl",
+        )
+    )
 
 
 def _git_config(repo_dir: Path, key: str, value: str) -> None:
@@ -195,6 +262,92 @@ class Workspace:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise WorkspaceError("failed to read workspace HEAD SHA") from exc
         return result.stdout.strip()
+
+    def resume_expected_ref(
+        self, repo: str, expected_owner: str, expected_ref: str, token: str
+    ) -> bool:
+        """Fetch and check out *expected_ref* from a default-branch workspace.
+
+        Only the authoritative same-repository owner/ref is resumed. An
+        unexpected owner or ref is rejected without touching git. A missing
+        remote ref returns False and leaves the default-branch checkout in
+        place.
+
+        Args:
+            token: GitHub PAT for the fetch. ``setup()`` strips the clone
+                token out of ``.git/config``, so this call must supply its
+                own credential -- it does not inherit one from the daemon's
+                own environment.
+
+        Returns:
+            True when the expected ref was fetched and checked out.
+        """
+        repo_dir = self.path
+        _assert_same_repo_expected_ref(repo, expected_owner, expected_ref)
+        env = {**os.environ, "GITHUB_TOKEN": token}
+        fetch_spec = f"refs/heads/{expected_ref}:refs/remotes/origin/{expected_ref}"
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_dir),
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    fetch_spec,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            raise WorkspaceError(
+                f"git fetch timed out after {_FETCH_TIMEOUT_SECONDS}s "
+                f"for {repo} ref {expected_ref}",
+                transient=True,
+            ) from None
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr or ""
+            if _missing_remote_ref(stderr):
+                logger.info(
+                    "Expected ref %s does not exist on origin for %s; staying on default branch",
+                    expected_ref,
+                    repo,
+                )
+                return False
+            raise WorkspaceError(
+                f"git fetch failed (exit {exc.returncode}) for {repo} ref {expected_ref}"
+                + (f": {stderr.strip()}" if stderr.strip() else ""),
+                transient=_transient_fetch_error(stderr),
+            ) from None
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_dir),
+                    "checkout",
+                    "-B",
+                    expected_ref,
+                    f"origin/{expected_ref}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = ""
+            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                detail = f": {exc.stderr.strip()}"
+            raise WorkspaceError(
+                f"git checkout failed for {repo} ref {expected_ref}{detail}"
+            ) from None
+        return True
 
     def cleanup(self) -> None:
         """Remove the workspace directory.
