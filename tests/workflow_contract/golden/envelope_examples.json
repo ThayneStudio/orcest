@@ -176,5 +176,64 @@
       "replayed": false,
       "rejection_code": "CAS_LOST"
     }
+  },
+  {
+    "name": "project_registration_request_register",
+    "source": "repository-configuration.md Local CLI contract",
+    "body": {
+      "protocol": "orcest.project-registration/1",
+      "idempotency_key": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "project_id": null,
+      "expected_registration_revision": null,
+      "forge": {
+        "adapter_kind": "GITHUB",
+        "canonical_origin": "https://github.com",
+        "installation_or_account_ref": "installation-1",
+        "repository_locator": "owner/repository"
+      },
+      "requested_default_ref": "refs/heads/main",
+      "trusted_base_policy_ref": "trusted-base/v1",
+      "budget_policy_ref": "budget/v1",
+      "budget_reset_window_ref": "budget-reset/v1"
+    }
+  },
+  {
+    "name": "project_registration_result_succeeded",
+    "source": "repository-configuration.md Local CLI contract",
+    "body": {
+      "protocol": "orcest.project-registration-result/1",
+      "idempotency_key": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "replayed": false,
+      "mode": "REGISTER",
+      "status": "SUCCEEDED",
+      "project_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "registration_revision": 1,
+      "registration_state": "ACTIVE",
+      "forge_instance_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "installation_or_account_ref": "installation-1",
+      "repository_external_id": "repo-external-1",
+      "repository_locator": "owner/repository",
+      "default_ref": "refs/heads/main",
+      "trusted_base_commit": {"object_format": "sha1", "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "workflow_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "policy_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "trusted_base_policy_ref": "trusted-base/v1",
+      "budget_policy_ref": "budget/v1",
+      "budget_reset_window_ref": "budget-reset/v1",
+      "readiness": {"ready": true, "diagnostics": []}
+    }
+  },
+  {
+    "name": "project_registration_result_rejected",
+    "source": "repository-configuration.md Local CLI contract",
+    "body": {
+      "protocol": "orcest.project-registration-result/1",
+      "idempotency_key": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "replayed": false,
+      "mode": "REGISTER",
+      "status": "REJECTED",
+      "rejection_code": "WORKFLOW_INVALID",
+      "diagnostics": []
+    }
   }
 ]

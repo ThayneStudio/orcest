@@ -7,11 +7,12 @@ leaves add feature tables and reducers on top of these primitives.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +29,7 @@ from orcest.workflow_contract.v1.digest import (
     is_valid_content_digest,
     receipt_digest,
     request_digest,
+    resolution_digest,
     response_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
@@ -36,12 +38,14 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
+    PROJECT_REGISTRATION_PROTOCOL,
+    PROJECT_REGISTRATION_RESULT_PROTOCOL,
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
     SECRET_PROVISION_REQUEST_PROTOCOL,
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -397,6 +401,94 @@ class SecretProvisionOperationResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ForgeInstanceRecord:
+    forge_instance_id: str
+    adapter_kind: str
+    canonical_origin: str
+    credential_secret_id: str
+    registration_provenance_version: int
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectRecord:
+    project_id: str
+    forge_instance_id: str
+    installation_or_account_ref: str
+    repository_external_id: str
+    repository_locator: str
+    default_ref: str
+    trusted_base_policy_ref: str
+    budget_policy_ref: str
+    budget_reset_window_ref: str
+    source_read_secret_id: str
+    publication_secret_id: str
+    registration_source_read_secret_version: int
+    registration_publication_secret_version: int
+    registration_revision: int
+    registration_operation_id: str
+    work_item_discovery_schedule_id: str
+    registration_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeObservationScheduleRecord:
+    forge_observation_schedule_id: str
+    schedule_kind: str
+    schedule_revision: int
+    state: str
+    target_kind: str
+    target_id: str
+    next_due_at_ms: int
+    created_at_ms: int
+    run_id: str | None = None
+    publication_id: str | None = None
+    last_request_id: str | None = None
+    last_observation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectRegistrationOperationResult:
+    project_registration_operation_id: str
+    authenticated_principal_id: str
+    idempotency_key: str
+    mode: str
+    status: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    resolution_digest: str
+    completed_at_ms: int
+    request_digest: str
+    authorization_context_digest: str
+    installation_or_account_ref: str
+    requested_project_id: str | None = None
+    expected_registration_revision: int | None = None
+    rejection_code: str | None = None
+    result_project_id: str | None = None
+    result_registration_revision: int | None = None
+    result_work_item_discovery_schedule_id: str | None = None
+    resolved_forge_instance_id: str | None = None
+    resolved_repository_external_id: str | None = None
+    resolved_base_commit_json: str | None = None
+    resolved_forge_api_secret_id: str | None = None
+    resolved_forge_api_secret_version: int | None = None
+    resolved_source_read_secret_id: str | None = None
+    resolved_source_read_secret_version: int | None = None
+    resolved_publication_secret_id: str | None = None
+    resolved_publication_secret_version: int | None = None
+    replayed: bool = False
+
+    def public_response_json(self) -> str:
+        """Canonical public body with the transport ``replayed`` projection applied."""
+        body = json.loads(self.response_json)
+        if not isinstance(body, dict):
+            raise RunStoreError("stored registration response is not a JSON object")
+        body["replayed"] = self.replayed
+        return canonical_json_text(body)
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -636,6 +728,92 @@ def _row_to_issued_capability(row: sqlite3.Row) -> IssuedCapabilityBinding:
         immutable_assignment_json=row["immutable_assignment_json"],
         capability_key_registry_revision=row["capability_key_registry_revision"],
         issued_at_ms=row["issued_at_ms"],
+    )
+
+
+def _row_to_forge_instance(row: sqlite3.Row) -> ForgeInstanceRecord:
+    return ForgeInstanceRecord(
+        forge_instance_id=row["forge_instance_id"],
+        adapter_kind=row["adapter_kind"],
+        canonical_origin=row["canonical_origin"],
+        credential_secret_id=row["credential_secret_id"],
+        registration_provenance_version=row["registration_provenance_version"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
+    return ProjectRecord(
+        project_id=row["project_id"],
+        forge_instance_id=row["forge_instance_id"],
+        installation_or_account_ref=row["installation_or_account_ref"],
+        repository_external_id=row["repository_external_id"],
+        repository_locator=row["repository_locator"],
+        default_ref=row["default_ref"],
+        trusted_base_policy_ref=row["trusted_base_policy_ref"],
+        budget_policy_ref=row["budget_policy_ref"],
+        budget_reset_window_ref=row["budget_reset_window_ref"],
+        source_read_secret_id=row["source_read_secret_id"],
+        publication_secret_id=row["publication_secret_id"],
+        registration_source_read_secret_version=row["registration_source_read_secret_version"],
+        registration_publication_secret_version=row["registration_publication_secret_version"],
+        registration_revision=row["registration_revision"],
+        registration_operation_id=row["registration_operation_id"],
+        work_item_discovery_schedule_id=row["work_item_discovery_schedule_id"],
+        registration_state=row["registration_state"],
+    )
+
+
+def _row_to_forge_observation_schedule(row: sqlite3.Row) -> ForgeObservationScheduleRecord:
+    return ForgeObservationScheduleRecord(
+        forge_observation_schedule_id=row["forge_observation_schedule_id"],
+        schedule_kind=row["schedule_kind"],
+        schedule_revision=row["schedule_revision"],
+        state=row["state"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        run_id=row["run_id"],
+        publication_id=row["publication_id"],
+        last_request_id=row["last_request_id"],
+        last_observation_id=row["last_observation_id"],
+        next_due_at_ms=row["next_due_at_ms"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_project_registration_operation(
+    row: sqlite3.Row, *, replayed: bool
+) -> ProjectRegistrationOperationResult:
+    return ProjectRegistrationOperationResult(
+        project_registration_operation_id=row["project_registration_operation_id"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        idempotency_key=row["idempotency_key"],
+        mode=row["mode"],
+        requested_project_id=row["requested_project_id"],
+        expected_registration_revision=row["expected_registration_revision"],
+        installation_or_account_ref=row["installation_or_account_ref"],
+        request_digest=row["request_digest"],
+        authorization_context_digest=row["authorization_context_digest"],
+        resolved_forge_instance_id=row["resolved_forge_instance_id"],
+        resolved_repository_external_id=row["resolved_repository_external_id"],
+        resolved_base_commit_json=row["resolved_base_commit_json"],
+        resolved_forge_api_secret_id=row["resolved_forge_api_secret_id"],
+        resolved_forge_api_secret_version=row["resolved_forge_api_secret_version"],
+        resolved_source_read_secret_id=row["resolved_source_read_secret_id"],
+        resolved_source_read_secret_version=row["resolved_source_read_secret_version"],
+        resolved_publication_secret_id=row["resolved_publication_secret_id"],
+        resolved_publication_secret_version=row["resolved_publication_secret_version"],
+        resolution_digest=row["resolution_digest"],
+        status=row["status"],
+        result_project_id=row["result_project_id"],
+        result_registration_revision=row["result_registration_revision"],
+        result_work_item_discovery_schedule_id=row["result_work_item_discovery_schedule_id"],
+        rejection_code=row["rejection_code"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        completed_at_ms=row["completed_at_ms"],
+        replayed=replayed,
     )
 
 
@@ -1277,6 +1455,155 @@ CREATE TABLE IF NOT EXISTS secret_provision_checkpoints (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_secret_provision_checkpoint_terminal
 ON secret_provision_checkpoints(secret_provision_operation_id)
 WHERE outcome IN ('SUCCEEDED', 'FAILED_TERMINAL');
+
+CREATE TABLE IF NOT EXISTS forge_instances (
+  forge_instance_id TEXT PRIMARY KEY,
+  adapter_kind TEXT NOT NULL CHECK (
+    adapter_kind IN ({_sql_in(_enum_values("forge_instance.adapter_kind"))})
+  ),
+  canonical_origin TEXT NOT NULL UNIQUE,
+  credential_secret_id TEXT NOT NULL,
+  registration_provenance_version INTEGER NOT NULL CHECK (registration_provenance_version > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  FOREIGN KEY (credential_secret_id)
+    REFERENCES secret_current_versions(secret_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS forge_observation_schedules (
+  forge_observation_schedule_id TEXT PRIMARY KEY,
+  schedule_kind TEXT NOT NULL CHECK (
+    schedule_kind IN ({_sql_in(_enum_values("forge_observation_schedule.schedule_kind"))})
+  ),
+  schedule_revision INTEGER NOT NULL CHECK (schedule_revision >= 0),
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("forge_observation_schedule.state"))})
+  ),
+  target_kind TEXT NOT NULL CHECK (
+    target_kind IN ({_sql_in(_enum_values("forge_observation.target_kind"))})
+  ),
+  target_id TEXT NOT NULL,
+  run_id TEXT,
+  publication_id TEXT,
+  last_request_id TEXT,
+  last_observation_id TEXT,
+  next_due_at_ms INTEGER NOT NULL CHECK (next_due_at_ms >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_discovery_one_open
+ON forge_observation_schedules(target_kind, target_id)
+WHERE schedule_kind = 'WORK_ITEM_DISCOVERY' AND state != 'CLOSED';
+
+CREATE TABLE IF NOT EXISTS project_registration_operations (
+  project_registration_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  authenticated_principal_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (
+    mode IN ({_sql_in(_enum_values("project_registration_operation.mode"))})
+  ),
+  requested_project_id TEXT,
+  expected_registration_revision INTEGER
+    CHECK (expected_registration_revision IS NULL OR expected_registration_revision > 0),
+  installation_or_account_ref TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  resolved_forge_instance_id TEXT,
+  resolved_repository_external_id TEXT,
+  resolved_base_commit_json TEXT,
+  resolved_forge_api_secret_id TEXT,
+  resolved_forge_api_secret_version INTEGER
+    CHECK (resolved_forge_api_secret_version IS NULL OR resolved_forge_api_secret_version > 0),
+  resolved_source_read_secret_id TEXT,
+  resolved_source_read_secret_version INTEGER
+    CHECK (resolved_source_read_secret_version IS NULL OR resolved_source_read_secret_version > 0),
+  resolved_publication_secret_id TEXT,
+  resolved_publication_secret_version INTEGER
+    CHECK (resolved_publication_secret_version IS NULL OR resolved_publication_secret_version > 0),
+  resolution_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("project_registration_operation.status"))})
+  ),
+  result_project_id TEXT,
+  result_registration_revision INTEGER
+    CHECK (result_registration_revision IS NULL OR result_registration_revision > 0),
+  result_work_item_discovery_schedule_id TEXT,
+  rejection_code TEXT CHECK (
+    rejection_code IN ({_sql_in(_enum_values("project_registration_operation.rejection_code"))})
+  ),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
+  UNIQUE (authenticated_principal_id, idempotency_key),
+  CHECK (
+    (mode = 'REGISTER' AND requested_project_id IS NULL
+      AND expected_registration_revision IS NULL)
+    OR (mode = 'REVALIDATE' AND requested_project_id IS NOT NULL
+      AND expected_registration_revision IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'SUCCEEDED'
+      AND rejection_code IS NULL
+      AND result_project_id IS NOT NULL
+      AND result_registration_revision IS NOT NULL
+      AND result_work_item_discovery_schedule_id IS NOT NULL
+      AND resolved_forge_instance_id IS NOT NULL
+      AND resolved_repository_external_id IS NOT NULL
+      AND resolved_base_commit_json IS NOT NULL
+      AND resolved_forge_api_secret_id IS NOT NULL
+      AND resolved_forge_api_secret_version IS NOT NULL
+      AND resolved_source_read_secret_id IS NOT NULL
+      AND resolved_source_read_secret_version IS NOT NULL
+      AND resolved_publication_secret_id IS NOT NULL
+      AND resolved_publication_secret_version IS NOT NULL)
+    OR (status = 'REJECTED'
+      AND rejection_code IS NOT NULL
+      AND result_project_id IS NULL
+      AND result_registration_revision IS NULL
+      AND result_work_item_discovery_schedule_id IS NULL
+      AND resolved_forge_api_secret_id IS NULL
+      AND resolved_forge_api_secret_version IS NULL
+      AND resolved_source_read_secret_id IS NULL
+      AND resolved_source_read_secret_version IS NULL
+      AND resolved_publication_secret_id IS NULL
+      AND resolved_publication_secret_version IS NULL)
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_registration_success_revision
+ON project_registration_operations(result_project_id, result_registration_revision)
+WHERE status = 'SUCCEEDED';
+
+CREATE TABLE IF NOT EXISTS projects (
+  project_id TEXT PRIMARY KEY,
+  forge_instance_id TEXT NOT NULL
+    REFERENCES forge_instances(forge_instance_id) ON DELETE RESTRICT,
+  installation_or_account_ref TEXT NOT NULL,
+  repository_external_id TEXT NOT NULL,
+  repository_locator TEXT NOT NULL,
+  default_ref TEXT NOT NULL,
+  trusted_base_policy_ref TEXT NOT NULL,
+  budget_policy_ref TEXT NOT NULL,
+  budget_reset_window_ref TEXT NOT NULL,
+  source_read_secret_id TEXT NOT NULL
+    REFERENCES secret_current_versions(secret_id) ON DELETE RESTRICT,
+  publication_secret_id TEXT NOT NULL
+    REFERENCES secret_current_versions(secret_id) ON DELETE RESTRICT,
+  registration_source_read_secret_version INTEGER NOT NULL
+    CHECK (registration_source_read_secret_version > 0),
+  registration_publication_secret_version INTEGER NOT NULL
+    CHECK (registration_publication_secret_version > 0),
+  registration_revision INTEGER NOT NULL CHECK (registration_revision > 0),
+  registration_operation_id TEXT NOT NULL,
+  work_item_discovery_schedule_id TEXT NOT NULL,
+  registration_state TEXT NOT NULL CHECK (
+    registration_state IN ({_sql_in(_enum_values("project.registration_state"))})
+  ),
+  UNIQUE (forge_instance_id, repository_external_id),
+  CHECK (source_read_secret_id != publication_secret_id)
+);
 """
 
 _V1_TO_V2 = f"""
@@ -1567,7 +1894,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3}:
+        if current not in {0, 1, 2, 3, 4}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -1625,11 +1952,10 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 3:
                 # A real version-3 database already has every table in its
-                # final v3 shape; _SCHEMA only needs to create the new
-                # secret-provision/adoption tables (all CREATE TABLE IF NOT
-                # EXISTS), so no rebuild script runs for this step.
+                # final v3 shape; _SCHEMA creates secret-provision tables and
+                # the later project-registration tables in one step.
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -1637,6 +1963,21 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-secret-provision-and-adoption",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                # A real version-4 database already has secret-provision
+                # tables; _SCHEMA only needs to create Project / Forge
+                # Instance / registration-operation / discovery-schedule
+                # tables (all CREATE TABLE IF NOT EXISTS).
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-project-registration",
                         _now_ms(),
                     ),
                 )
@@ -2638,6 +2979,17 @@ class RunStore:
         ).fetchone()
         return None if row is None else _row_to_secret_current_version(row)
 
+    def list_current_secrets_for_owner(
+        self, *, owner_scope_kind: str, owner_scope_id: str
+    ) -> list[SecretCurrentVersionProjection]:
+        enums.parse_enum("secret_provision_operation.owner_scope_kind", owner_scope_kind)
+        rows = self.conn.execute(
+            "SELECT * FROM secret_current_versions WHERE owner_scope_kind = ? "
+            "AND owner_scope_id = ? AND current_version > 0 ORDER BY purpose, secret_id",
+            (owner_scope_kind, owner_scope_id),
+        ).fetchall()
+        return [_row_to_secret_current_version(row) for row in rows]
+
     def get_secret_version(self, secret_id: str, version: int) -> SecretVersionRecord | None:
         require_lowercase_uuid(secret_id, field="secret_id")
         row = self.conn.execute(
@@ -3437,6 +3789,729 @@ class RunStore:
             ).fetchone()
             assert row is not None
             return _row_to_secret_provision_checkpoint(row)
+
+    def get_forge_instance(self, forge_instance_id: str) -> ForgeInstanceRecord | None:
+        require_lowercase_uuid(forge_instance_id, field="forge_instance_id")
+        row = self.conn.execute(
+            "SELECT * FROM forge_instances WHERE forge_instance_id = ?", (forge_instance_id,)
+        ).fetchone()
+        return None if row is None else _row_to_forge_instance(row)
+
+    def get_forge_instance_by_origin(self, canonical_origin: str) -> ForgeInstanceRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM forge_instances WHERE canonical_origin = ?", (canonical_origin,)
+        ).fetchone()
+        return None if row is None else _row_to_forge_instance(row)
+
+    def get_project(self, project_id: str) -> ProjectRecord | None:
+        require_lowercase_uuid(project_id, field="project_id")
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        return None if row is None else _row_to_project(row)
+
+    def get_project_by_repository(
+        self, *, forge_instance_id: str, repository_external_id: str
+    ) -> ProjectRecord | None:
+        require_lowercase_uuid(forge_instance_id, field="forge_instance_id")
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE forge_instance_id = ? AND repository_external_id = ?",
+            (forge_instance_id, repository_external_id),
+        ).fetchone()
+        return None if row is None else _row_to_project(row)
+
+    def get_forge_observation_schedule(
+        self, forge_observation_schedule_id: str
+    ) -> ForgeObservationScheduleRecord | None:
+        require_lowercase_uuid(forge_observation_schedule_id, field="forge_observation_schedule_id")
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+            (forge_observation_schedule_id,),
+        ).fetchone()
+        return None if row is None else _row_to_forge_observation_schedule(row)
+
+    def get_project_registration_operation(
+        self, *, authenticated_principal_id: str, idempotency_key: str
+    ) -> ProjectRegistrationOperationResult | None:
+        require_lowercase_uuid(idempotency_key, field="idempotency_key")
+        row = self.conn.execute(
+            "SELECT * FROM project_registration_operations "
+            "WHERE authenticated_principal_id = ? AND idempotency_key = ?",
+            (authenticated_principal_id, idempotency_key),
+        ).fetchone()
+        return None if row is None else _row_to_project_registration_operation(row, replayed=False)
+
+    def _project_registration_http_status(self, *, status: str, rejection_code: str | None) -> int:
+        if status == "SUCCEEDED":
+            return 200
+        if rejection_code == "STABLE_REPOSITORY_OWNERSHIP_CONFLICT":
+            return 409
+        return 422
+
+    def _project_registration_public_body(
+        self,
+        *,
+        idempotency_key: str,
+        mode: str,
+        status: str,
+        rejection_code: str | None = None,
+        diagnostics: list[dict[str, str]] | None = None,
+        project_id: str | None = None,
+        registration_revision: int | None = None,
+        forge_instance_id: str | None = None,
+        installation_or_account_ref: str | None = None,
+        repository_external_id: str | None = None,
+        repository_locator: str | None = None,
+        default_ref: str | None = None,
+        trusted_base_commit: dict[str, str] | None = None,
+        workflow_hash: str | None = None,
+        policy_hash: str | None = None,
+        trusted_base_policy_ref: str | None = None,
+        budget_policy_ref: str | None = None,
+        budget_reset_window_ref: str | None = None,
+        readiness: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "protocol": PROJECT_REGISTRATION_RESULT_PROTOCOL,
+            "idempotency_key": idempotency_key,
+            "mode": mode,
+            "status": status,
+            "replayed": False,
+        }
+        if status == "SUCCEEDED":
+            body.update(
+                {
+                    "project_id": project_id,
+                    "registration_revision": registration_revision,
+                    "registration_state": "ACTIVE",
+                    "forge_instance_id": forge_instance_id,
+                    "installation_or_account_ref": installation_or_account_ref,
+                    "repository_external_id": repository_external_id,
+                    "repository_locator": repository_locator,
+                    "default_ref": default_ref,
+                    "trusted_base_commit": trusted_base_commit,
+                    "workflow_hash": workflow_hash,
+                    "policy_hash": policy_hash,
+                    "trusted_base_policy_ref": trusted_base_policy_ref,
+                    "budget_policy_ref": budget_policy_ref,
+                    "budget_reset_window_ref": budget_reset_window_ref,
+                    "readiness": readiness,
+                }
+            )
+        else:
+            body["rejection_code"] = rejection_code
+            body["diagnostics"] = diagnostics or []
+        return body
+
+    def _insert_project_registration_operation(
+        self,
+        *,
+        operation_id: str,
+        authenticated_principal_id: str,
+        idempotency_key: str,
+        mode: str,
+        requested_project_id: str | None,
+        expected_registration_revision: int | None,
+        installation_or_account_ref: str,
+        request_json: str,
+        request_digest: str,
+        authorization_context_digest: str,
+        resolved_forge_instance_id: str | None,
+        resolved_repository_external_id: str | None,
+        resolved_base_commit_json: str | None,
+        forge_api_secret_id: str | None,
+        forge_api_secret_version: int | None,
+        source_read_secret_id: str | None,
+        source_read_secret_version: int | None,
+        publication_secret_id: str | None,
+        publication_secret_version: int | None,
+        resolution_digest: str,
+        status: str,
+        result_project_id: str | None,
+        result_registration_revision: int | None,
+        result_schedule_id: str | None,
+        rejection_code: str | None,
+        response_http_status: int,
+        response_json: str,
+        response_digest: str,
+        completed_at_ms: int,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO project_registration_operations("
+            "project_registration_operation_id, protocol_version, authenticated_principal_id, "
+            "idempotency_key, mode, requested_project_id, expected_registration_revision, "
+            "installation_or_account_ref, request_json, request_digest, "
+            "authorization_context_digest, resolved_forge_instance_id, "
+            "resolved_repository_external_id, resolved_base_commit_json, "
+            "resolved_forge_api_secret_id, resolved_forge_api_secret_version, "
+            "resolved_source_read_secret_id, resolved_source_read_secret_version, "
+            "resolved_publication_secret_id, resolved_publication_secret_version, "
+            "resolution_digest, status, result_project_id, result_registration_revision, "
+            "result_work_item_discovery_schedule_id, rejection_code, response_http_status, "
+            "response_json, response_digest, completed_at_ms) VALUES ("
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation_id,
+                PROJECT_REGISTRATION_PROTOCOL,
+                authenticated_principal_id,
+                idempotency_key,
+                mode,
+                requested_project_id,
+                expected_registration_revision,
+                installation_or_account_ref,
+                request_json,
+                request_digest,
+                authorization_context_digest,
+                resolved_forge_instance_id,
+                resolved_repository_external_id,
+                resolved_base_commit_json,
+                forge_api_secret_id,
+                forge_api_secret_version,
+                source_read_secret_id,
+                source_read_secret_version,
+                publication_secret_id,
+                publication_secret_version,
+                resolution_digest,
+                status,
+                result_project_id,
+                result_registration_revision,
+                result_schedule_id,
+                rejection_code,
+                response_http_status,
+                response_json,
+                response_digest,
+                completed_at_ms,
+            ),
+        )
+
+    def commit_project_registration(
+        self,
+        *,
+        authenticated_principal_id: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+        authorization_context_digest: str,
+        adapter_kind: str,
+        canonical_origin: str,
+        installation_or_account_ref: str,
+        default_ref: str,
+        trusted_base_policy_ref: str,
+        budget_policy_ref: str,
+        budget_reset_window_ref: str,
+        resolved_repository_external_id: str | None,
+        resolved_repository_locator: str | None,
+        resolved_base_commit: Mapping[str, str] | None,
+        resolved_forge_api_secret_id: str | None,
+        resolved_forge_api_secret_version: int | None,
+        resolved_source_read_secret_id: str | None,
+        resolved_source_read_secret_version: int | None,
+        resolved_publication_secret_id: str | None,
+        resolved_publication_secret_version: int | None,
+        workflow_hash: str | None = None,
+        policy_hash: str | None = None,
+        readiness: Mapping[str, Any] | None = None,
+        business_rejection_code: str | None = None,
+        diagnostics: list[dict[str, str]] | None = None,
+        fault: FaultInjectionPoint | None = None,
+    ) -> ProjectRegistrationOperationResult:
+        """Atomically claim the replay key and insert Project + Schedule + Operation.
+
+        Idempotency/body conflicts and REVALIDATE CAS/authority-reference
+        mismatches raise without writing an Operation. Bounded business
+        rejections persist only the immutable Operation. Success inserts the
+        Project, reciprocal provenance, and revision-0 WORK_ITEM_DISCOVERY
+        Schedule in the same writer transaction.
+        """
+        require_lowercase_uuid(idempotency_key, field="idempotency_key")
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        enums.parse_enum("forge_instance.adapter_kind", adapter_kind)
+        request_json = canonical_json_text(request)
+        req_digest = request_digest(request)
+        requested_project_id = request.get("project_id")
+        expected_revision = request.get("expected_registration_revision")
+        mode = "REGISTER" if requested_project_id is None else "REVALIDATE"
+        if requested_project_id is not None:
+            require_lowercase_uuid(requested_project_id, field="project_id")
+        if expected_revision is not None:
+            _require_positive_int(expected_revision, field="expected_registration_revision")
+
+        with self.transaction(fault=fault):
+            existing = self.conn.execute(
+                "SELECT * FROM project_registration_operations "
+                "WHERE authenticated_principal_id = ? AND idempotency_key = ?",
+                (authenticated_principal_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] == req_digest:
+                    return _row_to_project_registration_operation(existing, replayed=True)
+                raise IdempotencyConflictError(
+                    "idempotency key was reused with a different registration body"
+                )
+
+            if mode == "REVALIDATE":
+                assert requested_project_id is not None
+                assert expected_revision is not None
+                project = self.get_project(requested_project_id)
+                if project is None or project.registration_revision != expected_revision:
+                    raise CasMismatchError("registration revision CAS mismatch")
+                if (
+                    project.installation_or_account_ref != installation_or_account_ref
+                    or project.default_ref != default_ref
+                    or project.trusted_base_policy_ref != trusted_base_policy_ref
+                    or project.budget_policy_ref != budget_policy_ref
+                    or project.budget_reset_window_ref != budget_reset_window_ref
+                ):
+                    raise CasMismatchError(
+                        "revalidation cannot change installation or authority-bearing policy refs"
+                    )
+
+            now = _now_ms()
+            operation_id = str(uuid.uuid4())
+            base_commit_json = (
+                canonical_json_text(resolved_base_commit)
+                if isinstance(resolved_base_commit, Mapping)
+                else resolved_base_commit
+            )
+
+            if business_rejection_code is not None:
+                enums.parse_enum(
+                    "project_registration_operation.rejection_code", business_rejection_code
+                )
+                status = "REJECTED"
+                sorted_diagnostics = sorted(
+                    diagnostics or [], key=lambda item: (item.get("code", ""), item.get("path", ""))
+                )
+                body = self._project_registration_public_body(
+                    idempotency_key=idempotency_key,
+                    mode=mode,
+                    status=status,
+                    rejection_code=business_rejection_code,
+                    diagnostics=sorted_diagnostics,
+                )
+                http_status = self._project_registration_http_status(
+                    status=status, rejection_code=business_rejection_code
+                )
+                body_json = canonical_json_text(body)
+                resp_digest = response_digest(
+                    {"http_status": http_status, "body": _response_digest_preimage(body)}
+                )
+                res_digest = resolution_digest(
+                    {
+                        "request_digest": req_digest,
+                        "authorization_context_digest": authorization_context_digest,
+                        "installation_or_account_ref": installation_or_account_ref,
+                        "resolved_forge_instance_id": None,
+                        "resolved_repository_external_id": resolved_repository_external_id,
+                        "resolved_base_commit": resolved_base_commit,
+                        "resolved_forge_api_secret_ref": None,
+                        "resolved_source_read_secret_ref": None,
+                        "resolved_publication_secret_ref": None,
+                        "result_work_item_discovery_schedule_id": None,
+                    }
+                )
+                self._insert_project_registration_operation(
+                    operation_id=operation_id,
+                    authenticated_principal_id=authenticated_principal_id,
+                    idempotency_key=idempotency_key,
+                    mode=mode,
+                    requested_project_id=requested_project_id,
+                    expected_registration_revision=expected_revision,
+                    installation_or_account_ref=installation_or_account_ref,
+                    request_json=request_json,
+                    request_digest=req_digest,
+                    authorization_context_digest=authorization_context_digest,
+                    resolved_forge_instance_id=None,
+                    resolved_repository_external_id=resolved_repository_external_id,
+                    resolved_base_commit_json=base_commit_json,
+                    forge_api_secret_id=None,
+                    forge_api_secret_version=None,
+                    source_read_secret_id=None,
+                    source_read_secret_version=None,
+                    publication_secret_id=None,
+                    publication_secret_version=None,
+                    resolution_digest=res_digest,
+                    status=status,
+                    result_project_id=None,
+                    result_registration_revision=None,
+                    result_schedule_id=None,
+                    rejection_code=business_rejection_code,
+                    response_http_status=http_status,
+                    response_json=body_json,
+                    response_digest=resp_digest,
+                    completed_at_ms=now,
+                )
+            else:
+                if (
+                    resolved_forge_api_secret_id is None
+                    or resolved_forge_api_secret_version is None
+                    or resolved_source_read_secret_id is None
+                    or resolved_source_read_secret_version is None
+                    or resolved_publication_secret_id is None
+                    or resolved_publication_secret_version is None
+                    or resolved_repository_external_id is None
+                    or resolved_repository_locator is None
+                    or resolved_base_commit is None
+                    or workflow_hash is None
+                    or policy_hash is None
+                    or readiness is None
+                ):
+                    raise ValueError("successful registration requires complete secret resolution")
+                require_lowercase_uuid(resolved_forge_api_secret_id, field="forge_api_secret_id")
+                require_lowercase_uuid(
+                    resolved_source_read_secret_id, field="source_read_secret_id"
+                )
+                require_lowercase_uuid(
+                    resolved_publication_secret_id, field="publication_secret_id"
+                )
+                _require_digest(workflow_hash, field="workflow_hash")
+                _require_digest(policy_hash, field="policy_hash")
+                if resolved_source_read_secret_id == resolved_publication_secret_id:
+                    raise ValueError("source-read and publication Secret IDs must differ")
+
+                forge_row = self.conn.execute(
+                    "SELECT * FROM forge_instances WHERE canonical_origin = ?",
+                    (canonical_origin,),
+                ).fetchone()
+                if forge_row is None:
+                    forge_instance_id = str(uuid.uuid4())
+                    self.conn.execute(
+                        "INSERT INTO forge_instances("
+                        "forge_instance_id, adapter_kind, canonical_origin, "
+                        "credential_secret_id, registration_provenance_version, created_at_ms) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            forge_instance_id,
+                            adapter_kind,
+                            canonical_origin,
+                            resolved_forge_api_secret_id,
+                            resolved_forge_api_secret_version,
+                            now,
+                        ),
+                    )
+                else:
+                    forge_instance_id = forge_row["forge_instance_id"]
+                    if forge_row["credential_secret_id"] != resolved_forge_api_secret_id:
+                        raise CasMismatchError(
+                            "registration cannot rewrite an existing Forge Instance credential"
+                        )
+
+                owner = self.conn.execute(
+                    "SELECT * FROM projects WHERE forge_instance_id = ? "
+                    "AND repository_external_id = ?",
+                    (forge_instance_id, resolved_repository_external_id),
+                ).fetchone()
+                if owner is not None and (
+                    mode == "REGISTER" or owner["project_id"] != requested_project_id
+                ):
+                    status = "REJECTED"
+                    body = self._project_registration_public_body(
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        status=status,
+                        rejection_code="STABLE_REPOSITORY_OWNERSHIP_CONFLICT",
+                        diagnostics=[
+                            {
+                                "code": "STABLE_REPOSITORY_OWNERSHIP_CONFLICT",
+                                "message": "repository is already registered to another Project",
+                                "path": "forge.repository_locator",
+                            }
+                        ],
+                    )
+                    http_status = 409
+                    body_json = canonical_json_text(body)
+                    resp_digest = response_digest(
+                        {"http_status": http_status, "body": _response_digest_preimage(body)}
+                    )
+                    res_digest = resolution_digest(
+                        {
+                            "request_digest": req_digest,
+                            "authorization_context_digest": authorization_context_digest,
+                            "installation_or_account_ref": installation_or_account_ref,
+                            "resolved_forge_instance_id": forge_instance_id,
+                            "resolved_repository_external_id": resolved_repository_external_id,
+                            "resolved_base_commit": resolved_base_commit,
+                            "resolved_forge_api_secret_ref": None,
+                            "resolved_source_read_secret_ref": None,
+                            "resolved_publication_secret_ref": None,
+                            "result_work_item_discovery_schedule_id": None,
+                        }
+                    )
+                    self._insert_project_registration_operation(
+                        operation_id=operation_id,
+                        authenticated_principal_id=authenticated_principal_id,
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        requested_project_id=requested_project_id,
+                        expected_registration_revision=expected_revision,
+                        installation_or_account_ref=installation_or_account_ref,
+                        request_json=request_json,
+                        request_digest=req_digest,
+                        authorization_context_digest=authorization_context_digest,
+                        resolved_forge_instance_id=forge_instance_id,
+                        resolved_repository_external_id=resolved_repository_external_id,
+                        resolved_base_commit_json=base_commit_json,
+                        forge_api_secret_id=None,
+                        forge_api_secret_version=None,
+                        source_read_secret_id=None,
+                        source_read_secret_version=None,
+                        publication_secret_id=None,
+                        publication_secret_version=None,
+                        resolution_digest=res_digest,
+                        status=status,
+                        result_project_id=None,
+                        result_registration_revision=None,
+                        result_schedule_id=None,
+                        rejection_code="STABLE_REPOSITORY_OWNERSHIP_CONFLICT",
+                        response_http_status=http_status,
+                        response_json=body_json,
+                        response_digest=resp_digest,
+                        completed_at_ms=now,
+                    )
+                elif mode == "REGISTER":
+                    project_id = str(uuid.uuid4())
+                    schedule_id = str(uuid.uuid4())
+                    self.conn.execute(
+                        "INSERT INTO forge_observation_schedules("
+                        "forge_observation_schedule_id, schedule_kind, schedule_revision, state, "
+                        "target_kind, target_id, run_id, publication_id, last_request_id, "
+                        "last_observation_id, next_due_at_ms, created_at_ms) "
+                        "VALUES (?, 'WORK_ITEM_DISCOVERY', 0, 'ACTIVE', 'PROJECT', ?, "
+                        "NULL, NULL, NULL, NULL, ?, ?)",
+                        (schedule_id, project_id, now, now),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO projects("
+                        "project_id, forge_instance_id, installation_or_account_ref, "
+                        "repository_external_id, repository_locator, default_ref, "
+                        "trusted_base_policy_ref, budget_policy_ref, budget_reset_window_ref, "
+                        "source_read_secret_id, publication_secret_id, "
+                        "registration_source_read_secret_version, "
+                        "registration_publication_secret_version, registration_revision, "
+                        "registration_operation_id, work_item_discovery_schedule_id, "
+                        "registration_state) VALUES ("
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'ACTIVE')",
+                        (
+                            project_id,
+                            forge_instance_id,
+                            installation_or_account_ref,
+                            resolved_repository_external_id,
+                            resolved_repository_locator,
+                            default_ref,
+                            trusted_base_policy_ref,
+                            budget_policy_ref,
+                            budget_reset_window_ref,
+                            resolved_source_read_secret_id,
+                            resolved_publication_secret_id,
+                            resolved_source_read_secret_version,
+                            resolved_publication_secret_version,
+                            operation_id,
+                            schedule_id,
+                        ),
+                    )
+                    body = self._project_registration_public_body(
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        status="SUCCEEDED",
+                        project_id=project_id,
+                        registration_revision=1,
+                        forge_instance_id=forge_instance_id,
+                        installation_or_account_ref=installation_or_account_ref,
+                        repository_external_id=resolved_repository_external_id,
+                        repository_locator=resolved_repository_locator,
+                        default_ref=default_ref,
+                        trusted_base_commit=dict(resolved_base_commit),
+                        workflow_hash=workflow_hash,
+                        policy_hash=policy_hash,
+                        trusted_base_policy_ref=trusted_base_policy_ref,
+                        budget_policy_ref=budget_policy_ref,
+                        budget_reset_window_ref=budget_reset_window_ref,
+                        readiness=dict(readiness),
+                    )
+                    http_status = 200
+                    body_json = canonical_json_text(body)
+                    resp_digest = response_digest(
+                        {"http_status": http_status, "body": _response_digest_preimage(body)}
+                    )
+                    res_digest = resolution_digest(
+                        {
+                            "request_digest": req_digest,
+                            "authorization_context_digest": authorization_context_digest,
+                            "installation_or_account_ref": installation_or_account_ref,
+                            "resolved_forge_instance_id": forge_instance_id,
+                            "resolved_repository_external_id": resolved_repository_external_id,
+                            "resolved_base_commit": resolved_base_commit,
+                            "resolved_forge_api_secret_ref": {
+                                "secret_id": resolved_forge_api_secret_id,
+                                "version": resolved_forge_api_secret_version,
+                            },
+                            "resolved_source_read_secret_ref": {
+                                "secret_id": resolved_source_read_secret_id,
+                                "version": resolved_source_read_secret_version,
+                            },
+                            "resolved_publication_secret_ref": {
+                                "secret_id": resolved_publication_secret_id,
+                                "version": resolved_publication_secret_version,
+                            },
+                            "result_work_item_discovery_schedule_id": schedule_id,
+                        }
+                    )
+                    self._insert_project_registration_operation(
+                        operation_id=operation_id,
+                        authenticated_principal_id=authenticated_principal_id,
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        requested_project_id=requested_project_id,
+                        expected_registration_revision=expected_revision,
+                        installation_or_account_ref=installation_or_account_ref,
+                        request_json=request_json,
+                        request_digest=req_digest,
+                        authorization_context_digest=authorization_context_digest,
+                        resolved_forge_instance_id=forge_instance_id,
+                        resolved_repository_external_id=resolved_repository_external_id,
+                        resolved_base_commit_json=base_commit_json,
+                        forge_api_secret_id=resolved_forge_api_secret_id,
+                        forge_api_secret_version=resolved_forge_api_secret_version,
+                        source_read_secret_id=resolved_source_read_secret_id,
+                        source_read_secret_version=resolved_source_read_secret_version,
+                        publication_secret_id=resolved_publication_secret_id,
+                        publication_secret_version=resolved_publication_secret_version,
+                        resolution_digest=res_digest,
+                        status="SUCCEEDED",
+                        result_project_id=project_id,
+                        result_registration_revision=1,
+                        result_schedule_id=schedule_id,
+                        rejection_code=None,
+                        response_http_status=http_status,
+                        response_json=body_json,
+                        response_digest=resp_digest,
+                        completed_at_ms=now,
+                    )
+                else:
+                    assert requested_project_id is not None
+                    assert expected_revision is not None
+                    project_id = requested_project_id
+                    current = self.get_project(project_id)
+                    assert current is not None
+                    if current.forge_instance_id != forge_instance_id:
+                        raise CasMismatchError(
+                            "revalidation cannot rewrite Forge Instance identity"
+                        )
+                    if current.repository_external_id != resolved_repository_external_id:
+                        raise CasMismatchError("revalidation cannot rewrite stable repository id")
+                    if current.installation_or_account_ref != installation_or_account_ref:
+                        raise CasMismatchError("revalidation cannot rewrite installation binding")
+                    if (
+                        current.source_read_secret_id != resolved_source_read_secret_id
+                        or current.publication_secret_id != resolved_publication_secret_id
+                    ):
+                        raise CasMismatchError("revalidation cannot substitute Project secrets")
+                    new_revision = expected_revision + 1
+                    schedule_id = current.work_item_discovery_schedule_id
+                    updated = self.conn.execute(
+                        "UPDATE projects SET repository_locator = ?, "
+                        "registration_source_read_secret_version = ?, "
+                        "registration_publication_secret_version = ?, "
+                        "registration_revision = ?, registration_operation_id = ? "
+                        "WHERE project_id = ? AND registration_revision = ?",
+                        (
+                            resolved_repository_locator,
+                            resolved_source_read_secret_version,
+                            resolved_publication_secret_version,
+                            new_revision,
+                            operation_id,
+                            project_id,
+                            expected_revision,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise CasMismatchError("registration revision CAS mismatch")
+                    body = self._project_registration_public_body(
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        status="SUCCEEDED",
+                        project_id=project_id,
+                        registration_revision=new_revision,
+                        forge_instance_id=forge_instance_id,
+                        installation_or_account_ref=installation_or_account_ref,
+                        repository_external_id=resolved_repository_external_id,
+                        repository_locator=resolved_repository_locator,
+                        default_ref=default_ref,
+                        trusted_base_commit=dict(resolved_base_commit),
+                        workflow_hash=workflow_hash,
+                        policy_hash=policy_hash,
+                        trusted_base_policy_ref=trusted_base_policy_ref,
+                        budget_policy_ref=budget_policy_ref,
+                        budget_reset_window_ref=budget_reset_window_ref,
+                        readiness=dict(readiness),
+                    )
+                    http_status = 200
+                    body_json = canonical_json_text(body)
+                    resp_digest = response_digest(
+                        {"http_status": http_status, "body": _response_digest_preimage(body)}
+                    )
+                    res_digest = resolution_digest(
+                        {
+                            "request_digest": req_digest,
+                            "authorization_context_digest": authorization_context_digest,
+                            "installation_or_account_ref": installation_or_account_ref,
+                            "resolved_forge_instance_id": forge_instance_id,
+                            "resolved_repository_external_id": resolved_repository_external_id,
+                            "resolved_base_commit": resolved_base_commit,
+                            "resolved_forge_api_secret_ref": {
+                                "secret_id": resolved_forge_api_secret_id,
+                                "version": resolved_forge_api_secret_version,
+                            },
+                            "resolved_source_read_secret_ref": {
+                                "secret_id": resolved_source_read_secret_id,
+                                "version": resolved_source_read_secret_version,
+                            },
+                            "resolved_publication_secret_ref": {
+                                "secret_id": resolved_publication_secret_id,
+                                "version": resolved_publication_secret_version,
+                            },
+                            "result_work_item_discovery_schedule_id": schedule_id,
+                        }
+                    )
+                    self._insert_project_registration_operation(
+                        operation_id=operation_id,
+                        authenticated_principal_id=authenticated_principal_id,
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        requested_project_id=requested_project_id,
+                        expected_registration_revision=expected_revision,
+                        installation_or_account_ref=installation_or_account_ref,
+                        request_json=request_json,
+                        request_digest=req_digest,
+                        authorization_context_digest=authorization_context_digest,
+                        resolved_forge_instance_id=forge_instance_id,
+                        resolved_repository_external_id=resolved_repository_external_id,
+                        resolved_base_commit_json=base_commit_json,
+                        forge_api_secret_id=resolved_forge_api_secret_id,
+                        forge_api_secret_version=resolved_forge_api_secret_version,
+                        source_read_secret_id=resolved_source_read_secret_id,
+                        source_read_secret_version=resolved_source_read_secret_version,
+                        publication_secret_id=resolved_publication_secret_id,
+                        publication_secret_version=resolved_publication_secret_version,
+                        resolution_digest=res_digest,
+                        status="SUCCEEDED",
+                        result_project_id=project_id,
+                        result_registration_revision=new_revision,
+                        result_schedule_id=schedule_id,
+                        rejection_code=None,
+                        response_http_status=http_status,
+                        response_json=body_json,
+                        response_digest=resp_digest,
+                        completed_at_ms=now,
+                    )
+
+            row = self.conn.execute(
+                "SELECT * FROM project_registration_operations "
+                "WHERE project_registration_operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_project_registration_operation(row, replayed=False)
 
     def create_run(
         self,

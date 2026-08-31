@@ -1,12 +1,8 @@
 """``orcest project`` -- the local CLI contract for repository-owned ``.orcest`` bundles.
 
-Implements the four commands ``docs/wiki/repository-configuration.md``'s
-"Local CLI contract" assigns to this leaf (workflow-control-v1-id V1-06,
-issue #673): ``init``, ``lint``, ``explain``, ``simulate``. ``onboard`` (the
-authenticated project-registration endpoint) belongs to a separate leaf
-(#674, "add authenticated project onboarding and registration") and is not
-implemented here -- these four commands never contact a server and never
-mutate one.
+``init``, ``lint``, ``explain``, and ``simulate`` never contact a server.
+``onboard`` is the authenticated HTTPS project-registration client: it never
+SSHes to Proxmox and never writes a secret value locally.
 
 Canonical output/exit contract for ``lint``/``explain``/``simulate``:
 
@@ -21,11 +17,15 @@ Canonical output/exit contract for ``lint``/``explain``/``simulate``:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import click
+import yaml
 
 from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.project_bundle import BUNDLE_ROOT, BundleValidationError
@@ -37,6 +37,7 @@ from orcest.workflow_contract.v1.project_bundle_source import (
     resolve_default_branch_revision,
 )
 from orcest.workflow_contract.v1.project_bundle_yaml import YamlParseError
+from orcest.workflow_contract.v1.protocol_registry import PROJECT_REGISTRATION_PROTOCOL
 
 _EXIT_OK = 0
 _EXIT_INVALID = 1
@@ -371,6 +372,134 @@ def project_simulate(event_fixture: str, revision: str | None) -> None:
             },
         }
     )
+    raise SystemExit(_EXIT_OK)
+
+
+def _server_profiles_dir() -> Path:
+    override = os.environ.get("ORCEST_SERVER_PROFILES")
+    if override:
+        return Path(override)
+    return Path.home() / ".config" / "orcest" / "servers"
+
+
+def _load_server_profile(name: str) -> dict[str, Any]:
+    path = Path(name)
+    if path.suffix in {".yaml", ".yml"} and path.is_file():
+        profile_path = path
+    else:
+        if any(sep in name for sep in ("/", "\\", "..")) or not name:
+            click.echo("error: --server must be a registered profile name", err=True)
+            raise SystemExit(_EXIT_ENVIRONMENT)
+        profile_path = _server_profiles_dir() / f"{name}.yaml"
+    try:
+        raw = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        click.echo(f"error: server profile {profile_path} was not found", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    except OSError as exc:
+        click.echo(f"error: could not read server profile: {exc}", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    if not isinstance(raw, dict):
+        click.echo("error: server profile must be a YAML mapping", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    if raw.get("insecure") or raw.get("verify") is False or raw.get("tls_verify") is False:
+        click.echo("error: --server cannot disable TLS certificate validation", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    url = raw.get("url")
+    if not isinstance(url, str):
+        click.echo("error: server profile is missing url", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        click.echo("error: server URL must be HTTPS with a hostname", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    hostname = raw.get("hostname", parsed.hostname)
+    if hostname != parsed.hostname:
+        click.echo("error: server profile hostname must match the URL hostname", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    for required in (
+        "ca_file",
+        "client_cert",
+        "client_key",
+        "installation_or_account_ref",
+        "trusted_base_policy_ref",
+        "budget_policy_ref",
+        "budget_reset_window_ref",
+        "canonical_origin",
+    ):
+        if not isinstance(raw.get(required), str) or not raw[required]:
+            click.echo(f"error: server profile is missing {required}", err=True)
+            raise SystemExit(_EXIT_ENVIRONMENT)
+    return raw
+
+
+@project.command("onboard")
+@click.option("--server", "server_profile", required=True, help="Registered HTTPS server profile.")
+@click.option("--repo", "repository_locator", required=True, help="Forge repository locator.")
+@click.option(
+    "--idempotency-key",
+    default=None,
+    help="Lowercase UUID replay key. Generated if omitted; never a secret.",
+)
+@click.option("--project-id", default=None, help="Existing Project UUID for REVALIDATE.")
+@click.option(
+    "--expected-registration-revision",
+    type=int,
+    default=None,
+    help="Current Project registration revision for REVALIDATE CAS.",
+)
+def project_onboard(
+    server_profile: str,
+    repository_locator: str,
+    idempotency_key: str | None,
+    project_id: str | None,
+    expected_registration_revision: int | None,
+) -> None:
+    """Send an authenticated HTTPS project-registration request. Never uses SSH."""
+    import requests
+
+    profile = _load_server_profile(server_profile)
+    key = idempotency_key or str(uuid.uuid4())
+    body = {
+        "protocol": PROJECT_REGISTRATION_PROTOCOL,
+        "idempotency_key": key,
+        "project_id": project_id,
+        "expected_registration_revision": expected_registration_revision,
+        "forge": {
+            "adapter_kind": profile.get("adapter_kind", "GITHUB"),
+            "canonical_origin": profile["canonical_origin"],
+            "installation_or_account_ref": profile["installation_or_account_ref"],
+            "repository_locator": repository_locator,
+        },
+        "requested_default_ref": profile.get("requested_default_ref", "refs/heads/main"),
+        "trusted_base_policy_ref": profile["trusted_base_policy_ref"],
+        "budget_policy_ref": profile["budget_policy_ref"],
+        "budget_reset_window_ref": profile["budget_reset_window_ref"],
+    }
+    url = profile["url"].rstrip("/") + "/api/v1/projects/registrations"
+    try:
+        response = requests.post(
+            url,
+            json=body,
+            headers={"Idempotency-Key": key, "Content-Type": "application/json"},
+            cert=(profile["client_cert"], profile["client_key"]),
+            verify=profile["ca_file"],
+            timeout=60,
+        )
+    except requests.exceptions.SSLError as exc:
+        click.echo(f"error: TLS validation failed: {exc}", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    except requests.exceptions.RequestException as exc:
+        click.echo(f"error: registration request failed: {exc}", err=True)
+        raise SystemExit(_EXIT_ENVIRONMENT) from exc
+    try:
+        payload = response.json()
+    except ValueError:
+        click.echo(response.text)
+        raise SystemExit(_EXIT_ENVIRONMENT)
+    _print_json(payload)
+    if response.status_code >= 400:
+        raise SystemExit(_EXIT_INVALID)
     raise SystemExit(_EXIT_OK)
 
 
