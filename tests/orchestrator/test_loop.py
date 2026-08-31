@@ -10,11 +10,6 @@ import time
 
 import pytest
 
-from orcest.orchestrator.github_delivery_verifier import (
-    DeliveryErrorKind,
-    DeliveryFailureReason,
-    DeliveryVerification,
-)
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
     has_usage_exhausted_cooldown as has_issue_usage_exhausted_cooldown,
@@ -33,8 +28,6 @@ from orcest.orchestrator.loop import (
     _is_merge_conflict_error,
     _is_required_checks_expected_error,
     _is_stale_head_error,
-    _issue_delivery_counter_key,
-    _issue_delivery_evidence_key,
     _make_review_rerun_failure_cooldown_key,
     _mark_usage_exhausted_token,
     _merge_status_indicates_conflict,
@@ -1298,10 +1291,17 @@ def test_consume_results_completed_pr_attempt_guard_is_retry_budget_not_active_w
     assert results[0].action == PRAction.ENQUEUE_FIX
 
 
-def test_consume_results_completed_issue_clears_attempts(
+def test_consume_results_completed_issue_admits_verification_job(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """Completed issue tasks keep the existing issue behavior."""
+    """Completed issue tasks admit a verification job and do not clear ready yet."""
+    from orcest.orchestrator.issue_delivery import (
+        VerificationState,
+        get_verification_job,
+        has_issue_dispatch_barrier,
+    )
+    from orcest.orchestrator.issue_publication import make_issue_dispatch_barrier_key
+
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
 
     repo = orchestrator_config.github.repo
@@ -1319,34 +1319,25 @@ def test_consume_results_completed_issue_clears_attempts(
     logger = logging.getLogger("test")
     _consume_results(orchestrator_config, fake_redis_client, logger)
 
-    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
-    gh_mock.remove_issue_label.assert_called_once()
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+    gh_mock.remove_issue_label.assert_not_called()
+    job = get_verification_job(fake_redis_client, repo, issue_number, 0)
+    assert job is not None
+    assert job.state is VerificationState.PENDING
+    assert has_issue_dispatch_barrier(fake_redis_client, repo, issue_number)
+    assert fake_redis_client.exists(make_issue_dispatch_barrier_key(repo, issue_number))
 
 
-def test_consume_results_completed_issue_records_delivery_shadow_evidence(
+def test_consume_results_completed_issue_disabled_verifier_keeps_legacy_path(
     fake_redis_client, orchestrator_config, gh_mock
 ):
-    """Completed issue tasks write verifier evidence without changing existing side effects."""
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    """enabled=false restores immediate ready-label removal."""
+    from orcest.shared.config import IssueDeliveryVerifierConfig
 
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     repo = orchestrator_config.github.repo
     issue_number = 44
-    verification = DeliveryVerification(
-        verified=True,
-        error_kind=DeliveryErrorKind.NONE,
-        reason=DeliveryFailureReason.VERIFIED,
-        repo=repo,
-        issue_number=issue_number,
-        default_branch="master",
-        default_branch_oid="b" * 40,
-        expected_head_ref="issue-44-work",
-        expected_head_oid="a" * 40,
-        live_head_oid="a" * 40,
-        complete=True,
-        message="verified",
-    )
-    gh_mock.verify_issue_delivery.return_value = verification
-
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
     result = _make_task_result(
         status=ResultStatus.COMPLETED,
         resource_type="issue",
@@ -1356,26 +1347,16 @@ def test_consume_results_completed_issue_records_delivery_shadow_evidence(
     )
     fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
-    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
 
-    gh_mock.verify_issue_delivery.assert_called_once_with(
-        repo,
-        issue_number,
-        "issue-44-work",
-        "a" * 40,
-        orchestrator_config.github.token,
-    )
-    evidence = fake_redis_client.hgetall(
-        _issue_delivery_evidence_key(repo, issue_number, result.task_id)
-    )
-    assert evidence["verified"] == "1"
-    assert evidence["candidate_pr_count"] == "0"
-    assert (
-        fake_redis_client.get(
-            _issue_delivery_counter_key(DeliveryErrorKind.NONE, DeliveryFailureReason.VERIFIED)
-        )
-        == "1"
-    )
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
     gh_mock.remove_issue_label.assert_called_once()
 
 
@@ -2369,12 +2350,14 @@ def test_handle_result_post_comment_failure(
     gh_mock.post_comment.assert_called_once()
 
 
-def test_completed_issue_label_failure_stays_pending_then_retries(
+def test_completed_issue_does_not_call_github_during_result_admission(
     fake_redis_client,
     orchestrator_config,
     gh_mock,
-    mocker,
 ):
+    """Completed issue results ACK after job admission without mutating GitHub."""
+    from orcest.orchestrator.issue_delivery import get_verification_job
+
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     repo = orchestrator_config.github.repo
     issue_number = 92
@@ -2387,29 +2370,61 @@ def test_completed_issue_label_failure_stays_pending_then_retries(
     )
     increment_issue_attempts(fake_redis_client, repo, issue_number)
     set_pending_task(fake_redis_client, repo, "issue", issue_number, result.task_id)
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    gh_mock.remove_issue_label.side_effect = [RuntimeError("GitHub down"), None]
+    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    gh_mock.remove_issue_label.side_effect = RuntimeError("GitHub down")
 
     _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) == result.task_id
-    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 1
+    gh_mock.remove_issue_label.assert_not_called()
+    assert get_verification_job(fake_redis_client, repo, issue_number, 0) is not None
     assert (
         fake_redis_client.client.xpending(
             fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
         )["pending"]
-        == 1
+        == 0
     )
 
-    mocker.patch.object(
-        fake_redis_client,
-        "xreadgroup",
-        side_effect=[[(entry_id, result.to_dict())], [], []],
+
+def test_completed_issue_job_admission_mismatch_is_quarantined(
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """A pre-schema generation-0 job collision is alerted before ACK."""
+    from orcest.orchestrator.issue_delivery import (
+        get_verification_job,
+        list_quarantined_conflicts,
     )
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 93
+    first = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-1",
+        branch="",
+    )
+    second = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        task_id="legacy-completed-2",
+        branch="",
+    )
+    fake_redis_client.xadd(RESULTS_STREAM, first.to_dict())
+    fake_redis_client.xadd(RESULTS_STREAM, second.to_dict())
+
     _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
 
-    assert get_pending_task(fake_redis_client, repo, "issue", issue_number) is None
-    assert gh_mock.remove_issue_label.call_count == 2
+    assert get_verification_job(fake_redis_client, repo, issue_number, 0) is not None
+    items = list_quarantined_conflicts(fake_redis_client)
+    assert items[0]["task_id"] == "legacy-completed-2"
+    assert items[0]["reason"] == "verification_job_mismatch"
+    gh_mock.remove_issue_label.assert_not_called()
     assert (
         fake_redis_client.client.xpending(
             fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP

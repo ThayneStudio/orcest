@@ -572,6 +572,233 @@ def _fetch_candidate_prs(
     return tuple(candidates), pages, closing_pages
 
 
+def normalize_head_ref(ref: str) -> str:
+    """Return a branch name without ``refs/`` or ``heads/`` prefixes."""
+    value = (ref or "").strip()
+    value = value.removeprefix("refs/")
+    value = value.removeprefix("heads/")
+    return value
+
+
+def candidate_qualifies(
+    pr: CandidatePullRequest,
+    *,
+    repo: str,
+    issue_number: int,
+    expected_head_owner: str,
+    expected_head_ref: str,
+    default_branch: str,
+    live_head_oid: str,
+) -> bool:
+    """Return True when *pr* is a fully observed, usable issue handoff."""
+    head_ref = normalize_head_ref(expected_head_ref)
+    if not head_ref or not default_branch or not live_head_oid:
+        return False
+    if not _OID_RE.fullmatch(live_head_oid):
+        return False
+    if pr.state.upper() != "OPEN" or pr.is_draft:
+        return False
+    if pr.base_repository != repo or pr.head_repository != repo:
+        return False
+    owner = expected_head_owner or repo.split("/", 1)[0]
+    head_owner = pr.head_repository.split("/", 1)[0]
+    if head_owner != owner:
+        return False
+    if pr.head_ref_name != head_ref:
+        return False
+    if pr.base_ref_name != default_branch:
+        return False
+    if not pr.head_oid or not _OID_RE.fullmatch(pr.head_oid):
+        return False
+    if pr.head_oid != live_head_oid:
+        return False
+    return any(
+        ref.repository == repo and ref.number == issue_number
+        for ref in pr.closing_issues_references
+    )
+
+
+@dataclass(frozen=True)
+class HandoffObservation:
+    """Live-GitHub observation used by durable delivery verification."""
+
+    verified: bool
+    error_kind: DeliveryErrorKind
+    reason: DeliveryFailureReason
+    repo: str
+    issue_number: int
+    default_branch: str
+    default_branch_oid: str
+    expected_head_ref: str
+    claimed_head_oid: str
+    live_head_oid: str
+    complete: bool
+    echo_mismatch: bool = False
+    ambiguous: bool = False
+    selected_pr: CandidatePullRequest | None = None
+    qualifying_prs: tuple[CandidatePullRequest, ...] = field(default_factory=tuple)
+    candidate_prs: tuple[CandidatePullRequest, ...] = field(default_factory=tuple)
+    pages_fetched: int = 0
+    closing_pages_fetched: int = 0
+    message: str = ""
+
+    def to_shadow_fields(self) -> dict[str, str]:
+        urls = [pr.url for pr in self.qualifying_prs[:10] or self.candidate_prs[:10]]
+        selected = self.selected_pr
+        return {
+            "verified": "1" if self.verified else "0",
+            "error_kind": self.error_kind.value,
+            "reason": self.reason.value,
+            "repo": self.repo,
+            "issue_number": str(self.issue_number),
+            "default_branch": self.default_branch[:120],
+            "default_branch_oid": self.default_branch_oid,
+            "expected_head_ref": self.expected_head_ref[:240],
+            "claimed_head_oid": self.claimed_head_oid,
+            "live_head_oid": self.live_head_oid,
+            "candidate_pr_count": str(len(self.candidate_prs)),
+            "qualifying_pr_count": str(len(self.qualifying_prs)),
+            "selected_pr_number": "" if selected is None else str(selected.number),
+            "matching_pr_numbers": ",".join(str(pr.number) for pr in self.qualifying_prs[:20]),
+            "candidate_pr_urls": json.dumps(urls, separators=(",", ":")),
+            "pages_fetched": str(self.pages_fetched),
+            "closing_pages_fetched": str(self.closing_pages_fetched),
+            "complete": "1" if self.complete else "0",
+            "echo_mismatch": "1" if self.echo_mismatch else "0",
+            "ambiguous": "1" if self.ambiguous else "0",
+            "message": self.message[:500],
+        }
+
+
+def observe_issue_handoff(
+    repo: str,
+    issue_number: int,
+    expected_head_ref: str,
+    token: str,
+    *,
+    expected_head_owner: str = "",
+    claimed_head_oid: str = "",
+    claimed_branch: str = "",
+    expected_default_branch: str | None = None,
+    page_cap: int = _DEFAULT_PAGE_CAP,
+    pre_schema: bool = False,
+) -> HandoffObservation:
+    """Observe live GitHub state for an issue implementation handoff.
+
+    Provider echoes (``claimed_head_oid`` / ``claimed_branch``) are diagnostic
+    only: a mismatch cannot verify or invalidate an otherwise qualifying PR.
+    """
+    gh._validate_repo(repo)
+    head_ref = normalize_head_ref(expected_head_ref)
+    if page_cap < 1:
+        raise ValueError("page_cap must be positive")
+    if pre_schema:
+        return _observe_pre_schema_handoff(
+            repo,
+            issue_number,
+            token,
+            claimed_head_oid=claimed_head_oid,
+            claimed_branch=claimed_branch,
+            page_cap=page_cap,
+        )
+    if not head_ref:
+        return _handoff_failure(
+            repo,
+            issue_number,
+            "",
+            claimed_head_oid,
+            DeliveryErrorKind.MISMATCH,
+            DeliveryFailureReason.HEAD_REF_NOT_FOUND,
+            "expected head ref was empty",
+            complete=True,
+        )
+    try:
+        default_branch, default_oid, live_oid = _fetch_repository_boundary(repo, token, head_ref)
+        echo_mismatch = _echo_mismatch(claimed_head_oid, claimed_branch, live_oid, head_ref)
+        if expected_default_branch is not None and default_branch != expected_default_branch:
+            return _handoff_failure(
+                repo,
+                issue_number,
+                head_ref,
+                claimed_head_oid,
+                DeliveryErrorKind.MISMATCH,
+                DeliveryFailureReason.DEFAULT_BRANCH_MISMATCH,
+                f"default branch was {default_branch}, expected {expected_default_branch}",
+                default_branch=default_branch,
+                default_branch_oid=default_oid,
+                live_head_oid=live_oid,
+                complete=True,
+                echo_mismatch=echo_mismatch,
+            )
+        candidates, pr_pages, closing_pages = _fetch_candidate_prs(repo, token, head_ref, page_cap)
+        qualifying = tuple(
+            pr
+            for pr in candidates
+            if candidate_qualifies(
+                pr,
+                repo=repo,
+                issue_number=issue_number,
+                expected_head_owner=expected_head_owner or repo.split("/", 1)[0],
+                expected_head_ref=head_ref,
+                default_branch=default_branch,
+                live_head_oid=live_oid,
+            )
+        )
+        if qualifying:
+            selected = min(qualifying, key=lambda pr: pr.number)
+            ambiguous = len(qualifying) > 1
+            return HandoffObservation(
+                verified=True,
+                error_kind=DeliveryErrorKind.NONE,
+                reason=DeliveryFailureReason.VERIFIED,
+                repo=repo,
+                issue_number=issue_number,
+                default_branch=default_branch,
+                default_branch_oid=default_oid,
+                expected_head_ref=head_ref,
+                claimed_head_oid=claimed_head_oid,
+                live_head_oid=live_oid,
+                complete=True,
+                echo_mismatch=echo_mismatch,
+                ambiguous=ambiguous,
+                selected_pr=selected,
+                qualifying_prs=tuple(sorted(qualifying, key=lambda pr: pr.number)),
+                candidate_prs=candidates,
+                pages_fetched=pr_pages,
+                closing_pages_fetched=closing_pages,
+                message="verified from canonical GitHub closingIssuesReferences",
+            )
+        reason, message = _mismatch_reason(candidates, repo, issue_number)
+        return _handoff_failure(
+            repo,
+            issue_number,
+            head_ref,
+            claimed_head_oid,
+            DeliveryErrorKind.MISMATCH,
+            reason,
+            message,
+            default_branch=default_branch,
+            default_branch_oid=default_oid,
+            live_head_oid=live_oid,
+            candidate_prs=candidates,
+            pages_fetched=pr_pages,
+            closing_pages_fetched=closing_pages,
+            complete=True,
+            echo_mismatch=echo_mismatch,
+        )
+    except _VerificationAbort as exc:
+        return _handoff_failure(
+            repo,
+            issue_number,
+            head_ref,
+            claimed_head_oid,
+            exc.kind,
+            exc.reason,
+            exc.message,
+            echo_mismatch=_echo_mismatch(claimed_head_oid, claimed_branch, "", head_ref),
+        )
+
+
 def verify_issue_delivery(
     repo: str,
     issue_number: int,
@@ -743,3 +970,373 @@ def _failure(
         complete=complete,
         message=message,
     )
+
+
+def _echo_mismatch(
+    claimed_head_oid: str,
+    claimed_branch: str,
+    live_head_oid: str,
+    expected_head_ref: str,
+) -> bool:
+    claimed_oid = (claimed_head_oid or "").strip()
+    claimed_ref = normalize_head_ref(claimed_branch)
+    if claimed_oid and live_head_oid and claimed_oid != live_head_oid:
+        return True
+    if claimed_ref and expected_head_ref and claimed_ref != expected_head_ref:
+        return True
+    return False
+
+
+def _mismatch_reason(
+    candidates: tuple[CandidatePullRequest, ...],
+    repo: str,
+    issue_number: int,
+) -> tuple[DeliveryFailureReason, str]:
+    if not candidates:
+        return (
+            DeliveryFailureReason.NO_CANDIDATE_PR,
+            "no same-repository PR found for expected head ref",
+        )
+    if any(
+        any(
+            ref.repository == repo and ref.number == issue_number
+            for ref in pr.closing_issues_references
+        )
+        for pr in candidates
+    ):
+        return (
+            DeliveryFailureReason.NO_CANDIDATE_PR,
+            "candidate PRs existed but none were open, non-draft, matching, and OID-aligned",
+        )
+    return (
+        DeliveryFailureReason.NO_CANONICAL_CLOSING_REFERENCE,
+        "candidate PRs did not include the canonical closing issue relation",
+    )
+
+
+def _handoff_failure(
+    repo: str,
+    issue_number: int,
+    expected_head_ref: str,
+    claimed_head_oid: str,
+    kind: DeliveryErrorKind,
+    reason: DeliveryFailureReason,
+    message: str,
+    *,
+    default_branch: str = "",
+    default_branch_oid: str = "",
+    live_head_oid: str = "",
+    candidate_prs: tuple[CandidatePullRequest, ...] = (),
+    pages_fetched: int = 0,
+    closing_pages_fetched: int = 0,
+    complete: bool = False,
+    echo_mismatch: bool = False,
+) -> HandoffObservation:
+    return HandoffObservation(
+        verified=False,
+        error_kind=kind,
+        reason=reason,
+        repo=repo,
+        issue_number=issue_number,
+        default_branch=default_branch,
+        default_branch_oid=default_branch_oid,
+        expected_head_ref=expected_head_ref,
+        claimed_head_oid=claimed_head_oid,
+        live_head_oid=live_head_oid,
+        complete=complete,
+        echo_mismatch=echo_mismatch,
+        candidate_prs=candidate_prs,
+        pages_fetched=pages_fetched,
+        closing_pages_fetched=closing_pages_fetched,
+        message=message,
+    )
+
+
+_PRE_SCHEMA_TIMELINE_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    nameWithOwner
+    defaultBranchRef { name target { oid } }
+    issue(number: $number) {
+      timelineItems(
+        itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT],
+        first: 100,
+        after: $after
+      ) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on CrossReferencedEvent {
+            source {
+              __typename
+              ... on PullRequest {
+                number
+                url
+                state
+                isDraft
+                baseRefName
+                headRefName
+                headRefOid
+                baseRepository { nameWithOwner }
+                headRepository { nameWithOwner }
+                closingIssuesReferences(first: 100) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number
+                    url
+                    repository { nameWithOwner }
+                  }
+                }
+              }
+            }
+          }
+          ... on ConnectedEvent {
+            subject {
+              __typename
+              ... on PullRequest {
+                number
+                url
+                state
+                isDraft
+                baseRefName
+                headRefName
+                headRefOid
+                baseRepository { nameWithOwner }
+                headRepository { nameWithOwner }
+                closingIssuesReferences(first: 100) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number
+                    url
+                    repository { nameWithOwner }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _pr_from_timeline_node(
+    node: Any,
+    path: str,
+    repo: str,
+    token: str,
+    page_cap: int,
+) -> tuple[CandidatePullRequest | None, int]:
+    if not isinstance(node, dict):
+        return None, 0
+    typename = node.get("__typename")
+    payload: Any
+    if typename == "CrossReferencedEvent":
+        payload = node.get("source")
+    elif typename == "ConnectedEvent":
+        payload = node.get("subject")
+    else:
+        payload = node
+    if not isinstance(payload, dict):
+        return None, 0
+    if payload.get("__typename") not in (None, "PullRequest"):
+        return None, 0
+    if "number" not in payload:
+        return None, 0
+    initial_refs, closing_page_info = _parse_closing_refs(
+        payload.get("closingIssuesReferences"),
+        f"{path}.closingIssuesReferences",
+    )
+    pr_number = _expect_int(payload.get("number"), f"{path}.number")
+    refs, closing_pages = _fetch_remaining_closing_refs(
+        repo, token, pr_number, initial_refs, closing_page_info, page_cap
+    )
+    return (
+        CandidatePullRequest(
+            number=pr_number,
+            url=_expect_string(payload.get("url"), f"{path}.url"),
+            state=_expect_string(payload.get("state"), f"{path}.state"),
+            is_draft=_expect_bool(payload.get("isDraft"), f"{path}.isDraft"),
+            base_repository=_repository_name(
+                payload.get("baseRepository"), f"{path}.baseRepository"
+            ),
+            base_ref_name=_expect_string(payload.get("baseRefName"), f"{path}.baseRefName"),
+            head_repository=_repository_name(
+                payload.get("headRepository"), f"{path}.headRepository"
+            ),
+            head_ref_name=_expect_string(payload.get("headRefName"), f"{path}.headRefName"),
+            head_oid=_expect_string(payload.get("headRefOid"), f"{path}.headRefOid"),
+            closing_issues_references=refs,
+        ),
+        closing_pages,
+    )
+
+
+def _observe_pre_schema_handoff(
+    repo: str,
+    issue_number: int,
+    token: str,
+    *,
+    claimed_head_oid: str,
+    claimed_branch: str,
+    page_cap: int,
+) -> HandoffObservation:
+    """Prove a handoff by canonical closing relationship without a branch slug."""
+    owner, name = repo.split("/", 1)
+    try:
+        candidates: list[CandidatePullRequest] = []
+        seen_set: set[int] = set()
+        cursor: str | None = None
+        pages = 0
+        closing_pages = 0
+        default_branch = ""
+        default_oid = ""
+        live_oids: dict[str, str] = {}
+        while True:
+            if pages >= page_cap:
+                raise _VerificationAbort(
+                    DeliveryErrorKind.COMPLETENESS,
+                    DeliveryFailureReason.PAGE_CAP_EXCEEDED,
+                    "pre-schema issue timeline exceeded page cap",
+                )
+            data = _graphql(
+                repo,
+                token,
+                _PRE_SCHEMA_TIMELINE_QUERY,
+                {"owner": owner, "repo": name, "number": issue_number, "after": cursor},
+            )
+            repository = data.get("repository")
+            if repository is None:
+                raise _VerificationAbort(
+                    DeliveryErrorKind.NOT_FOUND,
+                    DeliveryFailureReason.REPOSITORY_NOT_FOUND,
+                    f"repository {repo} was not found",
+                )
+            repository = _expect_object(repository, "data.repository")
+            default_ref = _expect_object(
+                repository.get("defaultBranchRef"), "repository.defaultBranchRef"
+            )
+            default_branch = _expect_string(
+                default_ref.get("name"), "repository.defaultBranchRef.name"
+            )
+            default_oid = _expect_string(
+                _expect_object(default_ref.get("target"), "repository.defaultBranchRef.target").get(
+                    "oid"
+                ),
+                "repository.defaultBranchRef.target.oid",
+            )
+            issue = repository.get("issue")
+            if issue is None:
+                raise _VerificationAbort(
+                    DeliveryErrorKind.NOT_FOUND,
+                    DeliveryFailureReason.REPOSITORY_NOT_FOUND,
+                    f"issue #{issue_number} was not found in {repo}",
+                )
+            nodes, page_info = _connection_nodes(
+                _expect_object(issue, "repository.issue").get("timelineItems"),
+                "repository.issue.timelineItems",
+            )
+            pages += 1
+            for index, node in enumerate(nodes):
+                pr, extra_closing = _pr_from_timeline_node(
+                    node, f"timelineItems.nodes[{index}]", repo, token, page_cap
+                )
+                closing_pages += extra_closing
+                if pr is None or pr.number in seen_set:
+                    continue
+                seen_set.add(pr.number)
+                candidates.append(pr)
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                raise _VerificationAbort(
+                    DeliveryErrorKind.COMPLETENESS,
+                    DeliveryFailureReason.MISSING_CURSOR,
+                    "pre-schema timeline had hasNextPage=true and no endCursor",
+                )
+        qualifying: list[CandidatePullRequest] = []
+        for pr in candidates:
+            if pr.head_repository != repo:
+                continue
+            if pr.head_ref_name not in live_oids:
+                try:
+                    _default, _default_oid, live_oid = _fetch_repository_boundary(
+                        repo, token, pr.head_ref_name
+                    )
+                except _VerificationAbort as exc:
+                    if (
+                        exc.kind is DeliveryErrorKind.NOT_FOUND
+                        and exc.reason is DeliveryFailureReason.HEAD_REF_NOT_FOUND
+                    ):
+                        continue
+                    raise
+                live_oids[pr.head_ref_name] = live_oid
+            live_oid = live_oids[pr.head_ref_name]
+            if candidate_qualifies(
+                pr,
+                repo=repo,
+                issue_number=issue_number,
+                expected_head_owner=repo.split("/", 1)[0],
+                expected_head_ref=pr.head_ref_name,
+                default_branch=default_branch,
+                live_head_oid=live_oid,
+            ):
+                qualifying.append(pr)
+        selected_ref = qualifying[0].head_ref_name if qualifying else ""
+        selected_live = live_oids.get(selected_ref, "")
+        echo_mismatch = _echo_mismatch(
+            claimed_head_oid, claimed_branch, selected_live, selected_ref
+        )
+        if qualifying:
+            selected = min(qualifying, key=lambda pr: pr.number)
+            return HandoffObservation(
+                verified=True,
+                error_kind=DeliveryErrorKind.NONE,
+                reason=DeliveryFailureReason.VERIFIED,
+                repo=repo,
+                issue_number=issue_number,
+                default_branch=default_branch,
+                default_branch_oid=default_oid,
+                expected_head_ref=selected.head_ref_name,
+                claimed_head_oid=claimed_head_oid,
+                live_head_oid=live_oids.get(selected.head_ref_name, selected.head_oid),
+                complete=True,
+                echo_mismatch=echo_mismatch,
+                ambiguous=len(qualifying) > 1,
+                selected_pr=selected,
+                qualifying_prs=tuple(sorted(qualifying, key=lambda pr: pr.number)),
+                candidate_prs=tuple(candidates),
+                pages_fetched=pages,
+                closing_pages_fetched=closing_pages,
+                message="verified pre-schema handoff from canonical closing relationship",
+            )
+        return _handoff_failure(
+            repo,
+            issue_number,
+            "",
+            claimed_head_oid,
+            DeliveryErrorKind.MISMATCH,
+            DeliveryFailureReason.NO_CANONICAL_CLOSING_REFERENCE
+            if candidates
+            else DeliveryFailureReason.NO_CANDIDATE_PR,
+            "pre-schema observation could not prove a canonical issue handoff",
+            default_branch=default_branch,
+            default_branch_oid=default_oid,
+            candidate_prs=tuple(candidates),
+            pages_fetched=pages,
+            complete=True,
+            echo_mismatch=echo_mismatch,
+        )
+    except _VerificationAbort as exc:
+        return _handoff_failure(
+            repo,
+            issue_number,
+            "",
+            claimed_head_oid,
+            exc.kind,
+            exc.reason,
+            exc.message,
+        )

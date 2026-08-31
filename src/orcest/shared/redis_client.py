@@ -725,7 +725,7 @@ class RedisClient:
         """
         if not mapping:
             return 0
-        result: int = self._client.hset(self._prefixed(key), mapping=mapping)  # type: ignore[assignment]
+        result: int = self._client.hset(self._prefixed(key), mapping=mapping)  # type: ignore[assignment,arg-type]
         return result
 
     def hset_json_if_newer(
@@ -806,6 +806,71 @@ class RedisClient:
     def sismember(self, key: str, member: str) -> bool:
         """SISMEMBER key member."""
         return bool(self._client.sismember(self._prefixed(key), member))
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        """ZADD key score member [score member ...]. Returns 0 if mapping is empty."""
+        if not mapping:
+            return 0
+        result: int = self._client.zadd(self._prefixed(key), mapping)  # type: ignore[assignment]
+        return result
+
+    def zrangebyscore(
+        self,
+        key: str,
+        min_score: float | str,
+        max_score: float | str,
+        start: int = 0,
+        num: int | None = None,
+    ) -> list[str]:
+        """ZRANGEBYSCORE key min max [LIMIT start num]."""
+        kwargs: dict[str, Any] = {}
+        if num is not None:
+            kwargs["start"] = start
+            kwargs["num"] = num
+        result: list[str] = self._client.zrangebyscore(  # type: ignore[assignment]
+            self._prefixed(key), min_score, max_score, **kwargs
+        )
+        return result
+
+    def zrem(self, key: str, *members: str) -> int:
+        """ZREM key member [member ...]. Returns 0 immediately if no members given."""
+        if not members:
+            return 0
+        result: int = self._client.zrem(self._prefixed(key), *members)  # type: ignore[assignment]
+        return result
+
+    def zscore(self, key: str, member: str) -> float | None:
+        """ZSCORE key member."""
+        result: float | None = self._client.zscore(  # type: ignore[assignment]
+            self._prefixed(key), member
+        )
+        return float(result) if result is not None else None
+
+    def zcard(self, key: str) -> int:
+        """ZCARD key."""
+        result: int = self._client.zcard(self._prefixed(key))  # type: ignore[assignment]
+        return result
+
+    def lpush(self, key: str, *values: str) -> int:
+        """LPUSH key value [value ...]. Returns 0 immediately if no values given."""
+        if not values:
+            return 0
+        result: int = self._client.lpush(self._prefixed(key), *values)  # type: ignore[assignment]
+        return result
+
+    def ltrim(self, key: str, start: int, end: int) -> None:
+        """LTRIM key start end."""
+        self._client.ltrim(self._prefixed(key), start, end)
+
+    def lrange(self, key: str, start: int, end: int) -> list[str]:
+        """LRANGE key start end."""
+        result: list[str] = self._client.lrange(self._prefixed(key), start, end)  # type: ignore[assignment]
+        return result
+
+    def llen(self, key: str) -> int:
+        """LLEN key."""
+        result: int = self._client.llen(self._prefixed(key))  # type: ignore[assignment]
+        return result
 
     # ------------------------------------------------------------------
     # Additional hash operations (auto-prefix)

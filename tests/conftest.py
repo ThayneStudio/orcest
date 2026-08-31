@@ -191,18 +191,20 @@ def gh_mock(mocker):
     ]:
         mock = mocker.patch(f"orcest.orchestrator.gh.{fn_name}")
         setattr(ns, fn_name, mock)
-    if "orcest.orchestrator.loop" in sys.modules:
-        ns.verify_issue_delivery = mocker.patch("orcest.orchestrator.loop.verify_issue_delivery")
+    if "orcest.orchestrator.issue_delivery" in sys.modules:
+        ns.observe_issue_handoff = mocker.patch(
+            "orcest.orchestrator.issue_delivery.observe_issue_handoff"
+        )
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
     ns.has_issue_comment_marker.return_value = False
-    if hasattr(ns, "verify_issue_delivery"):
+    if hasattr(ns, "observe_issue_handoff"):
         from orcest.orchestrator.github_delivery_verifier import (
             DeliveryErrorKind,
             DeliveryFailureReason,
-            DeliveryVerification,
+            HandoffObservation,
         )
 
-        ns.verify_issue_delivery.return_value = DeliveryVerification(
+        ns.observe_issue_handoff.return_value = HandoffObservation(
             verified=False,
             error_kind=DeliveryErrorKind.MISMATCH,
             reason=DeliveryFailureReason.NO_CANONICAL_CLOSING_REFERENCE,
@@ -211,7 +213,7 @@ def gh_mock(mocker):
             default_branch="",
             default_branch_oid="",
             expected_head_ref="",
-            expected_head_oid="",
+            claimed_head_oid="",
             live_head_oid="",
             complete=False,
             message="test default",

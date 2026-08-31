@@ -65,6 +65,18 @@ providers:
 # monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 # monitor_write_token_env: "MONITOR_WRITE_TOKEN"
 
+# Durable issue-delivery verification. enabled:false restores immediate
+# orcest:ready removal only for newly consumed completed issue results. It does
+# not process or clear existing verification jobs/dispatch barriers; drain first
+# before disabling or rolling the binary back. See
+# docs/operations/issue-delivery-verification-rollback.md.
+# issue_delivery_verifier:
+#   enabled: true
+#   grace_seconds: 60
+#   backoff_initial_seconds: 10
+#   backoff_max_seconds: 300
+#   ineffective_cooldown_seconds: 60
+
 # Fleet-health kill-pressure gate for the activity watchdog's STUCK/LOOPING
 # escalation (CEILING kills are exempt from this gate and its budget). Keeps
 # a systemic issue (e.g. a bad model rollout) from reading as many
