@@ -87,6 +87,8 @@ __all__ = [
     "SECRET_STAGING_ATTESTATION_DOMAIN",
     "secret_staging_attestation_preimage",
     "secret_staging_attestation",
+    "transition_digest",
+    "activity_idempotency_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -344,6 +346,42 @@ def result_digest(result_json: Any) -> str:
 def request_digest(request_json: Any) -> str:
     """Digest of a complete canonical immutable request/CAS field set (``request_digest``)."""
     return generic_domain_digest("orcest-request-v1", request_json)
+
+
+_ACTIVITY_IDEMPOTENCY_FIELDS = (
+    "reducer_version",
+    "run_id",
+    "specification_generation",
+    "policy_hash",
+    "created_transition_sequence",
+    "kind",
+    "execution_class",
+    "semantic_input_digest",
+    "candidate_id",
+    "forge_observation_id",
+    "role",
+    "repair_cycle",
+    "recovery_cycle",
+    "strategy_index",
+    "recovery_tactic",
+    "recovery_evidence_id",
+    "rescue_epoch",
+)
+
+
+def activity_idempotency_digest(fields: Mapping[str, Any]) -> str:
+    """Activity ``idempotency_key`` as ``sha256(canonical_json({...exact field set...}))``."""
+    if set(fields) != set(_ACTIVITY_IDEMPOTENCY_FIELDS):
+        raise ValueError(
+            "activity idempotency preimage must contain exactly the domain field set, "
+            f"got {sorted(fields)!r}"
+        )
+    return bare_canonical_digest({name: fields[name] for name in _ACTIVITY_IDEMPOTENCY_FIELDS})
+
+
+def transition_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of normalized reducer inputs and outputs (``transition_digest``)."""
+    return generic_domain_digest("orcest-transition-v1", fields)
 
 
 def response_digest(response_json: Any) -> str:

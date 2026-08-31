@@ -12,6 +12,7 @@ See ``docs/wiki/architecture.md`` and ``docs/wiki/persistence-and-recovery.md``.
 
 from orcest.workflow_store.store import (
     DEFAULT_REDUCER_VERSION,
+    PRIOR_STATE_NONE,
     SCHEMA_VERSION,
     SUPPORTED_REDUCER_VERSIONS,
     CasMismatchError,
@@ -23,6 +24,7 @@ from orcest.workflow_store.store import (
     OutboxRecord,
     ProjectionOutboxRecord,
     ReducerVersionError,
+    RunRecord,
     RunStore,
     RunStoreError,
     SchemaVersionError,
@@ -53,6 +55,7 @@ from orcest.workflow_store.v1.secrets import (
 
 __all__ = [
     "DEFAULT_REDUCER_VERSION",
+    "PRIOR_STATE_NONE",
     "SCHEMA_VERSION",
     "SUPPORTED_REDUCER_VERSIONS",
     "CasMismatchError",
@@ -64,6 +67,7 @@ __all__ = [
     "OutboxRecord",
     "ProjectionOutboxRecord",
     "ReducerVersionError",
+    "RunRecord",
     "RunStore",
     "RunStoreError",
     "SchemaVersionError",

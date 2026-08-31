@@ -11,6 +11,8 @@ import pytest
 from orcest.workflow_contract.v1.digest import request_digest
 from orcest.workflow_store import (
     DEFAULT_REDUCER_VERSION,
+    PRIOR_STATE_NONE,
+    SCHEMA_VERSION,
     SUPPORTED_REDUCER_VERSIONS,
     CasMismatchError,
     FaultInjectionPoint,
@@ -188,7 +190,7 @@ def test_schema_migration_rolls_back_as_one_transaction(
 
 def test_startup_sets_sqlite_profile_and_bootstrap_mode(tmp_path: Path) -> None:
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
-        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert store.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert store.conn.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert store.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -671,3 +673,33 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
         assert not store.maintenance_mode.dispatch_enabled
     finally:
         store.close()
+
+
+def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 2
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        with store.transaction():
+            store.create_run(
+                run_id=RUN_ID,
+                project_id="project-a",
+                work_item_key="work-1",
+                state="ADMITTED",
+                specification_generation=0,
+            )
+            transition = store.append_transition(
+                run_id=RUN_ID,
+                transition_id=TRANSITION_ID,
+                prior_state=PRIOR_STATE_NONE,
+                trigger_kind="ADMIT",
+                trigger_id="obs-work-1",
+                next_state="ADMITTED",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest({"admit": 1}),
+                specification_generation=0,
+                admit_base_observation_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+        assert transition.prior_state == PRIOR_STATE_NONE
+        assert transition.specification_generation == 0
+        row = store.get_run(RUN_ID)
+        assert row is not None
+        assert row.specification_generation == 0
