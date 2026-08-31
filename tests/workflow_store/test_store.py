@@ -1199,13 +1199,7 @@ def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -
         assert row.specification_generation == 0
 
 
-def _write_v2_shaped_database(db_path: Path) -> None:
-    """Recreate a pre-#717 schema-version-2 workflow.db (no capability-key
-    tables, controller_mode_operations lacking the backup_* columns)."""
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(
-            """
+_PRE_V3_CONTROLLER_AND_LEDGER_DDL = """
             CREATE TABLE schema_migrations (
               version INTEGER PRIMARY KEY,
               name TEXT NOT NULL UNIQUE,
@@ -1239,7 +1233,11 @@ def _write_v2_shaped_database(db_path: Path) -> None:
               dispatch_paused_intake_policy TEXT,
               maintenance_prior_mode TEXT,
               maintenance_prior_dispatch_paused_intake_policy TEXT,
-              last_operation_id TEXT
+              last_operation_id TEXT,
+              CHECK (
+                maintenance_prior_dispatch_paused_intake_policy IS NULL
+                OR maintenance_prior_mode = 'DISPATCH_PAUSED'
+              )
             );
             CREATE TABLE runs (
               run_id TEXT PRIMARY KEY,
@@ -1269,65 +1267,158 @@ def _write_v2_shaped_database(db_path: Path) -> None:
               PRIMARY KEY (run_id, transition_sequence)
             );
             """
+
+_SEEDED_CONTROLLER_MODE_OPERATION_ID = "12345678-1234-4234-9234-123456789abc"
+
+
+def _seed_pre_v3_controller_rows(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO controller_mode_operations VALUES ("
+        f"'{_SEEDED_CONTROLLER_MODE_OPERATION_ID}', 'orcest.controller-mode-operation/1', "
+        "'INITIALIZE', 0, NULL, 'MAINTENANCE', NULL, 'bootstrap-service', "
+        "'sha256:" + "a" * 64 + "', 'sha256:" + "b" * 64 + "', 'SUCCEEDED', NULL, "
+        "1, 'MAINTENANCE', NULL, 200, '{}', 'sha256:" + "c" * 64 + "', 0)"
+    )
+    conn.execute(
+        "INSERT INTO controller_mode VALUES ("
+        f"'ORCEST_V1', 1, 'MAINTENANCE', NULL, NULL, NULL, "
+        f"'{_SEEDED_CONTROLLER_MODE_OPERATION_ID}')"
+    )
+
+
+def _write_v1_shaped_database(db_path: Path) -> None:
+    """Recreate a schema-version-1 workflow.db: controller_mode tables exist
+    (that's why the pre-#717 current==1 branch never ran _SCHEMA), but they
+    lack the v3 backup_* columns and bidirectional CHECK, and there are no
+    capability-key tables."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_PRE_V3_CONTROLLER_AND_LEDGER_DDL)
+        _seed_pre_v3_controller_rows(conn)
+        conn.execute(
+            "INSERT INTO runs VALUES ("
+            f"'{RUN_ID}', 'project-a', 'work-1', 1, 'ADMITTED', NULL, "
+            f"'{REDUCER_VERSION}', 1, 0, 0)"
         )
         conn.execute(
-            "INSERT INTO controller_mode_operations VALUES ("
-            "'12345678-1234-4234-9234-123456789abc', 'orcest.controller-mode-operation/1', "
-            "'INITIALIZE', 0, NULL, 'MAINTENANCE', NULL, 'bootstrap-service', "
-            "'sha256:" + "a" * 64 + "', 'sha256:" + "b" * 64 + "', 'SUCCEEDED', NULL, "
-            "1, 'MAINTENANCE', NULL, 200, '{}', 'sha256:" + "c" * 64 + "', 0)"
+            "INSERT INTO transitions VALUES ("
+            f"'{RUN_ID}', 1, '{TRANSITION_ID}', 'ADMITTED', 'ADMIT', 'obs-work-1', "
+            f"NULL, 'ADMITTED', '{REDUCER_VERSION}', 'sha256:" + "d" * 64 + "', 1, 0)"
         )
-        conn.execute(
-            "INSERT INTO controller_mode VALUES ("
-            "'ORCEST_V1', 1, 'MAINTENANCE', NULL, NULL, NULL, "
-            "'12345678-1234-4234-9234-123456789abc')"
-        )
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_v2_shaped_database(db_path: Path) -> None:
+    """Recreate a pre-#717 schema-version-2 workflow.db (no capability-key
+    tables, controller_mode_operations lacking the backup_* columns)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_PRE_V3_CONTROLLER_AND_LEDGER_DDL)
+        _seed_pre_v3_controller_rows(conn)
         conn.execute("PRAGMA user_version=2")
         conn.commit()
     finally:
         conn.close()
 
 
+def _assert_migrated_to_v3_controller_and_capability_shape(store: RunStore) -> None:
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    tables = {
+        row[0] for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    for expected_table in (
+        "capability_key_registry",
+        "capability_key_operations",
+        "capability_signing_keys",
+        "capability_issuance_audit",
+    ):
+        assert expected_table in tables
+
+    columns = {
+        row[1] for row in store.conn.execute("PRAGMA table_info(controller_mode_operations)")
+    }
+    assert {
+        "backup_manifest_digest",
+        "backup_prior_mode",
+        "backup_prior_dispatch_paused_intake_policy",
+    } <= columns
+
+    mode_sql = store.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='controller_mode'"
+    ).fetchone()[0]
+    assert "(maintenance_prior_dispatch_paused_intake_policy IS NOT NULL)" in mode_sql
+    assert "= (maintenance_prior_mode = 'DISPATCH_PAUSED')" in mode_sql
+
+    preserved = store.conn.execute(
+        "SELECT operation_kind, status FROM controller_mode_operations "
+        "WHERE controller_mode_operation_id = ?",
+        (_SEEDED_CONTROLLER_MODE_OPERATION_ID,),
+    ).fetchone()
+    assert tuple(preserved) == ("INITIALIZE", "SUCCEEDED")
+
+    mode = store.conn.execute("SELECT mode, mode_revision FROM controller_mode").fetchone()
+    assert tuple(mode) == ("MAINTENANCE", 1)
+
+    registry = store.conn.execute(
+        "SELECT registry_revision FROM capability_key_registry"
+    ).fetchone()
+    assert tuple(registry) == (0,)
+
+    # apply_controller_mode_operation always INSERTs the backup_* columns;
+    # this is the failure the 1→3 skip-version path used to hit.
+    result = store.apply_controller_mode_operation(
+        controller_mode_operation_id=OPERATION_ID,
+        operation_kind="SET_MODE",
+        expected_mode_revision=1,
+        expected_mode="MAINTENANCE",
+        requested_mode="RUNNING",
+        authenticated_principal_id="operator",
+        authorization_context_digest=AUTHZ_DIGEST,
+    )
+    assert result.status == "SUCCEEDED"
+    assert result.mode == "RUNNING"
+
+
+def test_v1_database_migrates_capability_tables_and_backup_columns(tmp_path: Path) -> None:
+    _write_v1_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _assert_migrated_to_v3_controller_and_capability_shape(store)
+        preserved_run = store.conn.execute(
+            "SELECT project_id, specification_generation, state FROM runs WHERE run_id = ?",
+            (RUN_ID,),
+        ).fetchone()
+        assert tuple(preserved_run) == ("project-a", 1, "ADMITTED")
+        with store.transaction():
+            store.create_run(
+                run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                project_id="project-b",
+                work_item_key="work-gen-0",
+                state="ADMITTED",
+                specification_generation=0,
+            )
+            store.append_transition(
+                run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                transition_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                prior_state=PRIOR_STATE_NONE,
+                trigger_kind="ADMIT",
+                trigger_id="obs-work-gen-0",
+                next_state="ADMITTED",
+                reducer_version=REDUCER_VERSION,
+                input_digest=_digest({"admit": 1}),
+                specification_generation=0,
+                admit_base_observation_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+
+
 def test_v2_database_migrates_capability_tables_and_backup_columns(tmp_path: Path) -> None:
     _write_v2_shaped_database(tmp_path / "workflow.db")
 
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
-        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        tables = {
-            row[0]
-            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        for expected_table in (
-            "capability_key_registry",
-            "capability_key_operations",
-            "capability_signing_keys",
-            "capability_issuance_audit",
-        ):
-            assert expected_table in tables
-
-        columns = {
-            row[1] for row in store.conn.execute("PRAGMA table_info(controller_mode_operations)")
-        }
-        assert {
-            "backup_manifest_digest",
-            "backup_prior_mode",
-            "backup_prior_dispatch_paused_intake_policy",
-        } <= columns
-
-        preserved = store.conn.execute(
-            "SELECT operation_kind, status FROM controller_mode_operations "
-            "WHERE controller_mode_operation_id = ?",
-            ("12345678-1234-4234-9234-123456789abc",),
-        ).fetchone()
-        assert tuple(preserved) == ("INITIALIZE", "SUCCEEDED")
-
-        mode = store.conn.execute("SELECT mode, mode_revision FROM controller_mode").fetchone()
-        assert tuple(mode) == ("MAINTENANCE", 1)
-
-        registry = store.conn.execute(
-            "SELECT registry_revision FROM capability_key_registry"
-        ).fetchone()
-        assert tuple(registry) == (0,)
+        _assert_migrated_to_v3_controller_and_capability_shape(store)
 
 
 def test_capability_key_register_rejects_reused_digest_under_new_key_id(

@@ -1255,12 +1255,17 @@ class RunStore:
                     (SCHEMA_VERSION, "workflow-control-v1-base-store", _now_ms()),
                 )
             elif current == 1:
-                # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): pre-existing
-                # tables from a real version-1 database are left untouched, and every
-                # table this version added (controller_mode, controller_mode_operations,
-                # the capability-key tables) gets created fresh in its final shape
-                # before _V1_TO_V2 rebuilds runs/transitions.
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V1_TO_V2)
+                # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): a real
+                # version-1 database already has controller_mode /
+                # controller_mode_operations, so those two tables stay in their
+                # version-1 shape here. Missing tables (capability-key) are
+                # created; _V1_TO_V2 rebuilds runs/transitions; _V2_TO_V3 then
+                # rebuilds controller_mode_operations (three new columns) and
+                # controller_mode (bidirectional maintenance_prior_* CHECK) so
+                # a v1-to-v3 upgrade lands in the same final shape as v2-to-v3.
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V1_TO_V2 + "\n" + _V2_TO_V3
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
