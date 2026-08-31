@@ -21,13 +21,20 @@ from typing import Any, Self
 from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
+    capability_public_key_digest,
     is_valid_content_digest,
     request_digest,
     response_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
+from orcest.workflow_contract.v1.protocol_registry import (
+    CAPABILITY_KEY_OPERATION_PROTOCOL,
+    CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
+    CONTROLLER_MODE_OPERATION_PROTOCOL,
+    CONTROLLER_MODE_RESULT_PROTOCOL,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -77,6 +84,10 @@ class IdempotencyConflictError(RunStoreError):
 
 class CasMismatchError(RunStoreError):
     """Raised when a monotonic compare-and-swap update loses its fence."""
+
+
+class WorkflowGateClosedError(RunStoreError):
+    """Raised when the durable controller mode or key registry forbids work."""
 
 
 class FaultInjectionPoint(str, Enum):
@@ -197,6 +208,103 @@ class DurableOperation:
     response_digest: str
     response_http_status: int
     committed_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerModeProjection:
+    controller_id: str
+    mode_revision: int
+    mode: str | None
+    dispatch_paused_intake_policy: str | None
+    maintenance_prior_mode: str | None
+    maintenance_prior_dispatch_paused_intake_policy: str | None
+    last_operation_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerModeOperationResult:
+    controller_mode_operation_id: str
+    operation_kind: str
+    status: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    completed_at_ms: int
+    rejection_code: str | None = None
+    mode_revision: int | None = None
+    mode: str | None = None
+    dispatch_paused_intake_policy: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityKeyRegistryProjection:
+    registry_id: str
+    registry_revision: int
+    current_issuance_key_id: str | None
+    last_operation_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilitySigningKey:
+    capability_signing_key_id: str
+    registration_operation_id: str
+    signature_algorithm: str
+    public_verification_key: bytes
+    public_key_digest: str
+    private_signing_secret_ref: str
+    registered_at_ms: int
+    not_before_ms: int
+    state: str
+    retired_at_ms: int | None = None
+    retirement_change_id: str | None = None
+    retirement_principal_id: str | None = None
+    retirement_authorization_digest: str | None = None
+    revoked_at_ms: int | None = None
+    revocation_change_id: str | None = None
+    revocation_principal_id: str | None = None
+    revocation_authorization_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityKeyOperationResult:
+    capability_key_operation_id: str
+    kind: str
+    status: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    completed_at_ms: int
+    rejection_code: str | None = None
+    registry_revision: int | None = None
+    current_issuance_key_id: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerGatePermissions:
+    mode_revision: int
+    mode: str | None
+    registry_revision: int
+    current_issuance_key_id: str | None
+    new_admission: bool
+    new_claims: bool
+    first_result_mutation: bool
+    existing_result_replay: bool
+    forge_reconciliation: bool
+    management_operations: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedCapabilityBinding:
+    capability_jti: str
+    capability_signing_key_id: str
+    signature_algorithm: str
+    claim_digest: str
+    immutable_assignment_digest: str
+    immutable_assignment_json: str
+    capability_key_registry_revision: int
+    issued_at_ms: int
 
 
 def _now_ms() -> int:
@@ -340,6 +448,101 @@ def _row_to_operation(row: sqlite3.Row) -> DurableOperation:
     )
 
 
+def _row_to_controller_mode(row: sqlite3.Row) -> ControllerModeProjection:
+    return ControllerModeProjection(
+        controller_id=row["controller_id"],
+        mode_revision=row["mode_revision"],
+        mode=row["mode"],
+        dispatch_paused_intake_policy=row["dispatch_paused_intake_policy"],
+        maintenance_prior_mode=row["maintenance_prior_mode"],
+        maintenance_prior_dispatch_paused_intake_policy=row[
+            "maintenance_prior_dispatch_paused_intake_policy"
+        ],
+        last_operation_id=row["last_operation_id"],
+    )
+
+
+def _row_to_controller_mode_operation(
+    row: sqlite3.Row, *, replayed: bool
+) -> ControllerModeOperationResult:
+    return ControllerModeOperationResult(
+        controller_mode_operation_id=row["controller_mode_operation_id"],
+        operation_kind=row["operation_kind"],
+        status=row["status"],
+        rejection_code=row["rejection_code"],
+        mode_revision=row["result_mode_revision"],
+        mode=row["result_mode"],
+        dispatch_paused_intake_policy=row["result_dispatch_paused_intake_policy"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        completed_at_ms=row["completed_at_ms"],
+        replayed=replayed,
+    )
+
+
+def _row_to_capability_registry(row: sqlite3.Row) -> CapabilityKeyRegistryProjection:
+    return CapabilityKeyRegistryProjection(
+        registry_id=row["registry_id"],
+        registry_revision=row["registry_revision"],
+        current_issuance_key_id=row["current_issuance_key_id"],
+        last_operation_id=row["last_operation_id"],
+    )
+
+
+def _row_to_capability_key(row: sqlite3.Row) -> CapabilitySigningKey:
+    return CapabilitySigningKey(
+        capability_signing_key_id=row["capability_signing_key_id"],
+        registration_operation_id=row["registration_operation_id"],
+        signature_algorithm=row["signature_algorithm"],
+        public_verification_key=row["public_verification_key"],
+        public_key_digest=row["public_key_digest"],
+        private_signing_secret_ref=row["private_signing_secret_ref"],
+        registered_at_ms=row["registered_at_ms"],
+        not_before_ms=row["not_before_ms"],
+        state=row["state"],
+        retired_at_ms=row["retired_at_ms"],
+        retirement_change_id=row["retirement_change_id"],
+        retirement_principal_id=row["retirement_principal_id"],
+        retirement_authorization_digest=row["retirement_authorization_digest"],
+        revoked_at_ms=row["revoked_at_ms"],
+        revocation_change_id=row["revocation_change_id"],
+        revocation_principal_id=row["revocation_principal_id"],
+        revocation_authorization_digest=row["revocation_authorization_digest"],
+    )
+
+
+def _row_to_capability_key_operation(
+    row: sqlite3.Row, *, replayed: bool
+) -> CapabilityKeyOperationResult:
+    return CapabilityKeyOperationResult(
+        capability_key_operation_id=row["capability_key_operation_id"],
+        kind=row["kind"],
+        status=row["status"],
+        rejection_code=row["rejection_code"],
+        registry_revision=row["result_registry_revision"],
+        current_issuance_key_id=row["result_issuance_key_id"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        completed_at_ms=row["completed_at_ms"],
+        replayed=replayed,
+    )
+
+
+def _row_to_issued_capability(row: sqlite3.Row) -> IssuedCapabilityBinding:
+    return IssuedCapabilityBinding(
+        capability_jti=row["capability_jti"],
+        capability_signing_key_id=row["capability_signing_key_id"],
+        signature_algorithm=row["signature_algorithm"],
+        claim_digest=row["claim_digest"],
+        immutable_assignment_digest=row["immutable_assignment_digest"],
+        immutable_assignment_json=row["immutable_assignment_json"],
+        capability_key_registry_revision=row["capability_key_registry_revision"],
+        issued_at_ms=row["issued_at_ms"],
+    )
+
+
 def _mount_for(path: Path) -> tuple[Path, str]:
     path = path.resolve()
     best_mount = Path("/")
@@ -443,8 +646,8 @@ CREATE TABLE IF NOT EXISTS controller_mode (
     OR (mode != 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NULL)
   ),
   CHECK (
-    maintenance_prior_dispatch_paused_intake_policy IS NULL
-    OR maintenance_prior_mode = 'DISPATCH_PAUSED'
+    (maintenance_prior_dispatch_paused_intake_policy IS NOT NULL)
+    = (maintenance_prior_mode = 'DISPATCH_PAUSED')
   )
 );
 
@@ -461,6 +664,14 @@ CREATE TABLE IF NOT EXISTS controller_mode_operations (
   ),
   requested_dispatch_paused_intake_policy TEXT
     CHECK (requested_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  backup_manifest_digest TEXT,
+  backup_prior_mode TEXT CHECK (
+    backup_prior_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  backup_prior_dispatch_paused_intake_policy TEXT
+    CHECK (backup_prior_dispatch_paused_intake_policy IN (
       {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
     )),
   authenticated_principal_id TEXT NOT NULL,
@@ -484,6 +695,109 @@ CREATE TABLE IF NOT EXISTS controller_mode_operations (
   completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
   CHECK ((status = 'SUCCEEDED' AND rejection_code IS NULL)
     OR (status = 'REJECTED' AND rejection_code IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS capability_key_registry (
+  registry_id TEXT PRIMARY KEY CHECK (registry_id = '{CONTROLLER_ID}'),
+  registry_revision INTEGER NOT NULL CHECK (registry_revision >= 0),
+  current_issuance_key_id TEXT,
+  last_operation_id TEXT,
+  FOREIGN KEY (current_issuance_key_id)
+    REFERENCES capability_signing_keys(capability_signing_key_id) ON DELETE RESTRICT,
+  FOREIGN KEY (last_operation_id)
+    REFERENCES capability_key_operations(capability_key_operation_id) ON DELETE RESTRICT,
+  CHECK (
+    (registry_revision = 0 AND current_issuance_key_id IS NULL AND last_operation_id IS NULL)
+    OR registry_revision > 0
+  )
+);
+
+CREATE TABLE IF NOT EXISTS capability_key_operations (
+  capability_key_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (
+    kind IN ({_sql_in(_enum_values("capability_key_operation.kind"))})
+  ),
+  expected_registry_revision INTEGER NOT NULL CHECK (expected_registry_revision >= 0),
+  expected_issuance_key_id TEXT,
+  target_capability_signing_key_id TEXT NOT NULL,
+  replacement_issuance_key_id TEXT,
+  register_public_verification_key BLOB,
+  register_public_key_digest TEXT,
+  register_private_signing_secret_ref TEXT,
+  register_not_before_ms INTEGER CHECK (
+    register_not_before_ms IS NULL OR register_not_before_ms >= 0
+  ),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("capability_key_operation.status"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IN ({_sql_in(_enum_values("capability_key_operation.rejection_code"))})
+  ),
+  result_registry_revision INTEGER CHECK (result_registry_revision > 0),
+  result_issuance_key_id TEXT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
+  CHECK ((status = 'SUCCEEDED' AND rejection_code IS NULL)
+    OR (status = 'REJECTED' AND rejection_code IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS capability_signing_keys (
+  capability_signing_key_id TEXT PRIMARY KEY,
+  registration_operation_id TEXT NOT NULL UNIQUE
+    REFERENCES capability_key_operations(capability_key_operation_id) ON DELETE RESTRICT,
+  signature_algorithm TEXT NOT NULL CHECK (
+    signature_algorithm IN ({_sql_in(_enum_values("capability_signing_key.signature_algorithm"))})
+  ),
+  public_verification_key BLOB NOT NULL CHECK (length(public_verification_key) = 32),
+  public_key_digest TEXT NOT NULL UNIQUE,
+  private_signing_secret_ref TEXT NOT NULL,
+  registered_at_ms INTEGER NOT NULL CHECK (registered_at_ms >= 0),
+  not_before_ms INTEGER NOT NULL CHECK (not_before_ms >= 0),
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("capability_signing_key.state"))})
+  ),
+  retired_at_ms INTEGER CHECK (retired_at_ms IS NULL OR retired_at_ms >= registered_at_ms),
+  retirement_change_id TEXT,
+  retirement_principal_id TEXT,
+  retirement_authorization_digest TEXT,
+  revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= registered_at_ms),
+  revocation_change_id TEXT,
+  revocation_principal_id TEXT,
+  revocation_authorization_digest TEXT,
+  CHECK (
+    (state = 'ACTIVE' AND retired_at_ms IS NULL AND retirement_change_id IS NULL
+      AND retirement_principal_id IS NULL AND retirement_authorization_digest IS NULL
+      AND revoked_at_ms IS NULL AND revocation_change_id IS NULL
+      AND revocation_principal_id IS NULL AND revocation_authorization_digest IS NULL)
+    OR (state = 'RETIRED' AND retired_at_ms IS NOT NULL AND retirement_change_id IS NOT NULL
+      AND retirement_principal_id IS NOT NULL AND retirement_authorization_digest IS NOT NULL
+      AND revoked_at_ms IS NULL AND revocation_change_id IS NULL
+      AND revocation_principal_id IS NULL AND revocation_authorization_digest IS NULL)
+    OR (state = 'REVOKED' AND revoked_at_ms IS NOT NULL AND revocation_change_id IS NOT NULL
+      AND revocation_principal_id IS NOT NULL AND revocation_authorization_digest IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS capability_issuance_audit (
+  capability_jti TEXT PRIMARY KEY,
+  capability_signing_key_id TEXT NOT NULL
+    REFERENCES capability_signing_keys(capability_signing_key_id) ON DELETE RESTRICT,
+  signature_algorithm TEXT NOT NULL CHECK (
+    signature_algorithm IN ({_sql_in(_enum_values("capability_signing_key.signature_algorithm"))})
+  ),
+  claim_digest TEXT NOT NULL,
+  immutable_assignment_digest TEXT NOT NULL,
+  immutable_assignment_json TEXT NOT NULL,
+  capability_key_registry_revision INTEGER NOT NULL CHECK (
+    capability_key_registry_revision > 0
+  ),
+  issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -675,6 +989,115 @@ ALTER TABLE transitions_v2 RENAME TO transitions;
 PRAGMA foreign_keys=ON;
 """
 
+_V2_TO_V3 = f"""
+PRAGMA foreign_keys=OFF;
+CREATE TABLE controller_mode_operations_v3 (
+  controller_mode_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  operation_kind TEXT NOT NULL CHECK (
+    operation_kind IN ({_sql_in(_enum_values("controller_mode_operation.operation_kind"))})
+  ),
+  expected_mode_revision INTEGER NOT NULL CHECK (expected_mode_revision >= 0),
+  expected_mode TEXT CHECK (expected_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  requested_mode TEXT CHECK (
+    requested_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  requested_dispatch_paused_intake_policy TEXT
+    CHECK (requested_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  backup_manifest_digest TEXT,
+  backup_prior_mode TEXT CHECK (
+    backup_prior_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  backup_prior_dispatch_paused_intake_policy TEXT
+    CHECK (backup_prior_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("controller_mode_operation.status"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IN ({_sql_in(_enum_values("controller_mode_operation.rejection_code"))})
+  ),
+  result_mode_revision INTEGER CHECK (result_mode_revision > 0),
+  result_mode TEXT CHECK (result_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  result_dispatch_paused_intake_policy TEXT
+    CHECK (result_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
+  CHECK ((status = 'SUCCEEDED' AND rejection_code IS NULL)
+    OR (status = 'REJECTED' AND rejection_code IS NOT NULL))
+);
+INSERT INTO controller_mode_operations_v3 (
+  controller_mode_operation_id, protocol_version, operation_kind,
+  expected_mode_revision, expected_mode, requested_mode,
+  requested_dispatch_paused_intake_policy, authenticated_principal_id,
+  authorization_context_digest, request_digest, status, rejection_code,
+  result_mode_revision, result_mode, result_dispatch_paused_intake_policy,
+  response_http_status, response_json, response_digest, completed_at_ms
+)
+SELECT
+  controller_mode_operation_id, protocol_version, operation_kind,
+  expected_mode_revision, expected_mode, requested_mode,
+  requested_dispatch_paused_intake_policy, authenticated_principal_id,
+  authorization_context_digest, request_digest, status, rejection_code,
+  result_mode_revision, result_mode, result_dispatch_paused_intake_policy,
+  response_http_status, response_json, response_digest, completed_at_ms
+FROM controller_mode_operations;
+CREATE TABLE controller_mode_v3 (
+  controller_id TEXT PRIMARY KEY CHECK (controller_id = '{CONTROLLER_ID}'),
+  mode_revision INTEGER NOT NULL CHECK (mode_revision >= 0),
+  mode TEXT CHECK (mode IN ({_sql_in(_enum_values("controller_mode.mode"))})),
+  dispatch_paused_intake_policy TEXT
+    CHECK (dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  maintenance_prior_mode TEXT CHECK (
+    maintenance_prior_mode IN ({_sql_in(_enum_values("controller_mode.mode"))})
+  ),
+  maintenance_prior_dispatch_paused_intake_policy TEXT
+    CHECK (maintenance_prior_dispatch_paused_intake_policy IN (
+      {_sql_in(_enum_values("controller_mode.dispatch_paused_intake_policy"))}
+    )),
+  last_operation_id TEXT,
+  FOREIGN KEY (last_operation_id)
+    REFERENCES controller_mode_operations(controller_mode_operation_id) ON DELETE RESTRICT,
+  CHECK ((mode_revision = 0 AND mode IS NULL) OR (mode_revision > 0 AND mode IS NOT NULL)),
+  CHECK (
+    (mode = 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NOT NULL)
+    OR (mode IS NULL AND dispatch_paused_intake_policy IS NULL)
+    OR (mode != 'DISPATCH_PAUSED' AND dispatch_paused_intake_policy IS NULL)
+  ),
+  CHECK (
+    (maintenance_prior_dispatch_paused_intake_policy IS NOT NULL)
+    = (maintenance_prior_mode = 'DISPATCH_PAUSED')
+  )
+);
+INSERT INTO controller_mode_v3 (
+  controller_id, mode_revision, mode, dispatch_paused_intake_policy,
+  maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy,
+  last_operation_id
+)
+SELECT
+  controller_id, mode_revision, mode, dispatch_paused_intake_policy,
+  maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy,
+  last_operation_id
+FROM controller_mode;
+DROP TABLE controller_mode;
+DROP TABLE controller_mode_operations;
+ALTER TABLE controller_mode_operations_v3 RENAME TO controller_mode_operations;
+ALTER TABLE controller_mode_v3 RENAME TO controller_mode;
+PRAGMA foreign_keys=ON;
+"""
+
 
 class RunStore:
     """Controller-owned SQLite store with an exclusive process writer lock."""
@@ -806,7 +1229,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1}:
+        if current not in {0, 1, 2}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -815,6 +1238,14 @@ class RunStore:
         # is already open (sqlite3 documented behavior, independent of
         # isolation_level). BEGIN EXCLUSIVE therefore has to live inside the
         # script so DDL, seed rows, and the user_version bump share one txn.
+        #
+        # PRAGMA foreign_keys is a no-op once a transaction is open (SQLite
+        # only honors it in autocommit mode), so the table-rebuild scripts'
+        # own "PRAGMA foreign_keys=OFF;" lines can't actually suspend
+        # enforcement for the BEGIN EXCLUSIVE they run inside. Toggle it here,
+        # before that transaction starts, so DROP TABLE on a table still
+        # carrying real rows referenced by another table's FK doesn't fail.
+        self.conn.execute("PRAGMA foreign_keys=OFF")
         try:
             if current == 0:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
@@ -823,25 +1254,59 @@ class RunStore:
                     "VALUES (?, ?, ?)",
                     (SCHEMA_VERSION, "workflow-control-v1-base-store", _now_ms()),
                 )
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO controller_mode"
-                    "(controller_id, mode_revision, mode, dispatch_paused_intake_policy, "
-                    "maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy, "
-                    "last_operation_id) VALUES (?, 0, NULL, NULL, NULL, NULL, NULL)",
-                    (CONTROLLER_ID,),
+            elif current == 1:
+                # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): a real
+                # version-1 database already has controller_mode /
+                # controller_mode_operations, so those two tables stay in their
+                # version-1 shape here. Missing tables (capability-key) are
+                # created; _V1_TO_V2 rebuilds runs/transitions; _V2_TO_V3 then
+                # rebuilds controller_mode_operations (three new columns) and
+                # controller_mode (bidirectional maintenance_prior_* CHECK) so
+                # a v1-to-v3 upgrade lands in the same final shape as v2-to-v3.
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V1_TO_V2 + "\n" + _V2_TO_V3
                 )
-            else:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V1_TO_V2)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (SCHEMA_VERSION, "workflow-control-v1-reducer-ledger", _now_ms()),
                 )
+            else:
+                # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): a real version-2
+                # database already has controller_mode/controller_mode_operations, so
+                # only the capability-key tables get created here; _V2_TO_V3 then
+                # rebuilds controller_mode_operations (three new columns) and
+                # controller_mode (bidirectional maintenance_prior_* CHECK) in place.
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V2_TO_V3)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-controller-mode-and-key-gates",
+                        _now_ms(),
+                    ),
+                )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO controller_mode"
+                "(controller_id, mode_revision, mode, dispatch_paused_intake_policy, "
+                "maintenance_prior_mode, maintenance_prior_dispatch_paused_intake_policy, "
+                "last_operation_id) VALUES (?, 0, NULL, NULL, NULL, NULL, NULL)",
+                (CONTROLLER_ID,),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO capability_key_registry"
+                "(registry_id, registry_revision, current_issuance_key_id, last_operation_id) "
+                "VALUES (?, 0, NULL, NULL)",
+                (CONTROLLER_ID,),
+            )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def _startup_checks(self) -> None:
         try:
@@ -919,6 +1384,897 @@ class RunStore:
             if not committed:
                 self.conn.rollback()
             raise
+
+    def get_controller_mode(self) -> ControllerModeProjection:
+        row = self.conn.execute(
+            "SELECT * FROM controller_mode WHERE controller_id = ?", (CONTROLLER_ID,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_controller_mode(row)
+
+    def get_capability_key_registry(self) -> CapabilityKeyRegistryProjection:
+        row = self.conn.execute(
+            "SELECT * FROM capability_key_registry WHERE registry_id = ?", (CONTROLLER_ID,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_capability_registry(row)
+
+    def get_capability_signing_key(self, key_id: str) -> CapabilitySigningKey | None:
+        require_lowercase_uuid(key_id, field="capability_signing_key_id")
+        row = self.conn.execute(
+            "SELECT * FROM capability_signing_keys WHERE capability_signing_key_id = ?",
+            (key_id,),
+        ).fetchone()
+        return None if row is None else _row_to_capability_key(row)
+
+    def _controller_mode_response(
+        self,
+        *,
+        operation_id: str,
+        operation_kind: str,
+        status: str,
+        rejection_code: str | None = None,
+        mode_revision: int | None = None,
+        mode: str | None = None,
+        dispatch_paused_intake_policy: str | None = None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, object] = {
+            "protocol_version": CONTROLLER_MODE_RESULT_PROTOCOL,
+            "controller_mode_operation_id": operation_id,
+            "operation_kind": operation_kind,
+            "status": status,
+            "replayed": False,
+        }
+        if status == "SUCCEEDED":
+            body.update(
+                {
+                    "mode_revision": mode_revision,
+                    "mode": mode,
+                    "dispatch_paused_intake_policy": dispatch_paused_intake_policy,
+                }
+            )
+            http_status = 200
+        else:
+            body["rejection_code"] = rejection_code
+            http_status = 403 if rejection_code == "AUTHORITY_REVOKED" else 409
+        body_json = canonical_json_text(body)
+        digest = response_digest(
+            {"http_status": http_status, "body": _response_digest_preimage(body)}
+        )
+        return http_status, body_json, digest
+
+    def _capability_key_response(
+        self,
+        *,
+        operation_id: str,
+        kind: str,
+        status: str,
+        rejection_code: str | None = None,
+        registry_revision: int | None = None,
+        current_issuance_key_id: str | None = None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, object] = {
+            "protocol_version": CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
+            "capability_key_operation_id": operation_id,
+            "kind": kind,
+            "status": status,
+            "replayed": False,
+        }
+        if status == "SUCCEEDED":
+            body.update(
+                {
+                    "registry_revision": registry_revision,
+                    "current_issuance_key_id": current_issuance_key_id,
+                }
+            )
+            http_status = 200
+        else:
+            body["rejection_code"] = rejection_code
+            http_status = 403 if rejection_code == "AUTHORITY_REVOKED" else 409
+        body_json = canonical_json_text(body)
+        digest = response_digest(
+            {"http_status": http_status, "body": _response_digest_preimage(body)}
+        )
+        return http_status, body_json, digest
+
+    def _controller_mode_request_digest(
+        self,
+        *,
+        operation_kind: str,
+        expected_mode_revision: int,
+        expected_mode: str | None,
+        requested_mode: str | None,
+        requested_dispatch_paused_intake_policy: str | None,
+        backup_manifest_digest: str | None,
+        backup_prior_mode: str | None,
+        backup_prior_dispatch_paused_intake_policy: str | None,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+    ) -> str:
+        return request_digest(
+            {
+                "protocol_version": CONTROLLER_MODE_OPERATION_PROTOCOL,
+                "operation_kind": operation_kind,
+                "expected_mode_revision": expected_mode_revision,
+                "expected_mode": expected_mode,
+                "requested_mode": requested_mode,
+                "requested_dispatch_paused_intake_policy": requested_dispatch_paused_intake_policy,
+                "backup_manifest_digest": backup_manifest_digest,
+                "backup_prior_mode": backup_prior_mode,
+                "backup_prior_dispatch_paused_intake_policy": (
+                    backup_prior_dispatch_paused_intake_policy
+                ),
+                "authenticated_principal_id": authenticated_principal_id,
+                "authorization_context_digest": authorization_context_digest,
+            }
+        )
+
+    def apply_controller_mode_operation(
+        self,
+        *,
+        controller_mode_operation_id: str,
+        operation_kind: str,
+        expected_mode_revision: int,
+        expected_mode: str | None,
+        requested_mode: str | None,
+        requested_dispatch_paused_intake_policy: str | None = None,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        authority_revoked: bool = False,
+        backup_manifest_digest: str | None = None,
+        backup_prior_mode: str | None = None,
+        backup_prior_dispatch_paused_intake_policy: str | None = None,
+    ) -> ControllerModeOperationResult:
+        require_lowercase_uuid(controller_mode_operation_id, field="controller_mode_operation_id")
+        enums.parse_enum("controller_mode_operation.operation_kind", operation_kind)
+        if expected_mode is not None:
+            enums.parse_enum("controller_mode.mode", expected_mode)
+        if requested_mode is not None:
+            enums.parse_enum("controller_mode.mode", requested_mode)
+        if requested_dispatch_paused_intake_policy is not None:
+            enums.parse_enum(
+                "controller_mode.dispatch_paused_intake_policy",
+                requested_dispatch_paused_intake_policy,
+            )
+        if backup_prior_mode is not None:
+            enums.parse_enum("controller_mode.mode", backup_prior_mode)
+        if backup_prior_dispatch_paused_intake_policy is not None:
+            enums.parse_enum(
+                "controller_mode.dispatch_paused_intake_policy",
+                backup_prior_dispatch_paused_intake_policy,
+            )
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        if backup_manifest_digest is not None:
+            _require_digest(backup_manifest_digest, field="backup_manifest_digest")
+        req_digest = self._controller_mode_request_digest(
+            operation_kind=operation_kind,
+            expected_mode_revision=expected_mode_revision,
+            expected_mode=expected_mode,
+            requested_mode=requested_mode,
+            requested_dispatch_paused_intake_policy=requested_dispatch_paused_intake_policy,
+            backup_manifest_digest=backup_manifest_digest,
+            backup_prior_mode=backup_prior_mode,
+            backup_prior_dispatch_paused_intake_policy=(backup_prior_dispatch_paused_intake_policy),
+            authenticated_principal_id=authenticated_principal_id,
+            authorization_context_digest=authorization_context_digest,
+        )
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM controller_mode_operations WHERE controller_mode_operation_id = ?",
+                (controller_mode_operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["request_digest"] == req_digest
+                ):
+                    return _row_to_controller_mode_operation(existing, replayed=True)
+                return self._transient_controller_mode_conflict(
+                    controller_mode_operation_id, operation_kind
+                )
+            projection = self.get_controller_mode()
+            rejection = self._validate_controller_mode_operation(
+                projection=projection,
+                operation_kind=operation_kind,
+                expected_mode_revision=expected_mode_revision,
+                expected_mode=expected_mode,
+                requested_mode=requested_mode,
+                requested_dispatch_paused_intake_policy=requested_dispatch_paused_intake_policy,
+                authority_revoked=authority_revoked,
+                backup_manifest_digest=backup_manifest_digest,
+                backup_prior_mode=backup_prior_mode,
+                backup_prior_dispatch_paused_intake_policy=(
+                    backup_prior_dispatch_paused_intake_policy
+                ),
+            )
+            result_revision = None
+            result_mode = None
+            result_policy = None
+            prior_mode = None
+            prior_policy = None
+            if rejection is None:
+                result_revision = projection.mode_revision + 1
+                result_mode = requested_mode
+                result_policy = requested_dispatch_paused_intake_policy
+                if result_mode == "MAINTENANCE":
+                    prior_mode = projection.maintenance_prior_mode
+                    prior_policy = projection.maintenance_prior_dispatch_paused_intake_policy
+                    if operation_kind == "SET_MODE":
+                        prior_mode = projection.mode
+                        prior_policy = projection.dispatch_paused_intake_policy
+                    elif operation_kind == "RESTORE_BACKUP":
+                        prior_mode = backup_prior_mode
+                        prior_policy = backup_prior_dispatch_paused_intake_policy
+                http_status, body_json, resp_digest = self._controller_mode_response(
+                    operation_id=controller_mode_operation_id,
+                    operation_kind=operation_kind,
+                    status="SUCCEEDED",
+                    mode_revision=result_revision,
+                    mode=result_mode,
+                    dispatch_paused_intake_policy=result_policy,
+                )
+                status = "SUCCEEDED"
+            else:
+                http_status, body_json, resp_digest = self._controller_mode_response(
+                    operation_id=controller_mode_operation_id,
+                    operation_kind=operation_kind,
+                    status="REJECTED",
+                    rejection_code=rejection,
+                )
+                status = "REJECTED"
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO controller_mode_operations("
+                "controller_mode_operation_id, protocol_version, operation_kind, "
+                "expected_mode_revision, expected_mode, requested_mode, "
+                "requested_dispatch_paused_intake_policy, backup_manifest_digest, "
+                "backup_prior_mode, backup_prior_dispatch_paused_intake_policy, "
+                "authenticated_principal_id, authorization_context_digest, request_digest, "
+                "status, rejection_code, result_mode_revision, result_mode, "
+                "result_dispatch_paused_intake_policy, response_http_status, response_json, "
+                "response_digest, completed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    controller_mode_operation_id,
+                    CONTROLLER_MODE_OPERATION_PROTOCOL,
+                    operation_kind,
+                    expected_mode_revision,
+                    expected_mode,
+                    requested_mode,
+                    requested_dispatch_paused_intake_policy,
+                    backup_manifest_digest,
+                    backup_prior_mode,
+                    backup_prior_dispatch_paused_intake_policy,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    status,
+                    rejection,
+                    result_revision,
+                    result_mode,
+                    result_policy,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            if status == "SUCCEEDED":
+                self.conn.execute(
+                    "UPDATE controller_mode SET mode_revision = ?, mode = ?, "
+                    "dispatch_paused_intake_policy = ?, maintenance_prior_mode = ?, "
+                    "maintenance_prior_dispatch_paused_intake_policy = ?, "
+                    "last_operation_id = ? WHERE controller_id = ? AND mode_revision = ?",
+                    (
+                        result_revision,
+                        result_mode,
+                        result_policy,
+                        prior_mode,
+                        prior_policy,
+                        controller_mode_operation_id,
+                        CONTROLLER_ID,
+                        expected_mode_revision,
+                    ),
+                )
+            row = self.conn.execute(
+                "SELECT * FROM controller_mode_operations WHERE controller_mode_operation_id = ?",
+                (controller_mode_operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_controller_mode_operation(row, replayed=False)
+
+    def _transient_controller_mode_conflict(
+        self, operation_id: str, operation_kind: str
+    ) -> ControllerModeOperationResult:
+        http_status, body_json, resp_digest = self._controller_mode_response(
+            operation_id=operation_id,
+            operation_kind=operation_kind,
+            status="REJECTED",
+            rejection_code="INTEGRITY_CONFLICT",
+        )
+        return ControllerModeOperationResult(
+            controller_mode_operation_id=operation_id,
+            operation_kind=operation_kind,
+            status="REJECTED",
+            rejection_code="INTEGRITY_CONFLICT",
+            response_http_status=http_status,
+            response_json=body_json,
+            response_digest=resp_digest,
+            completed_at_ms=_now_ms(),
+        )
+
+    def _validate_controller_mode_operation(
+        self,
+        *,
+        projection: ControllerModeProjection,
+        operation_kind: str,
+        expected_mode_revision: int,
+        expected_mode: str | None,
+        requested_mode: str | None,
+        requested_dispatch_paused_intake_policy: str | None,
+        authority_revoked: bool,
+        backup_manifest_digest: str | None,
+        backup_prior_mode: str | None,
+        backup_prior_dispatch_paused_intake_policy: str | None,
+    ) -> str | None:
+        if authority_revoked:
+            return "AUTHORITY_REVOKED"
+        if operation_kind == "INITIALIZE" and projection.mode_revision > 0:
+            return "ALREADY_INITIALIZED"
+        if projection.mode_revision != expected_mode_revision or projection.mode != expected_mode:
+            return "CAS_LOST"
+        requested_policy_ok = (
+            requested_mode == "DISPATCH_PAUSED"
+            and requested_dispatch_paused_intake_policy is not None
+        ) or (
+            requested_mode != "DISPATCH_PAUSED" and requested_dispatch_paused_intake_policy is None
+        )
+        if requested_mode is None or not requested_policy_ok:
+            return "TRANSITION_NOT_ALLOWED"
+        if operation_kind == "INITIALIZE":
+            if requested_mode != "MAINTENANCE":
+                return "TRANSITION_NOT_ALLOWED"
+            return None
+        if projection.mode_revision == 0 or projection.mode is None:
+            return "NOT_INITIALIZED"
+        if operation_kind == "SET_MODE":
+            if backup_manifest_digest is not None:
+                return "TRANSITION_NOT_ALLOWED"
+            if (
+                projection.mode == requested_mode
+                and projection.dispatch_paused_intake_policy
+                == requested_dispatch_paused_intake_policy
+            ):
+                return "NO_CHANGE"
+            return None
+        if operation_kind == "RESTORE_BACKUP":
+            if backup_manifest_digest is None:
+                return "TRANSITION_NOT_ALLOWED"
+            if expected_mode == "MAINTENANCE":
+                if requested_mode != "MAINTENANCE" or requested_dispatch_paused_intake_policy:
+                    return "TRANSITION_NOT_ALLOWED"
+                if (backup_prior_dispatch_paused_intake_policy is not None) != (
+                    backup_prior_mode == "DISPATCH_PAUSED"
+                ):
+                    return "TRANSITION_NOT_ALLOWED"
+                return None
+            if (
+                requested_mode == "DISPATCH_PAUSED"
+                and requested_dispatch_paused_intake_policy == "PAUSE_ADMISSION"
+                and backup_prior_mode is None
+                and backup_prior_dispatch_paused_intake_policy is None
+            ):
+                return None
+            return "TRANSITION_NOT_ALLOWED"
+        raise AssertionError("unreachable operation kind")
+
+    def _capability_key_request_digest(
+        self,
+        *,
+        kind: str,
+        expected_registry_revision: int,
+        expected_issuance_key_id: str | None,
+        target_capability_signing_key_id: str,
+        replacement_issuance_key_id: str | None,
+        register_public_verification_key: bytes | None,
+        register_public_key_digest: str | None,
+        register_private_signing_secret_ref: str | None,
+        register_not_before_ms: int | None,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+    ) -> str:
+        public_key_hex = (
+            None
+            if register_public_verification_key is None
+            else register_public_verification_key.hex()
+        )
+        return request_digest(
+            {
+                "protocol_version": CAPABILITY_KEY_OPERATION_PROTOCOL,
+                "kind": kind,
+                "expected_registry_revision": expected_registry_revision,
+                "expected_issuance_key_id": expected_issuance_key_id,
+                "target_capability_signing_key_id": target_capability_signing_key_id,
+                "replacement_issuance_key_id": replacement_issuance_key_id,
+                "register_public_verification_key": public_key_hex,
+                "register_public_key_digest": register_public_key_digest,
+                "register_private_signing_secret_ref": register_private_signing_secret_ref,
+                "register_not_before_ms": register_not_before_ms,
+                "authenticated_principal_id": authenticated_principal_id,
+                "authorization_context_digest": authorization_context_digest,
+            }
+        )
+
+    def apply_capability_key_operation(
+        self,
+        *,
+        capability_key_operation_id: str,
+        kind: str,
+        expected_registry_revision: int,
+        expected_issuance_key_id: str | None,
+        target_capability_signing_key_id: str,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        replacement_issuance_key_id: str | None = None,
+        register_public_verification_key: bytes | None = None,
+        register_public_key_digest: str | None = None,
+        register_private_signing_secret_ref: str | None = None,
+        register_not_before_ms: int | None = None,
+        authority_revoked: bool = False,
+        private_key_proof_valid: bool = False,
+    ) -> CapabilityKeyOperationResult:
+        require_lowercase_uuid(capability_key_operation_id, field="capability_key_operation_id")
+        require_lowercase_uuid(
+            target_capability_signing_key_id, field="target_capability_signing_key_id"
+        )
+        if expected_issuance_key_id is not None:
+            require_lowercase_uuid(expected_issuance_key_id, field="expected_issuance_key_id")
+        if replacement_issuance_key_id is not None:
+            require_lowercase_uuid(replacement_issuance_key_id, field="replacement_issuance_key_id")
+        enums.parse_enum("capability_key_operation.kind", kind)
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        if register_public_key_digest is not None:
+            _require_digest(register_public_key_digest, field="register_public_key_digest")
+        req_digest = self._capability_key_request_digest(
+            kind=kind,
+            expected_registry_revision=expected_registry_revision,
+            expected_issuance_key_id=expected_issuance_key_id,
+            target_capability_signing_key_id=target_capability_signing_key_id,
+            replacement_issuance_key_id=replacement_issuance_key_id,
+            register_public_verification_key=register_public_verification_key,
+            register_public_key_digest=register_public_key_digest,
+            register_private_signing_secret_ref=register_private_signing_secret_ref,
+            register_not_before_ms=register_not_before_ms,
+            authenticated_principal_id=authenticated_principal_id,
+            authorization_context_digest=authorization_context_digest,
+        )
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM capability_key_operations WHERE capability_key_operation_id = ?",
+                (capability_key_operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["request_digest"] == req_digest
+                ):
+                    return _row_to_capability_key_operation(existing, replayed=True)
+                return self._transient_capability_key_conflict(capability_key_operation_id, kind)
+            registry = self.get_capability_key_registry()
+            rejection = self._validate_capability_key_operation(
+                registry=registry,
+                kind=kind,
+                expected_registry_revision=expected_registry_revision,
+                expected_issuance_key_id=expected_issuance_key_id,
+                target_capability_signing_key_id=target_capability_signing_key_id,
+                replacement_issuance_key_id=replacement_issuance_key_id,
+                register_public_verification_key=register_public_verification_key,
+                register_public_key_digest=register_public_key_digest,
+                register_private_signing_secret_ref=register_private_signing_secret_ref,
+                register_not_before_ms=register_not_before_ms,
+                authority_revoked=authority_revoked,
+                private_key_proof_valid=private_key_proof_valid,
+            )
+            result_revision = None
+            result_key = None
+            status = "REJECTED"
+            if rejection is None:
+                status = "SUCCEEDED"
+                result_revision = registry.registry_revision + 1
+                result_key = self._result_issuance_key_id(
+                    current_key_id=registry.current_issuance_key_id,
+                    kind=kind,
+                    target_capability_signing_key_id=target_capability_signing_key_id,
+                    replacement_issuance_key_id=replacement_issuance_key_id,
+                )
+                http_status, body_json, resp_digest = self._capability_key_response(
+                    operation_id=capability_key_operation_id,
+                    kind=kind,
+                    status=status,
+                    registry_revision=result_revision,
+                    current_issuance_key_id=result_key,
+                )
+            else:
+                http_status, body_json, resp_digest = self._capability_key_response(
+                    operation_id=capability_key_operation_id,
+                    kind=kind,
+                    status=status,
+                    rejection_code=rejection,
+                )
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO capability_key_operations("
+                "capability_key_operation_id, protocol_version, kind, "
+                "expected_registry_revision, expected_issuance_key_id, "
+                "target_capability_signing_key_id, replacement_issuance_key_id, "
+                "register_public_verification_key, register_public_key_digest, "
+                "register_private_signing_secret_ref, register_not_before_ms, "
+                "authenticated_principal_id, authorization_context_digest, request_digest, "
+                "status, rejection_code, result_registry_revision, result_issuance_key_id, "
+                "response_http_status, response_json, response_digest, completed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    capability_key_operation_id,
+                    CAPABILITY_KEY_OPERATION_PROTOCOL,
+                    kind,
+                    expected_registry_revision,
+                    expected_issuance_key_id,
+                    target_capability_signing_key_id,
+                    replacement_issuance_key_id,
+                    register_public_verification_key,
+                    register_public_key_digest,
+                    register_private_signing_secret_ref,
+                    register_not_before_ms,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    status,
+                    rejection,
+                    result_revision,
+                    result_key,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            if status == "SUCCEEDED":
+                self._apply_successful_capability_key_operation(
+                    kind=kind,
+                    capability_key_operation_id=capability_key_operation_id,
+                    target_capability_signing_key_id=target_capability_signing_key_id,
+                    replacement_issuance_key_id=replacement_issuance_key_id,
+                    register_public_verification_key=register_public_verification_key,
+                    register_public_key_digest=register_public_key_digest,
+                    register_private_signing_secret_ref=register_private_signing_secret_ref,
+                    register_not_before_ms=register_not_before_ms,
+                    result_revision=result_revision,
+                    result_key=result_key,
+                    now=now,
+                )
+            row = self.conn.execute(
+                "SELECT * FROM capability_key_operations WHERE capability_key_operation_id = ?",
+                (capability_key_operation_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_capability_key_operation(row, replayed=False)
+
+    def _transient_capability_key_conflict(
+        self, operation_id: str, kind: str
+    ) -> CapabilityKeyOperationResult:
+        http_status, body_json, resp_digest = self._capability_key_response(
+            operation_id=operation_id,
+            kind=kind,
+            status="REJECTED",
+            rejection_code="INTEGRITY_CONFLICT",
+        )
+        return CapabilityKeyOperationResult(
+            capability_key_operation_id=operation_id,
+            kind=kind,
+            status="REJECTED",
+            rejection_code="INTEGRITY_CONFLICT",
+            response_http_status=http_status,
+            response_json=body_json,
+            response_digest=resp_digest,
+            completed_at_ms=_now_ms(),
+        )
+
+    def _validate_capability_key_operation(
+        self,
+        *,
+        registry: CapabilityKeyRegistryProjection,
+        kind: str,
+        expected_registry_revision: int,
+        expected_issuance_key_id: str | None,
+        target_capability_signing_key_id: str,
+        replacement_issuance_key_id: str | None,
+        register_public_verification_key: bytes | None,
+        register_public_key_digest: str | None,
+        register_private_signing_secret_ref: str | None,
+        register_not_before_ms: int | None,
+        authority_revoked: bool,
+        private_key_proof_valid: bool,
+    ) -> str | None:
+        if authority_revoked:
+            return "AUTHORITY_REVOKED"
+        if (
+            registry.registry_revision != expected_registry_revision
+            or registry.current_issuance_key_id != expected_issuance_key_id
+        ):
+            return "CAS_LOST"
+        target = self.get_capability_signing_key(target_capability_signing_key_id)
+        if kind == "REGISTER":
+            if target is not None:
+                return "KEY_ALREADY_EXISTS"
+            if (
+                register_public_verification_key is None
+                or register_public_key_digest is None
+                or register_private_signing_secret_ref is None
+                or register_not_before_ms is None
+                or replacement_issuance_key_id is not None
+                or len(register_public_verification_key) != 32
+                or capability_public_key_digest(register_public_verification_key)
+                != register_public_key_digest
+                or not private_key_proof_valid
+            ):
+                return "INTEGRITY_CONFLICT"
+            digest_collision = self.conn.execute(
+                "SELECT 1 FROM capability_signing_keys WHERE public_key_digest = ?",
+                (register_public_key_digest,),
+            ).fetchone()
+            if digest_collision is not None:
+                return "INTEGRITY_CONFLICT"
+            return None
+        if any(
+            value is not None
+            for value in (
+                register_public_verification_key,
+                register_public_key_digest,
+                register_private_signing_secret_ref,
+                register_not_before_ms,
+            )
+        ):
+            return "INTEGRITY_CONFLICT"
+        if target is None or target.state != "ACTIVE":
+            if not (kind == "REVOKE" and target is not None and target.state == "RETIRED"):
+                return "KEY_NOT_ACTIVE"
+        replacement = (
+            None
+            if replacement_issuance_key_id is None
+            else self.get_capability_signing_key(replacement_issuance_key_id)
+        )
+        if replacement_issuance_key_id is not None and (
+            replacement is None or replacement.state != "ACTIVE"
+        ):
+            return "KEY_NOT_ACTIVE"
+        if kind == "SELECT":
+            if replacement_issuance_key_id is not None:
+                return "INTEGRITY_CONFLICT"
+            return None
+        if kind == "RETIRE":
+            if target_capability_signing_key_id == registry.current_issuance_key_id:
+                if replacement_issuance_key_id is None:
+                    return "CURRENT_KEY_REQUIRES_REPLACEMENT"
+                if replacement_issuance_key_id == target_capability_signing_key_id:
+                    return "KEY_NOT_ACTIVE"
+            elif replacement_issuance_key_id is not None:
+                return "INTEGRITY_CONFLICT"
+            return None
+        if kind == "REVOKE":
+            if (
+                target_capability_signing_key_id != registry.current_issuance_key_id
+                and replacement_issuance_key_id is not None
+            ):
+                return "INTEGRITY_CONFLICT"
+            if replacement_issuance_key_id == target_capability_signing_key_id:
+                return "KEY_NOT_ACTIVE"
+            return None
+        raise AssertionError("unreachable capability key operation kind")
+
+    def _result_issuance_key_id(
+        self,
+        *,
+        current_key_id: str | None,
+        kind: str,
+        target_capability_signing_key_id: str,
+        replacement_issuance_key_id: str | None,
+    ) -> str | None:
+        if kind == "REGISTER":
+            return current_key_id
+        if kind == "SELECT":
+            return target_capability_signing_key_id
+        if kind == "RETIRE":
+            return (
+                replacement_issuance_key_id
+                if target_capability_signing_key_id == current_key_id
+                else current_key_id
+            )
+        if kind == "REVOKE":
+            return (
+                replacement_issuance_key_id
+                if target_capability_signing_key_id == current_key_id
+                else current_key_id
+            )
+        raise AssertionError("unreachable capability key operation kind")
+
+    def _apply_successful_capability_key_operation(
+        self,
+        *,
+        kind: str,
+        capability_key_operation_id: str,
+        target_capability_signing_key_id: str,
+        replacement_issuance_key_id: str | None,
+        register_public_verification_key: bytes | None,
+        register_public_key_digest: str | None,
+        register_private_signing_secret_ref: str | None,
+        register_not_before_ms: int | None,
+        result_revision: int | None,
+        result_key: str | None,
+        now: int,
+    ) -> None:
+        assert result_revision is not None
+        if kind == "REGISTER":
+            assert register_public_verification_key is not None
+            assert register_public_key_digest is not None
+            assert register_private_signing_secret_ref is not None
+            assert register_not_before_ms is not None
+            self.conn.execute(
+                "INSERT INTO capability_signing_keys("
+                "capability_signing_key_id, registration_operation_id, signature_algorithm, "
+                "public_verification_key, public_key_digest, private_signing_secret_ref, "
+                "registered_at_ms, not_before_ms, state) "
+                "VALUES (?, ?, 'ED25519', ?, ?, ?, ?, ?, 'ACTIVE')",
+                (
+                    target_capability_signing_key_id,
+                    capability_key_operation_id,
+                    register_public_verification_key,
+                    register_public_key_digest,
+                    register_private_signing_secret_ref,
+                    now,
+                    register_not_before_ms,
+                ),
+            )
+        elif kind == "RETIRE":
+            self.conn.execute(
+                "UPDATE capability_signing_keys SET state = 'RETIRED', retired_at_ms = ?, "
+                "retirement_change_id = ?, retirement_principal_id = ("
+                "SELECT authenticated_principal_id FROM capability_key_operations "
+                "WHERE capability_key_operation_id = ?), retirement_authorization_digest = ("
+                "SELECT authorization_context_digest FROM capability_key_operations "
+                "WHERE capability_key_operation_id = ?) "
+                "WHERE capability_signing_key_id = ? AND state = 'ACTIVE'",
+                (
+                    now,
+                    capability_key_operation_id,
+                    capability_key_operation_id,
+                    capability_key_operation_id,
+                    target_capability_signing_key_id,
+                ),
+            )
+        elif kind == "REVOKE":
+            self.conn.execute(
+                "UPDATE capability_signing_keys SET state = 'REVOKED', revoked_at_ms = ?, "
+                "revocation_change_id = ?, revocation_principal_id = ("
+                "SELECT authenticated_principal_id FROM capability_key_operations "
+                "WHERE capability_key_operation_id = ?), revocation_authorization_digest = ("
+                "SELECT authorization_context_digest FROM capability_key_operations "
+                "WHERE capability_key_operation_id = ?) "
+                "WHERE capability_signing_key_id = ? AND state IN ('ACTIVE', 'RETIRED')",
+                (
+                    now,
+                    capability_key_operation_id,
+                    capability_key_operation_id,
+                    capability_key_operation_id,
+                    target_capability_signing_key_id,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE capability_key_registry SET registry_revision = ?, "
+            "current_issuance_key_id = ?, last_operation_id = ? WHERE registry_id = ?",
+            (result_revision, result_key, capability_key_operation_id, CONTROLLER_ID),
+        )
+
+    def selected_issuance_key(self, *, now_ms: int | None = None) -> CapabilitySigningKey | None:
+        registry = self.get_capability_key_registry()
+        if registry.current_issuance_key_id is None:
+            return None
+        key = self.get_capability_signing_key(registry.current_issuance_key_id)
+        now = _now_ms() if now_ms is None else now_ms
+        if key is None or key.state != "ACTIVE" or key.not_before_ms > now:
+            return None
+        if capability_public_key_digest(key.public_verification_key) != key.public_key_digest:
+            return None
+        return key
+
+    def controller_gate_permissions(self) -> ControllerGatePermissions:
+        mode = self.get_controller_mode()
+        registry = self.get_capability_key_registry()
+        issuance_ready = self.selected_issuance_key() is not None
+        current_mode = mode.mode
+        new_admission = current_mode == "RUNNING" or (
+            current_mode == "DISPATCH_PAUSED"
+            and mode.dispatch_paused_intake_policy == "ALLOW_ADMISSION"
+        )
+        new_claims = current_mode in {"RUNNING", "INTAKE_PAUSED"} and issuance_ready
+        return ControllerGatePermissions(
+            mode_revision=mode.mode_revision,
+            mode=current_mode,
+            registry_revision=registry.registry_revision,
+            current_issuance_key_id=registry.current_issuance_key_id,
+            new_admission=new_admission,
+            new_claims=new_claims,
+            first_result_mutation=current_mode
+            in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
+            existing_result_replay=current_mode is not None,
+            forge_reconciliation=current_mode
+            in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
+            management_operations=current_mode is not None,
+        )
+
+    def assert_offer_planning_permitted(self) -> None:
+        gates = self.controller_gate_permissions()
+        if not gates.new_claims:
+            raise WorkflowGateClosedError(
+                "offer planning requires an active issuance key and a dispatch-permitting mode"
+            )
+
+    def record_issued_capability_binding(
+        self,
+        *,
+        capability_jti: str,
+        claim_digest: str,
+        immutable_assignment_digest: str,
+        immutable_assignment: Any,
+    ) -> IssuedCapabilityBinding:
+        require_lowercase_uuid(capability_jti, field="capability_jti")
+        _require_digest(claim_digest, field="claim_digest")
+        _require_digest(immutable_assignment_digest, field="immutable_assignment_digest")
+        assignment_json = _require_json_text(immutable_assignment)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM capability_issuance_audit WHERE capability_jti = ?",
+                (capability_jti,),
+            ).fetchone()
+            if existing is not None:
+                row = _row_to_issued_capability(existing)
+                if (
+                    row.claim_digest == claim_digest
+                    and row.immutable_assignment_digest == immutable_assignment_digest
+                    and row.immutable_assignment_json == assignment_json
+                ):
+                    return row
+                raise IdempotencyConflictError("capability JTI was reused")
+            self.assert_offer_planning_permitted()
+            registry = self.get_capability_key_registry()
+            key = self.selected_issuance_key()
+            if key is None:
+                raise WorkflowGateClosedError("selected issuance key is absent or invalid")
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO capability_issuance_audit("
+                "capability_jti, capability_signing_key_id, signature_algorithm, "
+                "claim_digest, immutable_assignment_digest, immutable_assignment_json, "
+                "capability_key_registry_revision, issued_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    capability_jti,
+                    key.capability_signing_key_id,
+                    key.signature_algorithm,
+                    claim_digest,
+                    immutable_assignment_digest,
+                    assignment_json,
+                    registry.registry_revision,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM capability_issuance_audit WHERE capability_jti = ?",
+                (capability_jti,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_issued_capability(row)
 
     def create_run(
         self,
