@@ -1684,7 +1684,7 @@ class RunStore:
         register_private_signing_secret_ref: str | None = None,
         register_not_before_ms: int | None = None,
         authority_revoked: bool = False,
-        private_key_proof_valid: bool = True,
+        private_key_proof_valid: bool = False,
     ) -> CapabilityKeyOperationResult:
         require_lowercase_uuid(capability_key_operation_id, field="capability_key_operation_id")
         require_lowercase_uuid(
@@ -2049,10 +2049,9 @@ class RunStore:
         registry = self.get_capability_key_registry()
         issuance_ready = self.selected_issuance_key() is not None
         current_mode = mode.mode
-        new_admission = (
-            current_mode == "RUNNING"
-            or current_mode == "DISPATCH_PAUSED"
-            and (mode.dispatch_paused_intake_policy == "ALLOW_ADMISSION")
+        new_admission = current_mode == "RUNNING" or (
+            current_mode == "DISPATCH_PAUSED"
+            and mode.dispatch_paused_intake_policy == "ALLOW_ADMISSION"
         )
         new_claims = current_mode in {"RUNNING", "INTAKE_PAUSED"} and issuance_ready
         return ControllerGatePermissions(

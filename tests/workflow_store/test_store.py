@@ -82,6 +82,7 @@ def _register_key(
         register_public_key_digest=capability_public_key_digest(public_key),
         register_private_signing_secret_ref=f"secret:{key_id}:1",
         register_not_before_ms=0,
+        private_key_proof_valid=True,
         authenticated_principal_id="key-operator",
         authorization_context_digest=AUTHZ_DIGEST,
     )
@@ -119,6 +120,28 @@ def _initialize_mode(store: RunStore) -> None:
         authorization_context_digest=AUTHZ_DIGEST,
     )
     assert result.status == "SUCCEEDED"
+
+
+def test_capability_key_registration_requires_private_key_proof(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        public_key = _public_key(1)
+        result = store.apply_capability_key_operation(
+            capability_key_operation_id=KEY_OP_ID,
+            kind="REGISTER",
+            expected_registry_revision=0,
+            expected_issuance_key_id=None,
+            target_capability_signing_key_id=KEY_ID,
+            register_public_verification_key=public_key,
+            register_public_key_digest=capability_public_key_digest(public_key),
+            register_private_signing_secret_ref=f"secret:{KEY_ID}:1",
+            register_not_before_ms=0,
+            authenticated_principal_id="key-operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+
+        assert result.status == "REJECTED"
+        assert result.rejection_code == "INTEGRITY_CONFLICT"
+        assert store.get_capability_signing_key(KEY_ID) is None
 
 
 def test_default_reducer_version_is_an_explicit_supported_constant() -> None:
