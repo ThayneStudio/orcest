@@ -862,11 +862,16 @@ def test_oldest_pending_alert(fake_redis_client, caplog):
     assert get_delivery_metrics(fake_redis_client).get("oldest_pending_alerts") == "1"
 
 
-def _draft_pr(*, number: int = 4, head_repository: str = REPO) -> CandidatePullRequest:
+def _draft_pr(
+    *,
+    number: int = 4,
+    head_repository: str = REPO,
+    state: str = "OPEN",
+) -> CandidatePullRequest:
     return CandidatePullRequest(
         number=number,
         url=f"https://evil.example/{head_repository}/pull/{number}",
-        state="OPEN",
+        state=state,
         is_draft=True,
         base_repository=REPO,
         base_ref_name="master",
@@ -904,6 +909,31 @@ def test_ineffective_retry_record_resumes_partial_pr(fake_redis_client):
     dumped = context.to_canonical_json()
     assert "evil.example" not in dumped
     assert "is_draft" not in dumped
+
+
+def test_ineffective_retry_context_ignores_closed_partial_pr(fake_redis_client):
+    _admit_completed(fake_redis_client)
+    process_due_verification_jobs(
+        fake_redis_client,
+        REPO,
+        TOKEN,
+        LabelConfig(),
+        _config(grace_seconds=0, ineffective_cooldown_seconds=20),
+        stream_redis=fake_redis_client,
+        now=lambda: 1_040.0,
+        observe=lambda *a, **k: _observation(
+            verified=False,
+            kind=DeliveryErrorKind.MISMATCH,
+            reason=DeliveryFailureReason.NO_CANDIDATE_PR,
+            selected_number=None,
+            live_head_oid=OID,
+            candidate_prs=(_draft_pr(number=4, state="CLOSED"), _draft_pr(number=8)),
+        ),
+    )
+    context = load_latest_issue_retry_context(fake_redis_client, REPO, ISSUE)
+    assert context is not None
+    assert context.pr_number == 8
+    assert context.pr_url == f"https://github.com/{REPO}/pull/8"
 
 
 def test_fork_pr_is_not_stored_in_retry_context(fake_redis_client):

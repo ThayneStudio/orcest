@@ -352,11 +352,13 @@ def _as_float(value: str | None, default: float = 0.0) -> float:
 
 
 def _partial_pr_number(observation: HandoffObservation, job: VerificationJob) -> str:
-    """Lowest same-repository PR on the expected ref, even if it does not qualify."""
+    """Lowest open same-repository PR on the expected ref, even if it is draft."""
     expected = normalize_head_ref(job.expected_branch)
     numbers: list[int] = []
     for pr in observation.candidate_prs:
         if pr.number < 1:
+            continue
+        if pr.state.upper() != "OPEN":
             continue
         if pr.head_repository != job.repo:
             continue
@@ -365,7 +367,10 @@ def _partial_pr_number(observation: HandoffObservation, job: VerificationJob) ->
         numbers.append(pr.number)
     selected = observation.selected_pr
     if selected is not None and selected.number >= 1 and selected.head_repository == job.repo:
-        if normalize_head_ref(selected.head_ref_name) == expected:
+        if (
+            selected.state.upper() == "OPEN"
+            and normalize_head_ref(selected.head_ref_name) == expected
+        ):
             numbers.append(selected.number)
     return str(min(numbers)) if numbers else ""
 
