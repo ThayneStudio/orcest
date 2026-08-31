@@ -7,6 +7,7 @@ and disabling certificate checks are rejected even on loopback.
 from __future__ import annotations
 
 import ssl
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ from orcest.workflow_store.v1.project_registration import (
 )
 
 REGISTRATIONS_PATH = "/api/v1/projects/registrations"
+_RUN_STORE_LOCK = threading.Lock()
 
 
 def _error_body(http_status: int, code: str, message: str, *, retryable: bool = False) -> bytes:
@@ -71,14 +73,15 @@ def handle_registration_http(
             header_key = value
             break
     try:
-        result = register_or_revalidate_project(
-            run_store,
-            catalog=catalog,
-            resolver=resolver,
-            raw_body=body,
-            idempotency_key_header=header_key,
-            authenticated_principal_id=principal_id,
-        )
+        with _RUN_STORE_LOCK:
+            result = register_or_revalidate_project(
+                run_store,
+                catalog=catalog,
+                resolver=resolver,
+                raw_body=body,
+                idempotency_key_header=header_key,
+                authenticated_principal_id=principal_id,
+            )
     except TransportError as exc:
         return (
             exc.http_status,
@@ -159,7 +162,7 @@ class RegistrationHttpsServer(ThreadingHTTPServer):
         self.resolver = resolver
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.verify_mode = ssl.CERT_REQUIRED if tls.require_client_cert else ssl.CERT_REQUIRED
+        context.verify_mode = ssl.CERT_REQUIRED if tls.require_client_cert else ssl.CERT_OPTIONAL
         context.load_cert_chain(tls.certfile, tls.keyfile)
         context.load_verify_locations(tls.cafile)
         self.socket = context.wrap_socket(self.socket, server_side=True)

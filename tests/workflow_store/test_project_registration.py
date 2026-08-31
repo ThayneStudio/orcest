@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import subprocess
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -40,7 +43,11 @@ from orcest.workflow_store.v1.project_registration import (
     TrustedBasePolicyRecord,
     register_or_revalidate_project,
 )
-from orcest.workflow_store.v1.registration_http import handle_registration_http
+from orcest.workflow_store.v1.registration_http import (
+    RegistrationHttpsServer,
+    RegistrationTlsConfig,
+    handle_registration_http,
+)
 from orcest.workflow_store.v1.secret_provision import provision_or_adopt_secret
 from orcest.workflow_store.v1.secrets import SecretStore
 
@@ -616,6 +623,90 @@ def test_http_handler_round_trip(
         resolver=_Resolver(compiled, oid),
     )
     assert json.loads(payload)["replayed"] is True
+
+
+def test_http_handler_serializes_registration_store_calls(monkeypatch) -> None:
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    class _Result:
+        http_status = 200
+        body_json = "{}"
+
+    def fake_register(*_args, **_kwargs):
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with active_lock:
+            active -= 1
+        return _Result()
+
+    monkeypatch.setattr(
+        "orcest.workflow_store.v1.registration_http.register_or_revalidate_project",
+        fake_register,
+    )
+    statuses: list[int] = []
+
+    def post() -> None:
+        status, _, _ = handle_registration_http(
+            method="POST",
+            path="/api/v1/projects/registrations",
+            headers={},
+            body=b"{}",
+            principal_id=PRINCIPAL,
+            run_store=object(),  # type: ignore[arg-type]
+            catalog=object(),  # type: ignore[arg-type]
+            resolver=object(),  # type: ignore[arg-type]
+        )
+        statuses.append(status)
+
+    threads = [threading.Thread(target=post) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert statuses == [200] * 8
+    assert max_active == 1
+
+
+def test_registration_tls_client_cert_requirement_is_configurable(
+    run_store: RunStore, monkeypatch
+) -> None:
+    contexts = []
+
+    class _FakeContext:
+        def __init__(self, protocol) -> None:
+            self.protocol = protocol
+            self.minimum_version = None
+            self.verify_mode = None
+            contexts.append(self)
+
+        def load_cert_chain(self, _certfile, _keyfile) -> None:
+            return None
+
+        def load_verify_locations(self, _cafile) -> None:
+            return None
+
+        def wrap_socket(self, socket, *, server_side: bool):
+            assert server_side is True
+            return socket
+
+    monkeypatch.setattr("orcest.workflow_store.v1.registration_http.ssl.SSLContext", _FakeContext)
+    server = RegistrationHttpsServer(
+        ("127.0.0.1", 0),
+        run_store=run_store,
+        catalog=_real_catalog(),
+        resolver=object(),  # type: ignore[arg-type]
+        tls=RegistrationTlsConfig("server.crt", "server.key", "ca.crt", require_client_cert=False),
+    )
+    try:
+        assert contexts[-1].verify_mode == ssl.CERT_OPTIONAL
+    finally:
+        server.server_close()
 
 
 def test_cli_onboard_rejects_plaintext_and_disabled_tls(tmp_path: Path, monkeypatch) -> None:
