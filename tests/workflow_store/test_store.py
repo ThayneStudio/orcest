@@ -106,9 +106,10 @@ def test_create_run_replay_after_transition_is_idempotent(tmp_path: Path) -> Non
                 specification_generation=1,
             )
         assert replayed == transition
-        assert store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (RUN_ID,)).fetchone()[
-            0
-        ] == "PLANNING"
+        assert (
+            store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (RUN_ID,)).fetchone()[0]
+            == "PLANNING"
+        )
         assert store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 
 
