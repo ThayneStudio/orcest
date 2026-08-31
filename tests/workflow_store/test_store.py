@@ -1170,7 +1170,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1419,6 +1419,87 @@ def test_v2_database_migrates_capability_tables_and_backup_columns(tmp_path: Pat
 
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         _assert_migrated_to_v3_controller_and_capability_shape(store)
+
+
+_SECRET_PROVISION_TABLES = (
+    "secret_current_versions",
+    "secret_versions",
+    "credential_rotation_receipts",
+    "secret_provision_operations",
+    "secret_provision_checkpoints",
+)
+
+
+def _write_v3_shaped_database(db_path: Path) -> None:
+    """Build a real v4 database, then strip it back to the v3 shape: every
+    secret-provision table dropped and ``user_version`` rolled back to 3."""
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in _SECRET_PROVISION_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 4")
+        conn.execute("PRAGMA user_version=3")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v3_database_migrates_secret_provision_tables(tmp_path: Path) -> None:
+    _write_v3_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _SECRET_PROVISION_TABLES:
+            assert expected_table in tables
+        # A prior-version secret provision now round-trips end to end on the
+        # freshly migrated database.
+        result = store.apply_capability_key_operation(
+            capability_key_operation_id=KEY_OP_ID,
+            kind="REGISTER",
+            expected_registry_revision=0,
+            expected_issuance_key_id=None,
+            target_capability_signing_key_id=KEY_ID,
+            register_public_verification_key=_public_key(1),
+            register_public_key_digest=capability_public_key_digest(_public_key(1)),
+            register_private_signing_secret_ref="bootstrap:0",
+            register_not_before_ms=0,
+            private_key_proof_valid=True,
+            authenticated_principal_id="key-operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+        assert result.status == "SUCCEEDED"
+        store.apply_capability_key_operation(
+            capability_key_operation_id=KEY_OP_ID_2,
+            kind="SELECT",
+            expected_registry_revision=1,
+            expected_issuance_key_id=None,
+            target_capability_signing_key_id=KEY_ID,
+            authenticated_principal_id="key-operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+        secret_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        accepted = store.begin_secret_provision_operation(
+            secret_provision_operation_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            mode="PROVISION",
+            secret_id=secret_id,
+            expected_prior_version=None,
+            purpose="FORGE_API",
+            owner_scope_kind="FORGE_INSTALLATION",
+            owner_scope_id="installation-1",
+            provider_account_ref="installation-1",
+            authenticated_principal_id="operator-1",
+            authorization_context_digest=AUTHZ_DIGEST,
+            secret_store_staging_receipt_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+            secret_integrity_attestation_id="11111111-2222-4333-8444-555555555555",
+        )
+        assert accepted.state == "PENDING"
+        assert accepted.target_version == 1
 
 
 def test_capability_key_register_rejects_reused_digest_under_new_key_id(

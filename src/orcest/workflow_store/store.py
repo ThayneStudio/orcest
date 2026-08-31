@@ -10,6 +10,7 @@ import fcntl
 import os
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,8 +22,11 @@ from typing import Any, Self
 from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
+    affected_run_ids_digest,
     capability_public_key_digest,
+    checkpoint_digest,
     is_valid_content_digest,
+    receipt_digest,
     request_digest,
     response_digest,
 )
@@ -32,9 +36,12 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
+    SECRET_PROVISION_ACCEPTED_PROTOCOL,
+    SECRET_PROVISION_REQUEST_PROTOCOL,
+    SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -307,6 +314,89 @@ class IssuedCapabilityBinding:
     issued_at_ms: int
 
 
+@dataclass(frozen=True, slots=True)
+class SecretCurrentVersionProjection:
+    """CAS-fenced current-version pointer and immutable owner/purpose binding."""
+
+    secret_id: str
+    purpose: str | None
+    owner_scope_kind: str | None
+    owner_scope_id: str | None
+    provider_account_ref: str | None
+    current_version: int
+    last_operation_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SecretVersionRecord:
+    secret_id: str
+    version: int
+    creation_receipt_id: str
+    storage_path: str
+    affected_run_ids_digest: str
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialRotationReceiptRecord:
+    credential_rotation_receipt_id: str
+    source_kind: str
+    source_id: str
+    secret_id: str
+    expected_prior_version: int | None
+    new_version: int
+    purpose: str
+    owner_scope_kind: str
+    owner_scope_id: str
+    secret_integrity_attestation_id: str
+    receipt_digest: str
+    created_at_ms: int
+    provider_account_ref: str | None = None
+    credential_rotation_request_id: str | None = None
+    attempt_id: str | None = None
+    activity_id: str | None = None
+    attempt_generation: int | None = None
+    worker_id: str | None = None
+    worker_session_id: str | None = None
+    attempt_capability_digest: str | None = None
+    launch_attestation_id: str | None = None
+    management_operation_id: str | None = None
+    authenticated_principal_id: str | None = None
+    authorization_context_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SecretProvisionCheckpointRecord:
+    secret_provision_checkpoint_id: str
+    secret_provision_operation_id: str
+    checkpoint_sequence: int
+    phase: str
+    outcome: str
+    recorded_at_ms: int
+    failure_code: str | None = None
+    failure_evidence_digest: str | None = None
+    next_retry_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SecretProvisionOperationResult:
+    secret_provision_operation_id: str
+    mode: str
+    secret_id: str
+    target_version: int
+    state: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    created_at_ms: int
+    expected_prior_version: int | None = None
+    rejection_code: str | None = None
+    new_version: int | None = None
+    credential_rotation_receipt_id: str | None = None
+    secret_store_staging_receipt_id: str | None = None
+    replayed: bool = False
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -322,6 +412,12 @@ def _sql_in(values: Iterable[str]) -> str:
 def _require_digest(value: str, *, field: str) -> str:
     if not is_valid_content_digest(value):
         raise ValueError(f"{field} must be a v1 sha256 content digest")
+    return value
+
+
+def _require_positive_int(value: int, *, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{field} must be a positive integer")
     return value
 
 
@@ -540,6 +636,72 @@ def _row_to_issued_capability(row: sqlite3.Row) -> IssuedCapabilityBinding:
         immutable_assignment_json=row["immutable_assignment_json"],
         capability_key_registry_revision=row["capability_key_registry_revision"],
         issued_at_ms=row["issued_at_ms"],
+    )
+
+
+def _row_to_secret_current_version(row: sqlite3.Row) -> SecretCurrentVersionProjection:
+    return SecretCurrentVersionProjection(
+        secret_id=row["secret_id"],
+        purpose=row["purpose"],
+        owner_scope_kind=row["owner_scope_kind"],
+        owner_scope_id=row["owner_scope_id"],
+        provider_account_ref=row["provider_account_ref"],
+        current_version=row["current_version"],
+        last_operation_id=row["last_operation_id"],
+    )
+
+
+def _row_to_secret_version(row: sqlite3.Row) -> SecretVersionRecord:
+    return SecretVersionRecord(
+        secret_id=row["secret_id"],
+        version=row["version"],
+        creation_receipt_id=row["creation_receipt_id"],
+        storage_path=row["storage_path"],
+        affected_run_ids_digest=row["affected_run_ids_digest"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_credential_rotation_receipt(row: sqlite3.Row) -> CredentialRotationReceiptRecord:
+    return CredentialRotationReceiptRecord(
+        credential_rotation_receipt_id=row["credential_rotation_receipt_id"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        credential_rotation_request_id=row["credential_rotation_request_id"],
+        secret_id=row["secret_id"],
+        expected_prior_version=row["expected_prior_version"],
+        new_version=row["new_version"],
+        purpose=row["purpose"],
+        owner_scope_kind=row["owner_scope_kind"],
+        owner_scope_id=row["owner_scope_id"],
+        provider_account_ref=row["provider_account_ref"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        worker_id=row["worker_id"],
+        worker_session_id=row["worker_session_id"],
+        attempt_capability_digest=row["attempt_capability_digest"],
+        launch_attestation_id=row["launch_attestation_id"],
+        management_operation_id=row["management_operation_id"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        authorization_context_digest=row["authorization_context_digest"],
+        secret_integrity_attestation_id=row["secret_integrity_attestation_id"],
+        receipt_digest=row["receipt_digest"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_secret_provision_checkpoint(row: sqlite3.Row) -> SecretProvisionCheckpointRecord:
+    return SecretProvisionCheckpointRecord(
+        secret_provision_checkpoint_id=row["secret_provision_checkpoint_id"],
+        secret_provision_operation_id=row["secret_provision_operation_id"],
+        checkpoint_sequence=row["checkpoint_sequence"],
+        phase=row["phase"],
+        outcome=row["outcome"],
+        failure_code=row["failure_code"],
+        failure_evidence_digest=row["failure_evidence_digest"],
+        next_retry_ms=row["next_retry_ms"],
+        recorded_at_ms=row["recorded_at_ms"],
     )
 
 
@@ -939,6 +1101,182 @@ CREATE TABLE IF NOT EXISTS durable_operations (
   committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms >= 0),
   UNIQUE (principal_id, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS secret_current_versions (
+  secret_id TEXT PRIMARY KEY,
+  purpose TEXT NOT NULL CHECK (
+    purpose IN ({_sql_in(_enum_values("secret_provision_operation.purpose"))})
+  ),
+  owner_scope_kind TEXT NOT NULL CHECK (
+    owner_scope_kind IN ({_sql_in(_enum_values("secret_provision_operation.owner_scope_kind"))})
+  ),
+  owner_scope_id TEXT NOT NULL,
+  provider_account_ref TEXT,
+  current_version INTEGER NOT NULL CHECK (current_version >= 0),
+  last_operation_id TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  CHECK ((current_version = 0 AND last_operation_id IS NULL)
+    OR (current_version > 0 AND last_operation_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS secret_versions (
+  secret_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  creation_receipt_id TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  affected_run_ids_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  PRIMARY KEY (secret_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS credential_rotation_receipts (
+  credential_rotation_receipt_id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("credential_rotation_receipt.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  credential_rotation_request_id TEXT,
+  secret_id TEXT NOT NULL,
+  expected_prior_version INTEGER
+    CHECK (expected_prior_version IS NULL OR expected_prior_version > 0),
+  new_version INTEGER NOT NULL CHECK (new_version > 0),
+  purpose TEXT NOT NULL CHECK (
+    purpose IN ({_sql_in(_enum_values("secret_provision_operation.purpose"))})
+  ),
+  owner_scope_kind TEXT NOT NULL CHECK (
+    owner_scope_kind IN ({_sql_in(_enum_values("secret_provision_operation.owner_scope_kind"))})
+  ),
+  owner_scope_id TEXT NOT NULL,
+  provider_account_ref TEXT,
+  attempt_id TEXT,
+  activity_id TEXT,
+  attempt_generation INTEGER CHECK (attempt_generation IS NULL OR attempt_generation > 0),
+  worker_id TEXT,
+  worker_session_id TEXT,
+  attempt_capability_digest TEXT,
+  launch_attestation_id TEXT,
+  management_operation_id TEXT,
+  authenticated_principal_id TEXT,
+  authorization_context_digest TEXT,
+  secret_integrity_attestation_id TEXT NOT NULL,
+  receipt_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (secret_id, new_version),
+  UNIQUE (source_kind, source_id),
+  CHECK (
+    (source_kind = 'MANAGEMENT_PROVISION'
+      AND management_operation_id IS NOT NULL
+      AND authenticated_principal_id IS NOT NULL
+      AND authorization_context_digest IS NOT NULL
+      AND credential_rotation_request_id IS NULL
+      AND attempt_id IS NULL AND activity_id IS NULL AND attempt_generation IS NULL
+      AND worker_id IS NULL AND worker_session_id IS NULL
+      AND attempt_capability_digest IS NULL AND launch_attestation_id IS NULL)
+    OR
+    (source_kind = 'ATTEMPT_ROTATION'
+      AND attempt_id IS NOT NULL AND activity_id IS NOT NULL AND attempt_generation IS NOT NULL
+      AND worker_id IS NOT NULL AND worker_session_id IS NOT NULL
+      AND attempt_capability_digest IS NOT NULL AND launch_attestation_id IS NOT NULL
+      AND management_operation_id IS NULL
+      AND authenticated_principal_id IS NULL AND authorization_context_digest IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS secret_provision_operations (
+  secret_provision_operation_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (
+    mode IN ({_sql_in(_enum_values("secret_provision_operation.mode"))})
+  ),
+  secret_id TEXT NOT NULL,
+  expected_prior_version INTEGER
+    CHECK (expected_prior_version IS NULL OR expected_prior_version > 0),
+  target_version INTEGER NOT NULL CHECK (target_version > 0),
+  purpose TEXT NOT NULL CHECK (
+    purpose IN ({_sql_in(_enum_values("secret_provision_operation.purpose"))})
+  ),
+  owner_scope_kind TEXT NOT NULL CHECK (
+    owner_scope_kind IN ({_sql_in(_enum_values("secret_provision_operation.owner_scope_kind"))})
+  ),
+  owner_scope_id TEXT NOT NULL,
+  provider_account_ref TEXT,
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  secret_store_staging_receipt_id TEXT NOT NULL,
+  secret_integrity_attestation_id TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("secret_provision_operation.state"))})
+  ),
+  rejection_code TEXT CHECK (
+    rejection_code IN ({_sql_in(_enum_values("secret_provision_operation.rejection_code"))})
+  ),
+  new_version INTEGER CHECK (new_version IS NULL OR new_version > 0),
+  credential_rotation_receipt_id TEXT,
+  terminal_http_status INTEGER
+    CHECK (terminal_http_status IS NULL OR terminal_http_status BETWEEN 100 AND 599),
+  terminal_response_json TEXT,
+  terminal_response_digest TEXT,
+  last_checkpoint_id TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (
+    (state = 'PENDING'
+      AND credential_rotation_receipt_id IS NULL AND new_version IS NULL
+      AND rejection_code IS NULL AND terminal_http_status IS NULL
+      AND terminal_response_json IS NULL AND terminal_response_digest IS NULL)
+    OR (state = 'COMPLETED'
+      AND credential_rotation_receipt_id IS NOT NULL AND new_version IS NOT NULL
+      AND rejection_code IS NULL AND terminal_http_status IS NOT NULL
+      AND terminal_response_json IS NOT NULL AND terminal_response_digest IS NOT NULL)
+    OR (state = 'REJECTED'
+      AND credential_rotation_receipt_id IS NULL AND new_version IS NULL
+      AND rejection_code IS NOT NULL AND terminal_http_status IS NOT NULL
+      AND terminal_response_json IS NOT NULL AND terminal_response_digest IS NOT NULL)
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_secret_provision_target_reservation
+ON secret_provision_operations(secret_id, target_version)
+WHERE state IN ('PENDING', 'COMPLETED');
+
+CREATE TABLE IF NOT EXISTS secret_provision_checkpoints (
+  secret_provision_checkpoint_id TEXT PRIMARY KEY,
+  secret_provision_operation_id TEXT NOT NULL
+    REFERENCES secret_provision_operations(secret_provision_operation_id) ON DELETE RESTRICT,
+  checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+  phase TEXT NOT NULL CHECK (
+    phase IN ({_sql_in(_enum_values("secret_provision_checkpoint.phase"))})
+  ),
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("secret_provision_checkpoint.outcome"))})
+  ),
+  failure_code TEXT CHECK (
+    failure_code IN ({_sql_in(_enum_values("secret_provision_checkpoint.failure_code"))})
+  ),
+  failure_evidence_digest TEXT,
+  next_retry_ms INTEGER CHECK (next_retry_ms IS NULL OR next_retry_ms >= 0),
+  checkpoint_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (secret_provision_operation_id, checkpoint_sequence),
+  CHECK (outcome != 'SUCCEEDED' OR phase = 'INSTALL_VERSION'),
+  CHECK (
+    (outcome = 'SUCCEEDED'
+      AND failure_code IS NULL AND failure_evidence_digest IS NULL AND next_retry_ms IS NULL)
+    OR (outcome = 'FAILED_RETRYABLE'
+      AND failure_code IN ('SECRET_STORE_UNAVAILABLE', 'TRANSIENT_STORAGE_ERROR',
+        'TRANSIENT_DATABASE_BUSY')
+      AND failure_evidence_digest IS NOT NULL AND next_retry_ms IS NOT NULL)
+    OR (outcome = 'FAILED_TERMINAL'
+      AND failure_code IN ('CAS_LOST', 'AUTHORITY_REVOKED', 'STAGED_OBJECT_INVALID',
+        'INTEGRITY_CONFLICT')
+      AND failure_evidence_digest IS NOT NULL AND next_retry_ms IS NULL)
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_secret_provision_checkpoint_terminal
+ON secret_provision_checkpoints(secret_provision_operation_id)
+WHERE outcome IN ('SUCCEEDED', 'FAILED_TERMINAL');
 """
 
 _V1_TO_V2 = f"""
@@ -1229,7 +1567,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2}:
+        if current not in {0, 1, 2, 3}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -1271,7 +1609,7 @@ class RunStore:
                     "VALUES (?, ?, ?)",
                     (SCHEMA_VERSION, "workflow-control-v1-reducer-ledger", _now_ms()),
                 )
-            else:
+            elif current == 2:
                 # _SCHEMA is idempotent (CREATE TABLE IF NOT EXISTS): a real version-2
                 # database already has controller_mode/controller_mode_operations, so
                 # only the capability-key tables get created here; _V2_TO_V3 then
@@ -1284,6 +1622,21 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-controller-mode-and-key-gates",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                # A real version-3 database already has every table in its
+                # final v3 shape; _SCHEMA only needs to create the new
+                # secret-provision/adoption tables (all CREATE TABLE IF NOT
+                # EXISTS), so no rebuild script runs for this step.
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-secret-provision-and-adoption",
                         _now_ms(),
                     ),
                 )
@@ -2275,6 +2628,812 @@ class RunStore:
             ).fetchone()
             assert row is not None
             return _row_to_issued_capability(row)
+
+    # -- Secret Provision Operation (MANAGEMENT_PROVISION provision/adopt) --
+
+    def get_secret_current_version(self, secret_id: str) -> SecretCurrentVersionProjection | None:
+        require_lowercase_uuid(secret_id, field="secret_id")
+        row = self.conn.execute(
+            "SELECT * FROM secret_current_versions WHERE secret_id = ?", (secret_id,)
+        ).fetchone()
+        return None if row is None else _row_to_secret_current_version(row)
+
+    def get_secret_version(self, secret_id: str, version: int) -> SecretVersionRecord | None:
+        require_lowercase_uuid(secret_id, field="secret_id")
+        row = self.conn.execute(
+            "SELECT * FROM secret_versions WHERE secret_id = ? AND version = ?",
+            (secret_id, version),
+        ).fetchone()
+        return None if row is None else _row_to_secret_version(row)
+
+    def get_credential_rotation_receipt(
+        self, credential_rotation_receipt_id: str
+    ) -> CredentialRotationReceiptRecord | None:
+        require_lowercase_uuid(
+            credential_rotation_receipt_id, field="credential_rotation_receipt_id"
+        )
+        row = self.conn.execute(
+            "SELECT * FROM credential_rotation_receipts WHERE credential_rotation_receipt_id = ?",
+            (credential_rotation_receipt_id,),
+        ).fetchone()
+        return None if row is None else _row_to_credential_rotation_receipt(row)
+
+    def list_secret_provision_checkpoints(
+        self, secret_provision_operation_id: str
+    ) -> list[SecretProvisionCheckpointRecord]:
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        rows = self.conn.execute(
+            "SELECT * FROM secret_provision_checkpoints "
+            "WHERE secret_provision_operation_id = ? ORDER BY checkpoint_sequence",
+            (secret_provision_operation_id,),
+        ).fetchall()
+        return [_row_to_secret_provision_checkpoint(row) for row in rows]
+
+    def get_secret_provision_operation(
+        self, secret_provision_operation_id: str
+    ) -> SecretProvisionOperationResult | None:
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        row = self.conn.execute(
+            "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+            (secret_provision_operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._secret_provision_operation_from_row(row, replayed=True)
+
+    def _secret_provision_operation_from_row(
+        self, row: sqlite3.Row, *, replayed: bool
+    ) -> SecretProvisionOperationResult:
+        if row["state"] == "PENDING":
+            http_status, body_json, resp_digest = self._secret_provision_accepted_response(
+                operation_id=row["secret_provision_operation_id"],
+                secret_id=row["secret_id"],
+                target_version=row["target_version"],
+            )
+        else:
+            http_status = row["terminal_http_status"]
+            body_json = row["terminal_response_json"]
+            resp_digest = row["terminal_response_digest"]
+        return SecretProvisionOperationResult(
+            secret_provision_operation_id=row["secret_provision_operation_id"],
+            mode=row["mode"],
+            secret_id=row["secret_id"],
+            expected_prior_version=row["expected_prior_version"],
+            target_version=row["target_version"],
+            state=row["state"],
+            rejection_code=row["rejection_code"],
+            new_version=row["new_version"],
+            credential_rotation_receipt_id=row["credential_rotation_receipt_id"],
+            secret_store_staging_receipt_id=row["secret_store_staging_receipt_id"],
+            response_http_status=http_status,
+            response_json=body_json,
+            response_digest=resp_digest,
+            created_at_ms=row["created_at_ms"],
+            replayed=replayed,
+        )
+
+    def _secret_provision_request_digest(
+        self,
+        *,
+        mode: str,
+        secret_id: str,
+        expected_prior_version: int | None,
+        target_version: int,
+        purpose: str,
+        owner_scope_kind: str,
+        owner_scope_id: str,
+        provider_account_ref: str | None,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        secret_store_staging_receipt_id: str,
+        secret_integrity_attestation_id: str,
+    ) -> str:
+        return request_digest(
+            {
+                "protocol_version": SECRET_PROVISION_REQUEST_PROTOCOL,
+                "mode": mode,
+                "secret_id": secret_id,
+                "expected_prior_version": expected_prior_version,
+                "target_version": target_version,
+                "purpose": purpose,
+                "owner_scope_kind": owner_scope_kind,
+                "owner_scope_id": owner_scope_id,
+                "provider_account_ref": provider_account_ref,
+                "authenticated_principal_id": authenticated_principal_id,
+                "authorization_context_digest": authorization_context_digest,
+                "secret_store_staging_receipt_id": secret_store_staging_receipt_id,
+                "secret_integrity_attestation_id": secret_integrity_attestation_id,
+            }
+        )
+
+    def _secret_provision_accepted_response(
+        self, *, operation_id: str, secret_id: str, target_version: int
+    ) -> tuple[int, str, str]:
+        body: dict[str, object] = {
+            "protocol": SECRET_PROVISION_ACCEPTED_PROTOCOL,
+            "secret_provision_operation_id": operation_id,
+            "state": "PENDING",
+            "secret_id": secret_id,
+            "target_version": target_version,
+        }
+        body_json = canonical_json_text(body)
+        digest = response_digest({"http_status": 202, "body": body})
+        return 202, body_json, digest
+
+    def _secret_provision_result_response(
+        self,
+        *,
+        operation_id: str,
+        secret_id: str,
+        target_version: int,
+        state: str,
+        new_version: int | None = None,
+        secret_version_key: str | None = None,
+        credential_rotation_receipt_id: str | None = None,
+        rejection_code: str | None = None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, object] = {
+            "protocol": SECRET_PROVISION_RESULT_PROTOCOL,
+            "secret_provision_operation_id": operation_id,
+            "state": state,
+            "secret_id": secret_id,
+            "target_version": target_version,
+        }
+        if state == "COMPLETED":
+            body["secret_version_key"] = secret_version_key
+            body["new_version"] = new_version
+            body["credential_rotation_receipt_id"] = credential_rotation_receipt_id
+            http_status = 200
+        else:
+            body["rejection_code"] = rejection_code
+            http_status = (
+                403
+                if rejection_code == "AUTHORITY_REVOKED"
+                else 422
+                if rejection_code == "STAGED_OBJECT_INVALID"
+                else 409
+            )
+        body_json = canonical_json_text(body)
+        digest = response_digest({"http_status": http_status, "body": body})
+        return http_status, body_json, digest
+
+    def _owner_purpose_matrix_valid(
+        self,
+        *,
+        purpose: str,
+        owner_scope_kind: str,
+        owner_scope_id: str,
+        provider_account_ref: str | None,
+    ) -> bool:
+        if owner_scope_kind == "FORGE_INSTALLATION":
+            return (
+                purpose in ("FORGE_API", "SOURCE_READ", "PUBLICATION")
+                and provider_account_ref == owner_scope_id
+            )
+        if owner_scope_kind == "CONTROLLER":
+            return (
+                purpose == "CAPABILITY_SIGNING_PRIVATE_KEY"
+                and owner_scope_id == CONTROLLER_ID
+                and provider_account_ref is None
+            )
+        if owner_scope_kind == "PROJECT":
+            return purpose in ("FORGE_API", "SOURCE_READ", "PUBLICATION")
+        return False
+
+    def _validate_secret_provision_operation(
+        self,
+        *,
+        current: SecretCurrentVersionProjection | None,
+        secret_id: str,
+        target_version: int,
+        mode: str,
+        expected_prior_version: int | None,
+        purpose: str,
+        owner_scope_kind: str,
+        owner_scope_id: str,
+        provider_account_ref: str | None,
+        authority_revoked: bool,
+    ) -> str | None:
+        if authority_revoked:
+            return "AUTHORITY_REVOKED"
+        current_version = 0 if current is None else current.current_version
+        if expected_prior_version is None:
+            if current_version != 0:
+                return "CAS_LOST"
+        elif current_version != expected_prior_version:
+            return "CAS_LOST"
+        # A concurrent operation may already have reserved this exact target
+        # (single-writer serialization means it committed its PENDING/COMPLETED
+        # row before this transaction's BEGIN IMMEDIATE was granted, but before
+        # its own COMPLETED transition ever touches secret_current_versions).
+        reserved = self.conn.execute(
+            "SELECT 1 FROM secret_provision_operations WHERE secret_id = ? "
+            "AND target_version = ? AND state IN ('PENDING', 'COMPLETED')",
+            (secret_id, target_version),
+        ).fetchone()
+        if reserved is not None:
+            return "CAS_LOST"
+        if current is not None and current_version > 0:
+            if (
+                current.purpose != purpose
+                or current.owner_scope_kind != owner_scope_kind
+                or current.owner_scope_id != owner_scope_id
+                or current.provider_account_ref != provider_account_ref
+            ):
+                return "INTEGRITY_CONFLICT"
+        if not self._owner_purpose_matrix_valid(
+            purpose=purpose,
+            owner_scope_kind=owner_scope_kind,
+            owner_scope_id=owner_scope_id,
+            provider_account_ref=provider_account_ref,
+        ):
+            return "INTEGRITY_CONFLICT"
+        if purpose != "CAPABILITY_SIGNING_PRIVATE_KEY":
+            # Stage 0: no other Secret purpose may be provisioned or adopted
+            # until the Capability Registry has a selected ACTIVE issuance
+            # key -- there is no verifiable authority chain yet.
+            registry = self.get_capability_key_registry()
+            if registry.current_issuance_key_id is None:
+                return "AUTHORITY_REVOKED"
+        return None
+
+    def _next_secret_provision_checkpoint_sequence(self, secret_provision_operation_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(checkpoint_sequence), 0) AS seq "
+            "FROM secret_provision_checkpoints WHERE secret_provision_operation_id = ?",
+            (secret_provision_operation_id,),
+        ).fetchone()
+        return int(row["seq"]) + 1
+
+    def begin_secret_provision_operation(
+        self,
+        *,
+        secret_provision_operation_id: str,
+        mode: str,
+        secret_id: str,
+        expected_prior_version: int | None,
+        purpose: str,
+        owner_scope_kind: str,
+        owner_scope_id: str,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        secret_store_staging_receipt_id: str,
+        secret_integrity_attestation_id: str,
+        provider_account_ref: str | None = None,
+        authority_revoked: bool = False,
+    ) -> SecretProvisionOperationResult:
+        """Accept (or replay) one MANAGEMENT_PROVISION request.
+
+        Validates the closed owner/purpose matrix and the prior-version CAS,
+        then freezes ``target_version`` and commits the ``PENDING`` Operation
+        plus its retry Outbox record in one transaction. A CAS/authority
+        rejection detected here has no install phase and is committed as an
+        immediately terminal ``REJECTED`` row with no Checkpoint, matching
+        "invalid syntax/initial authority is rejected before Operation
+        acceptance and has no checkpoint".
+        """
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        require_lowercase_uuid(secret_id, field="secret_id")
+        require_lowercase_uuid(
+            secret_store_staging_receipt_id, field="secret_store_staging_receipt_id"
+        )
+        require_lowercase_uuid(
+            secret_integrity_attestation_id, field="secret_integrity_attestation_id"
+        )
+        enums.parse_enum("secret_provision_operation.mode", mode)
+        enums.parse_enum("secret_provision_operation.purpose", purpose)
+        enums.parse_enum("secret_provision_operation.owner_scope_kind", owner_scope_kind)
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        if expected_prior_version is not None:
+            _require_positive_int(expected_prior_version, field="expected_prior_version")
+        target_version = 1 if expected_prior_version is None else expected_prior_version + 1
+
+        req_digest = self._secret_provision_request_digest(
+            mode=mode,
+            secret_id=secret_id,
+            expected_prior_version=expected_prior_version,
+            target_version=target_version,
+            purpose=purpose,
+            owner_scope_kind=owner_scope_kind,
+            owner_scope_id=owner_scope_id,
+            provider_account_ref=provider_account_ref,
+            authenticated_principal_id=authenticated_principal_id,
+            authorization_context_digest=authorization_context_digest,
+            secret_store_staging_receipt_id=secret_store_staging_receipt_id,
+            secret_integrity_attestation_id=secret_integrity_attestation_id,
+        )
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["request_digest"] == req_digest
+                ):
+                    return self._secret_provision_operation_from_row(existing, replayed=True)
+                raise IdempotencyConflictError(
+                    "secret provision operation id was reused with different content"
+                )
+            current = self.get_secret_current_version(secret_id)
+            rejection = self._validate_secret_provision_operation(
+                current=current,
+                secret_id=secret_id,
+                target_version=target_version,
+                mode=mode,
+                expected_prior_version=expected_prior_version,
+                purpose=purpose,
+                owner_scope_kind=owner_scope_kind,
+                owner_scope_id=owner_scope_id,
+                provider_account_ref=provider_account_ref,
+                authority_revoked=authority_revoked,
+            )
+            now = _now_ms()
+            if rejection is not None:
+                http_status, body_json, resp_digest = self._secret_provision_result_response(
+                    operation_id=secret_provision_operation_id,
+                    secret_id=secret_id,
+                    target_version=target_version,
+                    state="REJECTED",
+                    rejection_code=rejection,
+                )
+                self.conn.execute(
+                    "INSERT INTO secret_provision_operations("
+                    "secret_provision_operation_id, protocol_version, mode, secret_id, "
+                    "expected_prior_version, target_version, purpose, owner_scope_kind, "
+                    "owner_scope_id, provider_account_ref, authenticated_principal_id, "
+                    "authorization_context_digest, secret_store_staging_receipt_id, "
+                    "secret_integrity_attestation_id, request_digest, state, rejection_code, "
+                    "new_version, credential_rotation_receipt_id, terminal_http_status, "
+                    "terminal_response_json, terminal_response_digest, last_checkpoint_id, "
+                    "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "'REJECTED', ?, NULL, NULL, ?, ?, ?, NULL, ?)",
+                    (
+                        secret_provision_operation_id,
+                        SECRET_PROVISION_REQUEST_PROTOCOL,
+                        mode,
+                        secret_id,
+                        expected_prior_version,
+                        target_version,
+                        purpose,
+                        owner_scope_kind,
+                        owner_scope_id,
+                        provider_account_ref,
+                        authenticated_principal_id,
+                        authorization_context_digest,
+                        secret_store_staging_receipt_id,
+                        secret_integrity_attestation_id,
+                        req_digest,
+                        rejection,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO secret_provision_operations("
+                    "secret_provision_operation_id, protocol_version, mode, secret_id, "
+                    "expected_prior_version, target_version, purpose, owner_scope_kind, "
+                    "owner_scope_id, provider_account_ref, authenticated_principal_id, "
+                    "authorization_context_digest, secret_store_staging_receipt_id, "
+                    "secret_integrity_attestation_id, request_digest, state, rejection_code, "
+                    "new_version, credential_rotation_receipt_id, terminal_http_status, "
+                    "terminal_response_json, terminal_response_digest, last_checkpoint_id, "
+                    "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "'PENDING', NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)",
+                    (
+                        secret_provision_operation_id,
+                        SECRET_PROVISION_REQUEST_PROTOCOL,
+                        mode,
+                        secret_id,
+                        expected_prior_version,
+                        target_version,
+                        purpose,
+                        owner_scope_kind,
+                        owner_scope_id,
+                        provider_account_ref,
+                        authenticated_principal_id,
+                        authorization_context_digest,
+                        secret_store_staging_receipt_id,
+                        secret_integrity_attestation_id,
+                        req_digest,
+                        now,
+                    ),
+                )
+                outbox_payload = {
+                    "secret_provision_operation_id": secret_provision_operation_id,
+                    "secret_id": secret_id,
+                    "mode": mode,
+                    "target_version": target_version,
+                    "secret_store_staging_receipt_id": secret_store_staging_receipt_id,
+                }
+                self.insert_outbox(
+                    outbox_id=secret_provision_operation_id,
+                    source_kind="SECRET_PROVISION_OPERATION",
+                    source_id=secret_provision_operation_id,
+                    destination="secret-store:install",
+                    protocol_version=SECRET_PROVISION_REQUEST_PROTOCOL,
+                    payload_digest=request_digest(outbox_payload),
+                    payload=outbox_payload,
+                    next_delivery_at_ms=now,
+                )
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            assert row is not None
+            return self._secret_provision_operation_from_row(row, replayed=False)
+
+    def complete_secret_provision_operation(
+        self,
+        *,
+        secret_provision_operation_id: str,
+        storage_path: str,
+        secret_integrity_attestation_id: str,
+    ) -> SecretProvisionOperationResult:
+        """Install the frozen ``target_version`` and close the Operation.
+
+        Must run only after the Secret Store has durably promoted the staged
+        bytes into an immutable Secret Version (write-before-reference): this
+        method creates the Credential Rotation Receipt and Secret Version
+        rows, advances the current-version CAS pointer, appends the
+        ``INSTALL_VERSION``/``SUCCEEDED`` Checkpoint, and marks the Operation
+        ``COMPLETED`` -- all in one transaction. Replaying against an
+        already-terminal Operation returns its stored projection unchanged.
+        """
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        require_lowercase_uuid(
+            secret_integrity_attestation_id, field="secret_integrity_attestation_id"
+        )
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"secret provision operation {secret_provision_operation_id!r} was not found"
+                )
+            if row["state"] != "PENDING":
+                return self._secret_provision_operation_from_row(row, replayed=True)
+            secret_id = row["secret_id"]
+            target_version = row["target_version"]
+            expected_prior_version = row["expected_prior_version"]
+            purpose = row["purpose"]
+            owner_scope_kind = row["owner_scope_kind"]
+            owner_scope_id = row["owner_scope_id"]
+            provider_account_ref = row["provider_account_ref"]
+            now = _now_ms()
+
+            receipt_id = str(uuid.uuid4())
+            rc_digest = receipt_digest(
+                {
+                    "source_kind": "MANAGEMENT_PROVISION",
+                    "source_id": secret_provision_operation_id,
+                    "secret_id": secret_id,
+                    "expected_prior_version": expected_prior_version,
+                    "new_version": target_version,
+                    "purpose": purpose,
+                    "owner_scope_kind": owner_scope_kind,
+                    "owner_scope_id": owner_scope_id,
+                    "provider_account_ref": provider_account_ref,
+                    "management_operation_id": secret_provision_operation_id,
+                    "authenticated_principal_id": row["authenticated_principal_id"],
+                    "authorization_context_digest": row["authorization_context_digest"],
+                    "secret_integrity_attestation_id": secret_integrity_attestation_id,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO credential_rotation_receipts("
+                "credential_rotation_receipt_id, source_kind, source_id, "
+                "credential_rotation_request_id, secret_id, expected_prior_version, "
+                "new_version, purpose, owner_scope_kind, owner_scope_id, "
+                "provider_account_ref, attempt_id, activity_id, attempt_generation, "
+                "worker_id, worker_session_id, attempt_capability_digest, "
+                "launch_attestation_id, management_operation_id, "
+                "authenticated_principal_id, authorization_context_digest, "
+                "secret_integrity_attestation_id, receipt_digest, created_at_ms) "
+                "VALUES (?, 'MANAGEMENT_PROVISION', ?, NULL, ?, ?, ?, ?, ?, ?, ?, "
+                "NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    secret_provision_operation_id,
+                    secret_id,
+                    expected_prior_version,
+                    target_version,
+                    purpose,
+                    owner_scope_kind,
+                    owner_scope_id,
+                    provider_account_ref,
+                    secret_provision_operation_id,
+                    row["authenticated_principal_id"],
+                    row["authorization_context_digest"],
+                    secret_integrity_attestation_id,
+                    rc_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO secret_versions("
+                "secret_id, version, creation_receipt_id, storage_path, "
+                "affected_run_ids_digest, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    secret_id,
+                    target_version,
+                    receipt_id,
+                    storage_path,
+                    affected_run_ids_digest([]),
+                    now,
+                ),
+            )
+            if expected_prior_version is None:
+                self.conn.execute(
+                    "INSERT INTO secret_current_versions("
+                    "secret_id, purpose, owner_scope_kind, owner_scope_id, "
+                    "provider_account_ref, current_version, last_operation_id, "
+                    "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        secret_id,
+                        purpose,
+                        owner_scope_kind,
+                        owner_scope_id,
+                        provider_account_ref,
+                        target_version,
+                        secret_provision_operation_id,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                cur = self.conn.execute(
+                    "UPDATE secret_current_versions SET current_version = ?, "
+                    "last_operation_id = ?, updated_at_ms = ? "
+                    "WHERE secret_id = ? AND current_version = ?",
+                    (
+                        target_version,
+                        secret_provision_operation_id,
+                        now,
+                        secret_id,
+                        expected_prior_version,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    # The target_version reservation held since acceptance makes
+                    # this unreachable in normal operation; treat it as a real
+                    # storage inconsistency rather than a client-facing CAS_LOST.
+                    raise CasMismatchError(
+                        "secret current-version CAS was lost between acceptance and install"
+                    )
+
+            checkpoint_id = str(uuid.uuid4())
+            checkpoint_seq = self._next_secret_provision_checkpoint_sequence(
+                secret_provision_operation_id
+            )
+            cp_digest = checkpoint_digest(
+                {
+                    "secret_provision_operation_id": secret_provision_operation_id,
+                    "checkpoint_sequence": checkpoint_seq,
+                    "phase": "INSTALL_VERSION",
+                    "outcome": "SUCCEEDED",
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO secret_provision_checkpoints("
+                "secret_provision_checkpoint_id, secret_provision_operation_id, "
+                "checkpoint_sequence, phase, outcome, failure_code, "
+                "failure_evidence_digest, next_retry_ms, checkpoint_digest, "
+                "recorded_at_ms) VALUES (?, ?, ?, 'INSTALL_VERSION', 'SUCCEEDED', "
+                "NULL, NULL, NULL, ?, ?)",
+                (checkpoint_id, secret_provision_operation_id, checkpoint_seq, cp_digest, now),
+            )
+
+            http_status, body_json, resp_digest = self._secret_provision_result_response(
+                operation_id=secret_provision_operation_id,
+                secret_id=secret_id,
+                target_version=target_version,
+                state="COMPLETED",
+                new_version=target_version,
+                secret_version_key=f"{secret_id}:{target_version}",
+                credential_rotation_receipt_id=receipt_id,
+            )
+            cur = self.conn.execute(
+                "UPDATE secret_provision_operations SET state = 'COMPLETED', "
+                "new_version = ?, credential_rotation_receipt_id = ?, "
+                "terminal_http_status = ?, terminal_response_json = ?, "
+                "terminal_response_digest = ?, last_checkpoint_id = ? "
+                "WHERE secret_provision_operation_id = ? AND state = 'PENDING'",
+                (
+                    target_version,
+                    receipt_id,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    checkpoint_id,
+                    secret_provision_operation_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RunStoreError("secret provision operation was not PENDING at install commit")
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            assert row is not None
+            return self._secret_provision_operation_from_row(row, replayed=False)
+
+    def fail_secret_provision_operation(
+        self,
+        *,
+        secret_provision_operation_id: str,
+        rejection_code: str,
+        failure_evidence_digest: str,
+    ) -> SecretProvisionOperationResult:
+        """Close a still-``PENDING`` Operation as ``REJECTED`` after an install failure.
+
+        Only ``STAGED_OBJECT_INVALID`` and ``INTEGRITY_CONFLICT`` are decided
+        here: ``CAS_LOST``/``AUTHORITY_REVOKED`` are decided at acceptance and
+        never reach ``PENDING``. Releases the ``target_version`` reservation
+        (the partial unique index only covers ``PENDING``/``COMPLETED``), so a
+        corrected request may immediately reserve the same target again.
+        """
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        enums.parse_enum("secret_provision_operation.rejection_code", rejection_code)
+        if rejection_code not in ("STAGED_OBJECT_INVALID", "INTEGRITY_CONFLICT"):
+            raise ValueError(
+                "fail_secret_provision_operation only closes an install-phase "
+                "rejection (STAGED_OBJECT_INVALID or INTEGRITY_CONFLICT)"
+            )
+        _require_digest(failure_evidence_digest, field="failure_evidence_digest")
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"secret provision operation {secret_provision_operation_id!r} was not found"
+                )
+            if row["state"] != "PENDING":
+                return self._secret_provision_operation_from_row(row, replayed=True)
+            now = _now_ms()
+            checkpoint_id = str(uuid.uuid4())
+            checkpoint_seq = self._next_secret_provision_checkpoint_sequence(
+                secret_provision_operation_id
+            )
+            cp_digest = checkpoint_digest(
+                {
+                    "secret_provision_operation_id": secret_provision_operation_id,
+                    "checkpoint_sequence": checkpoint_seq,
+                    "phase": "INSTALL_VERSION",
+                    "outcome": "FAILED_TERMINAL",
+                    "failure_code": rejection_code,
+                    "failure_evidence_digest": failure_evidence_digest,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO secret_provision_checkpoints("
+                "secret_provision_checkpoint_id, secret_provision_operation_id, "
+                "checkpoint_sequence, phase, outcome, failure_code, "
+                "failure_evidence_digest, next_retry_ms, checkpoint_digest, "
+                "recorded_at_ms) VALUES (?, ?, ?, 'INSTALL_VERSION', 'FAILED_TERMINAL', "
+                "?, ?, NULL, ?, ?)",
+                (
+                    checkpoint_id,
+                    secret_provision_operation_id,
+                    checkpoint_seq,
+                    rejection_code,
+                    failure_evidence_digest,
+                    cp_digest,
+                    now,
+                ),
+            )
+            http_status, body_json, resp_digest = self._secret_provision_result_response(
+                operation_id=secret_provision_operation_id,
+                secret_id=row["secret_id"],
+                target_version=row["target_version"],
+                state="REJECTED",
+                rejection_code=rejection_code,
+            )
+            cur = self.conn.execute(
+                "UPDATE secret_provision_operations SET state = 'REJECTED', "
+                "rejection_code = ?, terminal_http_status = ?, terminal_response_json = ?, "
+                "terminal_response_digest = ?, last_checkpoint_id = ? "
+                "WHERE secret_provision_operation_id = ? AND state = 'PENDING'",
+                (
+                    rejection_code,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    checkpoint_id,
+                    secret_provision_operation_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RunStoreError(
+                    "secret provision operation was not PENDING at rejection commit"
+                )
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            assert row is not None
+            return self._secret_provision_operation_from_row(row, replayed=False)
+
+    def record_secret_provision_retry_checkpoint(
+        self,
+        *,
+        secret_provision_operation_id: str,
+        phase: str,
+        failure_code: str,
+        failure_evidence_digest: str,
+        next_retry_ms: int,
+    ) -> SecretProvisionCheckpointRecord:
+        """Append a ``FAILED_RETRYABLE`` checkpoint without closing the Operation."""
+        require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
+        enums.parse_enum("secret_provision_checkpoint.phase", phase)
+        enums.parse_enum("secret_provision_checkpoint.failure_code", failure_code)
+        _require_digest(failure_evidence_digest, field="failure_evidence_digest")
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT state FROM secret_provision_operations "
+                "WHERE secret_provision_operation_id = ?",
+                (secret_provision_operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"secret provision operation {secret_provision_operation_id!r} was not found"
+                )
+            if row["state"] != "PENDING":
+                raise RunStoreError("a retry checkpoint requires a PENDING operation")
+            now = _now_ms()
+            checkpoint_id = str(uuid.uuid4())
+            checkpoint_seq = self._next_secret_provision_checkpoint_sequence(
+                secret_provision_operation_id
+            )
+            cp_digest = checkpoint_digest(
+                {
+                    "secret_provision_operation_id": secret_provision_operation_id,
+                    "checkpoint_sequence": checkpoint_seq,
+                    "phase": phase,
+                    "outcome": "FAILED_RETRYABLE",
+                    "failure_code": failure_code,
+                    "failure_evidence_digest": failure_evidence_digest,
+                    "next_retry_ms": next_retry_ms,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO secret_provision_checkpoints("
+                "secret_provision_checkpoint_id, secret_provision_operation_id, "
+                "checkpoint_sequence, phase, outcome, failure_code, "
+                "failure_evidence_digest, next_retry_ms, checkpoint_digest, "
+                "recorded_at_ms) VALUES (?, ?, ?, ?, 'FAILED_RETRYABLE', ?, ?, ?, ?, ?)",
+                (
+                    checkpoint_id,
+                    secret_provision_operation_id,
+                    checkpoint_seq,
+                    phase,
+                    failure_code,
+                    failure_evidence_digest,
+                    next_retry_ms,
+                    cp_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE secret_provision_operations SET last_checkpoint_id = ? "
+                "WHERE secret_provision_operation_id = ?",
+                (checkpoint_id, secret_provision_operation_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM secret_provision_checkpoints "
+                "WHERE secret_provision_checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_secret_provision_checkpoint(row)
 
     def create_run(
         self,
