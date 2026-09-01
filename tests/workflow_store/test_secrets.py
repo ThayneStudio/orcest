@@ -234,20 +234,34 @@ def test_staging_integrity_meta_missing_identity_fails_closed(
         )
 
 
-def test_value_without_meta_is_repaired_on_retry(secret_store: SecretStore, layout: object) -> None:
+def test_value_without_meta_fails_closed_on_retry(
+    secret_store: SecretStore, layout: object
+) -> None:
     from orcest.workflow_store.v1.fs import ControlLayout
 
     assert isinstance(layout, ControlLayout)
     secret_id = _secret_id()
-    secret_store.put_version(secret_id, 1, SECRET)
+    first = secret_store.put_version(secret_id, 1, SECRET)
+    dest = layout.secrets_root / secret_id / "versions" / "1"
     meta = layout.secrets_root / secret_id / "integrity" / "1"
+    original_value = dest.read_bytes()
     meta.unlink()
     with pytest.raises(IntegrityConflictError):
         secret_store.verify(secret_id, 1)
-    repaired = secret_store.put_version(secret_id, 1, SECRET)
-    assert secret_store.read_value(secret_id, 1) == SECRET
-    assert repaired.byte_length == len(SECRET)
-    assert secret_store.verify(secret_id, 1).attestation_id == repaired.attestation_id
+
+    retry_staging = secret_store.stage(SECRET)
+    assert retry_staging.attestation_id != first.attestation_id
+    with pytest.raises(
+        IntegrityConflictError, match="secret version integrity metadata is missing"
+    ):
+        secret_store.promote_version(
+            staging_id=retry_staging.staging_id,
+            secret_id=secret_id,
+            version=1,
+        )
+
+    assert not meta.exists()
+    assert dest.read_bytes() == original_value
 
 
 def test_meta_without_value_completes_on_retry(secret_store: SecretStore, layout: object) -> None:
