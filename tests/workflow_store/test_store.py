@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1320,7 +1321,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1852,3 +1853,71 @@ def test_v5_database_migrates_forge_observation_tables(tmp_path: Path) -> None:
         )
         assert request is not None
         assert request.state == "PENDING"
+
+
+_CAPACITY_BUDGET_WORKER_LOSS_TABLES = (
+    "health_observations",
+    "capacity_reports",
+    "capacity_report_entries",
+    "attempt_terminal_facts",
+    "worker_loss_reports",
+    "budget_reports",
+    "budget_report_runs",
+)
+
+
+def _write_v8_shaped_database(db_path: Path) -> None:
+    """Build a real v9 database, then strip it back to the v8 shape: every
+    capacity/budget/worker-loss-report table dropped and ``user_version``
+    rolled back to 8."""
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in _CAPACITY_BUDGET_WORKER_LOSS_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 9")
+        conn.execute("PRAGMA user_version=8")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v8_database_migrates_capacity_budget_worker_loss_tables(tmp_path: Path) -> None:
+    _write_v8_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _CAPACITY_BUDGET_WORKER_LOSS_TABLES:
+            assert expected_table in tables
+
+        # A Capacity Report round-trips end to end on the freshly migrated
+        # database.
+        from orcest.workflow_store.store import CapacityReportEntryInput
+
+        now = int(time.time() * 1000)
+        result = store.submit_capacity_report(
+            capacity_report_id="aaaaaaaa-0000-4000-8000-000000000101",
+            pool_manager_id="pool-manager-migration",
+            report_id="aaaaaaaa-0000-4000-8000-000000000102",
+            idempotency_key="aaaaaaaa-0000-4000-8000-000000000103",
+            report_sequence=1,
+            observed_at_ms=now,
+            expires_at_ms=now + 60_000,
+            configured_max_ttl_ms=300_000,
+            entries=[
+                CapacityReportEntryInput(
+                    scope_kind="CAPACITY_POOL",
+                    scope_id="default",
+                    capacity_pool_id="default",
+                    available_slots=4,
+                )
+            ],
+            authenticated_principal_id="pool-manager-principal",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+        assert result.health_observations[0].kind == "AVAILABLE"
