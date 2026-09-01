@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import ssl
@@ -9,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,7 @@ from orcest.workflow_store import (
 )
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
 from orcest.workflow_store.v1.project_registration import (
+    MAX_REQUEST_BYTES,
     BudgetPolicyRecord,
     BudgetResetWindowRecord,
     ExecutionProfileRecord,
@@ -45,6 +48,7 @@ from orcest.workflow_store.v1.project_registration import (
 )
 from orcest.workflow_store.v1.registration_http import (
     RegistrationHttpsServer,
+    RegistrationRequestHandler,
     RegistrationTlsConfig,
     handle_registration_http,
 )
@@ -671,6 +675,84 @@ def test_http_handler_serializes_registration_store_calls(monkeypatch) -> None:
 
     assert statuses == [200] * 8
     assert max_active == 1
+
+
+def _plain_registration_server() -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationRequestHandler)
+    server.run_store = None  # type: ignore[attr-defined]
+    server.catalog = None  # type: ignore[attr-defined]
+    server.resolver = None  # type: ignore[attr-defined]
+    return server
+
+
+def test_do_post_rejects_oversized_content_length_without_reading_body() -> None:
+    server = _plain_registration_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/projects/registrations")
+            conn.putheader("Content-Length", str(MAX_REQUEST_BYTES + 1))
+            conn.endheaders()
+            # Deliberately never write the declared body: if the handler tried
+            # to buffer it before checking the size, this would hang/timeout.
+            response = conn.getresponse()
+            assert response.status == 422
+            body = json.loads(response.read())
+            assert body["code"] == "SCHEMA_INVALID"
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_do_post_rejects_missing_content_length_header() -> None:
+    server = _plain_registration_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/projects/registrations", skip_host=True)
+            conn.endheaders()
+            response = conn.getresponse()
+            assert response.status == 400
+            body = json.loads(response.read())
+            assert body["code"] == "MALFORMED"
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_do_post_rejects_invalid_content_length_header() -> None:
+    server = _plain_registration_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/projects/registrations")
+            conn.putheader("Content-Length", "not-a-number")
+            conn.endheaders()
+            response = conn.getresponse()
+            assert response.status == 400
+            body = json.loads(response.read())
+            assert body["code"] == "MALFORMED"
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_registration_tls_client_cert_requirement_is_configurable(
