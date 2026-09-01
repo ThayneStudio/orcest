@@ -7070,12 +7070,24 @@ class RunStore:
             if active is not None:
                 existing_snapshot = self.conn.execute(
                     "SELECT * FROM work_item_snapshots WHERE run_id = ? "
-                    "ORDER BY snapshot_sequence LIMIT 1",
-                    (active["run_id"],),
+                    "AND source_kind = 'FORGE_OBSERVATION' AND source_id = ?",
+                    (active["run_id"], work.forge_observation_id),
                 ).fetchone()
+                if existing_snapshot is None:
+                    raise IdempotencyConflictError(
+                        "work item already has an active run admitted by a different observation"
+                    )
+                if (
+                    active["run_id"] != run_id
+                    or existing_snapshot["snapshot_id"] != snapshot_id
+                    or existing_snapshot["work_item_observation_id"] != work.forge_observation_id
+                ):
+                    raise IdempotencyConflictError(
+                        "active run admission was replayed with different content"
+                    )
                 return AdmissionResult(
                     run_id=active["run_id"],
-                    snapshot_id=existing_snapshot["snapshot_id"] if existing_snapshot else "",
+                    snapshot_id=existing_snapshot["snapshot_id"],
                     transition=None,
                     projection_outbox_id=None,
                     replayed=True,

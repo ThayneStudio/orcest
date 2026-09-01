@@ -10,7 +10,7 @@ import pytest
 
 from orcest.workflow_contract.v1.digest import request_digest
 from orcest.workflow_reducer.ledger import load_view
-from orcest.workflow_store import ForgeObservationInput, RunStore
+from orcest.workflow_store import ForgeObservationInput, IdempotencyConflictError, RunStore
 
 pytestmark = pytest.mark.unit
 
@@ -233,15 +233,66 @@ def test_admission_restarts_through_three_committed_boundaries(tmp_path: Path) -
         assert store.conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] == 3
 
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
-        replay = store.admit_work_item_from_observations(
-            **{
-                **_admit_kwargs(work_id),
-                "snapshot_id": "66666666-6666-4666-8666-666666666666",
-            }
-        )
+        replay = store.admit_work_item_from_observations(**_admit_kwargs(work_id))
         assert replay.replayed is True
         assert replay.run_id == RUN_ID
+        assert replay.snapshot_id == SNAPSHOT_ID
         assert store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_active_admission_replay_rejects_different_snapshot_id(tmp_path: Path) -> None:
+    work_id, _ = _seed_observations(tmp_path)
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        store.admit_work_item_from_observations(**_admit_kwargs(work_id))
+
+        with pytest.raises(IdempotencyConflictError):
+            store.admit_work_item_from_observations(
+                **{
+                    **_admit_kwargs(work_id),
+                    "snapshot_id": "66666666-6666-4666-8666-666666666666",
+                }
+            )
+
+
+def test_active_admission_replay_rejects_different_work_item_observation(
+    tmp_path: Path,
+) -> None:
+    work_id, _ = _seed_observations(tmp_path)
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        first = store.admit_work_item_from_observations(**_admit_kwargs(work_id))
+        assert first.replayed is False
+
+        project_id = store.get_forge_observation(work_id).project_id  # type: ignore[union-attr]
+        project = store.conn.execute(
+            "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        assert project is not None
+        same_work_item = _Project(
+            project_id,
+            project["forge_instance_id"],
+            project["source_read_secret_id"],
+        )
+        later_work_schedule = _schedule(store, same_work_item, "WORK_ITEM_POLL", "issue-1")
+        later_work_id = _complete_one(
+            store,
+            same_work_item,
+            later_work_schedule.forge_observation_schedule_id,
+            ForgeObservationInput(
+                kind="WORK_ITEM_SNAPSHOT",
+                external_revision="work-rev-2",
+                fact={"title": "Implement thing", "body": "Newer pinned body"},
+            ),
+        )
+
+        with pytest.raises(IdempotencyConflictError):
+            store.admit_work_item_from_observations(
+                **{
+                    **_admit_kwargs(later_work_id),
+                    "snapshot_id": "66666666-6666-4666-8666-666666666666",
+                }
+            )
 
 
 def test_snapshot_capture_retains_ordered_provenance_and_blobs(tmp_path: Path) -> None:
