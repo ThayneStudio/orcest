@@ -9,8 +9,9 @@ Write-before-reference: the controller-only integrity metadata is made
 durable first, then the immutable version file, both via no-clobber
 promotion under ``storage.lock``, before the optional reference callback
 (the later SQLite Secret Version insert) runs. A crash cannot leave a live
-reference to missing bytes, and ``dest`` existing implies metadata is
-already durable.
+reference to missing bytes. If a version value is later present without its
+mandatory metadata, the store fails closed so operator repair can preserve
+the original opaque attestation identity.
 """
 
 from __future__ import annotations
@@ -388,9 +389,7 @@ class SecretStore:
             if existing_bytes != value:
                 raise IntegrityConflictError("secret version already exists with different bytes")
             if not meta_dest.is_file():
-                # Crash after dest, before meta (or meta dirent lost). Repair
-                # by establishing metadata for the already-durable bytes.
-                self._promote_integrity_file(meta_dest, meta_body)
+                raise IntegrityConflictError("secret version integrity metadata is missing")
             try:
                 os.unlink(staged_path)
             except FileNotFoundError:
