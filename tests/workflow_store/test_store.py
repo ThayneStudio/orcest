@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -22,8 +24,10 @@ from orcest.workflow_store import (
     SchemaVersionError,
     TransactionFault,
     WorkflowGateClosedError,
+    WriterLockError,
     open_read_only,
 )
+from orcest.workflow_store.store import _verify_local_state_root
 
 RUN_ID = "11111111-1111-1111-1111-111111111111"
 TRANSITION_ID = "22222222-2222-2222-2222-222222222222"
@@ -805,6 +809,74 @@ def test_two_writers_cannot_acquire_authority(tmp_path: Path) -> None:
         assert result.returncode == 0
     finally:
         store.close()
+
+
+@pytest.mark.timeout(5)
+def test_concurrent_fsync_probes_do_not_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    barrier = threading.Barrier(2, timeout=5)
+    real_fsync = os.fsync
+
+    def synced_fsync(fd: int) -> None:
+        # Force both invocations to have a probe file on disk at the same
+        # time, on both sides of the directory fsync, instead of relying on
+        # thread-scheduling luck to interleave them.
+        real_fsync(fd)
+        barrier.wait()
+
+    monkeypatch.setattr(os, "fsync", synced_fsync)
+
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def run() -> None:
+        try:
+            _verify_local_state_root(root, min_free_bytes=0)
+        except BaseException as exc:  # noqa: BLE001 - captured for assertion below
+            with errors_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert list(root.glob(".fsync-probe*")) == []
+
+
+@pytest.mark.timeout(5)
+def test_concurrent_run_store_startup_reaches_writer_lock_arbitration(tmp_path: Path) -> None:
+    results: list[RunStore | WriterLockError] = []
+    results_lock = threading.Lock()
+
+    def start() -> None:
+        try:
+            store = RunStore(tmp_path)
+        except WriterLockError as exc:
+            with results_lock:
+                results.append(exc)
+        else:
+            with results_lock:
+                results.append(store)
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    stores = [r for r in results if isinstance(r, RunStore)]
+    errors = [r for r in results if isinstance(r, WriterLockError)]
+    try:
+        assert len(stores) == 1
+        assert len(errors) == 1
+    finally:
+        for store in stores:
+            store.close()
 
 
 def test_replay_returns_committed_transition_and_outbox_without_duplicates(tmp_path: Path) -> None:
