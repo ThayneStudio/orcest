@@ -43,6 +43,7 @@ from orcest.orchestrator.issue_ops import (
 from orcest.orchestrator.pr_ops import (
     PRAction,
     PRState,
+    classify_ci_checks,
     clear_attempts,
     clear_attempts_if_head_sha,
     clear_review_retrigger,
@@ -1280,6 +1281,188 @@ def _back_off_pr_retries(
     )
 
 
+def _merge_evidence_is_current(
+    *,
+    repo: str,
+    token: str,
+    pr_state: PRState,
+    label_config: LabelConfig,
+    logger: logging.Logger,
+) -> bool:
+    """Return True only when fresh same-head evidence still permits merge."""
+    if not pr_state.head_sha:
+        logger.warning(
+            "PR #%d: merge skipped because PRState has empty head SHA",
+            pr_state.number,
+        )
+        return False
+
+    terminal_labels = {label_config.blocked, label_config.needs_human}
+    try:
+        review_snapshot = gh.get_review_snapshot(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time review snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time review evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    if review_snapshot.state != "OPEN":
+        logger.info(
+            "PR #%d: merge skipped because action-time PR state is %s",
+            pr_state.number,
+            review_snapshot.state,
+        )
+        return False
+    if review_snapshot.is_draft:
+        logger.info("PR #%d: merge skipped because PR became draft", pr_state.number)
+        return False
+    terminal_present = sorted(set(review_snapshot.labels) & terminal_labels)
+    if terminal_present:
+        logger.info(
+            "PR #%d: merge skipped because terminal label appeared: %s",
+            pr_state.number,
+            terminal_present,
+        )
+        return False
+    if (
+        review_snapshot.review_decision != "APPROVED"
+        or not review_snapshot.has_current_head_approval
+    ):
+        logger.info(
+            "PR #%d: merge skipped because action-time approval eligibility changed "
+            "(decision=%s current_head_approval=%s)",
+            pr_state.number,
+            review_snapshot.review_decision,
+            review_snapshot.has_current_head_approval,
+        )
+        return False
+
+    try:
+        checks = gh.get_ci_status(repo, pr_state.number, token, expected_head_sha=pr_state.head_sha)
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time CI snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time CI evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    ci_state = classify_ci_checks(checks)
+    if not checks or not ci_state.terminal_success:
+        logger.info(
+            "PR #%d: merge skipped because action-time CI eligibility changed "
+            "(checks=%d failures=%d pending=%d)",
+            pr_state.number,
+            len(checks),
+            len(ci_state.failures),
+            len(ci_state.pending),
+        )
+        return False
+
+    try:
+        threads = gh.get_unresolved_review_threads(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: merge skipped because action-time thread snapshot head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: merge skipped because action-time thread evidence could not be verified",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    if threads:
+        logger.info(
+            "PR #%d: merge skipped because %d unresolved thread(s) appeared",
+            pr_state.number,
+            len(threads),
+        )
+        return False
+
+    return True
+
+
+def _review_rerun_still_needed(
+    *,
+    repo: str,
+    token: str,
+    pr_state: PRState,
+    label_config: LabelConfig,
+    logger: logging.Logger,
+) -> bool:
+    """Best-effort stale-action guard before rerunning claude-review."""
+    if not pr_state.head_sha:
+        logger.warning(
+            "PR #%d: review rerun skipped because PRState has empty head SHA",
+            pr_state.number,
+        )
+        return False
+    try:
+        snapshot = gh.get_review_snapshot(
+            repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
+        )
+    except gh.GhStaleSnapshotError:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: head changed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PR #%d: review rerun skipped because fresh review snapshot failed",
+            pr_state.number,
+            exc_info=True,
+        )
+        return False
+
+    terminal_labels = {label_config.blocked, label_config.needs_human}
+    if snapshot.state != "OPEN" or snapshot.is_draft or set(snapshot.labels) & terminal_labels:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: "
+            "state=%s draft=%s labels=%s",
+            pr_state.number,
+            snapshot.state,
+            snapshot.is_draft,
+            list(snapshot.labels),
+        )
+        return False
+    if snapshot.review_decision == "CHANGES_REQUESTED" or snapshot.has_current_head_approval:
+        logger.info(
+            "PR #%d: review rerun skipped because action became obsolete: "
+            "decision=%s current_head_approval=%s",
+            pr_state.number,
+            snapshot.review_decision,
+            snapshot.has_current_head_approval,
+        )
+        return False
+    return True
+
+
 def _load_fleet_repo_to_project_map(logger: logging.Logger) -> dict[str, str]:
     """Best-effort load of repo→project_name from a mounted fleet config.
 
@@ -2043,6 +2226,14 @@ def _poll_project(
     for pr_state in pr_states:
         if pr_state.action == PRAction.MERGE:
             logger.info("PR #%d (%s): merging", pr_state.number, pr_state.title)
+            if not _merge_evidence_is_current(
+                repo=repo,
+                token=token,
+                pr_state=pr_state,
+                label_config=labels,
+                logger=logger,
+            ):
+                continue
             try:
                 gh.merge_pr(
                     repo,
@@ -2438,6 +2629,14 @@ def _poll_project(
                     "PR #%d: RETRIGGER_REVIEW action but review_run_id is None, skipping",
                     pr_state.number,
                 )
+            elif not _review_rerun_still_needed(
+                repo=repo,
+                token=token,
+                pr_state=pr_state,
+                label_config=labels,
+                logger=logger,
+            ):
+                continue
             elif _review_rerun_failure_cooldown_active(
                 project_redis, repo, pr_state.number, pr_state.head_sha
             ):

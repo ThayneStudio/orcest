@@ -19,6 +19,8 @@ from orcest.orchestrator.gh import (
     GhCliError,
     GhNotInstalledError,
     GhRateLimitError,
+    GhStaleSnapshotError,
+    PRReviewSnapshot,
     add_label,
     create_issue,
     get_ci_status,
@@ -27,6 +29,7 @@ from orcest.orchestrator.gh import (
     get_issue_state,
     get_pr,
     get_pr_diff,
+    get_review_snapshot,
     get_unresolved_review_threads,
     has_issue_comment_marker,
     list_labeled_issues,
@@ -72,6 +75,48 @@ def _open_prs_graphql_response(
             }
         }
     )
+
+
+def _review_snapshot_graphql_response(
+    *,
+    head_sha: str = "abc123",
+    state: str = "OPEN",
+    is_draft: bool = False,
+    labels: list[dict] | None = None,
+    review_decision: str | None = "APPROVED",
+    reviews: list[dict] | None = None,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
+) -> str:
+    pr_node = {
+        "headRefOid": head_sha,
+        "state": state,
+        "isDraft": is_draft,
+        "reviewDecision": review_decision,
+        "labels": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": labels if labels is not None else [],
+        },
+        "latestOpinionatedReviews": {
+            "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+            "nodes": reviews if reviews is not None else [],
+        },
+    }
+    return json.dumps({"data": {"repository": {"pullRequest": pr_node}}})
+
+
+def _review_node(
+    *,
+    state: str = "APPROVED",
+    commit_oid: str | None = "abc123",
+    can_push: bool = True,
+) -> dict:
+    return {
+        "state": state,
+        "author": {"login": "reviewer"},
+        "authorCanPushToRepository": can_push,
+        "commit": None if commit_oid is None else {"oid": commit_oid},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +225,202 @@ def test_get_ci_status_returns_failed_checks(mocker):
     assert failed[0]["name"] == "tests"
 
     assert_uses_status_check_rollup_json(mock_run)
+
+
+def test_get_ci_status_with_expected_head_requires_matching_head(mocker):
+    checks = [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"],
+            returncode=0,
+            stdout=json.dumps({"headRefOid": "abc123", "statusCheckRollup": checks}),
+            stderr="",
+        ),
+    )
+
+    assert get_ci_status(REPO, 10, TOKEN, expected_head_sha="abc123") == checks
+
+    args_passed = mock_run.call_args[0][0]
+    json_idx = args_passed.index("--json")
+    assert args_passed[json_idx + 1] == "headRefOid,statusCheckRollup"
+
+
+def test_get_ci_status_with_expected_head_rejects_mismatch(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"],
+            returncode=0,
+            stdout=json.dumps({"headRefOid": "new456", "statusCheckRollup": []}),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(GhStaleSnapshotError):
+        get_ci_status(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+def test_get_ci_status_with_expected_head_rejects_missing_head(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout=json.dumps({"statusCheckRollup": []}), stderr=""
+        ),
+    )
+
+    with pytest.raises(GhCliError):
+        get_ci_status(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+# ---------------------------------------------------------------------------
+# get_review_snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_get_review_snapshot_current_head_writer_approval(mocker):
+    mock_run = mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(
+            reviews=[_review_node(commit_oid="abc123", can_push=True)]
+        ),
+    )
+
+    snapshot = get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+    assert snapshot == PRReviewSnapshot(
+        head_sha="abc123",
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=True,
+    )
+    assert "writersOnly: true" in mock_run.call_args[0][0][-1]
+
+
+def test_get_review_snapshot_old_approval_is_not_current_head_evidence(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(
+            reviews=[_review_node(commit_oid="old456", can_push=True)]
+        ),
+    )
+
+    snapshot = get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+    assert snapshot.review_decision == "APPROVED"
+    assert snapshot.has_current_head_approval is False
+
+
+def test_get_review_snapshot_rejects_non_writer_current_approval(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(
+            reviews=[
+                _review_node(commit_oid="old456", can_push=True),
+                _review_node(commit_oid="abc123", can_push=False),
+            ]
+        ),
+    )
+
+    snapshot = get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+    assert snapshot.has_current_head_approval is False
+
+
+def test_get_review_snapshot_ignores_non_approvals_and_null_commit(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(
+            review_decision="CHANGES_REQUESTED",
+            reviews=[
+                _review_node(state="COMMENTED", commit_oid="abc123"),
+                _review_node(state="CHANGES_REQUESTED", commit_oid="abc123"),
+                _review_node(state="DISMISSED", commit_oid="abc123"),
+                _review_node(state="APPROVED", commit_oid=None),
+            ],
+        ),
+    )
+
+    snapshot = get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+    assert snapshot.review_decision == "CHANGES_REQUESTED"
+    assert snapshot.has_current_head_approval is False
+
+
+def test_get_review_snapshot_paginates_until_current_approval(mocker):
+    page1 = _review_snapshot_graphql_response(
+        reviews=[_review_node(commit_oid="old456")],
+        has_next_page=True,
+        end_cursor="cursor1",
+    )
+    page2 = _review_snapshot_graphql_response(reviews=[_review_node(commit_oid="abc123")])
+    mock_run = mocker.patch("orcest.orchestrator.gh._run_gh", side_effect=[page1, page2])
+
+    snapshot = get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+    assert snapshot.has_current_head_approval is True
+    assert "after=cursor1" in " ".join(mock_run.call_args_list[1][0][0])
+
+
+def test_get_review_snapshot_head_mismatch_raises_stale(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(head_sha="new456"),
+    )
+
+    with pytest.raises(GhStaleSnapshotError):
+        get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+def test_get_review_snapshot_metadata_change_raises_stale(mocker):
+    page1 = _review_snapshot_graphql_response(has_next_page=True, end_cursor="cursor1")
+    page2 = _review_snapshot_graphql_response(is_draft=True)
+    mocker.patch("orcest.orchestrator.gh._run_gh", side_effect=[page1, page2])
+
+    with pytest.raises(GhStaleSnapshotError):
+        get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "not-json",
+        json.dumps({"errors": [{"message": "boom"}]}),
+        json.dumps({"data": {"repository": None}}),
+        json.dumps({"data": {"repository": {"pullRequest": None}}}),
+        json.dumps({"data": {"repository": {"pullRequest": {"headRefOid": "abc123"}}}}),
+    ],
+)
+def test_get_review_snapshot_malformed_responses_raise(mocker, payload):
+    mocker.patch("orcest.orchestrator.gh._run_gh", return_value=payload)
+
+    with pytest.raises(GhCliError):
+        get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+def test_get_review_snapshot_missing_commit_key_raises(mocker):
+    review = _review_node()
+    review.pop("commit")
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(reviews=[review]),
+    )
+
+    with pytest.raises(GhCliError):
+        get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
+
+
+def test_get_review_snapshot_missing_cursor_raises(mocker):
+    mocker.patch(
+        "orcest.orchestrator.gh._run_gh",
+        return_value=_review_snapshot_graphql_response(has_next_page=True, end_cursor=None),
+    )
+
+    with pytest.raises(GhCliError):
+        get_review_snapshot(REPO, 10, TOKEN, expected_head_sha="abc123")
 
 
 # ---------------------------------------------------------------------------
@@ -942,7 +1183,7 @@ def test_merge_pr_rebase_method(mocker):
         "orcest.orchestrator.gh._run_gh",
         return_value="",
     )
-    merge_pr(REPO, 10, TOKEN, method="rebase")
+    merge_pr(REPO, 10, TOKEN, method="rebase", head_sha="abc123")
 
     args_passed = mock_run.call_args[0][0]
     assert "--rebase" in args_passed
@@ -957,7 +1198,7 @@ def test_merge_pr_merge_method(mocker):
         "orcest.orchestrator.gh._run_gh",
         return_value="",
     )
-    merge_pr(REPO, 10, TOKEN, method="merge")
+    merge_pr(REPO, 10, TOKEN, method="merge", head_sha="abc123")
 
     args_passed = mock_run.call_args[0][0]
     assert "--merge" in args_passed
@@ -972,23 +1213,24 @@ def test_merge_pr_no_delete_branch(mocker):
         "orcest.orchestrator.gh._run_gh",
         return_value="",
     )
-    merge_pr(REPO, 10, TOKEN, delete_branch=False)
+    merge_pr(REPO, 10, TOKEN, delete_branch=False, head_sha="abc123")
 
     args_passed = mock_run.call_args[0][0]
     assert "--delete-branch" not in args_passed
     assert "--squash" in args_passed
 
 
-def test_merge_pr_without_head_sha_omits_match_head_commit(mocker):
-    """merge_pr keeps the head guard optional for callers without a discovered SHA."""
+def test_merge_pr_without_head_sha_raises_before_gh(mocker):
+    """merge_pr requires the final match-head guard."""
     mock_run = mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value="",
     )
-    merge_pr(REPO, 10, TOKEN)
 
-    args_passed = mock_run.call_args[0][0]
-    assert "--match-head-commit" not in args_passed
+    with pytest.raises(GhCliError):
+        merge_pr(REPO, 10, TOKEN)
+
+    mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1314,7 @@ def test_get_unresolved_threads_null_data(mocker):
 
 
 def test_get_unresolved_threads_null_review_threads(mocker):
-    """reviewThreads is None -> returns empty list (no crash)."""
+    """reviewThreads is None -> malformed evidence."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
@@ -1087,8 +1329,8 @@ def test_get_unresolved_threads_null_review_threads(mocker):
             }
         ),
     )
-    result = get_unresolved_review_threads(REPO, 5, TOKEN)
-    assert result == []
+    with pytest.raises(GhCliError):
+        get_unresolved_review_threads(REPO, 5, TOKEN)
 
 
 def test_get_unresolved_threads_null_comment_author(mocker):
@@ -1270,8 +1512,8 @@ def test_get_unresolved_threads_pagination_fetches_all(mocker, caplog):
     assert "after=cursor_abc" in " ".join(second_args)
 
 
-def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
-    """Stops pagination and logs a warning when hasNextPage=True but endCursor is absent."""
+def test_get_unresolved_threads_missing_cursor_raises(mocker):
+    """Incomplete pagination fails closed."""
     mocker.patch(
         "orcest.orchestrator.gh._run_gh",
         return_value=json.dumps(
@@ -1302,19 +1544,12 @@ def test_get_unresolved_threads_missing_cursor_stops_pagination(mocker, caplog):
             }
         ),
     )
-    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
-        result = get_unresolved_review_threads(REPO, 5, TOKEN)
-
-    # The fetched thread is still returned
-    assert len(result) == 1
-    assert result[0]["id"] == "PRRT_1"
-    # Both the "more than 100" and "endCursor missing" warnings are logged
-    assert any("more than 100 review threads" in msg for msg in caplog.messages)
-    assert any("endCursor is missing" in msg for msg in caplog.messages)
+    with pytest.raises(GhCliError):
+        get_unresolved_review_threads(REPO, 5, TOKEN)
 
 
-def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
-    """Logs a warning when _MAX_PAGES is exhausted and hasNextPage is still True."""
+def test_get_unresolved_threads_max_pages_raises(mocker):
+    """Pagination cap exhaustion fails closed."""
     # Build a page response with hasNextPage=True and a valid cursor so the
     # loop keeps iterating until it hits the _MAX_PAGES safety cap.
     # The while...else branch fires when page_count reaches _MAX_PAGES.
@@ -1348,12 +1583,8 @@ def test_get_unresolved_threads_max_pages_warns(mocker, caplog):
         side_effect=[page] * _MAX_PAGES,
     )
 
-    with caplog.at_level(logging.WARNING, logger="orcest.orchestrator.gh"):
-        result = get_unresolved_review_threads(REPO, 5, TOKEN)
-
-    assert any("reached MAX_PAGES" in msg for msg in caplog.messages)
-    # All _MAX_PAGES fetched threads are included in the result despite the truncation warning
-    assert len(result) == _MAX_PAGES
+    with pytest.raises(GhCliError):
+        get_unresolved_review_threads(REPO, 5, TOKEN)
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,34 @@ class PRState:
     stale_run_ids: list[int] = field(default_factory=list)  # Run IDs of stale pending checks
 
 
+@dataclass(frozen=True)
+class CIClassification:
+    """Normalized CI state used by discovery and action-time merge validation."""
+
+    failures: list[dict]
+    pending: list[dict]
+
+    @property
+    def terminal_success(self) -> bool:
+        return not self.failures and not self.pending
+
+
+def classify_ci_checks(checks: list[dict]) -> CIClassification:
+    """Classify GitHub statusCheckRollup nodes conservatively."""
+    ci_failures = [
+        c
+        for c in checks
+        if (c.get("conclusion") or "").upper() in _FAILURE_CONCLUSIONS
+        or (not c.get("conclusion") and (c.get("state") or "").upper() in ("FAILURE", "ERROR"))
+    ]
+    ci_pending = [
+        c
+        for c in checks
+        if not c.get("conclusion") and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
+    ]
+    return CIClassification(failures=ci_failures, pending=ci_pending)
+
+
 def _make_attempts_key(repo: str, pr_number: int) -> str:
     """Redis key for tracking task attempt count per PR."""
     return f"pr:{repo}:{pr_number}:attempts"
@@ -560,6 +588,26 @@ def discover_actionable_prs(
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
 
+        if not head_sha:
+            logger.warning(
+                "PR #%d: missing head SHA in open-PR snapshot; retrying next poll",
+                number,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha="",
+                    action=PRAction.SKIP_PENDING,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+
         # Skip draft PRs -- cheapest check, single boolean field
         if pr_data.get("isDraft"):
             results.append(
@@ -789,7 +837,27 @@ def discover_actionable_prs(
         # Check CI status -- wrapped in try/except so a single PR's
         # failure does not crash discovery for all other PRs.
         try:
-            checks = gh.get_ci_status(repo, number, token)
+            checks = gh.get_ci_status(repo, number, token, expected_head_sha=head_sha)
+        except gh.GhStaleSnapshotError:
+            logger.info(
+                "PR #%d: CI snapshot head changed during discovery; retrying next poll",
+                number,
+                exc_info=True,
+            )
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_PENDING,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
         except Exception:
             logger.warning(
                 "Failed to fetch CI status for PR #%d, skipping",
@@ -819,12 +887,8 @@ def discover_actionable_prs(
             )
             continue
 
-        ci_failures = [
-            c
-            for c in checks
-            if (c.get("conclusion") or "").upper() in _FAILURE_CONCLUSIONS
-            or (not c.get("conclusion") and (c.get("state") or "").upper() in ("FAILURE", "ERROR"))
-        ]
+        ci_classification = classify_ci_checks(checks)
+        ci_failures = ci_classification.failures
         suppressed_self_cancelled_failures = [
             c
             for c in ci_failures
@@ -841,18 +905,7 @@ def discover_actionable_prs(
                 number,
                 len(suppressed_self_cancelled_failures),
             )
-        # A check is pending if it hasn't reached a terminal state.
-        # statusCheckRollup can include both CheckRun objects (which have
-        # "conclusion") and StatusContext objects (which have "state").
-        # - CheckRun: pending when "conclusion" is absent/empty (still running)
-        # - StatusContext: pending when "state" is absent, empty, or "PENDING"
-        ci_pending = [
-            c
-            for c in checks
-            if not c.get("conclusion")
-            # "" matches both absent StatusContext state and absent CheckRun state (no state field)
-            and (c.get("state") or "").upper() in ("", "PENDING", "EXPECTED")
-        ]
+        ci_pending = ci_classification.pending
 
         if suppressed_self_cancelled_failures and not ci_failures and not ci_pending:
             results.append(
@@ -955,7 +1008,30 @@ def discover_actionable_prs(
             # Fetch unresolved review threads for worker prompt context
             threads: list | None = None
             try:
-                threads = gh.get_unresolved_review_threads(repo, number, token)
+                threads = gh.get_unresolved_review_threads(
+                    repo, number, token, expected_head_sha=head_sha
+                )
+            except gh.GhStaleSnapshotError:
+                logger.info(
+                    "PR #%d: review-thread snapshot head changed during discovery; "
+                    "retrying next poll",
+                    number,
+                    exc_info=True,
+                )
+                results.append(
+                    PRState(
+                        number=number,
+                        title=title,
+                        branch=branch,
+                        head_sha=head_sha,
+                        action=PRAction.SKIP_PENDING,
+                        ci_failures=[],
+                        review_threads=[],
+                        labels=pr_labels,
+                        base_branch=base_branch,
+                    )
+                )
+                continue
             except Exception:
                 logger.warning(
                     "Failed to fetch review threads for PR #%d with CHANGES_REQUESTED, "
@@ -1042,60 +1118,117 @@ def discover_actionable_prs(
                         base_branch=base_branch,
                     )
                 )
-        elif review_decision == "APPROVED":
-            # CI green + approved — check for unresolved threads
-            try:
-                threads = gh.get_unresolved_review_threads(repo, number, token)
-            except Exception:
-                # Cannot verify thread state — do NOT merge. Fall through
-                # to SKIP_GREEN so the PR stays visible and gets retried
-                # on the next poll cycle.
-                logger.warning(
-                    "Failed to fetch review threads for PR #%d, "
-                    "skipping merge until threads can be verified",
-                    number,
-                    exc_info=True,
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_GREEN,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
+        else:
+            if review_decision == "APPROVED":
+                try:
+                    review_snapshot = gh.get_review_snapshot(
+                        repo, number, token, expected_head_sha=head_sha
                     )
-                )
-                continue
-
-            if threads:
-                # Approved but unresolved threads — triage into issues
-                logger.info(
-                    "PR #%d is approved but has %d unresolved thread(s), enqueuing followup triage",
-                    number,
-                    len(threads),
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.ENQUEUE_FOLLOWUP,
-                        ci_failures=[],
-                        review_threads=threads,
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
-                )
-            else:
-                if pr_data.get("mergeable") == "UNKNOWN":
-                    logger.debug(
-                        "PR #%d is approved and green but mergeability is UNKNOWN, skipping merge",
+                except gh.GhStaleSnapshotError:
+                    logger.info(
+                        "PR #%d: review snapshot head changed during discovery; retrying next poll",
                         number,
+                        exc_info=True,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+                except Exception:
+                    logger.warning(
+                        "PR #%d: review evidence could not be verified; retrying next poll",
+                        number,
+                        exc_info=True,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+                if review_snapshot.review_decision != review_decision:
+                    logger.info(
+                        "PR #%d: aggregate review decision changed during discovery "
+                        "(listed=%s snapshot=%s); retrying next poll",
+                        number,
+                        review_decision,
+                        review_snapshot.review_decision,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+                if not review_snapshot.has_current_head_approval:
+                    logger.info(
+                        "PR #%d: aggregate approval ignored because it targets an older "
+                        "head than %s; using no-formal-verdict path",
+                        number,
+                        head_sha,
+                    )
+                    review_decision = ""
+
+            if review_decision == "APPROVED":
+                # CI green + approved — check for unresolved threads
+                try:
+                    threads = gh.get_unresolved_review_threads(
+                        repo, number, token, expected_head_sha=head_sha
+                    )
+                except gh.GhStaleSnapshotError:
+                    logger.info(
+                        "PR #%d: review-thread snapshot head changed during discovery; "
+                        "retrying next poll",
+                        number,
+                        exc_info=True,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+                except Exception:
+                    # Cannot verify thread state — do NOT merge.
+                    logger.warning(
+                        "Failed to fetch review threads for PR #%d, "
+                        "skipping merge until threads can be verified",
+                        number,
+                        exc_info=True,
                     )
                     results.append(
                         PRState(
@@ -1112,79 +1245,13 @@ def discover_actionable_prs(
                     )
                     continue
 
-                # All clear — merge
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.MERGE,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
-                )
-        else:
-            # CI green, no formal review decision — check for unresolved
-            # review threads (e.g. from automated code review comments that
-            # use COMMENTED state rather than CHANGES_REQUESTED).
-            try:
-                threads = gh.get_unresolved_review_threads(repo, number, token)
-            except Exception:
-                logger.warning(
-                    "Failed to fetch review threads for PR #%d, skipping",
-                    number,
-                    exc_info=True,
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.SKIP_PENDING,
-                        ci_failures=[],
-                        review_threads=[],
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
-                )
-                continue
-
-            if threads:
-                logger.info(
-                    "PR #%d is CI green with %d unresolved review thread(s), enqueuing fix",
-                    number,
-                    len(threads),
-                )
-                results.append(
-                    PRState(
-                        number=number,
-                        title=title,
-                        branch=branch,
-                        head_sha=head_sha,
-                        action=PRAction.ENQUEUE_FIX,
-                        ci_failures=[],
-                        review_threads=threads,
-                        labels=pr_labels,
-                        base_branch=base_branch,
-                    )
-                )
-            else:
-                # CI green, no review threads, no formal review decision.
-                # Check if claude-review passed but didn't submit a formal
-                # review — if so, re-trigger once per SHA.
-                review_run_id = _get_claude_review_run_id(checks)
-                retrigger_sha = get_review_retrigger_sha(redis, repo, number)
-
-                if review_run_id is not None and retrigger_sha != head_sha:
-                    # claude-review passed but no formal review — re-trigger
+                if threads:
+                    # Approved but unresolved threads — triage into issues
                     logger.info(
-                        "PR #%d: claude-review passed but no formal review, will re-trigger run %d",
+                        "PR #%d is approved but has %d unresolved thread(s), "
+                        "enqueuing followup triage",
                         number,
-                        review_run_id,
+                        len(threads),
                     )
                     results.append(
                         PRState(
@@ -1192,51 +1259,184 @@ def discover_actionable_prs(
                             title=title,
                             branch=branch,
                             head_sha=head_sha,
-                            action=PRAction.RETRIGGER_REVIEW,
+                            action=PRAction.ENQUEUE_FOLLOWUP,
                             ci_failures=[],
-                            review_threads=[],
-                            labels=pr_labels,
-                            base_branch=base_branch,
-                            review_run_id=review_run_id,
-                        )
-                    )
-                elif review_run_id is not None and retrigger_sha == head_sha:
-                    # Already re-triggered for this SHA, still no review. Route
-                    # to SKIP_MAX_ATTEMPTS, which backs off and retries later
-                    # (it no longer escalates to a human).
-                    logger.warning(
-                        "PR #%d: claude-review re-trigger exhausted (SHA %s), backing off",
-                        number,
-                        head_sha[:8],
-                    )
-                    results.append(
-                        PRState(
-                            number=number,
-                            title=title,
-                            branch=branch,
-                            head_sha=head_sha,
-                            action=PRAction.SKIP_MAX_ATTEMPTS,
-                            ci_failures=[],
-                            review_threads=[],
+                            review_threads=threads,
                             labels=pr_labels,
                             base_branch=base_branch,
                         )
                     )
                 else:
-                    # No actionable claude-review run (absent, not SUCCESS, or missing run URL)
-                    # — normal SKIP_GREEN
+                    if pr_data.get("mergeable") == "UNKNOWN":
+                        logger.debug(
+                            "PR #%d is approved and green but mergeability is UNKNOWN, "
+                            "skipping merge",
+                            number,
+                        )
+                        results.append(
+                            PRState(
+                                number=number,
+                                title=title,
+                                branch=branch,
+                                head_sha=head_sha,
+                                action=PRAction.SKIP_PENDING,
+                                ci_failures=[],
+                                review_threads=[],
+                                labels=pr_labels,
+                                base_branch=base_branch,
+                            )
+                        )
+                        continue
+
+                    # All clear — merge
                     results.append(
                         PRState(
                             number=number,
                             title=title,
                             branch=branch,
                             head_sha=head_sha,
-                            action=PRAction.SKIP_GREEN,
+                            action=PRAction.MERGE,
                             ci_failures=[],
                             review_threads=[],
                             labels=pr_labels,
                             base_branch=base_branch,
                         )
                     )
+            else:
+                # CI green, no formal review decision — check for unresolved
+                # review threads (e.g. from automated code review comments that
+                # use COMMENTED state rather than CHANGES_REQUESTED).
+                try:
+                    threads = gh.get_unresolved_review_threads(
+                        repo, number, token, expected_head_sha=head_sha
+                    )
+                except gh.GhStaleSnapshotError:
+                    logger.info(
+                        "PR #%d: review-thread snapshot head changed during discovery; "
+                        "retrying next poll",
+                        number,
+                        exc_info=True,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+                except Exception:
+                    logger.warning(
+                        "Failed to fetch review threads for PR #%d, skipping",
+                        number,
+                        exc_info=True,
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.SKIP_PENDING,
+                            ci_failures=[],
+                            review_threads=[],
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                    continue
+
+                if threads:
+                    logger.info(
+                        "PR #%d is CI green with %d unresolved review thread(s), enqueuing fix",
+                        number,
+                        len(threads),
+                    )
+                    results.append(
+                        PRState(
+                            number=number,
+                            title=title,
+                            branch=branch,
+                            head_sha=head_sha,
+                            action=PRAction.ENQUEUE_FIX,
+                            ci_failures=[],
+                            review_threads=threads,
+                            labels=pr_labels,
+                            base_branch=base_branch,
+                        )
+                    )
+                else:
+                    # CI green, no review threads, no formal review decision.
+                    # Check if claude-review passed but didn't submit a formal
+                    # review — if so, re-trigger once per SHA.
+                    review_run_id = _get_claude_review_run_id(checks)
+                    retrigger_sha = get_review_retrigger_sha(redis, repo, number)
+
+                    if review_run_id is not None and retrigger_sha != head_sha:
+                        # claude-review passed but no formal review — re-trigger
+                        logger.info(
+                            "PR #%d: claude-review passed but no formal review, "
+                            "will re-trigger run %d",
+                            number,
+                            review_run_id,
+                        )
+                        results.append(
+                            PRState(
+                                number=number,
+                                title=title,
+                                branch=branch,
+                                head_sha=head_sha,
+                                action=PRAction.RETRIGGER_REVIEW,
+                                ci_failures=[],
+                                review_threads=[],
+                                labels=pr_labels,
+                                base_branch=base_branch,
+                                review_run_id=review_run_id,
+                            )
+                        )
+                    elif review_run_id is not None and retrigger_sha == head_sha:
+                        # Already re-triggered for this SHA, still no review. Route
+                        # to SKIP_MAX_ATTEMPTS, which backs off and retries later
+                        # (it no longer escalates to a human).
+                        logger.warning(
+                            "PR #%d: claude-review re-trigger exhausted (SHA %s), backing off",
+                            number,
+                            head_sha[:8],
+                        )
+                        results.append(
+                            PRState(
+                                number=number,
+                                title=title,
+                                branch=branch,
+                                head_sha=head_sha,
+                                action=PRAction.SKIP_MAX_ATTEMPTS,
+                                ci_failures=[],
+                                review_threads=[],
+                                labels=pr_labels,
+                                base_branch=base_branch,
+                            )
+                        )
+                    else:
+                        # No actionable claude-review run (absent, not SUCCESS, or missing run URL)
+                        # — normal SKIP_GREEN
+                        results.append(
+                            PRState(
+                                number=number,
+                                title=title,
+                                branch=branch,
+                                head_sha=head_sha,
+                                action=PRAction.SKIP_GREEN,
+                                ci_failures=[],
+                                review_threads=[],
+                                labels=pr_labels,
+                                base_branch=base_branch,
+                            )
+                        )
 
     return results

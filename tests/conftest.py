@@ -7,6 +7,7 @@ import fakeredis
 import pytest
 import redis
 
+from orcest.orchestrator.gh import PRReviewSnapshot
 from orcest.shared.config import (
     GithubConfig,
     LabelConfig,
@@ -174,6 +175,7 @@ def gh_mock(mocker):
         "get_ci_status",
         "get_pr_diff",
         "get_failed_run_logs",
+        "get_review_snapshot",
         "add_label",
         "remove_label",
         "post_comment",
@@ -196,6 +198,18 @@ def gh_mock(mocker):
             "orcest.orchestrator.issue_delivery.observe_issue_handoff"
         )
     ns.get_pr.return_value = {"headRefOid": "abc123", "statusCheckRollup": []}
+    ns.get_ci_status.return_value = [
+        {"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    ]
+    ns.get_unresolved_review_threads.return_value = []
+    ns.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha="abc123",
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=True,
+    )
     ns.has_issue_comment_marker.return_value = False
     if hasattr(ns, "observe_issue_handoff"):
         from orcest.orchestrator.github_delivery_verifier import (
@@ -219,6 +233,29 @@ def gh_mock(mocker):
             message="test default",
         )
     return ns
+
+
+@pytest.fixture
+def make_review_snapshot():
+    def factory(
+        *,
+        head_sha: str = "abc123",
+        state: str = "OPEN",
+        is_draft: bool = False,
+        labels: tuple[str, ...] = (),
+        review_decision: str = "APPROVED",
+        has_current_head_approval: bool = True,
+    ) -> PRReviewSnapshot:
+        return PRReviewSnapshot(
+            head_sha=head_sha,
+            state=state,
+            is_draft=is_draft,
+            labels=labels,
+            review_decision=review_decision,
+            has_current_head_approval=has_current_head_approval,
+        )
+
+    return factory
 
 
 # --- Real Redis fixtures (shared by integration and stress tests) ---
