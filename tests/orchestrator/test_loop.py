@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from orcest.orchestrator.gh import PRReviewSnapshot
 from orcest.orchestrator.issue_ops import (
     get_attempt_count as get_issue_attempt_count,
     has_usage_exhausted_cooldown as has_issue_usage_exhausted_cooldown,
@@ -90,6 +91,17 @@ def _make_pr_state(
         ci_failures=ci_failures,
         review_threads=[],
         labels=[],
+    )
+
+
+def _review_rerun_snapshot(head_sha: str) -> PRReviewSnapshot:
+    return PRReviewSnapshot(
+        head_sha=head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="",
+        has_current_head_approval=False,
     )
 
 
@@ -2607,6 +2619,7 @@ def test_poll_cycle_retrigger_review(mocker, fake_redis_client, orchestrator_con
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha999")
 
     logger = logging.getLogger("test")
     _poll_cycle(orchestrator_config, fake_redis_client, fake_redis_client, {}, logger, 3600)
@@ -2647,6 +2660,7 @@ def test_poll_cycle_retrigger_review_failure_logged(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha000")
 
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
@@ -2685,6 +2699,7 @@ def test_poll_cycle_retrigger_review_failure_cooldown_skips_next_poll(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha-cooldown")
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
     logger = logging.getLogger("test")
@@ -2720,6 +2735,7 @@ def test_poll_cycle_retrigger_review_failures_back_off_after_limit(
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    gh_mock.get_review_snapshot.return_value = _review_rerun_snapshot("sha-escalate")
     gh_mock.rerun_workflow.side_effect = RuntimeError("GitHub API error")
 
     repo = orchestrator_config.github.repo
@@ -3815,6 +3831,78 @@ def _make_merge_pr_state(number: int = 42) -> PRState:
         review_threads=[],
         labels=[],
     )
+
+
+def test_merge_action_old_only_approval_skips_without_side_effects(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    pr_state = _make_merge_pr_state(number=649)
+    gh_mock.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha=pr_state.head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=(),
+        review_decision="APPROVED",
+        has_current_head_approval=False,
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    gh_mock.merge_pr.assert_not_called()
+    gh_mock.add_label.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
+    assert (
+        get_backoff_step(fake_redis_client, orchestrator_config.github.repo, pr_state.number)
+        is None
+    )
+
+
+def test_merge_action_unresolved_thread_appears_before_merge_skips(
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    pr_state = _make_merge_pr_state(number=650)
+    gh_mock.get_unresolved_review_threads.return_value = [
+        {"id": "thread1", "path": "src/a.py", "line": 1, "comments": []}
+    ]
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[pr_state],
+    )
+    mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    gh_mock.merge_pr.assert_not_called()
+    gh_mock.post_comment.assert_not_called()
 
 
 def test_merge_network_error_skips_needs_human(
