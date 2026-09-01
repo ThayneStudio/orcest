@@ -1488,6 +1488,26 @@ def _row_to_activity_review_assignment(
     )
 
 
+def _review_assignment_digest_for_input(assignment: ActivityReviewAssignmentInput) -> str:
+    subject_refs_digest_value = subject_refs_digest(assignment.subject_refs)
+    disputed_digest_value = (
+        bare_canonical_digest(list(assignment.disputed_finding_ids))
+        if assignment.disputed_finding_ids
+        else None
+    )
+    return review_assignment_digest(
+        assignment_kind=assignment.assignment_kind,
+        panel_round=assignment.panel_round,
+        reviewer_slot=assignment.reviewer_slot,
+        adjudication_round=assignment.adjudication_round,
+        adjudicator_slot=assignment.adjudicator_slot,
+        role=assignment.role,
+        subject_refs_digest=subject_refs_digest_value,
+        context_digest=assignment.context_digest,
+        disputed_finding_ids_digest=disputed_digest_value,
+    )
+
+
 def _row_to_attempt(row: sqlite3.Row) -> AttemptRecord:
     return AttemptRecord(
         attempt_id=row["attempt_id"],
@@ -8103,6 +8123,8 @@ class RunStore:
                 raise ValueError("review_assignment.role must equal Activity.role")
         if attempt is not None and attempt.generation != 1:
             raise ValueError("create_activity only offers the first Attempt generation")
+        if attempt is not None and outbox_id is None:
+            raise ValueError("outbox_id is required whenever attempt is given")
         with self.transaction():
             existing = self.conn.execute(
                 "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
@@ -8112,8 +8134,13 @@ class RunStore:
                 record = _row_to_activity(existing)
                 if (
                     record.activity_id != activity_id
+                    or record.activity_ordinal != activity_ordinal
+                    or record.specification_generation != specification_generation
+                    or record.policy_hash != policy_hash
                     or record.kind != kind
                     or record.execution_class != execution_class
+                    or record.role != role
+                    or record.slot != slot
                     or record.semantic_input_digest != semantic_input_digest
                     or record.created_transition_sequence != created_transition_sequence
                 ):
@@ -8121,6 +8148,19 @@ class RunStore:
                         "activity idempotency_key was reused with different content"
                     )
                 existing_assignment = self._get_activity_review_assignment(record.activity_id)
+                if (existing_assignment is None) != (review_assignment is None):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                if (
+                    existing_assignment is not None
+                    and review_assignment is not None
+                    and existing_assignment.assignment_digest
+                    != _review_assignment_digest_for_input(review_assignment)
+                ):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
                 existing_attempt_row = self.conn.execute(
                     "SELECT * FROM attempts WHERE activity_id = ? ORDER BY generation DESC LIMIT 1",
                     (record.activity_id,),
@@ -8130,6 +8170,41 @@ class RunStore:
                     if existing_attempt_row is not None
                     else None
                 )
+                if (existing_attempt is None) != (attempt is None):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                if (
+                    existing_attempt is not None
+                    and attempt is not None
+                    and (
+                        existing_attempt.protocol_version,
+                        existing_attempt.execution_profile_id,
+                        existing_attempt.worker_profile,
+                        existing_attempt.provider,
+                        existing_attempt.model,
+                        existing_attempt.provider_account_ref,
+                        existing_attempt.provider_family,
+                        existing_attempt.model_family,
+                        existing_attempt.classification_revision,
+                        existing_attempt.claim_timeout_ms,
+                    )
+                    != (
+                        attempt.protocol_version,
+                        attempt.execution_profile_id,
+                        attempt.worker_profile,
+                        attempt.provider,
+                        attempt.model,
+                        attempt.provider_account_ref,
+                        attempt.provider_family,
+                        attempt.model_family,
+                        attempt.classification_revision,
+                        attempt.claim_timeout_ms,
+                    )
+                ):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
                 return (
                     dataclasses.replace(record, review_assignment=existing_assignment),
                     existing_attempt,
@@ -8182,16 +8257,15 @@ class RunStore:
             attempt_record = None
             outbox_record = None
             if attempt is not None:
+                assert outbox_id is not None
                 attempt_record = self._insert_attempt_row(activity_id=activity_id, offer=attempt)
-                if outbox_id is not None:
-                    outbox_record = self._insert_activity_offer_outbox(
-                        outbox_id=outbox_id,
-                        activity_id=activity_id,
-                        attempt=attempt_record,
-                        destination=outbox_destination
-                        or f"activity-offer/1/{attempt.worker_profile}",
-                        protocol_version=outbox_protocol_version or attempt.protocol_version,
-                    )
+                outbox_record = self._insert_activity_offer_outbox(
+                    outbox_id=outbox_id,
+                    activity_id=activity_id,
+                    attempt=attempt_record,
+                    destination=outbox_destination or f"activity-offer/1/{attempt.worker_profile}",
+                    protocol_version=outbox_protocol_version or attempt.protocol_version,
+                )
             row = self.conn.execute(
                 "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
             ).fetchone()
@@ -8218,7 +8292,7 @@ class RunStore:
         supplies the exact terminal state (``FAILED``, ``ABSTAINED``,
         ``EXPIRED``, or ``SUPERSEDED``) the prior generation already reduced
         to before this call, and this method fences the write on that prior
-        generation still being nonterminal in storage.
+        generation having actually reduced to that exact state in storage.
         """
         require_lowercase_uuid(activity_id, field="activity_id")
         if prior_attempt_terminal_state not in {"FAILED", "ABSTAINED", "EXPIRED", "SUPERSEDED"}:
@@ -8235,6 +8309,11 @@ class RunStore:
             if prior["state"] in {"OFFERED", "CLAIMED"}:
                 raise CasMismatchError(
                     "prior Attempt generation is still nonterminal; terminalize it first"
+                )
+            if prior["state"] != prior_attempt_terminal_state:
+                raise CasMismatchError(
+                    "prior_attempt_terminal_state does not match the prior Attempt's actual "
+                    f"terminal state ({prior['state']!r})"
                 )
             attempt_record = self._insert_attempt_row(activity_id=activity_id, offer=offer)
             outbox_record = self._insert_activity_offer_outbox(
@@ -8324,17 +8403,7 @@ class RunStore:
             if assignment.disputed_finding_ids
             else None
         )
-        assignment_digest_value = review_assignment_digest(
-            assignment_kind=assignment.assignment_kind,
-            panel_round=assignment.panel_round,
-            reviewer_slot=assignment.reviewer_slot,
-            adjudication_round=assignment.adjudication_round,
-            adjudicator_slot=assignment.adjudicator_slot,
-            role=assignment.role,
-            subject_refs_digest=subject_refs_digest_value,
-            context_digest=assignment.context_digest,
-            disputed_finding_ids_digest=disputed_digest_value,
-        )
+        assignment_digest_value = _review_assignment_digest_for_input(assignment)
         self.conn.execute(
             "INSERT INTO activity_review_assignments(activity_id, assignment_kind, panel_round, "
             "reviewer_slot, adjudication_round, adjudicator_slot, role, subject_refs_digest, "

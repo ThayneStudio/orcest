@@ -129,6 +129,79 @@ def test_replaying_idempotency_key_with_different_content_conflicts(store: RunSt
         _create(store, kind="VERIFY")
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"policy_hash": "sha256:" + "9" * 64},
+        {"activity_ordinal": 2},
+        {"specification_generation": 2},
+        {"role": "reviewer"},
+        {"slot": "slot-a"},
+    ],
+)
+def test_replaying_idempotency_key_with_different_activity_field_conflicts(
+    store: RunStore, overrides: dict
+) -> None:
+    _create(store)
+    with pytest.raises(IdempotencyConflictError):
+        _create(store, **overrides)
+
+
+def test_replaying_idempotency_key_with_different_attempt_offer_conflicts(store: RunStore) -> None:
+    _create(store)
+    with pytest.raises(IdempotencyConflictError):
+        _create(store, attempt=_offer(worker_profile="grok"))
+
+
+def test_replaying_idempotency_key_with_attempt_added_conflicts(store: RunStore) -> None:
+    kwargs = dict(
+        activity_id=ACTIVITY_ID,
+        run_id=RUN_ID,
+        activity_ordinal=1,
+        specification_generation=1,
+        policy_hash=POLICY_HASH,
+        kind="BUILD",
+        execution_class="WORKER",
+        state="READY",
+        created_transition_sequence=1,
+        semantic_input={"a": 1},
+        semantic_input_digest=SEMANTIC_DIGEST,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+    store.create_activity(**kwargs)
+    with pytest.raises(IdempotencyConflictError):
+        store.create_activity(**kwargs, attempt=_offer(), outbox_id=OUTBOX_ID)
+
+
+def test_replaying_idempotency_key_with_different_review_assignment_conflicts(
+    store: RunStore,
+) -> None:
+    review = ActivityReviewAssignmentInput(
+        assignment_kind="REVIEW",
+        panel_round=1,
+        role="reviewer",
+        context_digest="sha256:" + "3" * 64,
+        subject_refs=("snapshot:overall",),
+        reviewer_slot="slot-a",
+    )
+    _create(store, kind="REVIEW", role="reviewer", review_assignment=review)
+    other_review = ActivityReviewAssignmentInput(
+        assignment_kind="REVIEW",
+        panel_round=2,
+        role="reviewer",
+        context_digest="sha256:" + "3" * 64,
+        subject_refs=("snapshot:overall",),
+        reviewer_slot="slot-a",
+    )
+    with pytest.raises(IdempotencyConflictError):
+        _create(store, kind="REVIEW", role="reviewer", review_assignment=other_review)
+
+
+def test_create_activity_requires_outbox_id_when_attempt_given(store: RunStore) -> None:
+    with pytest.raises(ValueError):
+        _create(store, outbox_id=None)
+
+
 def test_activity_ordinal_and_idempotency_key_are_unique_per_run(store: RunStore) -> None:
     _create(store)
     with pytest.raises(sqlite3.IntegrityError):
@@ -170,6 +243,23 @@ def test_create_next_attempt_requires_prior_generation_terminal(store: RunStore)
             activity_id=ACTIVITY_ID,
             prior_attempt_terminal_state="FAILED",
             offer=_offer(generation=2, attempt_id="77777777-7777-4777-8777-777777777777"),
+            outbox_id="88888888-8888-4888-8888-888888888888",
+        )
+
+
+def test_create_next_attempt_requires_terminal_state_to_match_actual_state(
+    store: RunStore,
+) -> None:
+    _activity, attempt1, _outbox1 = _create(store)
+    with store.transaction():
+        store.conn.execute(
+            "UPDATE attempts SET state = 'EXPIRED' WHERE attempt_id = ?", (attempt1.attempt_id,)
+        )
+    with pytest.raises(CasMismatchError):
+        store.create_next_attempt(
+            activity_id=ACTIVITY_ID,
+            prior_attempt_terminal_state="FAILED",
+            offer=_offer(generation=2, attempt_id="99999999-9999-4999-8999-999999999999"),
             outbox_id="88888888-8888-4888-8888-888888888888",
         )
 
