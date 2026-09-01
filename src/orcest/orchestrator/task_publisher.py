@@ -1055,7 +1055,7 @@ def _publish_issue_and_notify(
             )
         raise
 
-    mark_issue_published(
+    publication_confirmed = mark_issue_published(
         redis,
         repo,
         issue_state.number,
@@ -1063,6 +1063,17 @@ def _publish_issue_and_notify(
         tasks_stream,
         stream_id,
     )
+    if not publication_confirmed:
+        _log.warning(
+            "Publication CAS failed for issue %s#%d generation %d task %s "
+            "(stream %s, stream_id %s); durable record was not moved to published",
+            repo,
+            issue_state.number,
+            reservation.generation,
+            task.id,
+            tasks_stream,
+            stream_id,
+        )
     _emit_enqueued(redis, task)
 
     _log.info(f"Published {task_type.value} task {task.id} for issue #{issue_state.number}")

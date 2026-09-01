@@ -1979,3 +1979,80 @@ def test_publish_issue_xadd_failure_rolls_back_one_attempt_not_whole_budget(
 
     # Reservation incremented to 3 then rolled back exactly one -> 2.
     assert get_issue_attempt_count(fake_redis_client, repo, 555) == 2
+
+
+def test_publish_issue_task_no_warning_when_publication_cas_succeeds(
+    gh_mock,
+    fake_redis_client,
+    caplog,
+):
+    """A successful publication CAS emits no CAS-failure warning and the
+    task is still reported as published."""
+    _setup_gh_defaults(gh_mock)
+    issue_state = IssueState(
+        number=901,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        task = publish_issue_task(
+            issue_state=issue_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    assert task is not None
+    assert not any("Publication CAS failed" in record.getMessage() for record in caplog.records)
+
+
+def test_publish_issue_task_warns_once_when_publication_cas_fails(
+    gh_mock,
+    fake_redis_client,
+    mocker,
+    caplog,
+):
+    """When mark_issue_published cannot move the durable record to
+    published, publish_issue_task still enqueues the task, still returns it,
+    and emits exactly one warning identifying the stale record -- without
+    logging the task payload or credentials."""
+    _setup_gh_defaults(gh_mock)
+    mocker.patch(
+        "orcest.orchestrator.task_publisher.mark_issue_published",
+        return_value=False,
+    )
+    issue_state = IssueState(
+        number=902,
+        title="Test issue",
+        body="Test issue body",
+        action=IssueAction.ENQUEUE_IMPLEMENT,
+        labels=[],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        task = publish_issue_task(
+            issue_state=issue_state,
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="claude",
+        )
+
+    # The task was already appended to the stream, so publish_issue_task
+    # still reports success -- publication is observability-only.
+    assert task is not None
+
+    cas_warnings = [
+        record for record in caplog.records if "Publication CAS failed" in record.getMessage()
+    ]
+    assert len(cas_warnings) == 1
+    message = cas_warnings[0].getMessage()
+    assert "test-org/test-repo" in message
+    assert "902" in message
+    assert task.id in message
+    assert "fake-token" not in message
+    assert issue_state.body not in message
