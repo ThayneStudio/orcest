@@ -23,17 +23,22 @@ OUTBOX_ID = "44444444-4444-4444-8444-444444444444"
 POLICY_HASH = "sha256:" + "0" * 64
 SEMANTIC_DIGEST = "sha256:" + "1" * 64
 IDEMPOTENCY_KEY = "sha256:" + "2" * 64
+FUTURE_OFFERED_AT_MS = 4_102_444_800_000
 
 
 def _offer(
-    *, generation: int = 1, attempt_id: str = ATTEMPT_ID, worker_profile: str = "codex"
+    *,
+    generation: int = 1,
+    attempt_id: str = ATTEMPT_ID,
+    worker_profile: str = "codex",
+    offered_at_ms: int = FUTURE_OFFERED_AT_MS,
 ) -> AttemptOfferInput:
     return AttemptOfferInput(
         attempt_id=attempt_id,
         generation=generation,
         protocol_version=activity_offer_protocol(),
         worker_profile=worker_profile,
-        offered_at_ms=1_000,
+        offered_at_ms=offered_at_ms,
         claim_timeout_ms=300_000,
     )
 
@@ -135,7 +140,16 @@ def test_replaying_idempotency_key_with_different_content_conflicts(store: RunSt
         {"policy_hash": "sha256:" + "9" * 64},
         {"activity_ordinal": 2},
         {"specification_generation": 2},
+        {"state": "PLANNED"},
+        {"candidate_id": "55555555-5555-4555-8555-555555555555"},
+        {"forge_observation_id": "66666666-6666-4666-8666-666666666666"},
         {"role": "reviewer"},
+        {"repair_cycle": 1},
+        {"recovery_cycle": 1},
+        {"strategy_index": 1},
+        {"recovery_tactic": "retry-with-smaller-scope"},
+        {"recovery_evidence_id": "evidence-1"},
+        {"rescue_epoch": 1},
         {"slot": "slot-a"},
     ],
 )
@@ -151,6 +165,21 @@ def test_replaying_idempotency_key_with_different_attempt_offer_conflicts(store:
     _create(store)
     with pytest.raises(IdempotencyConflictError):
         _create(store, attempt=_offer(worker_profile="grok"))
+
+
+@pytest.mark.parametrize(
+    "offer",
+    [
+        _offer(attempt_id="55555555-5555-4555-8555-555555555555"),
+        _offer(offered_at_ms=FUTURE_OFFERED_AT_MS + 1),
+    ],
+)
+def test_replaying_idempotency_key_with_different_attempt_identity_conflicts(
+    store: RunStore, offer: AttemptOfferInput
+) -> None:
+    _create(store)
+    with pytest.raises(IdempotencyConflictError):
+        _create(store, attempt=offer)
 
 
 def test_replaying_idempotency_key_with_attempt_added_conflicts(store: RunStore) -> None:

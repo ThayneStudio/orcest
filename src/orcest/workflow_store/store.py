@@ -8139,8 +8139,18 @@ class RunStore:
                     or record.policy_hash != policy_hash
                     or record.kind != kind
                     or record.execution_class != execution_class
+                    or record.state != state
+                    or record.candidate_id != candidate_id
+                    or record.forge_observation_id != forge_observation_id
                     or record.role != role
+                    or record.repair_cycle != repair_cycle
+                    or record.recovery_cycle != recovery_cycle
+                    or record.strategy_index != strategy_index
+                    or record.recovery_tactic != recovery_tactic
+                    or record.recovery_evidence_id != recovery_evidence_id
+                    or record.rescue_epoch != rescue_epoch
                     or record.slot != slot
+                    or record.semantic_input_json != semantic_input_json
                     or record.semantic_input_digest != semantic_input_digest
                     or record.created_transition_sequence != created_transition_sequence
                 ):
@@ -8178,6 +8188,8 @@ class RunStore:
                     existing_attempt is not None
                     and attempt is not None
                     and (
+                        existing_attempt.attempt_id,
+                        existing_attempt.generation,
                         existing_attempt.protocol_version,
                         existing_attempt.execution_profile_id,
                         existing_attempt.worker_profile,
@@ -8187,9 +8199,12 @@ class RunStore:
                         existing_attempt.provider_family,
                         existing_attempt.model_family,
                         existing_attempt.classification_revision,
+                        existing_attempt.offered_at_ms,
                         existing_attempt.claim_timeout_ms,
                     )
                     != (
+                        attempt.attempt_id,
+                        attempt.generation,
                         attempt.protocol_version,
                         attempt.execution_profile_id,
                         attempt.worker_profile,
@@ -8199,6 +8214,7 @@ class RunStore:
                         attempt.provider_family,
                         attempt.model_family,
                         attempt.classification_revision,
+                        attempt.offered_at_ms,
                         attempt.claim_timeout_ms,
                     )
                 ):
@@ -8492,11 +8508,14 @@ class RunStore:
         This is exactly the durable set Redis reconstruction must republish
         (never a ``CLAIMED`` Attempt, which is not schedulable work).
         """
+        now = _now_ms()
         rows = self.conn.execute(
             "SELECT attempts.*, outbox.outbox_id AS outbox_row_id FROM attempts "
             "JOIN outbox ON outbox.attempt_id = attempts.attempt_id "
             "AND outbox.attempt_generation = attempts.generation "
-            "WHERE attempts.state = 'OFFERED' AND outbox.source_kind = 'ACTIVITY'"
+            "WHERE attempts.state = 'OFFERED' AND attempts.claim_deadline_ms > ? "
+            "AND outbox.source_kind = 'ACTIVITY'",
+            (now,),
         ).fetchall()
         results: list[tuple[AttemptRecord, OutboxRecord]] = []
         for row in rows:

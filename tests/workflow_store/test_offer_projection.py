@@ -19,17 +19,22 @@ from orcest.workflow_store import (
 pytestmark = pytest.mark.unit
 
 RUN_ID = "11111111-1111-4111-8111-111111111111"
+FUTURE_OFFERED_AT_MS = 4_102_444_800_000
 
 
 def _offer(
-    *, generation: int = 1, attempt_id: str, worker_profile: str = "codex"
+    *,
+    generation: int = 1,
+    attempt_id: str,
+    worker_profile: str = "codex",
+    offered_at_ms: int = FUTURE_OFFERED_AT_MS,
 ) -> AttemptOfferInput:
     return AttemptOfferInput(
         attempt_id=attempt_id,
         generation=generation,
         protocol_version=activity_offer_protocol(),
         worker_profile=worker_profile,
-        offered_at_ms=1_000,
+        offered_at_ms=offered_at_ms,
         claim_timeout_ms=300_000,
     )
 
@@ -49,7 +54,13 @@ def store(tmp_path: Path) -> RunStore:
 
 
 def _create_offer(
-    store: RunStore, *, activity_id: str, attempt_id: str, outbox_id: str, activity_ordinal: int = 1
+    store: RunStore,
+    *,
+    activity_id: str,
+    attempt_id: str,
+    outbox_id: str,
+    activity_ordinal: int = 1,
+    offered_at_ms: int = FUTURE_OFFERED_AT_MS,
 ):
     return store.create_activity(
         activity_id=activity_id,
@@ -64,7 +75,7 @@ def _create_offer(
         semantic_input={},
         semantic_input_digest="sha256:" + "1" * 64,
         idempotency_key="sha256:" + activity_id.replace("-", "")[:64].ljust(64, "0"),
-        attempt=_offer(attempt_id=attempt_id),
+        attempt=_offer(attempt_id=attempt_id, offered_at_ms=offered_at_ms),
         outbox_id=outbox_id,
     )
 
@@ -170,6 +181,20 @@ def test_reconstruction_republishes_only_current_offered_attempts(store, fake_re
     _entry_id, fields = entries[0]
     assert fields["attempt_id"] == attempt_a.attempt_id
     assert fields["redis_epoch"] == "2"
+
+
+def test_reconstruction_skips_expired_offered_attempts(store, fake_redis_client) -> None:
+    _create_offer(
+        store,
+        activity_id="22222222-2222-4222-8222-222222222222",
+        attempt_id="33333333-3333-4333-8333-333333333333",
+        outbox_id="44444444-4444-4444-8444-444444444444",
+        offered_at_ms=1_000,
+    )
+
+    republished = reconstruct_open_offers(store, fake_redis_client, redis_epoch=1)
+    assert republished == 0
+    assert fake_redis_client.xrange(offer_stream_key("codex"), count=10) == []
 
 
 def test_reconstruction_is_reachable_from_a_fresh_process_boundary(
