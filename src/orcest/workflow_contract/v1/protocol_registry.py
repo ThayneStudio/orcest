@@ -39,6 +39,7 @@ from orcest.workflow_contract.v1.protocol import (
 CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
 CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
 ATTEMPT_CLAIM_PROTOCOL = "orcest.attempt-claim/1"
+CANDIDATE_UPLOAD_EXPIRED_PROTOCOL = "orcest.candidate-upload-expired/1"
 CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
 ERROR_PROTOCOL = "orcest.error/1"
@@ -53,6 +54,7 @@ __all__ = [
     "CAPABILITY_KEY_OPERATION_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
     "ATTEMPT_CLAIM_PROTOCOL",
+    "CANDIDATE_UPLOAD_EXPIRED_PROTOCOL",
     "CONTROLLER_MODE_OPERATION_PROTOCOL",
     "CONTROLLER_MODE_RESULT_PROTOCOL",
     "ERROR_PROTOCOL",
@@ -556,7 +558,7 @@ register_envelope(
     protocol_field="protocol",
 )
 register_envelope(
-    "orcest.candidate-upload-expired/1",
+    CANDIDATE_UPLOAD_EXPIRED_PROTOCOL,
     {
         "upload_id": Field(validator=_is_uuid),
         "state": Field(enum=frozenset({"EXPIRED"})),
