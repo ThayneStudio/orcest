@@ -1248,7 +1248,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1660,3 +1660,123 @@ def test_v4_database_migrates_project_registration_tables(tmp_path: Path) -> Non
         }
         for expected_table in _PROJECT_REGISTRATION_TABLES:
             assert expected_table in tables
+
+
+_FORGE_OBSERVATION_TABLES = (
+    "forge_observation_requests",
+    "forge_observation_request_results",
+    "forge_request_failure_facts",
+    "forge_observations",
+)
+
+_V5_FORGE_OBSERVATION_SCHEDULES_DDL = """
+CREATE TABLE forge_observation_schedules (
+  forge_observation_schedule_id TEXT PRIMARY KEY,
+  schedule_kind TEXT NOT NULL,
+  schedule_revision INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  run_id TEXT,
+  publication_id TEXT,
+  last_request_id TEXT,
+  last_observation_id TEXT,
+  next_due_at_ms INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL
+)
+"""
+
+
+def _write_v5_shaped_database(db_path: Path) -> None:
+    """Build a real v6 database, seed one real pre-v6-shape WORK_ITEM_DISCOVERY
+    Schedule row (the only kind the pre-#676 code ever wrote), drop the new
+    Forge Observation Request/Result/Failure-Fact/Observation tables, and roll
+    ``user_version`` back to 5."""
+    with RunStore(db_path.parent, verify_local_filesystem=False) as store:
+        now = 1_700_000_000_000
+        secret_id = "aaaaaaaa-0000-4000-8000-000000000001"
+        publication_secret_id = "aaaaaaaa-0000-4000-8000-000000000009"
+        for sid in (secret_id, publication_secret_id):
+            store.conn.execute(
+                "INSERT INTO secret_current_versions(secret_id, purpose, owner_scope_kind, "
+                "owner_scope_id, provider_account_ref, current_version, last_operation_id, "
+                "created_at_ms, updated_at_ms) VALUES (?, 'FORGE_API', 'PROJECT', 'scope', NULL, "
+                "1, ?, ?, ?)",
+                (sid, "aaaaaaaa-0000-4000-8000-000000000002", now, now),
+            )
+        forge_instance_id = "aaaaaaaa-0000-4000-8000-000000000003"
+        store.conn.execute(
+            "INSERT INTO forge_instances(forge_instance_id, adapter_kind, canonical_origin, "
+            "credential_secret_id, registration_provenance_version, created_at_ms) "
+            "VALUES (?, 'GITHUB', 'github.com/legacy', ?, 1, ?)",
+            (forge_instance_id, secret_id, now),
+        )
+        project_id = "aaaaaaaa-0000-4000-8000-000000000004"
+        schedule_id = "aaaaaaaa-0000-4000-8000-000000000005"
+        store.conn.execute(
+            "INSERT INTO projects(project_id, forge_instance_id, installation_or_account_ref, "
+            "repository_external_id, repository_locator, default_ref, trusted_base_policy_ref, "
+            "budget_policy_ref, budget_reset_window_ref, source_read_secret_id, "
+            "publication_secret_id, registration_source_read_secret_version, "
+            "registration_publication_secret_version, registration_revision, "
+            "registration_operation_id, work_item_discovery_schedule_id, registration_state) "
+            "VALUES (?, ?, 'inst', 'legacy/repo', 'legacy/repo', 'main', 'default', 'default', "
+            "'default', ?, ?, 1, 1, 1, 'aaaaaaaa-0000-4000-8000-000000000006', ?, 'ACTIVE')",
+            (project_id, forge_instance_id, secret_id, publication_secret_id, schedule_id),
+        )
+        store.conn.commit()
+        for table in _FORGE_OBSERVATION_TABLES + ("forge_observation_schedules",):
+            store.conn.execute(f"DROP TABLE IF EXISTS {table}")
+        store.conn.execute(_V5_FORGE_OBSERVATION_SCHEDULES_DDL)
+        store.conn.execute(
+            "INSERT INTO forge_observation_schedules(forge_observation_schedule_id, "
+            "schedule_kind, schedule_revision, state, target_kind, target_id, run_id, "
+            "publication_id, last_request_id, last_observation_id, next_due_at_ms, "
+            "created_at_ms) VALUES (?, 'WORK_ITEM_DISCOVERY', 0, 'ACTIVE', 'PROJECT', ?, "
+            "NULL, NULL, NULL, NULL, ?, ?)",
+            (schedule_id, project_id, now, now),
+        )
+        store.conn.execute("DELETE FROM schema_migrations WHERE version = 6")
+        store.conn.execute("PRAGMA user_version=5")
+        store.conn.commit()
+
+
+def test_v5_database_migrates_forge_observation_tables(tmp_path: Path) -> None:
+    _write_v5_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _FORGE_OBSERVATION_TABLES:
+            assert expected_table in tables
+
+        # The real legacy WORK_ITEM_DISCOVERY row was rebuilt into the final
+        # shape with project_id/forge_instance_id backfilled from Project and
+        # a real, non-empty schedule_digest computed (not left as the '' DDL
+        # placeholder).
+        row = store.conn.execute(
+            "SELECT * FROM forge_observation_schedules WHERE schedule_kind = 'WORK_ITEM_DISCOVERY'"
+        ).fetchone()
+        assert row is not None
+        assert row["project_id"] == row["target_id"]
+        assert row["forge_instance_id"] == "aaaaaaaa-0000-4000-8000-000000000003"
+        assert row["schedule_digest"] != ""
+        assert row["minimum_interval_ms"] > 0
+
+        # A due Request can now be created against the migrated Schedule.
+        request = store.create_due_forge_observation_request(
+            forge_observation_request_id="aaaaaaaa-0000-4000-8000-000000000007",
+            forge_observation_schedule_id=row["forge_observation_schedule_id"],
+            now_ms=row["next_due_at_ms"],
+            controller_mode="RUNNING",
+            controller_mode_revision=1,
+            credential_purpose="PROJECT_SOURCE_READ",
+            credential_secret_id="aaaaaaaa-0000-4000-8000-000000000001",
+            credential_secret_version=1,
+            outbox_id="aaaaaaaa-0000-4000-8000-000000000008",
+        )
+        assert request is not None
+        assert request.state == "PENDING"
