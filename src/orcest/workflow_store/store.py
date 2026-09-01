@@ -307,6 +307,13 @@ class ControllerGatePermissions:
 
 
 @dataclass(frozen=True, slots=True)
+class _ControllerGateEvaluation:
+    permissions: ControllerGatePermissions
+    registry: CapabilityKeyRegistryProjection
+    selected_key: CapabilitySigningKey | None
+
+
+@dataclass(frozen=True, slots=True)
 class IssuedCapabilityBinding:
     capability_jti: str
     capability_signing_key_id: str
@@ -2870,8 +2877,9 @@ class RunStore:
             (result_revision, result_key, capability_key_operation_id, CONTROLLER_ID),
         )
 
-    def selected_issuance_key(self, *, now_ms: int | None = None) -> CapabilitySigningKey | None:
-        registry = self.get_capability_key_registry()
+    def _selected_issuance_key_from_registry(
+        self, registry: CapabilityKeyRegistryProjection, *, now_ms: int | None = None
+    ) -> CapabilitySigningKey | None:
         if registry.current_issuance_key_id is None:
             return None
         key = self.get_capability_signing_key(registry.current_issuance_key_id)
@@ -2882,37 +2890,56 @@ class RunStore:
             return None
         return key
 
-    def controller_gate_permissions(self) -> ControllerGatePermissions:
+    def selected_issuance_key(self, *, now_ms: int | None = None) -> CapabilitySigningKey | None:
+        registry = self.get_capability_key_registry()
+        return self._selected_issuance_key_from_registry(registry, now_ms=now_ms)
+
+    def _controller_gate_evaluation(self) -> _ControllerGateEvaluation:
         mode = self.get_controller_mode()
         registry = self.get_capability_key_registry()
-        issuance_ready = self.selected_issuance_key() is not None
+        selected_key = self._selected_issuance_key_from_registry(registry)
+        issuance_ready = selected_key is not None
         current_mode = mode.mode
         new_admission = current_mode == "RUNNING" or (
             current_mode == "DISPATCH_PAUSED"
             and mode.dispatch_paused_intake_policy == "ALLOW_ADMISSION"
         )
         new_claims = current_mode in {"RUNNING", "INTAKE_PAUSED"} and issuance_ready
-        return ControllerGatePermissions(
-            mode_revision=mode.mode_revision,
-            mode=current_mode,
-            registry_revision=registry.registry_revision,
-            current_issuance_key_id=registry.current_issuance_key_id,
-            new_admission=new_admission,
-            new_claims=new_claims,
-            first_result_mutation=current_mode
-            in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
-            existing_result_replay=current_mode is not None,
-            forge_reconciliation=current_mode
-            in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
-            management_operations=current_mode is not None,
+        return _ControllerGateEvaluation(
+            permissions=ControllerGatePermissions(
+                mode_revision=mode.mode_revision,
+                mode=current_mode,
+                registry_revision=registry.registry_revision,
+                current_issuance_key_id=registry.current_issuance_key_id,
+                new_admission=new_admission,
+                new_claims=new_claims,
+                first_result_mutation=current_mode
+                in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
+                existing_result_replay=current_mode is not None,
+                forge_reconciliation=current_mode
+                in {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"},
+                management_operations=current_mode is not None,
+            ),
+            registry=registry,
+            selected_key=selected_key,
         )
 
-    def assert_offer_planning_permitted(self) -> None:
-        gates = self.controller_gate_permissions()
-        if not gates.new_claims:
+    def controller_gate_permissions(self) -> ControllerGatePermissions:
+        return self._controller_gate_evaluation().permissions
+
+    def _assert_offer_planning_permitted(
+        self,
+    ) -> tuple[CapabilityKeyRegistryProjection, CapabilitySigningKey]:
+        evaluation = self._controller_gate_evaluation()
+        if not evaluation.permissions.new_claims:
             raise WorkflowGateClosedError(
                 "offer planning requires an active issuance key and a dispatch-permitting mode"
             )
+        assert evaluation.selected_key is not None
+        return evaluation.registry, evaluation.selected_key
+
+    def assert_offer_planning_permitted(self) -> None:
+        self._assert_offer_planning_permitted()
 
     def record_issued_capability_binding(
         self,
@@ -2940,11 +2967,7 @@ class RunStore:
                 ):
                     return row
                 raise IdempotencyConflictError("capability JTI was reused")
-            self.assert_offer_planning_permitted()
-            registry = self.get_capability_key_registry()
-            key = self.selected_issuance_key()
-            if key is None:
-                raise WorkflowGateClosedError("selected issuance key is absent or invalid")
+            registry, key = self._assert_offer_planning_permitted()
             now = _now_ms()
             self.conn.execute(
                 "INSERT INTO capability_issuance_audit("
