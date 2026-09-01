@@ -17,6 +17,7 @@ from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.protocol_registry import ERROR_PROTOCOL
 from orcest.workflow_store.store import RunStore
 from orcest.workflow_store.v1.project_registration import (
+    MAX_REQUEST_BYTES,
     ForgeResolver,
     ServerRegistrationCatalog,
     TransportError,
@@ -121,7 +122,20 @@ class RegistrationRequestHandler(BaseHTTPRequestHandler):
     server_version = "orcest-project-registration/1"
 
     def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        header_value = self.headers.get("Content-Length")
+        if header_value is None:
+            self._reject(400, "MALFORMED", "Content-Length header is required")
+            return
+        try:
+            length = int(header_value)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._reject(400, "MALFORMED", "Content-Length must be a non-negative integer")
+            return
+        if length > MAX_REQUEST_BYTES:
+            self._reject(422, "SCHEMA_INVALID", "request exceeds the v1 size bound")
+            return
         body = self.rfile.read(length) if length > 0 else b""
         cert = self.connection.getpeercert() if hasattr(self.connection, "getpeercert") else None
         principal_id = principal_from_client_cert(cert)
@@ -138,6 +152,14 @@ class RegistrationRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         for name, value in headers.items():
             self.send_header(name, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _reject(self, status: int, code: str, message: str) -> None:
+        payload = _error_body(status, code, message)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
