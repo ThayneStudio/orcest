@@ -12,7 +12,11 @@ import pytest
 from orcest.workflow_store.v1 import fs as fs_mod
 from orcest.workflow_store.v1.blobs import WorkflowBlobStore
 from orcest.workflow_store.v1.candidates import CandidateObjectStore
-from orcest.workflow_store.v1.errors import IntegrityConflictError, QuotaExceededError
+from orcest.workflow_store.v1.errors import (
+    IntegrityConflictError,
+    QuotaExceededError,
+    StorageLockError,
+)
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
 from orcest.workflow_store.v1.secrets import SecretStore
 
@@ -282,6 +286,29 @@ def test_storage_lock_excludes_other_holder(tmp_path: Path) -> None:
     finally:
         a.release()
     assert b.acquire(blocking=False) is True
+    b.release()
+
+
+@pytest.mark.timeout(2)
+def test_storage_lock_nested_acquire_across_instances_fails_closed(tmp_path: Path) -> None:
+    layout = ControlLayout(root=tmp_path / "control")
+    layout.initialize()
+    a = StorageLock(layout.storage_lock_path)
+    b = StorageLock(layout.storage_lock_path)
+    assert a.acquire(blocking=True) is True
+    try:
+        with pytest.raises(StorageLockError, match="another StorageLock"):
+            b.acquire(blocking=True)
+        assert a.held() is True
+        assert b.held() is False
+        with pytest.raises(StorageLockError, match="not held"):
+            b.release()
+    finally:
+        a.release()
+    assert a.held() is False
+    with pytest.raises(StorageLockError, match="not held"):
+        a.release()
+    assert b.acquire(blocking=True) is True
     b.release()
 
 
