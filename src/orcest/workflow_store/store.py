@@ -88,6 +88,10 @@ _FORBIDDEN_STATE_FS = {
 }
 
 
+class _CandidateUploadExpiredDuringPromotion(Exception):
+    pass
+
+
 class RunStoreError(RuntimeError):
     """Base class for run-store failures."""
 
@@ -9848,7 +9852,9 @@ class RunStore:
         if existing is None:
             raise RunStoreError(f"candidate upload {upload_id!r} was not found")
         if now >= existing.expires_at_ms:
-            return self.expire_candidate_upload(upload_id, now_ms=now)
+            return self.expire_candidate_upload(
+                upload_id, candidate_store=candidate_store, now_ms=now
+            )
         if existing.state in {"VALIDATED", "PROMOTED", "CONSUMED"}:
             digest = candidate_store.identity(bundle_bytes).bundle_digest
             if digest != existing.computed_bundle_digest:
@@ -9880,7 +9886,9 @@ class RunStore:
                     raise RunStoreError(f"candidate upload {upload_id!r} was not found")
                 current = _row_to_candidate_upload(row)
                 if now >= current.expires_at_ms:
-                    self._expire_candidate_upload_row(current, now_ms=now)
+                    self._expire_candidate_upload_row(
+                        current, candidate_store=candidate_store, now_ms=now
+                    )
                     candidate_store.discard_staged(staged_path)
                     refreshed = self.conn.execute(
                         "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
@@ -9912,7 +9920,7 @@ class RunStore:
             raise
 
     def expire_candidate_upload(
-        self, upload_id: str, *, now_ms: int | None = None
+        self, upload_id: str, *, candidate_store: Any, now_ms: int | None = None
     ) -> CandidateUploadRecord:
         require_lowercase_uuid(upload_id, field="upload_id")
         now = _now_ms() if now_ms is None else now_ms
@@ -9927,17 +9935,27 @@ class RunStore:
                 return upload
             if now < upload.expires_at_ms:
                 raise CasMismatchError("candidate upload has not expired")
-            self._expire_candidate_upload_row(upload, now_ms=now)
+            self._expire_candidate_upload_row(upload, candidate_store=candidate_store, now_ms=now)
             updated = self.conn.execute(
                 "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
             ).fetchone()
             assert updated is not None
             return _row_to_candidate_upload(updated)
 
-    def _expire_candidate_upload_row(self, upload: CandidateUploadRecord, *, now_ms: int) -> None:
+    def _expire_candidate_upload_row(
+        self,
+        upload: CandidateUploadRecord,
+        *,
+        candidate_store: Any,
+        now_ms: int,
+    ) -> None:
+        if upload.incoming_path is not None:
+            candidate_store.discard_staged(upload.incoming_path)
         self.conn.execute(
-            "UPDATE candidate_uploads SET state = 'EXPIRED', artifact_bundle_digest = NULL, "
-            "artifact_storage_key = NULL, consumed_candidate_id = NULL, updated_at_ms = ? "
+            "UPDATE candidate_uploads SET state = 'EXPIRED', incoming_path = NULL, "
+            "computed_bundle_digest = NULL, computed_bytes = NULL, verified_tip_json = NULL, "
+            "artifact_bundle_digest = NULL, artifact_storage_key = NULL, promoted_at_ms = NULL, "
+            "consumed_candidate_id = NULL, updated_at_ms = ? "
             "WHERE upload_id = ? AND state != 'CONSUMED'",
             (now_ms, upload.upload_id),
         )
@@ -9956,7 +9974,9 @@ class RunStore:
         if upload.state == "PROMOTED":
             return upload
         if now >= upload.expires_at_ms:
-            return self.expire_candidate_upload(upload_id, now_ms=now)
+            return self.expire_candidate_upload(
+                upload_id, candidate_store=candidate_store, now_ms=now
+            )
         if upload.state != "VALIDATED" or upload.incoming_path is None:
             raise CasMismatchError("candidate upload is not validated")
         if upload.computed_bundle_digest is None or upload.computed_bytes is None:
@@ -9980,13 +10000,15 @@ class RunStore:
                     raise RunStoreError(f"candidate upload {upload_id!r} was not found")
                 current = _row_to_candidate_upload(row)
                 if now >= current.expires_at_ms:
-                    self._expire_candidate_upload_row(current, now_ms=now)
+                    self._expire_candidate_upload_row(
+                        current, candidate_store=candidate_store, now_ms=now
+                    )
                     expired_row = self.conn.execute(
                         "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
                     ).fetchone()
                     assert expired_row is not None
                     promoted = _row_to_candidate_upload(expired_row)
-                    return
+                    raise _CandidateUploadExpiredDuringPromotion
                 self.conn.execute(
                     "INSERT OR IGNORE INTO artifact_objects(bundle_digest, storage_key, "
                     "byte_length, installed_at_ms) VALUES (?, ?, ?, ?)",
@@ -10004,9 +10026,13 @@ class RunStore:
                 assert updated is not None
                 promoted = _row_to_candidate_upload(updated)
 
-        candidate_store.promote_staged_with_reference(
-            upload.incoming_path, expected, reference=reference
-        )
+        try:
+            candidate_store.promote_staged_with_reference(
+                upload.incoming_path, expected, reference=reference
+            )
+        except _CandidateUploadExpiredDuringPromotion:
+            assert promoted is not None
+            return promoted
         assert promoted is not None
         return promoted
 

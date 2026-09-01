@@ -149,7 +149,7 @@ class CandidateObjectStore:
             raise IntegrityConflictError("staged Candidate upload does not match expected identity")
         with self._lock:
             dest = self._dest(expected)
-            promote_no_clobber(
+            result = promote_no_clobber(
                 incoming=self._incoming_path(incoming_path),
                 dest=dest,
                 incoming_dir=self._incoming,
@@ -157,7 +157,16 @@ class CandidateObjectStore:
                 expected=data,
             )
             verified = self._verify_at(dest, expected)
-            reference(verified)
+            try:
+                reference(verified)
+            except BaseException:
+                if result.created:
+                    try:
+                        os.unlink(dest)
+                    except FileNotFoundError:
+                        pass
+                    fsync_dir(dest.parent)
+                raise
             return verified
 
     def _incoming_path(self, incoming_path: str) -> Path:

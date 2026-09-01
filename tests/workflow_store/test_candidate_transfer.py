@@ -217,6 +217,75 @@ def test_expiry_at_equality_wins_for_put_and_replays_exact_body(
     )
 
 
+def test_expiring_validated_upload_discards_staged_bundle(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    bundle, base, _tip = _candidate_bundle(tmp_path)
+    _claimed_build_attempt(store)
+    expires = FUTURE_MS + 100
+    _create_upload(store, bundle, base, expires=expires)
+    validated = store.put_candidate_upload_content(
+        candidate_store=candidate_store,
+        upload_id=UPLOAD_ID,
+        bundle_bytes=bundle,
+        now_ms=FUTURE_MS + 1,
+    )
+    assert validated.incoming_path is not None
+    staged_file = candidate_store._incoming_path(validated.incoming_path)
+    assert staged_file.exists()
+
+    expired = store.expire_candidate_upload(
+        UPLOAD_ID, candidate_store=candidate_store, now_ms=expires
+    )
+
+    assert expired.state == "EXPIRED"
+    assert expired.incoming_path is None
+    assert not staged_file.exists()
+
+
+def test_mid_promotion_expiry_discards_staged_bundle_and_created_object(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, candidate_store = stores
+    bundle, base, _tip = _candidate_bundle(tmp_path)
+    _claimed_build_attempt(store)
+    expires = FUTURE_MS + 100
+    _create_upload(store, bundle, base, expires=expires + 1)
+    validated = store.put_candidate_upload_content(
+        candidate_store=candidate_store,
+        upload_id=UPLOAD_ID,
+        bundle_bytes=bundle,
+        now_ms=FUTURE_MS + 1,
+    )
+    assert validated.incoming_path is not None
+    staged_file = candidate_store._incoming_path(validated.incoming_path)
+    object_file = candidate_store._dest(candidate_store.identity(bundle))
+    original_promote = candidate_store.promote_staged_with_reference
+
+    def expire_before_reference(*args: object, **kwargs: object) -> object:
+        with store.transaction():
+            store.conn.execute(
+                "UPDATE candidate_uploads SET expires_at_ms = ? WHERE upload_id = ?",
+                (expires, UPLOAD_ID),
+            )
+        return original_promote(*args, **kwargs)
+
+    monkeypatch.setattr(candidate_store, "promote_staged_with_reference", expire_before_reference)
+
+    expired = store.promote_candidate_upload(
+        candidate_store=candidate_store,
+        upload_id=UPLOAD_ID,
+        now_ms=expires,
+    )
+
+    assert expired.state == "EXPIRED"
+    assert expired.incoming_path is None
+    assert not staged_file.exists()
+    assert not object_file.exists()
+    assert store.conn.execute("SELECT COUNT(*) FROM artifact_objects").fetchone()[0] == 0
+
+
 def test_corrupt_wrong_base_and_wrong_repository_uploads_do_not_promote(
     stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
 ) -> None:
