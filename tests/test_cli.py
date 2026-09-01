@@ -122,6 +122,23 @@ def test_main_help(runner):
     assert "monitor" in result.stdout
 
 
+def test_init_labels_creates_only_supported_control_labels(runner, mocker):
+    cfg = MagicMock()
+    cfg.labels.needs_human = "orcest:needs-human"
+    cfg.labels.ready = "orcest:ready"
+    cfg.projects = [MagicMock(repo="test-org/test-repo", token="test-token")]
+    mocker.patch("orcest.shared.config.load_orchestrator_config", return_value=cfg)
+    run = mocker.patch("subprocess.run")
+
+    result = runner.invoke(main, ["init-labels", "--config", "unused.yaml"])
+
+    assert result.exit_code == 0
+    assert [call.args[0][3] for call in run.call_args_list] == [
+        "orcest:needs-human",
+        "orcest:ready",
+    ]
+
+
 def test_monitor_help(runner):
     """`orcest monitor --help` exits 0 without requiring the monitor extra's
     imports to run (they're lazy inside the command body)."""

@@ -10,9 +10,8 @@ their blockers land. Two dependency sources are checked:
 2. **Body-declared references** — plain-text patterns like
    `blocked by #N` in the issue body (same-repo only).
 
-You don't need to apply the `orcest:blocked` label by hand — declare
-the dependency either way and orcest will pick it up. If *either*
-source has an open blocker, the issue is deferred.
+Declare the dependency either way and orcest will pick it up. If
+*either* source has an open blocker, the issue is deferred.
 
 ## GitHub-native dependencies
 
@@ -29,8 +28,8 @@ cross-repo dependencies work — they're logged as `owner/repo#N`.
 One caveat: a native blocker in a repo the orchestrator's token
 **cannot access** is silently omitted from the API response (GitHub
 returns no signal it exists), so it cannot defer the dependent. Give
-the token read access to blocker repos, or fall back to manual
-`orcest:blocked`.
+the token read access to blocker repos, or leave the dependent without
+`orcest:ready` until the prerequisite can be verified.
 
 ## Body-declared reference syntax
 
@@ -113,16 +112,13 @@ docker logs orcest-<project>-orchestrator-1 2>&1 | grep -E 'Issue #[0-9]+: defer
 - **No comment scanning** — only native relationships and the issue
   body are read.
 
-## When to fall back to manual `orcest:blocked`
+## External prerequisites
 
-Apply `orcest:blocked` yourself when:
-
-- You want to block on something that isn't a GitHub issue at all
-  (a release window, a stakeholder decision, an external migration).
-- You want orcest to stop touching the issue regardless of body text.
-
-`orcest:blocked` is treated as a terminal label and is not
-auto-removed when blockers close — you have to take it off yourself.
+An issue waiting on something that isn't a GitHub issue (such as a
+release window or external migration) should remain without
+`orcest:ready`. Add `orcest:ready` once that prerequisite is satisfied.
+If admitted work reaches a point that requires a human decision, Orcest
+uses `orcest:needs-human`.
 
 ## How to extend
 

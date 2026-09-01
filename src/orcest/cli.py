@@ -1123,7 +1123,6 @@ def init_labels(config: str) -> None:
     cfg = load_orchestrator_config(config)
     console = Console()
     label_defs = [
-        (cfg.labels.blocked, "d93f0b", "Blocked — waiting for dependency"),
         (cfg.labels.needs_human, "b60205", "Orcest failed — needs manual review"),
         (cfg.labels.ready, "0e8a16", "Issue is ready for orcest to implement"),
     ]

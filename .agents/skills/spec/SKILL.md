@@ -116,7 +116,7 @@ Hard rules:
 - **Dual dependency encoding** applies only when a leaf is blocked by another **work** issue: native `--blocked-by` **and** a body line `Blocked by #N` (same-repo). Unblocked leaves: no `--blocked-by`, body says `None`. Cross-repo: native blocked-by only (issue URL). Multiple blockers: `--blocked-by 200,201` and one `Blocked by #N` line per blocker.
 - File **work blockers first** so numbers exist.
 - Never use `Closes` / `Fixes` / `Resolves #N` as a dependency. Never a bare `#N`. Never parent/sub-issue hierarchy as the pickup gate (`--parent` is extra tracking, not a substitute). Attach `--parent` **after** the leaf is created so a sub-issue failure cannot abort filing.
-- **Orcest, if `orcest:ready` exists:** blocked leaves still get `orcest:ready`. Do **not** apply `orcest:blocked` for dependency waits — that label is terminal and is never auto-cleared, so the fleet starves. Epics never get `orcest:ready`.
+- **Orcest, if `orcest:ready` exists:** leaves blocked by work issues still get `orcest:ready`; encode waits with native blocked-by relationships and body dependency text. Epics never get `orcest:ready`.
 - Detect with `gh label list --search orcest`. If `orcest:ready` is absent, generic mode (native blocked-by + body text, no `orcest:*` flags). Do not invent labels without asking.
 - Any issue with runnable payloads (IDs, SQL, bids) gets a data-window/expiry block. Pick expiry from how fast the inputs move. **Expiry is not a reason to omit the issue.**
 
@@ -139,7 +139,7 @@ Do not: create a feature branch, start ticket #1, "knock out the trivial one," o
 | "We can defer phase 3" | Deprioritize: still spec, still file. Defer only if it cannot be specified, and only after asking. |
 | "This part is obvious, no issue needed" | Obvious work is still an issue. No silent leftovers. |
 | "I'll file the important issues now, the rest later" | Partial backlog is the failure mode. Coverage table must be full. |
-| "Label dependents `orcest:blocked` so workers wait" | Terminal label; never auto-cleared. Use `orcest:ready` + blocked-by. |
+| "Remove `orcest:ready` from dependents so workers wait" | Keep `orcest:ready`; use native blocked-by plus body dependency text so Orcest defers automatically. |
 | "I'll spec now and file issues after I code the spike" | Spec + graph first. A spike is a throwaway, or an experiment that must be asked as a deferral. |
 | "Non-interactive, so I'll just implement" | Write spec + issue drafts under `docs/specs/<slug>-issues/`. Do not file, do not code. |
 | "Blocked by the epic so it stays grouped" | Epic is tracking, not a blocker. That wait never clears. Use `--parent` only. |
@@ -149,7 +149,7 @@ Do not: create a feature branch, start ticket #1, "knock out the trivial one," o
 - Writing application code, tests-for-the-feature, or a feature branch
 - "I'll just start ticket #1"
 - "Phase 2" as a one-line note with no spec section and no issues
-- Applying `orcest:blocked` for a GitHub-issue dependency
+- Representing a GitHub-issue dependency with a manual control label instead of blocked-by metadata/body text
 - `Blocked by #<epic>` or `--blocked-by` the tracking issue
 - Labeling an epic `orcest:ready`
 - Filing without a dry-run table the human approved

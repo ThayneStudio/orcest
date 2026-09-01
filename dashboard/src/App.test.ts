@@ -85,10 +85,9 @@ describe("results tab badge", () => {
     expect(resultsTabAttentionCount([
       { status: "completed" },
       { status: "failed" },
-      { status: "blocked" },
       { status: "usage_exhausted" },
       { status: "stale" },
-    ])).toBe(3);
+    ])).toBe(2);
   });
 
   it("shows attention counts or unknown degraded state", () => {

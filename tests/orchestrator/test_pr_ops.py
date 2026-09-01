@@ -77,7 +77,7 @@ def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):
     gh_mock.list_open_prs.return_value = [
         _make_pr_data(
             number=10,
-            labels=[{"name": "orcest:blocked"}],
+            labels=[{"name": "orcest:needs-human"}],
         ),
     ]
 
@@ -927,10 +927,9 @@ def test_clear_attempts_deletes_key(fake_redis_client):
 # ---------------------------------------------------------------------------
 
 
-def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config):
-    """PRs with terminal orcest labels (blocked/needs-human) are skipped as SKIP_LABELED."""
+def test_discover_skips_needs_human_label(gh_mock, fake_redis_client, label_config):
+    """PRs that need human intervention are skipped as SKIP_LABELED."""
     gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=302, labels=[{"name": "orcest:blocked"}]),
         _make_pr_data(number=303, labels=[{"name": "orcest:needs-human"}]),
     ]
 
@@ -941,7 +940,7 @@ def test_discover_skips_terminal_labels(gh_mock, fake_redis_client, label_config
         label_config=label_config,
     )
 
-    assert len(results) == 2
+    assert len(results) == 1
     for pr in results:
         assert pr.action == PRAction.SKIP_LABELED
     # CI should never be fetched for any of these
@@ -1787,38 +1786,6 @@ def test_skip_labeled_needs_human_refreshes_exhausted_notified_ttl(
     assert get_exhausted_notified(fake_redis_client, REPO, pr_number)
     ttl_after = fake_redis_client.ttl(key)
     assert ttl_after > 24 * 3600  # reset to ~30-day window, not just any increase
-
-
-def test_skip_labeled_blocked_does_not_refresh_exhausted_notified(
-    gh_mock, fake_redis_client, label_config
-):
-    """SKIP_LABELED with blocked label does NOT refresh exhausted_notified.
-
-    The TTL refresh is specific to the needs-human label, which is the recovery
-    signal. A blocked PR is in a different state; we should not touch the flag.
-    """
-    pr_number = 762
-    gh_mock.list_open_prs.return_value = [
-        _make_pr_data(number=pr_number, labels=[{"name": label_config.blocked}]),
-    ]
-    set_exhausted_notified(fake_redis_client, REPO, pr_number)
-
-    key = f"pr:{REPO}:{pr_number}:exhausted_notified"
-    fake_redis_client.expire(key, 60)
-    ttl_before = fake_redis_client.ttl(key)
-
-    results = discover_actionable_prs(
-        repo="test-org/test-repo",
-        token="fake-token",
-        redis=fake_redis_client,
-        label_config=label_config,
-    )
-
-    assert len(results) == 1
-    assert results[0].action == PRAction.SKIP_LABELED
-    # TTL must NOT have been refreshed.
-    ttl_after = fake_redis_client.ttl(key)
-    assert ttl_after <= ttl_before
 
 
 def test_max_total_attempts_hard_stop_ignores_exhausted_notified(

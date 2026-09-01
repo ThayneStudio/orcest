@@ -55,7 +55,7 @@ class PRAction(str, Enum):
     # Out-of-date with base, no conflicts — orchestrator updates via GitHub API
     UPDATE_BRANCH = "update_branch"
     SKIP_LOCKED = "skip_locked"  # Another worker already on it
-    SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
+    SKIP_LABELED = "skip_labeled"  # Terminal needs-human label
     SKIP_ACTIVE = "skip_active"  # Historical value; attempts alone no longer suppress work
     SKIP_GREEN = "skip_green"  # CI passing, nothing to do
     SKIP_DRAFT = "skip_draft"  # Draft PR, ignore
@@ -562,7 +562,7 @@ def discover_actionable_prs(
 
     Filter cascade (ordered by cost, cheapest first):
     1. Skip draft PRs (single boolean field, cheapest check)
-    2. Skip PRs with terminal orcest labels (blocked/needs-human)
+    2. Skip PRs with the terminal `orcest:needs-human` label
     3. Skip PRs with active Redis locks (worker in progress)
     4. Skip PRs with a pending task already queued
     5. Skip PRs that exceeded total cross-SHA attempt limit
@@ -574,11 +574,6 @@ def discover_actionable_prs(
     """
     prs = gh.list_open_prs(repo, token)
     results: list[PRState] = []
-
-    terminal_labels = {
-        label_config.blocked,
-        label_config.needs_human,
-    }
 
     for pr_data in prs:
         number: int = pr_data["number"]
@@ -625,8 +620,8 @@ def discover_actionable_prs(
             )
             continue
 
-        # Skip if terminal orcest label present (blocked/needs-human)
-        if any(label in terminal_labels for label in pr_labels):
+        # Skip if human intervention is required.
+        if label_config.needs_human in pr_labels:
             # TTL cliff prevention: refresh exhausted_notified on every SKIP_LABELED cycle
             # while the needs-human label is present and the flag is set. Without this,
             # the 30-day TTL can expire before the operator removes the label, causing the

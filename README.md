@@ -41,7 +41,7 @@ actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-m
 - **Redis** — task distribution via streams, distributed locks via
   `SET NX EX`, pending markers tied to PR head SHAs, attempt counters,
   per-provider exhaustion keys, and operational memory.
-- **GitHub as dashboard** — labels (`orcest:ready`, `orcest:blocked`,
+- **GitHub as dashboard** — labels (`orcest:ready`,
   `orcest:needs-human`), PR/issue comments for status, and `orcest status`
   for a Rich/Textual TUI of queue and worker health.
 - **Snapshot validation** — every task carries the PR head SHA plus a
@@ -171,8 +171,8 @@ src/orcest/
 ## Key features
 
 - **GitHub polling + label-driven triage** — discovers actionable PRs and
-  issues via labels (`orcest:ready`, terminal `orcest:blocked` /
-  `orcest:needs-human`) and per-snapshot decision reasons.
+  issues via labels (`orcest:ready` and terminal `orcest:needs-human`)
+  and per-snapshot decision reasons.
 - **CI triage** — captures failing check names at enqueue time, drops
   tasks whose CI predicate no longer applies before running.
 - **Issue dependency deferral** — `orcest:ready` issues whose body
@@ -261,7 +261,7 @@ verbatim from the implementations in `src/orcest/cli.py` and
 | `orcest dead-letters`       | List and optionally replay dead-lettered tasks (`--replay`, `--count`).                       |
 | `orcest init`               | Initialize orcest on a Proxmox host (writes `/etc/orcest/config.yaml`, copies Terraform templates, runs `tofu init`). |
 | `orcest upgrade`            | Update the orcest CLI to the latest version from GitHub and refresh Terraform templates.      |
-| `orcest init-labels`        | Create orcest labels (`orcest:ready`, `orcest:blocked`, `orcest:needs-human`) on every configured project repo. |
+| `orcest init-labels`        | Create orcest labels (`orcest:ready`, `orcest:needs-human`) on every configured project repo. |
 | `orcest provision <host>`   | Provision a worker VM via SSH: copy setup script, config, systemd service; start the worker. |
 | `orcest pool-manage`        | Run the warm pool manager (long-running service that reconciles ephemeral worker VMs).        |
 | `orcest trace`              | Inspect an archived worker trace. Supports `<task-id>`, `--pr owner/repo#N`, `--list <project>`, `--meta`, `--raw`. |
@@ -288,7 +288,7 @@ Top-level keys:
   list is given.
 - **`polling`** — `interval` in seconds between GitHub polling cycles
   (default `60`).
-- **`labels`** — names for the three orcest labels: `ready`, `blocked`,
+- **`labels`** — names for the two orcest labels: `ready` and
   `needs_human`.
 - **`runner`** — `type` (default `claude`), `timeout`, `max_retries`,
   `retry_backoff`, optional `model`. Used to compute pending-task marker

@@ -549,7 +549,6 @@ class TestStatusStyle:
         """Each known status returns the correct Rich color."""
         assert _status_style("completed") == "green"
         assert _status_style("failed") == "red"
-        assert _status_style("blocked") == "yellow"
         assert _status_style("usage_exhausted") == "magenta"
         assert _status_style("anything_else") == "white"
 

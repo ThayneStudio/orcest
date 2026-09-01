@@ -99,7 +99,7 @@ def _review_rerun_snapshot(head_sha: str) -> PRReviewSnapshot:
         head_sha=head_sha,
         state="OPEN",
         is_draft=False,
-        labels=(),
+        labels=("priority:high",),
         review_decision="",
         has_current_head_approval=False,
     )
@@ -561,6 +561,14 @@ def test_poll_cycle_merges_pr(mocker, fake_redis_client, orchestrator_config, gh
     )
     mocker.patch("orcest.orchestrator.loop.publish_fix_task")
     mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    gh_mock.get_review_snapshot.return_value = PRReviewSnapshot(
+        head_sha=pr_state.head_sha,
+        state="OPEN",
+        is_draft=False,
+        labels=("priority:high",),
+        review_decision="APPROVED",
+        has_current_head_approval=True,
+    )
     fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
     # Pre-populate total_attempts so we can verify it is cleared on merge
     repo = orchestrator_config.github.repo
@@ -1979,40 +1987,6 @@ def test_consume_results_xack_failure_continues(
     gh_mock.post_comment.assert_not_called()
 
 
-def test_consume_results_blocked_status_posts_comment(
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-):
-    """A result with BLOCKED status posts a comment and adds blocked label."""
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-
-    result = _make_task_result(status=ResultStatus.BLOCKED, pr_number=71)
-    fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-
-    logger = logging.getLogger("test")
-    _consume_results(orchestrator_config, fake_redis_client, logger)
-
-    # Should post a comment with the fallback format (includes summary/duration/worker)
-    gh_mock.post_comment.assert_called_once()
-    comment_body = gh_mock.post_comment.call_args[0][2]
-    assert result.task_id in comment_body
-    assert "blocked" in comment_body
-    assert result.summary in comment_body
-    assert result.worker_id in comment_body
-
-    # No label removals
-    gh_mock.remove_label.assert_not_called()
-
-    # Should add blocked label, NOT needs-human
-    gh_mock.add_label.assert_called_once_with(
-        orchestrator_config.github.repo,
-        71,
-        orchestrator_config.labels.blocked,
-        orchestrator_config.github.token,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Additional _poll_cycle tests
 # ---------------------------------------------------------------------------
@@ -2455,9 +2429,11 @@ def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
     repo = orchestrator_config.github.repo
     pr_number = 93
     result = _make_task_result(
-        status=ResultStatus.BLOCKED,
+        status=ResultStatus.FAILED,
         pr_number=pr_number,
         task_id="pending-clear-retry",
+        needs_human=True,
+        needs_human_reason="needs a product decision",
     )
     set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
     entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
@@ -2504,47 +2480,6 @@ def test_pending_marker_clear_failure_retries_without_duplicate_github_effects(
     )
     # The durable side-effect checkpoint bypasses already-completed GitHub work.
     gh_mock.add_label.assert_called_once()
-    gh_mock.post_comment.assert_called_once()
-
-
-def test_blocked_label_failure_stays_pending_then_retries(
-    fake_redis_client,
-    orchestrator_config,
-    gh_mock,
-    mocker,
-):
-    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
-    repo = orchestrator_config.github.repo
-    pr_number = 94
-    result = _make_task_result(
-        status=ResultStatus.BLOCKED,
-        pr_number=pr_number,
-        task_id="blocked-label-retry",
-    )
-    set_pending_task(fake_redis_client, repo, "pr", pr_number, result.task_id)
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
-    gh_mock.add_label.side_effect = [RuntimeError("GitHub down"), None]
-
-    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
-
-    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) == result.task_id
-    assert (
-        fake_redis_client.client.xpending(
-            fake_redis_client._prefixed(RESULTS_STREAM), RESULTS_GROUP
-        )["pending"]
-        == 1
-    )
-    gh_mock.post_comment.assert_not_called()
-
-    mocker.patch.object(
-        fake_redis_client,
-        "xreadgroup",
-        side_effect=[[(entry_id, result.to_dict())], [], []],
-    )
-    _consume_results(orchestrator_config, fake_redis_client, logging.getLogger("test"))
-
-    assert get_pending_task(fake_redis_client, repo, "pr", pr_number) is None
-    assert gh_mock.add_label.call_count == 2
     gh_mock.post_comment.assert_called_once()
 
 

@@ -34,9 +34,8 @@ describe("resultColumnForStatus", () => {
     expect(resultColumnForStatus(" COMPLETED ")).toBe("completed");
   });
 
-  it("classifies attention states as failed", () => {
+  it("classifies supported attention states as failed", () => {
     expect(resultColumnForStatus("failed")).toBe("failed");
-    expect(resultColumnForStatus("blocked")).toBe("failed");
     expect(resultColumnForStatus("usage_exhausted")).toBe("failed");
   });
 
@@ -52,14 +51,13 @@ describe("partitionResultsByStatus", () => {
     const partitions = partitionResultsByStatus([
       result("completed", "done"),
       result("failed", "failed"),
-      result("blocked", "blocked"),
       result("usage_exhausted", "usage"),
       result("stale", "stale"),
       result("unknown", "unknown"),
     ]);
 
     expect(partitions.completed.map((r) => r.result_id)).toEqual(["done"]);
-    expect(partitions.failed.map((r) => r.result_id)).toEqual(["failed", "blocked", "usage"]);
+    expect(partitions.failed.map((r) => r.result_id)).toEqual(["failed", "usage"]);
     expect(partitions.neutral.map((r) => r.result_id)).toEqual(["stale", "unknown"]);
   });
 });
@@ -68,7 +66,6 @@ describe("result display labels", () => {
   it("formats known status labels for display", () => {
     expect(resultStatusLabel("COMPLETED")).toBe("Completed");
     expect(resultStatusLabel("  failed  ")).toBe("Failed");
-    expect(resultStatusLabel("blocked")).toBe("Blocked");
     expect(resultStatusLabel("usage_exhausted")).toBe("Usage exhausted");
     expect(resultStatusLabel("stale")).toBe("Stale");
   });
