@@ -27,14 +27,18 @@ from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
+    attempt_terminal_fact_digest,
     bare_canonical_digest,
+    budget_report_digest,
     capability_public_key_digest,
+    capacity_report_digest,
     checkpoint_digest,
     config_bundle_hash,
     forge_observation_payload_digest,
     forge_observation_result_membership_digest,
     forge_observation_schedule_digest,
     forge_request_failure_fact_digest,
+    health_observation_payload_digest,
     is_valid_content_digest,
     launch_capability_claims_digest,
     policy_digest,
@@ -46,14 +50,18 @@ from orcest.workflow_contract.v1.digest import (
     specification_digest,
     subject_refs_digest,
     work_item_discovery_set_digest,
+    worker_loss_report_digest,
     workflow_blob_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
     ATTEMPT_CLAIM_PROTOCOL,
+    BUDGET_REPORT_RESULT_PROTOCOL,
     CANDIDATE_UPLOAD_EXPIRED_PROTOCOL,
     CAPABILITY_KEY_OPERATION_PROTOCOL,
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
+    CAPACITY_REPORT_PROTOCOL,
+    CAPACITY_REPORT_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
     FORGE_OBSERVATION_REQUEST_PROTOCOL,
@@ -62,9 +70,11 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
     SECRET_PROVISION_REQUEST_PROTOCOL,
     SECRET_PROVISION_RESULT_PROTOCOL,
+    WORKER_LOSS_PROTOCOL,
+    WORKER_LOSS_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -126,6 +136,12 @@ class CasMismatchError(RunStoreError):
 
 class WorkflowGateClosedError(RunStoreError):
     """Raised when the durable controller mode or key registry forbids work."""
+
+
+class AttemptUnknownError(RunStoreError):
+    """Raised when a report's exact (attempt_id, activity_id, generation) triple
+    has no durable Attempt at all (HTTP 404 ATTEMPT_UNKNOWN); no ledger row is
+    created for this case."""
 
 
 class FaultInjectionPoint(str, Enum):
@@ -1053,6 +1069,122 @@ class ControllerOperationFactRecord:
     forge_observation_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CapacityReportEntryInput:
+    """One caller-submitted scope observation within a Capacity Report."""
+
+    scope_kind: str
+    scope_id: str
+    capacity_pool_id: str
+    available_slots: int
+    worker_profile: str | None = None
+    session_evidence: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HealthObservationRecord:
+    health_observation_id: str
+    scope_kind: str
+    scope_id: str
+    health_sequence: int
+    kind: str
+    source_kind: str
+    source_id: str
+    subject_bindings_json: str
+    effective_at_ms: int
+    expires_at_ms: int | None
+    payload_digest: str
+    created_at_ms: int
+    observed_revision: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityReportResult:
+    capacity_report_id: str
+    pool_manager_id: str
+    report_id: str
+    idempotency_key: str
+    report_sequence: int
+    health_observations: tuple[HealthObservationRecord, ...]
+    woken_wait_condition_ids: tuple[str, ...]
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    accepted_at_ms: int
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerLossReportResult:
+    worker_loss_report_id: str
+    pool_manager_id: str
+    idempotency_key: str
+    worker_id: str
+    worker_session_id: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    reason: str
+    outcome: str
+    health_observation_id: str | None
+    attempt_terminal_fact_id: str | None
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    accepted_at_ms: int
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetReportResult:
+    budget_report_id: str
+    project_id: str
+    accounting_scope_id: str
+    source_sequence: int
+    availability: str
+    affected_run_ids_digest: str
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    accepted_at_ms: int
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OfferGateEvaluation:
+    """Combined dispatch gate for a proposed new Attempt offer.
+
+    A purely read-only snapshot over already-durable inputs -- Controller
+    Mode, the Capability Registry's selected issuance key, and the latest
+    applicable unexpired capacity Health Observations plus Budget Report for
+    the caller's given scopes. It never mutates state and never invents
+    evidence when a required input is simply absent: an absent Health
+    Observation or Budget Report leaves the corresponding ``*_health``/
+    ``budget_report`` field ``None`` and the corresponding ``*_available``
+    flag ``False``, exactly as domain-model.md requires ("absence ... leaves
+    work durably PLANNED ... and creates no invented Evidence").
+
+    ``disposition`` mirrors ``AttemptTerminalFactReplacementOfferDisposition``
+    and reflects only the controller-mode/issuance-key precedence
+    (``MODE_BLOCKED`` first, then ``ISSUANCE_KEY_UNAVAILABLE``, else
+    ``OFFER_ALLOWED``); it does not fold in capacity/budget availability
+    because "current capacity" and "budget" are scope-specific and the caller
+    is better placed to combine them with its own compatibility rules.
+    """
+
+    disposition: str
+    controller_mode: str | None
+    controller_mode_revision: int
+    capability_registry_revision: int
+    selected_issuance_key_id: str | None
+    worker_profile_health: HealthObservationRecord | None
+    capacity_pool_health: HealthObservationRecord | None
+    provider_account_health: HealthObservationRecord | None
+    budget_report: BudgetReportResult | None
+    capacity_available: bool
+    budget_available: bool
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -1281,6 +1413,62 @@ def _require_controller_import_replay_match(
         raise IdempotencyConflictError(
             "controller operation fact id was reused with different content"
         )
+
+
+_CAPACITY_SCOPE_ORDER = {"WORKER_SESSION": 0, "WORKER_PROFILE": 1, "CAPACITY_POOL": 2}
+_CAPACITY_SESSION_UNAVAILABLE_STATES = frozenset(
+    {"SESSION_STOPPED", "VM_MISSING", "DRAIN_COMPLETE", "SESSION_UNREACHABLE"}
+)
+
+
+def _validate_capacity_report_entries(entries: Sequence["CapacityReportEntryInput"]) -> None:
+    """Validate one Capacity Report's ``observations`` per worker-protocol.md
+    "Pool-manager capacity report": non-empty, no duplicate scope, canonically
+    ordered (``WORKER_SESSION``, ``WORKER_PROFILE``, ``CAPACITY_POOL``, then by
+    ``scope_id``), and the closed per-scope-kind field matrix."""
+    if not entries:
+        raise ValueError("a Capacity Report requires at least one entry")
+    seen: set[tuple[str, str]] = set()
+    prior_order_key: tuple[int, str] | None = None
+    for entry in entries:
+        enums.parse_enum("capacity_report.scope_kind", entry.scope_kind)
+        scope_key = (entry.scope_kind, entry.scope_id)
+        if scope_key in seen:
+            raise ValueError(f"duplicate capacity report scope {scope_key!r}")
+        seen.add(scope_key)
+        order_key = (_CAPACITY_SCOPE_ORDER[entry.scope_kind], entry.scope_id)
+        if prior_order_key is not None and order_key <= prior_order_key:
+            raise ValueError("capacity report entries must be in canonical scope order")
+        prior_order_key = order_key
+        if entry.available_slots < 0:
+            raise ValueError("available_slots must be nonnegative")
+        if entry.scope_kind == "WORKER_SESSION":
+            if entry.available_slots not in (0, 1):
+                raise ValueError("WORKER_SESSION available_slots must be 0 or 1")
+            if not entry.session_evidence:
+                raise ValueError("WORKER_SESSION requires session_evidence")
+            if entry.session_evidence.get("worker_session_id") != entry.scope_id:
+                raise ValueError(
+                    "WORKER_SESSION scope_id must equal session_evidence.worker_session_id"
+                )
+            state = entry.session_evidence.get("state")
+            if entry.available_slots > 0:
+                if state != "SESSION_READY":
+                    raise ValueError("AVAILABLE WORKER_SESSION requires state SESSION_READY")
+            elif state not in _CAPACITY_SESSION_UNAVAILABLE_STATES:
+                raise ValueError(
+                    "UNAVAILABLE WORKER_SESSION requires a recognized stopped/unreachable state"
+                )
+        elif entry.scope_kind == "WORKER_PROFILE":
+            if entry.session_evidence is not None:
+                raise ValueError("WORKER_PROFILE must not carry session_evidence")
+            if entry.worker_profile != entry.scope_id:
+                raise ValueError("WORKER_PROFILE scope_id must equal worker_profile")
+        else:
+            if entry.session_evidence is not None or entry.worker_profile is not None:
+                raise ValueError("CAPACITY_POOL must not carry worker_profile/session_evidence")
+            if entry.capacity_pool_id != entry.scope_id:
+                raise ValueError("CAPACITY_POOL scope_id must equal capacity_pool_id")
 
 
 def _require_target_id(observation: "ForgeObservationInput", *, field: str) -> str:
@@ -3423,9 +3611,179 @@ CREATE TABLE IF NOT EXISTS controller_operation_facts (
     OR (outcome = 'FAILED' AND failure_category IS NOT NULL AND candidate_id IS NULL)
   )
 );
+CREATE TABLE IF NOT EXISTS health_observations (
+  health_observation_id TEXT PRIMARY KEY,
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  health_sequence INTEGER NOT NULL CHECK (health_sequence > 0),
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("health_observation.kind"))})),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("health_observation.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  subject_bindings_json TEXT NOT NULL,
+  observed_revision INTEGER,
+  effective_at_ms INTEGER NOT NULL CHECK (effective_at_ms >= 0),
+  expires_at_ms INTEGER CHECK (expires_at_ms IS NULL OR expires_at_ms > effective_at_ms),
+  payload_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (scope_kind, scope_id, health_sequence),
+  UNIQUE (scope_kind, scope_id, source_kind, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_observations_scope_sequence
+ON health_observations(scope_kind, scope_id, health_sequence);
+
+CREATE TABLE IF NOT EXISTS capacity_reports (
+  capacity_report_id TEXT PRIMARY KEY,
+  pool_manager_id TEXT NOT NULL,
+  report_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  report_sequence INTEGER NOT NULL CHECK (report_sequence > 0),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL,
+  configured_max_ttl_ms INTEGER NOT NULL CHECK (configured_max_ttl_ms > 0),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (pool_manager_id, report_id),
+  UNIQUE (pool_manager_id, idempotency_key),
+  UNIQUE (pool_manager_id, report_sequence),
+  CHECK (
+    expires_at_ms > accepted_at_ms
+    AND expires_at_ms <= accepted_at_ms + configured_max_ttl_ms
+  )
+);
+
+CREATE TABLE IF NOT EXISTS capacity_report_entries (
+  capacity_report_id TEXT NOT NULL
+    REFERENCES capacity_reports(capacity_report_id) ON DELETE RESTRICT,
+  entry_ordinal INTEGER NOT NULL CHECK (entry_ordinal >= 0),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("capacity_report.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  availability TEXT NOT NULL CHECK (
+    availability IN ({_sql_in(_enum_values("capacity_report.availability"))})
+  ),
+  capacity_pool_id TEXT NOT NULL,
+  worker_profile TEXT,
+  available_slots INTEGER NOT NULL CHECK (available_slots >= 0),
+  session_evidence_json TEXT,
+  health_observation_id TEXT NOT NULL UNIQUE
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (capacity_report_id, entry_ordinal),
+  UNIQUE (capacity_report_id, scope_kind, scope_id)
+);
+
+-- Narrow slice of domain-model.md's "Attempt Terminal Fact" closed matrix:
+-- this leaf (#680) only ever inserts the pool-loss WORKER_LOST/HEALTH_OBSERVATION
+-- member. The idempotent-Results/terminal-fact-reduction leaf widens this table
+-- (CLAIM_DEADLINE/EXECUTION_DEADLINE/RESULT_AFTER_TERMINAL columns) via the same
+-- rebuild-and-rename migration style used elsewhere in this schema.
+CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
+  attempt_terminal_fact_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("attempt_terminal_fact.kind"))})),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("attempt_terminal_fact.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  health_observation_id TEXT
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  fact_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (attempt_id, kind, source_kind, source_id),
+  CHECK (
+    kind != 'WORKER_LOST'
+    OR (source_kind = 'HEALTH_OBSERVATION' AND health_observation_id IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS worker_loss_reports (
+  worker_loss_report_id TEXT PRIMARY KEY,
+  pool_manager_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  reason TEXT NOT NULL CHECK (reason IN ({_sql_in(_enum_values("worker_loss_report.reason"))})),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("worker_loss_report.outcome"))})
+  ),
+  health_observation_id TEXT
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  attempt_terminal_fact_id TEXT
+    REFERENCES attempt_terminal_facts(attempt_terminal_fact_id) ON DELETE RESTRICT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (pool_manager_id, idempotency_key),
+  CHECK (
+    (outcome = 'ACCEPTED' AND health_observation_id IS NOT NULL
+      AND attempt_terminal_fact_id IS NOT NULL)
+    OR (outcome = 'STALE' AND health_observation_id IS NULL
+      AND attempt_terminal_fact_id IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS budget_reports (
+  budget_report_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  accounting_scope_id TEXT NOT NULL,
+  budget_policy_ref TEXT NOT NULL,
+  budget_reset_window_ref TEXT NOT NULL,
+  window_id TEXT NOT NULL,
+  window_start_ms INTEGER NOT NULL CHECK (window_start_ms >= 0),
+  reset_at_ms INTEGER NOT NULL CHECK (reset_at_ms > window_start_ms),
+  source_sequence INTEGER NOT NULL CHECK (source_sequence > 0),
+  source_revision TEXT NOT NULL,
+  limit_microunits INTEGER NOT NULL CHECK (limit_microunits > 0),
+  consumed_microunits INTEGER NOT NULL CHECK (consumed_microunits >= 0),
+  availability TEXT NOT NULL CHECK (
+    availability IN ({_sql_in(_enum_values("budget_report.availability"))})
+  ),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  report_digest TEXT NOT NULL,
+  affected_run_ids_digest TEXT NOT NULL,
+  next_member_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_member_ordinal >= 0),
+  fanout_completed_at_ms INTEGER,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > accepted_at_ms),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  UNIQUE (project_id, accounting_scope_id, source_sequence),
+  UNIQUE (project_id, accounting_scope_id, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS budget_report_runs (
+  budget_report_id TEXT NOT NULL
+    REFERENCES budget_reports(budget_report_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  run_id TEXT NOT NULL,
+  PRIMARY KEY (budget_report_id, member_ordinal),
+  UNIQUE (budget_report_id, run_id)
+);
 """
 
-_V8_TO_V9 = """
+_V8_TO_V9 = f"""
 CREATE TABLE IF NOT EXISTS launch_attestations (
   launch_attestation_id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
@@ -3478,6 +3836,177 @@ CREATE TABLE IF NOT EXISTS launch_attestations (
   ),
   FOREIGN KEY (attempt_id, activity_id, attempt_generation)
     REFERENCES attempts(attempt_id, activity_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS health_observations (
+  health_observation_id TEXT PRIMARY KEY,
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  health_sequence INTEGER NOT NULL CHECK (health_sequence > 0),
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("health_observation.kind"))})),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("health_observation.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  subject_bindings_json TEXT NOT NULL,
+  observed_revision INTEGER,
+  effective_at_ms INTEGER NOT NULL CHECK (effective_at_ms >= 0),
+  expires_at_ms INTEGER CHECK (expires_at_ms IS NULL OR expires_at_ms > effective_at_ms),
+  payload_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (scope_kind, scope_id, health_sequence),
+  UNIQUE (scope_kind, scope_id, source_kind, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_observations_scope_sequence
+ON health_observations(scope_kind, scope_id, health_sequence);
+
+CREATE TABLE IF NOT EXISTS capacity_reports (
+  capacity_report_id TEXT PRIMARY KEY,
+  pool_manager_id TEXT NOT NULL,
+  report_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  report_sequence INTEGER NOT NULL CHECK (report_sequence > 0),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL,
+  configured_max_ttl_ms INTEGER NOT NULL CHECK (configured_max_ttl_ms > 0),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (pool_manager_id, report_id),
+  UNIQUE (pool_manager_id, idempotency_key),
+  UNIQUE (pool_manager_id, report_sequence),
+  CHECK (
+    expires_at_ms > accepted_at_ms
+    AND expires_at_ms <= accepted_at_ms + configured_max_ttl_ms
+  )
+);
+
+CREATE TABLE IF NOT EXISTS capacity_report_entries (
+  capacity_report_id TEXT NOT NULL
+    REFERENCES capacity_reports(capacity_report_id) ON DELETE RESTRICT,
+  entry_ordinal INTEGER NOT NULL CHECK (entry_ordinal >= 0),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("capacity_report.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  availability TEXT NOT NULL CHECK (
+    availability IN ({_sql_in(_enum_values("capacity_report.availability"))})
+  ),
+  capacity_pool_id TEXT NOT NULL,
+  worker_profile TEXT,
+  available_slots INTEGER NOT NULL CHECK (available_slots >= 0),
+  session_evidence_json TEXT,
+  health_observation_id TEXT NOT NULL UNIQUE
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (capacity_report_id, entry_ordinal),
+  UNIQUE (capacity_report_id, scope_kind, scope_id)
+);
+
+-- Narrow slice of domain-model.md's "Attempt Terminal Fact" closed matrix:
+-- this leaf (#680) only ever inserts the pool-loss WORKER_LOST/HEALTH_OBSERVATION
+-- member. The idempotent-Results/terminal-fact-reduction leaf widens this table
+-- (CLAIM_DEADLINE/EXECUTION_DEADLINE/RESULT_AFTER_TERMINAL columns) via the same
+-- rebuild-and-rename migration style used elsewhere in this schema.
+CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
+  attempt_terminal_fact_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("attempt_terminal_fact.kind"))})),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("attempt_terminal_fact.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  health_observation_id TEXT
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  fact_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (attempt_id, kind, source_kind, source_id),
+  CHECK (
+    kind != 'WORKER_LOST'
+    OR (source_kind = 'HEALTH_OBSERVATION' AND health_observation_id IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS worker_loss_reports (
+  worker_loss_report_id TEXT PRIMARY KEY,
+  pool_manager_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  reason TEXT NOT NULL CHECK (reason IN ({_sql_in(_enum_values("worker_loss_report.reason"))})),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("worker_loss_report.outcome"))})
+  ),
+  health_observation_id TEXT
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  attempt_terminal_fact_id TEXT
+    REFERENCES attempt_terminal_facts(attempt_terminal_fact_id) ON DELETE RESTRICT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (pool_manager_id, idempotency_key),
+  CHECK (
+    (outcome = 'ACCEPTED' AND health_observation_id IS NOT NULL
+      AND attempt_terminal_fact_id IS NOT NULL)
+    OR (outcome = 'STALE' AND health_observation_id IS NULL
+      AND attempt_terminal_fact_id IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS budget_reports (
+  budget_report_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  accounting_scope_id TEXT NOT NULL,
+  budget_policy_ref TEXT NOT NULL,
+  budget_reset_window_ref TEXT NOT NULL,
+  window_id TEXT NOT NULL,
+  window_start_ms INTEGER NOT NULL CHECK (window_start_ms >= 0),
+  reset_at_ms INTEGER NOT NULL CHECK (reset_at_ms > window_start_ms),
+  source_sequence INTEGER NOT NULL CHECK (source_sequence > 0),
+  source_revision TEXT NOT NULL,
+  limit_microunits INTEGER NOT NULL CHECK (limit_microunits > 0),
+  consumed_microunits INTEGER NOT NULL CHECK (consumed_microunits >= 0),
+  availability TEXT NOT NULL CHECK (
+    availability IN ({_sql_in(_enum_values("budget_report.availability"))})
+  ),
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  report_digest TEXT NOT NULL,
+  affected_run_ids_digest TEXT NOT NULL,
+  next_member_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_member_ordinal >= 0),
+  fanout_completed_at_ms INTEGER,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > accepted_at_ms),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  UNIQUE (project_id, accounting_scope_id, source_sequence),
+  UNIQUE (project_id, accounting_scope_id, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS budget_report_runs (
+  budget_report_id TEXT NOT NULL
+    REFERENCES budget_reports(budget_report_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  run_id TEXT NOT NULL,
+  PRIMARY KEY (budget_report_id, member_ordinal),
+  UNIQUE (budget_report_id, run_id)
 );
 """
 
@@ -4022,8 +4551,8 @@ class RunStore:
             elif current == 7:
                 # A real version-7 database already has every table in its
                 # final v7 shape; _SCHEMA only needs to create the new v8
-                # activities/attempts/attempt_claims tables and v9 launch
-                # attestation table (all CREATE TABLE IF NOT EXISTS).
+                # activities/attempts/attempt_claims tables and later additive
+                # tables (all CREATE TABLE IF NOT EXISTS).
                 self.conn.executescript(
                     "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -4043,11 +4572,11 @@ class RunStore:
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
-                        "workflow-control-v1-launch-attestations",
+                        "workflow-control-v1-launch-attestations-and-reports",
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 9:
                 assert current == 9
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
                 self.conn.execute(
@@ -4056,6 +4585,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-candidate-transfer",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 10
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-capacity-budget-worker-loss-reports",
                         _now_ms(),
                     ),
                 )
@@ -10255,6 +10796,1113 @@ class RunStore:
             installed_at_ms=row["artifact_installed_at_ms"],
         )
         return CandidateDownloadRecord(candidate=candidate, bundle=bundle)
+
+    # -- Health Observation ------------------------------------------------
+
+    def _next_health_sequence(self, scope_kind: str, scope_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(health_sequence), 0) AS seq FROM health_observations "
+            "WHERE scope_kind = ? AND scope_id = ?",
+            (scope_kind, scope_id),
+        ).fetchone()
+        return int(row["seq"]) + 1
+
+    def _row_to_health_observation(self, row: sqlite3.Row) -> HealthObservationRecord:
+        return HealthObservationRecord(
+            health_observation_id=row["health_observation_id"],
+            scope_kind=row["scope_kind"],
+            scope_id=row["scope_id"],
+            health_sequence=row["health_sequence"],
+            kind=row["kind"],
+            source_kind=row["source_kind"],
+            source_id=row["source_id"],
+            subject_bindings_json=row["subject_bindings_json"],
+            observed_revision=row["observed_revision"],
+            effective_at_ms=row["effective_at_ms"],
+            expires_at_ms=row["expires_at_ms"],
+            payload_digest=row["payload_digest"],
+            created_at_ms=row["created_at_ms"],
+        )
+
+    def _insert_health_observation(
+        self,
+        *,
+        scope_kind: str,
+        scope_id: str,
+        kind: str,
+        source_kind: str,
+        source_id: str,
+        subject_bindings: Mapping[str, Any],
+        observed_revision: int | None,
+        effective_at_ms: int,
+        expires_at_ms: int | None,
+    ) -> HealthObservationRecord:
+        """Insert one immutable, ordered Health Observation.
+
+        Must run inside ``self.transaction()``, alongside the report/fact that
+        sources it, per domain-model.md "Health Observation":
+        ``health_sequence`` is strictly increasing within
+        ``(scope_kind, scope_id)`` and a fresh authenticated observation
+        always gets a new ID/sequence, even when its payload repeats an
+        earlier one.
+        """
+        health_observation_id = str(uuid.uuid4())
+        health_sequence = self._next_health_sequence(scope_kind, scope_id)
+        payload_digest = health_observation_payload_digest(
+            {
+                "scope_kind": scope_kind,
+                "scope_id": scope_id,
+                "kind": kind,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "subject_bindings": dict(subject_bindings),
+                "observed_revision": observed_revision,
+                "effective_at_ms": effective_at_ms,
+                "expires_at_ms": expires_at_ms,
+            }
+        )
+        self.conn.execute(
+            "INSERT INTO health_observations(health_observation_id, scope_kind, scope_id, "
+            "health_sequence, kind, source_kind, source_id, subject_bindings_json, "
+            "observed_revision, effective_at_ms, expires_at_ms, payload_digest, "
+            "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                health_observation_id,
+                scope_kind,
+                scope_id,
+                health_sequence,
+                kind,
+                source_kind,
+                source_id,
+                canonical_json_text(subject_bindings),
+                observed_revision,
+                effective_at_ms,
+                expires_at_ms,
+                payload_digest,
+                effective_at_ms,
+            ),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM health_observations WHERE health_observation_id = ?",
+            (health_observation_id,),
+        ).fetchone()
+        assert row is not None
+        return self._row_to_health_observation(row)
+
+    def get_latest_health_observation(
+        self, scope_kind: str, scope_id: str, *, now_ms: int | None = None
+    ) -> HealthObservationRecord | None:
+        """The highest applicable unexpired Health Observation for one scope.
+
+        Never a fallback: an expired or absent Observation returns ``None``
+        rather than synthesizing availability (domain-model.md "Health
+        Observation": "the reducer uses the highest applicable unexpired
+        sequence ... Health arrival order, wall-clock timestamps, or Redis
+        lease presence cannot choose a fallback").
+        """
+        now = _now_ms() if now_ms is None else now_ms
+        row = self.conn.execute(
+            "SELECT * FROM health_observations WHERE scope_kind = ? AND scope_id = ? "
+            "AND (expires_at_ms IS NULL OR expires_at_ms > ?) "
+            "ORDER BY health_sequence DESC LIMIT 1",
+            (scope_kind, scope_id, now),
+        ).fetchone()
+        return None if row is None else self._row_to_health_observation(row)
+
+    def _waiting_run_ids(self, *, wait_reason: str, project_id: str | None = None) -> list[str]:
+        """Bytewise-sorted ``run_id``s currently ``WAITING`` for ``wait_reason``.
+
+        Runs are cheap projections reconstructed from durable pointers, not a
+        dedicated Wait Condition table (not yet built by any landed leaf);
+        this is the exact information the pure reducer already exposes via
+        ``RunView.wait_reason``.
+        """
+        from orcest.workflow_reducer.ledger import load_view
+
+        query = "SELECT run_id FROM runs WHERE state = 'WAITING'"
+        params: list[Any] = []
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id)
+        run_ids = [row["run_id"] for row in self.conn.execute(query, params).fetchall()]
+        matching = [
+            run_id
+            for run_id in run_ids
+            if (view := load_view(self, run_id)) is not None and view.wait_reason == wait_reason
+        ]
+        return sorted(matching)
+
+    def _wake_capacity_waits(self, observations: Sequence[HealthObservationRecord]) -> list[str]:
+        """Apply each ``AVAILABLE`` capacity Health Observation to every current
+        ``WAITING``/``CAPACITY`` Run, in bytewise Run-ID order, and return the
+        distinct ``wait_condition_id``s actually cleared.
+
+        Must run inside the same writer transaction as the Capacity Report and
+        its Health Observations (domain-model.md "Capacity Report": "The
+        Capacity Report, all Health Observations, per-Run wake
+        Transitions/outboxes, and response commit in one writer
+        transaction"). ``UNAVAILABLE`` never proposes a wake here; only the
+        lifecycle reducer's own Health Observation handling may later use it.
+        """
+        available = [obs for obs in observations if obs.kind == "AVAILABLE"]
+        if not available:
+            return []
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        woken: list[str] = []
+        for run_id in self._waiting_run_ids(wait_reason="CAPACITY"):
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_reason != "CAPACITY":
+                continue
+            prior_wait_condition_id = view.wait_condition_id
+            for observation in available:
+                applied = apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="HEALTH_OBSERVATION",
+                        trigger_id=observation.health_observation_id,
+                        facts={"wakes_wait": True},
+                    ),
+                    run_id=run_id,
+                )
+                view = applied.view
+                if (
+                    not applied.replayed
+                    and applied.reduction is not None
+                    and applied.reduction.reason_code == "WAIT_WAKE"
+                ):
+                    if prior_wait_condition_id is not None:
+                        woken.append(prior_wait_condition_id)
+                    break
+        return woken
+
+    # -- Capacity Report -----------------------------------------------
+
+    def _capacity_report_result_from_row(
+        self, row: sqlite3.Row, *, replayed: bool
+    ) -> CapacityReportResult:
+        entry_rows = self.conn.execute(
+            "SELECT ho.* FROM capacity_report_entries cre "
+            "JOIN health_observations ho ON ho.health_observation_id = cre.health_observation_id "
+            "WHERE cre.capacity_report_id = ? ORDER BY cre.entry_ordinal",
+            (row["capacity_report_id"],),
+        ).fetchall()
+        observations = tuple(self._row_to_health_observation(r) for r in entry_rows)
+        woken = tuple(json.loads(row["response_json"]).get("woken_wait_condition_ids", ()))
+        return CapacityReportResult(
+            capacity_report_id=row["capacity_report_id"],
+            pool_manager_id=row["pool_manager_id"],
+            report_id=row["report_id"],
+            idempotency_key=row["idempotency_key"],
+            report_sequence=row["report_sequence"],
+            health_observations=observations,
+            woken_wait_condition_ids=woken,
+            response_http_status=row["response_http_status"],
+            response_json=row["response_json"],
+            response_digest=row["response_digest"],
+            accepted_at_ms=row["accepted_at_ms"],
+            replayed=replayed,
+        )
+
+    def submit_capacity_report(
+        self,
+        *,
+        capacity_report_id: str,
+        pool_manager_id: str,
+        report_id: str,
+        idempotency_key: str,
+        report_sequence: int,
+        observed_at_ms: int,
+        expires_at_ms: int,
+        configured_max_ttl_ms: int,
+        entries: Sequence[CapacityReportEntryInput],
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+    ) -> CapacityReportResult:
+        """Accept (or replay) one pool-manager Capacity Report.
+
+        Commits the Capacity Report, one Health Observation per entry, and any
+        resulting capacity-wait wake Transitions in a single writer
+        transaction (domain-model.md "Capacity Report"). A previously unseen
+        report whose sequence is not greater than the pool manager's last
+        accepted sequence is rejected without a ledger row or Health
+        Observation.
+        """
+        require_lowercase_uuid(capacity_report_id, field="capacity_report_id")
+        require_lowercase_uuid(report_id, field="report_id")
+        require_lowercase_uuid(idempotency_key, field="idempotency_key")
+        _require_positive_int(report_sequence, field="report_sequence")
+        _require_positive_int(configured_max_ttl_ms, field="configured_max_ttl_ms")
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        _validate_capacity_report_entries(entries)
+
+        entry_payload = [
+            {
+                "scope_kind": entry.scope_kind,
+                "scope_id": entry.scope_id,
+                "capacity_pool_id": entry.capacity_pool_id,
+                "worker_profile": entry.worker_profile,
+                "available_slots": entry.available_slots,
+                "session_evidence": dict(entry.session_evidence)
+                if entry.session_evidence
+                else None,
+            }
+            for entry in entries
+        ]
+        req_digest = capacity_report_digest(
+            {
+                "protocol": CAPACITY_REPORT_PROTOCOL,
+                "pool_manager_id": pool_manager_id,
+                "report_id": report_id,
+                "idempotency_key": idempotency_key,
+                "report_sequence": report_sequence,
+                "observed_at_ms": observed_at_ms,
+                "expires_at_ms": expires_at_ms,
+                "entries": entry_payload,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM capacity_reports WHERE pool_manager_id = ? "
+                "AND (report_id = ? OR idempotency_key = ?)",
+                (pool_manager_id, report_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_digest"] != req_digest:
+                    raise IdempotencyConflictError(
+                        "capacity report id/idempotency key was reused with different content"
+                    )
+                return self._capacity_report_result_from_row(existing, replayed=True)
+
+            last_sequence = self.conn.execute(
+                "SELECT COALESCE(MAX(report_sequence), 0) AS seq FROM capacity_reports "
+                "WHERE pool_manager_id = ?",
+                (pool_manager_id,),
+            ).fetchone()["seq"]
+            if report_sequence <= int(last_sequence):
+                raise CasMismatchError(
+                    "capacity report sequence is not greater than the last accepted sequence"
+                )
+
+            accepted_at_ms = _now_ms()
+            if not (
+                expires_at_ms > accepted_at_ms
+                and expires_at_ms <= accepted_at_ms + configured_max_ttl_ms
+            ):
+                raise ValueError(
+                    "capacity report expires_at_ms must satisfy accepted_at_ms < expires_at_ms "
+                    "<= accepted_at_ms + configured_max_ttl_ms"
+                )
+
+            self.conn.execute(
+                "INSERT INTO capacity_reports(capacity_report_id, pool_manager_id, report_id, "
+                "idempotency_key, report_sequence, observed_at_ms, expires_at_ms, "
+                "configured_max_ttl_ms, authenticated_principal_id, "
+                "authorization_context_digest, payload_digest, response_http_status, "
+                "response_json, response_digest, accepted_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    capacity_report_id,
+                    pool_manager_id,
+                    report_id,
+                    idempotency_key,
+                    report_sequence,
+                    observed_at_ms,
+                    expires_at_ms,
+                    configured_max_ttl_ms,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    200,
+                    "",
+                    "",
+                    accepted_at_ms,
+                ),
+            )
+
+            observations: list[HealthObservationRecord] = []
+            for ordinal, entry in enumerate(entries):
+                availability = "AVAILABLE" if entry.available_slots > 0 else "UNAVAILABLE"
+                subject_bindings: dict[str, Any] = {
+                    "capacity_pool_id": entry.capacity_pool_id,
+                    "worker_profile": entry.worker_profile,
+                    "available_slots": entry.available_slots,
+                }
+                if entry.session_evidence is not None:
+                    subject_bindings["session_evidence"] = dict(entry.session_evidence)
+                observation = self._insert_health_observation(
+                    scope_kind=entry.scope_kind,
+                    scope_id=entry.scope_id,
+                    kind=availability,
+                    source_kind="CAPACITY_REPORT",
+                    source_id=capacity_report_id,
+                    subject_bindings=subject_bindings,
+                    observed_revision=report_sequence,
+                    effective_at_ms=accepted_at_ms,
+                    expires_at_ms=expires_at_ms,
+                )
+                observations.append(observation)
+                self.conn.execute(
+                    "INSERT INTO capacity_report_entries(capacity_report_id, entry_ordinal, "
+                    "scope_kind, scope_id, availability, capacity_pool_id, worker_profile, "
+                    "available_slots, session_evidence_json, health_observation_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        capacity_report_id,
+                        ordinal,
+                        entry.scope_kind,
+                        entry.scope_id,
+                        availability,
+                        entry.capacity_pool_id,
+                        entry.worker_profile,
+                        entry.available_slots,
+                        canonical_json_text(entry.session_evidence)
+                        if entry.session_evidence
+                        else None,
+                        observation.health_observation_id,
+                    ),
+                )
+
+            woken = self._wake_capacity_waits(observations)
+
+            body = {
+                "protocol": CAPACITY_REPORT_RESULT_PROTOCOL,
+                "capacity_report_id": capacity_report_id,
+                "report_id": report_id,
+                "report_sequence": report_sequence,
+                "health_observations": [
+                    {
+                        "health_observation_id": obs.health_observation_id,
+                        "scope_kind": obs.scope_kind,
+                        "scope_id": obs.scope_id,
+                        "health_sequence": obs.health_sequence,
+                        "kind": obs.kind,
+                        "effective_at_ms": obs.effective_at_ms,
+                        "expires_at_ms": obs.expires_at_ms,
+                    }
+                    for obs in observations
+                ],
+                "woken_wait_condition_ids": list(woken),
+            }
+            resp_digest = response_digest({"http_status": 200, "body": body})
+            body_json = canonical_json_text(body)
+            self.conn.execute(
+                "UPDATE capacity_reports SET response_json = ?, response_digest = ? "
+                "WHERE capacity_report_id = ?",
+                (body_json, resp_digest, capacity_report_id),
+            )
+            return CapacityReportResult(
+                capacity_report_id=capacity_report_id,
+                pool_manager_id=pool_manager_id,
+                report_id=report_id,
+                idempotency_key=idempotency_key,
+                report_sequence=report_sequence,
+                health_observations=tuple(observations),
+                woken_wait_condition_ids=tuple(woken),
+                response_http_status=200,
+                response_json=body_json,
+                response_digest=resp_digest,
+                accepted_at_ms=accepted_at_ms,
+                replayed=False,
+            )
+
+    # -- Worker Loss Report --------------------------------------------
+
+    def _worker_loss_report_result_response(
+        self,
+        *,
+        worker_loss_report_id: str,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        accepted: bool,
+        stale: bool,
+        health_observation_id: str | None = None,
+        attempt_terminal_fact_id: str | None = None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, Any] = {
+            "protocol": WORKER_LOSS_RESULT_PROTOCOL,
+            "worker_loss_report_id": worker_loss_report_id,
+            "attempt_id": attempt_id,
+            "activity_id": activity_id,
+            "generation": attempt_generation,
+            "accepted": accepted,
+            "stale": stale,
+            "health_observation_id": health_observation_id,
+            "attempt_terminal_fact_id": attempt_terminal_fact_id,
+        }
+        resp_digest = response_digest({"http_status": 200, "body": body})
+        return 200, canonical_json_text(body), resp_digest
+
+    def _worker_loss_report_result_from_row(
+        self, row: sqlite3.Row, *, replayed: bool
+    ) -> WorkerLossReportResult:
+        return WorkerLossReportResult(
+            worker_loss_report_id=row["worker_loss_report_id"],
+            pool_manager_id=row["pool_manager_id"],
+            idempotency_key=row["idempotency_key"],
+            worker_id=row["worker_id"],
+            worker_session_id=row["worker_session_id"],
+            attempt_id=row["attempt_id"],
+            activity_id=row["activity_id"],
+            attempt_generation=row["attempt_generation"],
+            reason=row["reason"],
+            outcome=row["outcome"],
+            health_observation_id=row["health_observation_id"],
+            attempt_terminal_fact_id=row["attempt_terminal_fact_id"],
+            response_http_status=row["response_http_status"],
+            response_json=row["response_json"],
+            response_digest=row["response_digest"],
+            accepted_at_ms=row["accepted_at_ms"],
+            replayed=replayed,
+        )
+
+    def submit_worker_loss_report(
+        self,
+        *,
+        worker_loss_report_id: str,
+        pool_manager_id: str,
+        idempotency_key: str,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        reason: str,
+        observed_at_ms: int,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+    ) -> WorkerLossReportResult:
+        """Accept (or replay) one pool-manager Worker Loss Report.
+
+        ``ACCEPTED`` requires the exact current claimed Attempt/session: in
+        that one writer transaction this terminalizes the Attempt
+        (``FAILED``/``WORKER_LOST``), returns its Activity to ``PLANNED``, and
+        reduces the resulting Attempt Terminal Fact. An already-terminal or
+        mismatched Attempt yields the durable ``STALE`` path instead and
+        cannot rewrite state or reason (domain-model.md "Worker Loss Report").
+        An unknown Attempt triple raises :class:`AttemptUnknownError` and
+        creates no ledger row at all.
+        """
+        require_lowercase_uuid(worker_loss_report_id, field="worker_loss_report_id")
+        require_lowercase_uuid(idempotency_key, field="idempotency_key")
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        _require_positive_int(attempt_generation, field="attempt_generation")
+        enums.parse_enum("worker_loss_report.reason", reason)
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+
+        req_digest = worker_loss_report_digest(
+            {
+                "protocol": WORKER_LOSS_PROTOCOL,
+                "pool_manager_id": pool_manager_id,
+                "idempotency_key": idempotency_key,
+                "worker_id": worker_id,
+                "worker_session_id": worker_session_id,
+                "attempt_id": attempt_id,
+                "activity_id": activity_id,
+                "attempt_generation": attempt_generation,
+                "reason": reason,
+                "observed_at_ms": observed_at_ms,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM worker_loss_reports "
+                "WHERE pool_manager_id = ? AND idempotency_key = ?",
+                (pool_manager_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_digest"] != req_digest:
+                    raise IdempotencyConflictError(
+                        "worker loss report idempotency key was reused with different content"
+                    )
+                return self._worker_loss_report_result_from_row(existing, replayed=True)
+
+            attempt_row = self.conn.execute(
+                "SELECT * FROM attempts WHERE attempt_id = ? AND activity_id = ? "
+                "AND generation = ?",
+                (attempt_id, activity_id, attempt_generation),
+            ).fetchone()
+            if attempt_row is None:
+                raise AttemptUnknownError(
+                    f"no Attempt with attempt_id={attempt_id!r} activity_id={activity_id!r} "
+                    f"generation={attempt_generation!r}"
+                )
+
+            accepted_at_ms = _now_ms()
+            matches_current_claim = (
+                attempt_row["state"] == "CLAIMED"
+                and attempt_row["claimed_worker_id"] == worker_id
+                and attempt_row["claimed_worker_session_id"] == worker_session_id
+            )
+
+            if not matches_current_claim:
+                http_status, body_json, resp_digest = self._worker_loss_report_result_response(
+                    worker_loss_report_id=worker_loss_report_id,
+                    attempt_id=attempt_id,
+                    activity_id=activity_id,
+                    attempt_generation=attempt_generation,
+                    accepted=False,
+                    stale=True,
+                )
+                self.conn.execute(
+                    "INSERT INTO worker_loss_reports(worker_loss_report_id, pool_manager_id, "
+                    "idempotency_key, worker_id, worker_session_id, attempt_id, activity_id, "
+                    "attempt_generation, reason, observed_at_ms, authenticated_principal_id, "
+                    "authorization_context_digest, payload_digest, outcome, "
+                    "health_observation_id, attempt_terminal_fact_id, response_http_status, "
+                    "response_json, response_digest, accepted_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'STALE', NULL, NULL, "
+                    "?, ?, ?, ?)",
+                    (
+                        worker_loss_report_id,
+                        pool_manager_id,
+                        idempotency_key,
+                        worker_id,
+                        worker_session_id,
+                        attempt_id,
+                        activity_id,
+                        attempt_generation,
+                        reason,
+                        observed_at_ms,
+                        authenticated_principal_id,
+                        authorization_context_digest,
+                        req_digest,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        accepted_at_ms,
+                    ),
+                )
+                return WorkerLossReportResult(
+                    worker_loss_report_id=worker_loss_report_id,
+                    pool_manager_id=pool_manager_id,
+                    idempotency_key=idempotency_key,
+                    worker_id=worker_id,
+                    worker_session_id=worker_session_id,
+                    attempt_id=attempt_id,
+                    activity_id=activity_id,
+                    attempt_generation=attempt_generation,
+                    reason=reason,
+                    outcome="STALE",
+                    health_observation_id=None,
+                    attempt_terminal_fact_id=None,
+                    response_http_status=http_status,
+                    response_json=body_json,
+                    response_digest=resp_digest,
+                    accepted_at_ms=accepted_at_ms,
+                    replayed=False,
+                )
+
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            assert activity_row is not None
+            run_id = activity_row["run_id"]
+
+            subject_bindings = {
+                "worker_id": worker_id,
+                "worker_session_id": worker_session_id,
+                "attempt_id": attempt_id,
+                "activity_id": activity_id,
+                "attempt_generation": attempt_generation,
+            }
+            observation = self._insert_health_observation(
+                scope_kind="WORKER_SESSION",
+                scope_id=worker_session_id,
+                kind="LOST",
+                source_kind="WORKER_LOSS_REPORT",
+                source_id=worker_loss_report_id,
+                subject_bindings=subject_bindings,
+                observed_revision=None,
+                effective_at_ms=accepted_at_ms,
+                expires_at_ms=None,
+            )
+
+            attempt_terminal_fact_id = str(uuid.uuid4())
+            fact_digest = attempt_terminal_fact_digest(
+                {
+                    "attempt_id": attempt_id,
+                    "activity_id": activity_id,
+                    "attempt_generation": attempt_generation,
+                    "kind": "WORKER_LOST",
+                    "source_kind": "HEALTH_OBSERVATION",
+                    "source_id": observation.health_observation_id,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO attempt_terminal_facts(attempt_terminal_fact_id, attempt_id, "
+                "activity_id, attempt_generation, kind, source_kind, source_id, "
+                "health_observation_id, fact_digest, recorded_at_ms) "
+                "VALUES (?, ?, ?, ?, 'WORKER_LOST', 'HEALTH_OBSERVATION', ?, ?, ?, ?)",
+                (
+                    attempt_terminal_fact_id,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    observation.health_observation_id,
+                    observation.health_observation_id,
+                    fact_digest,
+                    accepted_at_ms,
+                ),
+            )
+
+            cur = self.conn.execute(
+                "UPDATE attempts SET state = 'FAILED', terminal_reason = 'WORKER_LOST' "
+                "WHERE attempt_id = ? AND activity_id = ? AND generation = ? "
+                "AND state = 'CLAIMED'",
+                (attempt_id, activity_id, attempt_generation),
+            )
+            if cur.rowcount != 1:
+                raise CasMismatchError(
+                    "attempt claim was lost between the match check and terminalization"
+                )
+            cur = self.conn.execute(
+                "UPDATE activities SET state = 'PLANNED', updated_at_ms = ? "
+                "WHERE activity_id = ? AND state = 'ACTIVE'",
+                (accepted_at_ms, activity_id),
+            )
+            if cur.rowcount != 1:
+                raise RunStoreError(
+                    f"activity {activity_id!r} was not ACTIVE for its exact claimed Attempt"
+                )
+
+            from orcest.workflow_reducer.ledger import apply, load_view
+            from orcest.workflow_reducer.types import Trigger
+
+            view = load_view(self, run_id)
+            if view is None:
+                raise RunStoreError(f"run {run_id!r} for activity {activity_id!r} was not found")
+            apply(
+                self,
+                view,
+                Trigger(
+                    kind="ATTEMPT_TERMINAL",
+                    trigger_id=attempt_terminal_fact_id,
+                    facts={"kind": "WORKER_LOST", "already_terminal": False},
+                ),
+                run_id=run_id,
+            )
+
+            http_status, body_json, resp_digest = self._worker_loss_report_result_response(
+                worker_loss_report_id=worker_loss_report_id,
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                accepted=True,
+                stale=False,
+                health_observation_id=observation.health_observation_id,
+                attempt_terminal_fact_id=attempt_terminal_fact_id,
+            )
+            self.conn.execute(
+                "INSERT INTO worker_loss_reports(worker_loss_report_id, pool_manager_id, "
+                "idempotency_key, worker_id, worker_session_id, attempt_id, activity_id, "
+                "attempt_generation, reason, observed_at_ms, authenticated_principal_id, "
+                "authorization_context_digest, payload_digest, outcome, "
+                "health_observation_id, attempt_terminal_fact_id, response_http_status, "
+                "response_json, response_digest, accepted_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACCEPTED', ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_loss_report_id,
+                    pool_manager_id,
+                    idempotency_key,
+                    worker_id,
+                    worker_session_id,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    reason,
+                    observed_at_ms,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    observation.health_observation_id,
+                    attempt_terminal_fact_id,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    accepted_at_ms,
+                ),
+            )
+            return WorkerLossReportResult(
+                worker_loss_report_id=worker_loss_report_id,
+                pool_manager_id=pool_manager_id,
+                idempotency_key=idempotency_key,
+                worker_id=worker_id,
+                worker_session_id=worker_session_id,
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                reason=reason,
+                outcome="ACCEPTED",
+                health_observation_id=observation.health_observation_id,
+                attempt_terminal_fact_id=attempt_terminal_fact_id,
+                response_http_status=http_status,
+                response_json=body_json,
+                response_digest=resp_digest,
+                accepted_at_ms=accepted_at_ms,
+                replayed=False,
+            )
+
+    # -- Budget Report ---------------------------------------------------
+
+    def _budget_report_result_from_row(
+        self, row: sqlite3.Row, *, replayed: bool
+    ) -> BudgetReportResult:
+        return BudgetReportResult(
+            budget_report_id=row["budget_report_id"],
+            project_id=row["project_id"],
+            accounting_scope_id=row["accounting_scope_id"],
+            source_sequence=row["source_sequence"],
+            availability=row["availability"],
+            affected_run_ids_digest=row["affected_run_ids_digest"],
+            response_http_status=row["response_http_status"],
+            response_json=row["response_json"],
+            response_digest=row["response_digest"],
+            accepted_at_ms=row["accepted_at_ms"],
+            replayed=replayed,
+        )
+
+    def submit_budget_report(
+        self,
+        *,
+        budget_report_id: str,
+        project_id: str,
+        accounting_scope_id: str,
+        budget_policy_ref: str,
+        budget_reset_window_ref: str,
+        window_id: str,
+        window_start_ms: int,
+        reset_at_ms: int,
+        source_sequence: int,
+        source_revision: str,
+        limit_microunits: int,
+        consumed_microunits: int,
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+        max_budget_report_age_ms: int,
+    ) -> BudgetReportResult:
+        """Accept (or replay) one cumulative Budget Report.
+
+        ``availability`` is always controller-derived from the normalized
+        integers, never trusted from the caller. Freezes, in bytewise Run-ID
+        order, every current same-Project ``WAITING``/``BUDGET`` Run and fans
+        its wake Transition out immediately (restartable via
+        :meth:`run_budget_report_fanout` on crash/Redis-loss reconciliation)
+        (domain-model.md "Budget Report").
+        """
+        require_lowercase_uuid(budget_report_id, field="budget_report_id")
+        require_lowercase_uuid(project_id, field="project_id")
+        _require_positive_int(source_sequence, field="source_sequence")
+        _require_positive_int(limit_microunits, field="limit_microunits")
+        _require_positive_int(max_budget_report_age_ms, field="max_budget_report_age_ms")
+        if consumed_microunits < 0:
+            raise ValueError("consumed_microunits must be nonnegative")
+        if window_start_ms >= reset_at_ms:
+            raise ValueError("window_start_ms must precede reset_at_ms")
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+
+        req_digest = budget_report_digest(
+            {
+                "budget_report_id": budget_report_id,
+                "project_id": project_id,
+                "accounting_scope_id": accounting_scope_id,
+                "budget_policy_ref": budget_policy_ref,
+                "budget_reset_window_ref": budget_reset_window_ref,
+                "window_id": window_id,
+                "window_start_ms": window_start_ms,
+                "reset_at_ms": reset_at_ms,
+                "source_sequence": source_sequence,
+                "source_revision": source_revision,
+                "limit_microunits": limit_microunits,
+                "consumed_microunits": consumed_microunits,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM budget_reports WHERE budget_report_id = ?",
+                (budget_report_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["report_digest"] != req_digest:
+                    raise IdempotencyConflictError(
+                        "budget report id was reused with different content"
+                    )
+                return self._budget_report_result_from_row(existing, replayed=True)
+
+            revision_conflict = self.conn.execute(
+                "SELECT 1 FROM budget_reports WHERE project_id = ? AND accounting_scope_id = ? "
+                "AND source_revision = ? AND budget_report_id != ?",
+                (project_id, accounting_scope_id, source_revision, budget_report_id),
+            ).fetchone()
+            if revision_conflict is not None:
+                raise IdempotencyConflictError(
+                    "budget report source_revision was reused under a different budget_report_id"
+                )
+
+            last_sequence = self.conn.execute(
+                "SELECT COALESCE(MAX(source_sequence), 0) AS seq FROM budget_reports "
+                "WHERE project_id = ? AND accounting_scope_id = ?",
+                (project_id, accounting_scope_id),
+            ).fetchone()["seq"]
+            if source_sequence <= int(last_sequence):
+                raise CasMismatchError(
+                    "budget report source_sequence is not greater than the last accepted sequence"
+                )
+
+            accepted_at_ms = _now_ms()
+            expires_at_ms = min(reset_at_ms, accepted_at_ms + max_budget_report_age_ms)
+            if accepted_at_ms >= expires_at_ms:
+                raise ValueError("budget report expires_at_ms must be after accepted_at_ms")
+            availability = "AVAILABLE" if consumed_microunits < limit_microunits else "EXHAUSTED"
+
+            member_run_ids = (
+                self._waiting_run_ids(wait_reason="BUDGET", project_id=project_id)
+                if availability == "AVAILABLE"
+                else []
+            )
+            members_digest = affected_run_ids_digest(
+                [{"run_id": run_id} for run_id in member_run_ids]
+            )
+
+            body = {
+                "protocol": BUDGET_REPORT_RESULT_PROTOCOL,
+                "budget_report_id": budget_report_id,
+                "project_id": project_id,
+                "accounting_scope_id": accounting_scope_id,
+                "source_sequence": source_sequence,
+                "availability": availability,
+                "affected_run_ids_digest": members_digest,
+            }
+            resp_digest = response_digest({"http_status": 200, "body": body})
+            body_json = canonical_json_text(body)
+
+            self.conn.execute(
+                "INSERT INTO budget_reports(budget_report_id, project_id, accounting_scope_id, "
+                "budget_policy_ref, budget_reset_window_ref, window_id, window_start_ms, "
+                "reset_at_ms, source_sequence, source_revision, limit_microunits, "
+                "consumed_microunits, availability, authenticated_principal_id, "
+                "authorization_context_digest, report_digest, affected_run_ids_digest, "
+                "next_member_ordinal, fanout_completed_at_ms, accepted_at_ms, expires_at_ms, "
+                "response_http_status, response_json, response_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, "
+                "?, ?)",
+                (
+                    budget_report_id,
+                    project_id,
+                    accounting_scope_id,
+                    budget_policy_ref,
+                    budget_reset_window_ref,
+                    window_id,
+                    window_start_ms,
+                    reset_at_ms,
+                    source_sequence,
+                    source_revision,
+                    limit_microunits,
+                    consumed_microunits,
+                    availability,
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    members_digest,
+                    accepted_at_ms,
+                    expires_at_ms,
+                    200,
+                    body_json,
+                    resp_digest,
+                ),
+            )
+            for ordinal, run_id in enumerate(member_run_ids):
+                self.conn.execute(
+                    "INSERT INTO budget_report_runs(budget_report_id, member_ordinal, run_id) "
+                    "VALUES (?, ?, ?)",
+                    (budget_report_id, ordinal, run_id),
+                )
+
+            self._run_budget_report_fanout(budget_report_id)
+
+            row = self.conn.execute(
+                "SELECT * FROM budget_reports WHERE budget_report_id = ?", (budget_report_id,)
+            ).fetchone()
+            assert row is not None
+            return self._budget_report_result_from_row(row, replayed=False)
+
+    def run_budget_report_fanout(self, budget_report_id: str) -> None:
+        """Advance one Budget Report's restartable per-Run wake fanout.
+
+        Safe to call repeatedly -- on acceptance, and again from a startup or
+        Redis-loss reconciliation sweep after a crash mid-fanout: each member
+        Transition is idempotent by trigger identity and the cursor only
+        advances transactionally after that Transition commits.
+        """
+        with self.transaction():
+            self._run_budget_report_fanout(budget_report_id)
+
+    def _run_budget_report_fanout(self, budget_report_id: str) -> None:
+        """Must run inside ``self.transaction()``."""
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        row = self.conn.execute(
+            "SELECT * FROM budget_reports WHERE budget_report_id = ?", (budget_report_id,)
+        ).fetchone()
+        if row is None:
+            raise RunStoreError(f"budget report {budget_report_id!r} was not found")
+        if row["fanout_completed_at_ms"] is not None:
+            return
+        members = self.conn.execute(
+            "SELECT member_ordinal, run_id FROM budget_report_runs WHERE budget_report_id = ? "
+            "AND member_ordinal >= ? ORDER BY member_ordinal",
+            (budget_report_id, row["next_member_ordinal"]),
+        ).fetchall()
+        for member in members:
+            view = load_view(self, member["run_id"])
+            if view is not None:
+                apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="BUDGET_REPORT",
+                        trigger_id=budget_report_id,
+                        facts={"wakes_wait": True},
+                    ),
+                    run_id=member["run_id"],
+                )
+            self.conn.execute(
+                "UPDATE budget_reports SET next_member_ordinal = ? WHERE budget_report_id = ?",
+                (member["member_ordinal"] + 1, budget_report_id),
+            )
+        total = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM budget_report_runs WHERE budget_report_id = ?",
+            (budget_report_id,),
+        ).fetchone()["n"]
+        cursor = self.conn.execute(
+            "SELECT next_member_ordinal AS n FROM budget_reports WHERE budget_report_id = ?",
+            (budget_report_id,),
+        ).fetchone()["n"]
+        if cursor >= total:
+            self.conn.execute(
+                "UPDATE budget_reports SET fanout_completed_at_ms = ? WHERE budget_report_id = ?",
+                (_now_ms(), budget_report_id),
+            )
+
+    def get_latest_budget_report(
+        self,
+        project_id: str,
+        accounting_scope_id: str,
+        *,
+        budget_policy_ref: str | None = None,
+        budget_reset_window_ref: str | None = None,
+        window_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> BudgetReportResult | None:
+        """The latest applicable Budget Report: greatest accepted sequence for
+        the exact current scope/policy/window whose freshness deadline has
+        not been reached. An old-window, expired, or policy-mismatched Report
+        cannot authorize an offer (domain-model.md "Budget Report")."""
+        now = _now_ms() if now_ms is None else now_ms
+        query = (
+            "SELECT * FROM budget_reports WHERE project_id = ? AND accounting_scope_id = ? "
+            "AND expires_at_ms > ?"
+        )
+        params: list[Any] = [project_id, accounting_scope_id, now]
+        if budget_policy_ref is not None:
+            query += " AND budget_policy_ref = ?"
+            params.append(budget_policy_ref)
+        if budget_reset_window_ref is not None:
+            query += " AND budget_reset_window_ref = ?"
+            params.append(budget_reset_window_ref)
+        if window_id is not None:
+            query += " AND window_id = ?"
+            params.append(window_id)
+        query += " ORDER BY source_sequence DESC LIMIT 1"
+        row = self.conn.execute(query, params).fetchone()
+        return None if row is None else self._budget_report_result_from_row(row, replayed=False)
+
+    # -- Offer gate --------------------------------------------------------
+
+    def evaluate_offer_gate(
+        self,
+        *,
+        worker_profile_scope_id: str | None = None,
+        capacity_pool_scope_id: str | None = None,
+        provider_account_scope_id: str | None = None,
+        project_id: str | None = None,
+        accounting_scope_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> OfferGateEvaluation:
+        """Read-only dispatch-gate snapshot for a proposed new Attempt offer.
+
+        See :class:`OfferGateEvaluation`. Omit a scope to skip evaluating that
+        dimension; its ``*_health``/``budget_report`` field is then ``None``
+        and its ``*_available`` flag is ``False``.
+        """
+        now = _now_ms() if now_ms is None else now_ms
+        evaluation = self._controller_gate_evaluation()
+        mode = evaluation.permissions.mode
+        if mode not in {"RUNNING", "INTAKE_PAUSED"}:
+            disposition = "MODE_BLOCKED"
+        elif evaluation.selected_key is None:
+            disposition = "ISSUANCE_KEY_UNAVAILABLE"
+        else:
+            disposition = "OFFER_ALLOWED"
+
+        worker_profile_health = (
+            self.get_latest_health_observation(
+                "WORKER_PROFILE", worker_profile_scope_id, now_ms=now
+            )
+            if worker_profile_scope_id is not None
+            else None
+        )
+        capacity_pool_health = (
+            self.get_latest_health_observation("CAPACITY_POOL", capacity_pool_scope_id, now_ms=now)
+            if capacity_pool_scope_id is not None
+            else None
+        )
+        provider_account_health = (
+            self.get_latest_health_observation(
+                "PROVIDER_ACCOUNT", provider_account_scope_id, now_ms=now
+            )
+            if provider_account_scope_id is not None
+            else None
+        )
+        budget_report = (
+            self.get_latest_budget_report(project_id, accounting_scope_id, now_ms=now)
+            if project_id is not None and accounting_scope_id is not None
+            else None
+        )
+
+        capacity_available = (
+            worker_profile_health is not None
+            and worker_profile_health.kind == "AVAILABLE"
+            and capacity_pool_health is not None
+            and capacity_pool_health.kind == "AVAILABLE"
+        )
+        budget_available = budget_report is not None and budget_report.availability == "AVAILABLE"
+
+        return OfferGateEvaluation(
+            disposition=disposition,
+            controller_mode=mode,
+            controller_mode_revision=evaluation.permissions.mode_revision,
+            capability_registry_revision=evaluation.permissions.registry_revision,
+            selected_issuance_key_id=(
+                evaluation.selected_key.capability_signing_key_id
+                if evaluation.selected_key is not None
+                else None
+            ),
+            worker_profile_health=worker_profile_health,
+            capacity_pool_health=capacity_pool_health,
+            provider_account_health=provider_account_health,
+            budget_report=budget_report,
+            capacity_available=capacity_available,
+            budget_available=budget_available,
+        )
 
     def list_open_activity_offers(self) -> list[tuple[AttemptRecord, OutboxRecord]]:
         """Every current, unexpired ``OFFERED`` Attempt with its dispatch Outbox row.

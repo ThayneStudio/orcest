@@ -36,10 +36,13 @@ from orcest.workflow_contract.v1.protocol import (
     register_envelope,
 )
 
+ATTEMPT_CLAIM_PROTOCOL = "orcest.attempt-claim/1"
+BUDGET_REPORT_RESULT_PROTOCOL = "orcest.budget-report-result/1"
 CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
 CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
-ATTEMPT_CLAIM_PROTOCOL = "orcest.attempt-claim/1"
 CANDIDATE_UPLOAD_EXPIRED_PROTOCOL = "orcest.candidate-upload-expired/1"
+CAPACITY_REPORT_PROTOCOL = "orcest.capacity-report/1"
+CAPACITY_REPORT_RESULT_PROTOCOL = "orcest.capacity-report-result/1"
 CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
 ERROR_PROTOCOL = "orcest.error/1"
@@ -49,12 +52,17 @@ PROJECT_REGISTRATION_RESULT_PROTOCOL = "orcest.project-registration-result/1"
 SECRET_PROVISION_REQUEST_PROTOCOL = "orcest.secret-provision/1"
 SECRET_PROVISION_ACCEPTED_PROTOCOL = "orcest.secret-provision-accepted/1"
 SECRET_PROVISION_RESULT_PROTOCOL = "orcest.secret-provision-result/1"
+WORKER_LOSS_PROTOCOL = "orcest.worker-loss/1"
+WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
 
 __all__ = [
+    "ATTEMPT_CLAIM_PROTOCOL",
+    "BUDGET_REPORT_RESULT_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
-    "ATTEMPT_CLAIM_PROTOCOL",
     "CANDIDATE_UPLOAD_EXPIRED_PROTOCOL",
+    "CAPACITY_REPORT_PROTOCOL",
+    "CAPACITY_REPORT_RESULT_PROTOCOL",
     "CONTROLLER_MODE_OPERATION_PROTOCOL",
     "CONTROLLER_MODE_RESULT_PROTOCOL",
     "ERROR_PROTOCOL",
@@ -64,6 +72,8 @@ __all__ = [
     "SECRET_PROVISION_REQUEST_PROTOCOL",
     "SECRET_PROVISION_ACCEPTED_PROTOCOL",
     "SECRET_PROVISION_RESULT_PROTOCOL",
+    "WORKER_LOSS_PROTOCOL",
+    "WORKER_LOSS_RESULT_PROTOCOL",
 ]
 
 
@@ -456,11 +466,52 @@ register_envelope(
 
 
 # ---------------------------------------------------------------------------
+# Budget Report -- the budget-accounting service's own submission wire shape
+# is owned by a document not in scope for this issue; the field set below is
+# exactly the caller-submitted subset of domain-model.md's "Budget Report"
+# ledger (excluding controller-derived ``availability``/times and transport
+# authentication, which never travel in the body).
+# ---------------------------------------------------------------------------
+
+register_envelope(
+    "orcest.budget-report/1",
+    {
+        "budget_report_id": Field(validator=_is_uuid),
+        "project_id": Field(validator=_is_uuid),
+        "accounting_scope_id": Field(validator=_is_nonempty_str),
+        "budget_policy_ref": Field(validator=_is_nonempty_str),
+        "budget_reset_window_ref": Field(validator=_is_nonempty_str),
+        "window_id": Field(validator=_is_nonempty_str),
+        "window_start_ms": Field(validator=_is_nonneg_int),
+        "reset_at_ms": Field(validator=_is_nonneg_int),
+        "source_sequence": Field(validator=_is_positive_int),
+        "source_revision": Field(validator=_is_nonempty_str),
+        "limit_microunits": Field(validator=_is_positive_int),
+        "consumed_microunits": Field(validator=_is_nonneg_int),
+    },
+    protocol_field="protocol",
+)
+register_envelope(
+    BUDGET_REPORT_RESULT_PROTOCOL,
+    {
+        "budget_report_id": Field(validator=_is_uuid),
+        "project_id": Field(validator=_is_uuid),
+        "accounting_scope_id": Field(validator=_is_nonempty_str),
+        "source_sequence": Field(validator=_is_positive_int),
+        "replayed": Field(validator=_is_bool),
+        "availability": Field(enum=_enum_values(enums.BudgetReportAvailability)),
+        "affected_run_ids_digest": Field(validator=_is_digest),
+    },
+    protocol_field="protocol",
+)
+
+
+# ---------------------------------------------------------------------------
 # Capacity Report
 # ---------------------------------------------------------------------------
 
 register_envelope(
-    "orcest.capacity-report/1",
+    CAPACITY_REPORT_PROTOCOL,
     {
         "idempotency_key": Field(validator=_is_uuid),
         "report_id": Field(validator=_is_uuid),
@@ -472,7 +523,7 @@ register_envelope(
     protocol_field="protocol",
 )
 register_envelope(
-    "orcest.capacity-report-result/1",
+    CAPACITY_REPORT_RESULT_PROTOCOL,
     {
         "capacity_report_id": Field(validator=_is_uuid),
         "report_id": Field(validator=_is_uuid),
@@ -490,7 +541,7 @@ register_envelope(
 # ---------------------------------------------------------------------------
 
 register_envelope(
-    "orcest.worker-loss/1",
+    WORKER_LOSS_PROTOCOL,
     {
         "idempotency_key": Field(validator=_is_uuid),
         "worker_session_id": Field(validator=_is_nonempty_str),
@@ -503,7 +554,7 @@ register_envelope(
     protocol_field="protocol",
 )
 register_envelope(
-    "orcest.worker-loss-result/1",
+    WORKER_LOSS_RESULT_PROTOCOL,
     {
         "worker_loss_report_id": Field(validator=_is_uuid),
         "attempt_id": Field(validator=_is_uuid),
