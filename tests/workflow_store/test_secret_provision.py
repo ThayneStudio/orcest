@@ -13,6 +13,7 @@ from orcest.workflow_store import (
     RunStore,
     RunStoreError,
 )
+from orcest.workflow_store.v1.errors import IntegrityConflictError
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
 from orcest.workflow_store.v1.secret_provision import (
     SecretProvisionReplayConflictError,
@@ -164,6 +165,54 @@ def test_identical_replay_returns_same_response(
     assert second.response_json == first.response_json
     assert second.response_digest == first.response_digest
     assert second.new_version == first.new_version
+
+
+def test_replay_after_missing_secret_metadata_does_not_change_persisted_attestation(
+    run_store: RunStore, secret_store: SecretStore
+) -> None:
+    _select_capability_key(run_store)
+    secret_id = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+
+    first = _provision(
+        run_store, secret_store, operation_id=op_id, secret_id=secret_id, secret_bytes=b"same"
+    )
+    assert first.credential_rotation_receipt_id is not None
+
+    original_operation_attestation = run_store.conn.execute(
+        "SELECT secret_integrity_attestation_id FROM secret_provision_operations "
+        "WHERE secret_provision_operation_id = ?",
+        (op_id,),
+    ).fetchone()["secret_integrity_attestation_id"]
+    receipt = run_store.get_credential_rotation_receipt(first.credential_rotation_receipt_id)
+    assert receipt is not None
+    original_receipt_attestation = receipt.secret_integrity_attestation_id
+
+    meta = secret_store._root / secret_id / "integrity" / "1"
+    value = secret_store._root / secret_id / "versions" / "1"
+    original_value = value.read_bytes()
+    meta.unlink()
+
+    with pytest.raises(IntegrityConflictError, match="secret version integrity metadata"):
+        _provision(
+            run_store,
+            secret_store,
+            operation_id=op_id,
+            secret_id=secret_id,
+            secret_bytes=b"same",
+        )
+
+    current_operation_attestation = run_store.conn.execute(
+        "SELECT secret_integrity_attestation_id FROM secret_provision_operations "
+        "WHERE secret_provision_operation_id = ?",
+        (op_id,),
+    ).fetchone()["secret_integrity_attestation_id"]
+    receipt = run_store.get_credential_rotation_receipt(first.credential_rotation_receipt_id)
+    assert receipt is not None
+    assert current_operation_attestation == original_operation_attestation
+    assert receipt.secret_integrity_attestation_id == original_receipt_attestation
+    assert not meta.exists()
+    assert value.read_bytes() == original_value
 
 
 def test_replay_with_different_bytes_conflicts_without_leaking_either_value(
