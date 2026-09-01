@@ -194,6 +194,11 @@ class PoolManager:
         # failure retries until Redis is readable or this age exceeds the
         # snapshot freshness window (_STREAM_HEALTH_TTL_SECONDS).
         self._stream_health_restore_first_attempt: dict[tuple[str, str], float] = {}
+        # Consecutive Redis-read failures per stream-health snapshot key.
+        # Warn at 1, 10, 100, then every 1000th so a sustained outage during
+        # the restore window does not flood logs. Discarded on a successful
+        # pipeline read and when restore gives up at the freshness deadline.
+        self._stream_health_restore_read_failures: dict[str, int] = {}
         # EventPublisher instances, cached per project key_prefix ("default"
         # for the pool manager's own prefix). A fresh EventPublisher per call
         # would reset its decimated-error counter every time, defeating the
@@ -2996,6 +3001,7 @@ class PoolManager:
         if self._stream_health_tracker.has_state(provider, stream):
             return True
         identity = (provider, stream)
+        key = stream_health_snapshot_key(provider, issue=issue)
         first_attempt = self._stream_health_restore_first_attempt.setdefault(identity, now)
         if now - first_attempt > float(_STREAM_HEALTH_TTL_SECONDS):
             logger.warning(
@@ -3004,9 +3010,9 @@ class PoolManager:
                 provider,
                 stream,
             )
+            self._stream_health_restore_read_failures.pop(key, None)
             return True
         try:
-            key = stream_health_snapshot_key(provider, issue=issue)
             record = self._read_stream_health_snapshot_record(key)
             if record is None:
                 return False
@@ -3054,12 +3060,18 @@ class PoolManager:
             pipe.ttl(key)
             raw, ttl = pipe.execute()
         except Exception:
-            logger.warning(
-                "Failed to read stream health snapshot %s; restore will retry",
-                key,
-                exc_info=True,
-            )
+            count = self._stream_health_restore_read_failures.get(key, 0) + 1
+            self._stream_health_restore_read_failures[key] = count
+            if count in (1, 10, 100) or count % 1000 == 0:
+                logger.warning(
+                    "Failed to read stream health snapshot %s; restore will retry "
+                    "(%d consecutive failures)",
+                    key,
+                    count,
+                    exc_info=True,
+                )
             return None
+        self._stream_health_restore_read_failures.pop(key, None)
         payload = None if raw is None else str(raw)
         try:
             ttl_seconds = int(ttl)
