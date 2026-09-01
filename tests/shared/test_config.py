@@ -311,6 +311,49 @@ def test_delete_branch_on_merge_null_raises(tmp_path: Path):
         load_orchestrator_config(cfg_file)
 
 
+def test_issue_delivery_verifier_defaults_enabled_when_absent(tmp_path: Path):
+    """An absent issue_delivery_verifier block defaults enabled to True."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is True
+
+
+def test_issue_delivery_verifier_defaults_enabled_when_empty_block(tmp_path: Path):
+    """An empty issue_delivery_verifier block defaults enabled to True."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text("github:\n  repo: acme/widgets\nissue_delivery_verifier: {}\n")
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is True
+
+
+def test_issue_delivery_verifier_enabled_false_from_yaml(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nissue_delivery_verifier:\n  enabled: false\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.issue_delivery_verifier.enabled is False
+
+
+@pytest.mark.parametrize("enabled_yaml", ['"false"', "0", "null"])
+def test_issue_delivery_verifier_enabled_rejects_non_bool(tmp_path: Path, enabled_yaml: str):
+    """Quoted strings, integers, and explicit null are rejected via _safe_bool."""
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        f"github:\n  repo: acme/widgets\nissue_delivery_verifier:\n  enabled: {enabled_yaml}\n"
+    )
+
+    with pytest.raises(ValueError, match="issue_delivery_verifier.enabled"):
+        load_orchestrator_config(cfg_file)
+
+
 def test_load_orchestrator_config_runner_defaults(tmp_path: Path):
     """OrchestratorConfig.runner uses RunnerConfig defaults when not specified."""
     cfg_file = tmp_path / "orcest.yaml"
