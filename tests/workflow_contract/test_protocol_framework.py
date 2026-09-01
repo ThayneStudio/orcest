@@ -80,3 +80,20 @@ def test_duplicate_protocol_registration_raises() -> None:
 def test_field_cannot_declare_both_schema_and_item_schema() -> None:
     with pytest.raises(ValueError):
         Field(schema=Schema(fields={}), item_schema=Schema(fields={}))
+
+
+def _error_envelope(code: str) -> dict[str, object]:
+    return {"protocol": "orcest.error/1", "code": code, "retryable": True}
+
+
+def test_error_envelope_accepts_attempt_stale() -> None:
+    validate_envelope(_error_envelope("ATTEMPT_STALE"))
+
+
+def test_error_envelope_accepts_cas_lost_extension() -> None:
+    validate_envelope(_error_envelope("CAS_LOST"))
+
+
+def test_error_envelope_rejects_unknown_code() -> None:
+    with pytest.raises(ProtocolValidationError):
+        validate_envelope(_error_envelope("NOT_A_REAL_CODE"))
