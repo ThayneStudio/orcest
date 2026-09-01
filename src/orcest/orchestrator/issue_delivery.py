@@ -69,6 +69,12 @@ _PAYLOAD_SUMMARY_LIMIT = 200
 _METRICS_TTL_SECONDS = 30 * 24 * 3600
 _GENERATION_WALK_CAP = 32
 
+# Bounds for raw provider-echo fields persisted to Redis. These fields are
+# untrusted diagnostic input, not authoritative for verification -- live
+# GitHub state is always the source of truth.
+_CLAIMED_HEAD_OID_LIMIT = 64
+_CLAIMED_BRANCH_LIMIT = 120
+
 NowFn = Callable[[], float]
 
 
@@ -314,9 +320,9 @@ def result_fingerprint(result: TaskResult) -> str:
 
 def _bounded_payload(result: TaskResult) -> str:
     payload = {
-        "branch": (result.branch or "")[:120],
+        "branch": (result.branch or "")[:_CLAIMED_BRANCH_LIMIT],
         "needs_human": bool(result.needs_human),
-        "snapshot_head_sha": result.snapshot_head_sha,
+        "snapshot_head_sha": (result.snapshot_head_sha or "")[:_CLAIMED_HEAD_OID_LIMIT],
         "status": result.status.value,
         "summary": (result.summary or "")[:_PAYLOAD_SUMMARY_LIMIT],
     }
@@ -643,8 +649,8 @@ def admit_completed_verification_job(
         "due_at": f"{due_at:.3f}",
         "grace_deadline": f"{grace_deadline:.3f}",
         "attempt_count": "0",
-        "claimed_head_oid": result.snapshot_head_sha,
-        "claimed_branch": result.branch or "",
+        "claimed_head_oid": (result.snapshot_head_sha or "")[:_CLAIMED_HEAD_OID_LIMIT],
+        "claimed_branch": (result.branch or "")[:_CLAIMED_BRANCH_LIMIT],
         "admission_fingerprint": decision.fingerprint,
     }
     flattened: list[str] = []
