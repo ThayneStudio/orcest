@@ -232,8 +232,8 @@ class RedisTestSupervisor:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"failed to discover published Redis port: {proc.stderr.strip()}")
-        line = proc.stdout.strip().splitlines()[-1]
         try:
+            line = proc.stdout.strip().splitlines()[-1]
             return int(line.rsplit(":", 1)[1])
         except (IndexError, ValueError) as exc:
             raise RuntimeError(f"unexpected `docker compose port` output: {proc.stdout!r}") from exc
