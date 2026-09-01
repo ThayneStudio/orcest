@@ -201,6 +201,19 @@ def test_replaying_same_idempotency_key_returns_stored_response(store: RunStore)
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_terminal_facts").fetchone()[0] == 1
 
 
+def test_replaying_same_body_with_different_principal_conflicts(store: RunStore) -> None:
+    _claim_activity(store)
+    idempotency_key = _uid()
+    _submit(store, idempotency_key=idempotency_key)
+
+    with pytest.raises(IdempotencyConflictError):
+        _submit(
+            store,
+            idempotency_key=idempotency_key,
+            authenticated_principal_id="other-pool-manager-principal",
+        )
+
+
 def test_reusing_idempotency_key_with_different_body_conflicts(store: RunStore) -> None:
     _claim_activity(store)
     idempotency_key = _uid()

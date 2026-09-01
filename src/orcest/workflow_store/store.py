@@ -11071,11 +11071,14 @@ class RunStore:
                 (pool_manager_id, report_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                if existing["payload_digest"] != req_digest:
-                    raise IdempotencyConflictError(
-                        "capacity report id/idempotency key was reused with different content"
-                    )
-                return self._capacity_report_result_from_row(existing, replayed=True)
+                if (
+                    existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["payload_digest"] == req_digest
+                ):
+                    return self._capacity_report_result_from_row(existing, replayed=True)
+                raise IdempotencyConflictError(
+                    "capacity report id/idempotency key was reused with different content"
+                )
 
             last_sequence = self.conn.execute(
                 "SELECT COALESCE(MAX(report_sequence), 0) AS seq FROM capacity_reports "
@@ -11317,11 +11320,14 @@ class RunStore:
                 (pool_manager_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                if existing["payload_digest"] != req_digest:
-                    raise IdempotencyConflictError(
-                        "worker loss report idempotency key was reused with different content"
-                    )
-                return self._worker_loss_report_result_from_row(existing, replayed=True)
+                if (
+                    existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["payload_digest"] == req_digest
+                ):
+                    return self._worker_loss_report_result_from_row(existing, replayed=True)
+                raise IdempotencyConflictError(
+                    "worker loss report idempotency key was reused with different content"
+                )
 
             attempt_row = self.conn.execute(
                 "SELECT * FROM attempts WHERE attempt_id = ? AND activity_id = ? "
@@ -11630,11 +11636,14 @@ class RunStore:
                 (budget_report_id,),
             ).fetchone()
             if existing is not None:
-                if existing["report_digest"] != req_digest:
-                    raise IdempotencyConflictError(
-                        "budget report id was reused with different content"
-                    )
-                return self._budget_report_result_from_row(existing, replayed=True)
+                if (
+                    existing["project_id"] == project_id
+                    and existing["accounting_scope_id"] == accounting_scope_id
+                    and existing["authenticated_principal_id"] == authenticated_principal_id
+                    and existing["report_digest"] == req_digest
+                ):
+                    return self._budget_report_result_from_row(existing, replayed=True)
+                raise IdempotencyConflictError("budget report id was reused with different content")
 
             revision_conflict = self.conn.execute(
                 "SELECT 1 FROM budget_reports WHERE project_id = ? AND accounting_scope_id = ? "

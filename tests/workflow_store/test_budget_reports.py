@@ -102,6 +102,21 @@ def test_replaying_same_budget_report_id_returns_stored_response(store: RunStore
     assert store.conn.execute("SELECT COUNT(*) FROM budget_reports").fetchone()[0] == 1
 
 
+def test_replaying_same_body_with_different_principal_conflicts(store: RunStore) -> None:
+    budget_report_id = _uid()
+    now = _now_ms()
+    fixed = dict(window_start_ms=now - 1_000, reset_at_ms=now + 3_600_000)
+    _submit(store, budget_report_id=budget_report_id, **fixed)
+
+    with pytest.raises(IdempotencyConflictError):
+        _submit(
+            store,
+            budget_report_id=budget_report_id,
+            authenticated_principal_id="other-budget-accounting-service",
+            **fixed,
+        )
+
+
 def test_reusing_budget_report_id_with_different_body_conflicts(store: RunStore) -> None:
     budget_report_id = _uid()
     _submit(store, budget_report_id=budget_report_id, consumed_microunits=1)

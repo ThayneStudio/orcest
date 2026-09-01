@@ -118,12 +118,16 @@ def test_replaying_same_report_id_and_body_returns_stored_response(store: RunSto
     idempotency_key = _uid()
     session_id = _uid()
     entries = [_session_entry(worker_session_id=session_id)]
+    observed_at_ms = _now_ms()
+    expires_at_ms = observed_at_ms + 60_000
 
     first = _submit(
         store,
         report_id=report_id,
         idempotency_key=idempotency_key,
         entries=entries,
+        observed_at_ms=observed_at_ms,
+        expires_at_ms=expires_at_ms,
     )
     assert first.replayed is False
 
@@ -133,8 +137,8 @@ def test_replaying_same_report_id_and_body_returns_stored_response(store: RunSto
         report_id=report_id,
         idempotency_key=idempotency_key,
         report_sequence=1,
-        observed_at_ms=first.accepted_at_ms,
-        expires_at_ms=first.accepted_at_ms + 60_000,
+        observed_at_ms=observed_at_ms,
+        expires_at_ms=expires_at_ms,
         configured_max_ttl_ms=300_000,
         entries=entries,
         authenticated_principal_id="pool-manager-principal",
@@ -145,6 +149,39 @@ def test_replaying_same_report_id_and_body_returns_stored_response(store: RunSto
     assert second.health_observations == first.health_observations
     assert store.conn.execute("SELECT COUNT(*) FROM capacity_reports").fetchone()[0] == 1
     assert store.conn.execute("SELECT COUNT(*) FROM health_observations").fetchone()[0] == 1
+
+
+def test_replaying_same_body_with_different_principal_conflicts(store: RunStore) -> None:
+    report_id = _uid()
+    idempotency_key = _uid()
+    session_id = _uid()
+    entries = [_session_entry(worker_session_id=session_id)]
+    observed_at_ms = _now_ms()
+    expires_at_ms = observed_at_ms + 60_000
+
+    _submit(
+        store,
+        report_id=report_id,
+        idempotency_key=idempotency_key,
+        entries=entries,
+        observed_at_ms=observed_at_ms,
+        expires_at_ms=expires_at_ms,
+    )
+
+    with pytest.raises(IdempotencyConflictError):
+        store.submit_capacity_report(
+            capacity_report_id=_uid(),
+            pool_manager_id=POOL_MANAGER_ID,
+            report_id=report_id,
+            idempotency_key=idempotency_key,
+            report_sequence=1,
+            observed_at_ms=observed_at_ms,
+            expires_at_ms=expires_at_ms,
+            configured_max_ttl_ms=300_000,
+            entries=entries,
+            authenticated_principal_id="other-pool-manager-principal",
+            authorization_context_digest="sha256:" + "1" * 64,
+        )
 
 
 def test_reusing_report_id_with_different_body_conflicts(store: RunStore) -> None:
