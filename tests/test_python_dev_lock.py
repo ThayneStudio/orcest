@@ -26,7 +26,7 @@ def test_makefile_dev_lock_targets_are_non_mutating_and_constrained() -> None:
     makefile = (_repo_root() / "Makefile").read_text()
 
     assert (
-        "lock:\n\tpip-compile pyproject.toml --output-file requirements.lock --strip-extras"
+        "lock:\n\t$(PIP_COMPILE_CMD) pyproject.toml --output-file requirements.lock --strip-extras"
         in makefile
     )
     assert "lock-dev:" in makefile

@@ -129,7 +129,7 @@ format:
 	ruff format src/ tests/
 
 lock:
-	pip-compile pyproject.toml --output-file requirements.lock --strip-extras
+	$(PIP_COMPILE_CMD) pyproject.toml --output-file requirements.lock --strip-extras
 
 lock-dev:
 	$(PIP_COMPILE_CMD) pyproject.toml --extra dev --all-build-deps --constraint requirements.lock --constraint requirements-dev-toolchain.txt --output-file requirements-dev.lock --strip-extras --allow-unsafe --no-header
