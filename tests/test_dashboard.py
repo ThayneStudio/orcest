@@ -2862,6 +2862,21 @@ exit 0
         assert "tar -C /app -xf - && $(1)" in text
         assert '-v "$$tmpdir:/app"' not in text
 
+    def test_dashboard_clean_copy_native_runner_avoids_docker_pull(self):
+        """CI can reuse setup-node's pinned Node instead of pulling Docker Hub."""
+        result = subprocess.run(
+            ["make", "-n", "check-dashboard-clean-copy", "DASHBOARD_CLEAN_COPY_RUNNER=native"],
+            cwd=self._repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert "tmpdir=$(mktemp -d)" in result.stdout
+        assert 'tar -C "$tmpdir" -xf -' in result.stdout
+        assert "npm run check:node" in result.stdout
+        assert "docker run" not in result.stdout
+
     def test_dashboard_tracked_guard_rejects_unstaged_edits(self, tmp_path):
         """Dashboard Make targets copy the working tree and deploy root compose
         files, so the guard must fail when tracked verification files have
