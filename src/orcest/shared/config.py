@@ -58,7 +58,6 @@ class PollingConfig:
 
 @dataclass
 class LabelConfig:
-    blocked: str = "orcest:blocked"
     needs_human: str = "orcest:needs-human"
     ready: str = "orcest:ready"
 
@@ -777,8 +776,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
 
     # Labels
     labels_raw = {k.replace("-", "_"): v for k, v in _safe_dict(raw, "labels").items()}
+    unsupported_label_keys = sorted(set(labels_raw) - {"needs_human", "ready"})
+    if unsupported_label_keys:
+        joined_keys = ", ".join(unsupported_label_keys)
+        raise ValueError(f"Unsupported labels config key(s): {joined_keys}")
     labels_config = LabelConfig(
-        blocked=_safe_str(labels_raw.get("blocked", "orcest:blocked"), "labels.blocked"),
         needs_human=_safe_str(
             labels_raw.get("needs_human", "orcest:needs-human"), "labels.needs_human"
         ),

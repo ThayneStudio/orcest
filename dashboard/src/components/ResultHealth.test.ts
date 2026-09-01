@@ -145,7 +145,7 @@ describe("ResultHealth", () => {
         result({
           result_id: "results:newest-failure",
           entry_id: newestEntryId,
-          status: "blocked",
+          status: "usage_exhausted",
           resource_id: "42",
           worker_id: "newest-worker",
           summary: "newest failure",
@@ -154,23 +154,16 @@ describe("ResultHealth", () => {
     }));
 
     expect(html).toContain("PR owner/repo #42");
-    expect(html).toContain("Blocked");
+    expect(html).toContain("Usage exhausted");
     expect(html).toContain(formatTimestampMs(resultTimestampMs(newestEntryId)));
     expect(html).toContain("newest-worker");
     expect(html).toContain("newest failure");
     expect(html).not.toContain("older-worker");
   });
 
-  it("does not call blocked or usage-exhausted attention results failures", () => {
+  it("does not call usage-exhausted attention results failures", () => {
     const html = renderToStaticMarkup(createElement(ResultHealth, {
       results: [
-        result({
-          result_id: "results:blocked",
-          entry_id: "1710000001000-0",
-          status: "blocked",
-          resource_id: "41",
-          summary: "blocked by policy",
-        }),
         result({
           result_id: "results:usage",
           entry_id: "1710000002000-0",

@@ -448,8 +448,6 @@ def _status_style(status: str) -> str:
         return "green"
     if s == "failed":
         return "red"
-    if s == "blocked":
-        return "yellow"
     if s == "usage_exhausted":
         return "magenta"
     return "white"

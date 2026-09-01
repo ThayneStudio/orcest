@@ -65,10 +65,10 @@ gh label list --repo OWNER/REPO --search orcest --json name --limit 20
 | Issue | Labels |
 |-------|--------|
 | Leaf, unblocked or blocked-by GitHub **work** issues | `orcest:ready` (+ type labels if the repo uses them) |
-| Leaf, waiting on a **non-issue** (funding, experiment, human decision) | `orcest:blocked` — only this case, and only after asking |
-| Epic / parent | no `orcest:ready`, no `orcest:blocked` |
+| Leaf, waiting on a **non-issue** (funding, experiment, human decision) | no `orcest:ready`; add it only after the prerequisite is satisfied |
+| Epic / parent | no `orcest:ready` |
 
-Blocked-by GitHub work issues: keep `orcest:ready`. The orchestrator defers while those blockers are open and enqueues on the next poll when they close. `orcest:blocked` is terminal and is not auto-cleared.
+Blocked-by GitHub work issues keep `orcest:ready`. The orchestrator defers while blockers are open and enqueues on the next poll when they close.
 
 **Generic mode** if `orcest:ready` is absent: native `--blocked-by` + body text. Pass **no** `orcest:*` flags. Do not create those labels unless the user asks.
 

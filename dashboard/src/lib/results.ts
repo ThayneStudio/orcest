@@ -9,8 +9,6 @@ export function resultStatusLabel(status: string): string {
       return "Completed";
     case "failed":
       return "Failed";
-    case "blocked":
-      return "Blocked";
     case "usage_exhausted":
       return "Usage exhausted";
     case "stale":
@@ -95,7 +93,6 @@ export function resultColumnForStatus(status: string): ResultColumn {
     case "completed":
       return "completed";
     case "failed":
-    case "blocked":
     case "usage_exhausted":
       return "failed";
     case "stale":

@@ -173,29 +173,8 @@ def test_multiple_actionable_issues(issue_gh_mock, fake_redis_client, label_conf
 
 
 # ---------------------------------------------------------------------------
-# Terminal labels
+# Terminal label
 # ---------------------------------------------------------------------------
-
-
-def test_skip_blocked_label(issue_gh_mock, fake_redis_client, label_config):
-    """An issue with orcest:blocked is classified as SKIP_LABELED."""
-    issue_gh_mock.return_value = [
-        _make_issue_data(
-            number=5,
-            labels=[{"name": label_config.ready}, {"name": label_config.blocked}],
-        ),
-    ]
-
-    results = discover_actionable_issues(
-        repo=REPO,
-        token=TOKEN,
-        redis=fake_redis_client,
-        label_config=label_config,
-    )
-
-    assert len(results) == 1
-    assert results[0].action == IssueAction.SKIP_LABELED
-    assert results[0].number == 5
 
 
 def test_skip_needs_human_label(issue_gh_mock, fake_redis_client, label_config):
@@ -486,7 +465,7 @@ def test_terminal_label_checked_before_lock(issue_gh_mock, fake_redis_client, la
     issue_gh_mock.return_value = [
         _make_issue_data(
             number=11,
-            labels=[{"name": label_config.blocked}],
+            labels=[{"name": label_config.needs_human}],
         ),
     ]
     # Also set a lock — the label check should short-circuit first

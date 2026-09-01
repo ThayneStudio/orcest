@@ -31,7 +31,7 @@ class IssueAction(str, Enum):
 
     ENQUEUE_IMPLEMENT = "enqueue_implement"
     SKIP_LOCKED = "skip_locked"
-    SKIP_LABELED = "skip_labeled"  # Terminal label (blocked/needs-human)
+    SKIP_LABELED = "skip_labeled"  # Terminal needs-human label
     SKIP_QUEUED = "skip_queued"  # Task already pending in queue
     SKIP_ACTIVE = "skip_active"  # Task in flight (attempts > 0, no terminal label)
     SKIP_MAX_ATTEMPTS = "skip_max_attempts"
@@ -120,7 +120,7 @@ def discover_actionable_issues(
 
     Filter cascade:
     1. Fetch issues with the `orcest:ready` label
-    2. Skip if terminal orcest label present (blocked/needs-human)
+    2. Skip if terminal `orcest:needs-human` label present
     3. Skip if Redis lock exists (worker in progress)
     4. Skip if usage-exhausted cooldown is active
     5. Skip if a nonterminal delivery-verification job holds the dispatch barrier
@@ -147,11 +147,6 @@ def discover_actionable_issues(
     issues = gh.list_labeled_issues(repo, label_config.ready, token)
     results: list[IssueState] = []
 
-    terminal_labels = {
-        label_config.blocked,
-        label_config.needs_human,
-    }
-
     # Cache of blocker issue states for the duration of this discovery cycle.
     # If 10 dependent issues all reference #5, we hit gh once.
     blocker_state_cache: dict[int, str] = {}
@@ -164,8 +159,8 @@ def discover_actionable_issues(
             name for lbl in (issue_data.get("labels") or []) if (name := lbl.get("name"))
         ]
 
-        # Skip if terminal orcest label present (blocked/needs-human)
-        if any(label in terminal_labels for label in issue_labels):
+        # Skip if human intervention is required.
+        if label_config.needs_human in issue_labels:
             results.append(
                 IssueState(
                     number=number,
