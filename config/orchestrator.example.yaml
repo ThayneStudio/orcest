@@ -29,7 +29,6 @@ runner:
   # model: opus
 
 labels:
-  blocked: "orcest:blocked"
   needs_human: "orcest:needs-human"
   ready: "orcest:ready"
 

@@ -1297,7 +1297,7 @@ def _merge_evidence_is_current(
         )
         return False
 
-    terminal_labels = {label_config.blocked, label_config.needs_human}
+    terminal_labels = {label_config.needs_human}
     try:
         review_snapshot = gh.get_review_snapshot(
             repo, pr_state.number, token, expected_head_sha=pr_state.head_sha
@@ -1440,7 +1440,7 @@ def _review_rerun_still_needed(
         )
         return False
 
-    terminal_labels = {label_config.blocked, label_config.needs_human}
+    terminal_labels = {label_config.needs_human}
     if snapshot.state != "OPEN" or snapshot.is_draft or set(snapshot.labels) & terminal_labels:
         logger.info(
             "PR #%d: review rerun skipped because action became obsolete: "
@@ -3143,7 +3143,6 @@ def _handle_result(
     - completed: clears issue attempt counter; PR attempts remain until the SHA changes
     - failed: retried automatically; needs-human is added ONLY when the worker
       explicitly reported a human-decision blocker (result.needs_human)
-    - blocked: adds blocked label
     - usage_exhausted: no label changes; resource resumes after cooldown
     """
     logger.info(
@@ -3704,21 +3703,7 @@ def _handle_result(
                 exc,
                 side_effect="label",
             )
-    elif result.status == ResultStatus.BLOCKED:
-        try:
-            _add_label(repo, resource_id, labels.blocked, token)
-            labeled = True
-        except Exception as exc:
-            _raise_or_abandon_github_side_effect(
-                redis,
-                result,
-                logger,
-                f"failed to add blocked label on {resource_label} #{resource_id}",
-                exc,
-                side_effect="label",
-            )
-
-    # Only post comments for non-success statuses (failures, blocked, etc.)
+    # Only post comments for non-success statuses.
     # Success is silent to avoid comment noise on PRs/issues.
     if result.status != ResultStatus.COMPLETED:
         safe_summary = result.summary[:500] if result.summary else ""
@@ -3741,19 +3726,6 @@ def _handle_result(
             body = (
                 f"**orcest** needs a human decision on this PR.\n\n"
                 f"The worker reported: {reason}\n\n"
-                f"{label_note}"
-            )
-        elif result.status == ResultStatus.BLOCKED:
-            label_note = (
-                f"Labeling as `{labels.blocked}` — waiting for external input."
-                if labeled
-                else f"Failed to add `{labels.blocked}` label — please triage manually."
-            )
-            body = (
-                f"**orcest** task `{result.task_id}` is blocked "
-                f"({result.duration_seconds}s, "
-                f"worker: {result.worker_id}).\n\n"
-                f"Summary: {safe_summary}\n\n"
                 f"{label_note}"
             )
         elif result.status == ResultStatus.USAGE_EXHAUSTED:
@@ -3803,7 +3775,7 @@ def _handle_result(
     # Clean up ProviderPool tracking. This unconditional trailing call is the
     # safety net guaranteeing the UUID -> identity mapping in
     # ProviderPool._task_identities does NOT leak for any non-USAGE_EXHAUSTED,
-    # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED, BLOCKED,
+    # non-rebake result path (SUCCEEDED/COMPLETED, needs_human FAILED,
     # transient, etc.). mark_exhausted already pops the mapping for exhausted
     # results, so task_completed is a no-op there (safe to call). The durable
     # task -> account mapping is cleared at the same boundary.

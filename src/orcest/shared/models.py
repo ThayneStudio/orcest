@@ -94,7 +94,6 @@ class TaskType(str, Enum):
 class ResultStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
-    BLOCKED = "blocked"
     USAGE_EXHAUSTED = "usage_exhausted"
     STALE = "stale"
 

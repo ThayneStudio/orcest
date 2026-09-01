@@ -438,7 +438,11 @@ describe("App DOM tab interactions", () => {
       snapshot: snapshot({
         recent_results: [
           recentResult({ status: "failed", result_id: "results:failed", entry_id: "2-0" }),
-          recentResult({ status: "blocked", result_id: "results:blocked", entry_id: "3-0" }),
+          recentResult({
+            status: "usage_exhausted",
+            result_id: "results:usage-exhausted",
+            entry_id: "3-0",
+          }),
           recentResult({ status: "completed", result_id: "results:completed", entry_id: "4-0" }),
         ],
       }),
@@ -452,11 +456,10 @@ describe("App DOM tab interactions", () => {
     })).toBeTruthy();
   });
 
-  it("names blocked and usage-exhausted Results badges without calling them failures", () => {
+  it("names usage-exhausted Results badges without calling them failures", () => {
     resetSnapshotState({
       snapshot: snapshot({
         recent_results: [
-          recentResult({ status: "blocked", result_id: "results:blocked", entry_id: "3-0" }),
           recentResult({
             status: "usage_exhausted",
             result_id: "results:usage-exhausted",
@@ -471,7 +474,7 @@ describe("App DOM tab interactions", () => {
     render(<App />);
 
     const resultsTab = screen.getByRole("tab", {
-      name: "Results 2 recent results need attention",
+      name: "Results 1 recent result needs attention",
     });
     expect(resultsTab.textContent?.toLowerCase()).not.toContain("failure");
   });

@@ -928,18 +928,11 @@ describe("Kanban", () => {
     expect(html).toContain(`${formatTimestampMs(resultTimestampMs(neutralEntryId))} - 1m 24s`);
   });
 
-  it("labels blocked and usage-exhausted result columns as needing attention", () => {
+  it("labels usage-exhausted results as needing attention", () => {
     const html = renderToStaticMarkup(
       createElement(Kanban, {
         snapshot: snapshot({
           recent_results: [
-            result({
-              result_id: "results:blocked",
-              entry_id: "1710000001000-0",
-              status: "blocked",
-              resource_id: "41",
-              summary: "blocked by policy",
-            }),
             result({
               result_id: "results:usage",
               entry_id: "1710000002000-0",
@@ -954,9 +947,7 @@ describe("Kanban", () => {
     );
 
     expect(html).toContain("Needs Attention");
-    expect(html).toContain("Blocked");
     expect(html).toContain("Usage exhausted");
-    expect(html).toContain("blocked by policy");
     expect(html).toContain("usage cap reached");
     expect(html).not.toContain("Failed / Blocked");
     expect(html).not.toMatch(/failures?/i);

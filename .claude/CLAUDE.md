@@ -73,15 +73,15 @@ make format
 ## Dashboard
 
 GitHub itself is the dashboard:
-- Labels: `orcest:ready`, `orcest:blocked`, `orcest:needs-human`
+- Labels: `orcest:ready`, `orcest:needs-human`
 - Comments on PRs/issues for status updates
 - `orcest status` CLI for system health
 
 ## Issue Dependencies
 
 Issues labeled `orcest:ready` with a still-open prerequisite are
-automatically deferred (no manual `orcest:blocked` needed). Two
-sources are checked (see `src/orcest/orchestrator/issue_deps.py` and
+automatically deferred. Two sources are checked (see
+`src/orcest/orchestrator/issue_deps.py` and
 `docs/issue-dependencies.md`); an open blocker in either defers:
 
 1. **GitHub-native blocked-by relationships** (issue sidebar /

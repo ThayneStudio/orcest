@@ -91,7 +91,6 @@ class PollingConfig:
 class LabelConfig:
     queued: str = "orcest:queued"
     in_progress: str = "orcest:in-progress"
-    blocked: str = "orcest:blocked"
     needs_human: str = "orcest:needs-human"
 
 
@@ -376,7 +375,6 @@ class TaskType(str, Enum):
 class ResultStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
-    BLOCKED = "blocked"
     USAGE_EXHAUSTED = "usage_exhausted"
 
 
@@ -1299,7 +1297,6 @@ def discover_actionable_prs(
     orcest_labels = {
         label_config.queued,
         label_config.in_progress,
-        label_config.blocked,
         label_config.needs_human,
     }
 
@@ -2026,7 +2023,6 @@ Create these labels in the target repository (manual or via `gh label create`):
 |-------|-------|-------------|
 | `orcest:queued` | `#0E8A16` (green) | Task queued for worker pickup |
 | `orcest:in-progress` | `#FBCA04` (yellow) | Worker actively processing |
-| `orcest:blocked` | `#D93F0B` (red) | Blocked on dependency or conflict |
 | `orcest:needs-human` | `#B60205` (dark red) | Requires human intervention |
 
 **Label lifecycle for a PR fix:**

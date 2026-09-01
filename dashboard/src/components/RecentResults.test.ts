@@ -85,25 +85,25 @@ describe("recent result filters", () => {
     const rows = [
       result("done", { status: "completed" }),
       result("failed", { status: "failed" }),
-      result("blocked", { status: "blocked" }),
+      result("unknown", { status: "cancelled" }),
       result("stale", { status: "stale" }),
     ];
 
     expect(recentResultFilterLabel("all")).toBe("All");
     expect(recentResultFilterLabel("failed")).toBe("Needs attention");
     expect(filterRecentResults(rows, "all").map((row) => row.result_id))
-      .toEqual(["done", "failed", "blocked", "stale"]);
+      .toEqual(["done", "failed", "unknown", "stale"]);
     expect(filterRecentResults(rows, "failed").map((row) => row.result_id))
-      .toEqual(["failed", "blocked"]);
+      .toEqual(["failed"]);
     expect(filterRecentResults(rows, "completed").map((row) => row.result_id))
       .toEqual(["done"]);
     expect(filterRecentResults(rows, "neutral").map((row) => row.result_id))
-      .toEqual(["stale"]);
+      .toEqual(["unknown", "stale"]);
     expect(recentResultFilterCounts(rows)).toEqual({
       all: 4,
       completed: 1,
-      failed: 2,
-      neutral: 1,
+      failed: 1,
+      neutral: 2,
     });
     expect(recentResultFilterCountLabel(2)).toBe("2");
     expect(recentResultFilterCountLabel(2, true)).toBe("2 loaded");
