@@ -6,6 +6,7 @@ leaves add feature tables and reducers on top of these primitives.
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -38,7 +39,9 @@ from orcest.workflow_contract.v1.digest import (
     request_digest,
     resolution_digest,
     response_digest,
+    review_assignment_digest,
     specification_digest,
+    subject_refs_digest,
     work_item_discovery_set_digest,
     workflow_blob_digest,
 )
@@ -56,7 +59,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -738,6 +741,128 @@ class ProjectRegistrationOperationResult:
         return canonical_json_text(body)
 
 
+@dataclass(frozen=True, slots=True)
+class ActivityReviewAssignmentRecord:
+    activity_id: str
+    assignment_kind: str
+    panel_round: int
+    role: str
+    subject_refs_digest: str
+    context_digest: str
+    assignment_digest: str
+    created_at_ms: int
+    reviewer_slot: str | None = None
+    adjudication_round: int | None = None
+    adjudicator_slot: str | None = None
+    disputed_finding_ids_digest: str | None = None
+    subject_refs: tuple[str, ...] = ()
+    disputed_finding_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityRecord:
+    activity_id: str
+    run_id: str
+    activity_ordinal: int
+    specification_generation: int
+    policy_hash: str
+    kind: str
+    execution_class: str
+    state: str
+    repair_cycle: int
+    recovery_cycle: int
+    strategy_index: int
+    rescue_epoch: int
+    created_transition_sequence: int
+    semantic_input_json: str
+    semantic_input_digest: str
+    idempotency_key: str
+    created_at_ms: int
+    updated_at_ms: int
+    candidate_id: str | None = None
+    forge_observation_id: str | None = None
+    change_request_head_observation_id: str | None = None
+    observed_change_request_head_json: str | None = None
+    role: str | None = None
+    recovery_tactic: str | None = None
+    recovery_evidence_id: str | None = None
+    slot: str | None = None
+    input_ref_json: str | None = None
+    review_assignment: ActivityReviewAssignmentRecord | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    attempt_id: str
+    activity_id: str
+    generation: int
+    state: str
+    protocol_version: str
+    worker_profile: str
+    offered_at_ms: int
+    claim_timeout_ms: int
+    claim_deadline_ms: int
+    created_at_ms: int
+    execution_profile_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    provider_account_ref: str | None = None
+    provider_family: str | None = None
+    model_family: str | None = None
+    classification_revision: str | None = None
+    provider_secret_ref: str | None = None
+    claimed_worker_id: str | None = None
+    claimed_worker_session_id: str | None = None
+    claimed_at_ms: int | None = None
+    execution_deadline_ms: int | None = None
+    capability_auth_expires_at_ms: int | None = None
+    last_liveness_observed_ms: int | None = None
+    attempt_capability_jti: str | None = None
+    attempt_capability_digest: str | None = None
+    attempt_capability_signing_key_id: str | None = None
+    attempt_capability_signature_algorithm: str | None = None
+    attempt_claim_id: str | None = None
+    launch_nonce_id: str | None = None
+    launch_capability_digest: str | None = None
+    launch_attestation_id: str | None = None
+    launch_capability_consumed_at_ms: int | None = None
+    terminal_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityReviewAssignmentInput:
+    """Typed review assignment input for a new ``REVIEW``/``ADJUDICATE`` Activity."""
+
+    assignment_kind: str
+    panel_round: int
+    role: str
+    context_digest: str
+    subject_refs: tuple[str, ...]
+    reviewer_slot: str | None = None
+    adjudication_round: int | None = None
+    adjudicator_slot: str | None = None
+    disputed_finding_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptOfferInput:
+    """Immutable execution assignment for a new generation's ``OFFERED`` Attempt."""
+
+    attempt_id: str
+    generation: int
+    protocol_version: str
+    worker_profile: str
+    offered_at_ms: int
+    claim_timeout_ms: int
+    execution_profile_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    provider_account_ref: str | None = None
+    provider_family: str | None = None
+    model_family: str | None = None
+    classification_revision: str | None = None
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -1301,6 +1426,124 @@ def _row_to_forge_observation(row: sqlite3.Row) -> ForgeObservationRecord:
         payload_digest=row["payload_digest"],
         observation_sequence=row["observation_sequence"],
         observed_at_ms=row["observed_at_ms"],
+    )
+
+
+def _row_to_activity(
+    row: sqlite3.Row, *, review_assignment: ActivityReviewAssignmentRecord | None = None
+) -> ActivityRecord:
+    return ActivityRecord(
+        activity_id=row["activity_id"],
+        run_id=row["run_id"],
+        activity_ordinal=row["activity_ordinal"],
+        specification_generation=row["specification_generation"],
+        policy_hash=row["policy_hash"],
+        kind=row["kind"],
+        execution_class=row["execution_class"],
+        state=row["state"],
+        candidate_id=row["candidate_id"],
+        forge_observation_id=row["forge_observation_id"],
+        change_request_head_observation_id=row["change_request_head_observation_id"],
+        observed_change_request_head_json=row["observed_change_request_head_json"],
+        role=row["role"],
+        repair_cycle=row["repair_cycle"],
+        recovery_cycle=row["recovery_cycle"],
+        strategy_index=row["strategy_index"],
+        recovery_tactic=row["recovery_tactic"],
+        recovery_evidence_id=row["recovery_evidence_id"],
+        rescue_epoch=row["rescue_epoch"],
+        created_transition_sequence=row["created_transition_sequence"],
+        semantic_input_json=row["semantic_input_json"],
+        semantic_input_digest=row["semantic_input_digest"],
+        idempotency_key=row["idempotency_key"],
+        slot=row["slot"],
+        input_ref_json=row["input_ref_json"],
+        created_at_ms=row["created_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
+        review_assignment=review_assignment,
+    )
+
+
+def _row_to_activity_review_assignment(
+    row: sqlite3.Row,
+    *,
+    subject_refs: tuple[str, ...] = (),
+    disputed_finding_ids: tuple[str, ...] = (),
+) -> ActivityReviewAssignmentRecord:
+    return ActivityReviewAssignmentRecord(
+        activity_id=row["activity_id"],
+        assignment_kind=row["assignment_kind"],
+        panel_round=row["panel_round"],
+        reviewer_slot=row["reviewer_slot"],
+        adjudication_round=row["adjudication_round"],
+        adjudicator_slot=row["adjudicator_slot"],
+        role=row["role"],
+        subject_refs_digest=row["subject_refs_digest"],
+        context_digest=row["context_digest"],
+        disputed_finding_ids_digest=row["disputed_finding_ids_digest"],
+        assignment_digest=row["assignment_digest"],
+        created_at_ms=row["created_at_ms"],
+        subject_refs=subject_refs,
+        disputed_finding_ids=disputed_finding_ids,
+    )
+
+
+def _review_assignment_digest_for_input(assignment: ActivityReviewAssignmentInput) -> str:
+    subject_refs_digest_value = subject_refs_digest(assignment.subject_refs)
+    disputed_digest_value = (
+        bare_canonical_digest(list(assignment.disputed_finding_ids))
+        if assignment.disputed_finding_ids
+        else None
+    )
+    return review_assignment_digest(
+        assignment_kind=assignment.assignment_kind,
+        panel_round=assignment.panel_round,
+        reviewer_slot=assignment.reviewer_slot,
+        adjudication_round=assignment.adjudication_round,
+        adjudicator_slot=assignment.adjudicator_slot,
+        role=assignment.role,
+        subject_refs_digest=subject_refs_digest_value,
+        context_digest=assignment.context_digest,
+        disputed_finding_ids_digest=disputed_digest_value,
+    )
+
+
+def _row_to_attempt(row: sqlite3.Row) -> AttemptRecord:
+    return AttemptRecord(
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        generation=row["generation"],
+        state=row["state"],
+        protocol_version=row["protocol_version"],
+        execution_profile_id=row["execution_profile_id"],
+        worker_profile=row["worker_profile"],
+        provider=row["provider"],
+        model=row["model"],
+        provider_account_ref=row["provider_account_ref"],
+        provider_family=row["provider_family"],
+        model_family=row["model_family"],
+        classification_revision=row["classification_revision"],
+        provider_secret_ref=row["provider_secret_ref"],
+        offered_at_ms=row["offered_at_ms"],
+        claim_timeout_ms=row["claim_timeout_ms"],
+        claim_deadline_ms=row["claim_deadline_ms"],
+        claimed_worker_id=row["claimed_worker_id"],
+        claimed_worker_session_id=row["claimed_worker_session_id"],
+        claimed_at_ms=row["claimed_at_ms"],
+        execution_deadline_ms=row["execution_deadline_ms"],
+        capability_auth_expires_at_ms=row["capability_auth_expires_at_ms"],
+        last_liveness_observed_ms=row["last_liveness_observed_ms"],
+        attempt_capability_jti=row["attempt_capability_jti"],
+        attempt_capability_digest=row["attempt_capability_digest"],
+        attempt_capability_signing_key_id=row["attempt_capability_signing_key_id"],
+        attempt_capability_signature_algorithm=row["attempt_capability_signature_algorithm"],
+        attempt_claim_id=row["attempt_claim_id"],
+        launch_nonce_id=row["launch_nonce_id"],
+        launch_capability_digest=row["launch_capability_digest"],
+        launch_attestation_id=row["launch_attestation_id"],
+        launch_capability_consumed_at_ms=row["launch_capability_consumed_at_ms"],
+        terminal_reason=row["terminal_reason"],
+        created_at_ms=row["created_at_ms"],
     )
 
 
@@ -2395,6 +2638,178 @@ CREATE TABLE IF NOT EXISTS projects (
   UNIQUE (forge_instance_id, repository_external_id),
   CHECK (source_read_secret_id != publication_secret_id)
 );
+
+CREATE TABLE IF NOT EXISTS activities (
+  activity_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  activity_ordinal INTEGER NOT NULL CHECK (activity_ordinal > 0),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
+  policy_hash TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("activity.kind"))})),
+  execution_class TEXT NOT NULL CHECK (
+    execution_class IN ({_sql_in(_enum_values("activity.execution_class"))})
+  ),
+  state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("activity.state"))})),
+  input_ref_json TEXT,
+  candidate_id TEXT,
+  forge_observation_id TEXT,
+  change_request_head_observation_id TEXT,
+  observed_change_request_head_json TEXT,
+  role TEXT,
+  repair_cycle INTEGER NOT NULL DEFAULT 0 CHECK (repair_cycle >= 0),
+  recovery_cycle INTEGER NOT NULL DEFAULT 0 CHECK (recovery_cycle >= 0),
+  strategy_index INTEGER NOT NULL DEFAULT 0 CHECK (strategy_index >= 0),
+  recovery_tactic TEXT,
+  recovery_evidence_id TEXT,
+  rescue_epoch INTEGER NOT NULL DEFAULT 0 CHECK (rescue_epoch >= 0),
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  semantic_input_json TEXT NOT NULL,
+  semantic_input_digest TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  slot TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  UNIQUE (run_id, activity_ordinal),
+  UNIQUE (run_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS activity_review_assignments (
+  activity_id TEXT PRIMARY KEY REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  assignment_kind TEXT NOT NULL CHECK (
+    assignment_kind IN ({_sql_in(_enum_values("activity_review_assignment.assignment_kind"))})
+  ),
+  panel_round INTEGER NOT NULL CHECK (panel_round > 0),
+  reviewer_slot TEXT,
+  adjudication_round INTEGER CHECK (adjudication_round IS NULL OR adjudication_round = 1),
+  adjudicator_slot TEXT,
+  role TEXT NOT NULL,
+  subject_refs_digest TEXT NOT NULL,
+  context_digest TEXT NOT NULL,
+  disputed_finding_ids_digest TEXT,
+  assignment_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (
+    (assignment_kind = 'REVIEW'
+      AND reviewer_slot IS NOT NULL
+      AND adjudication_round IS NULL AND adjudicator_slot IS NULL
+      AND disputed_finding_ids_digest IS NULL)
+    OR
+    (assignment_kind = 'ADJUDICATE'
+      AND reviewer_slot IS NULL
+      AND adjudication_round = 1 AND adjudicator_slot = 'default'
+      AND role = 'adjudicator'
+      AND disputed_finding_ids_digest IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS activity_review_subjects (
+  activity_id TEXT NOT NULL REFERENCES activity_review_assignments(activity_id) ON DELETE RESTRICT,
+  subject_ordinal INTEGER NOT NULL CHECK (subject_ordinal >= 0),
+  subject_ref TEXT NOT NULL,
+  PRIMARY KEY (activity_id, subject_ordinal),
+  UNIQUE (activity_id, subject_ref)
+);
+
+CREATE TABLE IF NOT EXISTS activity_adjudication_findings (
+  activity_id TEXT NOT NULL REFERENCES activity_review_assignments(activity_id) ON DELETE RESTRICT,
+  finding_ordinal INTEGER NOT NULL CHECK (finding_ordinal >= 0),
+  finding_id TEXT NOT NULL,
+  PRIMARY KEY (activity_id, finding_ordinal),
+  UNIQUE (activity_id, finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS attempts (
+  attempt_id TEXT PRIMARY KEY,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("attempt.state"))})),
+  protocol_version TEXT NOT NULL,
+  execution_profile_id TEXT,
+  worker_profile TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  provider_account_ref TEXT,
+  provider_family TEXT,
+  model_family TEXT,
+  classification_revision TEXT,
+  provider_secret_ref TEXT,
+  offered_at_ms INTEGER NOT NULL CHECK (offered_at_ms >= 0),
+  claim_timeout_ms INTEGER NOT NULL CHECK (claim_timeout_ms > 0),
+  claim_deadline_ms INTEGER NOT NULL CHECK (claim_deadline_ms > offered_at_ms),
+  claimed_worker_id TEXT,
+  claimed_worker_session_id TEXT,
+  claimed_at_ms INTEGER,
+  execution_deadline_ms INTEGER,
+  capability_auth_expires_at_ms INTEGER,
+  last_liveness_observed_ms INTEGER,
+  attempt_capability_jti TEXT,
+  attempt_capability_digest TEXT,
+  attempt_capability_signing_key_id TEXT,
+  attempt_capability_signature_algorithm TEXT,
+  attempt_claim_id TEXT,
+  launch_nonce_id TEXT,
+  launch_capability_digest TEXT,
+  launch_attestation_id TEXT,
+  launch_capability_consumed_at_ms INTEGER,
+  terminal_reason TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (activity_id, generation),
+  UNIQUE (attempt_id, activity_id, generation),
+  CHECK (
+    state != 'OFFERED'
+    OR (claimed_worker_id IS NULL AND claimed_worker_session_id IS NULL
+      AND claimed_at_ms IS NULL AND execution_deadline_ms IS NULL
+      AND capability_auth_expires_at_ms IS NULL
+      AND attempt_capability_jti IS NULL AND attempt_capability_digest IS NULL
+      AND attempt_capability_signing_key_id IS NULL
+      AND attempt_capability_signature_algorithm IS NULL
+      AND attempt_claim_id IS NULL AND provider_secret_ref IS NULL
+      AND terminal_reason IS NULL)
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_nonterminal_activity
+ON attempts(activity_id) WHERE state IN ('OFFERED', 'CLAIMED');
+
+CREATE TABLE IF NOT EXISTS attempt_claims (
+  attempt_claim_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  offer_outbox_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  worker_profile TEXT NOT NULL,
+  worker_build_revision TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL CHECK (claimed_at_ms >= 0),
+  execution_deadline_ms INTEGER NOT NULL CHECK (execution_deadline_ms > claimed_at_ms),
+  capability_auth_expires_at_ms INTEGER NOT NULL
+    CHECK (capability_auth_expires_at_ms > execution_deadline_ms),
+  attempt_capability_jti TEXT NOT NULL UNIQUE,
+  attempt_capability_digest TEXT NOT NULL,
+  attempt_capability_signing_key_id TEXT NOT NULL,
+  attempt_capability_signature_algorithm TEXT NOT NULL,
+  capability_key_registry_revision INTEGER NOT NULL CHECK (capability_key_registry_revision >= 0),
+  launch_nonce_id TEXT,
+  launch_capability_jti TEXT UNIQUE,
+  launch_capability_digest TEXT,
+  launch_capability_signing_key_id TEXT,
+  launch_capability_signature_algorithm TEXT,
+  source_access_kind TEXT NOT NULL CHECK (
+    source_access_kind IN ({_sql_in(_enum_values("attempt_claim.source_access_kind"))})
+  ),
+  source_read_secret_ref TEXT,
+  provider_secret_ref TEXT,
+  source_access_descriptor_json TEXT NOT NULL,
+  source_access_descriptor_digest TEXT NOT NULL,
+  response_contract_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (worker_session_id, attempt_claim_id),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation)
+);
 """
 
 _V1_TO_V2 = f"""
@@ -2739,7 +3154,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -2917,8 +3332,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 6
+            elif current == 6:
                 self.conn.executescript(
                     "BEGIN EXCLUSIVE;\n"
                     + _SCHEMA
@@ -2933,6 +3347,24 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-snapshot-admission",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                # A real version-7 database already has every table in its
+                # final v7 shape; _SCHEMA only needs to create the new
+                # activities/attempts/attempt_claims tables (all CREATE TABLE
+                # IF NOT EXISTS).
+                assert current == 7
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-durable-activity-attempts",
                         _now_ms(),
                     ),
                 )
@@ -7633,6 +8065,492 @@ class RunStore:
         ).fetchone()
         assert row is not None
         return _row_to_source_record(row)
+
+    def create_activity(
+        self,
+        *,
+        activity_id: str,
+        run_id: str,
+        activity_ordinal: int,
+        specification_generation: int,
+        policy_hash: str,
+        kind: str,
+        execution_class: str,
+        state: str,
+        created_transition_sequence: int,
+        semantic_input: Any,
+        semantic_input_digest: str,
+        idempotency_key: str,
+        candidate_id: str | None = None,
+        forge_observation_id: str | None = None,
+        role: str | None = None,
+        repair_cycle: int = 0,
+        recovery_cycle: int = 0,
+        strategy_index: int = 0,
+        recovery_tactic: str | None = None,
+        recovery_evidence_id: str | None = None,
+        rescue_epoch: int = 0,
+        slot: str | None = None,
+        review_assignment: ActivityReviewAssignmentInput | None = None,
+        attempt: AttemptOfferInput | None = None,
+        outbox_id: str | None = None,
+        outbox_destination: str | None = None,
+        outbox_protocol_version: str | None = None,
+    ) -> tuple[ActivityRecord, AttemptRecord | None, OutboxRecord | None]:
+        """Durably create one Activity, its optional Review Assignment, and optional offer.
+
+        When ``attempt`` is given, the ``OFFERED`` Attempt and its dispatch
+        Outbox row commit in the same transaction as the Activity (and its
+        Review Assignment/subject/finding memberships, when given) -- the
+        "plan before dispatch" invariant. Replaying with the same
+        ``(run_id, idempotency_key)`` and identical content returns the
+        already-committed Activity unchanged; different content is a
+        conflict.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("activity.kind", kind)
+        enums.parse_enum("activity.execution_class", execution_class)
+        enums.parse_enum("activity.state", state)
+        semantic_input_json = _require_json_text(semantic_input)
+        if review_assignment is not None:
+            enums.parse_enum(
+                "activity_review_assignment.assignment_kind", review_assignment.assignment_kind
+            )
+            if review_assignment.assignment_kind != kind:
+                raise ValueError("review_assignment.assignment_kind must equal Activity.kind")
+            if review_assignment.role != role:
+                raise ValueError("review_assignment.role must equal Activity.role")
+        if attempt is not None and attempt.generation != 1:
+            raise ValueError("create_activity only offers the first Attempt generation")
+        if attempt is not None and outbox_id is None:
+            raise ValueError("outbox_id is required whenever attempt is given")
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_activity(existing)
+                if (
+                    record.activity_id != activity_id
+                    or record.activity_ordinal != activity_ordinal
+                    or record.specification_generation != specification_generation
+                    or record.policy_hash != policy_hash
+                    or record.kind != kind
+                    or record.execution_class != execution_class
+                    or record.state != state
+                    or record.candidate_id != candidate_id
+                    or record.forge_observation_id != forge_observation_id
+                    or record.role != role
+                    or record.repair_cycle != repair_cycle
+                    or record.recovery_cycle != recovery_cycle
+                    or record.strategy_index != strategy_index
+                    or record.recovery_tactic != recovery_tactic
+                    or record.recovery_evidence_id != recovery_evidence_id
+                    or record.rescue_epoch != rescue_epoch
+                    or record.slot != slot
+                    or record.semantic_input_json != semantic_input_json
+                    or record.semantic_input_digest != semantic_input_digest
+                    or record.created_transition_sequence != created_transition_sequence
+                ):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                existing_assignment = self._get_activity_review_assignment(record.activity_id)
+                if (existing_assignment is None) != (review_assignment is None):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                if (
+                    existing_assignment is not None
+                    and review_assignment is not None
+                    and existing_assignment.assignment_digest
+                    != _review_assignment_digest_for_input(review_assignment)
+                ):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                existing_attempt_row = self.conn.execute(
+                    "SELECT * FROM attempts WHERE activity_id = ? ORDER BY generation DESC LIMIT 1",
+                    (record.activity_id,),
+                ).fetchone()
+                existing_attempt = (
+                    _row_to_attempt(existing_attempt_row)
+                    if existing_attempt_row is not None
+                    else None
+                )
+                if (existing_attempt is None) != (attempt is None):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                if (
+                    existing_attempt is not None
+                    and attempt is not None
+                    and (
+                        existing_attempt.attempt_id,
+                        existing_attempt.generation,
+                        existing_attempt.protocol_version,
+                        existing_attempt.execution_profile_id,
+                        existing_attempt.worker_profile,
+                        existing_attempt.provider,
+                        existing_attempt.model,
+                        existing_attempt.provider_account_ref,
+                        existing_attempt.provider_family,
+                        existing_attempt.model_family,
+                        existing_attempt.classification_revision,
+                        existing_attempt.offered_at_ms,
+                        existing_attempt.claim_timeout_ms,
+                    )
+                    != (
+                        attempt.attempt_id,
+                        attempt.generation,
+                        attempt.protocol_version,
+                        attempt.execution_profile_id,
+                        attempt.worker_profile,
+                        attempt.provider,
+                        attempt.model,
+                        attempt.provider_account_ref,
+                        attempt.provider_family,
+                        attempt.model_family,
+                        attempt.classification_revision,
+                        attempt.offered_at_ms,
+                        attempt.claim_timeout_ms,
+                    )
+                ):
+                    raise IdempotencyConflictError(
+                        "activity idempotency_key was reused with different content"
+                    )
+                return (
+                    dataclasses.replace(record, review_assignment=existing_assignment),
+                    existing_attempt,
+                    None,
+                )
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO activities(activity_id, run_id, activity_ordinal, "
+                "specification_generation, policy_hash, kind, execution_class, state, "
+                "input_ref_json, candidate_id, forge_observation_id, "
+                "change_request_head_observation_id, observed_change_request_head_json, role, "
+                "repair_cycle, recovery_cycle, strategy_index, recovery_tactic, "
+                "recovery_evidence_id, rescue_epoch, created_transition_sequence, "
+                "semantic_input_json, semantic_input_digest, idempotency_key, slot, "
+                "created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?)",
+                (
+                    activity_id,
+                    run_id,
+                    activity_ordinal,
+                    specification_generation,
+                    policy_hash,
+                    kind,
+                    execution_class,
+                    state,
+                    candidate_id,
+                    forge_observation_id,
+                    role,
+                    repair_cycle,
+                    recovery_cycle,
+                    strategy_index,
+                    recovery_tactic,
+                    recovery_evidence_id,
+                    rescue_epoch,
+                    created_transition_sequence,
+                    semantic_input_json,
+                    semantic_input_digest,
+                    idempotency_key,
+                    slot,
+                    now,
+                    now,
+                ),
+            )
+            assignment_record = None
+            if review_assignment is not None:
+                assignment_record = self._insert_activity_review_assignment(
+                    activity_id=activity_id, assignment=review_assignment, now_ms=now
+                )
+            attempt_record = None
+            outbox_record = None
+            if attempt is not None:
+                assert outbox_id is not None
+                attempt_record = self._insert_attempt_row(activity_id=activity_id, offer=attempt)
+                outbox_record = self._insert_activity_offer_outbox(
+                    outbox_id=outbox_id,
+                    activity_id=activity_id,
+                    attempt=attempt_record,
+                    destination=outbox_destination or f"activity-offer/1/{attempt.worker_profile}",
+                    protocol_version=outbox_protocol_version or attempt.protocol_version,
+                )
+            row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            assert row is not None
+            return (
+                _row_to_activity(row, review_assignment=assignment_record),
+                (attempt_record),
+                outbox_record,
+            )
+
+    def create_next_attempt(
+        self,
+        *,
+        activity_id: str,
+        prior_attempt_terminal_state: str,
+        offer: AttemptOfferInput,
+        outbox_id: str,
+        outbox_destination: str | None = None,
+        outbox_protocol_version: str | None = None,
+    ) -> tuple[AttemptRecord, OutboxRecord]:
+        """Terminalize the current generation and atomically offer ``g + 1``.
+
+        Only one nonterminal Attempt may exist per Activity; the caller
+        supplies the exact terminal state (``FAILED``, ``ABSTAINED``,
+        ``EXPIRED``, or ``SUPERSEDED``) the prior generation already reduced
+        to before this call, and this method fences the write on that prior
+        generation having actually reduced to that exact state in storage.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        if prior_attempt_terminal_state not in {"FAILED", "ABSTAINED", "EXPIRED", "SUPERSEDED"}:
+            raise ValueError("prior_attempt_terminal_state must be a closed terminal Attempt state")
+        with self.transaction():
+            prior = self.conn.execute(
+                "SELECT * FROM attempts WHERE activity_id = ? ORDER BY generation DESC LIMIT 1",
+                (activity_id,),
+            ).fetchone()
+            if prior is None:
+                raise RunStoreError(f"activity {activity_id!r} has no prior Attempt")
+            if int(prior["generation"]) != offer.generation - 1:
+                raise CasMismatchError("create_next_attempt generation is not the successor")
+            if prior["state"] in {"OFFERED", "CLAIMED"}:
+                raise CasMismatchError(
+                    "prior Attempt generation is still nonterminal; terminalize it first"
+                )
+            if prior["state"] != prior_attempt_terminal_state:
+                raise CasMismatchError(
+                    "prior_attempt_terminal_state does not match the prior Attempt's actual "
+                    f"terminal state ({prior['state']!r})"
+                )
+            attempt_record = self._insert_attempt_row(activity_id=activity_id, offer=offer)
+            outbox_record = self._insert_activity_offer_outbox(
+                outbox_id=outbox_id,
+                activity_id=activity_id,
+                attempt=attempt_record,
+                destination=outbox_destination or f"activity-offer/1/{offer.worker_profile}",
+                protocol_version=outbox_protocol_version or offer.protocol_version,
+            )
+            return attempt_record, outbox_record
+
+    def _insert_attempt_row(self, *, activity_id: str, offer: AttemptOfferInput) -> AttemptRecord:
+        require_lowercase_uuid(offer.attempt_id, field="attempt_id")
+        claim_deadline_ms = offer.offered_at_ms + offer.claim_timeout_ms
+        now = _now_ms()
+        self.conn.execute(
+            "INSERT INTO attempts(attempt_id, activity_id, generation, state, "
+            "protocol_version, execution_profile_id, worker_profile, provider, model, "
+            "provider_account_ref, provider_family, model_family, classification_revision, "
+            "offered_at_ms, claim_timeout_ms, claim_deadline_ms, created_at_ms) "
+            "VALUES (?, ?, ?, 'OFFERED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                offer.attempt_id,
+                activity_id,
+                offer.generation,
+                offer.protocol_version,
+                offer.execution_profile_id,
+                offer.worker_profile,
+                offer.provider,
+                offer.model,
+                offer.provider_account_ref,
+                offer.provider_family,
+                offer.model_family,
+                offer.classification_revision,
+                offer.offered_at_ms,
+                offer.claim_timeout_ms,
+                claim_deadline_ms,
+                now,
+            ),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM attempts WHERE attempt_id = ?", (offer.attempt_id,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_attempt(row)
+
+    def _insert_activity_offer_outbox(
+        self,
+        *,
+        outbox_id: str,
+        activity_id: str,
+        attempt: AttemptRecord,
+        destination: str,
+        protocol_version: str,
+    ) -> OutboxRecord:
+        payload = {
+            "outbox_id": outbox_id,
+            "attempt_id": attempt.attempt_id,
+            "activity_id": activity_id,
+            "generation": attempt.generation,
+            "worker_profile": attempt.worker_profile,
+            "claim_deadline_ms": attempt.claim_deadline_ms,
+        }
+        return self.insert_outbox(
+            outbox_id=outbox_id,
+            source_kind="ACTIVITY",
+            source_id=activity_id,
+            destination=destination,
+            protocol_version=protocol_version,
+            payload_digest=request_digest(payload),
+            payload=payload,
+            next_delivery_at_ms=attempt.offered_at_ms,
+            attempt_id=attempt.attempt_id,
+            attempt_generation=attempt.generation,
+        )
+
+    def _insert_activity_review_assignment(
+        self,
+        *,
+        activity_id: str,
+        assignment: ActivityReviewAssignmentInput,
+        now_ms: int,
+    ) -> ActivityReviewAssignmentRecord:
+        subject_refs_digest_value = subject_refs_digest(assignment.subject_refs)
+        disputed_digest_value = (
+            bare_canonical_digest(list(assignment.disputed_finding_ids))
+            if assignment.disputed_finding_ids
+            else None
+        )
+        assignment_digest_value = _review_assignment_digest_for_input(assignment)
+        self.conn.execute(
+            "INSERT INTO activity_review_assignments(activity_id, assignment_kind, panel_round, "
+            "reviewer_slot, adjudication_round, adjudicator_slot, role, subject_refs_digest, "
+            "context_digest, disputed_finding_ids_digest, assignment_digest, created_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                activity_id,
+                assignment.assignment_kind,
+                assignment.panel_round,
+                assignment.reviewer_slot,
+                assignment.adjudication_round,
+                assignment.adjudicator_slot,
+                assignment.role,
+                subject_refs_digest_value,
+                assignment.context_digest,
+                disputed_digest_value,
+                assignment_digest_value,
+                now_ms,
+            ),
+        )
+        for ordinal, subject_ref in enumerate(assignment.subject_refs):
+            self.conn.execute(
+                "INSERT INTO activity_review_subjects(activity_id, subject_ordinal, subject_ref) "
+                "VALUES (?, ?, ?)",
+                (activity_id, ordinal, subject_ref),
+            )
+        for ordinal, finding_id in enumerate(assignment.disputed_finding_ids):
+            self.conn.execute(
+                "INSERT INTO activity_adjudication_findings"
+                "(activity_id, finding_ordinal, finding_id) VALUES (?, ?, ?)",
+                (activity_id, ordinal, finding_id),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM activity_review_assignments WHERE activity_id = ?", (activity_id,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_activity_review_assignment(
+            row,
+            subject_refs=tuple(assignment.subject_refs),
+            disputed_finding_ids=tuple(assignment.disputed_finding_ids),
+        )
+
+    def _get_activity_review_assignment(
+        self, activity_id: str
+    ) -> ActivityReviewAssignmentRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM activity_review_assignments WHERE activity_id = ?", (activity_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        subject_rows = self.conn.execute(
+            "SELECT subject_ref FROM activity_review_subjects "
+            "WHERE activity_id = ? ORDER BY subject_ordinal",
+            (activity_id,),
+        ).fetchall()
+        finding_rows = self.conn.execute(
+            "SELECT finding_id FROM activity_adjudication_findings "
+            "WHERE activity_id = ? ORDER BY finding_ordinal",
+            (activity_id,),
+        ).fetchall()
+        return _row_to_activity_review_assignment(
+            row,
+            subject_refs=tuple(r["subject_ref"] for r in subject_rows),
+            disputed_finding_ids=tuple(r["finding_id"] for r in finding_rows),
+        )
+
+    def get_activity(self, activity_id: str) -> ActivityRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_activity(
+            row, review_assignment=self._get_activity_review_assignment(activity_id)
+        )
+
+    def get_attempt(self, attempt_id: str) -> AttemptRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return None if row is None else _row_to_attempt(row)
+
+    def list_open_activity_offers(self) -> list[tuple[AttemptRecord, OutboxRecord]]:
+        """Every current, unexpired ``OFFERED`` Attempt with its dispatch Outbox row.
+
+        This is exactly the durable set Redis reconstruction must republish
+        (never a ``CLAIMED`` Attempt, which is not schedulable work).
+        """
+        now = _now_ms()
+        rows = self.conn.execute(
+            "SELECT attempts.*, outbox.outbox_id AS outbox_row_id FROM attempts "
+            "JOIN outbox ON outbox.attempt_id = attempts.attempt_id "
+            "AND outbox.attempt_generation = attempts.generation "
+            "WHERE attempts.state = 'OFFERED' AND attempts.claim_deadline_ms > ? "
+            "AND outbox.source_kind = 'ACTIVITY'",
+            (now,),
+        ).fetchall()
+        results: list[tuple[AttemptRecord, OutboxRecord]] = []
+        for row in rows:
+            attempt_record = _row_to_attempt(row)
+            outbox_row = self.conn.execute(
+                "SELECT * FROM outbox WHERE outbox_id = ?", (row["outbox_row_id"],)
+            ).fetchone()
+            assert outbox_row is not None
+            results.append((attempt_record, _row_to_outbox(outbox_row)))
+        return results
+
+    def get_outbox(self, outbox_id: str) -> OutboxRecord | None:
+        row = self.conn.execute("SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
+        return None if row is None else _row_to_outbox(row)
+
+    def list_pending_activity_offers(self, *, limit: int = 100) -> list[OutboxRecord]:
+        """Due ``PENDING`` ``ACTIVITY``-sourced Outbox rows, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' AND state = 'PENDING' "
+            "ORDER BY next_delivery_at_ms LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_outbox(row) for row in rows]
+
+    def mark_outbox_redis_delivered(
+        self, outbox_id: str, *, redis_epoch: int, redis_entry_id: str
+    ) -> None:
+        """Record a successful Redis append. Safe to call again on republish/reconstruction."""
+        cur = self.conn.execute(
+            "UPDATE outbox SET state = 'DELIVERED', delivery_count = delivery_count + 1, "
+            "last_redis_epoch = ?, last_redis_entry = ? WHERE outbox_id = ?",
+            (redis_epoch, redis_entry_id, outbox_id),
+        )
+        if cur.rowcount != 1:
+            raise RunStoreError(f"outbox {outbox_id!r} was not found")
 
     def insert_outbox(
         self,

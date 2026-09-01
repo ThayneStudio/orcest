@@ -769,4 +769,23 @@ register_envelope("orcest.diagnosis/1", {})
 register_envelope("orcest.redundant-publication-cleanup/1", {})
 register_envelope("orcest.run-marker-repair/1", {})
 register_envelope(FORGE_OBSERVATION_REQUEST_PROTOCOL, {})
-register_envelope("orcest.activity-offer/1", {}, protocol_field="protocol")
+
+
+# ---------------------------------------------------------------------------
+# Redis activity offer (worker-protocol.md "Redis activity offer")
+# ---------------------------------------------------------------------------
+
+register_envelope(
+    "orcest.activity-offer/1",
+    {
+        "protocol_version": Field(enum=frozenset({"1"})),
+        "redis_epoch": Field(validator=_is_positive_int),
+        "outbox_id": Field(validator=_is_uuid),
+        "attempt_id": Field(validator=_is_uuid),
+        "activity_id": Field(validator=_is_uuid),
+        "generation": Field(validator=_is_positive_int),
+        "worker_profile": Field(validator=_is_nonempty_str),
+        "claim_deadline_ms": Field(validator=_is_nonneg_int),
+    },
+    protocol_field="protocol",
+)
