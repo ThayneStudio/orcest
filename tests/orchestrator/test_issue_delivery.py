@@ -289,6 +289,48 @@ def test_atomic_job_and_due_index_and_replay(fake_redis_client):
     assert job.expected_head_owner == "owner"
 
 
+def test_oversized_provider_echo_is_bounded_in_admission_and_job(fake_redis_client):
+    oversized_oid = "f" * 5000
+    oversized_branch = "b" * 5000
+    result = _result(snapshot_head_sha=oversized_oid, branch=oversized_branch)
+    _publish(fake_redis_client, result.task_id, oversized_branch)
+    decision = admit_issue_result(fake_redis_client, REPO, result, now=lambda: 1_000.0)
+    assert decision.kind is AdmissionKind.ADMITTED
+
+    admission = get_admission(fake_redis_client, result.task_id)
+    assert admission is not None
+    payload = json.loads(admission.payload)
+    assert len(payload["snapshot_head_sha"]) == 64
+    assert payload["snapshot_head_sha"] == oversized_oid[:64]
+    assert len(payload["branch"]) == 120
+    assert payload["branch"] == oversized_branch[:120]
+
+    created = admit_completed_verification_job(
+        fake_redis_client, REPO, result, decision, _config(), now=lambda: 1_000.0
+    )
+    assert created is True
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, decision.generation)
+    assert job is not None
+    assert len(job.claimed_head_oid) == 64
+    assert job.claimed_head_oid == oversized_oid[:64]
+    assert len(job.claimed_branch) == 120
+    assert job.claimed_branch == oversized_branch[:120]
+
+
+def test_normal_oid_and_branch_are_unchanged_by_bounding(fake_redis_client):
+    result = _admit_completed(fake_redis_client)
+    admission = get_admission(fake_redis_client, result.task_id)
+    assert admission is not None
+    payload = json.loads(admission.payload)
+    assert payload["snapshot_head_sha"] == OID
+    assert payload["branch"] == BRANCH
+
+    job = get_verification_job(fake_redis_client, REPO, ISSUE, 1)
+    assert job is not None
+    assert job.claimed_head_oid == OID
+    assert job.claimed_branch == BRANCH
+
+
 def test_job_admission_mismatch_is_quarantined(fake_redis_client):
     first = _result(task_id="legacy-task-1", branch="")
     first_decision = admit_issue_result(fake_redis_client, REPO, first, now=lambda: 1_000.0)
