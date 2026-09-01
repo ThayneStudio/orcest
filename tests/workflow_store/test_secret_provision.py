@@ -664,3 +664,38 @@ def test_fail_secret_provision_operation_rejects_accept_time_codes(
             rejection_code="CAS_LOST",
             failure_evidence_digest="sha256:" + "d" * 64,
         )
+
+
+def test_record_retry_checkpoint_rejects_non_retryable_failure_codes(
+    run_store: RunStore, secret_store: SecretStore
+) -> None:
+    _select_capability_key(run_store)
+    secret_id = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+    staging = secret_store.stage(b"whatever")
+    run_store.begin_secret_provision_operation(
+        secret_provision_operation_id=op_id,
+        mode="PROVISION",
+        secret_id=secret_id,
+        expected_prior_version=None,
+        purpose="FORGE_API",
+        owner_scope_kind="FORGE_INSTALLATION",
+        owner_scope_id=INSTALLATION,
+        provider_account_ref=INSTALLATION,
+        authenticated_principal_id=PRINCIPAL,
+        authorization_context_digest=AUTHZ_DIGEST,
+        secret_store_staging_receipt_id=staging.staging_id,
+        secret_integrity_attestation_id=staging.attestation_id,
+    )
+    with pytest.raises(ValueError, match="retryable failure"):
+        run_store.record_secret_provision_retry_checkpoint(
+            secret_provision_operation_id=op_id,
+            phase="VERIFY_STAGING",
+            failure_code="CAS_LOST",
+            failure_evidence_digest="sha256:" + "e" * 64,
+            next_retry_ms=1_000,
+        )
+    still_pending = run_store.get_secret_provision_operation(op_id)
+    assert still_pending is not None
+    assert still_pending.state == "PENDING"
+    assert run_store.list_secret_provision_checkpoints(op_id) == []
