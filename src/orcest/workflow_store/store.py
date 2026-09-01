@@ -10015,9 +10015,10 @@ class RunStore:
             raise CasMismatchError("validated candidate upload staged bytes changed")
 
         promoted: CandidateUploadRecord | None = None
+        expired_during_promotion = False
 
         def reference(record: Any) -> None:
-            nonlocal promoted
+            nonlocal promoted, expired_during_promotion
             with self.transaction():
                 row = self.conn.execute(
                     "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
@@ -10034,23 +10035,26 @@ class RunStore:
                     ).fetchone()
                     assert expired_row is not None
                     promoted = _row_to_candidate_upload(expired_row)
-                    raise _CandidateUploadExpiredDuringPromotion
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO artifact_objects(bundle_digest, storage_key, "
-                    "byte_length, installed_at_ms) VALUES (?, ?, ?, ?)",
-                    (record.bundle_digest, record.storage_key, record.byte_length, now),
-                )
-                self.conn.execute(
-                    "UPDATE candidate_uploads SET state = 'PROMOTED', "
-                    "artifact_bundle_digest = ?, artifact_storage_key = ?, promoted_at_ms = ?, "
-                    "updated_at_ms = ? WHERE upload_id = ? AND state = 'VALIDATED'",
-                    (record.bundle_digest, record.storage_key, now, now, upload_id),
-                )
-                updated = self.conn.execute(
-                    "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
-                ).fetchone()
-                assert updated is not None
-                promoted = _row_to_candidate_upload(updated)
+                    expired_during_promotion = True
+                else:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO artifact_objects(bundle_digest, storage_key, "
+                        "byte_length, installed_at_ms) VALUES (?, ?, ?, ?)",
+                        (record.bundle_digest, record.storage_key, record.byte_length, now),
+                    )
+                    self.conn.execute(
+                        "UPDATE candidate_uploads SET state = 'PROMOTED', "
+                        "artifact_bundle_digest = ?, artifact_storage_key = ?, promoted_at_ms = ?, "
+                        "updated_at_ms = ? WHERE upload_id = ? AND state = 'VALIDATED'",
+                        (record.bundle_digest, record.storage_key, now, now, upload_id),
+                    )
+                    updated = self.conn.execute(
+                        "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                    ).fetchone()
+                    assert updated is not None
+                    promoted = _row_to_candidate_upload(updated)
+            if expired_during_promotion:
+                raise _CandidateUploadExpiredDuringPromotion
 
         try:
             candidate_store.promote_staged_with_reference(

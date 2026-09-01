@@ -303,6 +303,11 @@ def test_mid_promotion_expiry_discards_staged_bundle_and_created_object(
     assert not object_file.exists()
     assert store.conn.execute("SELECT COUNT(*) FROM artifact_objects").fetchone()[0] == 0
 
+    persisted = store.get_candidate_upload(UPLOAD_ID)
+    assert persisted is not None
+    assert persisted.state == "EXPIRED"
+    assert persisted.incoming_path is None
+
 
 def test_corrupt_wrong_base_and_wrong_repository_uploads_do_not_promote(
     stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
