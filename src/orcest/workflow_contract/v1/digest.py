@@ -98,6 +98,11 @@ __all__ = [
     "forge_observation_payload_digest",
     "forge_observation_result_membership_digest",
     "forge_request_failure_fact_digest",
+    "capacity_report_digest",
+    "health_observation_payload_digest",
+    "worker_loss_report_digest",
+    "attempt_terminal_fact_digest",
+    "budget_report_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -430,6 +435,36 @@ def forge_request_failure_fact_digest(fields: Mapping[str, Any]) -> str:
     """Digest of a Forge Request Failure Fact's complete normalized fields
     (``fact_digest``, domain-model.md "Forge Request Failure Fact")."""
     return generic_domain_digest("orcest-forge-request-failure-fact-v1", fields)
+
+
+def capacity_report_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Capacity Report's complete canonical request body
+    (``payload_digest``, domain-model.md "Capacity Report")."""
+    return generic_domain_digest("orcest-capacity-report-v1", fields)
+
+
+def health_observation_payload_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Health Observation's bounded normalized non-secret health
+    fields (``payload_digest``, domain-model.md "Health Observation")."""
+    return generic_domain_digest("orcest-health-observation-payload-v1", fields)
+
+
+def worker_loss_report_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Worker Loss Report's canonical request
+    (``payload_digest``, domain-model.md "Worker Loss Report")."""
+    return generic_domain_digest("orcest-worker-loss-report-v1", fields)
+
+
+def attempt_terminal_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of an Attempt Terminal Fact's normalized immutable fields
+    (``fact_digest``, domain-model.md "Attempt Terminal Fact")."""
+    return generic_domain_digest("orcest-attempt-terminal-fact-v1", fields)
+
+
+def budget_report_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Budget Report's complete immutable fields, including both
+    controller times (``report_digest``, domain-model.md "Budget Report")."""
+    return generic_domain_digest("orcest-budget-report-v1", fields)
 
 
 def affected_run_ids_digest(member_rows: Sequence[Mapping[str, Any]]) -> str:
