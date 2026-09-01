@@ -15,6 +15,7 @@ from orcest.workflow_store import (
     RunStore,
     StorageLock,
     activity_offer_protocol,
+    store as store_module,
 )
 from orcest.workflow_store.v1.candidates import CandidateObjectStore
 
@@ -136,6 +137,23 @@ def _claimed_build_attempt(store: RunStore) -> None:
             "WHERE attempt_id = ?",
             (FUTURE_MS, FUTURE_MS + 300_000, FUTURE_MS + 86_700_000, ATTEMPT_ID),
         )
+
+
+def _controller_import_activity(store: RunStore, *, activity_id: str) -> None:
+    store.create_activity(
+        activity_id=activity_id,
+        run_id=RUN_ID,
+        activity_ordinal=1,
+        specification_generation=1,
+        policy_hash=POLICY_HASH,
+        kind="IMPORT",
+        execution_class="CONTROLLER",
+        state="ACTIVE",
+        created_transition_sequence=1,
+        semantic_input={},
+        semantic_input_digest=SEMANTIC_DIGEST,
+        idempotency_key="sha256:" + "3" * 64,
+    )
 
 
 def _create_upload(store: RunStore, bundle: bytes, base: dict[str, str], *, expires: int) -> None:
@@ -377,26 +395,37 @@ def test_validated_upload_rejects_different_complete_body_replay(
         )
 
 
+def test_candidate_bundle_validation_timeout_is_cas_mismatch(
+    stores: tuple[RunStore, CandidateObjectStore],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate_store = stores
+    bundle, base, _tip = _candidate_bundle(tmp_path)
+    _claimed_build_attempt(store)
+    _create_upload(store, bundle, base, expires=FUTURE_MS + 300_000)
+
+    def timeout(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd=["git"], timeout=30)
+
+    monkeypatch.setattr(store_module.subprocess, "run", timeout)
+
+    with pytest.raises(CasMismatchError, match="timed out"):
+        store.put_candidate_upload_content(
+            candidate_store=candidate_store,
+            upload_id=UPLOAD_ID,
+            bundle_bytes=bundle,
+            now_ms=FUTURE_MS + 1,
+        )
+
+
 def test_controller_import_admits_candidate_and_download_is_attempt_scoped(
     stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
 ) -> None:
     store, candidate_store = stores
     bundle, base, tip = _candidate_bundle(tmp_path)
     import_activity = "99999999-9999-4999-8999-999999999999"
-    store.create_activity(
-        activity_id=import_activity,
-        run_id=RUN_ID,
-        activity_ordinal=1,
-        specification_generation=1,
-        policy_hash=POLICY_HASH,
-        kind="IMPORT",
-        execution_class="CONTROLLER",
-        state="ACTIVE",
-        created_transition_sequence=1,
-        semantic_input={},
-        semantic_input_digest=SEMANTIC_DIGEST,
-        idempotency_key="sha256:" + "3" * 64,
-    )
+    _controller_import_activity(store, activity_id=import_activity)
 
     candidate, fact = store.admit_controller_import_candidate(
         candidate_store=candidate_store,
@@ -456,4 +485,92 @@ def test_controller_import_admits_candidate_and_download_is_attempt_scoped(
         store.get_candidate_download_for_attempt(
             attempt_id=ATTEMPT_ID,
             candidate_id=candidate.candidate_id,
+        )
+
+
+def test_controller_import_replay_validates_original_fact_and_candidate(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    bundle, base, _tip = _candidate_bundle(tmp_path)
+    import_activity = "99999999-9999-4999-8999-999999999999"
+    candidate_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    fact_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    operation_digest = request_digest({"operation": "import"})
+    fact_digest = request_digest({"fact": "import"})
+    _controller_import_activity(store, activity_id=import_activity)
+
+    candidate, fact = store.admit_controller_import_candidate(
+        candidate_store=candidate_store,
+        candidate_id=candidate_id,
+        controller_operation_fact_id=fact_id,
+        activity_id=import_activity,
+        forge_observation_id="forge-observation-1",
+        operation_digest=operation_digest,
+        fact_digest=fact_digest,
+        bundle_bytes=bundle,
+        expected_base_commit=base,
+        expected_repository_external_id=REPOSITORY_EXTERNAL_ID,
+        now_ms=FUTURE_MS + 1,
+    )
+
+    replay_candidate, replay_fact = store.admit_controller_import_candidate(
+        candidate_store=candidate_store,
+        candidate_id=candidate_id,
+        controller_operation_fact_id=fact_id,
+        activity_id=import_activity,
+        forge_observation_id="forge-observation-1",
+        operation_digest=operation_digest,
+        fact_digest=fact_digest,
+        bundle_bytes=bundle,
+        expected_base_commit=base,
+        expected_repository_external_id=REPOSITORY_EXTERNAL_ID,
+        now_ms=FUTURE_MS + 2,
+    )
+    assert replay_candidate == candidate
+    assert replay_fact == fact
+
+    with pytest.raises(IdempotencyConflictError, match="controller operation fact id"):
+        store.admit_controller_import_candidate(
+            candidate_store=candidate_store,
+            candidate_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            controller_operation_fact_id=fact_id,
+            activity_id=import_activity,
+            forge_observation_id="forge-observation-1",
+            operation_digest=operation_digest,
+            fact_digest=fact_digest,
+            bundle_bytes=bundle,
+            expected_base_commit=base,
+            expected_repository_external_id=REPOSITORY_EXTERNAL_ID,
+            now_ms=FUTURE_MS + 3,
+        )
+
+    with pytest.raises(IdempotencyConflictError, match="controller operation fact id"):
+        store.admit_controller_import_candidate(
+            candidate_store=candidate_store,
+            candidate_id=candidate_id,
+            controller_operation_fact_id=fact_id,
+            activity_id=import_activity,
+            forge_observation_id="forge-observation-2",
+            operation_digest=operation_digest,
+            fact_digest=fact_digest,
+            bundle_bytes=bundle,
+            expected_base_commit=base,
+            expected_repository_external_id=REPOSITORY_EXTERNAL_ID,
+            now_ms=FUTURE_MS + 4,
+        )
+
+    with pytest.raises(IdempotencyConflictError, match="controller operation fact id"):
+        store.admit_controller_import_candidate(
+            candidate_store=candidate_store,
+            candidate_id=candidate_id,
+            controller_operation_fact_id=fact_id,
+            activity_id=import_activity,
+            forge_observation_id="forge-observation-1",
+            operation_digest=request_digest({"operation": "changed"}),
+            fact_digest=fact_digest,
+            bundle_bytes=bundle,
+            expected_base_commit=base,
+            expected_repository_external_id=REPOSITORY_EXTERNAL_ID,
+            now_ms=FUTURE_MS + 5,
         )

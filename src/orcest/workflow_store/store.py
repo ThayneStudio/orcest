@@ -1195,15 +1195,18 @@ def _require_json_text(value: Any) -> str:
 
 
 def _run_git(args: Sequence[str], *, cwd: Path) -> str:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CasMismatchError("git Candidate validation timed out") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise CasMismatchError(f"git Candidate validation failed: {detail}")
@@ -1255,6 +1258,29 @@ def _validate_candidate_bundle(
         if embedded_repo != expected_repository_external_id:
             raise CasMismatchError("Candidate bundle repository identity mismatch")
         return GitCommitRef(object_format=expected_base_commit.object_format, oid=tip_oid)
+
+
+def _require_controller_import_replay_match(
+    fact: ControllerOperationFactRecord,
+    *,
+    candidate_id: str,
+    activity_id: str,
+    forge_observation_id: str,
+    operation_digest: str,
+    fact_digest: str,
+) -> None:
+    if (
+        fact.operation_kind != "IMPORT"
+        or fact.outcome != "SUCCEEDED"
+        or fact.candidate_id != candidate_id
+        or fact.activity_id != activity_id
+        or fact.forge_observation_id != forge_observation_id
+        or fact.operation_digest != operation_digest
+        or fact.fact_digest != fact_digest
+    ):
+        raise IdempotencyConflictError(
+            "controller operation fact id was reused with different content"
+        )
 
 
 def _require_target_id(observation: "ForgeObservationInput", *, field: str) -> str:
@@ -10082,9 +10108,34 @@ class RunStore:
                     ).fetchone()
                     if existing_fact is not None:
                         fact = _row_to_controller_operation_fact(existing_fact)
-                        existing_candidate = self.get_candidate(candidate_id)
+                        _require_controller_import_replay_match(
+                            fact,
+                            candidate_id=candidate_id,
+                            activity_id=activity_id,
+                            forge_observation_id=forge_observation_id,
+                            operation_digest=operation_digest,
+                            fact_digest=fact_digest,
+                        )
+                        fact_candidate_id = fact.candidate_id
+                        if fact_candidate_id is None:
+                            raise IdempotencyConflictError(
+                                "controller operation fact id was reused with different content"
+                            )
+                        existing_candidate = self.get_candidate(fact_candidate_id)
                         if existing_candidate is None:
                             raise RunStoreError("controller import fact has no Candidate")
+                        if (
+                            existing_candidate.producing_activity_id != activity_id
+                            or existing_candidate.import_forge_observation_id
+                            != forge_observation_id
+                            or existing_candidate.object_format != tip.object_format
+                            or existing_candidate.oid != tip.oid
+                            or existing_candidate.base_commit_json != base.as_json()
+                            or existing_candidate.bundle_digest != staged.bundle_digest
+                        ):
+                            raise IdempotencyConflictError(
+                                "controller import Candidate replay content changed"
+                            )
                         candidate = existing_candidate
                         return
                     activity = self.get_activity(activity_id)
