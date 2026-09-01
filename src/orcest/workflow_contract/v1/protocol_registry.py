@@ -38,6 +38,7 @@ from orcest.workflow_contract.v1.protocol import (
 
 CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
 CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
+ATTEMPT_CLAIM_PROTOCOL = "orcest.attempt-claim/1"
 CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
 ERROR_PROTOCOL = "orcest.error/1"
@@ -51,6 +52,7 @@ SECRET_PROVISION_RESULT_PROTOCOL = "orcest.secret-provision-result/1"
 __all__ = [
     "CAPABILITY_KEY_OPERATION_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
+    "ATTEMPT_CLAIM_PROTOCOL",
     "CONTROLLER_MODE_OPERATION_PROTOCOL",
     "CONTROLLER_MODE_RESULT_PROTOCOL",
     "ERROR_PROTOCOL",
