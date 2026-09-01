@@ -173,7 +173,7 @@ def compile_bundle(
     _check_no_case_collisions(source, diags=diags)
 
     try:
-        project_bytes = source.read_regular_blob(project_path)
+        project_bytes = source.read_regular_blob(project_path, max_bytes=MAX_DOCUMENT_BYTES)
     except GitSourceError as exc:
         diags.add(exc.code, str(exc), file=project_path, path="$")
         diags.raise_if_any()
@@ -195,7 +195,7 @@ def compile_bundle(
         diags.raise_if_any()
 
     try:
-        workflow_bytes = source.read_regular_blob(workflow_path)
+        workflow_bytes = source.read_regular_blob(workflow_path, max_bytes=MAX_DOCUMENT_BYTES)
     except GitSourceError as exc:
         diags.add(exc.code, str(exc), file=workflow_path, path="$")
         diags.raise_if_any()
@@ -241,7 +241,7 @@ def compile_bundle(
 
     for prompt_path in parsed_workflow.referenced_prompt_paths:
         try:
-            raw_bytes = source.read_regular_blob(prompt_path)
+            raw_bytes = source.read_regular_blob(prompt_path, max_bytes=MAX_DOCUMENT_BYTES)
         except GitSourceError as exc:
             diags.add(exc.code, str(exc), file=prompt_path, path="$")
             continue
