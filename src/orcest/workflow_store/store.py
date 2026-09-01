@@ -933,17 +933,20 @@ def _verify_local_state_root(root: Path, *, min_free_bytes: int) -> None:
         raise StartupIntegrityError(
             f"state root {root} has {free_bytes} free bytes below safety floor {min_free_bytes}"
         )
-    probe = root / ".fsync-probe"
-    with probe.open("wb") as file:
-        file.write(b"orcest workflow store fsync probe\n")
-        file.flush()
-        os.fsync(file.fileno())
-    dir_fd = os.open(root, os.O_DIRECTORY)
+    probe = root / f".fsync-probe.{uuid.uuid4().hex}"
+    probe_fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.fsync(dir_fd)
+        with os.fdopen(probe_fd, "wb") as file:
+            file.write(b"orcest workflow store fsync probe\n")
+            file.flush()
+            os.fsync(file.fileno())
+        dir_fd = os.open(root, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
-        os.close(dir_fd)
-    probe.unlink()
+        probe.unlink()
 
 
 def _verify_lock_file(path: Path) -> None:
