@@ -14,6 +14,7 @@ quota, and exact-object read/verify.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from orcest.workflow_store.v1.fs import (
     StorageLock,
     default_free_bytes,
     digest_hex,
+    fsync_dir,
     promote_no_clobber,
     read_exact_file,
     trusted_join,
@@ -86,6 +88,83 @@ class CandidateObjectStore:
     def _dest(self, record: CandidateObjectRecord) -> Path:
         hex_part = digest_hex(record.bundle_digest)
         return trusted_join(self._root, "objects", "sha256", hex_part[:2], f"{hex_part}.bundle")
+
+    def stage_upload_bytes(self, bundle_bytes: bytes) -> tuple[str, CandidateObjectRecord]:
+        """Durably stage complete upload bytes without making them a live artifact."""
+        if len(bundle_bytes) < 1:
+            raise QuotaExceededError("object byte length must be positive")
+        record = self.identity(bundle_bytes)
+        incoming = write_incoming_bytes(
+            self._incoming,
+            bundle_bytes,
+            store_root=self._root,
+            quota=self._quota,
+            usage_root=self._root,
+            free_space=self._free_space,
+        )
+        return (incoming.relative_to(self._root).as_posix(), record)
+
+    def read_staged(self, incoming_path: str) -> bytes:
+        path = self._incoming_path(incoming_path)
+        return read_exact_file(path, max_bytes=self._quota.max_object_bytes)
+
+    def discard_staged(self, incoming_path: str) -> None:
+        path = self._incoming_path(incoming_path)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return
+        fsync_dir(path.parent)
+
+    def promote_staged(
+        self, incoming_path: str, expected: CandidateObjectRecord
+    ) -> CandidateObjectRecord:
+        """Promote a previously staged upload with no clobber and exact-byte verify."""
+        data = self.read_staged(incoming_path)
+        actual = self.identity(data)
+        if actual != expected:
+            raise IntegrityConflictError("staged Candidate upload does not match expected identity")
+        with self._lock:
+            dest = self._dest(expected)
+            promote_no_clobber(
+                incoming=self._incoming_path(incoming_path),
+                dest=dest,
+                incoming_dir=self._incoming,
+                store_root=self._root,
+                expected=data,
+            )
+            return self._verify_at(dest, expected)
+
+    def promote_staged_with_reference(
+        self,
+        incoming_path: str,
+        expected: CandidateObjectRecord,
+        *,
+        reference: Callable[[CandidateObjectRecord], None],
+    ) -> CandidateObjectRecord:
+        """Promote staged bytes and create the SQLite reference under the same lock."""
+        data = self.read_staged(incoming_path)
+        actual = self.identity(data)
+        if actual != expected:
+            raise IntegrityConflictError("staged Candidate upload does not match expected identity")
+        with self._lock:
+            dest = self._dest(expected)
+            promote_no_clobber(
+                incoming=self._incoming_path(incoming_path),
+                dest=dest,
+                incoming_dir=self._incoming,
+                store_root=self._root,
+                expected=data,
+            )
+            verified = self._verify_at(dest, expected)
+            reference(verified)
+            return verified
+
+    def _incoming_path(self, incoming_path: str) -> Path:
+        parts = incoming_path.split("/")
+        if len(parts) != 2 or parts[0] != "incoming":
+            raise IntegrityConflictError("Candidate upload incoming path is invalid")
+        return trusted_join(self._root, parts[0], parts[1])
 
     def install(
         self,

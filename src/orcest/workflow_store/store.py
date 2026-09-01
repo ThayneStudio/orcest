@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -18,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import Any, Self
 
@@ -49,6 +51,7 @@ from orcest.workflow_contract.v1.digest import (
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
     ATTEMPT_CLAIM_PROTOCOL,
+    CANDIDATE_UPLOAD_EXPIRED_PROTOCOL,
     CAPABILITY_KEY_OPERATION_PROTOCOL,
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
@@ -61,7 +64,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -956,6 +959,96 @@ class AttemptOfferInput:
     classification_revision: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class GitCommitRef:
+    object_format: str
+    oid: str
+
+    def as_json(self) -> str:
+        return canonical_json_text({"object_format": self.object_format, "oid": self.oid})
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateUploadRecord:
+    upload_id: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    idempotency_key: str
+    request_digest: str
+    media_type: str
+    declared_bytes: int
+    expected_bundle_digest: str
+    expected_base_commit_json: str
+    expected_repository_external_id: str
+    expected_snapshot_id: str | None
+    incoming_path: str | None
+    computed_bundle_digest: str | None
+    computed_bytes: int | None
+    verified_tip_json: str | None
+    artifact_bundle_digest: str | None
+    artifact_storage_key: str | None
+    promoted_at_ms: int | None
+    consumed_candidate_id: str | None
+    state: str
+    expires_at_ms: int
+    created_at_ms: int
+    updated_at_ms: int
+
+    @property
+    def expected_base_commit(self) -> Any:
+        return json.loads(self.expected_base_commit_json)
+
+    @property
+    def verified_tip(self) -> Any | None:
+        return None if self.verified_tip_json is None else json.loads(self.verified_tip_json)
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactObjectRecord:
+    bundle_digest: str
+    storage_key: str
+    byte_length: int
+    installed_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRecord:
+    candidate_id: str
+    run_id: str
+    candidate_generation: int
+    provenance_kind: str
+    producing_activity_id: str
+    worker_attempt_id: str | None
+    worker_attempt_generation: int | None
+    import_forge_observation_id: str | None
+    object_format: str
+    oid: str
+    base_commit_json: str
+    bundle_digest: str
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateDownloadRecord:
+    candidate: CandidateRecord
+    bundle: ArtifactObjectRecord
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerOperationFactRecord:
+    controller_operation_fact_id: str
+    activity_id: str
+    operation_kind: str
+    outcome: str
+    operation_digest: str
+    fact_digest: str
+    recorded_at_ms: int
+    failure_category: str | None = None
+    candidate_id: str | None = None
+    forge_observation_id: str | None = None
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -1068,6 +1161,19 @@ def _require_digest(value: str, *, field: str) -> str:
     return value
 
 
+def _require_git_commit_ref(value: Mapping[str, Any], *, field: str) -> GitCommitRef:
+    object_format = value.get("object_format")
+    oid = value.get("oid")
+    if object_format not in {"sha1", "sha256"}:
+        raise ValueError(f"{field}.object_format must be sha1 or sha256")
+    if not isinstance(oid, str):
+        raise ValueError(f"{field}.oid must be a string")
+    expected_len = 40 if object_format == "sha1" else 64
+    if len(oid) != expected_len or any(ch not in "0123456789abcdef" for ch in oid):
+        raise ValueError(f"{field}.oid does not match object format")
+    return GitCommitRef(object_format=object_format, oid=oid)
+
+
 def _require_positive_int(value: int, *, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{field} must be a positive integer")
@@ -1082,6 +1188,69 @@ def _require_nonempty_text(value: str, *, field: str) -> str:
 
 def _require_json_text(value: Any) -> str:
     return value if isinstance(value, str) else canonical_json_text(value)
+
+
+def _run_git(args: Sequence[str], *, cwd: Path) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise CasMismatchError(f"git Candidate validation failed: {detail}")
+    return completed.stdout.strip()
+
+
+def _validate_candidate_bundle(
+    bundle_path: Path,
+    *,
+    expected_base_commit: GitCommitRef,
+    expected_repository_external_id: str,
+) -> GitCommitRef:
+    with TemporaryDirectory(prefix="orcest-candidate-") as tmp:
+        root = Path(tmp)
+        repo = root / "repo.git"
+        _run_git(
+            ["init", "--bare", f"--object-format={expected_base_commit.object_format}", str(repo)],
+            cwd=root,
+        )
+        lines = _run_git(["bundle", "list-heads", str(bundle_path)], cwd=repo).splitlines()
+        heads = [line.split() for line in lines if line.strip()]
+        matching = [
+            parts for parts in heads if len(parts) == 2 and parts[1] == "refs/orcest/candidate"
+        ]
+        if len(heads) != 1 or len(matching) != 1:
+            raise CasMismatchError("Candidate bundle must advertise exactly refs/orcest/candidate")
+        tip_oid = matching[0][0]
+        expected_len = 40 if expected_base_commit.object_format == "sha1" else 64
+        if len(tip_oid) != expected_len or any(ch not in "0123456789abcdef" for ch in tip_oid):
+            raise CasMismatchError("Candidate tip oid does not match object format")
+        _run_git(
+            ["fetch", "--no-tags", str(bundle_path), "refs/orcest/candidate:refs/orcest/candidate"],
+            cwd=repo,
+        )
+        if _run_git(["cat-file", "-t", tip_oid], cwd=repo) != "commit":
+            raise CasMismatchError("Candidate tip is not a commit")
+        if _run_git(["cat-file", "-t", expected_base_commit.oid], cwd=repo) != "commit":
+            raise CasMismatchError("Candidate base is not a commit")
+        _run_git(["merge-base", "--is-ancestor", expected_base_commit.oid, tip_oid], cwd=repo)
+        embedded_repo = _run_git(
+            [
+                "config",
+                "--blob",
+                f"{tip_oid}:.orcest/candidate-repository",
+                "orcest.repositoryExternalId",
+            ],
+            cwd=repo,
+        )
+        if embedded_repo != expected_repository_external_id:
+            raise CasMismatchError("Candidate bundle repository identity mismatch")
+        return GitCommitRef(object_format=expected_base_commit.object_format, oid=tip_oid)
 
 
 def _require_target_id(observation: "ForgeObservationInput", *, field: str) -> str:
@@ -1719,6 +1888,77 @@ def _row_to_attempt(row: sqlite3.Row) -> AttemptRecord:
         launch_capability_consumed_at_ms=row["launch_capability_consumed_at_ms"],
         terminal_reason=row["terminal_reason"],
         created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_candidate_upload(row: sqlite3.Row) -> CandidateUploadRecord:
+    return CandidateUploadRecord(
+        upload_id=row["upload_id"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        idempotency_key=row["idempotency_key"],
+        request_digest=row["request_digest"],
+        media_type=row["media_type"],
+        declared_bytes=row["declared_bytes"],
+        expected_bundle_digest=row["expected_bundle_digest"],
+        expected_base_commit_json=row["expected_base_commit_json"],
+        expected_repository_external_id=row["expected_repository_external_id"],
+        expected_snapshot_id=row["expected_snapshot_id"],
+        incoming_path=row["incoming_path"],
+        computed_bundle_digest=row["computed_bundle_digest"],
+        computed_bytes=row["computed_bytes"],
+        verified_tip_json=row["verified_tip_json"],
+        artifact_bundle_digest=row["artifact_bundle_digest"],
+        artifact_storage_key=row["artifact_storage_key"],
+        promoted_at_ms=row["promoted_at_ms"],
+        consumed_candidate_id=row["consumed_candidate_id"],
+        state=row["state"],
+        expires_at_ms=row["expires_at_ms"],
+        created_at_ms=row["created_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
+    )
+
+
+def _row_to_artifact_object(row: sqlite3.Row) -> ArtifactObjectRecord:
+    return ArtifactObjectRecord(
+        bundle_digest=row["bundle_digest"],
+        storage_key=row["storage_key"],
+        byte_length=row["byte_length"],
+        installed_at_ms=row["installed_at_ms"],
+    )
+
+
+def _row_to_candidate(row: sqlite3.Row) -> CandidateRecord:
+    return CandidateRecord(
+        candidate_id=row["candidate_id"],
+        run_id=row["run_id"],
+        candidate_generation=row["candidate_generation"],
+        provenance_kind=row["provenance_kind"],
+        producing_activity_id=row["producing_activity_id"],
+        worker_attempt_id=row["worker_attempt_id"],
+        worker_attempt_generation=row["worker_attempt_generation"],
+        import_forge_observation_id=row["import_forge_observation_id"],
+        object_format=row["object_format"],
+        oid=row["oid"],
+        base_commit_json=row["base_commit_json"],
+        bundle_digest=row["bundle_digest"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_controller_operation_fact(row: sqlite3.Row) -> ControllerOperationFactRecord:
+    return ControllerOperationFactRecord(
+        controller_operation_fact_id=row["controller_operation_fact_id"],
+        activity_id=row["activity_id"],
+        operation_kind=row["operation_kind"],
+        outcome=row["outcome"],
+        failure_category=row["failure_category"],
+        candidate_id=row["candidate_id"],
+        forge_observation_id=row["forge_observation_id"],
+        operation_digest=row["operation_digest"],
+        fact_digest=row["fact_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
     )
 
 
@@ -3039,6 +3279,120 @@ CREATE TABLE IF NOT EXISTS launch_attestations (
   FOREIGN KEY (attempt_id, activity_id, attempt_generation)
     REFERENCES attempts(attempt_id, activity_id, generation)
 );
+
+CREATE TABLE IF NOT EXISTS artifact_objects (
+  bundle_digest TEXT PRIMARY KEY,
+  storage_key TEXT NOT NULL UNIQUE,
+  byte_length INTEGER NOT NULL CHECK (byte_length > 0),
+  installed_at_ms INTEGER NOT NULL CHECK (installed_at_ms >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS candidate_uploads (
+  upload_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  idempotency_key TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  media_type TEXT NOT NULL CHECK (media_type = 'application/x-git-bundle'),
+  declared_bytes INTEGER NOT NULL CHECK (declared_bytes > 0),
+  expected_bundle_digest TEXT NOT NULL,
+  expected_base_commit_json TEXT NOT NULL,
+  expected_repository_external_id TEXT NOT NULL,
+  expected_snapshot_id TEXT,
+  incoming_path TEXT,
+  computed_bundle_digest TEXT,
+  computed_bytes INTEGER CHECK (computed_bytes IS NULL OR computed_bytes > 0),
+  verified_tip_json TEXT,
+  artifact_bundle_digest TEXT REFERENCES artifact_objects(bundle_digest) ON DELETE RESTRICT,
+  artifact_storage_key TEXT,
+  promoted_at_ms INTEGER CHECK (promoted_at_ms IS NULL OR promoted_at_ms >= 0),
+  consumed_candidate_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("candidate_upload.state"))})),
+  expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  UNIQUE (attempt_id, idempotency_key),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation),
+  CHECK (
+    (state = 'RECEIVING'
+      AND incoming_path IS NULL AND computed_bundle_digest IS NULL AND computed_bytes IS NULL
+      AND verified_tip_json IS NULL AND artifact_bundle_digest IS NULL
+      AND artifact_storage_key IS NULL AND promoted_at_ms IS NULL
+      AND consumed_candidate_id IS NULL)
+    OR (state = 'VALIDATED'
+      AND incoming_path IS NOT NULL AND computed_bundle_digest IS NOT NULL
+      AND computed_bytes IS NOT NULL AND verified_tip_json IS NOT NULL
+      AND artifact_bundle_digest IS NULL AND artifact_storage_key IS NULL
+      AND promoted_at_ms IS NULL AND consumed_candidate_id IS NULL)
+    OR (state = 'PROMOTED'
+      AND incoming_path IS NOT NULL AND computed_bundle_digest IS NOT NULL
+      AND computed_bytes IS NOT NULL AND verified_tip_json IS NOT NULL
+      AND artifact_bundle_digest IS NOT NULL AND artifact_storage_key IS NOT NULL
+      AND promoted_at_ms IS NOT NULL AND consumed_candidate_id IS NULL)
+    OR (state = 'CONSUMED'
+      AND incoming_path IS NOT NULL AND computed_bundle_digest IS NOT NULL
+      AND computed_bytes IS NOT NULL AND verified_tip_json IS NOT NULL
+      AND artifact_bundle_digest IS NOT NULL AND artifact_storage_key IS NOT NULL
+      AND promoted_at_ms IS NOT NULL AND consumed_candidate_id IS NOT NULL)
+    OR state = 'EXPIRED'
+  )
+);
+
+CREATE TABLE IF NOT EXISTS candidates (
+  candidate_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  candidate_generation INTEGER NOT NULL CHECK (candidate_generation > 0),
+  provenance_kind TEXT NOT NULL CHECK (
+    provenance_kind IN ({_sql_in(_enum_values("candidate.provenance_kind"))})
+  ),
+  producing_activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  worker_attempt_id TEXT,
+  worker_attempt_generation INTEGER CHECK (
+    worker_attempt_generation IS NULL OR worker_attempt_generation > 0
+  ),
+  import_forge_observation_id TEXT,
+  object_format TEXT NOT NULL CHECK (object_format IN ('sha1', 'sha256')),
+  oid TEXT NOT NULL,
+  base_commit_json TEXT NOT NULL,
+  bundle_digest TEXT NOT NULL REFERENCES artifact_objects(bundle_digest) ON DELETE RESTRICT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (run_id, candidate_generation),
+  UNIQUE (run_id, object_format, oid),
+  CHECK (
+    (provenance_kind = 'WORKER_ATTEMPT'
+      AND worker_attempt_id IS NOT NULL AND worker_attempt_generation IS NOT NULL
+      AND import_forge_observation_id IS NULL)
+    OR
+    (provenance_kind = 'FORGE_IMPORT'
+      AND worker_attempt_id IS NULL AND worker_attempt_generation IS NULL
+      AND import_forge_observation_id IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS controller_operation_facts (
+  controller_operation_fact_id TEXT PRIMARY KEY,
+  activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  operation_kind TEXT NOT NULL CHECK (
+    operation_kind IN ({_sql_in(_enum_values("controller_operation_fact.kind"))})
+  ),
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("controller_operation_fact.outcome"))})
+  ),
+  failure_category TEXT CHECK (
+    failure_category IN ({_sql_in(_enum_values("controller_operation_fact.failure_category"))})
+  ),
+  candidate_id TEXT REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  forge_observation_id TEXT,
+  operation_digest TEXT NOT NULL,
+  fact_digest TEXT NOT NULL UNIQUE,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  CHECK (
+    (outcome = 'SUCCEEDED' AND failure_category IS NULL)
+    OR (outcome = 'FAILED' AND failure_category IS NOT NULL AND candidate_id IS NULL)
+  )
+);
 """
 
 _V8_TO_V9 = """
@@ -3439,7 +3793,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -3652,15 +4006,26 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 8
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V8_TO_V9)
+            elif current == 8:
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V8_TO_V9 + "\n" + _SCHEMA)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-launch-attestations",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 9
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-candidate-transfer",
                         _now_ms(),
                     ),
                 )
@@ -9322,6 +9687,493 @@ class RunStore:
             "SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)
         ).fetchone()
         return None if row is None else _row_to_attempt(row)
+
+    def get_candidate_upload(self, upload_id: str) -> CandidateUploadRecord | None:
+        require_lowercase_uuid(upload_id, field="upload_id")
+        row = self.conn.execute(
+            "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+        ).fetchone()
+        return None if row is None else _row_to_candidate_upload(row)
+
+    def create_candidate_upload(
+        self,
+        *,
+        upload_id: str,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        idempotency_key: str,
+        request_digest: str,
+        media_type: str,
+        declared_bytes: int,
+        expected_bundle_digest: str,
+        expected_base_commit: Mapping[str, Any],
+        expected_repository_external_id: str,
+        expires_at_ms: int,
+        expected_snapshot_id: str | None = None,
+    ) -> CandidateUploadRecord:
+        require_lowercase_uuid(upload_id, field="upload_id")
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(idempotency_key, field="idempotency_key")
+        if expected_snapshot_id is not None:
+            require_lowercase_uuid(expected_snapshot_id, field="expected_snapshot_id")
+        _require_positive_int(generation, field="generation")
+        _require_positive_int(declared_bytes, field="declared_bytes")
+        _require_digest(request_digest, field="request_digest")
+        _require_digest(expected_bundle_digest, field="expected_bundle_digest")
+        base = _require_git_commit_ref(expected_base_commit, field="expected_base_commit")
+        _require_nonempty_text(
+            expected_repository_external_id, field="expected_repository_external_id"
+        )
+        if media_type != "application/x-git-bundle":
+            raise ValueError("Candidate uploads require application/x-git-bundle")
+        if not isinstance(expires_at_ms, int) or expires_at_ms < 0:
+            raise ValueError("expires_at_ms must be a nonnegative integer")
+        now = _now_ms()
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM candidate_uploads WHERE attempt_id = ? AND idempotency_key = ?",
+                (attempt_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_candidate_upload(existing)
+                if (
+                    record.upload_id != upload_id
+                    or record.activity_id != activity_id
+                    or record.attempt_generation != generation
+                    or record.request_digest != request_digest
+                    or record.declared_bytes != declared_bytes
+                    or record.expected_bundle_digest != expected_bundle_digest
+                    or record.expected_base_commit_json != base.as_json()
+                    or record.expected_repository_external_id != expected_repository_external_id
+                    or record.expected_snapshot_id != expected_snapshot_id
+                    or record.expires_at_ms != expires_at_ms
+                ):
+                    raise IdempotencyConflictError("candidate upload create key was reused")
+                return record
+            row = self.conn.execute(
+                "SELECT attempts.*, activities.kind AS activity_kind, "
+                "activities.execution_class AS execution_class, "
+                "runs.current_snapshot_id AS current_snapshot_id "
+                "FROM attempts JOIN activities ON activities.activity_id = attempts.activity_id "
+                "JOIN runs ON runs.run_id = activities.run_id "
+                "WHERE attempts.attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(f"attempt {attempt_id!r} was not found")
+            if row["activity_id"] != activity_id or row["generation"] != generation:
+                raise CasMismatchError("candidate upload does not match attempt")
+            if row["state"] != "CLAIMED":
+                raise CasMismatchError("candidate upload requires a claimed attempt")
+            if row["activity_kind"] not in {"BUILD", "REMEDIATE", "REBASE", "PR_REMEDIATE"}:
+                raise CasMismatchError("activity kind cannot produce a Candidate")
+            if expected_snapshot_id is not None:
+                if row["current_snapshot_id"] != expected_snapshot_id:
+                    raise CasMismatchError("candidate upload snapshot binding is not current")
+                snapshot = self.conn.execute(
+                    "SELECT project_id, base_commit_json FROM work_item_snapshots "
+                    "WHERE snapshot_id = ?",
+                    (expected_snapshot_id,),
+                ).fetchone()
+                if snapshot is None:
+                    raise CasMismatchError("candidate upload snapshot binding is missing")
+                project = self.conn.execute(
+                    "SELECT repository_external_id FROM projects WHERE project_id = ?",
+                    (snapshot["project_id"],),
+                ).fetchone()
+                if project is None:
+                    raise CasMismatchError("candidate upload snapshot project is missing")
+                if (
+                    snapshot["base_commit_json"] != base.as_json()
+                    or project["repository_external_id"] != expected_repository_external_id
+                ):
+                    raise CasMismatchError("candidate upload does not match snapshot binding")
+            if row["execution_deadline_ms"] is None or expires_at_ms > row["execution_deadline_ms"]:
+                raise CasMismatchError("candidate upload expiry exceeds execution deadline")
+            if now >= expires_at_ms:
+                raise CasMismatchError("candidate upload is already expired")
+            self.conn.execute(
+                "INSERT INTO candidate_uploads(upload_id, attempt_id, activity_id, "
+                "attempt_generation, idempotency_key, request_digest, media_type, "
+                "declared_bytes, expected_bundle_digest, expected_base_commit_json, "
+                "expected_repository_external_id, expected_snapshot_id, state, expires_at_ms, "
+                "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'RECEIVING', ?, ?, ?)",
+                (
+                    upload_id,
+                    attempt_id,
+                    activity_id,
+                    generation,
+                    idempotency_key,
+                    request_digest,
+                    media_type,
+                    declared_bytes,
+                    expected_bundle_digest,
+                    base.as_json(),
+                    expected_repository_external_id,
+                    expected_snapshot_id,
+                    expires_at_ms,
+                    now,
+                    now,
+                ),
+            )
+            inserted = self.conn.execute(
+                "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+            ).fetchone()
+            assert inserted is not None
+            return _row_to_candidate_upload(inserted)
+
+    def candidate_upload_expired_body(self, upload: CandidateUploadRecord) -> dict[str, Any]:
+        return {
+            "protocol": CANDIDATE_UPLOAD_EXPIRED_PROTOCOL,
+            "upload_id": upload.upload_id,
+            "state": "EXPIRED",
+            "code": "UPLOAD_EXPIRED",
+            "expires_at_ms": upload.expires_at_ms,
+        }
+
+    def put_candidate_upload_content(
+        self,
+        *,
+        candidate_store: Any,
+        upload_id: str,
+        bundle_bytes: bytes,
+        now_ms: int | None = None,
+    ) -> CandidateUploadRecord:
+        require_lowercase_uuid(upload_id, field="upload_id")
+        now = _now_ms() if now_ms is None else now_ms
+        existing = self.get_candidate_upload(upload_id)
+        if existing is None:
+            raise RunStoreError(f"candidate upload {upload_id!r} was not found")
+        if now >= existing.expires_at_ms:
+            return self.expire_candidate_upload(upload_id, now_ms=now)
+        if existing.state in {"VALIDATED", "PROMOTED", "CONSUMED"}:
+            digest = candidate_store.identity(bundle_bytes).bundle_digest
+            if digest != existing.computed_bundle_digest:
+                raise IdempotencyConflictError("candidate upload content changed")
+            return existing
+        if existing.state == "EXPIRED":
+            return existing
+        if existing.state != "RECEIVING":
+            raise CasMismatchError("candidate upload is not receiving content")
+        if len(bundle_bytes) != existing.declared_bytes:
+            raise CasMismatchError("candidate upload byte length mismatch")
+        staged_path, staged = candidate_store.stage_upload_bytes(bundle_bytes)
+        if staged.bundle_digest != existing.expected_bundle_digest:
+            candidate_store.discard_staged(staged_path)
+            raise CasMismatchError("candidate upload digest mismatch")
+        try:
+            tip = _validate_candidate_bundle(
+                candidate_store._incoming_path(staged_path),
+                expected_base_commit=_require_git_commit_ref(
+                    existing.expected_base_commit, field="expected_base_commit"
+                ),
+                expected_repository_external_id=existing.expected_repository_external_id,
+            )
+            with self.transaction():
+                row = self.conn.execute(
+                    "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                ).fetchone()
+                if row is None:
+                    raise RunStoreError(f"candidate upload {upload_id!r} was not found")
+                current = _row_to_candidate_upload(row)
+                if now >= current.expires_at_ms:
+                    self._expire_candidate_upload_row(current, now_ms=now)
+                    candidate_store.discard_staged(staged_path)
+                    refreshed = self.conn.execute(
+                        "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                    ).fetchone()
+                    assert refreshed is not None
+                    return _row_to_candidate_upload(refreshed)
+                if current.state != "RECEIVING":
+                    raise IdempotencyConflictError("candidate upload content race lost")
+                self.conn.execute(
+                    "UPDATE candidate_uploads SET state = 'VALIDATED', incoming_path = ?, "
+                    "computed_bundle_digest = ?, computed_bytes = ?, verified_tip_json = ?, "
+                    "updated_at_ms = ? WHERE upload_id = ? AND state = 'RECEIVING'",
+                    (
+                        staged_path,
+                        staged.bundle_digest,
+                        staged.byte_length,
+                        tip.as_json(),
+                        now,
+                        upload_id,
+                    ),
+                )
+                updated = self.conn.execute(
+                    "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                ).fetchone()
+                assert updated is not None
+                return _row_to_candidate_upload(updated)
+        except Exception:
+            candidate_store.discard_staged(staged_path)
+            raise
+
+    def expire_candidate_upload(
+        self, upload_id: str, *, now_ms: int | None = None
+    ) -> CandidateUploadRecord:
+        require_lowercase_uuid(upload_id, field="upload_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(f"candidate upload {upload_id!r} was not found")
+            upload = _row_to_candidate_upload(row)
+            if upload.state in {"CONSUMED", "EXPIRED"}:
+                return upload
+            if now < upload.expires_at_ms:
+                raise CasMismatchError("candidate upload has not expired")
+            self._expire_candidate_upload_row(upload, now_ms=now)
+            updated = self.conn.execute(
+                "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+            ).fetchone()
+            assert updated is not None
+            return _row_to_candidate_upload(updated)
+
+    def _expire_candidate_upload_row(self, upload: CandidateUploadRecord, *, now_ms: int) -> None:
+        self.conn.execute(
+            "UPDATE candidate_uploads SET state = 'EXPIRED', artifact_bundle_digest = NULL, "
+            "artifact_storage_key = NULL, consumed_candidate_id = NULL, updated_at_ms = ? "
+            "WHERE upload_id = ? AND state != 'CONSUMED'",
+            (now_ms, upload.upload_id),
+        )
+
+    def promote_candidate_upload(
+        self,
+        *,
+        candidate_store: Any,
+        upload_id: str,
+        now_ms: int | None = None,
+    ) -> CandidateUploadRecord:
+        upload = self.get_candidate_upload(upload_id)
+        if upload is None:
+            raise RunStoreError(f"candidate upload {upload_id!r} was not found")
+        now = _now_ms() if now_ms is None else now_ms
+        if upload.state == "PROMOTED":
+            return upload
+        if now >= upload.expires_at_ms:
+            return self.expire_candidate_upload(upload_id, now_ms=now)
+        if upload.state != "VALIDATED" or upload.incoming_path is None:
+            raise CasMismatchError("candidate upload is not validated")
+        if upload.computed_bundle_digest is None or upload.computed_bytes is None:
+            raise CasMismatchError("validated candidate upload is missing computed identity")
+        expected = candidate_store.identity(candidate_store.read_staged(upload.incoming_path))
+        if (
+            expected.bundle_digest != upload.computed_bundle_digest
+            or expected.byte_length != upload.computed_bytes
+        ):
+            raise CasMismatchError("validated candidate upload staged bytes changed")
+
+        promoted: CandidateUploadRecord | None = None
+
+        def reference(record: Any) -> None:
+            nonlocal promoted
+            with self.transaction():
+                row = self.conn.execute(
+                    "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                ).fetchone()
+                if row is None:
+                    raise RunStoreError(f"candidate upload {upload_id!r} was not found")
+                current = _row_to_candidate_upload(row)
+                if now >= current.expires_at_ms:
+                    self._expire_candidate_upload_row(current, now_ms=now)
+                    expired_row = self.conn.execute(
+                        "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                    ).fetchone()
+                    assert expired_row is not None
+                    promoted = _row_to_candidate_upload(expired_row)
+                    return
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO artifact_objects(bundle_digest, storage_key, "
+                    "byte_length, installed_at_ms) VALUES (?, ?, ?, ?)",
+                    (record.bundle_digest, record.storage_key, record.byte_length, now),
+                )
+                self.conn.execute(
+                    "UPDATE candidate_uploads SET state = 'PROMOTED', "
+                    "artifact_bundle_digest = ?, artifact_storage_key = ?, promoted_at_ms = ?, "
+                    "updated_at_ms = ? WHERE upload_id = ? AND state = 'VALIDATED'",
+                    (record.bundle_digest, record.storage_key, now, now, upload_id),
+                )
+                updated = self.conn.execute(
+                    "SELECT * FROM candidate_uploads WHERE upload_id = ?", (upload_id,)
+                ).fetchone()
+                assert updated is not None
+                promoted = _row_to_candidate_upload(updated)
+
+        candidate_store.promote_staged_with_reference(
+            upload.incoming_path, expected, reference=reference
+        )
+        assert promoted is not None
+        return promoted
+
+    def admit_controller_import_candidate(
+        self,
+        *,
+        candidate_store: Any,
+        candidate_id: str,
+        controller_operation_fact_id: str,
+        activity_id: str,
+        forge_observation_id: str,
+        operation_digest: str,
+        fact_digest: str,
+        bundle_bytes: bytes,
+        expected_base_commit: Mapping[str, Any],
+        expected_repository_external_id: str,
+        now_ms: int | None = None,
+    ) -> tuple[CandidateRecord, ControllerOperationFactRecord]:
+        require_lowercase_uuid(candidate_id, field="candidate_id")
+        require_lowercase_uuid(controller_operation_fact_id, field="controller_operation_fact_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        _require_nonempty_text(forge_observation_id, field="forge_observation_id")
+        _require_digest(operation_digest, field="operation_digest")
+        _require_digest(fact_digest, field="fact_digest")
+        base = _require_git_commit_ref(expected_base_commit, field="expected_base_commit")
+        _require_nonempty_text(
+            expected_repository_external_id, field="expected_repository_external_id"
+        )
+        staged_path, staged = candidate_store.stage_upload_bytes(bundle_bytes)
+        try:
+            tip = _validate_candidate_bundle(
+                candidate_store._incoming_path(staged_path),
+                expected_base_commit=base,
+                expected_repository_external_id=expected_repository_external_id,
+            )
+            now = _now_ms() if now_ms is None else now_ms
+            candidate: CandidateRecord | None = None
+            fact: ControllerOperationFactRecord | None = None
+
+            def reference(record: Any) -> None:
+                nonlocal candidate, fact
+                with self.transaction():
+                    existing_fact = self.conn.execute(
+                        "SELECT * FROM controller_operation_facts WHERE "
+                        "controller_operation_fact_id = ?",
+                        (controller_operation_fact_id,),
+                    ).fetchone()
+                    if existing_fact is not None:
+                        fact = _row_to_controller_operation_fact(existing_fact)
+                        existing_candidate = self.get_candidate(candidate_id)
+                        if existing_candidate is None:
+                            raise RunStoreError("controller import fact has no Candidate")
+                        candidate = existing_candidate
+                        return
+                    activity = self.get_activity(activity_id)
+                    if activity is None:
+                        raise RunStoreError(f"activity {activity_id!r} was not found")
+                    if activity.execution_class != "CONTROLLER" or activity.kind != "IMPORT":
+                        raise CasMismatchError("controller import requires an IMPORT Activity")
+                    if activity.state not in {"READY", "ACTIVE"}:
+                        raise CasMismatchError("controller import Activity is not current")
+                    run = self.get_run(activity.run_id)
+                    if run is None:
+                        raise RunStoreError(f"run {activity.run_id!r} was not found")
+                    generation = self.conn.execute(
+                        "SELECT COALESCE(MAX(candidate_generation), 0) + 1 "
+                        "FROM candidates WHERE run_id = ?",
+                        (activity.run_id,),
+                    ).fetchone()[0]
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO artifact_objects(bundle_digest, storage_key, "
+                        "byte_length, installed_at_ms) VALUES (?, ?, ?, ?)",
+                        (record.bundle_digest, record.storage_key, record.byte_length, now),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO candidates(candidate_id, run_id, candidate_generation, "
+                        "provenance_kind, producing_activity_id, import_forge_observation_id, "
+                        "object_format, oid, base_commit_json, bundle_digest, created_at_ms) "
+                        "VALUES (?, ?, ?, 'FORGE_IMPORT', ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            candidate_id,
+                            activity.run_id,
+                            generation,
+                            activity_id,
+                            forge_observation_id,
+                            tip.object_format,
+                            tip.oid,
+                            base.as_json(),
+                            record.bundle_digest,
+                            now,
+                        ),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO controller_operation_facts("
+                        "controller_operation_fact_id, activity_id, operation_kind, outcome, "
+                        "candidate_id, forge_observation_id, operation_digest, fact_digest, "
+                        "recorded_at_ms) VALUES (?, ?, 'IMPORT', 'SUCCEEDED', ?, ?, ?, ?, ?)",
+                        (
+                            controller_operation_fact_id,
+                            activity_id,
+                            candidate_id,
+                            forge_observation_id,
+                            operation_digest,
+                            fact_digest,
+                            now,
+                        ),
+                    )
+                    self.conn.execute(
+                        "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                        "WHERE activity_id = ?",
+                        (now, activity_id),
+                    )
+                    candidate_row = self.conn.execute(
+                        "SELECT * FROM candidates WHERE candidate_id = ?", (candidate_id,)
+                    ).fetchone()
+                    fact_row = self.conn.execute(
+                        "SELECT * FROM controller_operation_facts "
+                        "WHERE controller_operation_fact_id = ?",
+                        (controller_operation_fact_id,),
+                    ).fetchone()
+                    assert candidate_row is not None
+                    assert fact_row is not None
+                    candidate = _row_to_candidate(candidate_row)
+                    fact = _row_to_controller_operation_fact(fact_row)
+
+            candidate_store.promote_staged_with_reference(staged_path, staged, reference=reference)
+            assert candidate is not None
+            assert fact is not None
+            return candidate, fact
+        except Exception:
+            candidate_store.discard_staged(staged_path)
+            raise
+
+    def get_candidate(self, candidate_id: str) -> CandidateRecord | None:
+        require_lowercase_uuid(candidate_id, field="candidate_id")
+        row = self.conn.execute(
+            "SELECT * FROM candidates WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        return None if row is None else _row_to_candidate(row)
+
+    def get_candidate_download_for_attempt(
+        self, *, attempt_id: str, candidate_id: str
+    ) -> CandidateDownloadRecord:
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(candidate_id, field="candidate_id")
+        row = self.conn.execute(
+            "SELECT candidates.*, artifact_objects.storage_key AS artifact_storage_key, "
+            "artifact_objects.byte_length AS artifact_byte_length, "
+            "artifact_objects.installed_at_ms AS artifact_installed_at_ms "
+            "FROM attempts "
+            "JOIN activities ON activities.activity_id = attempts.activity_id "
+            "JOIN candidates ON candidates.candidate_id = activities.candidate_id "
+            "JOIN artifact_objects ON artifact_objects.bundle_digest = candidates.bundle_digest "
+            "WHERE attempts.attempt_id = ? AND candidates.candidate_id = ? "
+            "AND attempts.state = 'CLAIMED'",
+            (attempt_id, candidate_id),
+        ).fetchone()
+        if row is None:
+            raise CasMismatchError("Candidate download is not authorized for this Attempt")
+        candidate = _row_to_candidate(row)
+        bundle = ArtifactObjectRecord(
+            bundle_digest=row["bundle_digest"],
+            storage_key=row["artifact_storage_key"],
+            byte_length=row["artifact_byte_length"],
+            installed_at_ms=row["artifact_installed_at_ms"],
+        )
+        return CandidateDownloadRecord(candidate=candidate, bundle=bundle)
 
     def list_open_activity_offers(self) -> list[tuple[AttemptRecord, OutboxRecord]]:
         """Every current, unexpired ``OFFERED`` Attempt with its dispatch Outbox row.
