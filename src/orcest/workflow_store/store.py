@@ -34,6 +34,7 @@ from orcest.workflow_contract.v1.digest import (
     forge_observation_schedule_digest,
     forge_request_failure_fact_digest,
     is_valid_content_digest,
+    launch_capability_claims_digest,
     policy_digest,
     receipt_digest,
     request_digest,
@@ -47,6 +48,7 @@ from orcest.workflow_contract.v1.digest import (
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
+    ATTEMPT_CLAIM_PROTOCOL,
     CAPABILITY_KEY_OPERATION_PROTOCOL,
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
@@ -59,7 +61,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -341,6 +343,97 @@ class IssuedCapabilityBinding:
     immutable_assignment_json: str
     capability_key_registry_revision: int
     issued_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptClaimRecord:
+    attempt_claim_id: str
+    protocol_version: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    offer_outbox_id: str
+    worker_id: str
+    worker_session_id: str
+    worker_profile: str
+    worker_build_revision: str
+    request_digest: str
+    claimed_at_ms: int
+    execution_deadline_ms: int
+    capability_auth_expires_at_ms: int
+    attempt_capability_jti: str
+    attempt_capability_digest: str
+    attempt_capability_signing_key_id: str
+    attempt_capability_signature_algorithm: str
+    capability_key_registry_revision: int
+    source_access_kind: str
+    source_access_descriptor_json: str
+    source_access_descriptor_digest: str
+    response_contract_digest: str
+    created_at_ms: int
+    launch_nonce_id: str | None = None
+    launch_capability_jti: str | None = None
+    launch_capability_digest: str | None = None
+    launch_capability_signing_key_id: str | None = None
+    launch_capability_signature_algorithm: str | None = None
+    source_read_secret_ref: str | None = None
+    provider_secret_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptClaimReplayMaterialization:
+    claim: AttemptClaimRecord
+    attempt: AttemptRecord
+    can_rematerialize_source: bool
+    can_rematerialize_launch_capability: bool
+    can_rematerialize_attempt_capability: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchAttestationRecord:
+    launch_attestation_id: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    attempt_claim_id: str
+    worker_id: str
+    worker_session_id: str
+    pool_manager_id: str
+    runner_principal_id: str
+    runner_image_digest: str
+    runner_registration_revision: int
+    launch_nonce_id: str
+    launch_capability_digest: str
+    launch_capability_signing_key_id: str
+    launch_capability_signature_algorithm: str
+    workspace_instance_id: str
+    context_instance_id: str
+    invocation_instance_id: str
+    fresh_workspace: bool
+    fresh_context: bool
+    fresh_invocation: bool
+    prepared_at_ms: int
+    attested_at_ms: int
+    runner_signing_key_id: str
+    runner_signature_algorithm: str
+    attestation_digest: str
+    signature: str
+    response_contract_digest: str
+    accepted_at_ms: int
+    workspace_parent_id: str | None = None
+    context_parent_id: str | None = None
+    invocation_parent_id: str | None = None
+    provider_secret_ref: str | None = None
+    provider_material_descriptor_json: str | None = None
+    provider_material_descriptor_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchAcceptedReplay:
+    attestation: LaunchAttestationRecord
+    attempt: AttemptRecord
+    status: str
+    can_rematerialize_provider: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -981,6 +1074,12 @@ def _require_positive_int(value: int, *, field: str) -> int:
     return value
 
 
+def _require_nonempty_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
 def _require_json_text(value: Any) -> str:
     return value if isinstance(value, str) else canonical_json_text(value)
 
@@ -1277,6 +1376,82 @@ def _row_to_issued_capability(row: sqlite3.Row) -> IssuedCapabilityBinding:
         immutable_assignment_json=row["immutable_assignment_json"],
         capability_key_registry_revision=row["capability_key_registry_revision"],
         issued_at_ms=row["issued_at_ms"],
+    )
+
+
+def _row_to_attempt_claim(row: sqlite3.Row) -> AttemptClaimRecord:
+    return AttemptClaimRecord(
+        attempt_claim_id=row["attempt_claim_id"],
+        protocol_version=row["protocol_version"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        offer_outbox_id=row["offer_outbox_id"],
+        worker_id=row["worker_id"],
+        worker_session_id=row["worker_session_id"],
+        worker_profile=row["worker_profile"],
+        worker_build_revision=row["worker_build_revision"],
+        request_digest=row["request_digest"],
+        claimed_at_ms=row["claimed_at_ms"],
+        execution_deadline_ms=row["execution_deadline_ms"],
+        capability_auth_expires_at_ms=row["capability_auth_expires_at_ms"],
+        attempt_capability_jti=row["attempt_capability_jti"],
+        attempt_capability_digest=row["attempt_capability_digest"],
+        attempt_capability_signing_key_id=row["attempt_capability_signing_key_id"],
+        attempt_capability_signature_algorithm=row["attempt_capability_signature_algorithm"],
+        capability_key_registry_revision=row["capability_key_registry_revision"],
+        launch_nonce_id=row["launch_nonce_id"],
+        launch_capability_jti=row["launch_capability_jti"],
+        launch_capability_digest=row["launch_capability_digest"],
+        launch_capability_signing_key_id=row["launch_capability_signing_key_id"],
+        launch_capability_signature_algorithm=row["launch_capability_signature_algorithm"],
+        source_access_kind=row["source_access_kind"],
+        source_read_secret_ref=row["source_read_secret_ref"],
+        provider_secret_ref=row["provider_secret_ref"],
+        source_access_descriptor_json=row["source_access_descriptor_json"],
+        source_access_descriptor_digest=row["source_access_descriptor_digest"],
+        response_contract_digest=row["response_contract_digest"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_launch_attestation(row: sqlite3.Row) -> LaunchAttestationRecord:
+    return LaunchAttestationRecord(
+        launch_attestation_id=row["launch_attestation_id"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        attempt_claim_id=row["attempt_claim_id"],
+        worker_id=row["worker_id"],
+        worker_session_id=row["worker_session_id"],
+        pool_manager_id=row["pool_manager_id"],
+        runner_principal_id=row["runner_principal_id"],
+        runner_image_digest=row["runner_image_digest"],
+        runner_registration_revision=row["runner_registration_revision"],
+        launch_nonce_id=row["launch_nonce_id"],
+        launch_capability_digest=row["launch_capability_digest"],
+        launch_capability_signing_key_id=row["launch_capability_signing_key_id"],
+        launch_capability_signature_algorithm=row["launch_capability_signature_algorithm"],
+        workspace_instance_id=row["workspace_instance_id"],
+        context_instance_id=row["context_instance_id"],
+        invocation_instance_id=row["invocation_instance_id"],
+        workspace_parent_id=row["workspace_parent_id"],
+        context_parent_id=row["context_parent_id"],
+        invocation_parent_id=row["invocation_parent_id"],
+        fresh_workspace=bool(row["fresh_workspace"]),
+        fresh_context=bool(row["fresh_context"]),
+        fresh_invocation=bool(row["fresh_invocation"]),
+        prepared_at_ms=row["prepared_at_ms"],
+        attested_at_ms=row["attested_at_ms"],
+        runner_signing_key_id=row["runner_signing_key_id"],
+        runner_signature_algorithm=row["runner_signature_algorithm"],
+        signature=row["signature"],
+        attestation_digest=row["attestation_digest"],
+        provider_secret_ref=row["provider_secret_ref"],
+        provider_material_descriptor_json=row["provider_material_descriptor_json"],
+        provider_material_descriptor_digest=row["provider_material_descriptor_digest"],
+        response_contract_digest=row["response_contract_digest"],
+        accepted_at_ms=row["accepted_at_ms"],
     )
 
 
@@ -2810,6 +2985,116 @@ CREATE TABLE IF NOT EXISTS attempt_claims (
   FOREIGN KEY (attempt_id, activity_id, attempt_generation)
     REFERENCES attempts(attempt_id, activity_id, generation)
 );
+
+CREATE TABLE IF NOT EXISTS launch_attestations (
+  launch_attestation_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  attempt_claim_id TEXT NOT NULL REFERENCES attempt_claims(attempt_claim_id) ON DELETE RESTRICT,
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  pool_manager_id TEXT NOT NULL,
+  runner_principal_id TEXT NOT NULL,
+  runner_image_digest TEXT NOT NULL,
+  runner_registration_revision INTEGER NOT NULL CHECK (runner_registration_revision >= 0),
+  launch_nonce_id TEXT NOT NULL UNIQUE,
+  launch_capability_digest TEXT NOT NULL,
+  launch_capability_signing_key_id TEXT NOT NULL,
+  launch_capability_signature_algorithm TEXT NOT NULL,
+  workspace_instance_id TEXT NOT NULL UNIQUE,
+  context_instance_id TEXT NOT NULL UNIQUE,
+  invocation_instance_id TEXT NOT NULL UNIQUE,
+  workspace_parent_id TEXT,
+  context_parent_id TEXT,
+  invocation_parent_id TEXT,
+  fresh_workspace INTEGER NOT NULL CHECK (fresh_workspace = 1),
+  fresh_context INTEGER NOT NULL CHECK (fresh_context = 1),
+  fresh_invocation INTEGER NOT NULL CHECK (fresh_invocation = 1),
+  prepared_at_ms INTEGER NOT NULL CHECK (prepared_at_ms >= 0),
+  attested_at_ms INTEGER NOT NULL CHECK (attested_at_ms >= prepared_at_ms),
+  runner_signing_key_id TEXT NOT NULL,
+  runner_signature_algorithm TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  attestation_digest TEXT NOT NULL,
+  provider_secret_ref TEXT,
+  provider_material_descriptor_json TEXT,
+  provider_material_descriptor_digest TEXT,
+  response_contract_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (launch_attestation_id, attestation_digest),
+  UNIQUE (worker_session_id, launch_attestation_id),
+  CHECK (
+    workspace_parent_id IS NULL
+    AND context_parent_id IS NULL
+    AND invocation_parent_id IS NULL
+  ),
+  CHECK (
+    (provider_material_descriptor_json IS NULL AND provider_material_descriptor_digest IS NULL)
+    OR (
+      provider_material_descriptor_json IS NOT NULL
+      AND provider_material_descriptor_digest IS NOT NULL
+    )
+  ),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation)
+);
+"""
+
+_V8_TO_V9 = """
+CREATE TABLE IF NOT EXISTS launch_attestations (
+  launch_attestation_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  attempt_claim_id TEXT NOT NULL REFERENCES attempt_claims(attempt_claim_id) ON DELETE RESTRICT,
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  pool_manager_id TEXT NOT NULL,
+  runner_principal_id TEXT NOT NULL,
+  runner_image_digest TEXT NOT NULL,
+  runner_registration_revision INTEGER NOT NULL CHECK (runner_registration_revision >= 0),
+  launch_nonce_id TEXT NOT NULL UNIQUE,
+  launch_capability_digest TEXT NOT NULL,
+  launch_capability_signing_key_id TEXT NOT NULL,
+  launch_capability_signature_algorithm TEXT NOT NULL,
+  workspace_instance_id TEXT NOT NULL UNIQUE,
+  context_instance_id TEXT NOT NULL UNIQUE,
+  invocation_instance_id TEXT NOT NULL UNIQUE,
+  workspace_parent_id TEXT,
+  context_parent_id TEXT,
+  invocation_parent_id TEXT,
+  fresh_workspace INTEGER NOT NULL CHECK (fresh_workspace = 1),
+  fresh_context INTEGER NOT NULL CHECK (fresh_context = 1),
+  fresh_invocation INTEGER NOT NULL CHECK (fresh_invocation = 1),
+  prepared_at_ms INTEGER NOT NULL CHECK (prepared_at_ms >= 0),
+  attested_at_ms INTEGER NOT NULL CHECK (attested_at_ms >= prepared_at_ms),
+  runner_signing_key_id TEXT NOT NULL,
+  runner_signature_algorithm TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  attestation_digest TEXT NOT NULL,
+  provider_secret_ref TEXT,
+  provider_material_descriptor_json TEXT,
+  provider_material_descriptor_digest TEXT,
+  response_contract_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (launch_attestation_id, attestation_digest),
+  UNIQUE (worker_session_id, launch_attestation_id),
+  CHECK (
+    workspace_parent_id IS NULL
+    AND context_parent_id IS NULL
+    AND invocation_parent_id IS NULL
+  ),
+  CHECK (
+    (provider_material_descriptor_json IS NULL AND provider_material_descriptor_digest IS NULL)
+    OR (
+      provider_material_descriptor_json IS NOT NULL
+      AND provider_material_descriptor_digest IS NOT NULL
+    )
+  ),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation)
+);
 """
 
 _V1_TO_V2 = f"""
@@ -3154,7 +3439,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -3350,12 +3635,11 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 7:
                 # A real version-7 database already has every table in its
-                # final v7 shape; _SCHEMA only needs to create the new
-                # activities/attempts/attempt_claims tables (all CREATE TABLE
-                # IF NOT EXISTS).
-                assert current == 7
+                # final v7 shape; _SCHEMA only needs to create the new v8
+                # activities/attempts/attempt_claims tables and v9 launch
+                # attestation table (all CREATE TABLE IF NOT EXISTS).
                 self.conn.executescript(
                     "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -3365,6 +3649,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-durable-activity-attempts",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 8
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V8_TO_V9)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-launch-attestations",
                         _now_ms(),
                     ),
                 )
@@ -4372,6 +4668,531 @@ class RunStore:
             ).fetchone()
             assert row is not None
             return _row_to_issued_capability(row)
+
+    def get_attempt_claim(self, attempt_claim_id: str) -> AttemptClaimRecord | None:
+        require_lowercase_uuid(attempt_claim_id, field="attempt_claim_id")
+        row = self.conn.execute(
+            "SELECT * FROM attempt_claims WHERE attempt_claim_id = ?",
+            (attempt_claim_id,),
+        ).fetchone()
+        return None if row is None else _row_to_attempt_claim(row)
+
+    def get_attempt_claim_for_attempt(self, attempt_id: str) -> AttemptClaimRecord | None:
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        row = self.conn.execute(
+            "SELECT * FROM attempt_claims WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return None if row is None else _row_to_attempt_claim(row)
+
+    def claim_attempt(
+        self,
+        *,
+        attempt_claim_id: str,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        offer_outbox_id: str,
+        worker_id: str,
+        worker_session_id: str,
+        worker_profile: str,
+        worker_build_revision: str,
+        request_digest: str,
+        execution_deadline_ms: int,
+        attempt_capability_jti: str,
+        attempt_capability_digest: str,
+        source_access_kind: str,
+        source_access_descriptor: Any,
+        source_access_descriptor_digest: str,
+        response_contract_digest: str,
+        source_read_secret_ref: str | None = None,
+        provider_secret_ref: str | None = None,
+        launch_nonce_id: str | None = None,
+        launch_capability_jti: str | None = None,
+        launch_capability_claims: Mapping[str, Any] | None = None,
+        launch_capability_digest: str | None = None,
+    ) -> AttemptClaimReplayMaterialization:
+        """Durably claim one offered Attempt generation.
+
+        Raw bearers and secret bytes are intentionally outside this API; callers
+        rematerialize them from the returned immutable identifiers only while
+        the returned replay flags permit it.
+        """
+        require_lowercase_uuid(attempt_claim_id, field="attempt_claim_id")
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(attempt_capability_jti, field="attempt_capability_jti")
+        _require_positive_int(generation, field="generation")
+        _require_nonempty_text(offer_outbox_id, field="offer_outbox_id")
+        _require_nonempty_text(worker_id, field="worker_id")
+        _require_nonempty_text(worker_session_id, field="worker_session_id")
+        _require_nonempty_text(worker_profile, field="worker_profile")
+        _require_nonempty_text(worker_build_revision, field="worker_build_revision")
+        _require_digest(request_digest, field="request_digest")
+        _require_positive_int(execution_deadline_ms, field="execution_deadline_ms")
+        _require_digest(attempt_capability_digest, field="attempt_capability_digest")
+        _require_digest(source_access_descriptor_digest, field="source_access_descriptor_digest")
+        _require_digest(response_contract_digest, field="response_contract_digest")
+        enums.parse_enum("attempt_claim.source_access_kind", source_access_kind)
+        source_access_descriptor_json = _require_json_text(source_access_descriptor)
+        if launch_capability_claims is not None:
+            computed = launch_capability_claims_digest(launch_capability_claims)
+            if launch_capability_digest is not None and launch_capability_digest != computed:
+                raise IdempotencyConflictError("launch capability digest does not match claims")
+            launch_capability_digest = computed
+        if launch_nonce_id is not None:
+            require_lowercase_uuid(launch_nonce_id, field="launch_nonce_id")
+        if launch_capability_jti is not None:
+            require_lowercase_uuid(launch_capability_jti, field="launch_capability_jti")
+        if launch_capability_digest is not None:
+            _require_digest(launch_capability_digest, field="launch_capability_digest")
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM attempt_claims WHERE attempt_claim_id = ?",
+                (attempt_claim_id,),
+            ).fetchone()
+            if existing is not None:
+                claim = _row_to_attempt_claim(existing)
+                if (
+                    claim.attempt_id != attempt_id
+                    or claim.activity_id != activity_id
+                    or claim.attempt_generation != generation
+                    or claim.worker_id != worker_id
+                    or claim.worker_session_id != worker_session_id
+                    or claim.request_digest != request_digest
+                ):
+                    raise IdempotencyConflictError(
+                        "attempt claim id was reused with different content"
+                    )
+                attempt = self.get_attempt(attempt_id)
+                if attempt is None:
+                    raise RunStoreError(f"attempt {attempt_id!r} was not found")
+                return self._claim_replay_materialization(claim, attempt)
+
+            row = self.conn.execute(
+                "SELECT attempts.*, activities.state AS activity_state, "
+                "activities.run_id AS run_id, "
+                "activities.specification_generation AS activity_spec, "
+                "runs.state AS run_state, runs.specification_generation AS run_spec, "
+                "outbox.outbox_id AS outbox_row_id "
+                "FROM attempts "
+                "JOIN activities ON activities.activity_id = attempts.activity_id "
+                "JOIN runs ON runs.run_id = activities.run_id "
+                "JOIN outbox ON outbox.attempt_id = attempts.attempt_id "
+                "AND outbox.attempt_generation = attempts.generation "
+                "WHERE attempts.attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(f"attempt {attempt_id!r} was not found")
+            if row["activity_id"] != activity_id or row["generation"] != generation:
+                raise CasMismatchError("attempt identity does not match claim body")
+            if row["outbox_row_id"] != offer_outbox_id:
+                raise CasMismatchError("offer outbox does not match attempt")
+            if row["state"] != "OFFERED" or row["activity_state"] != "READY":
+                other = self.get_attempt_claim_for_attempt(attempt_id)
+                if other is not None and other.worker_session_id != worker_session_id:
+                    raise IdempotencyConflictError("attempt is already claimed")
+                raise CasMismatchError("attempt is not claimable")
+            now = _now_ms()
+            if now >= row["claim_deadline_ms"]:
+                raise CasMismatchError("attempt claim deadline has passed")
+            if row["worker_profile"] != worker_profile:
+                raise CasMismatchError("worker profile does not match attempt")
+            if (
+                row["run_state"] not in {"ADMITTED", "ACTIVE"}
+                or row["run_spec"] != row["activity_spec"]
+            ):
+                raise CasMismatchError("run generation is stale")
+            registry, key = self._assert_offer_planning_permitted()
+            if execution_deadline_ms <= now:
+                raise CasMismatchError("execution deadline is not in the future")
+            auth_expires_at_ms = execution_deadline_ms + 86_400_000
+            model_backed = row["provider"] is not None or row["model"] is not None
+            has_launch = (
+                launch_nonce_id is not None
+                and launch_capability_jti is not None
+                and launch_capability_digest is not None
+            )
+            if model_backed != has_launch:
+                raise CasMismatchError("launch capability presence does not match attempt kind")
+            if model_backed and provider_secret_ref is None:
+                raise CasMismatchError("model-backed attempt requires provider secret binding")
+            if not model_backed and provider_secret_ref is not None:
+                raise CasMismatchError("deterministic attempt cannot bind a provider secret")
+
+            self.conn.execute(
+                "INSERT INTO attempt_claims("
+                "attempt_claim_id, protocol_version, attempt_id, activity_id, "
+                "attempt_generation, offer_outbox_id, worker_id, worker_session_id, "
+                "worker_profile, worker_build_revision, request_digest, claimed_at_ms, "
+                "execution_deadline_ms, capability_auth_expires_at_ms, "
+                "attempt_capability_jti, attempt_capability_digest, "
+                "attempt_capability_signing_key_id, attempt_capability_signature_algorithm, "
+                "capability_key_registry_revision, launch_nonce_id, launch_capability_jti, "
+                "launch_capability_digest, launch_capability_signing_key_id, "
+                "launch_capability_signature_algorithm, source_access_kind, "
+                "source_read_secret_ref, provider_secret_ref, source_access_descriptor_json, "
+                "source_access_descriptor_digest, response_contract_digest, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    attempt_claim_id,
+                    ATTEMPT_CLAIM_PROTOCOL,
+                    attempt_id,
+                    activity_id,
+                    generation,
+                    offer_outbox_id,
+                    worker_id,
+                    worker_session_id,
+                    worker_profile,
+                    worker_build_revision,
+                    request_digest,
+                    now,
+                    execution_deadline_ms,
+                    auth_expires_at_ms,
+                    attempt_capability_jti,
+                    attempt_capability_digest,
+                    key.capability_signing_key_id,
+                    key.signature_algorithm,
+                    registry.registry_revision,
+                    launch_nonce_id,
+                    launch_capability_jti,
+                    launch_capability_digest,
+                    key.capability_signing_key_id if has_launch else None,
+                    key.signature_algorithm if has_launch else None,
+                    source_access_kind,
+                    source_read_secret_ref,
+                    provider_secret_ref,
+                    source_access_descriptor_json,
+                    source_access_descriptor_digest,
+                    response_contract_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE attempts SET state = 'CLAIMED', claimed_worker_id = ?, "
+                "claimed_worker_session_id = ?, claimed_at_ms = ?, execution_deadline_ms = ?, "
+                "capability_auth_expires_at_ms = ?, attempt_capability_jti = ?, "
+                "attempt_capability_digest = ?, attempt_capability_signing_key_id = ?, "
+                "attempt_capability_signature_algorithm = ?, attempt_claim_id = ?, "
+                "launch_nonce_id = ?, launch_capability_digest = ?, provider_secret_ref = ? "
+                "WHERE attempt_id = ? AND state = 'OFFERED'",
+                (
+                    worker_id,
+                    worker_session_id,
+                    now,
+                    execution_deadline_ms,
+                    auth_expires_at_ms,
+                    attempt_capability_jti,
+                    attempt_capability_digest,
+                    key.capability_signing_key_id,
+                    key.signature_algorithm,
+                    attempt_claim_id,
+                    launch_nonce_id,
+                    launch_capability_digest,
+                    provider_secret_ref,
+                    attempt_id,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE activities SET state = 'ACTIVE' WHERE activity_id = ? AND state = 'READY'",
+                (activity_id,),
+            )
+            self.conn.execute(
+                "UPDATE outbox SET state = 'DELIVERED', delivery_count = delivery_count + 1 "
+                "WHERE outbox_id = ? AND state != 'DELIVERED'",
+                (offer_outbox_id,),
+            )
+            claim_row = self.conn.execute(
+                "SELECT * FROM attempt_claims WHERE attempt_claim_id = ?",
+                (attempt_claim_id,),
+            ).fetchone()
+            assert claim_row is not None
+            attempt = self.get_attempt(attempt_id)
+            assert attempt is not None
+            return self._claim_replay_materialization(_row_to_attempt_claim(claim_row), attempt)
+
+    def _claim_replay_materialization(
+        self, claim: AttemptClaimRecord, attempt: AttemptRecord
+    ) -> AttemptClaimReplayMaterialization:
+        now = _now_ms()
+        before_execution_deadline = now < claim.execution_deadline_ms
+        signing_key = self.get_capability_signing_key(claim.attempt_capability_signing_key_id)
+        capability_key_retained = signing_key is not None and signing_key.state != "REVOKED"
+        return AttemptClaimReplayMaterialization(
+            claim=claim,
+            attempt=attempt,
+            can_rematerialize_source=before_execution_deadline,
+            can_rematerialize_launch_capability=(
+                before_execution_deadline
+                and capability_key_retained
+                and claim.launch_capability_digest is not None
+                and attempt.launch_capability_consumed_at_ms is None
+            ),
+            can_rematerialize_attempt_capability=(
+                capability_key_retained and now < claim.capability_auth_expires_at_ms
+            ),
+        )
+
+    def get_launch_attestation(self, launch_attestation_id: str) -> LaunchAttestationRecord | None:
+        require_lowercase_uuid(launch_attestation_id, field="launch_attestation_id")
+        row = self.conn.execute(
+            "SELECT * FROM launch_attestations WHERE launch_attestation_id = ?",
+            (launch_attestation_id,),
+        ).fetchone()
+        return None if row is None else _row_to_launch_attestation(row)
+
+    def accept_launch_attestation(
+        self,
+        *,
+        launch_attestation_id: str,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        pool_manager_id: str,
+        runner_principal_id: str,
+        runner_image_digest: str,
+        runner_registration_revision: int,
+        launch_nonce_id: str,
+        launch_capability_digest: str,
+        launch_capability_signing_key_id: str,
+        launch_capability_signature_algorithm: str,
+        workspace_instance_id: str,
+        context_instance_id: str,
+        invocation_instance_id: str,
+        workspace_parent_id: str | None,
+        context_parent_id: str | None,
+        invocation_parent_id: str | None,
+        fresh_workspace: bool,
+        fresh_context: bool,
+        fresh_invocation: bool,
+        prepared_at_ms: int,
+        attested_at_ms: int,
+        runner_signing_key_id: str,
+        runner_signature_algorithm: str,
+        signature: str,
+        attestation_digest: str,
+        response_contract_digest: str,
+        provider_material_descriptor: Any | None = None,
+        provider_material_descriptor_digest: str | None = None,
+    ) -> LaunchAcceptedReplay:
+        require_lowercase_uuid(launch_attestation_id, field="launch_attestation_id")
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(launch_nonce_id, field="launch_nonce_id")
+        require_lowercase_uuid(workspace_instance_id, field="workspace_instance_id")
+        require_lowercase_uuid(context_instance_id, field="context_instance_id")
+        require_lowercase_uuid(invocation_instance_id, field="invocation_instance_id")
+        _require_positive_int(attempt_generation, field="attempt_generation")
+        _require_nonempty_text(worker_id, field="worker_id")
+        _require_nonempty_text(worker_session_id, field="worker_session_id")
+        _require_nonempty_text(pool_manager_id, field="pool_manager_id")
+        _require_nonempty_text(runner_principal_id, field="runner_principal_id")
+        _require_digest(runner_image_digest, field="runner_image_digest")
+        if not isinstance(runner_registration_revision, int) or runner_registration_revision < 0:
+            raise ValueError("runner_registration_revision must be a nonnegative integer")
+        _require_digest(launch_capability_digest, field="launch_capability_digest")
+        _require_nonempty_text(
+            launch_capability_signing_key_id, field="launch_capability_signing_key_id"
+        )
+        enums.parse_enum(
+            "capability_signing_key.signature_algorithm",
+            launch_capability_signature_algorithm,
+        )
+        _require_nonempty_text(runner_signing_key_id, field="runner_signing_key_id")
+        enums.parse_enum(
+            "capability_signing_key.signature_algorithm",
+            runner_signature_algorithm,
+        )
+        _require_nonempty_text(signature, field="signature")
+        _require_digest(attestation_digest, field="attestation_digest")
+        _require_digest(response_contract_digest, field="response_contract_digest")
+        if not isinstance(prepared_at_ms, int) or prepared_at_ms < 0:
+            raise ValueError("prepared_at_ms must be a nonnegative integer")
+        if not isinstance(attested_at_ms, int) or attested_at_ms < prepared_at_ms:
+            raise ValueError("attested_at_ms must be greater than or equal to prepared_at_ms")
+        if (
+            workspace_parent_id is not None
+            or context_parent_id is not None
+            or invocation_parent_id is not None
+        ):
+            raise CasMismatchError("launch attestation parent ids must be null")
+        if not (fresh_workspace and fresh_context and fresh_invocation):
+            raise CasMismatchError("launch attestation must prove fresh isolation")
+        descriptor_json: str | None = None
+        if provider_material_descriptor is not None:
+            descriptor_json = _require_json_text(provider_material_descriptor)
+            if provider_material_descriptor_digest is None:
+                provider_material_descriptor_digest = request_digest(provider_material_descriptor)
+            _require_digest(
+                provider_material_descriptor_digest,
+                field="provider_material_descriptor_digest",
+            )
+        elif provider_material_descriptor_digest is not None:
+            raise ValueError("provider material descriptor digest requires a descriptor")
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM launch_attestations WHERE launch_attestation_id = ?",
+                (launch_attestation_id,),
+            ).fetchone()
+            if existing is not None:
+                attestation = _row_to_launch_attestation(existing)
+                if (
+                    attestation.attempt_id != attempt_id
+                    or attestation.activity_id != activity_id
+                    or attestation.attempt_generation != attempt_generation
+                    or attestation.worker_id != worker_id
+                    or attestation.worker_session_id != worker_session_id
+                    or attestation.launch_capability_digest != launch_capability_digest
+                    or attestation.attestation_digest != attestation_digest
+                ):
+                    raise IdempotencyConflictError(
+                        "launch attestation id was reused with different content"
+                    )
+                self._assert_launch_capability_key_lookup_permitted(
+                    attestation.launch_capability_signing_key_id
+                )
+                attempt = self.get_attempt(attempt_id)
+                if attempt is None:
+                    raise RunStoreError(f"attempt {attempt_id!r} was not found")
+                return self._launch_replay(attestation, attempt)
+
+            claim_row = self.conn.execute(
+                "SELECT * FROM attempt_claims WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if claim_row is None:
+                raise CasMismatchError("attempt has no durable claim")
+            claim = _row_to_attempt_claim(claim_row)
+            attempt = self.get_attempt(attempt_id)
+            if attempt is None:
+                raise RunStoreError(f"attempt {attempt_id!r} was not found")
+            if attempt.state != "CLAIMED":
+                raise CasMismatchError("attempt is not currently claimed")
+            if _now_ms() >= claim.execution_deadline_ms:
+                raise CasMismatchError("launch attestation arrived after execution deadline")
+            if (
+                claim.activity_id != activity_id
+                or claim.attempt_generation != attempt_generation
+                or claim.worker_id != worker_id
+                or claim.worker_session_id != worker_session_id
+                or claim.launch_nonce_id != launch_nonce_id
+                or claim.launch_capability_digest != launch_capability_digest
+                or claim.launch_capability_signing_key_id != launch_capability_signing_key_id
+                or claim.launch_capability_signature_algorithm
+                != launch_capability_signature_algorithm
+            ):
+                raise CasMismatchError("launch attestation does not match frozen claim")
+            if (
+                claim.launch_capability_digest is None
+                or attempt.launch_capability_consumed_at_ms is not None
+            ):
+                raise CasMismatchError("launch capability is not available")
+            self._assert_launch_capability_key_lookup_permitted(launch_capability_signing_key_id)
+            if attempt.provider_secret_ref != claim.provider_secret_ref:
+                raise CasMismatchError("provider secret binding drifted from claim")
+            if provider_material_descriptor is None and claim.provider_secret_ref is not None:
+                raise CasMismatchError("provider material descriptor is required")
+            for column, value in (
+                ("workspace_instance_id", workspace_instance_id),
+                ("context_instance_id", context_instance_id),
+                ("invocation_instance_id", invocation_instance_id),
+            ):
+                reused = self.conn.execute(
+                    f"SELECT 1 FROM launch_attestations WHERE {column} = ?", (value,)
+                ).fetchone()
+                if reused is not None:
+                    raise IdempotencyConflictError(f"{column} was already attested")
+
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO launch_attestations("
+                "launch_attestation_id, attempt_id, activity_id, attempt_generation, "
+                "attempt_claim_id, worker_id, worker_session_id, pool_manager_id, "
+                "runner_principal_id, runner_image_digest, runner_registration_revision, "
+                "launch_nonce_id, launch_capability_digest, launch_capability_signing_key_id, "
+                "launch_capability_signature_algorithm, workspace_instance_id, "
+                "context_instance_id, invocation_instance_id, workspace_parent_id, "
+                "context_parent_id, invocation_parent_id, fresh_workspace, fresh_context, "
+                "fresh_invocation, prepared_at_ms, attested_at_ms, runner_signing_key_id, "
+                "runner_signature_algorithm, signature, attestation_digest, provider_secret_ref, "
+                "provider_material_descriptor_json, provider_material_descriptor_digest, "
+                "response_contract_digest, accepted_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "1, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    launch_attestation_id,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    claim.attempt_claim_id,
+                    worker_id,
+                    worker_session_id,
+                    pool_manager_id,
+                    runner_principal_id,
+                    runner_image_digest,
+                    runner_registration_revision,
+                    launch_nonce_id,
+                    launch_capability_digest,
+                    launch_capability_signing_key_id,
+                    launch_capability_signature_algorithm,
+                    workspace_instance_id,
+                    context_instance_id,
+                    invocation_instance_id,
+                    workspace_parent_id,
+                    context_parent_id,
+                    invocation_parent_id,
+                    prepared_at_ms,
+                    attested_at_ms,
+                    runner_signing_key_id,
+                    runner_signature_algorithm,
+                    signature,
+                    attestation_digest,
+                    claim.provider_secret_ref,
+                    descriptor_json,
+                    provider_material_descriptor_digest,
+                    response_contract_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE attempts SET launch_attestation_id = ?, "
+                "launch_capability_consumed_at_ms = ? "
+                "WHERE attempt_id = ? AND launch_capability_consumed_at_ms IS NULL",
+                (launch_attestation_id, now, attempt_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM launch_attestations WHERE launch_attestation_id = ?",
+                (launch_attestation_id,),
+            ).fetchone()
+            assert row is not None
+            updated_attempt = self.get_attempt(attempt_id)
+            assert updated_attempt is not None
+            return self._launch_replay(_row_to_launch_attestation(row), updated_attempt)
+
+    def _assert_launch_capability_key_lookup_permitted(self, key_id: str) -> None:
+        key = self.get_capability_signing_key(key_id)
+        if key is None or key.state == "REVOKED":
+            raise WorkflowGateClosedError("launch capability signing key is revoked or unknown")
+
+    def _launch_replay(
+        self, attestation: LaunchAttestationRecord, attempt: AttemptRecord
+    ) -> LaunchAcceptedReplay:
+        available = (
+            attempt.state == "CLAIMED"
+            and attempt.execution_deadline_ms is not None
+            and _now_ms() < attempt.execution_deadline_ms
+        )
+        can_materialize = available and attestation.provider_material_descriptor_json is not None
+        return LaunchAcceptedReplay(
+            attestation=attestation,
+            attempt=attempt,
+            status="AVAILABLE" if can_materialize else "EXPIRED",
+            can_rematerialize_provider=can_materialize,
+        )
 
     # -- Secret Provision Operation (MANAGEMENT_PROVISION provision/adopt) --
 
