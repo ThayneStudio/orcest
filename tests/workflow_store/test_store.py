@@ -122,6 +122,14 @@ def _initialize_mode(store: RunStore) -> None:
     assert result.status == "SUCCEEDED"
 
 
+def _select_count(statements: list[str], table: str) -> int:
+    return sum(
+        1
+        for statement in statements
+        if statement.strip().lower().startswith("select ") and f" from {table}" in statement.lower()
+    )
+
+
 def test_capability_key_registration_requires_private_key_proof(tmp_path: Path) -> None:
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         public_key = _public_key(1)
@@ -611,6 +619,76 @@ def test_capability_key_bootstrap_register_then_select_and_issue_binding(
         assert binding.capability_signing_key_id == KEY_ID
         assert binding.signature_algorithm == "ED25519"
         assert binding.capability_key_registry_revision == 2
+
+
+def test_issued_capability_binding_reuses_controller_gate_reads(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _initialize_mode(store)
+        _register_key(store)
+        _select_key(store)
+        store.apply_controller_mode_operation(
+            controller_mode_operation_id="ffffffff-ffff-4fff-ffff-ffffffffffff",
+            operation_kind="SET_MODE",
+            expected_mode_revision=1,
+            expected_mode="MAINTENANCE",
+            requested_mode="RUNNING",
+            authenticated_principal_id="operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+
+        statements: list[str] = []
+        store.conn.set_trace_callback(statements.append)
+        binding = store.record_issued_capability_binding(
+            capability_jti=CAPABILITY_JTI,
+            claim_digest=_digest({"claim": 1}),
+            immutable_assignment_digest=_digest({"attempt": 1}),
+            immutable_assignment={"attempt": 1},
+        )
+        store.conn.set_trace_callback(None)
+
+        assert binding.capability_signing_key_id == KEY_ID
+        assert binding.capability_key_registry_revision == 2
+        assert _select_count(statements, "controller_mode") == 1
+        assert _select_count(statements, "capability_key_registry") == 1
+        assert _select_count(statements, "capability_signing_keys") == 1
+
+
+def test_issued_capability_binding_exact_replay_skips_gate_reads(tmp_path: Path) -> None:
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        _initialize_mode(store)
+        _register_key(store)
+        _select_key(store)
+        store.apply_controller_mode_operation(
+            controller_mode_operation_id="ffffffff-ffff-4fff-ffff-ffffffffffff",
+            operation_kind="SET_MODE",
+            expected_mode_revision=1,
+            expected_mode="MAINTENANCE",
+            requested_mode="RUNNING",
+            authenticated_principal_id="operator",
+            authorization_context_digest=AUTHZ_DIGEST,
+        )
+        binding = store.record_issued_capability_binding(
+            capability_jti=CAPABILITY_JTI,
+            claim_digest=_digest({"claim": 1}),
+            immutable_assignment_digest=_digest({"attempt": 1}),
+            immutable_assignment={"attempt": 1},
+        )
+
+        statements: list[str] = []
+        store.conn.set_trace_callback(statements.append)
+        replay = store.record_issued_capability_binding(
+            capability_jti=CAPABILITY_JTI,
+            claim_digest=_digest({"claim": 1}),
+            immutable_assignment_digest=_digest({"attempt": 1}),
+            immutable_assignment={"attempt": 1},
+        )
+        store.conn.set_trace_callback(None)
+
+        assert replay == binding
+        assert _select_count(statements, "capability_issuance_audit") == 1
+        assert _select_count(statements, "controller_mode") == 0
+        assert _select_count(statements, "capability_key_registry") == 0
+        assert _select_count(statements, "capability_signing_keys") == 0
 
 
 def test_capability_rotation_preserves_retired_key_and_revocation_disables_issuance(
