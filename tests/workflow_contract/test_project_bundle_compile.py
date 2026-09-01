@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from orcest.workflow_contract.v1 import project_bundle_source as source_mod
 from orcest.workflow_contract.v1.project_bundle import BundleValidationError
 from orcest.workflow_contract.v1.project_bundle_compile import compile_bundle
 from orcest.workflow_contract.v1.project_bundle_source import (
@@ -15,6 +16,7 @@ from orcest.workflow_contract.v1.project_bundle_source import (
     GitSourceError,
     resolve_commit,
 )
+from orcest.workflow_contract.v1.project_bundle_yaml import MAX_DOCUMENT_BYTES
 
 _PROJECT_YAML = """\
 apiVersion: orcest.dev/v1
@@ -232,3 +234,212 @@ def test_resolve_commit_unknown_revision(tmp_path: Path) -> None:
     _init_repo(repo, _valid_bundle_files())
     with pytest.raises(GitSourceError):
         resolve_commit(str(repo), "not-a-real-revision")
+
+
+def _blob_oid(source: GitBundleSource, path: str) -> str:
+    entry = source.ls_tree_entry(path)
+    assert entry is not None
+    return entry.oid
+
+
+def _spy_run_git(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    size_stdout_by_oid: dict[str, bytes] | None = None,
+    size_returncode_by_oid: dict[str, int] | None = None,
+) -> list[list[str]]:
+    """Record every ``_run_git`` argv; optionally stub ``cat-file -s`` per oid."""
+    calls: list[list[str]] = []
+    original = source_mod._run_git
+
+    def _spy(repo_root: str, args: list[str]) -> subprocess.CompletedProcess:
+        calls.append(list(args))
+        if len(args) >= 3 and args[0] == "cat-file" and args[1] == "-s":
+            oid = args[2]
+            if size_returncode_by_oid is not None and oid in size_returncode_by_oid:
+                return subprocess.CompletedProcess(
+                    args=["git", "-C", repo_root, *args],
+                    returncode=size_returncode_by_oid[oid],
+                    stdout=b"",
+                    stderr=b"cat-file: stub failure",
+                )
+            if size_stdout_by_oid is not None and oid in size_stdout_by_oid:
+                return subprocess.CompletedProcess(
+                    args=["git", "-C", repo_root, *args],
+                    returncode=0,
+                    stdout=size_stdout_by_oid[oid],
+                    stderr=b"",
+                )
+        return original(repo_root, args)
+
+    monkeypatch.setattr(source_mod, "_run_git", _spy)
+    return calls
+
+
+def _cat_file_called_for(calls: list[list[str]], flag: str, oid: str) -> bool:
+    return any(len(args) >= 3 and args[:3] == ["cat-file", flag, oid] for args in calls)
+
+
+def test_read_regular_blob_oversized_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    content = "hello\n"
+    commit = _init_repo(repo, {"blob.txt": content})
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, "blob.txt")
+    calls = _spy_run_git(monkeypatch)
+
+    with pytest.raises(GitSourceError) as excinfo:
+        source.read_regular_blob("blob.txt", max_bytes=len(content) - 1)
+    assert excinfo.value.code == "DOCUMENT_TOO_LARGE"
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+def test_read_regular_blob_at_limit_is_readable(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    content = "hello\n"
+    commit = _init_repo(repo, {"blob.txt": content})
+    source = _open_source(repo, commit)
+    assert source.read_regular_blob("blob.txt", max_bytes=len(content)) == content.encode()
+
+
+def test_read_regular_blob_size_query_failure_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, {"blob.txt": "hello\n"})
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, "blob.txt")
+    calls = _spy_run_git(monkeypatch, size_returncode_by_oid={oid: 128})
+
+    with pytest.raises(GitSourceError) as excinfo:
+        source.read_regular_blob("blob.txt", max_bytes=MAX_DOCUMENT_BYTES)
+    assert excinfo.value.code == "GIT_CAT_FILE_FAILED"
+    assert "blob.txt" in str(excinfo.value)
+    assert len(str(excinfo.value)) < 500
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"",
+        b"nope\n",
+        b"-1\n",
+        b"1.5\n",
+        b"1 2\n",
+        b"+10\n",
+        b" \n",
+        b"x" * 65,
+    ],
+    ids=[
+        "empty",
+        "non-numeric",
+        "negative",
+        "float",
+        "two-tokens",
+        "leading-plus",
+        "whitespace",
+        "oversized-stdout",
+    ],
+)
+def test_read_regular_blob_malformed_size_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, {"blob.txt": "hello\n"})
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, "blob.txt")
+    calls = _spy_run_git(monkeypatch, size_stdout_by_oid={oid: stdout})
+
+    with pytest.raises(GitSourceError) as excinfo:
+        source.read_regular_blob("blob.txt", max_bytes=MAX_DOCUMENT_BYTES)
+    assert excinfo.value.code == "GIT_CAT_FILE_FAILED"
+    assert len(str(excinfo.value)) < 500
+    if stdout.strip():
+        assert stdout.strip() not in str(excinfo.value).encode()
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+def test_compile_oversized_project_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, _valid_bundle_files())
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, ".orcest/project.yaml")
+    calls = _spy_run_git(
+        monkeypatch, size_stdout_by_oid={oid: f"{MAX_DOCUMENT_BYTES + 1}\n".encode()}
+    )
+
+    with pytest.raises(BundleValidationError) as excinfo:
+        compile_bundle(source)
+    assert any(d.code == "DOCUMENT_TOO_LARGE" for d in excinfo.value.diagnostics)
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+def test_compile_oversized_workflow_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, _valid_bundle_files())
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, ".orcest/workflows/implementation.yaml")
+    calls = _spy_run_git(
+        monkeypatch, size_stdout_by_oid={oid: f"{MAX_DOCUMENT_BYTES + 1}\n".encode()}
+    )
+
+    with pytest.raises(BundleValidationError) as excinfo:
+        compile_bundle(source)
+    assert any(d.code == "DOCUMENT_TOO_LARGE" for d in excinfo.value.diagnostics)
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+def test_compile_oversized_prompt_skips_content_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, _valid_bundle_files())
+    source = _open_source(repo, commit)
+    oid = _blob_oid(source, ".orcest/prompts/implement.md")
+    calls = _spy_run_git(
+        monkeypatch, size_stdout_by_oid={oid: f"{MAX_DOCUMENT_BYTES + 1}\n".encode()}
+    )
+
+    with pytest.raises(BundleValidationError) as excinfo:
+        compile_bundle(source)
+    assert any(d.code == "DOCUMENT_TOO_LARGE" for d in excinfo.value.diagnostics)
+    assert _cat_file_called_for(calls, "-s", oid)
+    assert not _cat_file_called_for(calls, "-p", oid)
+
+
+def test_compile_blob_exactly_at_document_limit_is_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    commit = _init_repo(repo, _valid_bundle_files())
+    source = _open_source(repo, commit)
+    oids = {
+        _blob_oid(source, path)
+        for path in (
+            ".orcest/project.yaml",
+            ".orcest/workflows/implementation.yaml",
+            *_PROMPTS,
+        )
+    }
+    calls = _spy_run_git(
+        monkeypatch,
+        size_stdout_by_oid={oid: f"{MAX_DOCUMENT_BYTES}\n".encode() for oid in oids},
+    )
+
+    compiled = compile_bundle(source)
+    assert compiled.workflow_hash.startswith("sha256:")
+    for oid in oids:
+        assert _cat_file_called_for(calls, "-s", oid)
+        assert _cat_file_called_for(calls, "-p", oid)

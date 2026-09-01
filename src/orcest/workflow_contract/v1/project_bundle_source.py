@@ -32,6 +32,10 @@ __all__ = [
 ]
 
 _GIT_TIMEOUT_SECONDS = 30
+# ``git cat-file -s`` prints a decimal byte count. 64 bytes of stdout is far
+# more than a well-formed size needs; anything larger is treated as malformed
+# so the resulting GitSourceError stays bounded.
+_MAX_CAT_FILE_SIZE_STDOUT_BYTES = 64
 
 
 class GitSourceError(ValueError):
@@ -133,9 +137,14 @@ class GitBundleSource:
             entries.append(TreeEntry(path=entry_path, mode=mode, object_type=object_type, oid=oid))
         return entries
 
-    def read_regular_blob(self, path: str) -> bytes:
+    def read_regular_blob(self, path: str, *, max_bytes: int) -> bytes:
         """Read ``path`` at the pinned commit; rejects a symlink, submodule, or other non-blob
         mode.
+
+        Queries ``git cat-file -s`` first and refuses to materialize the blob
+        when its size exceeds ``max_bytes``. A size-query failure or malformed
+        size output raises :class:`GitSourceError` without falling through to
+        ``git cat-file -p``.
         """
         entry = self.ls_tree_entry(path)
         if entry is None:
@@ -154,7 +163,32 @@ class GitBundleSource:
                 f"{path} has git mode {entry.mode!r}; only regular files "
                 f"({sorted(_ALLOWED_BLOB_MODES)}) are allowed",
             )
+        size = _blob_byte_size(self.repo_root, entry.oid, path=path)
+        if size > max_bytes:
+            raise GitSourceError(
+                "DOCUMENT_TOO_LARGE",
+                f"{path} exceeds the {max_bytes}-byte per-file limit",
+            )
         result = _run_git(self.repo_root, ["cat-file", "-p", entry.oid])
         if result.returncode != 0:
             raise GitSourceError("GIT_CAT_FILE_FAILED", f"git cat-file failed to read {path}")
         return result.stdout
+
+
+def _blob_byte_size(repo_root: str, oid: str, *, path: str) -> int:
+    """Return the byte size of ``oid`` via ``git cat-file -s``, failing closed."""
+    result = _run_git(repo_root, ["cat-file", "-s", oid])
+    if result.returncode != 0:
+        raise GitSourceError("GIT_CAT_FILE_FAILED", f"git cat-file -s failed to size {path}")
+    if len(result.stdout) > _MAX_CAT_FILE_SIZE_STDOUT_BYTES:
+        raise GitSourceError(
+            "GIT_CAT_FILE_FAILED",
+            f"git cat-file -s returned a malformed size for {path}",
+        )
+    text = result.stdout.decode("ascii", errors="replace").strip()
+    if not text.isdigit():
+        raise GitSourceError(
+            "GIT_CAT_FILE_FAILED",
+            f"git cat-file -s returned a malformed size for {path}",
+        )
+    return int(text)
