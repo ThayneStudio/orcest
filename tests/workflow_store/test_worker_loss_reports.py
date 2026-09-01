@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from pathlib import Path
 
 import pytest
 
+from orcest.workflow_contract.v1.protocol import validate_envelope
 from orcest.workflow_store import (
     AttemptOfferInput,
     AttemptUnknownError,
@@ -123,6 +125,9 @@ def test_accepted_report_terminalizes_attempt_and_returns_activity_to_planned(
     assert result.health_observation_id is not None
     assert result.attempt_terminal_fact_id is not None
     assert result.replayed is False
+    body = json.loads(result.response_json)
+    validate_envelope(body)
+    assert body["replayed"] is False
 
     attempt = store.get_attempt(ATTEMPT_ID)
     assert attempt.state == "FAILED"
@@ -195,6 +200,9 @@ def test_replaying_same_idempotency_key_returns_stored_response(store: RunStore)
     second = _submit(store, idempotency_key=idempotency_key)
 
     assert second.replayed is True
+    replay_body = json.loads(second.response_json)
+    validate_envelope(replay_body)
+    assert replay_body["replayed"] is True
     assert second.outcome == first.outcome
     assert second.attempt_terminal_fact_id == first.attempt_terminal_fact_id
     assert store.conn.execute("SELECT COUNT(*) FROM worker_loss_reports").fetchone()[0] == 1

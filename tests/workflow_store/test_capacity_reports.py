@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from orcest.workflow_contract.v1.digest import request_digest
+from orcest.workflow_contract.v1.protocol import validate_envelope
 from orcest.workflow_store.store import (
     CapacityReportEntryInput,
     CasMismatchError,
@@ -90,6 +92,9 @@ def test_submit_capacity_report_creates_health_observation_and_response(store: R
     result = _submit(store, entries=[_session_entry(worker_session_id=session_id)])
 
     assert result.replayed is False
+    body = json.loads(result.response_json)
+    validate_envelope(body)
+    assert body["replayed"] is False
     assert len(result.health_observations) == 1
     observation = result.health_observations[0]
     assert observation.scope_kind == "WORKER_SESSION"
@@ -145,6 +150,9 @@ def test_replaying_same_report_id_and_body_returns_stored_response(store: RunSto
         authorization_context_digest="sha256:" + "1" * 64,
     )
     assert second.replayed is True
+    replay_body = json.loads(second.response_json)
+    validate_envelope(replay_body)
+    assert replay_body["replayed"] is True
     assert second.capacity_report_id == first.capacity_report_id
     assert second.health_observations == first.health_observations
     assert store.conn.execute("SELECT COUNT(*) FROM capacity_reports").fetchone()[0] == 1

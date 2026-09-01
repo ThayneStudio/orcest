@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from orcest.workflow_contract.v1.digest import request_digest
+from orcest.workflow_contract.v1.protocol import validate_envelope
 from orcest.workflow_store.store import (
     CasMismatchError,
     IdempotencyConflictError,
@@ -84,6 +86,9 @@ def test_submit_budget_report_derives_available(store: RunStore) -> None:
     result = _submit(store, limit_microunits=100, consumed_microunits=10)
     assert result.availability == "AVAILABLE"
     assert result.replayed is False
+    body = json.loads(result.response_json)
+    validate_envelope(body)
+    assert body["replayed"] is False
 
 
 def test_submit_budget_report_derives_exhausted(store: RunStore) -> None:
@@ -98,6 +103,9 @@ def test_replaying_same_budget_report_id_returns_stored_response(store: RunStore
     first = _submit(store, budget_report_id=budget_report_id, **fixed)
     second = _submit(store, budget_report_id=budget_report_id, **fixed)
     assert second.replayed is True
+    replay_body = json.loads(second.response_json)
+    validate_envelope(replay_body)
+    assert replay_body["replayed"] is True
     assert second.response_digest == first.response_digest
     assert store.conn.execute("SELECT COUNT(*) FROM budget_reports").fetchone()[0] == 1
 

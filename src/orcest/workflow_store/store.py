@@ -1485,6 +1485,14 @@ def _response_digest_preimage(value: Any) -> Any:
     return stripped
 
 
+def _response_json_with_replayed(response_json: str, *, replayed: bool) -> str:
+    body = json.loads(response_json)
+    if not isinstance(body, dict):
+        raise RunStoreError("stored response is not a JSON object")
+    body["replayed"] = replayed
+    return canonical_json_text(body)
+
+
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
         run_id=row["run_id"],
@@ -11000,7 +11008,7 @@ class RunStore:
             health_observations=observations,
             woken_wait_condition_ids=woken,
             response_http_status=row["response_http_status"],
-            response_json=row["response_json"],
+            response_json=_response_json_with_replayed(row["response_json"], replayed=replayed),
             response_digest=row["response_digest"],
             accepted_at_ms=row["accepted_at_ms"],
             replayed=replayed,
@@ -11176,6 +11184,7 @@ class RunStore:
                 "capacity_report_id": capacity_report_id,
                 "report_id": report_id,
                 "report_sequence": report_sequence,
+                "replayed": False,
                 "health_observations": [
                     {
                         "health_observation_id": obs.health_observation_id,
@@ -11190,7 +11199,9 @@ class RunStore:
                 ],
                 "woken_wait_condition_ids": list(woken),
             }
-            resp_digest = response_digest({"http_status": 200, "body": body})
+            resp_digest = response_digest(
+                {"http_status": 200, "body": _response_digest_preimage(body)}
+            )
             body_json = canonical_json_text(body)
             self.conn.execute(
                 "UPDATE capacity_reports SET response_json = ?, response_digest = ? "
@@ -11234,10 +11245,11 @@ class RunStore:
             "generation": attempt_generation,
             "accepted": accepted,
             "stale": stale,
+            "replayed": False,
             "health_observation_id": health_observation_id,
             "attempt_terminal_fact_id": attempt_terminal_fact_id,
         }
-        resp_digest = response_digest({"http_status": 200, "body": body})
+        resp_digest = response_digest({"http_status": 200, "body": _response_digest_preimage(body)})
         return 200, canonical_json_text(body), resp_digest
 
     def _worker_loss_report_result_from_row(
@@ -11257,7 +11269,7 @@ class RunStore:
             health_observation_id=row["health_observation_id"],
             attempt_terminal_fact_id=row["attempt_terminal_fact_id"],
             response_http_status=row["response_http_status"],
-            response_json=row["response_json"],
+            response_json=_response_json_with_replayed(row["response_json"], replayed=replayed),
             response_digest=row["response_digest"],
             accepted_at_ms=row["accepted_at_ms"],
             replayed=replayed,
@@ -11568,7 +11580,7 @@ class RunStore:
             availability=row["availability"],
             affected_run_ids_digest=row["affected_run_ids_digest"],
             response_http_status=row["response_http_status"],
-            response_json=row["response_json"],
+            response_json=_response_json_with_replayed(row["response_json"], replayed=replayed),
             response_digest=row["response_digest"],
             accepted_at_ms=row["accepted_at_ms"],
             replayed=replayed,
@@ -11686,10 +11698,13 @@ class RunStore:
                 "project_id": project_id,
                 "accounting_scope_id": accounting_scope_id,
                 "source_sequence": source_sequence,
+                "replayed": False,
                 "availability": availability,
                 "affected_run_ids_digest": members_digest,
             }
-            resp_digest = response_digest({"http_status": 200, "body": body})
+            resp_digest = response_digest(
+                {"http_status": 200, "body": _response_digest_preimage(body)}
+            )
             body_json = canonical_json_text(body)
 
             self.conn.execute(
