@@ -3726,10 +3726,26 @@ class RunStore:
         failure_evidence_digest: str,
         next_retry_ms: int,
     ) -> SecretProvisionCheckpointRecord:
-        """Append a ``FAILED_RETRYABLE`` checkpoint without closing the Operation."""
+        """Append a ``FAILED_RETRYABLE`` checkpoint without closing the Operation.
+
+        Only ``SECRET_STORE_UNAVAILABLE``, ``TRANSIENT_STORAGE_ERROR``, and
+        ``TRANSIENT_DATABASE_BUSY`` are valid here: terminal codes such as
+        ``CAS_LOST`` are decided at acceptance or install rejection and never
+        recorded as retryable.
+        """
         require_lowercase_uuid(secret_provision_operation_id, field="secret_provision_operation_id")
         enums.parse_enum("secret_provision_checkpoint.phase", phase)
         enums.parse_enum("secret_provision_checkpoint.failure_code", failure_code)
+        if failure_code not in (
+            "SECRET_STORE_UNAVAILABLE",
+            "TRANSIENT_STORAGE_ERROR",
+            "TRANSIENT_DATABASE_BUSY",
+        ):
+            raise ValueError(
+                "record_secret_provision_retry_checkpoint only records a "
+                "retryable failure (SECRET_STORE_UNAVAILABLE, "
+                "TRANSIENT_STORAGE_ERROR, or TRANSIENT_DATABASE_BUSY)"
+            )
         _require_digest(failure_evidence_digest, field="failure_evidence_digest")
         with self.transaction():
             row = self.conn.execute(
