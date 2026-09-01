@@ -56,23 +56,37 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 
 _PATH_THREAD_LOCKS_GUARD = threading.Lock()
-_PATH_THREAD_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _thread_lock_for(path: Path) -> threading.Lock:
+class _PathLockState:
+    """Process-wide mutex and owner thread for one normalized ``storage.lock`` path."""
+
+    __slots__ = ("lock", "owner_guard", "owner_thread")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.owner_guard = threading.Lock()
+        self.owner_thread: int | None = None
+
+
+_PATH_THREAD_LOCKS: dict[str, _PathLockState] = {}
+
+
+def _path_lock_state_for(path: Path) -> _PathLockState:
     """One in-process lock per storage.lock path so concurrent writers serialize.
 
-    Re-entry is tracked by owning thread per ``StorageLock`` instance, not via
-    ``RLock``, so a second instance on the same path cannot sneak in on the
-    same thread.
+    The owning thread is stored on this shared state so a second ``StorageLock``
+    instance on the same path can detect same-thread ownership and fail closed
+    instead of blocking forever on the non-reentrant mutex. Same-instance
+    re-entry is still tracked per ``StorageLock`` via depth, not via ``RLock``.
     """
     key = str(Path(path).absolute())
     with _PATH_THREAD_LOCKS_GUARD:
-        lock = _PATH_THREAD_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _PATH_THREAD_LOCKS[key] = lock
-        return lock
+        state = _PATH_THREAD_LOCKS.get(key)
+        if state is None:
+            state = _PathLockState()
+            _PATH_THREAD_LOCKS[key] = state
+        return state
 
 
 def digest_hex(digest: str) -> str:
@@ -454,14 +468,18 @@ class ControlLayout:
 class StorageLock:
     """Controller-owned storage mutation lock backed by ``storage.lock``.
 
-    Combines a process-level ``fcntl.flock`` with a reentrant thread lock so
+    Combines a process-level ``fcntl.flock`` with a per-path thread mutex so
     concurrent in-process writers and cross-process writers both fail closed
     (they serialize or, in nonblocking mode, error) rather than clobbering.
+
+    Same-instance re-entry is counted on this object. A second instance for the
+    same path in the same thread raises ``StorageLockError`` instead of waiting
+    on the non-reentrant mutex or borrowing the first instance's ownership.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
-        self._thread = _thread_lock_for(self._path)
+        self._path_lock = _path_lock_state_for(self._path)
         self._state = threading.Lock()
         self._fd: int | None = None
         self._owner: int | None = None
@@ -473,7 +491,15 @@ class StorageLock:
             if self._owner == current_thread:
                 self._depth += 1
                 return True
-        if not self._thread.acquire(blocking=blocking):
+        with self._path_lock.owner_guard:
+            owned_by_this_thread = self._path_lock.owner_thread == current_thread
+        if owned_by_this_thread:
+            if blocking:
+                raise StorageLockError(
+                    "storage.lock is already held by this thread via another StorageLock"
+                )
+            return False
+        if not self._path_lock.lock.acquire(blocking=blocking):
             return False
         flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
         fd = os.open(self._path, flags, FILE_MODE)
@@ -483,12 +509,14 @@ class StorageLock:
             fcntl.flock(fd, flock_flags)
         except BlockingIOError:
             os.close(fd)
-            self._thread.release()
+            self._path_lock.lock.release()
             return False
         except BaseException:
             os.close(fd)
-            self._thread.release()
+            self._path_lock.lock.release()
             raise
+        with self._path_lock.owner_guard:
+            self._path_lock.owner_thread = current_thread
         with self._state:
             self._fd = fd
             self._owner = current_thread
@@ -516,7 +544,9 @@ class StorageLock:
                 self._fd = None
                 self._owner = None
                 self._depth = 0
-            self._thread.release()
+            with self._path_lock.owner_guard:
+                self._path_lock.owner_thread = None
+            self._path_lock.lock.release()
 
     def held(self) -> bool:
         with self._state:
