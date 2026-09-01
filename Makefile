@@ -5,9 +5,11 @@ DASHBOARD_REDIS_ENV ?= /opt/orcest/.redis.env
 DASHBOARD_ENV ?= /opt/orcest/.dashboard.env
 DASHBOARD_NODE_VERSION ?= $(shell cat dashboard/.node-version)
 DASHBOARD_NODE_IMAGE ?= node:$(DASHBOARD_NODE_VERSION)-slim
+DASHBOARD_CLEAN_COPY_RUNNER ?= docker
 DASHBOARD_AUDIT_LEVEL ?= moderate
 ORCEST_BUILD_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 DASHBOARD_NPM_ENV = -e NPM_CONFIG_AUDIT=false -e NPM_CONFIG_FUND=false -e NPM_CONFIG_PROGRESS=false -e NPM_CONFIG_UPDATE_NOTIFIER=false
+DASHBOARD_NPM_ENV_NATIVE = NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false NPM_CONFIG_PROGRESS=false NPM_CONFIG_UPDATE_NOTIFIER=false
 DASHBOARD_DOCKER_RUN = docker run --rm --user "$(shell id -u):$(shell id -g)" -e HOME=/tmp $(DASHBOARD_NPM_ENV) -v "$(CURDIR)/dashboard:/app" -w /app $(DASHBOARD_NODE_IMAGE)
 DASHBOARD_SOURCE_TAR_EXCLUDES = --exclude='./node_modules' --exclude='./dist' --exclude='./build' --exclude='./.git' --exclude='./.env' --exclude='./.env.*' --exclude='./*.env' --exclude='./.npmrc*' --exclude='./npm-debug.log*' --exclude='./vite.config.ts.timestamp-*.mjs'
 DASHBOARD_RSYNC_EXCLUDES = --exclude='node_modules/' --exclude='dist/' --exclude='build/' --exclude='.git/' --exclude='.env' --exclude='.env.*' --exclude='*.env' --exclude='.npmrc*' --exclude='npm-debug.log*' --exclude='vite.config.ts.timestamp-*.mjs'
@@ -38,9 +40,20 @@ DASHBOARD_REMOTE_COMPOSE_STATE_FILE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOAR
 DASHBOARD_NODE_VERSION_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_VERSION))
 DASHBOARD_NODE_IMAGE_SH = $(call DASHBOARD_SHELL_QUOTE,$(DASHBOARD_NODE_IMAGE))
 
-define DASHBOARD_RUN_IN_CLEAN_COPY
+define DASHBOARD_RUN_IN_CLEAN_COPY_DOCKER
 tar -C "$(CURDIR)/dashboard" $(DASHBOARD_SOURCE_TAR_EXCLUDES) -cf - . | \
 docker run --rm -i -e HOME=/tmp $(DASHBOARD_NPM_ENV) -w /app $(DASHBOARD_NODE_IMAGE) sh -lc 'tar -C /app -xf - && $(1)'
+endef
+
+define DASHBOARD_RUN_IN_CLEAN_COPY_NATIVE
+tmpdir=$$(mktemp -d); \
+trap 'rm -rf "$$tmpdir"' EXIT INT TERM; \
+tar -C "$(CURDIR)/dashboard" $(DASHBOARD_SOURCE_TAR_EXCLUDES) -cf - . | tar -C "$$tmpdir" -xf -; \
+cd "$$tmpdir" && HOME="$$tmpdir" $(DASHBOARD_NPM_ENV_NATIVE) sh -lc '$(1)'
+endef
+
+define DASHBOARD_RUN_IN_CLEAN_COPY
+$(if $(filter native,$(DASHBOARD_CLEAN_COPY_RUNNER)),$(call DASHBOARD_RUN_IN_CLEAN_COPY_NATIVE,$(1)),$(call DASHBOARD_RUN_IN_CLEAN_COPY_DOCKER,$(1)))
 endef
 
 define DASHBOARD_RUN_REMOTE
