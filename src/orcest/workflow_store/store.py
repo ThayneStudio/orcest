@@ -24,18 +24,23 @@ from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
+    bare_canonical_digest,
     capability_public_key_digest,
     checkpoint_digest,
+    config_bundle_hash,
     forge_observation_payload_digest,
     forge_observation_result_membership_digest,
     forge_observation_schedule_digest,
     forge_request_failure_fact_digest,
     is_valid_content_digest,
+    policy_digest,
     receipt_digest,
     request_digest,
     resolution_digest,
     response_digest,
+    specification_digest,
     work_item_discovery_set_digest,
+    workflow_blob_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
@@ -51,7 +56,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -566,6 +571,108 @@ class ForgeObservationRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowBlobSqlRecord:
+    blob_digest: str
+    media_kind: str
+    byte_length: int
+    normalized_bytes: bytes
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyUpdateRecord:
+    policy_update_id: str
+    project_id: str
+    policy_update_sequence: int
+    server_policy_revision: str
+    server_policy_blob_digest: str
+    default_ref: str
+    trusted_base_policy_ref: str
+    budget_policy_ref: str
+    budget_reset_window_ref: str
+    source_kind: str
+    source_id: str
+    authenticated_principal_id: str
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedPromptBlob:
+    path: str
+    git_blob: str
+    blob_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkItemSnapshotRecord:
+    snapshot_id: str
+    run_id: str
+    snapshot_sequence: int
+    source_kind: str
+    source_id: str
+    work_item_observation_id: str
+    base_observation_id: str
+    project_id: str
+    work_item_external_id: str
+    forge_revision: str
+    title: str
+    body: str
+    specification_comments_json: str
+    base_ref: str
+    base_commit_json: str
+    workflow_schema_version: str
+    workflow_hash: str
+    normalized_workflow_blob_digest: str
+    normalized_prompt_blobs_json: str
+    effective_policy_blob_digest: str
+    server_policy_revision: str
+    trusted_base_policy_ref: str
+    budget_policy_ref: str
+    budget_reset_window_ref: str
+    policy_hash: str
+    reducer_version: str
+    specification_hash: str
+    generation_input_hash: str
+    base_movement_policy: str
+    supersession_key: str
+    snapshot_hash: str
+    captured_at_ms: int
+
+    @property
+    def specification_comments(self) -> Any:
+        return json.loads(self.specification_comments_json)
+
+    @property
+    def base_commit(self) -> Any:
+        return json.loads(self.base_commit_json)
+
+    @property
+    def normalized_prompt_blobs(self) -> list[dict[str, str]]:
+        loaded = json.loads(self.normalized_prompt_blobs_json)
+        if not isinstance(loaded, list):
+            raise RunStoreError("stored normalized_prompt_blobs is not a JSON array")
+        return loaded
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotGenerationRecord:
+    run_id: str
+    specification_generation: int
+    snapshot_id: str
+    installed_transition_sequence: int
+    installed_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionResult:
+    run_id: str
+    snapshot_id: str
+    transition: Transition | None
+    projection_outbox_id: str | None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ForgeObservationInput:
     """One normalized adapter result to commit as a Forge Observation.
 
@@ -796,6 +903,81 @@ def _row_to_transition(row: sqlite3.Row) -> Transition:
         created_at_ms=row["created_at_ms"],
         specification_generation=row["specification_generation"],
         admit_base_observation_id=row["admit_base_observation_id"],
+    )
+
+
+def _row_to_workflow_blob(row: sqlite3.Row) -> WorkflowBlobSqlRecord:
+    return WorkflowBlobSqlRecord(
+        blob_digest=row["blob_digest"],
+        media_kind=row["media_kind"],
+        byte_length=row["byte_length"],
+        normalized_bytes=bytes(row["normalized_bytes"]),
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_policy_update(row: sqlite3.Row) -> PolicyUpdateRecord:
+    return PolicyUpdateRecord(
+        policy_update_id=row["policy_update_id"],
+        project_id=row["project_id"],
+        policy_update_sequence=row["policy_update_sequence"],
+        server_policy_revision=row["server_policy_revision"],
+        server_policy_blob_digest=row["server_policy_blob_digest"],
+        default_ref=row["default_ref"],
+        trusted_base_policy_ref=row["trusted_base_policy_ref"],
+        budget_policy_ref=row["budget_policy_ref"],
+        budget_reset_window_ref=row["budget_reset_window_ref"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_work_item_snapshot(row: sqlite3.Row) -> WorkItemSnapshotRecord:
+    return WorkItemSnapshotRecord(
+        snapshot_id=row["snapshot_id"],
+        run_id=row["run_id"],
+        snapshot_sequence=row["snapshot_sequence"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        work_item_observation_id=row["work_item_observation_id"],
+        base_observation_id=row["base_observation_id"],
+        project_id=row["project_id"],
+        work_item_external_id=row["work_item_external_id"],
+        forge_revision=row["forge_revision"],
+        title=row["title"],
+        body=row["body"],
+        specification_comments_json=row["specification_comments_json"],
+        base_ref=row["base_ref"],
+        base_commit_json=row["base_commit_json"],
+        workflow_schema_version=row["workflow_schema_version"],
+        workflow_hash=row["workflow_hash"],
+        normalized_workflow_blob_digest=row["normalized_workflow_blob_digest"],
+        normalized_prompt_blobs_json=row["normalized_prompt_blobs_json"],
+        effective_policy_blob_digest=row["effective_policy_blob_digest"],
+        server_policy_revision=row["server_policy_revision"],
+        trusted_base_policy_ref=row["trusted_base_policy_ref"],
+        budget_policy_ref=row["budget_policy_ref"],
+        budget_reset_window_ref=row["budget_reset_window_ref"],
+        policy_hash=row["policy_hash"],
+        reducer_version=row["reducer_version"],
+        specification_hash=row["specification_hash"],
+        generation_input_hash=row["generation_input_hash"],
+        base_movement_policy=row["base_movement_policy"],
+        supersession_key=row["supersession_key"],
+        snapshot_hash=row["snapshot_hash"],
+        captured_at_ms=row["captured_at_ms"],
+    )
+
+
+def _row_to_snapshot_generation(row: sqlite3.Row) -> SnapshotGenerationRecord:
+    return SnapshotGenerationRecord(
+        run_id=row["run_id"],
+        specification_generation=row["specification_generation"],
+        snapshot_id=row["snapshot_id"],
+        installed_transition_sequence=row["installed_transition_sequence"],
+        installed_at_ms=row["installed_at_ms"],
     )
 
 
@@ -1490,6 +1672,13 @@ CREATE TABLE IF NOT EXISTS runs (
   work_item_key TEXT NOT NULL,
   specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
   state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("run.state"))})),
+  current_snapshot_id TEXT,
+  pending_snapshot_id TEXT,
+  supersede_requested INTEGER NOT NULL DEFAULT 0 CHECK (supersede_requested IN (0, 1)),
+  supersede_requested_transition_sequence INTEGER CHECK (
+    supersede_requested_transition_sequence IS NULL
+    OR supersede_requested_transition_sequence > 0
+  ),
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -1501,6 +1690,95 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_work_item
 ON runs(project_id, work_item_key) WHERE terminal_outcome IS NULL;
+
+CREATE TABLE IF NOT EXISTS workflow_blobs (
+  blob_digest TEXT PRIMARY KEY,
+  media_kind TEXT NOT NULL CHECK (
+    media_kind IN ({_sql_in(_enum_values("workflow_blob.media_kind"))})
+  ),
+  byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+  normalized_bytes BLOB NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (length(normalized_bytes) = byte_length)
+);
+
+CREATE TABLE IF NOT EXISTS policy_updates (
+  policy_update_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  policy_update_sequence INTEGER NOT NULL CHECK (policy_update_sequence > 0),
+  server_policy_revision TEXT NOT NULL,
+  server_policy_blob_digest TEXT NOT NULL
+    REFERENCES workflow_blobs(blob_digest) ON DELETE RESTRICT,
+  default_ref TEXT NOT NULL,
+  trusted_base_policy_ref TEXT NOT NULL,
+  budget_policy_ref TEXT NOT NULL,
+  budget_reset_window_ref TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("policy_update.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  authenticated_principal_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (project_id, policy_update_sequence),
+  UNIQUE (source_kind, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS work_item_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  snapshot_sequence INTEGER NOT NULL CHECK (snapshot_sequence > 0),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("work_item_snapshot.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  work_item_observation_id TEXT NOT NULL
+    REFERENCES forge_observations(forge_observation_id) ON DELETE RESTRICT,
+  base_observation_id TEXT NOT NULL
+    REFERENCES forge_observations(forge_observation_id) ON DELETE RESTRICT,
+  project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  work_item_external_id TEXT NOT NULL,
+  forge_revision TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  specification_comments_json TEXT NOT NULL,
+  base_ref TEXT NOT NULL,
+  base_commit_json TEXT NOT NULL,
+  workflow_schema_version TEXT NOT NULL,
+  workflow_hash TEXT NOT NULL,
+  normalized_workflow_blob_digest TEXT NOT NULL
+    REFERENCES workflow_blobs(blob_digest) ON DELETE RESTRICT,
+  normalized_prompt_blobs_json TEXT NOT NULL,
+  effective_policy_blob_digest TEXT NOT NULL
+    REFERENCES workflow_blobs(blob_digest) ON DELETE RESTRICT,
+  server_policy_revision TEXT NOT NULL,
+  trusted_base_policy_ref TEXT NOT NULL,
+  budget_policy_ref TEXT NOT NULL,
+  budget_reset_window_ref TEXT NOT NULL,
+  policy_hash TEXT NOT NULL,
+  reducer_version TEXT NOT NULL,
+  specification_hash TEXT NOT NULL,
+  generation_input_hash TEXT NOT NULL,
+  base_movement_policy TEXT NOT NULL CHECK (
+    base_movement_policy IN ({_sql_in(_enum_values("snapshot.base_movement_policy"))})
+  ),
+  supersession_key TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  captured_at_ms INTEGER NOT NULL CHECK (captured_at_ms >= 0),
+  UNIQUE (run_id, snapshot_sequence),
+  UNIQUE (source_kind, source_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_generations (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  snapshot_id TEXT NOT NULL UNIQUE
+    REFERENCES work_item_snapshots(snapshot_id) ON DELETE RESTRICT,
+  installed_transition_sequence INTEGER NOT NULL CHECK (installed_transition_sequence > 0),
+  installed_at_ms INTEGER NOT NULL CHECK (installed_at_ms >= 0),
+  PRIMARY KEY (run_id, specification_generation),
+  FOREIGN KEY (run_id, installed_transition_sequence)
+    REFERENCES transitions(run_id, transition_sequence) ON DELETE RESTRICT
+);
 
 CREATE TABLE IF NOT EXISTS transitions (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -2127,6 +2405,13 @@ CREATE TABLE runs_v2 (
   work_item_key TEXT NOT NULL,
   specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
   state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("run.state"))})),
+  current_snapshot_id TEXT,
+  pending_snapshot_id TEXT,
+  supersede_requested INTEGER NOT NULL DEFAULT 0 CHECK (supersede_requested IN (0, 1)),
+  supersede_requested_transition_sequence INTEGER CHECK (
+    supersede_requested_transition_sequence IS NULL
+    OR supersede_requested_transition_sequence > 0
+  ),
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -2135,7 +2420,14 @@ CREATE TABLE runs_v2 (
   created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
   updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
 );
-INSERT INTO runs_v2 SELECT * FROM runs;
+INSERT INTO runs_v2 (
+  run_id, project_id, work_item_key, specification_generation, state, terminal_outcome,
+  reducer_version, current_revision, created_at_ms, updated_at_ms
+)
+SELECT
+  run_id, project_id, work_item_key, specification_generation, state, terminal_outcome,
+  reducer_version, current_revision, created_at_ms, updated_at_ms
+FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_v2 RENAME TO runs;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_work_item
@@ -2298,6 +2590,13 @@ ALTER TABLE forge_observation_schedules_v6 RENAME TO forge_observation_schedules
 PRAGMA foreign_keys=ON;
 """
 
+_V6_TO_V7 = """
+ALTER TABLE runs ADD COLUMN current_snapshot_id TEXT;
+ALTER TABLE runs ADD COLUMN pending_snapshot_id TEXT;
+ALTER TABLE runs ADD COLUMN supersede_requested INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN supersede_requested_transition_sequence INTEGER;
+"""
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -2440,7 +2739,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5}:
+        if current not in {0, 1, 2, 3, 4, 5, 6}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -2457,6 +2756,10 @@ class RunStore:
         # before that transaction starts, so DROP TABLE on a table still
         # carrying real rows referenced by another table's FK doesn't fail.
         self.conn.execute("PRAGMA foreign_keys=OFF")
+        run_columns = {
+            str(row["name"]) for row in self.conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        v6_to_v7 = "" if "current_snapshot_id" in run_columns else _V6_TO_V7
         try:
             if current == 0:
                 self.conn.executescript(
@@ -2503,6 +2806,8 @@ class RunStore:
                     + "\n"
                     + _V2_TO_V3
                     + "\n"
+                    + v6_to_v7
+                    + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
@@ -2519,7 +2824,12 @@ class RunStore:
                 # final v3 shape; _SCHEMA creates secret-provision tables and
                 # the later project-registration tables in one step.
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v6_to_v7
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -2538,7 +2848,12 @@ class RunStore:
                 # forge_observation_schedules directly in its final v6 shape
                 # since a v4 database never had that table at all.
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v6_to_v7
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -2549,7 +2864,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 5:
                 # A real version-5 database already has forge_observation_schedules
                 # in its pre-v6 shape (no project_id/forge_instance_id/cadence/
                 # digest columns); _V5_TO_V6 rebuilds it into the final shape,
@@ -2565,6 +2880,8 @@ class RunStore:
                     + _SCHEMA
                     + "\n"
                     + _V5_TO_V6
+                    + "\n"
+                    + v6_to_v7
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -2597,6 +2914,25 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-forge-observations",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 6
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v6_to_v7
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-snapshot-admission",
                         _now_ms(),
                     ),
                 )
@@ -6397,9 +6733,10 @@ class RunStore:
             ),
         )
         self.conn.execute(
-            "UPDATE runs SET state = ?, specification_generation = ?, updated_at_ms = ? "
+            "UPDATE runs SET state = ?, specification_generation = ?, current_revision = ?, "
+            "updated_at_ms = ? "
             "WHERE run_id = ?",
-            (next_state, specification_generation, now, run_id),
+            (next_state, specification_generation, sequence, now, run_id),
         )
         inserted = self.conn.execute(
             "SELECT * FROM transitions WHERE run_id = ? AND transition_sequence = ?",
@@ -6407,6 +6744,801 @@ class RunStore:
         ).fetchone()
         assert inserted is not None
         return _row_to_transition(inserted)
+
+    def put_workflow_blob(
+        self,
+        *,
+        media_kind: str,
+        normalized_bytes: bytes,
+    ) -> WorkflowBlobSqlRecord:
+        enums.parse_enum("workflow_blob.media_kind", media_kind)
+        blob_digest = workflow_blob_digest(media_kind, normalized_bytes)
+        existing = self.conn.execute(
+            "SELECT * FROM workflow_blobs WHERE blob_digest = ?", (blob_digest,)
+        ).fetchone()
+        if existing is not None:
+            row = _row_to_workflow_blob(existing)
+            if row.media_kind == media_kind and row.normalized_bytes == normalized_bytes:
+                return row
+            raise IdempotencyConflictError("workflow blob digest was reused")
+        now = _now_ms()
+        self.conn.execute(
+            "INSERT INTO workflow_blobs(blob_digest, media_kind, byte_length, "
+            "normalized_bytes, created_at_ms) VALUES (?, ?, ?, ?, ?)",
+            (blob_digest, media_kind, len(normalized_bytes), normalized_bytes, now),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM workflow_blobs WHERE blob_digest = ?", (blob_digest,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_workflow_blob(row)
+
+    def record_policy_update(
+        self,
+        *,
+        policy_update_id: str,
+        project_id: str,
+        server_policy_revision: str,
+        server_policy: Any,
+        default_ref: str,
+        trusted_base_policy_ref: str,
+        budget_policy_ref: str,
+        budget_reset_window_ref: str,
+        source_id: str,
+        authenticated_principal_id: str,
+    ) -> PolicyUpdateRecord:
+        require_lowercase_uuid(policy_update_id, field="policy_update_id")
+        server_policy_blob = self.put_workflow_blob(
+            media_kind="SERVER_POLICY_JSON",
+            normalized_bytes=canonical_json_text(server_policy).encode("utf-8"),
+        )
+        existing = self.conn.execute(
+            "SELECT * FROM policy_updates WHERE source_kind = 'SERVER_ROLLOUT' AND source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if existing is not None:
+            row = _row_to_policy_update(existing)
+            if (
+                row.policy_update_id == policy_update_id
+                and row.project_id == project_id
+                and row.server_policy_revision == server_policy_revision
+                and row.server_policy_blob_digest == server_policy_blob.blob_digest
+                and row.default_ref == default_ref
+                and row.trusted_base_policy_ref == trusted_base_policy_ref
+                and row.budget_policy_ref == budget_policy_ref
+                and row.budget_reset_window_ref == budget_reset_window_ref
+                and row.authenticated_principal_id == authenticated_principal_id
+            ):
+                return row
+            raise IdempotencyConflictError("policy update source was reused")
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(policy_update_sequence), 0) + 1 "
+            "FROM policy_updates WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        sequence = int(row[0])
+        now = _now_ms()
+        self.conn.execute(
+            "INSERT INTO policy_updates(policy_update_id, project_id, policy_update_sequence, "
+            "server_policy_revision, server_policy_blob_digest, default_ref, "
+            "trusted_base_policy_ref, budget_policy_ref, budget_reset_window_ref, "
+            "source_kind, source_id, authenticated_principal_id, created_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'SERVER_ROLLOUT', ?, ?, ?)",
+            (
+                policy_update_id,
+                project_id,
+                sequence,
+                server_policy_revision,
+                server_policy_blob.blob_digest,
+                default_ref,
+                trusted_base_policy_ref,
+                budget_policy_ref,
+                budget_reset_window_ref,
+                source_id,
+                authenticated_principal_id,
+                now,
+            ),
+        )
+        inserted = self.conn.execute(
+            "SELECT * FROM policy_updates WHERE policy_update_id = ?", (policy_update_id,)
+        ).fetchone()
+        assert inserted is not None
+        return _row_to_policy_update(inserted)
+
+    def capture_work_item_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        work_item_observation_id: str,
+        base_observation_id: str,
+        project_id: str,
+        work_item_external_id: str,
+        forge_revision: str,
+        title: str,
+        body: str,
+        specification_comments: Sequence[Any] = (),
+        base_ref: str,
+        base_commit: Any,
+        workflow_schema_version: str,
+        normalized_workflow: Any,
+        normalized_prompt_blobs: Sequence[Mapping[str, Any]] = (),
+        effective_policy: Any,
+        server_policy_revision: str,
+        trusted_base_policy_ref: str,
+        budget_policy_ref: str,
+        budget_reset_window_ref: str,
+        base_movement_policy: str,
+        reducer_version: str = DEFAULT_REDUCER_VERSION,
+        captured_at_ms: int | None = None,
+    ) -> WorkItemSnapshotRecord:
+        require_lowercase_uuid(snapshot_id, field="snapshot_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("work_item_snapshot.source_kind", source_kind)
+        enums.parse_enum("snapshot.base_movement_policy", base_movement_policy)
+        if reducer_version not in self._supported_reducer_versions:
+            raise ReducerVersionError(f"unsupported reducer version {reducer_version!r}")
+        normalized_workflow_json = canonical_json_text(normalized_workflow)
+        workflow_blob = self.put_workflow_blob(
+            media_kind="CONFIG_JSON", normalized_bytes=normalized_workflow_json.encode("utf-8")
+        )
+        prompt_entries: list[dict[str, str]] = []
+        for item in sorted(normalized_prompt_blobs, key=lambda entry: str(entry["path"])):
+            if "normalized_bytes" in item:
+                prompt_bytes = item["normalized_bytes"]
+                if isinstance(prompt_bytes, str):
+                    prompt_bytes = prompt_bytes.encode("utf-8")
+                if not isinstance(prompt_bytes, bytes):
+                    raise ValueError("prompt normalized_bytes must be bytes or str")
+                prompt_blob = self.put_workflow_blob(
+                    media_kind="PROMPT_UTF8", normalized_bytes=prompt_bytes
+                )
+                blob_digest = prompt_blob.blob_digest
+            else:
+                blob_digest = str(item["blob_digest"])
+                _require_digest(blob_digest, field="normalized_prompt_blobs[].blob_digest")
+            prompt_entries.append(
+                {
+                    "path": str(item["path"]),
+                    "git_blob": str(item["git_blob"]),
+                    "blob_digest": blob_digest,
+                }
+            )
+        policy_json = canonical_json_text(effective_policy)
+        policy_blob = self.put_workflow_blob(
+            media_kind="POLICY_JSON", normalized_bytes=policy_json.encode("utf-8")
+        )
+        policy_hash = policy_digest(effective_policy)
+        specification_hash = specification_digest(
+            {
+                "title": title,
+                "body": body,
+                "comments": list(specification_comments),
+            }
+        )
+        workflow_hash = config_bundle_hash(normalized_workflow)
+        generation_input_hash = bare_canonical_digest(
+            {
+                "specification_hash": specification_hash,
+                "workflow_schema_version": workflow_schema_version,
+                "workflow_hash": workflow_hash,
+                "policy_hash": policy_hash,
+            }
+        )
+        if base_movement_policy == "SUPERSEDE_AT_BOUNDARY":
+            supersession_key = bare_canonical_digest(
+                {
+                    "generation_input_hash": generation_input_hash,
+                    "base_commit": base_commit,
+                }
+            )
+        else:
+            supersession_key = generation_input_hash
+        comments_json = canonical_json_text(list(specification_comments))
+        base_commit_json = canonical_json_text(base_commit)
+        prompt_json = canonical_json_text(prompt_entries)
+        snapshot_preimage = {
+            "run_id": run_id,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "work_item_observation_id": work_item_observation_id,
+            "base_observation_id": base_observation_id,
+            "project_id": project_id,
+            "work_item_external_id": work_item_external_id,
+            "forge_revision": forge_revision,
+            "title": title,
+            "body": body,
+            "specification_comments": list(specification_comments),
+            "base_ref": base_ref,
+            "base_commit": base_commit,
+            "workflow_schema_version": workflow_schema_version,
+            "workflow_hash": workflow_hash,
+            "normalized_workflow_blob_digest": workflow_blob.blob_digest,
+            "normalized_prompt_blobs": prompt_entries,
+            "effective_policy_blob_digest": policy_blob.blob_digest,
+            "server_policy_revision": server_policy_revision,
+            "trusted_base_policy_ref": trusted_base_policy_ref,
+            "budget_policy_ref": budget_policy_ref,
+            "budget_reset_window_ref": budget_reset_window_ref,
+            "policy_hash": policy_hash,
+            "reducer_version": reducer_version,
+            "specification_hash": specification_hash,
+            "generation_input_hash": generation_input_hash,
+            "base_movement_policy": base_movement_policy,
+            "supersession_key": supersession_key,
+        }
+        snapshot_hash = request_digest(snapshot_preimage)
+        existing = self.conn.execute(
+            "SELECT * FROM work_item_snapshots WHERE run_id = ? AND source_kind = ? "
+            "AND source_id = ?",
+            (run_id, source_kind, source_id),
+        ).fetchone()
+        if existing is not None:
+            row = _row_to_work_item_snapshot(existing)
+            if row.snapshot_id == snapshot_id and row.snapshot_hash == snapshot_hash:
+                return row
+            raise IdempotencyConflictError("snapshot source was reused")
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(snapshot_sequence), 0) + 1 FROM work_item_snapshots "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        sequence = int(row[0])
+        now = _now_ms() if captured_at_ms is None else captured_at_ms
+        self.conn.execute(
+            "INSERT INTO work_item_snapshots(snapshot_id, run_id, snapshot_sequence, "
+            "source_kind, source_id, work_item_observation_id, base_observation_id, "
+            "project_id, work_item_external_id, forge_revision, title, body, "
+            "specification_comments_json, base_ref, base_commit_json, "
+            "workflow_schema_version, workflow_hash, normalized_workflow_blob_digest, "
+            "normalized_prompt_blobs_json, effective_policy_blob_digest, "
+            "server_policy_revision, trusted_base_policy_ref, budget_policy_ref, "
+            "budget_reset_window_ref, policy_hash, reducer_version, specification_hash, "
+            "generation_input_hash, base_movement_policy, supersession_key, snapshot_hash, "
+            "captured_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot_id,
+                run_id,
+                sequence,
+                source_kind,
+                source_id,
+                work_item_observation_id,
+                base_observation_id,
+                project_id,
+                work_item_external_id,
+                forge_revision,
+                title,
+                body,
+                comments_json,
+                base_ref,
+                base_commit_json,
+                workflow_schema_version,
+                workflow_hash,
+                workflow_blob.blob_digest,
+                prompt_json,
+                policy_blob.blob_digest,
+                server_policy_revision,
+                trusted_base_policy_ref,
+                budget_policy_ref,
+                budget_reset_window_ref,
+                policy_hash,
+                reducer_version,
+                specification_hash,
+                generation_input_hash,
+                base_movement_policy,
+                supersession_key,
+                snapshot_hash,
+                now,
+            ),
+        )
+        inserted = self.conn.execute(
+            "SELECT * FROM work_item_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        assert inserted is not None
+        return _row_to_work_item_snapshot(inserted)
+
+    def admit_work_item_from_observations(
+        self,
+        *,
+        run_id: str,
+        snapshot_id: str,
+        work_item_observation_id: str,
+        transition_id: str,
+        projection_outbox_id: str,
+        projection_idempotency_key: str,
+        normalized_workflow: Any,
+        effective_policy: Any,
+        server_policy_revision: str,
+        trusted_base_policy_ref: str,
+        budget_policy_ref: str,
+        budget_reset_window_ref: str,
+        base_movement_policy: str,
+        workflow_schema_version: str = "1",
+        normalized_prompt_blobs: Sequence[Mapping[str, Any]] = (),
+        reducer_version: str = DEFAULT_REDUCER_VERSION,
+        fault: FaultInjectionPoint | None = None,
+    ) -> AdmissionResult:
+        with self.transaction(fault=fault):
+            work = self.get_forge_observation(work_item_observation_id)
+            if work is None or work.kind != "WORK_ITEM_SNAPSHOT":
+                raise RunStoreError("admission requires an accepted WORK_ITEM_SNAPSHOT observation")
+            active = self.conn.execute(
+                "SELECT * FROM runs WHERE project_id = ? AND work_item_key = ? "
+                "AND terminal_outcome IS NULL",
+                (work.project_id, work.target_id),
+            ).fetchone()
+            if active is not None:
+                existing_snapshot = self.conn.execute(
+                    "SELECT * FROM work_item_snapshots WHERE run_id = ? "
+                    "AND source_kind = 'FORGE_OBSERVATION' AND source_id = ?",
+                    (active["run_id"], work.forge_observation_id),
+                ).fetchone()
+                if existing_snapshot is None:
+                    raise IdempotencyConflictError(
+                        "work item already has an active run admitted by a different observation"
+                    )
+                if (
+                    active["run_id"] != run_id
+                    or existing_snapshot["snapshot_id"] != snapshot_id
+                    or existing_snapshot["work_item_observation_id"] != work.forge_observation_id
+                ):
+                    raise IdempotencyConflictError(
+                        "active run admission was replayed with different content"
+                    )
+                return AdmissionResult(
+                    run_id=active["run_id"],
+                    snapshot_id=existing_snapshot["snapshot_id"],
+                    transition=None,
+                    projection_outbox_id=None,
+                    replayed=True,
+                )
+            base = self._select_admission_base_observation(work)
+            fact = work.fact
+            base_fact = base.fact
+            self.create_run(
+                run_id=run_id,
+                project_id=work.project_id,
+                work_item_key=work.target_id,
+                state="ADMITTED",
+                reducer_version=reducer_version,
+                specification_generation=0,
+            )
+            snapshot = self.capture_work_item_snapshot(
+                snapshot_id=snapshot_id,
+                run_id=run_id,
+                source_kind="FORGE_OBSERVATION",
+                source_id=work.forge_observation_id,
+                work_item_observation_id=work.forge_observation_id,
+                base_observation_id=base.forge_observation_id,
+                project_id=work.project_id,
+                work_item_external_id=work.target_id,
+                forge_revision=work.external_revision,
+                title=str(fact.get("title", "")) if isinstance(fact, dict) else "",
+                body=str(fact.get("body", "")) if isinstance(fact, dict) else "",
+                specification_comments=(
+                    fact.get("specification_comments", []) if isinstance(fact, dict) else []
+                ),
+                base_ref=str(base_fact.get("base_ref", "")) if isinstance(base_fact, dict) else "",
+                base_commit=base_fact.get("base_commit") if isinstance(base_fact, dict) else {},
+                workflow_schema_version=workflow_schema_version,
+                normalized_workflow=normalized_workflow,
+                normalized_prompt_blobs=normalized_prompt_blobs,
+                effective_policy=effective_policy,
+                server_policy_revision=server_policy_revision,
+                trusted_base_policy_ref=trusted_base_policy_ref,
+                budget_policy_ref=budget_policy_ref,
+                budget_reset_window_ref=budget_reset_window_ref,
+                base_movement_policy=base_movement_policy,
+                reducer_version=reducer_version,
+                captured_at_ms=work.observed_at_ms,
+            )
+            input_payload = {
+                "trigger_kind": "ADMIT",
+                "trigger_id": work.forge_observation_id,
+                "facts": {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "base_observation_id": base.forge_observation_id,
+                    "project_id": work.project_id,
+                    "work_item_key": work.target_id,
+                },
+                "prior_state": PRIOR_STATE_NONE,
+                "reason_code": "ADMIT",
+            }
+            transition = self.append_transition(
+                run_id=run_id,
+                transition_id=transition_id,
+                prior_state=PRIOR_STATE_NONE,
+                trigger_kind="ADMIT",
+                trigger_id=work.forge_observation_id,
+                next_state="ADMITTED",
+                reducer_version=reducer_version,
+                input_digest=request_digest(input_payload),
+                specification_generation=0,
+                admit_base_observation_id=base.forge_observation_id,
+            )
+            self._set_run_snapshot_pointers(
+                run_id=run_id,
+                current_snapshot_id=None,
+                pending_snapshot_id=snapshot.snapshot_id,
+                supersede_requested=False,
+                supersede_requested_transition_sequence=None,
+            )
+            self._put_admission_pointer_projection(
+                run_id=run_id,
+                work_item_key=work.target_id,
+                snapshot=snapshot,
+                transition=transition,
+                reducer_version=reducer_version,
+            )
+            projection_payload = {
+                "run_id": run_id,
+                "state": "ADMITTED",
+                "reason_code": "ADMIT",
+                "ready_label": "remove",
+                "working_label": "add",
+            }
+            projection = self.insert_projection_outbox(
+                projection_outbox_id=projection_outbox_id,
+                run_id=run_id,
+                transition_sequence=transition.transition_sequence,
+                kind="RUN_STATUS",
+                target_kind="WORK_ITEM",
+                target_id=work.target_id,
+                payload_digest=request_digest(projection_payload),
+                payload=projection_payload,
+                idempotency_key=projection_idempotency_key,
+                next_delivery_at_ms=0,
+            )
+            self._record_run_observation_consumption(
+                run_id=run_id,
+                observation_id=work.forge_observation_id,
+                transition_id=transition.transition_id,
+            )
+            self._record_run_observation_consumption(
+                run_id=run_id,
+                observation_id=base.forge_observation_id,
+                transition_id=transition.transition_id,
+            )
+            return AdmissionResult(
+                run_id=run_id,
+                snapshot_id=snapshot.snapshot_id,
+                transition=transition,
+                projection_outbox_id=projection.projection_outbox_id,
+            )
+
+    def install_pending_snapshot_generation(
+        self,
+        *,
+        run_id: str,
+        transition_id: str,
+        fault: FaultInjectionPoint | None = None,
+    ) -> SnapshotGenerationRecord:
+        from orcest.workflow_reducer.ledger import load_view
+
+        with self.transaction(fault=fault):
+            view = load_view(self, run_id)
+            if view is None or view.pending_snapshot_id is None:
+                raise RunStoreError("run has no pending snapshot to install")
+            existing = self.get_transition_by_trigger(
+                run_id, "SPEC_SUPERSEDE", view.pending_snapshot_id
+            )
+            if existing is not None:
+                generation = self.conn.execute(
+                    "SELECT * FROM snapshot_generations WHERE run_id = ? "
+                    "AND installed_transition_sequence = ?",
+                    (run_id, existing.transition_sequence),
+                ).fetchone()
+                if generation is None:
+                    raise RunStoreError("snapshot generation missing for replayed transition")
+                return _row_to_snapshot_generation(generation)
+            snapshot = self.get_work_item_snapshot(view.pending_snapshot_id)
+            if snapshot is None:
+                raise RunStoreError("pending snapshot row is missing")
+            generation = (
+                1 if view.specification_generation == 0 else view.specification_generation + 1
+            )
+            input_payload = {
+                "trigger_kind": "SPEC_SUPERSEDE",
+                "trigger_id": snapshot.snapshot_id,
+                "facts": {},
+                "prior_state": view.prior_state,
+                "reason_code": "INSTALL_GENERATION"
+                if view.state == "ADMITTED" and not view.generation_installed
+                else "SPEC_SUPERSEDE",
+            }
+            transition = self.append_transition(
+                run_id=run_id,
+                transition_id=transition_id,
+                prior_state=view.prior_state,
+                trigger_kind="SPEC_SUPERSEDE",
+                trigger_id=snapshot.snapshot_id,
+                next_state="ADMITTED" if generation == 1 else "REPLANNING",
+                reducer_version=view.reducer_version,
+                input_digest=request_digest(input_payload),
+                specification_generation=generation,
+            )
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO snapshot_generations(run_id, specification_generation, "
+                "snapshot_id, installed_transition_sequence, installed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, generation, snapshot.snapshot_id, transition.transition_sequence, now),
+            )
+            self._set_run_snapshot_pointers(
+                run_id=run_id,
+                current_snapshot_id=snapshot.snapshot_id,
+                pending_snapshot_id=None,
+                supersede_requested=False,
+                supersede_requested_transition_sequence=None,
+            )
+            stored = self.get_revisioned_object("run_pointers", run_id)
+            expected_revision = 0
+            pointers: dict[str, Any] = {}
+            if stored is not None:
+                expected_revision, _, payload_json = stored
+                loaded = json.loads(payload_json)
+                if isinstance(loaded, dict):
+                    pointers = loaded
+            pointers.update(
+                {
+                    "current_snapshot_id": snapshot.snapshot_id,
+                    "pending_snapshot_id": None,
+                    "supersede_requested": False,
+                    "generation_installed": True,
+                    "initial_plan_absent": generation == 1,
+                    "policy_hash": snapshot.policy_hash,
+                    "pending_internal_sequence": transition.transition_sequence,
+                    "next_transition_sequence": transition.transition_sequence + 1,
+                }
+            )
+            if generation > 1:
+                activity_id = str(uuid.uuid4())
+                attempt_id = str(uuid.uuid4())
+                outbox_id = str(uuid.uuid4())
+                payload = {
+                    "activity_id": activity_id,
+                    "attempt_id": attempt_id,
+                    "generation": 1,
+                    "kind": "REPLAN",
+                    "snapshot_id": snapshot.snapshot_id,
+                    "policy_hash": snapshot.policy_hash,
+                }
+                self.insert_source_unique_record(
+                    source_kind="activity_idempotency",
+                    source_id=f"{run_id}/spec-supersede:{snapshot.snapshot_id}:replan",
+                    record_kind="activity",
+                    record_id=activity_id,
+                    payload_digest=request_digest(payload),
+                    payload=payload,
+                )
+                self.insert_outbox(
+                    outbox_id=outbox_id,
+                    source_kind="ACTIVITY",
+                    source_id=activity_id,
+                    destination="worker",
+                    protocol_version=self._activity_offer_protocol(),
+                    payload_digest=request_digest(payload),
+                    payload=payload,
+                    next_delivery_at_ms=0,
+                    attempt_id=attempt_id,
+                    attempt_generation=1,
+                )
+                activities = list(pointers.get("activities", []))
+                activities.append(
+                    {
+                        "activity_id": activity_id,
+                        "kind": "REPLAN",
+                        "state": "READY",
+                        "specification_generation": generation,
+                        "candidate_id": None,
+                        "current_attempt_id": attempt_id,
+                        "current_attempt_state": "OFFERED",
+                        "slot": None,
+                    }
+                )
+                pointers["activities"] = activities
+                pointers["initial_plan_absent"] = False
+                pointers["next_activity_ordinal"] = (
+                    int(pointers.get("next_activity_ordinal", 1)) + 1
+                )
+                pointers["pending_internal_sequence"] = None
+            self.put_revisioned_object(
+                object_kind="run_pointers",
+                object_id=run_id,
+                expected_revision=expected_revision,
+                payload_digest=request_digest(pointers),
+                payload=pointers,
+            )
+            inserted = self.conn.execute(
+                "SELECT * FROM snapshot_generations WHERE run_id = ? "
+                "AND specification_generation = ?",
+                (run_id, generation),
+            ).fetchone()
+            assert inserted is not None
+            return _row_to_snapshot_generation(inserted)
+
+    def plan_initial_activity(
+        self,
+        *,
+        run_id: str,
+        id_factory: Callable[[], str] | None = None,
+        fault: FaultInjectionPoint | None = None,
+    ) -> Any:
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        with self.transaction(fault=fault):
+            view = load_view(self, run_id)
+            if view is None or view.pending_internal_sequence is None:
+                raise RunStoreError("run has no pending internal planning continuation")
+            return apply(
+                self,
+                view,
+                Trigger(kind="INTERNAL", trigger_id=str(view.pending_internal_sequence), facts={}),
+                run_id=run_id,
+                id_factory=id_factory,
+            )
+
+    def _activity_offer_protocol(self) -> str:
+        from orcest.workflow_contract.v1.protocol import known_protocol_literals
+
+        matches = sorted(
+            literal
+            for literal in known_protocol_literals()
+            if literal.startswith("orcest.activity-offer/")
+        )
+        if len(matches) != 1:
+            raise RuntimeError(f"expected one activity-offer protocol, got {matches!r}")
+        return matches[0]
+
+    def get_workflow_blob(self, blob_digest: str) -> WorkflowBlobSqlRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM workflow_blobs WHERE blob_digest = ?", (blob_digest,)
+        ).fetchone()
+        return None if row is None else _row_to_workflow_blob(row)
+
+    def get_policy_update(self, policy_update_id: str) -> PolicyUpdateRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM policy_updates WHERE policy_update_id = ?", (policy_update_id,)
+        ).fetchone()
+        return None if row is None else _row_to_policy_update(row)
+
+    def get_work_item_snapshot(self, snapshot_id: str) -> WorkItemSnapshotRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM work_item_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        return None if row is None else _row_to_work_item_snapshot(row)
+
+    def _select_admission_base_observation(
+        self, work_observation: ForgeObservationRecord
+    ) -> ForgeObservationRecord:
+        row = self.conn.execute(
+            "SELECT * FROM forge_observations WHERE project_id = ? AND target_kind = 'WORK_ITEM' "
+            "AND target_id = ? AND kind = 'BASE_HEAD' AND observation_sequence < ? "
+            "ORDER BY observation_sequence DESC LIMIT 1",
+            (
+                work_observation.project_id,
+                work_observation.target_id,
+                work_observation.observation_sequence,
+            ),
+        ).fetchone()
+        if row is None:
+            raise RunStoreError("admission requires a prior accepted BASE_HEAD observation")
+        return _row_to_forge_observation(row)
+
+    def _set_run_snapshot_pointers(
+        self,
+        *,
+        run_id: str,
+        current_snapshot_id: str | None,
+        pending_snapshot_id: str | None,
+        supersede_requested: bool,
+        supersede_requested_transition_sequence: int | None,
+    ) -> None:
+        now = _now_ms()
+        self.conn.execute(
+            "UPDATE runs SET current_snapshot_id = ?, pending_snapshot_id = ?, "
+            "supersede_requested = ?, supersede_requested_transition_sequence = ?, "
+            "updated_at_ms = ? WHERE run_id = ?",
+            (
+                current_snapshot_id,
+                pending_snapshot_id,
+                1 if supersede_requested else 0,
+                supersede_requested_transition_sequence,
+                now,
+                run_id,
+            ),
+        )
+
+    def _put_admission_pointer_projection(
+        self,
+        *,
+        run_id: str,
+        work_item_key: str,
+        snapshot: WorkItemSnapshotRecord,
+        transition: Transition,
+        reducer_version: str,
+    ) -> None:
+        payload = {
+            "current_snapshot_id": None,
+            "pending_snapshot_id": snapshot.snapshot_id,
+            "supersede_requested": False,
+            "current_candidate_id": None,
+            "policy_replan_candidate_id": None,
+            "publication_id": None,
+            "publication_state": None,
+            "change_request_external_id": None,
+            "next_activity_ordinal": 1,
+            "next_transition_sequence": transition.transition_sequence + 1,
+            "pending_internal_sequence": None,
+            "cancellation_source_kind": None,
+            "cancellation_source_id": None,
+            "pending_dependency_observation_id": None,
+            "panel_staffing_kind": None,
+            "latest_staffing_recheck_transition_sequence": None,
+            "wait_condition_id": None,
+            "wait_reason": None,
+            "human_boundary_id": None,
+            "human_boundary_reason": None,
+            "recovery_origin_state": None,
+            "recovery_activity_id": None,
+            "recovery_tactic": None,
+            "current_recovery_evidence_id": None,
+            "offer_permitted": True,
+            "safe_boundary": True,
+            "generation_installed": False,
+            "initial_plan_absent": True,
+            "claimed_unfilled_peer": False,
+            "panel_complete": False,
+            "policy_hash": snapshot.policy_hash,
+            "filling_review_slots": [],
+            "unfilled_review_slots": [],
+            "activities": [],
+            "consumed_forge_observation_ids": [
+                snapshot.work_item_observation_id,
+                snapshot.base_observation_id,
+            ],
+            "terminal_duplicate_cleanup_active": False,
+            "project_id": snapshot.project_id,
+            "work_item_key": work_item_key,
+            "reducer_version": reducer_version,
+        }
+        self.put_revisioned_object(
+            object_kind="run_pointers",
+            object_id=run_id,
+            expected_revision=0,
+            payload_digest=request_digest(payload),
+            payload=payload,
+        )
+
+    def _record_run_observation_consumption(
+        self,
+        *,
+        run_id: str,
+        observation_id: str,
+        transition_id: str,
+    ) -> None:
+        self.insert_source_unique_record(
+            source_kind="run_forge_observation",
+            source_id=f"{run_id}/{observation_id}",
+            record_kind="run_forge_observation",
+            record_id=f"{run_id}/{observation_id}",
+            payload_digest=request_digest(
+                {
+                    "run_id": run_id,
+                    "observation_id": observation_id,
+                    "transition_id": transition_id,
+                }
+            ),
+            payload={
+                "run_id": run_id,
+                "observation_id": observation_id,
+                "transition_id": transition_id,
+            },
+        )
 
     def insert_immutable_fact(
         self,
