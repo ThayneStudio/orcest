@@ -123,15 +123,18 @@ class RegistrationRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         header_value = self.headers.get("Content-Length")
+        if header_value is None:
+            self._reject(400, "MALFORMED", "Content-Length header is required")
+            return
         try:
-            length = int(header_value) if header_value is not None else 0
+            length = int(header_value)
         except ValueError:
             length = -1
         if length < 0:
             self._reject(400, "MALFORMED", "Content-Length must be a non-negative integer")
             return
         if length > MAX_REQUEST_BYTES:
-            self._reject(413, "SCHEMA_INVALID", "request exceeds the v1 size bound")
+            self._reject(422, "SCHEMA_INVALID", "request exceeds the v1 size bound")
             return
         body = self.rfile.read(length) if length > 0 else b""
         cert = self.connection.getpeercert() if hasattr(self.connection, "getpeercert") else None

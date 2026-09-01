@@ -699,9 +699,31 @@ def test_do_post_rejects_oversized_content_length_without_reading_body() -> None
             # Deliberately never write the declared body: if the handler tried
             # to buffer it before checking the size, this would hang/timeout.
             response = conn.getresponse()
-            assert response.status == 413
+            assert response.status == 422
             body = json.loads(response.read())
             assert body["code"] == "SCHEMA_INVALID"
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_do_post_rejects_missing_content_length_header() -> None:
+    server = _plain_registration_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/projects/registrations", skip_host=True)
+            conn.endheaders()
+            response = conn.getresponse()
+            assert response.status == 400
+            body = json.loads(response.read())
+            assert body["code"] == "MALFORMED"
         finally:
             conn.close()
     finally:
