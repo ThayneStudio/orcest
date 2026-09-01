@@ -41,6 +41,7 @@ CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-resu
 CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
 ERROR_PROTOCOL = "orcest.error/1"
+FORGE_OBSERVATION_REQUEST_PROTOCOL = "orcest.forge-observation-request/1"
 PROJECT_REGISTRATION_PROTOCOL = "orcest.project-registration/1"
 PROJECT_REGISTRATION_RESULT_PROTOCOL = "orcest.project-registration-result/1"
 SECRET_PROVISION_REQUEST_PROTOCOL = "orcest.secret-provision/1"
@@ -53,6 +54,7 @@ __all__ = [
     "CONTROLLER_MODE_OPERATION_PROTOCOL",
     "CONTROLLER_MODE_RESULT_PROTOCOL",
     "ERROR_PROTOCOL",
+    "FORGE_OBSERVATION_REQUEST_PROTOCOL",
     "PROJECT_REGISTRATION_PROTOCOL",
     "PROJECT_REGISTRATION_RESULT_PROTOCOL",
     "SECRET_PROVISION_REQUEST_PROTOCOL",
@@ -768,5 +770,5 @@ register_envelope("orcest.plan/1", {})
 register_envelope("orcest.diagnosis/1", {})
 register_envelope("orcest.redundant-publication-cleanup/1", {})
 register_envelope("orcest.run-marker-repair/1", {})
-register_envelope("orcest.forge-observation-request/1", {})
+register_envelope(FORGE_OBSERVATION_REQUEST_PROTOCOL, {})
 register_envelope("orcest.activity-offer/1", {}, protocol_field="protocol")
