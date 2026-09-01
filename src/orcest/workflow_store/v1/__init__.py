@@ -11,6 +11,12 @@ from orcest.workflow_store.v1.errors import (
     StorageLockError,
 )
 from orcest.workflow_store.v1.fs import ControlLayout, QuotaConfig, StorageLock
+from orcest.workflow_store.v1.offer_projection import (
+    activity_offer_protocol,
+    dispatch_pending_offers,
+    offer_stream_key,
+    reconstruct_open_offers,
+)
 from orcest.workflow_store.v1.project_registration import (
     ForgeResolution,
     PrincipalRecord,
@@ -58,4 +64,8 @@ __all__ = [
     "ServerRegistrationCatalog",
     "TransportError",
     "register_or_revalidate_project",
+    "activity_offer_protocol",
+    "dispatch_pending_offers",
+    "offer_stream_key",
+    "reconstruct_open_offers",
 ]
