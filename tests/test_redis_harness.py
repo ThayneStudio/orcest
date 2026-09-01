@@ -29,6 +29,7 @@ from tests.harness.proof import (
 )
 from tests.harness.supervisor import (
     CleanupOnce,
+    RedisTestSupervisor,
     compose_cleanup_cmd,
     generate_project_name,
     resolve_exit_status,
@@ -174,6 +175,22 @@ def test_compose_cleanup_cmd_targets_exact_project() -> None:
 def test_project_name_is_nonce_scoped() -> None:
     nonce = "abcdef0123456789"
     assert generate_project_name(nonce) == "orcest-test-rabcdef012345"
+
+
+def test_discover_port_empty_output_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = subprocess.CompletedProcess(
+        args=["docker", "compose", "port", "redis", "6379"],
+        returncode=0,
+        stdout=" \n\t",
+        stderr="",
+    )
+    monkeypatch.setattr("tests.harness.supervisor.subprocess.run", lambda *args, **kwargs: proc)
+
+    supervisor = RedisTestSupervisor(nonce="abcdef0123456789", environ={})
+    with pytest.raises(RuntimeError, match=r"unexpected `docker compose port` output"):
+        supervisor._discover_port()
 
 
 def test_test_compose_file_is_invocation_scoped() -> None:
