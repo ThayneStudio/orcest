@@ -120,9 +120,7 @@ def _require(condition: bool, message: str) -> None:
 register_envelope(
     ERROR_PROTOCOL,
     {
-        "code": Field(
-            enum=_enum_values(enums.WorkerProtocolErrorCode) | {"ATTEMPT_STALE", "CAS_LOST"}
-        ),
+        "code": Field(enum=_enum_values(enums.WorkerProtocolErrorCode) | {"CAS_LOST"}),
         "retryable": Field(validator=_is_bool),
         "message": Field(required=False, validator=_is_str),
         "retry_after_seconds": Field(required=False, nullable=True, validator=_is_nonneg_int),
