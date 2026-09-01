@@ -12,7 +12,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -26,11 +26,16 @@ from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
     capability_public_key_digest,
     checkpoint_digest,
+    forge_observation_payload_digest,
+    forge_observation_result_membership_digest,
+    forge_observation_schedule_digest,
+    forge_request_failure_fact_digest,
     is_valid_content_digest,
     receipt_digest,
     request_digest,
     resolution_digest,
     response_digest,
+    work_item_discovery_set_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
@@ -38,6 +43,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
+    FORGE_OBSERVATION_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
@@ -45,11 +51,15 @@ from orcest.workflow_contract.v1.protocol_registry import (
     SECRET_PROVISION_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
 PRIOR_STATE_NONE = "NONE"
+_DEFAULT_DISCOVERY_INTERVAL_MS = 300_000
+_NON_MAINTENANCE_CONTROLLER_MODES = frozenset(
+    {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"}
+)
 
 _FORBIDDEN_STATE_FS = {
     "9p",
@@ -443,16 +453,141 @@ class ProjectRecord:
 class ForgeObservationScheduleRecord:
     forge_observation_schedule_id: str
     schedule_kind: str
+    project_id: str
+    forge_instance_id: str
     schedule_revision: int
     state: str
     target_kind: str
     target_id: str
+    minimum_interval_ms: int
     next_due_at_ms: int
+    schedule_digest: str
     created_at_ms: int
     run_id: str | None = None
     publication_id: str | None = None
+    terminal_duplicate_cleanup_reservation_id: str | None = None
     last_request_id: str | None = None
-    last_observation_id: str | None = None
+    last_discovery_search_revision: str | None = None
+    last_discovery_set_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeObservationRequestRecord:
+    forge_observation_request_id: str
+    protocol_version: str
+    forge_observation_schedule_id: str
+    schedule_revision: int
+    request_sequence: int
+    request_kind: str
+    project_id: str
+    forge_instance_id: str
+    target_kind: str
+    target_id: str
+    created_under_controller_mode_revision: int
+    created_under_controller_mode: str
+    credential_purpose: str
+    credential_secret_id: str
+    credential_secret_version: int
+    request_idempotency_key: str
+    request_digest: str
+    state: str
+    outbox_id: str
+    next_attempt_ordinal: int
+    created_at_ms: int
+    run_id: str | None = None
+    publication_id: str | None = None
+    terminal_duplicate_cleanup_reservation_id: str | None = None
+    controller_activity_id: str | None = None
+    effect_generation: int | None = None
+    controller_operation_digest: str | None = None
+    terminal_duplicate_cleanup_action_id: str | None = None
+    terminal_cleanup_operation_digest: str | None = None
+    expected_prior_observation_sequence: int | None = None
+    expected_external_revision: str | None = None
+    expected_discovery_search_revision: str | None = None
+    expected_discovery_set_digest: str | None = None
+    last_failure_fact_id: str | None = None
+    next_retry_ms: int | None = None
+    result_observation_ids_digest: str | None = None
+    result_discovery_search_revision: str | None = None
+    result_discovery_set_digest: str | None = None
+    completed_at_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeRequestFailureFactRecord:
+    forge_request_failure_fact_id: str
+    forge_observation_request_id: str
+    request_attempt_ordinal: int
+    project_id: str
+    failure_kind: str
+    failure_code: str
+    failure_evidence_digest: str
+    retry_not_before_ms: int
+    request_digest: str
+    fact_digest: str
+    recorded_at_ms: int
+    run_id: str | None = None
+    publication_id: str | None = None
+    terminal_duplicate_cleanup_reservation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeObservationRecord:
+    forge_observation_id: str
+    project_id: str
+    target_kind: str
+    target_id: str
+    kind: str
+    external_revision: str
+    fact_json: str
+    payload_digest: str
+    observation_sequence: int
+    observed_at_ms: int
+    run_id: str | None = None
+    publication_id: str | None = None
+    created_by_forge_observation_request_id: str | None = None
+    credential_purpose: str | None = None
+    credential_secret_id: str | None = None
+    credential_secret_version: int | None = None
+    publication_effect_generation: int | None = None
+    controller_activity_id: str | None = None
+    controller_operation_digest: str | None = None
+    terminal_duplicate_cleanup_reservation_id: str | None = None
+    terminal_duplicate_cleanup_action_id: str | None = None
+    terminal_cleanup_operation_digest: str | None = None
+    adapter_event_id: str | None = None
+    actor_principal_id: str | None = None
+    actor_authorization_digest: str | None = None
+
+    @property
+    def fact(self) -> Any:
+        return json.loads(self.fact_json)
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeObservationInput:
+    """One normalized adapter result to commit as a Forge Observation.
+
+    ``target_id`` is required only for a ``WORK_ITEM_DISCOVERY`` result (the
+    discovered Work Item's stable external id); every other request kind
+    targets the Request's own ``target_id`` and must leave it ``None``.
+    """
+
+    kind: str
+    external_revision: str
+    fact: Any
+    target_id: str | None = None
+    adapter_event_id: str | None = None
+    actor_principal_id: str | None = None
+    actor_authorization_digest: str | None = None
+    observed_at_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeObservationRequestCompletion:
+    request: "ForgeObservationRequestRecord"
+    observation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +643,100 @@ def _sql_in(values: Iterable[str]) -> str:
     return ", ".join(f"'{value}'" for value in values)
 
 
+def _forge_observation_schedule_digest_fields(
+    *,
+    schedule_kind: str,
+    project_id: str,
+    forge_instance_id: str,
+    target_kind: str,
+    target_id: str,
+    run_id: str | None,
+    publication_id: str | None,
+    terminal_duplicate_cleanup_reservation_id: str | None,
+    minimum_interval_ms: int,
+) -> dict[str, Any]:
+    """Normalized authority/target/kind/cadence fields for ``schedule_digest``."""
+    return {
+        "schedule_kind": schedule_kind,
+        "project_id": project_id,
+        "forge_instance_id": forge_instance_id,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "run_id": run_id,
+        "publication_id": publication_id,
+        "terminal_duplicate_cleanup_reservation_id": terminal_duplicate_cleanup_reservation_id,
+        "minimum_interval_ms": minimum_interval_ms,
+    }
+
+
+def _forge_observation_schedules_ddl(table_name: str, *, if_not_exists: bool = False) -> str:
+    """DDL for the Forge Observation Schedule table.
+
+    Factored out (rather than inlined once in ``_SCHEMA``) so the version-5
+    -> version-6 migration can rebuild a real pre-existing table into this
+    exact final shape under a temporary name, the same rename-dance every
+    earlier column-adding migration in this module uses.
+    """
+    schedule_kinds = _sql_in(_enum_values("forge_observation_schedule.schedule_kind"))
+    target_kinds = _sql_in(_enum_values("forge_observation.target_kind"))
+    states = _sql_in(_enum_values("forge_observation_schedule.state"))
+    maybe_if_not_exists = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""
+CREATE TABLE {maybe_if_not_exists}{table_name} (
+  forge_observation_schedule_id TEXT PRIMARY KEY,
+  schedule_kind TEXT NOT NULL CHECK (schedule_kind IN ({schedule_kinds})),
+  project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  forge_instance_id TEXT NOT NULL
+    REFERENCES forge_instances(forge_instance_id) ON DELETE RESTRICT,
+  target_kind TEXT NOT NULL CHECK (target_kind IN ({target_kinds})),
+  target_id TEXT NOT NULL,
+  run_id TEXT,
+  publication_id TEXT,
+  terminal_duplicate_cleanup_reservation_id TEXT,
+  minimum_interval_ms INTEGER NOT NULL CHECK (minimum_interval_ms > 0),
+  next_due_at_ms INTEGER NOT NULL CHECK (next_due_at_ms >= 0),
+  schedule_revision INTEGER NOT NULL CHECK (schedule_revision >= 0),
+  last_request_id TEXT,
+  last_discovery_search_revision TEXT,
+  last_discovery_set_digest TEXT,
+  state TEXT NOT NULL CHECK (state IN ({states})),
+  schedule_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  identity_key TEXT GENERATED ALWAYS AS (
+    project_id || '|' || schedule_kind || '|' || target_kind || '|' || target_id || '|' ||
+    COALESCE(run_id, '') || '|' || COALESCE(publication_id, '') || '|' ||
+    COALESCE(terminal_duplicate_cleanup_reservation_id, '')
+  ) STORED,
+  CHECK (
+    (schedule_kind = 'WORK_ITEM_DISCOVERY' AND target_kind = 'PROJECT')
+    OR (schedule_kind = 'WORK_ITEM_POLL' AND target_kind = 'WORK_ITEM')
+    OR (schedule_kind = 'BASE_HEAD_POLL' AND target_kind IN ('WORK_ITEM', 'PUBLICATION'))
+    OR (
+      schedule_kind IN (
+        'REF_POLL', 'CHANGE_REQUEST_SEARCH', 'CHANGE_REQUEST_POLL', 'CI_POLL',
+        'COMPLETE_MARKER_SEARCH'
+      )
+      AND target_kind = 'PUBLICATION'
+    )
+  ),
+  CHECK (
+    (target_kind = 'PROJECT' AND run_id IS NULL AND publication_id IS NULL)
+    OR (target_kind = 'WORK_ITEM' AND publication_id IS NULL)
+    OR (target_kind = 'PUBLICATION' AND run_id IS NOT NULL AND publication_id IS NOT NULL)
+  ),
+  CHECK (
+    terminal_duplicate_cleanup_reservation_id IS NULL
+    OR schedule_kind IN ('CHANGE_REQUEST_POLL', 'COMPLETE_MARKER_SEARCH')
+  ),
+  CHECK ((last_discovery_search_revision IS NULL) = (last_discovery_set_digest IS NULL)),
+  CHECK (
+    schedule_kind = 'WORK_ITEM_DISCOVERY'
+    OR (last_discovery_search_revision IS NULL AND last_discovery_set_digest IS NULL)
+  )
+);
+"""
+
+
 def _require_digest(value: str, *, field: str) -> str:
     if not is_valid_content_digest(value):
         raise ValueError(f"{field} must be a v1 sha256 content digest")
@@ -522,6 +751,12 @@ def _require_positive_int(value: int, *, field: str) -> int:
 
 def _require_json_text(value: Any) -> str:
     return value if isinstance(value, str) else canonical_json_text(value)
+
+
+def _require_target_id(observation: "ForgeObservationInput", *, field: str) -> str:
+    if not observation.target_id:
+        raise ValueError(f"{field} is required for a WORK_ITEM_DISCOVERY result")
+    return observation.target_id
 
 
 def _response_digest_preimage(value: Any) -> Any:
@@ -775,16 +1010,115 @@ def _row_to_forge_observation_schedule(row: sqlite3.Row) -> ForgeObservationSche
     return ForgeObservationScheduleRecord(
         forge_observation_schedule_id=row["forge_observation_schedule_id"],
         schedule_kind=row["schedule_kind"],
+        project_id=row["project_id"],
+        forge_instance_id=row["forge_instance_id"],
         schedule_revision=row["schedule_revision"],
         state=row["state"],
         target_kind=row["target_kind"],
         target_id=row["target_id"],
         run_id=row["run_id"],
         publication_id=row["publication_id"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        minimum_interval_ms=row["minimum_interval_ms"],
         last_request_id=row["last_request_id"],
-        last_observation_id=row["last_observation_id"],
+        last_discovery_search_revision=row["last_discovery_search_revision"],
+        last_discovery_set_digest=row["last_discovery_set_digest"],
         next_due_at_ms=row["next_due_at_ms"],
+        schedule_digest=row["schedule_digest"],
         created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_forge_observation_request(row: sqlite3.Row) -> ForgeObservationRequestRecord:
+    return ForgeObservationRequestRecord(
+        forge_observation_request_id=row["forge_observation_request_id"],
+        protocol_version=row["protocol_version"],
+        forge_observation_schedule_id=row["forge_observation_schedule_id"],
+        schedule_revision=row["schedule_revision"],
+        request_sequence=row["request_sequence"],
+        request_kind=row["request_kind"],
+        project_id=row["project_id"],
+        forge_instance_id=row["forge_instance_id"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        run_id=row["run_id"],
+        publication_id=row["publication_id"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        created_under_controller_mode_revision=row["created_under_controller_mode_revision"],
+        created_under_controller_mode=row["created_under_controller_mode"],
+        credential_purpose=row["credential_purpose"],
+        credential_secret_id=row["credential_secret_id"],
+        credential_secret_version=row["credential_secret_version"],
+        controller_activity_id=row["controller_activity_id"],
+        effect_generation=row["effect_generation"],
+        controller_operation_digest=row["controller_operation_digest"],
+        terminal_duplicate_cleanup_action_id=row["terminal_duplicate_cleanup_action_id"],
+        terminal_cleanup_operation_digest=row["terminal_cleanup_operation_digest"],
+        expected_prior_observation_sequence=row["expected_prior_observation_sequence"],
+        expected_external_revision=row["expected_external_revision"],
+        expected_discovery_search_revision=row["expected_discovery_search_revision"],
+        expected_discovery_set_digest=row["expected_discovery_set_digest"],
+        request_idempotency_key=row["request_idempotency_key"],
+        request_digest=row["request_digest"],
+        state=row["state"],
+        outbox_id=row["outbox_id"],
+        next_attempt_ordinal=row["next_attempt_ordinal"],
+        last_failure_fact_id=row["last_failure_fact_id"],
+        next_retry_ms=row["next_retry_ms"],
+        result_observation_ids_digest=row["result_observation_ids_digest"],
+        result_discovery_search_revision=row["result_discovery_search_revision"],
+        result_discovery_set_digest=row["result_discovery_set_digest"],
+        created_at_ms=row["created_at_ms"],
+        completed_at_ms=row["completed_at_ms"],
+    )
+
+
+def _row_to_forge_request_failure_fact(row: sqlite3.Row) -> ForgeRequestFailureFactRecord:
+    return ForgeRequestFailureFactRecord(
+        forge_request_failure_fact_id=row["forge_request_failure_fact_id"],
+        forge_observation_request_id=row["forge_observation_request_id"],
+        request_attempt_ordinal=row["request_attempt_ordinal"],
+        project_id=row["project_id"],
+        run_id=row["run_id"],
+        publication_id=row["publication_id"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        failure_kind=row["failure_kind"],
+        failure_code=row["failure_code"],
+        failure_evidence_digest=row["failure_evidence_digest"],
+        retry_not_before_ms=row["retry_not_before_ms"],
+        request_digest=row["request_digest"],
+        fact_digest=row["fact_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
+    )
+
+
+def _row_to_forge_observation(row: sqlite3.Row) -> ForgeObservationRecord:
+    return ForgeObservationRecord(
+        forge_observation_id=row["forge_observation_id"],
+        project_id=row["project_id"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        run_id=row["run_id"],
+        publication_id=row["publication_id"],
+        created_by_forge_observation_request_id=row["created_by_forge_observation_request_id"],
+        credential_purpose=row["credential_purpose"],
+        credential_secret_id=row["credential_secret_id"],
+        credential_secret_version=row["credential_secret_version"],
+        publication_effect_generation=row["publication_effect_generation"],
+        controller_activity_id=row["controller_activity_id"],
+        controller_operation_digest=row["controller_operation_digest"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        terminal_duplicate_cleanup_action_id=row["terminal_duplicate_cleanup_action_id"],
+        terminal_cleanup_operation_digest=row["terminal_cleanup_operation_digest"],
+        kind=row["kind"],
+        external_revision=row["external_revision"],
+        adapter_event_id=row["adapter_event_id"],
+        actor_principal_id=row["actor_principal_id"],
+        actor_authorization_digest=row["actor_authorization_digest"],
+        fact_json=row["fact_json"],
+        payload_digest=row["payload_digest"],
+        observation_sequence=row["observation_sequence"],
+        observed_at_ms=row["observed_at_ms"],
     )
 
 
@@ -1476,30 +1810,199 @@ CREATE TABLE IF NOT EXISTS forge_instances (
     REFERENCES secret_current_versions(secret_id) ON DELETE RESTRICT
 );
 
-CREATE TABLE IF NOT EXISTS forge_observation_schedules (
-  forge_observation_schedule_id TEXT PRIMARY KEY,
-  schedule_kind TEXT NOT NULL CHECK (
-    schedule_kind IN ({_sql_in(_enum_values("forge_observation_schedule.schedule_kind"))})
-  ),
+{_forge_observation_schedules_ddl("forge_observation_schedules", if_not_exists=True)}
+
+CREATE TABLE IF NOT EXISTS forge_observation_requests (
+  forge_observation_request_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  forge_observation_schedule_id TEXT NOT NULL
+    REFERENCES forge_observation_schedules(forge_observation_schedule_id) ON DELETE RESTRICT,
   schedule_revision INTEGER NOT NULL CHECK (schedule_revision >= 0),
-  state TEXT NOT NULL CHECK (
-    state IN ({_sql_in(_enum_values("forge_observation_schedule.state"))})
+  request_sequence INTEGER NOT NULL CHECK (request_sequence > 0),
+  request_kind TEXT NOT NULL CHECK (
+    request_kind IN ({_sql_in(_enum_values("forge_observation_schedule.schedule_kind"))})
   ),
+  project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  forge_instance_id TEXT NOT NULL
+    REFERENCES forge_instances(forge_instance_id) ON DELETE RESTRICT,
   target_kind TEXT NOT NULL CHECK (
     target_kind IN ({_sql_in(_enum_values("forge_observation.target_kind"))})
   ),
   target_id TEXT NOT NULL,
   run_id TEXT,
   publication_id TEXT,
-  last_request_id TEXT,
-  last_observation_id TEXT,
-  next_due_at_ms INTEGER NOT NULL CHECK (next_due_at_ms >= 0),
-  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+  terminal_duplicate_cleanup_reservation_id TEXT,
+  created_under_controller_mode_revision INTEGER NOT NULL
+    CHECK (created_under_controller_mode_revision >= 0),
+  created_under_controller_mode TEXT NOT NULL CHECK (
+    created_under_controller_mode IN ('RUNNING', 'INTAKE_PAUSED', 'DISPATCH_PAUSED', 'DRAINING')
+  ),
+  credential_purpose TEXT NOT NULL CHECK (
+    credential_purpose IN ('PROJECT_SOURCE_READ', 'PUBLICATION')
+  ),
+  credential_secret_id TEXT NOT NULL,
+  credential_secret_version INTEGER NOT NULL CHECK (credential_secret_version > 0),
+  controller_activity_id TEXT,
+  effect_generation INTEGER CHECK (effect_generation IS NULL OR effect_generation > 0),
+  controller_operation_digest TEXT,
+  terminal_duplicate_cleanup_action_id TEXT,
+  terminal_cleanup_operation_digest TEXT,
+  expected_prior_observation_sequence INTEGER
+    CHECK (expected_prior_observation_sequence IS NULL OR expected_prior_observation_sequence >= 0),
+  expected_external_revision TEXT,
+  expected_discovery_search_revision TEXT,
+  expected_discovery_set_digest TEXT,
+  request_idempotency_key TEXT NOT NULL UNIQUE,
+  request_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('PENDING', 'COMPLETED', 'SUPERSEDED')),
+  outbox_id TEXT NOT NULL REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
+  next_attempt_ordinal INTEGER NOT NULL CHECK (next_attempt_ordinal > 0),
+  last_failure_fact_id TEXT,
+  next_retry_ms INTEGER,
+  result_observation_ids_digest TEXT,
+  result_discovery_search_revision TEXT,
+  result_discovery_set_digest TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  UNIQUE (forge_observation_schedule_id, request_sequence),
+  CHECK (
+    (request_kind = 'WORK_ITEM_DISCOVERY' AND target_kind = 'PROJECT')
+    OR (request_kind = 'WORK_ITEM_POLL' AND target_kind = 'WORK_ITEM')
+    OR (request_kind = 'BASE_HEAD_POLL' AND target_kind IN ('WORK_ITEM', 'PUBLICATION'))
+    OR (
+      request_kind IN (
+        'REF_POLL', 'CHANGE_REQUEST_SEARCH', 'CHANGE_REQUEST_POLL', 'CI_POLL',
+        'COMPLETE_MARKER_SEARCH'
+      )
+      AND target_kind = 'PUBLICATION'
+    )
+  ),
+  CHECK (
+    (target_kind = 'PROJECT' AND run_id IS NULL AND publication_id IS NULL)
+    OR (target_kind = 'WORK_ITEM' AND publication_id IS NULL)
+    OR (target_kind = 'PUBLICATION' AND run_id IS NOT NULL AND publication_id IS NOT NULL)
+  ),
+  CHECK ((last_failure_fact_id IS NULL) = (next_retry_ms IS NULL)),
+  CHECK ((controller_activity_id IS NULL) = (controller_operation_digest IS NULL)),
+  CHECK (
+    (terminal_duplicate_cleanup_action_id IS NULL) = (terminal_cleanup_operation_digest IS NULL)
+  ),
+  CHECK ((expected_discovery_search_revision IS NULL) = (expected_discovery_set_digest IS NULL)),
+  CHECK (
+    request_kind = 'WORK_ITEM_DISCOVERY'
+    OR (expected_discovery_search_revision IS NULL AND expected_discovery_set_digest IS NULL)
+  ),
+  CHECK (
+    request_kind != 'WORK_ITEM_DISCOVERY'
+    OR (expected_prior_observation_sequence IS NULL AND expected_external_revision IS NULL)
+  ),
+  CHECK (
+    request_kind = 'WORK_ITEM_DISCOVERY'
+    OR (result_discovery_search_revision IS NULL AND result_discovery_set_digest IS NULL)
+  ),
+  CHECK (
+    (state = 'PENDING'
+      AND completed_at_ms IS NULL AND result_observation_ids_digest IS NULL
+      AND result_discovery_search_revision IS NULL AND result_discovery_set_digest IS NULL)
+    OR (state != 'PENDING'
+      AND completed_at_ms IS NOT NULL AND result_observation_ids_digest IS NOT NULL)
+  ),
+  CHECK (
+    state != 'COMPLETED' OR request_kind != 'WORK_ITEM_DISCOVERY'
+    OR (result_discovery_search_revision IS NOT NULL AND result_discovery_set_digest IS NOT NULL)
+  )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_discovery_one_open
-ON forge_observation_schedules(target_kind, target_id)
-WHERE schedule_kind = 'WORK_ITEM_DISCOVERY' AND state != 'CLOSED';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forge_observation_request_one_pending
+ON forge_observation_requests(forge_observation_schedule_id) WHERE state = 'PENDING';
+
+CREATE INDEX IF NOT EXISTS idx_forge_observation_request_pending_retry
+ON forge_observation_requests(state, next_retry_ms) WHERE state = 'PENDING';
+
+CREATE TABLE IF NOT EXISTS forge_observations (
+  forge_observation_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  target_kind TEXT NOT NULL CHECK (target_kind IN ('WORK_ITEM', 'PUBLICATION')),
+  target_id TEXT NOT NULL,
+  run_id TEXT,
+  publication_id TEXT,
+  created_by_forge_observation_request_id TEXT
+    REFERENCES forge_observation_requests(forge_observation_request_id) ON DELETE RESTRICT,
+  credential_purpose TEXT CHECK (
+    credential_purpose IS NULL OR credential_purpose IN ('PROJECT_SOURCE_READ', 'PUBLICATION')
+  ),
+  credential_secret_id TEXT,
+  credential_secret_version INTEGER CHECK (
+    credential_secret_version IS NULL OR credential_secret_version > 0
+  ),
+  publication_effect_generation INTEGER CHECK (
+    publication_effect_generation IS NULL OR publication_effect_generation > 0
+  ),
+  controller_activity_id TEXT,
+  controller_operation_digest TEXT,
+  terminal_duplicate_cleanup_reservation_id TEXT,
+  terminal_duplicate_cleanup_action_id TEXT,
+  terminal_cleanup_operation_digest TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("forge_observation.kind"))})),
+  external_revision TEXT NOT NULL,
+  adapter_event_id TEXT,
+  actor_principal_id TEXT,
+  actor_authorization_digest TEXT,
+  fact_json TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  observation_sequence INTEGER NOT NULL CHECK (observation_sequence > 0),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  UNIQUE (project_id, target_kind, target_id, observation_sequence),
+  CHECK ((credential_purpose IS NULL) = (credential_secret_id IS NULL)),
+  CHECK ((credential_secret_id IS NULL) = (credential_secret_version IS NULL)),
+  CHECK ((created_by_forge_observation_request_id IS NULL) = (credential_purpose IS NULL)),
+  CHECK ((controller_activity_id IS NULL) = (controller_operation_digest IS NULL)),
+  CHECK (
+    (terminal_duplicate_cleanup_action_id IS NULL) = (terminal_cleanup_operation_digest IS NULL)
+  ),
+  CHECK (
+    terminal_duplicate_cleanup_action_id IS NULL
+    OR terminal_duplicate_cleanup_reservation_id IS NOT NULL
+  ),
+  CHECK (target_kind != 'WORK_ITEM' OR publication_id IS NULL),
+  CHECK ((actor_principal_id IS NULL) = (actor_authorization_digest IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forge_observation_adapter_event
+ON forge_observations(project_id, target_kind, target_id, adapter_event_id)
+WHERE adapter_event_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_forge_observation_target_sequence
+ON forge_observations(project_id, target_kind, target_id, observation_sequence DESC);
+
+CREATE TABLE IF NOT EXISTS forge_observation_request_results (
+  forge_observation_request_id TEXT NOT NULL
+    REFERENCES forge_observation_requests(forge_observation_request_id) ON DELETE RESTRICT,
+  observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+  forge_observation_id TEXT NOT NULL
+    REFERENCES forge_observations(forge_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (forge_observation_request_id, observation_ordinal),
+  UNIQUE (forge_observation_request_id, forge_observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS forge_request_failure_facts (
+  forge_request_failure_fact_id TEXT PRIMARY KEY,
+  forge_observation_request_id TEXT NOT NULL
+    REFERENCES forge_observation_requests(forge_observation_request_id) ON DELETE RESTRICT,
+  request_attempt_ordinal INTEGER NOT NULL CHECK (request_attempt_ordinal > 0),
+  project_id TEXT NOT NULL,
+  run_id TEXT,
+  publication_id TEXT,
+  terminal_duplicate_cleanup_reservation_id TEXT,
+  failure_kind TEXT NOT NULL CHECK (failure_kind IN ('TIMEOUT', 'RATE_LIMIT', 'UNAVAILABLE')),
+  failure_code TEXT NOT NULL,
+  failure_evidence_digest TEXT NOT NULL,
+  retry_not_before_ms INTEGER NOT NULL CHECK (retry_not_before_ms >= 0),
+  request_digest TEXT NOT NULL,
+  fact_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (forge_observation_request_id, request_attempt_ordinal)
+);
 
 CREATE TABLE IF NOT EXISTS project_registration_operations (
   project_registration_operation_id TEXT PRIMARY KEY,
@@ -1770,6 +2273,39 @@ ALTER TABLE controller_mode_v3 RENAME TO controller_mode;
 PRAGMA foreign_keys=ON;
 """
 
+_V5_TO_V6 = f"""
+PRAGMA foreign_keys=OFF;
+{_forge_observation_schedules_ddl("forge_observation_schedules_v6")}
+INSERT INTO forge_observation_schedules_v6 (
+  forge_observation_schedule_id, schedule_kind, project_id, forge_instance_id, target_kind,
+  target_id, run_id, publication_id, terminal_duplicate_cleanup_reservation_id,
+  minimum_interval_ms, next_due_at_ms, schedule_revision, last_request_id,
+  last_discovery_search_revision, last_discovery_set_digest, state, schedule_digest,
+  created_at_ms
+)
+SELECT
+  s.forge_observation_schedule_id, s.schedule_kind, s.target_id,
+  (SELECT p.forge_instance_id FROM projects p WHERE p.project_id = s.target_id),
+  s.target_kind, s.target_id, s.run_id, s.publication_id, NULL,
+  {_DEFAULT_DISCOVERY_INTERVAL_MS}, s.next_due_at_ms, s.schedule_revision, s.last_request_id,
+  NULL, NULL, s.state, '', s.created_at_ms
+FROM forge_observation_schedules s;
+DROP TABLE forge_observation_schedules;
+ALTER TABLE forge_observation_schedules_v6 RENAME TO forge_observation_schedules;
+PRAGMA foreign_keys=ON;
+"""
+
+# Appended after whichever script actually put forge_observation_schedules into
+# its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
+# _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
+# statements only ever run once the table already has ``identity_key``.
+_FORGE_OBSERVATION_SCHEDULE_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forge_observation_schedules_identity
+ON forge_observation_schedules(identity_key) WHERE state != 'CLOSED';
+CREATE INDEX IF NOT EXISTS idx_forge_observation_schedules_due
+ON forge_observation_schedules(state, next_due_at_ms) WHERE state = 'ACTIVE';
+"""
+
 
 class RunStore:
     """Controller-owned SQLite store with an exclusive process writer lock."""
@@ -1901,7 +2437,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4}:
+        if current not in {0, 1, 2, 3, 4, 5}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -1920,7 +2456,9 @@ class RunStore:
         self.conn.execute("PRAGMA foreign_keys=OFF")
         try:
             if current == 0:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -1936,7 +2474,14 @@ class RunStore:
                 # controller_mode (bidirectional maintenance_prior_* CHECK) so
                 # a v1-to-v3 upgrade lands in the same final shape as v2-to-v3.
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V1_TO_V2 + "\n" + _V2_TO_V3
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + _V1_TO_V2
+                    + "\n"
+                    + _V2_TO_V3
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -1949,7 +2494,14 @@ class RunStore:
                 # only the capability-key tables get created here; _V2_TO_V3 then
                 # rebuilds controller_mode_operations (three new columns) and
                 # controller_mode (bidirectional maintenance_prior_* CHECK) in place.
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _V2_TO_V3)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + _V2_TO_V3
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -1963,7 +2515,9 @@ class RunStore:
                 # A real version-3 database already has every table in its
                 # final v3 shape; _SCHEMA creates secret-provision tables and
                 # the later project-registration tables in one step.
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -1973,18 +2527,73 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 4:
                 # A real version-4 database already has secret-provision
                 # tables; _SCHEMA only needs to create Project / Forge
                 # Instance / registration-operation / discovery-schedule
-                # tables (all CREATE TABLE IF NOT EXISTS).
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                # tables (all CREATE TABLE IF NOT EXISTS), and it creates
+                # forge_observation_schedules directly in its final v6 shape
+                # since a v4 database never had that table at all.
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-project-registration",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                # A real version-5 database already has forge_observation_schedules
+                # in its pre-v6 shape (no project_id/forge_instance_id/cadence/
+                # digest columns); _V5_TO_V6 rebuilds it into the final shape,
+                # backfilling project_id/forge_instance_id from the existing
+                # WORK_ITEM_DISCOVERY rows' Project-scoped target_id, and
+                # _SCHEMA creates the new Forge Observation Request/Result/
+                # Failure-Fact/Observation tables (all CREATE TABLE IF NOT
+                # EXISTS). schedule_digest can't be computed inside raw SQL, so
+                # every migrated row is stamped with the real digest below
+                # before the transaction commits.
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + _V5_TO_V6
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                )
+                for row in self.conn.execute(
+                    "SELECT * FROM forge_observation_schedules WHERE schedule_digest = ''"
+                ).fetchall():
+                    digest = forge_observation_schedule_digest(
+                        _forge_observation_schedule_digest_fields(
+                            schedule_kind=row["schedule_kind"],
+                            project_id=row["project_id"],
+                            forge_instance_id=row["forge_instance_id"],
+                            target_kind=row["target_kind"],
+                            target_id=row["target_id"],
+                            run_id=row["run_id"],
+                            publication_id=row["publication_id"],
+                            terminal_duplicate_cleanup_reservation_id=row[
+                                "terminal_duplicate_cleanup_reservation_id"
+                            ],
+                            minimum_interval_ms=row["minimum_interval_ms"],
+                        )
+                    )
+                    self.conn.execute(
+                        "UPDATE forge_observation_schedules SET schedule_digest = ? "
+                        "WHERE forge_observation_schedule_id = ?",
+                        (digest, row["forge_observation_schedule_id"]),
+                    )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-forge-observations",
                         _now_ms(),
                     ),
                 )
@@ -3869,6 +4478,1094 @@ class RunStore:
         ).fetchone()
         return None if row is None else _row_to_forge_observation_schedule(row)
 
+    def get_forge_observation_schedule_by_identity(
+        self,
+        *,
+        project_id: str,
+        schedule_kind: str,
+        target_kind: str,
+        target_id: str,
+        run_id: str | None = None,
+        publication_id: str | None = None,
+        terminal_duplicate_cleanup_reservation_id: str | None = None,
+    ) -> ForgeObservationScheduleRecord | None:
+        """Return the one non-``CLOSED`` Schedule for this null-normalized identity, if any."""
+        identity_key = "|".join(
+            [
+                project_id,
+                schedule_kind,
+                target_kind,
+                target_id,
+                run_id or "",
+                publication_id or "",
+                terminal_duplicate_cleanup_reservation_id or "",
+            ]
+        )
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules "
+            "WHERE identity_key = ? AND state != 'CLOSED'",
+            (identity_key,),
+        ).fetchone()
+        return None if row is None else _row_to_forge_observation_schedule(row)
+
+    def create_forge_observation_schedule(
+        self,
+        *,
+        forge_observation_schedule_id: str,
+        schedule_kind: str,
+        project_id: str,
+        forge_instance_id: str,
+        target_kind: str,
+        target_id: str,
+        minimum_interval_ms: int,
+        next_due_at_ms: int,
+        run_id: str | None = None,
+        publication_id: str | None = None,
+        terminal_duplicate_cleanup_reservation_id: str | None = None,
+        initial_state: str = "ACTIVE",
+    ) -> ForgeObservationScheduleRecord:
+        """Create the durable Schedule for this identity at revision 0.
+
+        Idempotent: an existing non-``CLOSED`` Schedule for the same
+        null-normalized identity is returned unchanged rather than recreated
+        or reactivated (the CAS-reuse rule discovery completion and every
+        other Schedule-creating Transition relies on).
+        """
+        with self.transaction():
+            return self._create_or_reuse_forge_observation_schedule(
+                forge_observation_schedule_id=forge_observation_schedule_id,
+                schedule_kind=schedule_kind,
+                project_id=project_id,
+                forge_instance_id=forge_instance_id,
+                target_kind=target_kind,
+                target_id=target_id,
+                minimum_interval_ms=minimum_interval_ms,
+                next_due_at_ms=next_due_at_ms,
+                run_id=run_id,
+                publication_id=publication_id,
+                terminal_duplicate_cleanup_reservation_id=terminal_duplicate_cleanup_reservation_id,
+                initial_state=initial_state,
+            )
+
+    def _create_or_reuse_forge_observation_schedule(
+        self,
+        *,
+        forge_observation_schedule_id: str,
+        schedule_kind: str,
+        project_id: str,
+        forge_instance_id: str,
+        target_kind: str,
+        target_id: str,
+        minimum_interval_ms: int,
+        next_due_at_ms: int,
+        run_id: str | None = None,
+        publication_id: str | None = None,
+        terminal_duplicate_cleanup_reservation_id: str | None = None,
+        initial_state: str = "ACTIVE",
+    ) -> ForgeObservationScheduleRecord:
+        """Transaction-free body of :meth:`create_forge_observation_schedule`.
+
+        Called both by that public entry point (which opens the transaction)
+        and by :meth:`complete_work_item_discovery_request`, which is already
+        inside its own writer transaction when it creates child Schedules.
+        """
+        require_lowercase_uuid(forge_observation_schedule_id, field="forge_observation_schedule_id")
+        require_lowercase_uuid(project_id, field="project_id")
+        require_lowercase_uuid(forge_instance_id, field="forge_instance_id")
+        enums.parse_enum("forge_observation_schedule.schedule_kind", schedule_kind)
+        enums.parse_enum("forge_observation.target_kind", target_kind)
+        enums.parse_enum("forge_observation_schedule.state", initial_state)
+        if initial_state == "CLOSED":
+            raise ValueError("a Forge Observation Schedule cannot be created already CLOSED")
+        if minimum_interval_ms <= 0:
+            raise ValueError("minimum_interval_ms must be positive")
+        existing = self.get_forge_observation_schedule_by_identity(
+            project_id=project_id,
+            schedule_kind=schedule_kind,
+            target_kind=target_kind,
+            target_id=target_id,
+            run_id=run_id,
+            publication_id=publication_id,
+            terminal_duplicate_cleanup_reservation_id=terminal_duplicate_cleanup_reservation_id,
+        )
+        if existing is not None:
+            return existing
+        digest = forge_observation_schedule_digest(
+            _forge_observation_schedule_digest_fields(
+                schedule_kind=schedule_kind,
+                project_id=project_id,
+                forge_instance_id=forge_instance_id,
+                target_kind=target_kind,
+                target_id=target_id,
+                run_id=run_id,
+                publication_id=publication_id,
+                terminal_duplicate_cleanup_reservation_id=terminal_duplicate_cleanup_reservation_id,
+                minimum_interval_ms=minimum_interval_ms,
+            )
+        )
+        now = _now_ms()
+        try:
+            self.conn.execute(
+                "INSERT INTO forge_observation_schedules("
+                "forge_observation_schedule_id, schedule_kind, project_id, "
+                "forge_instance_id, target_kind, target_id, run_id, publication_id, "
+                "terminal_duplicate_cleanup_reservation_id, minimum_interval_ms, "
+                "next_due_at_ms, schedule_revision, last_request_id, "
+                "last_discovery_search_revision, last_discovery_set_digest, state, "
+                "schedule_digest, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, ?)",
+                (
+                    forge_observation_schedule_id,
+                    schedule_kind,
+                    project_id,
+                    forge_instance_id,
+                    target_kind,
+                    target_id,
+                    run_id,
+                    publication_id,
+                    terminal_duplicate_cleanup_reservation_id,
+                    minimum_interval_ms,
+                    next_due_at_ms,
+                    initial_state,
+                    digest,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise CasMismatchError(
+                "a non-closed Forge Observation Schedule already exists for this identity"
+            ) from exc
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+            (forge_observation_schedule_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_forge_observation_schedule(row)
+
+    def close_forge_observation_schedule(
+        self, forge_observation_schedule_id: str, *, expected_revision: int
+    ) -> ForgeObservationScheduleRecord:
+        """CAS a Schedule to ``CLOSED``, superseding any still-``PENDING`` Request
+        and its still-``PENDING`` reciprocal Outbox before any further I/O.
+
+        Idempotent: an already-``CLOSED`` Schedule is returned unchanged.
+        """
+        require_lowercase_uuid(forge_observation_schedule_id, field="forge_observation_schedule_id")
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+                (forge_observation_schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"forge observation schedule {forge_observation_schedule_id!r} was not found"
+                )
+            current = _row_to_forge_observation_schedule(row)
+            if current.state == "CLOSED":
+                return current
+            if current.schedule_revision != expected_revision:
+                raise CasMismatchError("forge_observation_schedule_id revision changed")
+            updated = self.conn.execute(
+                "UPDATE forge_observation_schedules SET state = 'CLOSED', "
+                "schedule_revision = schedule_revision + 1 "
+                "WHERE forge_observation_schedule_id = ? AND schedule_revision = ?",
+                (forge_observation_schedule_id, expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise CasMismatchError("forge_observation_schedule_id revision changed")
+            pending = self.conn.execute(
+                "SELECT * FROM forge_observation_requests "
+                "WHERE forge_observation_schedule_id = ? AND state = 'PENDING'",
+                (forge_observation_schedule_id,),
+            ).fetchone()
+            if pending is not None:
+                self._supersede_pending_request_before_io(pending)
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+            (forge_observation_schedule_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_forge_observation_schedule(row)
+
+    def _supersede_pending_request_before_io(self, request_row: sqlite3.Row) -> None:
+        now = _now_ms()
+        empty_digest = forge_observation_result_membership_digest([])
+        self.conn.execute(
+            "UPDATE forge_observation_requests SET state = 'SUPERSEDED', "
+            "result_observation_ids_digest = ?, completed_at_ms = ? "
+            "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+            (empty_digest, now, request_row["forge_observation_request_id"]),
+        )
+        self._mark_outbox_superseded(request_row["outbox_id"])
+
+    def _mark_outbox_delivered(self, outbox_id: str) -> None:
+        self.conn.execute(
+            "UPDATE outbox SET state = 'DELIVERED', delivery_count = delivery_count + 1 "
+            "WHERE outbox_id = ? AND state != 'DELIVERED'",
+            (outbox_id,),
+        )
+
+    def _mark_outbox_superseded(self, outbox_id: str) -> None:
+        self.conn.execute(
+            "UPDATE outbox SET state = 'SUPERSEDED' WHERE outbox_id = ? AND state = 'PENDING'",
+            (outbox_id,),
+        )
+
+    def create_due_forge_observation_request(
+        self,
+        *,
+        forge_observation_request_id: str,
+        forge_observation_schedule_id: str,
+        now_ms: int,
+        controller_mode: str,
+        controller_mode_revision: int,
+        credential_purpose: str,
+        credential_secret_id: str,
+        credential_secret_version: int,
+        outbox_id: str,
+        outbox_destination: str = "forge-observation-dispatch/1",
+        expected_prior_observation_sequence: int | None = None,
+        expected_external_revision: str | None = None,
+        controller_activity_id: str | None = None,
+        effect_generation: int | None = None,
+        controller_operation_digest: str | None = None,
+        terminal_duplicate_cleanup_action_id: str | None = None,
+        terminal_cleanup_operation_digest: str | None = None,
+    ) -> ForgeObservationRequestRecord | None:
+        """Create the next due Request for an ``ACTIVE`` due Schedule.
+
+        Returns the existing ``PENDING`` Request unchanged when one is already
+        outstanding (the "no existing PENDING Request" precondition makes this
+        idempotent rather than an error), or ``None`` when the Schedule is not
+        currently ``ACTIVE``-and-due or the controller is in ``MAINTENANCE``
+        (which creates no ordinary Request). Commits the Request and its
+        reciprocal Outbox in the same writer transaction as the Schedule CAS,
+        before any forge I/O.
+        """
+        require_lowercase_uuid(forge_observation_request_id, field="forge_observation_request_id")
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        enums.parse_enum("controller_mode.mode", controller_mode)
+        if controller_mode == "MAINTENANCE":
+            return None
+        enums.parse_enum("forge_observation_request.credential_purpose", credential_purpose)
+        if credential_purpose == "FORGE_CONNECTIVITY":
+            raise ValueError("FORGE_CONNECTIVITY credentials belong only to Health Probe Request")
+        protocol_version = FORGE_OBSERVATION_REQUEST_PROTOCOL
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+                (forge_observation_schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"forge observation schedule {forge_observation_schedule_id!r} was not found"
+                )
+            schedule = _row_to_forge_observation_schedule(row)
+            if schedule.state != "ACTIVE":
+                return None
+            pending = self.conn.execute(
+                "SELECT * FROM forge_observation_requests "
+                "WHERE forge_observation_schedule_id = ? AND state = 'PENDING'",
+                (forge_observation_schedule_id,),
+            ).fetchone()
+            if pending is not None:
+                # A retried create call (e.g. after a crash before the caller
+                # observed success) returns the still-outstanding Request
+                # regardless of due time -- due time only gates *new* work.
+                return _row_to_forge_observation_request(pending)
+            if schedule.next_due_at_ms > now_ms:
+                return None
+            next_sequence = self.conn.execute(
+                "SELECT COALESCE(MAX(request_sequence), 0) + 1 FROM forge_observation_requests "
+                "WHERE forge_observation_schedule_id = ?",
+                (forge_observation_schedule_id,),
+            ).fetchone()[0]
+            request_kind = schedule.schedule_kind
+            expected_discovery_search_revision = None
+            expected_discovery_set_digest = None
+            if request_kind == "WORK_ITEM_DISCOVERY":
+                expected_discovery_search_revision = schedule.last_discovery_search_revision
+                expected_discovery_set_digest = schedule.last_discovery_set_digest
+                expected_prior_observation_sequence = None
+                expected_external_revision = None
+            digest = request_digest(
+                {
+                    "protocol_version": protocol_version,
+                    "forge_observation_schedule_id": forge_observation_schedule_id,
+                    "schedule_revision": schedule.schedule_revision,
+                    "request_sequence": next_sequence,
+                    "request_kind": request_kind,
+                    "project_id": schedule.project_id,
+                    "forge_instance_id": schedule.forge_instance_id,
+                    "target_kind": schedule.target_kind,
+                    "target_id": schedule.target_id,
+                    "run_id": schedule.run_id,
+                    "publication_id": schedule.publication_id,
+                    "terminal_duplicate_cleanup_reservation_id": (
+                        schedule.terminal_duplicate_cleanup_reservation_id
+                    ),
+                    "created_under_controller_mode_revision": controller_mode_revision,
+                    "created_under_controller_mode": controller_mode,
+                    "credential_purpose": credential_purpose,
+                    "credential_secret_id": credential_secret_id,
+                    "credential_secret_version": credential_secret_version,
+                    "controller_activity_id": controller_activity_id,
+                    "effect_generation": effect_generation,
+                    "controller_operation_digest": controller_operation_digest,
+                    "terminal_duplicate_cleanup_action_id": terminal_duplicate_cleanup_action_id,
+                    "terminal_cleanup_operation_digest": terminal_cleanup_operation_digest,
+                    "expected_prior_observation_sequence": expected_prior_observation_sequence,
+                    "expected_external_revision": expected_external_revision,
+                    "expected_discovery_search_revision": expected_discovery_search_revision,
+                    "expected_discovery_set_digest": expected_discovery_set_digest,
+                }
+            )
+            updated = self.conn.execute(
+                "UPDATE forge_observation_schedules SET last_request_id = ?, "
+                "next_due_at_ms = ?, schedule_revision = schedule_revision + 1 "
+                "WHERE forge_observation_schedule_id = ? AND schedule_revision = ? "
+                "AND state = 'ACTIVE'",
+                (
+                    forge_observation_request_id,
+                    now_ms + schedule.minimum_interval_ms,
+                    forge_observation_schedule_id,
+                    schedule.schedule_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CasMismatchError("forge_observation_schedule_id revision changed")
+            self.insert_outbox(
+                outbox_id=outbox_id,
+                source_kind="FORGE_OBSERVATION_REQUEST",
+                source_id=forge_observation_request_id,
+                destination=outbox_destination,
+                protocol_version=protocol_version,
+                payload_digest=digest,
+                payload={
+                    "forge_observation_request_id": forge_observation_request_id,
+                    "request_kind": request_kind,
+                    "project_id": schedule.project_id,
+                    "forge_instance_id": schedule.forge_instance_id,
+                    "target_kind": schedule.target_kind,
+                    "target_id": schedule.target_id,
+                },
+                next_delivery_at_ms=now_ms,
+                publication_id=schedule.publication_id,
+                effect_generation=effect_generation,
+            )
+            self.conn.execute(
+                "INSERT INTO forge_observation_requests("
+                "forge_observation_request_id, protocol_version, "
+                "forge_observation_schedule_id, schedule_revision, request_sequence, "
+                "request_kind, project_id, forge_instance_id, target_kind, target_id, "
+                "run_id, publication_id, terminal_duplicate_cleanup_reservation_id, "
+                "created_under_controller_mode_revision, created_under_controller_mode, "
+                "credential_purpose, credential_secret_id, credential_secret_version, "
+                "controller_activity_id, effect_generation, controller_operation_digest, "
+                "terminal_duplicate_cleanup_action_id, terminal_cleanup_operation_digest, "
+                "expected_prior_observation_sequence, expected_external_revision, "
+                "expected_discovery_search_revision, expected_discovery_set_digest, "
+                "request_idempotency_key, request_digest, state, outbox_id, "
+                "next_attempt_ordinal, last_failure_fact_id, next_retry_ms, "
+                "result_observation_ids_digest, result_discovery_search_revision, "
+                "result_discovery_set_digest, created_at_ms, completed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, 'PENDING', ?, 1, NULL, NULL, NULL, NULL, NULL, ?, NULL)",
+                (
+                    forge_observation_request_id,
+                    protocol_version,
+                    forge_observation_schedule_id,
+                    schedule.schedule_revision,
+                    next_sequence,
+                    request_kind,
+                    schedule.project_id,
+                    schedule.forge_instance_id,
+                    schedule.target_kind,
+                    schedule.target_id,
+                    schedule.run_id,
+                    schedule.publication_id,
+                    schedule.terminal_duplicate_cleanup_reservation_id,
+                    controller_mode_revision,
+                    controller_mode,
+                    credential_purpose,
+                    credential_secret_id,
+                    credential_secret_version,
+                    controller_activity_id,
+                    effect_generation,
+                    controller_operation_digest,
+                    terminal_duplicate_cleanup_action_id,
+                    terminal_cleanup_operation_digest,
+                    expected_prior_observation_sequence,
+                    expected_external_revision,
+                    expected_discovery_search_revision,
+                    expected_discovery_set_digest,
+                    forge_observation_request_id,
+                    digest,
+                    outbox_id,
+                    now_ms,
+                ),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+            (forge_observation_request_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_forge_observation_request(row)
+
+    def record_forge_observation_request_attempt(self, forge_observation_request_id: str) -> int:
+        """Commit and return the Request's next outbound transport-attempt ordinal.
+
+        Must be called once, before each real outbound adapter attempt, per
+        the closed error taxonomy's "the writer commits the Request's next
+        attempt ordinal" pre-I/O rule.
+        """
+        require_lowercase_uuid(forge_observation_request_id, field="forge_observation_request_id")
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+                (forge_observation_request_id,),
+            ).fetchone()
+            if row is None:
+                raise RunStoreError(
+                    f"forge observation request {forge_observation_request_id!r} was not found"
+                )
+            if row["state"] != "PENDING":
+                raise CasMismatchError("forge_observation_request_id is no longer PENDING")
+            ordinal = row["next_attempt_ordinal"]
+            updated = self.conn.execute(
+                "UPDATE forge_observation_requests SET next_attempt_ordinal = "
+                "next_attempt_ordinal + 1 "
+                "WHERE forge_observation_request_id = ? AND state = 'PENDING' "
+                "AND next_attempt_ordinal = ?",
+                (forge_observation_request_id, ordinal),
+            )
+            if updated.rowcount != 1:
+                raise CasMismatchError("forge_observation_request_id attempt ordinal changed")
+        return ordinal
+
+    def record_forge_request_failure_fact(
+        self,
+        *,
+        forge_request_failure_fact_id: str,
+        forge_observation_request_id: str,
+        request_attempt_ordinal: int,
+        failure_kind: str,
+        failure_code: str,
+        failure_evidence_digest: str,
+        retry_not_before_ms: int,
+    ) -> ForgeRequestFailureFactRecord:
+        """Record one failed transport attempt for a still-``PENDING`` Request.
+
+        Idempotent on ``(forge_observation_request_id, request_attempt_ordinal)``:
+        an exact retry with identical content returns the existing Fact.
+        Leaves the Request and its reciprocal Outbox ``PENDING``. A failure
+        Fact for a Request that already won its terminal-state CAS
+        (``COMPLETED``/``SUPERSEDED``) is rejected as late.
+        """
+        require_lowercase_uuid(forge_request_failure_fact_id, field="forge_request_failure_fact_id")
+        enums.parse_enum("forge_request_failure_fact.failure_kind", failure_kind)
+        _require_digest(failure_evidence_digest, field="failure_evidence_digest")
+        with self.transaction():
+            req_row = self.conn.execute(
+                "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+                (forge_observation_request_id,),
+            ).fetchone()
+            if req_row is None:
+                raise RunStoreError(
+                    f"forge observation request {forge_observation_request_id!r} was not found"
+                )
+            existing = self.conn.execute(
+                "SELECT * FROM forge_request_failure_facts "
+                "WHERE forge_observation_request_id = ? AND request_attempt_ordinal = ?",
+                (forge_observation_request_id, request_attempt_ordinal),
+            ).fetchone()
+            fact_fields = {
+                "forge_observation_request_id": forge_observation_request_id,
+                "request_attempt_ordinal": request_attempt_ordinal,
+                "project_id": req_row["project_id"],
+                "run_id": req_row["run_id"],
+                "publication_id": req_row["publication_id"],
+                "terminal_duplicate_cleanup_reservation_id": req_row[
+                    "terminal_duplicate_cleanup_reservation_id"
+                ],
+                "failure_kind": failure_kind,
+                "failure_code": failure_code,
+                "failure_evidence_digest": failure_evidence_digest,
+                "retry_not_before_ms": retry_not_before_ms,
+                "request_digest": req_row["request_digest"],
+            }
+            fact_digest = forge_request_failure_fact_digest(fact_fields)
+            if existing is not None:
+                if existing["fact_digest"] != fact_digest:
+                    raise IdempotencyConflictError(
+                        "forge_request_failure_fact_id attempt was reused with different content"
+                    )
+                return _row_to_forge_request_failure_fact(existing)
+            if req_row["state"] != "PENDING":
+                raise CasMismatchError(
+                    "forge_observation_request_id already reached a terminal state; "
+                    "rejecting a late failure Fact"
+                )
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO forge_request_failure_facts("
+                "forge_request_failure_fact_id, forge_observation_request_id, "
+                "request_attempt_ordinal, project_id, run_id, publication_id, "
+                "terminal_duplicate_cleanup_reservation_id, failure_kind, failure_code, "
+                "failure_evidence_digest, retry_not_before_ms, request_digest, fact_digest, "
+                "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    forge_request_failure_fact_id,
+                    forge_observation_request_id,
+                    request_attempt_ordinal,
+                    req_row["project_id"],
+                    req_row["run_id"],
+                    req_row["publication_id"],
+                    req_row["terminal_duplicate_cleanup_reservation_id"],
+                    failure_kind,
+                    failure_code,
+                    failure_evidence_digest,
+                    retry_not_before_ms,
+                    req_row["request_digest"],
+                    fact_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE forge_observation_requests SET last_failure_fact_id = ?, "
+                "next_retry_ms = ? "
+                "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+                (forge_request_failure_fact_id, retry_not_before_ms, forge_observation_request_id),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM forge_request_failure_facts WHERE forge_request_failure_fact_id = ?",
+            (forge_request_failure_fact_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_forge_request_failure_fact(row)
+
+    def _insert_or_coalesce_observation(
+        self,
+        *,
+        forge_observation_id_factory: Callable[[], str],
+        project_id: str,
+        target_kind: str,
+        target_id: str,
+        run_id: str | None,
+        publication_id: str | None,
+        created_by_forge_observation_request_id: str | None,
+        credential_purpose: str | None,
+        credential_secret_id: str | None,
+        credential_secret_version: int | None,
+        obs: ForgeObservationInput,
+        now: int,
+    ) -> tuple[str, str]:
+        """Insert one new Forge Observation, or reuse an eligible coalesced row.
+
+        Returns ``(forge_observation_id, payload_digest)``. Idempotent replay
+        by ``adapter_event_id`` is checked first; absent that, a payload
+        identical to the immediately preceding observation for this exact
+        target is coalesced (never across an intervening different payload,
+        so an ``A -> B -> A`` sequence still records all three).
+        """
+        enums.parse_enum("forge_observation.kind", obs.kind)
+        fact_json = _require_json_text(obs.fact)
+        payload_digest = forge_observation_payload_digest(
+            {
+                "kind": obs.kind,
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "external_revision": obs.external_revision,
+                "fact": json.loads(fact_json),
+            }
+        )
+        if obs.adapter_event_id is not None:
+            existing = self.conn.execute(
+                "SELECT * FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+                "AND target_id = ? AND adapter_event_id = ?",
+                (project_id, target_kind, target_id, obs.adapter_event_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_digest"] != payload_digest:
+                    raise IdempotencyConflictError(
+                        "adapter_event_id was replayed with a different observation payload"
+                    )
+                return existing["forge_observation_id"], existing["payload_digest"]
+        else:
+            latest = self.conn.execute(
+                "SELECT * FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+                "AND target_id = ? ORDER BY observation_sequence DESC LIMIT 1",
+                (project_id, target_kind, target_id),
+            ).fetchone()
+            if (
+                latest is not None
+                and latest["payload_digest"] == payload_digest
+                and latest["run_id"] == run_id
+                and latest["publication_id"] == publication_id
+                and latest["credential_purpose"] == credential_purpose
+                and latest["credential_secret_id"] == credential_secret_id
+                and latest["credential_secret_version"] == credential_secret_version
+            ):
+                return latest["forge_observation_id"], latest["payload_digest"]
+        next_sequence = self.conn.execute(
+            "SELECT COALESCE(MAX(observation_sequence), 0) + 1 FROM forge_observations "
+            "WHERE project_id = ? AND target_kind = ? AND target_id = ?",
+            (project_id, target_kind, target_id),
+        ).fetchone()[0]
+        forge_observation_id = forge_observation_id_factory()
+        require_lowercase_uuid(forge_observation_id, field="forge_observation_id")
+        observed_at_ms = obs.observed_at_ms if obs.observed_at_ms is not None else now
+        self.conn.execute(
+            "INSERT INTO forge_observations("
+            "forge_observation_id, project_id, target_kind, target_id, run_id, "
+            "publication_id, created_by_forge_observation_request_id, credential_purpose, "
+            "credential_secret_id, credential_secret_version, publication_effect_generation, "
+            "controller_activity_id, controller_operation_digest, "
+            "terminal_duplicate_cleanup_reservation_id, terminal_duplicate_cleanup_action_id, "
+            "terminal_cleanup_operation_digest, kind, external_revision, adapter_event_id, "
+            "actor_principal_id, actor_authorization_digest, fact_json, payload_digest, "
+            "observation_sequence, observed_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?)",
+            (
+                forge_observation_id,
+                project_id,
+                target_kind,
+                target_id,
+                run_id,
+                publication_id,
+                created_by_forge_observation_request_id,
+                credential_purpose,
+                credential_secret_id,
+                credential_secret_version,
+                obs.kind,
+                obs.external_revision,
+                obs.adapter_event_id,
+                obs.actor_principal_id,
+                obs.actor_authorization_digest,
+                fact_json,
+                payload_digest,
+                next_sequence,
+                observed_at_ms,
+            ),
+        )
+        return forge_observation_id, payload_digest
+
+    def complete_forge_observation_request(
+        self,
+        *,
+        forge_observation_request_id: str,
+        observations: Sequence[ForgeObservationInput],
+        forge_observation_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+    ) -> ForgeObservationRequestCompletion:
+        """Complete a non-``WORK_ITEM_DISCOVERY`` Request from a real adapter response.
+
+        Commits the ordered Observation result (coalescing per
+        ``_insert_or_coalesce_observation``), marks the Request ``COMPLETED``,
+        and marks its reciprocal Outbox ``DELIVERED`` -- all in one writer
+        transaction. A stale schedule-scope fence (the Schedule ``CLOSED`` or
+        no longer naming this Request as current) instead records the Request
+        ``SUPERSEDED`` with no Observations, but the Outbox is still marked
+        ``DELIVERED`` because real adapter I/O produced this response. A
+        response for an already-terminal Request (a duplicate delivery, or one
+        that raced a schedule closure) redelivers the Outbox without
+        regressing the Request's own terminal state.
+        """
+        require_lowercase_uuid(forge_observation_request_id, field="forge_observation_request_id")
+        with self.transaction():
+            req_row = self.conn.execute(
+                "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+                (forge_observation_request_id,),
+            ).fetchone()
+            if req_row is None:
+                raise RunStoreError(
+                    f"forge observation request {forge_observation_request_id!r} was not found"
+                )
+            request = _row_to_forge_observation_request(req_row)
+            if request.request_kind == "WORK_ITEM_DISCOVERY":
+                raise ValueError("use complete_work_item_discovery_request for WORK_ITEM_DISCOVERY")
+            if request.state != "PENDING":
+                self._mark_outbox_delivered(request.outbox_id)
+                observation_ids = tuple(
+                    r["forge_observation_id"]
+                    for r in self.conn.execute(
+                        "SELECT forge_observation_id FROM forge_observation_request_results "
+                        "WHERE forge_observation_request_id = ? ORDER BY observation_ordinal",
+                        (forge_observation_request_id,),
+                    )
+                )
+                return ForgeObservationRequestCompletion(
+                    request=self._current_forge_observation_request(forge_observation_request_id),
+                    observation_ids=observation_ids,
+                )
+            schedule_row = self.conn.execute(
+                "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+                (request.forge_observation_schedule_id,),
+            ).fetchone()
+            assert schedule_row is not None
+            schedule = _row_to_forge_observation_schedule(schedule_row)
+            stale = (
+                schedule.state == "CLOSED"
+                or schedule.last_request_id != forge_observation_request_id
+            )
+            now = _now_ms()
+            if stale:
+                empty_digest = forge_observation_result_membership_digest([])
+                self.conn.execute(
+                    "UPDATE forge_observation_requests SET state = 'SUPERSEDED', "
+                    "result_observation_ids_digest = ?, completed_at_ms = ? "
+                    "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+                    (empty_digest, now, forge_observation_request_id),
+                )
+                self._mark_outbox_delivered(request.outbox_id)
+                observation_ids = ()
+            else:
+                observation_ids = tuple(
+                    self._insert_or_coalesce_observation(
+                        forge_observation_id_factory=forge_observation_id_factory,
+                        project_id=request.project_id,
+                        target_kind=request.target_kind,
+                        target_id=request.target_id,
+                        run_id=request.run_id,
+                        publication_id=request.publication_id,
+                        created_by_forge_observation_request_id=forge_observation_request_id,
+                        credential_purpose=request.credential_purpose,
+                        credential_secret_id=request.credential_secret_id,
+                        credential_secret_version=request.credential_secret_version,
+                        obs=obs,
+                        now=now,
+                    )[0]
+                    for obs in observations
+                )
+                for ordinal, forge_observation_id in enumerate(observation_ids):
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO forge_observation_request_results("
+                        "forge_observation_request_id, observation_ordinal, "
+                        "forge_observation_id) VALUES (?, ?, ?)",
+                        (forge_observation_request_id, ordinal, forge_observation_id),
+                    )
+                result_digest = forge_observation_result_membership_digest(observation_ids)
+                self.conn.execute(
+                    "UPDATE forge_observation_requests SET state = 'COMPLETED', "
+                    "result_observation_ids_digest = ?, completed_at_ms = ? "
+                    "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+                    (result_digest, now, forge_observation_request_id),
+                )
+                self._mark_outbox_delivered(request.outbox_id)
+        return ForgeObservationRequestCompletion(
+            request=self._current_forge_observation_request(forge_observation_request_id),
+            observation_ids=observation_ids,
+        )
+
+    def _current_forge_observation_request(
+        self, forge_observation_request_id: str
+    ) -> ForgeObservationRequestRecord:
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+            (forge_observation_request_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_forge_observation_request(row)
+
+    def complete_work_item_discovery_request(
+        self,
+        *,
+        forge_observation_request_id: str,
+        discovery_search_revision: str,
+        work_items: Sequence[ForgeObservationInput],
+        forge_observation_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+        child_schedule_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+        work_item_poll_minimum_interval_ms: int = _DEFAULT_DISCOVERY_INTERVAL_MS,
+        base_head_poll_minimum_interval_ms: int = _DEFAULT_DISCOVERY_INTERVAL_MS,
+    ) -> ForgeObservationRequestCompletion:
+        """Complete a ``WORK_ITEM_DISCOVERY`` Request from a real adapter response.
+
+        ``work_items`` is normalized to bytewise Work Item stable-ID order
+        before anything commits, so discovery ordering and child Schedule
+        creation are deterministic regardless of adapter response order. In
+        the same writer transaction: commits each item's ``WORK_ITEM_SNAPSHOT``
+        Observation (coalesced as usual), CASes the Schedule's discovery
+        search-revision/set-digest pair, creates-or-CAS-reuses a Run-null
+        ``WORK_ITEM_POLL`` and ``BASE_HEAD_POLL`` child Schedule per item
+        (``PAUSED`` when the discovery Schedule itself is ``PAUSED``, and
+        never reactivated by this completion), and closes any Run-null child
+        Schedule for a Work Item no longer in the discovered set that has no
+        active Run. A stale schedule-scope fence behaves like
+        :meth:`complete_forge_observation_request`: ``SUPERSEDED`` with no
+        Observations or children, Outbox still ``DELIVERED``.
+        """
+        require_lowercase_uuid(forge_observation_request_id, field="forge_observation_request_id")
+        ordered_items = sorted(
+            work_items, key=lambda item: _require_target_id(item, field="work_items[].target_id")
+        )
+        with self.transaction():
+            req_row = self.conn.execute(
+                "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+                (forge_observation_request_id,),
+            ).fetchone()
+            if req_row is None:
+                raise RunStoreError(
+                    f"forge observation request {forge_observation_request_id!r} was not found"
+                )
+            request = _row_to_forge_observation_request(req_row)
+            if request.request_kind != "WORK_ITEM_DISCOVERY":
+                raise ValueError(
+                    "complete_work_item_discovery_request only completes WORK_ITEM_DISCOVERY"
+                )
+            if request.state != "PENDING":
+                self._mark_outbox_delivered(request.outbox_id)
+                observation_ids = tuple(
+                    r["forge_observation_id"]
+                    for r in self.conn.execute(
+                        "SELECT forge_observation_id FROM forge_observation_request_results "
+                        "WHERE forge_observation_request_id = ? ORDER BY observation_ordinal",
+                        (forge_observation_request_id,),
+                    )
+                )
+                return ForgeObservationRequestCompletion(
+                    request=self._current_forge_observation_request(forge_observation_request_id),
+                    observation_ids=observation_ids,
+                )
+            schedule_row = self.conn.execute(
+                "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+                (request.forge_observation_schedule_id,),
+            ).fetchone()
+            assert schedule_row is not None
+            schedule = _row_to_forge_observation_schedule(schedule_row)
+            stale = (
+                schedule.state == "CLOSED"
+                or schedule.last_request_id != forge_observation_request_id
+            )
+            now = _now_ms()
+            if stale:
+                empty_digest = forge_observation_result_membership_digest([])
+                self.conn.execute(
+                    "UPDATE forge_observation_requests SET state = 'SUPERSEDED', "
+                    "result_observation_ids_digest = ?, completed_at_ms = ? "
+                    "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+                    (empty_digest, now, forge_observation_request_id),
+                )
+                self._mark_outbox_delivered(request.outbox_id)
+                observation_ids = ()
+            else:
+                observation_ids, discovery_set_digest = self._commit_discovery_results(
+                    forge_observation_request_id=forge_observation_request_id,
+                    request=request,
+                    ordered_items=ordered_items,
+                    forge_observation_id_factory=forge_observation_id_factory,
+                    now=now,
+                )
+                result_digest = forge_observation_result_membership_digest(observation_ids)
+                self.conn.execute(
+                    "UPDATE forge_observation_requests SET state = 'COMPLETED', "
+                    "result_observation_ids_digest = ?, result_discovery_search_revision = ?, "
+                    "result_discovery_set_digest = ?, completed_at_ms = ? "
+                    "WHERE forge_observation_request_id = ? AND state = 'PENDING'",
+                    (
+                        result_digest,
+                        discovery_search_revision,
+                        discovery_set_digest,
+                        now,
+                        forge_observation_request_id,
+                    ),
+                )
+                updated = self.conn.execute(
+                    "UPDATE forge_observation_schedules SET "
+                    "last_discovery_search_revision = ?, last_discovery_set_digest = ?, "
+                    "schedule_revision = schedule_revision + 1 "
+                    "WHERE forge_observation_schedule_id = ? AND schedule_revision = ? "
+                    "AND state != 'CLOSED' AND last_request_id = ?",
+                    (
+                        discovery_search_revision,
+                        discovery_set_digest,
+                        request.forge_observation_schedule_id,
+                        schedule.schedule_revision,
+                        forge_observation_request_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise CasMismatchError(
+                        "forge_observation_schedule_id revision changed during discovery completion"
+                    )
+                children_initial_state = "PAUSED" if schedule.state == "PAUSED" else "ACTIVE"
+                live_target_ids: list[str] = []
+                for item in ordered_items:
+                    assert item.target_id is not None
+                    live_target_ids.append(item.target_id)
+                    self._create_or_reuse_forge_observation_schedule(
+                        forge_observation_schedule_id=child_schedule_id_factory(),
+                        schedule_kind="WORK_ITEM_POLL",
+                        project_id=request.project_id,
+                        forge_instance_id=request.forge_instance_id,
+                        target_kind="WORK_ITEM",
+                        target_id=item.target_id,
+                        minimum_interval_ms=work_item_poll_minimum_interval_ms,
+                        next_due_at_ms=now,
+                        initial_state=children_initial_state,
+                    )
+                    self._create_or_reuse_forge_observation_schedule(
+                        forge_observation_schedule_id=child_schedule_id_factory(),
+                        schedule_kind="BASE_HEAD_POLL",
+                        project_id=request.project_id,
+                        forge_instance_id=request.forge_instance_id,
+                        target_kind="WORK_ITEM",
+                        target_id=item.target_id,
+                        minimum_interval_ms=base_head_poll_minimum_interval_ms,
+                        next_due_at_ms=now,
+                        initial_state=children_initial_state,
+                    )
+                self._close_stale_run_null_work_item_schedules(
+                    project_id=request.project_id,
+                    live_target_ids=live_target_ids,
+                )
+                self._mark_outbox_delivered(request.outbox_id)
+        return ForgeObservationRequestCompletion(
+            request=self._current_forge_observation_request(forge_observation_request_id),
+            observation_ids=observation_ids,
+        )
+
+    def _commit_discovery_results(
+        self,
+        *,
+        forge_observation_request_id: str,
+        request: ForgeObservationRequestRecord,
+        ordered_items: Sequence[ForgeObservationInput],
+        forge_observation_id_factory: Callable[[], str],
+        now: int,
+    ) -> tuple[tuple[str, ...], str]:
+        observation_ids: list[str] = []
+        set_members: list[tuple[str, str, str]] = []
+        for ordinal, item in enumerate(ordered_items):
+            target_id = _require_target_id(item, field="work_items[].target_id")
+            forge_observation_id, payload_digest = self._insert_or_coalesce_observation(
+                forge_observation_id_factory=forge_observation_id_factory,
+                project_id=request.project_id,
+                target_kind="WORK_ITEM",
+                target_id=target_id,
+                run_id=None,
+                publication_id=None,
+                created_by_forge_observation_request_id=forge_observation_request_id,
+                credential_purpose=request.credential_purpose,
+                credential_secret_id=request.credential_secret_id,
+                credential_secret_version=request.credential_secret_version,
+                obs=item,
+                now=now,
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO forge_observation_request_results("
+                "forge_observation_request_id, observation_ordinal, forge_observation_id) "
+                "VALUES (?, ?, ?)",
+                (forge_observation_request_id, ordinal, forge_observation_id),
+            )
+            observation_ids.append(forge_observation_id)
+            set_members.append((target_id, item.external_revision, payload_digest))
+        discovery_set_digest = work_item_discovery_set_digest(set_members)
+        return tuple(observation_ids), discovery_set_digest
+
+    def _close_stale_run_null_work_item_schedules(
+        self, *, project_id: str, live_target_ids: Sequence[str]
+    ) -> None:
+        """Close every Run-null Work-Item-targeted Schedule outside ``live_target_ids``
+        that has no active Run, using the complete discovery set as authority."""
+        # "NOT IN ()" with an empty list is not valid SQL, and "NOT IN (NULL)"
+        # is SQL NULL (never true) rather than "matches everything" -- an
+        # empty live_target_ids (discovery now returns zero Work Items) must
+        # therefore drop the membership filter entirely rather than matching
+        # nothing.
+        if live_target_ids:
+            placeholders = ",".join("?" * len(live_target_ids))
+            membership_filter = f"AND target_id NOT IN ({placeholders})"
+            params: tuple[Any, ...] = (project_id, *live_target_ids)
+        else:
+            membership_filter = ""
+            params = (project_id,)
+        stale = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules "
+            "WHERE project_id = ? AND target_kind = 'WORK_ITEM' AND run_id IS NULL "
+            f"AND state != 'CLOSED' {membership_filter}",
+            params,
+        ).fetchall()
+        for row in stale:
+            active_run = self.conn.execute(
+                "SELECT 1 FROM runs WHERE project_id = ? AND work_item_key = ? "
+                "AND terminal_outcome IS NULL LIMIT 1",
+                (project_id, row["target_id"]),
+            ).fetchone()
+            if active_run is not None:
+                continue
+            self.conn.execute(
+                "UPDATE forge_observation_schedules SET state = 'CLOSED', "
+                "schedule_revision = schedule_revision + 1 "
+                "WHERE forge_observation_schedule_id = ? AND schedule_revision = ?",
+                (row["forge_observation_schedule_id"], row["schedule_revision"]),
+            )
+            pending = self.conn.execute(
+                "SELECT * FROM forge_observation_requests "
+                "WHERE forge_observation_schedule_id = ? AND state = 'PENDING'",
+                (row["forge_observation_schedule_id"],),
+            ).fetchone()
+            if pending is not None:
+                self._supersede_pending_request_before_io(pending)
+
+    def list_active_due_forge_observation_schedules(
+        self, *, now_ms: int, limit: int = 100
+    ) -> list[ForgeObservationScheduleRecord]:
+        """List ``ACTIVE`` Schedules currently due, oldest-due first.
+
+        Restart/startup reconciliation scans exactly this: every ``ACTIVE``
+        due Schedule, never a synthesized one.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM forge_observation_schedules "
+            "WHERE state = 'ACTIVE' AND next_due_at_ms <= ? "
+            "ORDER BY next_due_at_ms ASC, forge_observation_schedule_id ASC LIMIT ?",
+            (now_ms, limit),
+        ).fetchall()
+        return [_row_to_forge_observation_schedule(row) for row in rows]
+
+    def list_pending_forge_observation_requests(
+        self, *, limit: int = 100
+    ) -> list[ForgeObservationRequestRecord]:
+        """List still-``PENDING`` Requests for restart redelivery.
+
+        Each is retried with its same ``request_idempotency_key``; none is
+        recreated.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM forge_observation_requests WHERE state = 'PENDING' "
+            "ORDER BY created_at_ms ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_forge_observation_request(row) for row in rows]
+
+    def get_forge_observation_request(
+        self, forge_observation_request_id: str
+    ) -> ForgeObservationRequestRecord | None:
+        require_lowercase_uuid(forge_observation_request_id, field="forge_observation_request_id")
+        row = self.conn.execute(
+            "SELECT * FROM forge_observation_requests WHERE forge_observation_request_id = ?",
+            (forge_observation_request_id,),
+        ).fetchone()
+        return None if row is None else _row_to_forge_observation_request(row)
+
+    def get_forge_observation(self, forge_observation_id: str) -> ForgeObservationRecord | None:
+        require_lowercase_uuid(forge_observation_id, field="forge_observation_id")
+        row = self.conn.execute(
+            "SELECT * FROM forge_observations WHERE forge_observation_id = ?",
+            (forge_observation_id,),
+        ).fetchone()
+        return None if row is None else _row_to_forge_observation(row)
+
+    def list_forge_observations_for_target(
+        self, *, project_id: str, target_kind: str, target_id: str
+    ) -> list[ForgeObservationRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+            "AND target_id = ? ORDER BY observation_sequence ASC",
+            (project_id, target_kind, target_id),
+        ).fetchall()
+        return [_row_to_forge_observation(row) for row in rows]
+
     def get_project_registration_operation(
         self, *, authenticated_principal_id: str, idempotency_key: str
     ) -> ProjectRegistrationOperationResult | None:
@@ -4310,15 +6007,23 @@ class RunStore:
                 elif mode == "REGISTER":
                     project_id = str(uuid.uuid4())
                     schedule_id = str(uuid.uuid4())
-                    self.conn.execute(
-                        "INSERT INTO forge_observation_schedules("
-                        "forge_observation_schedule_id, schedule_kind, schedule_revision, state, "
-                        "target_kind, target_id, run_id, publication_id, last_request_id, "
-                        "last_observation_id, next_due_at_ms, created_at_ms) "
-                        "VALUES (?, 'WORK_ITEM_DISCOVERY', 0, 'ACTIVE', 'PROJECT', ?, "
-                        "NULL, NULL, NULL, NULL, ?, ?)",
-                        (schedule_id, project_id, now, now),
+                    schedule_digest = forge_observation_schedule_digest(
+                        _forge_observation_schedule_digest_fields(
+                            schedule_kind="WORK_ITEM_DISCOVERY",
+                            project_id=project_id,
+                            forge_instance_id=forge_instance_id,
+                            target_kind="PROJECT",
+                            target_id=project_id,
+                            run_id=None,
+                            publication_id=None,
+                            terminal_duplicate_cleanup_reservation_id=None,
+                            minimum_interval_ms=_DEFAULT_DISCOVERY_INTERVAL_MS,
+                        )
                     )
+                    # projects is inserted before forge_observation_schedules: the
+                    # Schedule's project_id is now a real foreign key, and SQLite
+                    # checks FKs per-statement (not deferred), so the Project row
+                    # must already exist when the Schedule row is inserted.
                     self.conn.execute(
                         "INSERT INTO projects("
                         "project_id, forge_instance_id, installation_or_account_ref, "
@@ -4346,6 +6051,27 @@ class RunStore:
                             resolved_publication_secret_version,
                             operation_id,
                             schedule_id,
+                        ),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO forge_observation_schedules("
+                        "forge_observation_schedule_id, schedule_kind, project_id, "
+                        "forge_instance_id, schedule_revision, state, target_kind, target_id, "
+                        "run_id, publication_id, terminal_duplicate_cleanup_reservation_id, "
+                        "minimum_interval_ms, last_request_id, last_discovery_search_revision, "
+                        "last_discovery_set_digest, schedule_digest, next_due_at_ms, "
+                        "created_at_ms) "
+                        "VALUES (?, 'WORK_ITEM_DISCOVERY', ?, ?, 0, 'ACTIVE', 'PROJECT', ?, "
+                        "NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?)",
+                        (
+                            schedule_id,
+                            project_id,
+                            forge_instance_id,
+                            project_id,
+                            _DEFAULT_DISCOVERY_INTERVAL_MS,
+                            schedule_digest,
+                            now,
+                            now,
                         ),
                     )
                     body = self._project_registration_public_body(

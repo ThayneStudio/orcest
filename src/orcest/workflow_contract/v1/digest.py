@@ -94,6 +94,10 @@ __all__ = [
     "affected_run_ids_digest",
     "failure_evidence_digest",
     "resolution_digest",
+    "forge_observation_schedule_digest",
+    "forge_observation_payload_digest",
+    "forge_observation_result_membership_digest",
+    "forge_request_failure_fact_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -397,6 +401,35 @@ def receipt_digest(fields: Mapping[str, Any]) -> str:
 def checkpoint_digest(fields: Mapping[str, Any]) -> str:
     """Digest of normalized Secret Provision Checkpoint fields (``checkpoint_digest``)."""
     return generic_domain_digest("orcest-secret-provision-checkpoint-v1", fields)
+
+
+def forge_observation_schedule_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Forge Observation Schedule's normalized authority, target, kind,
+    and cadence fields (``schedule_digest``, domain-model.md "Forge Observation
+    Schedule and Request")."""
+    return generic_domain_digest("orcest-forge-observation-schedule-v1", fields)
+
+
+def forge_observation_payload_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Forge Observation's normalized reducer-consumed fields
+    (``payload_digest``, domain-model.md "Forge Observation")."""
+    return generic_domain_digest("orcest-forge-observation-payload-v1", fields)
+
+
+def forge_observation_result_membership_digest(observation_ids: Sequence[str]) -> str:
+    """Digest of a completed Forge Observation Request's ordered result
+    membership (``result_observation_ids_digest``, domain-model.md "Forge
+    Observation Schedule and Request"). Canonical empty for a superseded
+    Request with no I/O result."""
+    return generic_domain_digest(
+        "orcest-forge-observation-result-membership-v1", list(observation_ids)
+    )
+
+
+def forge_request_failure_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Forge Request Failure Fact's complete normalized fields
+    (``fact_digest``, domain-model.md "Forge Request Failure Fact")."""
+    return generic_domain_digest("orcest-forge-request-failure-fact-v1", fields)
 
 
 def affected_run_ids_digest(member_rows: Sequence[Mapping[str, Any]]) -> str:
