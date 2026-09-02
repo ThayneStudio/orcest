@@ -1321,7 +1321,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1921,3 +1921,40 @@ def test_v8_database_migrates_capacity_budget_worker_loss_tables(tmp_path: Path)
             authorization_context_digest=AUTHZ_DIGEST,
         )
         assert result.health_observations[0].kind == "AVAILABLE"
+
+
+_CREDENTIAL_ROTATION_TABLES = (
+    "credential_rotation_requests",
+    "secret_version_runs",
+    "secret_version_fanouts",
+)
+
+
+def _write_v12_shaped_database(db_path: Path) -> None:
+    """Build a real v13 database, then strip it back to the v12 shape: every
+    Credential Rotation Request/fanout table dropped and ``user_version``
+    rolled back to 12."""
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in _CREDENTIAL_ROTATION_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 13")
+        conn.execute("PRAGMA user_version=12")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v12_database_migrates_credential_rotation_tables(tmp_path: Path) -> None:
+    _write_v12_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _CREDENTIAL_ROTATION_TABLES:
+            assert expected_table in tables

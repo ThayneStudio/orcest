@@ -68,6 +68,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CAPACITY_REPORT_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
+    CREDENTIAL_ROTATION_RESULT_PROTOCOL,
     ERROR_PROTOCOL,
     FORGE_OBSERVATION_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
@@ -79,7 +80,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     WORKER_LOSS_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -544,6 +545,32 @@ class SecretProvisionOperationResult:
     new_version: int | None = None
     credential_rotation_receipt_id: str | None = None
     secret_store_staging_receipt_id: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialRotationRequestResult:
+    credential_rotation_request_id: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    worker_id: str
+    worker_session_id: str
+    attempt_capability_digest: str
+    launch_attestation_id: str
+    secret_id: str
+    expected_prior_version: int
+    secret_request_attestation_id: str
+    request_digest: str
+    disposition: str
+    current_version: int
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    accepted_at_ms: int
+    provider_account_ref: str | None = None
+    credential_rotation_receipt_id: str | None = None
+    accepted_version: int | None = None
     replayed: bool = False
 
 
@@ -2380,6 +2407,35 @@ def _row_to_credential_rotation_receipt(row: sqlite3.Row) -> CredentialRotationR
     )
 
 
+def _row_to_credential_rotation_request(
+    row: sqlite3.Row, *, replayed: bool
+) -> CredentialRotationRequestResult:
+    return CredentialRotationRequestResult(
+        credential_rotation_request_id=row["credential_rotation_request_id"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        worker_id=row["worker_id"],
+        worker_session_id=row["worker_session_id"],
+        attempt_capability_digest=row["attempt_capability_digest"],
+        launch_attestation_id=row["launch_attestation_id"],
+        provider_account_ref=row["provider_account_ref"],
+        secret_id=row["secret_id"],
+        expected_prior_version=row["expected_prior_version"],
+        secret_request_attestation_id=row["secret_request_attestation_id"],
+        request_digest=row["request_digest"],
+        disposition=row["disposition"],
+        credential_rotation_receipt_id=row["credential_rotation_receipt_id"],
+        accepted_version=row["accepted_version"],
+        current_version=row["current_version"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        accepted_at_ms=row["accepted_at_ms"],
+        replayed=replayed,
+    )
+
+
 def _row_to_secret_provision_checkpoint(row: sqlite3.Row) -> SecretProvisionCheckpointRecord:
     return SecretProvisionCheckpointRecord(
         secret_provision_checkpoint_id=row["secret_provision_checkpoint_id"],
@@ -3966,6 +4022,65 @@ CREATE TABLE IF NOT EXISTS budget_report_runs (
   PRIMARY KEY (budget_report_id, member_ordinal),
   UNIQUE (budget_report_id, run_id)
 );
+
+CREATE TABLE IF NOT EXISTS credential_rotation_requests (
+  credential_rotation_request_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  attempt_capability_digest TEXT NOT NULL,
+  launch_attestation_id TEXT NOT NULL,
+  provider_account_ref TEXT,
+  secret_id TEXT NOT NULL,
+  expected_prior_version INTEGER NOT NULL CHECK (expected_prior_version > 0),
+  secret_request_attestation_id TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK (
+    disposition IN ({_sql_in(_enum_values("credential_rotation_request.disposition"))})
+  ),
+  credential_rotation_receipt_id TEXT,
+  accepted_version INTEGER CHECK (accepted_version IS NULL OR accepted_version > 0),
+  current_version INTEGER NOT NULL CHECK (current_version > 0),
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (credential_rotation_receipt_id),
+  CHECK (
+    (disposition = 'APPLIED'
+      AND credential_rotation_receipt_id IS NOT NULL
+      AND accepted_version IS NOT NULL
+      AND accepted_version = current_version)
+    OR
+    (disposition = 'CAS_LOST'
+      AND credential_rotation_receipt_id IS NULL
+      AND accepted_version IS NULL)
+  ),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS secret_version_runs (
+  secret_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  run_ordinal INTEGER NOT NULL CHECK (run_ordinal >= 0),
+  run_id TEXT NOT NULL,
+  PRIMARY KEY (secret_id, version, run_ordinal),
+  UNIQUE (secret_id, version, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS secret_version_fanouts (
+  secret_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  member_count INTEGER NOT NULL CHECK (member_count >= 0),
+  next_member_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_member_ordinal >= 0),
+  fanout_completed_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  PRIMARY KEY (secret_id, version)
+);
 """
 
 _V8_TO_V9 = f"""
@@ -4537,7 +4652,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -4785,8 +4900,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 11
+            elif current == 11:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -4794,6 +4908,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-idempotent-results-terminal-facts",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 12
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-credential-rotation",
                         _now_ms(),
                     ),
                 )
@@ -6868,6 +6994,7 @@ class RunStore:
                     now,
                 ),
             )
+            affected_digest = self._freeze_secret_version_membership(secret_id, target_version)
             self.conn.execute(
                 "INSERT INTO secret_versions("
                 "secret_id, version, creation_receipt_id, storage_path, "
@@ -6877,7 +7004,7 @@ class RunStore:
                     target_version,
                     receipt_id,
                     storage_path,
-                    affected_run_ids_digest([]),
+                    affected_digest,
                     now,
                 ),
             )
@@ -6969,6 +7096,7 @@ class RunStore:
             )
             if cur.rowcount != 1:
                 raise RunStoreError("secret provision operation was not PENDING at install commit")
+            self._run_secret_version_fanout(secret_id, target_version)
             row = self.conn.execute(
                 "SELECT * FROM secret_provision_operations WHERE secret_provision_operation_id = ?",
                 (secret_provision_operation_id,),
@@ -7073,6 +7201,522 @@ class RunStore:
             ).fetchone()
             assert row is not None
             return self._secret_provision_operation_from_row(row, replayed=False)
+
+    def _freeze_secret_version_membership(self, secret_id: str, version: int) -> str:
+        """Freeze the affected active-Run membership for one new Secret Version.
+
+        Must run inside the same writer transaction that installs the Secret
+        Version row, before that transaction's ``INSERT INTO secret_versions``
+        (which stores the returned digest). No Wait Condition/Human Boundary
+        leaf has landed yet (see ``RunStore._waiting_run_ids``), so there is
+        currently no queryable Run scoped to an exact Secret ID/minimum
+        version and the frozen membership is always empty today. The fanout
+        intent is still durably recorded so the restartable reconciler and
+        its cursor are exercised end to end, and so a later leaf that adds
+        real Secret-scoped Wait/Boundary membership only has to change what
+        is frozen here, not the commit/fanout protocol itself.
+        """
+        members: list[str] = []
+        for ordinal, run_id in enumerate(members):
+            self.conn.execute(
+                "INSERT INTO secret_version_runs(secret_id, version, run_ordinal, run_id) "
+                "VALUES (?, ?, ?, ?)",
+                (secret_id, version, ordinal, run_id),
+            )
+        now = _now_ms()
+        self.conn.execute(
+            "INSERT INTO secret_version_fanouts("
+            "secret_id, version, member_count, next_member_ordinal, "
+            "fanout_completed_at_ms, created_at_ms) VALUES (?, ?, ?, 0, ?, ?)",
+            (secret_id, version, len(members), now if not members else None, now),
+        )
+        return affected_run_ids_digest([{"run_id": run_id} for run_id in members])
+
+    def run_secret_version_fanout(self, secret_id: str, version: int) -> None:
+        """Advance one Secret Version's restartable per-Run wake fanout.
+
+        Safe to call repeatedly -- once right after install, and again from a
+        startup or crash-reconciliation sweep: each member Transition is
+        idempotent by trigger identity and the durable cursor only advances
+        transactionally after that Transition commits.
+        """
+        require_lowercase_uuid(secret_id, field="secret_id")
+        with self.transaction():
+            self._run_secret_version_fanout(secret_id, version)
+
+    def _run_secret_version_fanout(self, secret_id: str, version: int) -> None:
+        """Must run inside ``self.transaction()``."""
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        row = self.conn.execute(
+            "SELECT * FROM secret_version_fanouts WHERE secret_id = ? AND version = ?",
+            (secret_id, version),
+        ).fetchone()
+        if row is None:
+            raise RunStoreError(f"secret version fanout {secret_id!r}:{version} was not found")
+        if row["fanout_completed_at_ms"] is not None:
+            return
+        members = self.conn.execute(
+            "SELECT run_ordinal, run_id FROM secret_version_runs WHERE secret_id = ? "
+            "AND version = ? AND run_ordinal >= ? ORDER BY run_ordinal",
+            (secret_id, version, row["next_member_ordinal"]),
+        ).fetchall()
+        secret_version_key = f"{secret_id}:{version}"
+        for member in members:
+            view = load_view(self, member["run_id"])
+            if view is not None:
+                apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="SECRET_VERSION",
+                        trigger_id=secret_version_key,
+                        facts={"wakes_wait": True},
+                    ),
+                    run_id=member["run_id"],
+                )
+            self.conn.execute(
+                "UPDATE secret_version_fanouts SET next_member_ordinal = ? "
+                "WHERE secret_id = ? AND version = ?",
+                (member["run_ordinal"] + 1, secret_id, version),
+            )
+        cursor = self.conn.execute(
+            "SELECT next_member_ordinal AS n FROM secret_version_fanouts "
+            "WHERE secret_id = ? AND version = ?",
+            (secret_id, version),
+        ).fetchone()["n"]
+        if cursor >= row["member_count"]:
+            self.conn.execute(
+                "UPDATE secret_version_fanouts SET fanout_completed_at_ms = ? "
+                "WHERE secret_id = ? AND version = ?",
+                (_now_ms(), secret_id, version),
+            )
+
+    def get_credential_rotation_request(
+        self, credential_rotation_request_id: str
+    ) -> CredentialRotationRequestResult | None:
+        require_lowercase_uuid(
+            credential_rotation_request_id, field="credential_rotation_request_id"
+        )
+        row = self.conn.execute(
+            "SELECT * FROM credential_rotation_requests WHERE credential_rotation_request_id = ?",
+            (credential_rotation_request_id,),
+        ).fetchone()
+        return None if row is None else _row_to_credential_rotation_request(row, replayed=True)
+
+    def _credential_rotation_result_response(
+        self,
+        *,
+        credential_rotation_request_id: str,
+        disposition: str,
+        secret_id: str,
+        expected_prior_version: int,
+        current_version: int,
+        accepted_version: int | None = None,
+        credential_rotation_receipt_id: str | None = None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, object] = {
+            "protocol": CREDENTIAL_ROTATION_RESULT_PROTOCOL,
+            "credential_rotation_request_id": credential_rotation_request_id,
+            "disposition": disposition,
+            "secret_id": secret_id,
+            "expected_prior_version": expected_prior_version,
+            "current_version": current_version,
+        }
+        if disposition == "APPLIED":
+            body["accepted_version"] = accepted_version
+            body["credential_rotation_receipt_id"] = credential_rotation_receipt_id
+            http_status = 200
+        else:
+            http_status = 409
+        body_json = canonical_json_text(body)
+        digest = response_digest({"http_status": http_status, "body": body})
+        return http_status, body_json, digest
+
+    def require_current_rotation_authority(
+        self,
+        *,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        launch_attestation_id: str,
+        provider_account_ref: str | None,
+        secret_id: str,
+    ) -> None:
+        """Fail closed unless this is the exact current claimed model-backed Attempt fence.
+
+        Required, strictly before ``execution_deadline_ms``, for first
+        acceptance of a Credential Rotation Request -- with its accepted
+        Launch Attestation and matching provider account (worker-protocol.md,
+        "Credential rotation handoff"). Deterministic ``VERIFY`` Attempts
+        (``provider_secret_ref is None``) can never rotate a credential, and
+        an Attempt can only rotate the exact secret bound to it -- never an
+        arbitrary ``secret_id`` -- mirroring the ``provider_secret_ref``
+        drift check :meth:`accept_launch_attestation` performs against the
+        frozen claim.
+        """
+        self._require_current_rotation_authority(
+            attempt_id=attempt_id,
+            activity_id=activity_id,
+            attempt_generation=attempt_generation,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+            attempt_capability_digest=attempt_capability_digest,
+            launch_attestation_id=launch_attestation_id,
+            provider_account_ref=provider_account_ref,
+            secret_id=secret_id,
+        )
+
+    def _require_current_rotation_authority(
+        self,
+        *,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        launch_attestation_id: str,
+        provider_account_ref: str | None,
+        secret_id: str,
+    ) -> None:
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(secret_id, field="secret_id")
+        attempt = self.get_attempt(attempt_id)
+        if attempt is None:
+            raise RunStoreError(f"attempt {attempt_id!r} was not found")
+        if (
+            attempt.activity_id != activity_id
+            or attempt.generation != attempt_generation
+            or attempt.state != "CLAIMED"
+            or attempt.claimed_worker_id != worker_id
+            or attempt.claimed_worker_session_id != worker_session_id
+            or attempt.attempt_capability_digest != attempt_capability_digest
+            or attempt.launch_attestation_id != launch_attestation_id
+            or attempt.provider_account_ref != provider_account_ref
+        ):
+            raise CasMismatchError("credential rotation does not match the current claimed attempt")
+        if attempt.provider_secret_ref is None:
+            raise CasMismatchError("deterministic attempt cannot rotate a provider credential")
+        if attempt.provider_secret_ref != secret_id:
+            raise CasMismatchError(
+                "credential rotation secret_id does not match the attempt's bound secret"
+            )
+        if attempt.execution_deadline_ms is None or _now_ms() >= attempt.execution_deadline_ms:
+            raise CasMismatchError("credential rotation arrived at or after the execution deadline")
+
+    def require_rotation_replay_before_deadline(self, attempt_id: str) -> None:
+        """Fail closed unless this Attempt's execution deadline has not yet passed.
+
+        An exact already-ledgered Credential Rotation Request may replay
+        after Attempt terminalization, but only while
+        ``controller_now_ms < execution_deadline_ms``; at or after that
+        deadline the rotation endpoint denies both first acceptance and
+        replay (domain-model.md I3, worker-protocol.md "Credential rotation
+        handoff").
+        """
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        attempt = self.get_attempt(attempt_id)
+        if (
+            attempt is None
+            or attempt.execution_deadline_ms is None
+            or _now_ms() >= attempt.execution_deadline_ms
+        ):
+            raise CasMismatchError(
+                "credential rotation replay arrived at or after the execution deadline"
+            )
+
+    def install_applied_credential_rotation(
+        self,
+        *,
+        credential_rotation_request_id: str,
+        protocol_version: str,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        launch_attestation_id: str,
+        provider_account_ref: str | None,
+        secret_id: str,
+        expected_prior_version: int,
+        secret_request_attestation_id: str,
+        request_digest_value: str,
+        storage_path: str,
+        secret_integrity_attestation_id: str,
+    ) -> CredentialRotationRequestResult:
+        """Atomically commit one ``APPLIED`` Credential Rotation Request.
+
+        Must run only after the Secret Store has durably promoted the staged
+        bytes into the immutable target version (write-before-reference),
+        while its storage mutation lock is still held: inserts the Request,
+        its reciprocal ``ATTEMPT_ROTATION`` Credential Rotation Receipt and
+        Secret Version, compare-and-swaps the current reference, freezes
+        affected-Run membership, and creates the durable fanout intent -- all
+        in one transaction (persistence-and-recovery.md, "Secret Store and
+        rotation").
+        """
+        require_lowercase_uuid(
+            credential_rotation_request_id, field="credential_rotation_request_id"
+        )
+        require_lowercase_uuid(secret_id, field="secret_id")
+        require_lowercase_uuid(secret_request_attestation_id, field="secret_request_attestation_id")
+        require_lowercase_uuid(
+            secret_integrity_attestation_id, field="secret_integrity_attestation_id"
+        )
+        _require_positive_int(expected_prior_version, field="expected_prior_version")
+        target_version = expected_prior_version + 1
+        with self.transaction():
+            current = self.get_secret_current_version(secret_id)
+            if current is None or current.current_version == 0:
+                raise RunStoreError(f"secret {secret_id!r} has no current version to rotate")
+            purpose = current.purpose
+            owner_scope_kind = current.owner_scope_kind
+            owner_scope_id = current.owner_scope_id
+            now = _now_ms()
+            receipt_id = str(uuid.uuid4())
+            rc_digest = receipt_digest(
+                {
+                    "source_kind": "ATTEMPT_ROTATION",
+                    "source_id": credential_rotation_request_id,
+                    "secret_id": secret_id,
+                    "expected_prior_version": expected_prior_version,
+                    "new_version": target_version,
+                    "purpose": purpose,
+                    "owner_scope_kind": owner_scope_kind,
+                    "owner_scope_id": owner_scope_id,
+                    "provider_account_ref": provider_account_ref,
+                    "attempt_id": attempt_id,
+                    "activity_id": activity_id,
+                    "attempt_generation": attempt_generation,
+                    "worker_id": worker_id,
+                    "worker_session_id": worker_session_id,
+                    "attempt_capability_digest": attempt_capability_digest,
+                    "launch_attestation_id": launch_attestation_id,
+                    "secret_integrity_attestation_id": secret_integrity_attestation_id,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO credential_rotation_receipts("
+                "credential_rotation_receipt_id, source_kind, source_id, "
+                "credential_rotation_request_id, secret_id, expected_prior_version, "
+                "new_version, purpose, owner_scope_kind, owner_scope_id, "
+                "provider_account_ref, attempt_id, activity_id, attempt_generation, "
+                "worker_id, worker_session_id, attempt_capability_digest, "
+                "launch_attestation_id, management_operation_id, "
+                "authenticated_principal_id, authorization_context_digest, "
+                "secret_integrity_attestation_id, receipt_digest, created_at_ms) "
+                "VALUES (?, 'ATTEMPT_ROTATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "NULL, NULL, NULL, ?, ?, ?)",
+                (
+                    receipt_id,
+                    credential_rotation_request_id,
+                    credential_rotation_request_id,
+                    secret_id,
+                    expected_prior_version,
+                    target_version,
+                    purpose,
+                    owner_scope_kind,
+                    owner_scope_id,
+                    provider_account_ref,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    worker_id,
+                    worker_session_id,
+                    attempt_capability_digest,
+                    launch_attestation_id,
+                    secret_integrity_attestation_id,
+                    rc_digest,
+                    now,
+                ),
+            )
+            affected_digest = self._freeze_secret_version_membership(secret_id, target_version)
+            self.conn.execute(
+                "INSERT INTO secret_versions("
+                "secret_id, version, creation_receipt_id, storage_path, "
+                "affected_run_ids_digest, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+                (secret_id, target_version, receipt_id, storage_path, affected_digest, now),
+            )
+            self._require_current_rotation_authority(
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                worker_id=worker_id,
+                worker_session_id=worker_session_id,
+                attempt_capability_digest=attempt_capability_digest,
+                launch_attestation_id=launch_attestation_id,
+                provider_account_ref=provider_account_ref,
+                secret_id=secret_id,
+            )
+            cur = self.conn.execute(
+                "UPDATE secret_current_versions SET current_version = ?, "
+                "last_operation_id = ?, updated_at_ms = ? "
+                "WHERE secret_id = ? AND current_version = ?",
+                (
+                    target_version,
+                    credential_rotation_request_id,
+                    now,
+                    secret_id,
+                    expected_prior_version,
+                ),
+            )
+            if cur.rowcount != 1:
+                # The Secret Store storage-mutation lock, held continuously
+                # from the caller's precheck through this install, makes this
+                # unreachable in normal operation; treat it as a real storage
+                # inconsistency rather than a client-facing CAS_LOST.
+                raise CasMismatchError(
+                    "secret current-version CAS was lost between precheck and install"
+                )
+            http_status, body_json, resp_digest = self._credential_rotation_result_response(
+                credential_rotation_request_id=credential_rotation_request_id,
+                disposition="APPLIED",
+                secret_id=secret_id,
+                expected_prior_version=expected_prior_version,
+                current_version=target_version,
+                accepted_version=target_version,
+                credential_rotation_receipt_id=receipt_id,
+            )
+            self.conn.execute(
+                "INSERT INTO credential_rotation_requests("
+                "credential_rotation_request_id, protocol_version, attempt_id, activity_id, "
+                "attempt_generation, worker_id, worker_session_id, attempt_capability_digest, "
+                "launch_attestation_id, provider_account_ref, secret_id, "
+                "expected_prior_version, secret_request_attestation_id, request_digest, "
+                "disposition, credential_rotation_receipt_id, accepted_version, "
+                "current_version, response_http_status, response_json, response_digest, "
+                "accepted_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPLIED', "
+                "?, ?, ?, ?, ?, ?, ?)",
+                (
+                    credential_rotation_request_id,
+                    protocol_version,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    worker_id,
+                    worker_session_id,
+                    attempt_capability_digest,
+                    launch_attestation_id,
+                    provider_account_ref,
+                    secret_id,
+                    expected_prior_version,
+                    secret_request_attestation_id,
+                    request_digest_value,
+                    receipt_id,
+                    target_version,
+                    target_version,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            self._run_secret_version_fanout(secret_id, target_version)
+            row = self.conn.execute(
+                "SELECT * FROM credential_rotation_requests "
+                "WHERE credential_rotation_request_id = ?",
+                (credential_rotation_request_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_credential_rotation_request(row, replayed=False)
+
+    def record_cas_lost_credential_rotation(
+        self,
+        *,
+        credential_rotation_request_id: str,
+        protocol_version: str,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        launch_attestation_id: str,
+        provider_account_ref: str | None,
+        secret_id: str,
+        expected_prior_version: int,
+        secret_request_attestation_id: str,
+        request_digest_value: str,
+    ) -> CredentialRotationRequestResult:
+        """Atomically ledger one ``CAS_LOST`` Credential Rotation Request.
+
+        Creates no Receipt, Version, reference mutation, fanout, Result, or
+        Transition; stores only the request/response ledger and the current
+        observed non-secret version.
+        """
+        require_lowercase_uuid(
+            credential_rotation_request_id, field="credential_rotation_request_id"
+        )
+        require_lowercase_uuid(secret_id, field="secret_id")
+        require_lowercase_uuid(secret_request_attestation_id, field="secret_request_attestation_id")
+        _require_positive_int(expected_prior_version, field="expected_prior_version")
+        with self.transaction():
+            self._require_current_rotation_authority(
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                worker_id=worker_id,
+                worker_session_id=worker_session_id,
+                attempt_capability_digest=attempt_capability_digest,
+                launch_attestation_id=launch_attestation_id,
+                provider_account_ref=provider_account_ref,
+                secret_id=secret_id,
+            )
+            current = self.get_secret_current_version(secret_id)
+            current_version = 0 if current is None else current.current_version
+            now = _now_ms()
+            http_status, body_json, resp_digest = self._credential_rotation_result_response(
+                credential_rotation_request_id=credential_rotation_request_id,
+                disposition="CAS_LOST",
+                secret_id=secret_id,
+                expected_prior_version=expected_prior_version,
+                current_version=current_version,
+            )
+            self.conn.execute(
+                "INSERT INTO credential_rotation_requests("
+                "credential_rotation_request_id, protocol_version, attempt_id, activity_id, "
+                "attempt_generation, worker_id, worker_session_id, attempt_capability_digest, "
+                "launch_attestation_id, provider_account_ref, secret_id, "
+                "expected_prior_version, secret_request_attestation_id, request_digest, "
+                "disposition, credential_rotation_receipt_id, accepted_version, "
+                "current_version, response_http_status, response_json, response_digest, "
+                "accepted_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CAS_LOST', "
+                "NULL, NULL, ?, ?, ?, ?, ?)",
+                (
+                    credential_rotation_request_id,
+                    protocol_version,
+                    attempt_id,
+                    activity_id,
+                    attempt_generation,
+                    worker_id,
+                    worker_session_id,
+                    attempt_capability_digest,
+                    launch_attestation_id,
+                    provider_account_ref,
+                    secret_id,
+                    expected_prior_version,
+                    secret_request_attestation_id,
+                    request_digest_value,
+                    current_version,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM credential_rotation_requests "
+                "WHERE credential_rotation_request_id = ?",
+                (credential_rotation_request_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_credential_rotation_request(row, replayed=False)
 
     def record_secret_provision_retry_checkpoint(
         self,
