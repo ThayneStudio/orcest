@@ -206,6 +206,12 @@ def test_create_wait_condition_is_idempotent_by_created_from_identity(store: Run
         with pytest.raises(IdempotencyConflictError):
             store.create_wait_condition(**conflicting)
 
+    conflicting_sequence = dict(kwargs)
+    conflicting_sequence["created_transition_sequence"] = kwargs["created_transition_sequence"] + 1
+    with store.transaction():
+        with pytest.raises(IdempotencyConflictError):
+            store.create_wait_condition(**conflicting_sequence)
+
 
 def test_create_wait_condition_freezes_health_membership_digest_regardless_of_input_order(
     store: RunStore,

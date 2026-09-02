@@ -13822,6 +13822,7 @@ class RunStore:
                 and record.wake_identity == wake_identity_payload
                 and record.health_observation_ids == health_ids
                 and same_panel
+                and record.created_transition_sequence == created_transition_sequence
             ):
                 return record
             raise IdempotencyConflictError(
@@ -14491,44 +14492,45 @@ class RunStore:
         resolved_source_id = source_id if source_id is not None else str(uuid.uuid4())
         from orcest.workflow_reducer.ledger import load_view
 
-        woken: list[str] = []
-        run_ids = sorted(
-            row["run_id"]
-            for row in self.conn.execute(
-                "SELECT run_id FROM runs WHERE state = 'WAITING'"
-            ).fetchall()
-        )
-        for run_id in run_ids:
-            view = load_view(self, run_id)
-            if view is None or view.state != "WAITING" or view.wait_condition_id is None:
-                continue
-            wait = self.get_wait_condition(view.wait_condition_id)
-            if wait is None or wait.not_before_ms is None or now < wait.not_before_ms:
-                continue
-            timer_fact = self._record_timer_fact(
-                scope_kind="WAIT_CONDITION_NOT_BEFORE",
-                scope_id=wait.wait_condition_id,
-                fired_for_ms=wait.not_before_ms,
-                source_kind=source_kind,
-                source_id=resolved_source_id,
-                run_id=run_id,
-                now_ms=now,
+        with self.transaction():
+            woken: list[str] = []
+            run_ids = sorted(
+                row["run_id"]
+                for row in self.conn.execute(
+                    "SELECT run_id FROM runs WHERE state = 'WAITING'"
+                ).fetchall()
             )
-            already_fired = self.conn.execute(
-                "SELECT 1 FROM transitions WHERE run_id = ? AND trigger_kind = 'TIMER_FACT' "
-                "AND trigger_id = ?",
-                (run_id, timer_fact.timer_fact_id),
-            ).fetchone()
-            if already_fired is not None:
-                continue
-            if self._wake_wait_condition(
-                run_id=run_id,
-                view=view,
-                trigger_kind="TIMER_FACT",
-                trigger_id=timer_fact.timer_fact_id,
-            ):
-                woken.append(wait.wait_condition_id)
-        return woken
+            for run_id in run_ids:
+                view = load_view(self, run_id)
+                if view is None or view.state != "WAITING" or view.wait_condition_id is None:
+                    continue
+                wait = self.get_wait_condition(view.wait_condition_id)
+                if wait is None or wait.not_before_ms is None or now < wait.not_before_ms:
+                    continue
+                timer_fact = self._record_timer_fact(
+                    scope_kind="WAIT_CONDITION_NOT_BEFORE",
+                    scope_id=wait.wait_condition_id,
+                    fired_for_ms=wait.not_before_ms,
+                    source_kind=source_kind,
+                    source_id=resolved_source_id,
+                    run_id=run_id,
+                    now_ms=now,
+                )
+                already_fired = self.conn.execute(
+                    "SELECT 1 FROM transitions WHERE run_id = ? AND trigger_kind = 'TIMER_FACT' "
+                    "AND trigger_id = ?",
+                    (run_id, timer_fact.timer_fact_id),
+                ).fetchone()
+                if already_fired is not None:
+                    continue
+                if self._wake_wait_condition(
+                    run_id=run_id,
+                    view=view,
+                    trigger_kind="TIMER_FACT",
+                    trigger_id=timer_fact.timer_fact_id,
+                ):
+                    woken.append(wait.wait_condition_id)
+            return woken
 
     def wake_secret_recovery_wait(self, run_id: str, *, secret_version_id: str) -> bool:
         """Wake one ``WAITING``/``SECRET_RECOVERY`` Run whose Wait names the
@@ -14538,20 +14540,24 @@ class RunStore:
         Waits")."""
         from orcest.workflow_reducer.ledger import load_view
 
-        view = load_view(self, run_id)
-        if view is None or view.state != "WAITING" or view.wait_reason != "SECRET_RECOVERY":
-            return False
-        if view.wait_condition_id is None:
-            return False
-        wait = self.get_wait_condition(view.wait_condition_id)
-        if wait is None or wait.wake_identity is None:
-            return False
-        check = self._secret_recovery_wait_satisfied(wait.wake_identity)
-        if not check.already_satisfied:
-            return False
-        return self._wake_wait_condition(
-            run_id=run_id, view=view, trigger_kind="SECRET_VERSION", trigger_id=secret_version_id
-        )
+        with self.transaction():
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_reason != "SECRET_RECOVERY":
+                return False
+            if view.wait_condition_id is None:
+                return False
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.wake_identity is None:
+                return False
+            check = self._secret_recovery_wait_satisfied(wait.wake_identity)
+            if not check.already_satisfied:
+                return False
+            return self._wake_wait_condition(
+                run_id=run_id,
+                view=view,
+                trigger_kind="SECRET_VERSION",
+                trigger_id=secret_version_id,
+            )
 
     def wake_external_dependency_wait(self, run_id: str, *, forge_observation_id: str) -> bool:
         """Wake one ``WAITING``/``EXTERNAL_DEPENDENCY`` Run whose Wait names
@@ -14559,23 +14565,24 @@ class RunStore:
         the accepted Forge Observation meets."""
         from orcest.workflow_reducer.ledger import load_view
 
-        view = load_view(self, run_id)
-        if view is None or view.state != "WAITING" or view.wait_reason != "EXTERNAL_DEPENDENCY":
-            return False
-        if view.wait_condition_id is None:
-            return False
-        wait = self.get_wait_condition(view.wait_condition_id)
-        if wait is None or wait.wake_identity is None:
-            return False
-        check = self._external_dependency_wait_satisfied(wait.wake_identity)
-        if not check.already_satisfied:
-            return False
-        return self._wake_wait_condition(
-            run_id=run_id,
-            view=view,
-            trigger_kind="FORGE_OBSERVATION",
-            trigger_id=forge_observation_id,
-        )
+        with self.transaction():
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_reason != "EXTERNAL_DEPENDENCY":
+                return False
+            if view.wait_condition_id is None:
+                return False
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.wake_identity is None:
+                return False
+            check = self._external_dependency_wait_satisfied(wait.wake_identity)
+            if not check.already_satisfied:
+                return False
+            return self._wake_wait_condition(
+                run_id=run_id,
+                view=view,
+                trigger_kind="FORGE_OBSERVATION",
+                trigger_id=forge_observation_id,
+            )
 
     # -- Capacity Report -----------------------------------------------
 
