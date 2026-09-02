@@ -114,10 +114,20 @@ def stores(tmp_path: Path) -> tuple[RunStore, CandidateObjectStore]:
         store.close()
 
 
-def _claimed_build_attempt(store: RunStore, *, deadline: int = FUTURE_MS + 300_000) -> None:
+def _claimed_build_attempt(
+    store: RunStore,
+    *,
+    deadline: int = FUTURE_MS + 300_000,
+    run_id: str = RUN_ID,
+    activity_id: str = ACTIVITY_ID,
+    attempt_id: str = ATTEMPT_ID,
+    outbox_id: str = OUTBOX_ID,
+    worker_session_id: str = WORKER_SESSION_ID,
+    idempotency_key: str = "sha256:" + "3" * 64,
+) -> None:
     store.create_activity(
-        activity_id=ACTIVITY_ID,
-        run_id=RUN_ID,
+        activity_id=activity_id,
+        run_id=run_id,
         activity_ordinal=1,
         specification_generation=1,
         policy_hash=POLICY_HASH,
@@ -127,16 +137,16 @@ def _claimed_build_attempt(store: RunStore, *, deadline: int = FUTURE_MS + 300_0
         created_transition_sequence=1,
         semantic_input={},
         semantic_input_digest=SEMANTIC_DIGEST,
-        idempotency_key="sha256:" + "3" * 64,
+        idempotency_key=idempotency_key,
         attempt=AttemptOfferInput(
-            attempt_id=ATTEMPT_ID,
+            attempt_id=attempt_id,
             generation=1,
             protocol_version=activity_offer_protocol(),
             worker_profile="codex",
             offered_at_ms=FUTURE_MS,
             claim_timeout_ms=300_000,
         ),
-        outbox_id=OUTBOX_ID,
+        outbox_id=outbox_id,
     )
     with store.transaction():
         store.conn.execute(
@@ -145,16 +155,16 @@ def _claimed_build_attempt(store: RunStore, *, deadline: int = FUTURE_MS + 300_0
             "capability_auth_expires_at_ms = ?, attempt_capability_digest = ? "
             "WHERE attempt_id = ?",
             (
-                WORKER_SESSION_ID,
+                worker_session_id,
                 FUTURE_MS,
                 deadline,
                 deadline + 86_400_000,
                 ATTEMPT_CAPABILITY_DIGEST,
-                ATTEMPT_ID,
+                attempt_id,
             ),
         )
         store.conn.execute(
-            "UPDATE activities SET state = 'ACTIVE' WHERE activity_id = ?", (ACTIVITY_ID,)
+            "UPDATE activities SET state = 'ACTIVE' WHERE activity_id = ?", (activity_id,)
         )
 
 
@@ -311,6 +321,54 @@ def test_key_reuse_with_different_body_conflicts(
 
     with pytest.raises(IdempotencyConflictError):
         _submit(store, candidate_store, result_request_id=result_request_id, summary="changed")
+
+
+def test_unrelated_attempts_with_identical_receipt_both_accepted(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+
+    other_run_id = "88888888-8888-4888-8888-888888888888"
+    other_activity_id = "99999999-9999-4999-8999-999999999999"
+    other_attempt_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    other_outbox_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    other_worker_session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    with store.transaction():
+        store.create_run(
+            run_id=other_run_id,
+            project_id="project-a",
+            work_item_key="work-2",
+            state="BUILDING",
+            specification_generation=1,
+        )
+    _claimed_build_attempt(
+        store,
+        run_id=other_run_id,
+        activity_id=other_activity_id,
+        attempt_id=other_attempt_id,
+        outbox_id=other_outbox_id,
+        worker_session_id=other_worker_session_id,
+        idempotency_key="sha256:" + "4" * 64,
+    )
+
+    identical_receipt = {"exit_code": 0}
+    first = _submit(store, candidate_store, receipt=identical_receipt)
+    second = _submit(
+        store,
+        candidate_store,
+        attempt_id=other_attempt_id,
+        activity_id=other_activity_id,
+        worker_session_id=other_worker_session_id,
+        receipt=identical_receipt,
+    )
+
+    assert first.request.disposition == "ACCEPTED"
+    assert second.request.disposition == "ACCEPTED"
+    assert first.attempt_result is not None
+    assert second.attempt_result is not None
+    assert first.attempt_result.receipt_digest != second.attempt_result.receipt_digest
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 2
 
 
 def test_different_result_after_acceptance_is_audited(

@@ -405,7 +405,13 @@ def receipt_digest(fields: Mapping[str, Any]) -> str:
 
 
 def attempt_result_receipt_digest(fields: Mapping[str, Any]) -> str:
-    """Digest of a complete canonical Attempt Result receipt (``receipt_digest``)."""
+    """Digest of a complete canonical Attempt Result receipt (``receipt_digest``).
+
+    ``fields`` must include the owning ``result_request_id``/``attempt_id``/
+    ``activity_id``/``generation`` alongside the raw receipt payload so that
+    byte-identical receipts from unrelated Attempts cannot collide on the
+    ``attempt_results.receipt_digest`` UNIQUE column.
+    """
     return generic_domain_digest("orcest-attempt-result-receipt-v1", fields)
 
 

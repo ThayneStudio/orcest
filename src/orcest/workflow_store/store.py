@@ -11182,7 +11182,19 @@ class RunStore:
         req_digest = request_digest(body)
         res_digest = result_digest(self._attempt_result_semantic_body(body))
         receipt_json = None if receipt is None else canonical_json_text(receipt)
-        receipt_digest_value = None if receipt is None else attempt_result_receipt_digest(receipt)
+        receipt_digest_value = (
+            None
+            if receipt is None
+            else attempt_result_receipt_digest(
+                {
+                    "result_request_id": result_request_id,
+                    "attempt_id": attempt_id,
+                    "activity_id": activity_id,
+                    "generation": generation,
+                    "receipt": receipt,
+                }
+            )
+        )
         now = _now_ms() if now_ms is None else now_ms
 
         with self.transaction():
