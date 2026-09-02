@@ -13743,6 +13743,19 @@ class RunStore:
         ).fetchone()
         return int(required[0]) > 0 and int(required[0]) == int(filled[0])
 
+    def _review_panel_slots(
+        self, *, run_id: str, candidate_id: str, panel_round: int
+    ) -> tuple[str, ...]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT r.reviewer_slot FROM activities a "
+            "JOIN activity_review_assignments r ON r.activity_id = a.activity_id "
+            "WHERE a.run_id = ? AND a.candidate_id = ? "
+            "AND r.assignment_kind = 'REVIEW' AND r.panel_round = ? "
+            "ORDER BY r.reviewer_slot",
+            (run_id, candidate_id, panel_round),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
     def submit_attempt_result(
         self,
         *,
@@ -14210,6 +14223,8 @@ class RunStore:
                 adjudication_receipt = None
                 adjudication_fills_slot = False
                 adjudication_summary = None
+                adjudication_next_panel_round = None
+                adjudication_review_slots: tuple[str, ...] = ()
                 if row["activity_kind"] == "REVIEW":
                     review_receipt, review_fills_slot, review_finding_ids_digest = (
                         self._derive_review_receipt(
@@ -14402,6 +14417,13 @@ class RunStore:
                             now,
                         ),
                     )
+                    if adjudication_summary == "OVERRULE":
+                        adjudication_next_panel_round = assignment.panel_round + 1
+                        adjudication_review_slots = self._review_panel_slots(
+                            run_id=str(row["run_id"]),
+                            candidate_id=candidate_record.candidate_id,
+                            panel_round=assignment.panel_round,
+                        )
                 self.conn.execute(
                     "UPDATE attempts SET state = ?, terminal_reason = ? "
                     "WHERE attempt_id = ? AND state = 'CLAIMED'",
@@ -14453,6 +14475,8 @@ class RunStore:
                                 if review_receipt is not None
                                 else None,
                                 "disposition": adjudication_summary,
+                                "next_panel_round": adjudication_next_panel_round,
+                                "review_slots": list(adjudication_review_slots),
                                 "structured_output_protocol": (
                                     structured_output.get("protocol_version")
                                     if isinstance(structured_output, Mapping)
