@@ -90,6 +90,7 @@ __all__ = [
     "transition_digest",
     "activity_idempotency_digest",
     "receipt_digest",
+    "attempt_result_receipt_digest",
     "checkpoint_digest",
     "affected_run_ids_digest",
     "failure_evidence_digest",
@@ -401,6 +402,11 @@ def transition_digest(fields: Mapping[str, Any]) -> str:
 def receipt_digest(fields: Mapping[str, Any]) -> str:
     """Digest of complete canonical Credential Rotation Receipt provenance (``receipt_digest``)."""
     return generic_domain_digest("orcest-credential-rotation-receipt-v1", fields)
+
+
+def attempt_result_receipt_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a complete canonical Attempt Result receipt (``receipt_digest``)."""
+    return generic_domain_digest("orcest-attempt-result-receipt-v1", fields)
 
 
 def checkpoint_digest(fields: Mapping[str, Any]) -> str:

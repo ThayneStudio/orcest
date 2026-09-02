@@ -27,6 +27,7 @@ from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
+    attempt_result_receipt_digest,
     attempt_terminal_fact_digest,
     bare_canonical_digest,
     budget_report_digest,
@@ -11181,7 +11182,7 @@ class RunStore:
         req_digest = request_digest(body)
         res_digest = result_digest(self._attempt_result_semantic_body(body))
         receipt_json = None if receipt is None else canonical_json_text(receipt)
-        receipt_digest_value = None if receipt is None else receipt_digest(receipt)
+        receipt_digest_value = None if receipt is None else attempt_result_receipt_digest(receipt)
         now = _now_ms() if now_ms is None else now_ms
 
         with self.transaction():
