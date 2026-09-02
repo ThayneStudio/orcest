@@ -84,6 +84,11 @@ from orcest.workflow_contract.v1.protocol_registry import (
     WORKER_LOSS_RESULT_PROTOCOL,
 )
 from orcest.workflow_contract.v1.structured_outputs import validate_attempt_structured_output
+from orcest.workflow_contract.v1.verification import (
+    VerificationReceiptRejectedError,
+    validate_verification_receipt,
+    verification_profile_from_effective_policy,
+)
 
 SCHEMA_VERSION = 15
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
@@ -12170,6 +12175,70 @@ class RunStore:
             request=request, attempt_result=result, candidate=candidate
         )
 
+    def _require_valid_verification_receipt(
+        self,
+        *,
+        row: sqlite3.Row,
+        outcome: str,
+        receipt: Any | None,
+        failure_class: str | None,
+        launch_attestation_id: str | None,
+    ) -> None:
+        """Admit a ``VERIFY`` Attempt Result's receipt only after independently
+        recomputing its outcome against the controller's own trusted Candidate
+        and pinned Verification Profile bindings (review-and-consensus.md's
+        "Verification Receipt" section). Never trusts the worker's claims for
+        the Candidate identity, profile, or outcome.
+        """
+        if launch_attestation_id is not None:
+            raise VerificationReceiptRejectedError(
+                "VERIFY Attempt Results require a null launch_attestation_id"
+            )
+        if receipt is None:
+            raise VerificationReceiptRejectedError(
+                "VERIFY Attempt Results require a verification receipt"
+            )
+        candidate_id = row["activity_candidate_id"]
+        if candidate_id is None:
+            raise RunStoreError("VERIFY Activity is missing its bound Candidate")
+        candidate = self.get_candidate(candidate_id)
+        if candidate is None:
+            raise RunStoreError("VERIFY Activity's bound Candidate is missing")
+        snapshot_row = self.conn.execute(
+            "SELECT * FROM work_item_snapshots WHERE run_id = ? AND policy_hash = ? LIMIT 1",
+            (row["run_id"], row["activity_policy_hash"]),
+        ).fetchone()
+        if snapshot_row is None:
+            raise RunStoreError("no Snapshot matches the VERIFY Activity's pinned policy_hash")
+        snapshot = _row_to_work_item_snapshot(snapshot_row)
+        policy_blob = self.get_workflow_blob(snapshot.effective_policy_blob_digest)
+        if policy_blob is None:
+            raise RunStoreError("the Snapshot's effective policy blob is missing")
+        effective_policy = json.loads(policy_blob.normalized_bytes.decode("utf-8"))
+        profile_id, commands, profile_hash = verification_profile_from_effective_policy(
+            effective_policy
+        )
+        recomputed_outcome = validate_verification_receipt(
+            receipt,
+            expected_candidate_id=candidate.candidate_id,
+            expected_commit={"object_format": candidate.object_format, "oid": candidate.oid},
+            expected_profile_id=profile_id,
+            expected_profile_hash=profile_hash,
+            expected_commands=commands,
+        )
+        expected_result_outcome = (
+            "SUCCEEDED" if recomputed_outcome in ("PASS", "FAIL") else "FAILED_RETRYABLE"
+        )
+        if outcome != expected_result_outcome:
+            raise VerificationReceiptRejectedError(
+                f"a {recomputed_outcome} verification receipt requires Attempt Result outcome "
+                f"{expected_result_outcome}, got {outcome!r}"
+            )
+        if recomputed_outcome == "ERROR" and failure_class != "VERIFICATION_ERROR":
+            raise VerificationReceiptRejectedError(
+                "an ERROR verification receipt requires failure_class VERIFICATION_ERROR"
+            )
+
     def submit_attempt_result(
         self,
         *,
@@ -12288,7 +12357,10 @@ class RunStore:
 
             row = self.conn.execute(
                 "SELECT attempts.*, activities.run_id AS run_id, activities.kind AS activity_kind, "
-                "activities.state AS activity_state, activities.execution_class AS execution_class "
+                "activities.state AS activity_state, "
+                "activities.execution_class AS execution_class, "
+                "activities.candidate_id AS activity_candidate_id, "
+                "activities.policy_hash AS activity_policy_hash "
                 "FROM attempts JOIN activities ON activities.activity_id = attempts.activity_id "
                 "WHERE attempts.attempt_id = ? AND attempts.activity_id = ? "
                 "ORDER BY attempts.generation DESC LIMIT 1",
@@ -12619,6 +12691,14 @@ class RunStore:
                     structured_output=structured_output,
                     summary=summary,
                 )
+                if row["activity_kind"] == "VERIFY":
+                    self._require_valid_verification_receipt(
+                        row=row,
+                        outcome=outcome,
+                        receipt=receipt,
+                        launch_attestation_id=launch_attestation_id,
+                        failure_class=failure_class,
+                    )
 
                 attempt_result_id = str(uuid.uuid4())
                 receipt_id = str(uuid.uuid4()) if receipt_json is not None else None

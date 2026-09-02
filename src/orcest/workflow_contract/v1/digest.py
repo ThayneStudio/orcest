@@ -75,6 +75,8 @@ __all__ = [
     "subject_refs_digest",
     "review_assignment_digest",
     "policy_digest",
+    "verification_profile_digest",
+    "verification_command_invocation_digest",
     "result_digest",
     "request_digest",
     "response_digest",
@@ -349,6 +351,16 @@ def review_assignment_digest(
 def policy_digest(effective_policy_json: Any) -> str:
     """Digest of a complete canonical effective ``POLICY_JSON`` document (``policy_hash``)."""
     return generic_domain_digest("orcest-policy-v1", effective_policy_json)
+
+
+def verification_profile_digest(profile_commands_json: Any) -> str:
+    """Digest of the frozen v1 Verification Profile's ordered commands (``profile_hash``)."""
+    return generic_domain_digest("orcest-verification-profile-v1", profile_commands_json)
+
+
+def verification_command_invocation_digest(command_json: Any) -> str:
+    """Digest of one normalized Verification Profile command (``invocation_digest``)."""
+    return generic_domain_digest("orcest-verification-invocation-v1", command_json)
 
 
 def specification_digest(specification_json: Any) -> str:

@@ -396,6 +396,24 @@ CandidateProvenanceKind = _register_enum(
 VerificationReceiptOutcome = _register_enum(
     "verification_receipt.outcome", "VerificationReceiptOutcome", ["PASS", "FAIL", "ERROR"]
 )
+VerificationCheckTermination = _register_enum(
+    "verification_check.termination",
+    "VerificationCheckTermination",
+    ["EXITED", "SIGNALED", "TIMED_OUT", "NOT_RUN"],
+)
+VerificationErrorCode = _register_enum(
+    "verification_receipt.error_code",
+    "VerificationErrorCode",
+    [
+        "SANDBOX",
+        "TOOL_MISSING",
+        "TIMEOUT",
+        "SIGNALED",
+        "RESOURCE_LIMIT",
+        "EVIDENCE_CAPTURE",
+        "INTEGRITY",
+    ],
+)
 ReviewAssessmentOutcome = _register_enum(
     "review_receipt.assessment_outcome",
     "ReviewAssessmentOutcome",
