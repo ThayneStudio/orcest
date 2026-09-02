@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -12,11 +13,18 @@ import pytest
 from orcest.workflow_contract.v1.digest import content_digest, request_digest
 from orcest.workflow_contract.v1.protocol import validate_envelope
 from orcest.workflow_contract.v1.structured_outputs import StructuredOutputValidationError
+from orcest.workflow_contract.v1.verification import (
+    VerificationReceiptRejectedError,
+    command_invocation_digest,
+    materialize_verification_profile,
+    verification_profile_hash,
+)
 from orcest.workflow_store import (
     AttemptOfferInput,
     AttemptUnknownError,
     CasMismatchError,
     ControlLayout,
+    ForgeObservationInput,
     IdempotencyConflictError,
     QuotaConfig,
     RunStore,
@@ -125,14 +133,19 @@ def _claimed_build_attempt(
     outbox_id: str = OUTBOX_ID,
     worker_session_id: str = WORKER_SESSION_ID,
     idempotency_key: str = "sha256:" + "3" * 64,
+    kind: str = "BUILD",
+    candidate_id: str | None = None,
+    policy_hash: str = POLICY_HASH,
+    activity_ordinal: int = 1,
 ) -> None:
     store.create_activity(
         activity_id=activity_id,
         run_id=run_id,
-        activity_ordinal=1,
+        activity_ordinal=activity_ordinal,
         specification_generation=1,
-        policy_hash=POLICY_HASH,
-        kind="BUILD",
+        policy_hash=policy_hash,
+        kind=kind,
+        candidate_id=candidate_id,
         execution_class="WORKER",
         state="READY",
         created_transition_sequence=1,
@@ -596,3 +609,403 @@ def test_result_after_capability_auth_expiry_creates_no_registry_row(
 
     assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 0
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_terminal_facts").fetchone()[0] == 0
+
+
+# --- VERIFY receipt admission -------------------------------------------------
+
+VERIFY_ACTIVITY_ID = "77777777-7777-4777-8777-777777777777"
+VERIFY_ATTEMPT_ID = "88888888-8888-4888-8888-888888888888"
+VERIFY_OUTBOX_ID = "99999999-9999-4999-8999-999999999999"
+VERIFICATION_COMMANDS = [
+    {"id": "unit", "argv": ["make", "test-unit"], "timeoutSeconds": 600},
+]
+
+
+def _seed_project(store: RunStore) -> str:
+    now = FUTURE_MS
+
+    def _secret(purpose: str) -> str:
+        secret_id = _uid()
+        store.conn.execute(
+            "INSERT INTO secret_current_versions(secret_id, purpose, owner_scope_kind, "
+            "owner_scope_id, provider_account_ref, current_version, last_operation_id, "
+            "created_at_ms, updated_at_ms) VALUES (?, ?, 'PROJECT', ?, NULL, 1, ?, ?, ?)",
+            (secret_id, purpose, _uid(), _uid(), now, now),
+        )
+        return secret_id
+
+    forge_api_secret = _secret("FORGE_API")
+    source_read_secret = _secret("SOURCE_READ")
+    publication_secret = _secret("PUBLICATION")
+    forge_instance_id = _uid()
+    store.conn.execute(
+        "INSERT INTO forge_instances(forge_instance_id, adapter_kind, canonical_origin, "
+        "credential_secret_id, registration_provenance_version, created_at_ms) "
+        "VALUES (?, 'GITHUB', ?, ?, 1, ?)",
+        (forge_instance_id, f"github.com/{_uid()}", forge_api_secret, now),
+    )
+    project_id = _uid()
+    store.conn.execute(
+        "INSERT INTO projects(project_id, forge_instance_id, installation_or_account_ref, "
+        "repository_external_id, repository_locator, default_ref, trusted_base_policy_ref, "
+        "budget_policy_ref, budget_reset_window_ref, source_read_secret_id, "
+        "publication_secret_id, registration_source_read_secret_version, "
+        "registration_publication_secret_version, registration_revision, "
+        "registration_operation_id, work_item_discovery_schedule_id, registration_state) "
+        "VALUES (?, ?, 'inst', ?, 'org/repo', 'main', 'base-v1', 'budget-v1', "
+        "'window-v1', ?, ?, 1, 1, 1, ?, ?, 'ACTIVE')",
+        (
+            project_id,
+            forge_instance_id,
+            _uid(),
+            source_read_secret,
+            publication_secret,
+            _uid(),
+            _uid(),
+        ),
+    )
+    store.conn.commit()
+    return project_id
+
+
+def _observation(
+    store: RunStore, project_id: str, *, kind: str, external_revision: str, fact
+) -> str:
+    schedule = store.create_forge_observation_schedule(
+        forge_observation_schedule_id=_uid(),
+        schedule_kind="BASE_HEAD_POLL" if kind == "BASE_HEAD" else "WORK_ITEM_POLL",
+        project_id=project_id,
+        forge_instance_id=store.conn.execute(
+            "SELECT forge_instance_id FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()[0],
+        target_kind="WORK_ITEM",
+        target_id="issue-1",
+        minimum_interval_ms=1,
+        next_due_at_ms=0,
+    )
+    source_read_secret = store.conn.execute(
+        "SELECT source_read_secret_id FROM projects WHERE project_id = ?", (project_id,)
+    ).fetchone()[0]
+    request = store.create_due_forge_observation_request(
+        forge_observation_request_id=_uid(),
+        forge_observation_schedule_id=schedule.forge_observation_schedule_id,
+        now_ms=int(time.time() * 1000),
+        controller_mode="RUNNING",
+        controller_mode_revision=1,
+        credential_purpose="PROJECT_SOURCE_READ",
+        credential_secret_id=source_read_secret,
+        credential_secret_version=1,
+        outbox_id=_uid(),
+    )
+    assert request is not None
+    store.record_forge_observation_request_attempt(request.forge_observation_request_id)
+    completion = store.complete_forge_observation_request(
+        forge_observation_request_id=request.forge_observation_request_id,
+        observations=[
+            ForgeObservationInput(kind=kind, external_revision=external_revision, fact=fact)
+        ],
+    )
+    assert len(completion.observation_ids) == 1
+    return completion.observation_ids[0]
+
+
+def _verification_snapshot(
+    store: RunStore, *, verification_commands=VERIFICATION_COMMANDS, run_id: str = RUN_ID
+):
+    project_id = _seed_project(store)
+    base_id = _observation(
+        store,
+        project_id,
+        kind="BASE_HEAD",
+        external_revision="base-rev-1",
+        fact={
+            "base_ref": "refs/heads/main",
+            "base_commit": {"object_format": "sha1", "oid": "a" * 40},
+        },
+    )
+    work_id = _observation(
+        store,
+        project_id,
+        kind="WORK_ITEM_SNAPSHOT",
+        external_revision="work-rev-1",
+        fact={"title": "Implement thing", "body": "Pinned body"},
+    )
+    return store.capture_work_item_snapshot(
+        snapshot_id=_uid(),
+        run_id=run_id,
+        source_kind="FORGE_OBSERVATION",
+        source_id=work_id,
+        work_item_observation_id=work_id,
+        base_observation_id=base_id,
+        project_id=project_id,
+        work_item_external_id="issue-1",
+        forge_revision="work-rev-1",
+        title="Implement thing",
+        body="Pinned body",
+        base_ref="refs/heads/main",
+        base_commit={"object_format": "sha1", "oid": "a" * 40},
+        workflow_schema_version="v1",
+        normalized_workflow={},
+        effective_policy={
+            "verification": {"profile": "default", "commands": verification_commands}
+        },
+        server_policy_revision="policy-1",
+        trusted_base_policy_ref="base-v1",
+        budget_policy_ref="budget-v1",
+        budget_reset_window_ref="window-v1",
+        base_movement_policy="REBASE_BEFORE_PUBLICATION",
+    )
+
+
+def _verify_check(command: dict, *, termination: str = "EXITED", exit_code: int | None = 0) -> dict:
+    check: dict[str, object] = {
+        "command_id": command["id"],
+        "invocation_digest": command_invocation_digest(command),
+        "termination": termination,
+        "stdout_digest": content_digest(b"out"),
+        "stderr_digest": content_digest(b"err"),
+        "evidence": [],
+    }
+    if exit_code is not None:
+        check["exit_code"] = exit_code
+    return check
+
+
+def _verify_receipt(
+    candidate, commands, profile_hash, *, outcome: str, checks=None, error=None
+) -> dict:
+    if checks is None:
+        checks = [_verify_check(c) for c in commands]
+    return {
+        "protocol": "orcest.verification-receipt/1",
+        "candidate": {
+            "candidate_id": candidate.candidate_id,
+            "commit": {"object_format": candidate.object_format, "oid": candidate.oid},
+        },
+        "profile_id": "default",
+        "profile_hash": profile_hash,
+        "checks": checks,
+        "outcome": outcome,
+        "error": error,
+    }
+
+
+def _seeded_candidate(store, candidate_store, tmp_path):
+    _claimed_build_attempt(store)
+    _promoted_upload(store, candidate_store, tmp_path)
+    result = _submit(store, candidate_store, candidate_upload_id=UPLOAD_ID)
+    assert result.candidate is not None
+    return result.candidate
+
+
+def _claim_verify_attempt(store, *, candidate_id: str, policy_hash: str) -> None:
+    _claimed_build_attempt(
+        store,
+        activity_id=VERIFY_ACTIVITY_ID,
+        attempt_id=VERIFY_ATTEMPT_ID,
+        outbox_id=VERIFY_OUTBOX_ID,
+        idempotency_key="sha256:" + "4" * 64,
+        kind="VERIFY",
+        candidate_id=candidate_id,
+        policy_hash=policy_hash,
+        activity_ordinal=2,
+    )
+
+
+def _submit_verify(store, candidate_store, **overrides):
+    kwargs = dict(
+        candidate_store=candidate_store,
+        result_request_id=_uid(),
+        attempt_id=VERIFY_ATTEMPT_ID,
+        activity_id=VERIFY_ACTIVITY_ID,
+        generation=1,
+        worker_id="worker-1",
+        worker_session_id=WORKER_SESSION_ID,
+        attempt_capability_digest=ATTEMPT_CAPABILITY_DIGEST,
+        outcome="SUCCEEDED",
+        candidate_upload_id=None,
+        structured_output=None,
+        summary="verified",
+        now_ms=FUTURE_MS + 10,
+    )
+    kwargs.update(overrides)
+    return store.submit_attempt_result(**kwargs)
+
+
+def test_verify_receipt_pass_admits_succeeded_result(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    receipt = _verify_receipt(candidate, commands, profile_hash, outcome="PASS")
+
+    result = _submit_verify(store, candidate_store, outcome="SUCCEEDED", receipt=receipt)
+
+    assert result.request.disposition == "ACCEPTED"
+    assert result.attempt_result is not None
+    assert result.attempt_result.outcome == "SUCCEEDED"
+
+
+def test_verify_receipt_fail_admits_succeeded_result(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    checks = [_verify_check(commands[0], exit_code=1)]
+    receipt = _verify_receipt(candidate, commands, profile_hash, outcome="FAIL", checks=checks)
+
+    result = _submit_verify(store, candidate_store, outcome="SUCCEEDED", receipt=receipt)
+
+    assert result.attempt_result is not None
+    assert result.attempt_result.outcome == "SUCCEEDED"
+
+
+def test_verify_receipt_error_admits_failed_retryable_with_verification_error(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    checks = [_verify_check(commands[0], termination="TIMED_OUT", exit_code=None)]
+    receipt = _verify_receipt(
+        candidate,
+        commands,
+        profile_hash,
+        outcome="ERROR",
+        checks=checks,
+        error={"code": "TIMEOUT", "command_id": commands[0]["id"], "evidence": []},
+    )
+
+    result = _submit_verify(
+        store,
+        candidate_store,
+        outcome="FAILED_RETRYABLE",
+        receipt=receipt,
+        failure={"failure_class": "VERIFICATION_ERROR"},
+    )
+
+    assert result.attempt_result is not None
+    assert result.attempt_result.outcome == "FAILED_RETRYABLE"
+    assert result.attempt_result.failure_class == "VERIFICATION_ERROR"
+
+
+def test_verify_receipt_missing_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+
+    with pytest.raises(VerificationReceiptRejectedError):
+        _submit_verify(store, candidate_store, outcome="SUCCEEDED", receipt=None)
+
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
+def test_verify_receipt_candidate_mismatch_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    receipt = _verify_receipt(candidate, commands, profile_hash, outcome="PASS")
+    receipt["candidate"]["candidate_id"] = "22222222-2222-4222-8222-222222222222"
+
+    with pytest.raises(VerificationReceiptRejectedError):
+        _submit_verify(store, candidate_store, outcome="SUCCEEDED", receipt=receipt)
+
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
+def test_verify_receipt_outcome_result_mismatch_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    receipt = _verify_receipt(candidate, commands, profile_hash, outcome="PASS")
+
+    with pytest.raises(VerificationReceiptRejectedError):
+        # A PASS receipt requires a SUCCEEDED Attempt Result, not FAILED_RETRYABLE.
+        _submit_verify(
+            store,
+            candidate_store,
+            outcome="FAILED_RETRYABLE",
+            receipt=receipt,
+            failure={"failure_class": "VERIFICATION_ERROR"},
+        )
+
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
+def test_verify_receipt_stale_profile_hash_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    receipt = _verify_receipt(candidate, commands, content_digest(b"stale-profile"), outcome="PASS")
+
+    with pytest.raises(VerificationReceiptRejectedError):
+        _submit_verify(store, candidate_store, outcome="SUCCEEDED", receipt=receipt)
+
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
+def test_verify_receipt_rejects_non_null_launch_attestation_id(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    snapshot = _verification_snapshot(store)
+    _claim_verify_attempt(
+        store, candidate_id=candidate.candidate_id, policy_hash=snapshot.policy_hash
+    )
+    commands = materialize_verification_profile(VERIFICATION_COMMANDS)
+    profile_hash = verification_profile_hash(commands)
+    receipt = _verify_receipt(candidate, commands, profile_hash, outcome="PASS")
+
+    with pytest.raises(VerificationReceiptRejectedError):
+        _submit_verify(
+            store,
+            candidate_store,
+            outcome="SUCCEEDED",
+            receipt=receipt,
+            launch_attestation_id=str(uuid.uuid4()),
+        )
+
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
