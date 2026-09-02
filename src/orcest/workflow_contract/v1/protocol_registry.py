@@ -54,6 +54,8 @@ PROJECT_REGISTRATION_RESULT_PROTOCOL = "orcest.project-registration-result/1"
 SECRET_PROVISION_REQUEST_PROTOCOL = "orcest.secret-provision/1"
 SECRET_PROVISION_ACCEPTED_PROTOCOL = "orcest.secret-provision-accepted/1"
 SECRET_PROVISION_RESULT_PROTOCOL = "orcest.secret-provision-result/1"
+CREDENTIAL_ROTATION_REQUEST_PROTOCOL = "orcest.credential-rotation/1"
+CREDENTIAL_ROTATION_RESULT_PROTOCOL = "orcest.credential-rotation-result/1"
 WORKER_LOSS_PROTOCOL = "orcest.worker-loss/1"
 WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
 
@@ -76,6 +78,8 @@ __all__ = [
     "SECRET_PROVISION_REQUEST_PROTOCOL",
     "SECRET_PROVISION_ACCEPTED_PROTOCOL",
     "SECRET_PROVISION_RESULT_PROTOCOL",
+    "CREDENTIAL_ROTATION_REQUEST_PROTOCOL",
+    "CREDENTIAL_ROTATION_RESULT_PROTOCOL",
     "WORKER_LOSS_PROTOCOL",
     "WORKER_LOSS_RESULT_PROTOCOL",
 ]
@@ -682,7 +686,7 @@ def _credential_rotation_result_invariant(value: Mapping[str, Any]) -> None:
 
 
 register_envelope(
-    "orcest.credential-rotation-result/1",
+    CREDENTIAL_ROTATION_RESULT_PROTOCOL,
     {
         "credential_rotation_request_id": Field(validator=_is_uuid),
         "disposition": Field(enum=_enum_values(enums.CredentialRotationDisposition)),
@@ -695,7 +699,7 @@ register_envelope(
     protocol_field="protocol",
     object_validator=_credential_rotation_result_invariant,
 )
-register_envelope("orcest.credential-rotation/1", {})
+register_envelope(CREDENTIAL_ROTATION_REQUEST_PROTOCOL, {})
 
 
 # ---------------------------------------------------------------------------

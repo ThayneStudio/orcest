@@ -42,6 +42,7 @@ from orcest.workflow_store.store import (
     ControllerModeProjection,
     ControllerOperationFactRecord,
     CredentialRotationReceiptRecord,
+    CredentialRotationRequestResult,
     DurableOperation,
     FaultInjectionPoint,
     ForgeInstanceRecord,
@@ -88,6 +89,10 @@ from orcest.workflow_store.store import (
 )
 from orcest.workflow_store.v1.blobs import WorkflowBlobRecord, WorkflowBlobStore
 from orcest.workflow_store.v1.candidates import CandidateObjectRecord, CandidateObjectStore
+from orcest.workflow_store.v1.credential_rotation import (
+    CredentialRotationReplayConflictError,
+    apply_credential_rotation,
+)
 from orcest.workflow_store.v1.errors import (
     DurableStoreError,
     IntegrityConflictError,
@@ -207,6 +212,7 @@ __all__ = [
     "SecretStore",
     "SecretVersionHandle",
     "CredentialRotationReceiptRecord",
+    "CredentialRotationRequestResult",
     "SecretCurrentVersionProjection",
     "SecretProvisionCheckpointRecord",
     "SecretProvisionOperationResult",
@@ -214,4 +220,6 @@ __all__ = [
     "SecretProvisionReplayConflictError",
     "provision_or_adopt_secret",
     "reconcile_pending_secret_provision_operation",
+    "CredentialRotationReplayConflictError",
+    "apply_credential_rotation",
 ]
