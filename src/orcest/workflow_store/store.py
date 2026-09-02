@@ -3767,6 +3767,8 @@ CREATE TABLE IF NOT EXISTS result_requests (
     OR (disposition IN ('EXPIRED_CURRENT', 'ALREADY_TERMINAL')
       AND attempt_result_id IS NULL AND stale_reason IS NULL
       AND attempt_terminal_fact_id IS NOT NULL)
+    OR (disposition = 'RESULT_ALREADY_ACCEPTED' AND attempt_result_id IS NULL
+      AND stale_reason IS NULL AND attempt_terminal_fact_id IS NULL)
   ),
   CHECK (disposition = 'ACCEPTED' OR accepted_result_created = 0),
   FOREIGN KEY (attempt_id, activity_id, attempt_generation)
@@ -11308,13 +11310,46 @@ class RunStore:
                 (attempt_id, activity_id, generation),
             ).fetchone()
             if prior_any is not None:
-                _http_status, body_json, _resp_digest = self._attempt_result_error_response(
+                if not binding_ok:
+                    raise CasMismatchError("attempt is stale")
+                http_status, body_json, resp_digest = self._attempt_result_error_response(
                     http_status=409,
                     code="RESULT_ALREADY_ACCEPTED",
                     attempt_id=attempt_id,
                     current_attempt_generation=generation,
                 )
-                raise CasMismatchError(body_json)
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'RESULT_ALREADY_ACCEPTED', "
+                    "NULL, 0, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
 
             before_execution_deadline = now < row["execution_deadline_ms"]
             if before_execution_deadline and (row["state"] != "CLAIMED" or not binding_ok):
@@ -11364,8 +11399,6 @@ class RunStore:
                 return self._result_request_from_row(inserted, replayed=False)
 
             if before_execution_deadline:
-                if not binding_ok or row["state"] != "CLAIMED":
-                    raise CasMismatchError("attempt is stale")
                 candidate_id = None
                 candidate = None
                 if candidate_upload_id is not None:

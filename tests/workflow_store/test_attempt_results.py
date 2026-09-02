@@ -313,16 +313,21 @@ def test_key_reuse_with_different_body_conflicts(
         _submit(store, candidate_store, result_request_id=result_request_id, summary="changed")
 
 
-def test_different_result_after_acceptance_is_rejected_without_registry_row(
+def test_different_result_after_acceptance_is_audited(
     stores: tuple[RunStore, CandidateObjectStore],
 ) -> None:
     store, candidate_store = stores
     _claimed_build_attempt(store)
     _submit(store, candidate_store)
 
-    with pytest.raises(CasMismatchError):
-        _submit(store, candidate_store, summary="different")
-    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 1
+    result = _submit(store, candidate_store, summary="different")
+
+    assert result.request.disposition == "RESULT_ALREADY_ACCEPTED"
+    assert result.request.response_http_status == 409
+    assert json.loads(result.request.response_json)["code"] == "RESULT_ALREADY_ACCEPTED"
+    assert result.attempt_result is None
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 2
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
 
 
 def test_execution_deadline_equality_expires_current_attempt(
