@@ -336,6 +336,55 @@ def apply(
         specification_generation=reduction.specification_generation,
         admit_base_observation_id=reduction.admit_base_observation_id,
     )
+    if reduction.prior_state == "AGGREGATING" and reduction.reason_code.startswith("CONSENSUS_"):
+        candidate_id = trigger.fact("candidate_id", working.current_candidate_id)
+        panel_round = int(trigger.fact("panel_round", 1))
+        outcome = str(trigger.fact("consensus_outcome", "APPROVED"))
+        review_receipt_ids = tuple(
+            sorted(str(item) for item in trigger.fact("review_receipt_ids", ()))
+        )
+        unresolved_finding_ids = tuple(
+            sorted(str(item) for item in trigger.fact("unresolved_finding_ids", ()))
+        )
+        candidate = store.get_candidate(str(candidate_id)) if candidate_id is not None else None
+        if candidate is not None:
+            decision_payload = {
+                "run_id": run_id,
+                "candidate_id": candidate.candidate_id,
+                "object_format": candidate.object_format,
+                "oid": candidate.oid,
+                "specification_generation": reduction.specification_generation,
+                "policy_hash": working.policy_hash,
+                "panel_round": panel_round,
+                "verification_receipt_id": str(trigger.fact("verification_receipt_id", "default")),
+                "review_receipt_ids": review_receipt_ids,
+                "unresolved_finding_ids": unresolved_finding_ids,
+                "outcome": outcome,
+            }
+            store.conn.execute(
+                "INSERT INTO consensus_decisions(consensus_decision_id, run_id, "
+                "candidate_id, object_format, oid, specification_generation, policy_hash, "
+                "panel_round, verification_receipt_id, review_receipt_ids_json, "
+                "unresolved_finding_ids_json, outcome, decision_digest, "
+                "created_transition_sequence, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now') * 1000)",
+                (
+                    new_id(),
+                    run_id,
+                    candidate.candidate_id,
+                    candidate.object_format,
+                    candidate.oid,
+                    reduction.specification_generation,
+                    working.policy_hash,
+                    panel_round,
+                    decision_payload["verification_receipt_id"],
+                    json.dumps(review_receipt_ids, separators=(",", ":"), sort_keys=True),
+                    json.dumps(unresolved_finding_ids, separators=(",", ":"), sort_keys=True),
+                    outcome,
+                    request_digest(decision_payload),
+                    transition.transition_sequence,
+                ),
+            )
     if reduction.terminal_outcome is not None:
         store.set_terminal_outcome(run_id, reduction.terminal_outcome)
 

@@ -65,7 +65,9 @@ from orcest.workflow_contract.v1.digest import (
     workflow_blob_digest,
 )
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
+from orcest.workflow_contract.v1.protocol import ProtocolValidationError, validate_envelope
 from orcest.workflow_contract.v1.protocol_registry import (
+    ADJUDICATION_RECEIPT_PROTOCOL,
     ATTEMPT_CLAIM_PROTOCOL,
     ATTEMPT_LIVENESS_RESULT_PROTOCOL,
     ATTEMPT_RESULT_ACCEPTED_PROTOCOL,
@@ -84,6 +86,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     HEALTH_PROBE_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
+    REVIEW_RECEIPT_PROTOCOL,
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
     SECRET_PROVISION_REQUEST_PROTOCOL,
     SECRET_PROVISION_RESULT_PROTOCOL,
@@ -97,7 +100,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -4526,6 +4529,103 @@ CREATE TABLE IF NOT EXISTS attempt_results (
   CHECK ((receipt_id IS NULL) = (receipt_digest IS NULL))
 );
 
+CREATE TABLE IF NOT EXISTS review_receipts (
+  receipt_id TEXT PRIMARY KEY REFERENCES attempt_results(receipt_id) ON DELETE RESTRICT,
+  attempt_result_id TEXT NOT NULL UNIQUE REFERENCES attempt_results(attempt_result_id)
+    ON DELETE RESTRICT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  object_format TEXT NOT NULL CHECK (object_format IN ('sha1', 'sha256')),
+  oid TEXT NOT NULL,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  policy_hash TEXT NOT NULL,
+  panel_round INTEGER NOT NULL CHECK (panel_round > 0),
+  reviewer_slot TEXT NOT NULL,
+  role TEXT NOT NULL,
+  subject_refs_digest TEXT NOT NULL,
+  context_digest TEXT NOT NULL,
+  execution_profile_id TEXT,
+  worker_profile TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  provider_account_ref TEXT,
+  provider_family TEXT,
+  model_family TEXT,
+  classification_revision TEXT,
+  launch_attestation_id TEXT NOT NULL REFERENCES launch_attestations(launch_attestation_id)
+    ON DELETE RESTRICT,
+  verdict TEXT NOT NULL CHECK (verdict IN ({_sql_in(_enum_values("review_receipt.verdict"))})),
+  fills_slot INTEGER NOT NULL CHECK (fills_slot IN (0, 1)),
+  finding_ids_digest TEXT NOT NULL,
+  receipt_digest TEXT NOT NULL UNIQUE,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (attempt_id, activity_id, attempt_generation)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_receipts_one_filling_slot
+ON review_receipts(candidate_id, panel_round, reviewer_slot) WHERE fills_slot = 1;
+
+CREATE TABLE IF NOT EXISTS adjudication_receipts (
+  receipt_id TEXT PRIMARY KEY REFERENCES attempt_results(receipt_id) ON DELETE RESTRICT,
+  attempt_result_id TEXT NOT NULL UNIQUE REFERENCES attempt_results(attempt_result_id)
+    ON DELETE RESTRICT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  object_format TEXT NOT NULL CHECK (object_format IN ('sha1', 'sha256')),
+  oid TEXT NOT NULL,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  policy_hash TEXT NOT NULL,
+  panel_round INTEGER NOT NULL CHECK (panel_round > 0),
+  adjudication_round INTEGER NOT NULL CHECK (adjudication_round = 1),
+  adjudicator_slot TEXT NOT NULL CHECK (adjudicator_slot = 'default'),
+  subject_refs_digest TEXT NOT NULL,
+  context_digest TEXT NOT NULL,
+  execution_profile_id TEXT,
+  worker_profile TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  provider_account_ref TEXT,
+  provider_family TEXT,
+  model_family TEXT,
+  classification_revision TEXT,
+  launch_attestation_id TEXT NOT NULL REFERENCES launch_attestations(launch_attestation_id)
+    ON DELETE RESTRICT,
+  disposition_summary TEXT NOT NULL,
+  fills_slot INTEGER NOT NULL CHECK (fills_slot IN (0, 1)),
+  receipt_digest TEXT NOT NULL UNIQUE,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (attempt_id, activity_id, attempt_generation)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adjudication_receipts_one_filling_slot
+ON adjudication_receipts(candidate_id, panel_round, adjudication_round, adjudicator_slot)
+WHERE fills_slot = 1;
+
+CREATE TABLE IF NOT EXISTS consensus_decisions (
+  consensus_decision_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  object_format TEXT NOT NULL CHECK (object_format IN ('sha1', 'sha256')),
+  oid TEXT NOT NULL,
+  specification_generation INTEGER NOT NULL CHECK (specification_generation > 0),
+  policy_hash TEXT NOT NULL,
+  panel_round INTEGER NOT NULL CHECK (panel_round > 0),
+  verification_receipt_id TEXT NOT NULL,
+  review_receipt_ids_json TEXT NOT NULL,
+  unresolved_finding_ids_json TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ({_sql_in(_enum_values("consensus_decision.outcome"))})),
+  decision_digest TEXT NOT NULL UNIQUE,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (candidate_id, panel_round)
+);
+
 CREATE TABLE IF NOT EXISTS result_requests (
   result_request_id TEXT PRIMARY KEY,
   attempt_result_id TEXT REFERENCES attempt_results(attempt_result_id) ON DELETE RESTRICT,
@@ -5919,6 +6019,8 @@ CREATE TABLE IF NOT EXISTS human_resolutions (
 );
 """
 
+_V18_TO_V19 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS review_receipts") :]
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -6092,7 +6194,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -6515,6 +6617,8 @@ class RunStore:
                     + _V17_TO_V18
                     + "\n"
                     + add_human_boundary_pointer
+                    + "\n"
+                    + _V18_TO_V19
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6525,17 +6629,36 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 17:
                 assert current == 17
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _V17_TO_V18 + "\n" + add_human_boundary_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _V17_TO_V18
+                    + "\n"
+                    + add_human_boundary_pointer
+                    + "\n"
+                    + _V18_TO_V19
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
-                        "workflow-control-v1-human-boundary-resolution",
+                        "workflow-control-v1-review-consensus-panels",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 18
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + add_human_boundary_pointer + "\n" + _V18_TO_V19
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-review-consensus-panels",
                         _now_ms(),
                     ),
                 )
@@ -13435,6 +13558,191 @@ class RunStore:
                 "an ERROR verification receipt requires failure_class VERIFICATION_ERROR"
             )
 
+    def _receipt_candidate_and_assignment(
+        self, *, row: sqlite3.Row, receipt: Mapping[str, Any], expected_kind: str
+    ) -> tuple[CandidateRecord, ActivityReviewAssignmentRecord, dict[str, Any]]:
+        assignment = self._get_activity_review_assignment(str(row["activity_id"]))
+        if assignment is None or assignment.assignment_kind != expected_kind:
+            raise ProtocolValidationError(f"{expected_kind} receipt has no matching assignment")
+        candidate_id = row["activity_candidate_id"]
+        if candidate_id is None:
+            raise ProtocolValidationError(f"{expected_kind} Activity is missing its Candidate")
+        candidate = self.get_candidate(str(candidate_id))
+        if candidate is None:
+            raise ProtocolValidationError(f"{expected_kind} Activity's Candidate is missing")
+        candidate_obj = receipt["candidate"]
+        commit_obj = candidate_obj["commit"]
+        if candidate_obj["candidate_id"] != candidate.candidate_id:
+            raise ProtocolValidationError("receipt candidate_id does not match assignment")
+        if (
+            commit_obj["object_format"] != candidate.object_format
+            or commit_obj["oid"] != candidate.oid
+        ):
+            raise ProtocolValidationError("receipt commit does not match assigned Candidate")
+        pointers = self.get_revisioned_object("run_pointers", str(row["run_id"]))
+        if pointers is not None:
+            current = json.loads(pointers[2])
+            if isinstance(current, Mapping):
+                if current.get("current_candidate_id") != candidate.candidate_id:
+                    raise CasMismatchError("receipt Candidate is no longer current")
+                if current.get("policy_hash") not in {None, row["activity_policy_hash"]}:
+                    raise CasMismatchError("receipt policy binding is no longer current")
+        return candidate, assignment, current if pointers is not None else {}
+
+    def _require_matching_launch_attestation(
+        self,
+        *,
+        row: sqlite3.Row,
+        launch_attestation_id: str | None,
+    ) -> str:
+        if launch_attestation_id is None:
+            raise ProtocolValidationError("model-backed receipt requires launch_attestation_id")
+        if row["launch_attestation_id"] != launch_attestation_id:
+            raise CasMismatchError("launch attestation does not match Attempt")
+        attestation = self.get_launch_attestation(launch_attestation_id)
+        if attestation is None:
+            raise CasMismatchError("launch attestation was not accepted")
+        return launch_attestation_id
+
+    def _derive_review_receipt(
+        self,
+        *,
+        row: sqlite3.Row,
+        receipt: Any | None,
+        outcome: str,
+        launch_attestation_id: str | None,
+    ) -> tuple[dict[str, Any], bool, str]:
+        if receipt is None:
+            raise ProtocolValidationError("REVIEW Attempt Result requires a review receipt")
+        validated = validate_envelope(receipt)
+        if validated["protocol"] != REVIEW_RECEIPT_PROTOCOL:
+            raise ProtocolValidationError("REVIEW Attempt Result requires a review receipt")
+        candidate, assignment, _current = self._receipt_candidate_and_assignment(
+            row=row, receipt=validated, expected_kind="REVIEW"
+        )
+        if validated["panel_round"] != assignment.panel_round:
+            raise ProtocolValidationError("review panel_round does not match assignment")
+        if validated["reviewer_slot"] != assignment.reviewer_slot:
+            raise ProtocolValidationError("reviewer_slot does not match assignment")
+        if validated["role"] != assignment.role:
+            raise ProtocolValidationError("review role does not match assignment")
+        if validated["subject_refs_digest"] != assignment.subject_refs_digest:
+            raise ProtocolValidationError("subject_refs_digest does not match assignment")
+        if validated["context_digest"] != assignment.context_digest:
+            raise ProtocolValidationError("context_digest does not match assignment")
+        assessments = validated["assessments"]
+        if tuple(item["subject_ref"] for item in assessments) != assignment.subject_refs:
+            raise ProtocolValidationError("assessments do not match the assigned subjects")
+        verdict = str(validated["verdict"])
+        fills_slot = verdict in {"APPROVE", "BLOCK"}
+        if verdict == "APPROVE":
+            if validated["findings"]:
+                raise ProtocolValidationError("APPROVE must not carry findings")
+            if any(item["outcome"] != "SATISFIED" for item in assessments):
+                raise ProtocolValidationError("APPROVE requires every subject to be SATISFIED")
+        expected_outcome = "SUCCEEDED" if fills_slot else "ABSTAINED"
+        if outcome != expected_outcome:
+            raise ProtocolValidationError(
+                f"{verdict} review receipt requires Attempt Result outcome {expected_outcome}"
+            )
+        launch_id = self._require_matching_launch_attestation(
+            row=row, launch_attestation_id=launch_attestation_id
+        )
+        finding_keys = tuple(str(item["finding_key"]) for item in validated["findings"])
+        normalized = {
+            "candidate_id": candidate.candidate_id,
+            "object_format": candidate.object_format,
+            "oid": candidate.oid,
+            "assignment_digest": assignment.assignment_digest,
+            "attempt_id": row["attempt_id"],
+            "activity_id": row["activity_id"],
+            "attempt_generation": row["generation"],
+            "launch_attestation_id": launch_id,
+            "receipt": validated,
+        }
+        return (
+            dict(validated),
+            fills_slot,
+            bare_canonical_digest(list(finding_keys) + [receipt_digest(normalized)]),
+        )
+
+    def _derive_adjudication_receipt(
+        self,
+        *,
+        row: sqlite3.Row,
+        receipt: Any | None,
+        outcome: str,
+        launch_attestation_id: str | None,
+    ) -> tuple[dict[str, Any], bool, str]:
+        if receipt is None:
+            raise ProtocolValidationError(
+                "ADJUDICATE Attempt Result requires an adjudication receipt"
+            )
+        validated = validate_envelope(receipt)
+        if validated["protocol"] != ADJUDICATION_RECEIPT_PROTOCOL:
+            raise ProtocolValidationError(
+                "ADJUDICATE Attempt Result requires an adjudication receipt"
+            )
+        _candidate, assignment, _current = self._receipt_candidate_and_assignment(
+            row=row, receipt=validated, expected_kind="ADJUDICATE"
+        )
+        if validated["panel_round"] != assignment.panel_round:
+            raise ProtocolValidationError("adjudication panel_round does not match assignment")
+        if validated["adjudication_round"] != 1 or assignment.adjudication_round != 1:
+            raise ProtocolValidationError("adjudication_round must be 1")
+        if validated["adjudicator_slot"] != assignment.adjudicator_slot:
+            raise ProtocolValidationError("adjudicator_slot does not match assignment")
+        if validated["subject_refs_digest"] != assignment.subject_refs_digest:
+            raise ProtocolValidationError("subject_refs_digest does not match assignment")
+        if validated["context_digest"] != assignment.context_digest:
+            raise ProtocolValidationError("context_digest does not match assignment")
+        dispositions = validated["dispositions"]
+        disposition_ids = tuple(str(item["finding_id"]) for item in dispositions)
+        if (
+            validated["abstention_code"] is None
+            and disposition_ids != assignment.disputed_finding_ids
+        ):
+            raise ProtocolValidationError("dispositions do not match assigned disputed findings")
+        fills_slot = (
+            validated["abstention_code"] is None
+            and not validated["new_findings"]
+            and bool(dispositions)
+            and all(item["disposition"] != "INCONCLUSIVE" for item in dispositions)
+        )
+        expected_outcome = "SUCCEEDED" if fills_slot else "ABSTAINED"
+        if outcome != expected_outcome:
+            raise ProtocolValidationError(
+                "adjudication receipt requires Attempt Result outcome " + expected_outcome
+            )
+        self._require_matching_launch_attestation(
+            row=row, launch_attestation_id=launch_attestation_id
+        )
+        if not fills_slot:
+            summary = "INCONCLUSIVE"
+        elif (
+            any(item["disposition"] == "SUSTAIN" for item in dispositions)
+            or validated["new_findings"]
+        ):
+            summary = "SUSTAIN"
+        else:
+            summary = "OVERRULE"
+        return dict(validated), fills_slot, summary
+
+    def _review_panel_complete(self, *, run_id: str, candidate_id: str, panel_round: int) -> bool:
+        required = self.conn.execute(
+            "SELECT COUNT(*) FROM activities a "
+            "JOIN activity_review_assignments r ON r.activity_id = a.activity_id "
+            "WHERE a.run_id = ? AND a.candidate_id = ? "
+            "AND r.assignment_kind = 'REVIEW' AND r.panel_round = ?",
+            (run_id, candidate_id, panel_round),
+        ).fetchone()
+        filled = self.conn.execute(
+            "SELECT COUNT(*) FROM review_receipts "
+            "WHERE run_id = ? AND candidate_id = ? AND panel_round = ? AND fills_slot = 1",
+            (run_id, candidate_id, panel_round),
+        ).fetchone()
+        return int(required[0]) > 0 and int(required[0]) == int(filled[0])
+
     def submit_attempt_result(
         self,
         *,
@@ -13554,6 +13862,7 @@ class RunStore:
             row = self.conn.execute(
                 "SELECT attempts.*, activities.run_id AS run_id, activities.kind AS activity_kind, "
                 "activities.state AS activity_state, "
+                "activities.specification_generation AS specification_generation, "
                 "activities.execution_class AS execution_class, "
                 "activities.candidate_id AS activity_candidate_id, "
                 "activities.policy_hash AS activity_policy_hash "
@@ -13895,6 +14204,30 @@ class RunStore:
                         launch_attestation_id=launch_attestation_id,
                         failure_class=failure_class,
                     )
+                review_receipt = None
+                review_fills_slot = False
+                review_finding_ids_digest = None
+                adjudication_receipt = None
+                adjudication_fills_slot = False
+                adjudication_summary = None
+                if row["activity_kind"] == "REVIEW":
+                    review_receipt, review_fills_slot, review_finding_ids_digest = (
+                        self._derive_review_receipt(
+                            row=row,
+                            receipt=receipt,
+                            outcome=outcome,
+                            launch_attestation_id=launch_attestation_id,
+                        )
+                    )
+                if row["activity_kind"] == "ADJUDICATE":
+                    adjudication_receipt, adjudication_fills_slot, adjudication_summary = (
+                        self._derive_adjudication_receipt(
+                            row=row,
+                            receipt=receipt,
+                            outcome=outcome,
+                            launch_attestation_id=launch_attestation_id,
+                        )
+                    )
 
                 attempt_result_id = str(uuid.uuid4())
                 receipt_id = str(uuid.uuid4()) if receipt_json is not None else None
@@ -13932,6 +14265,143 @@ class RunStore:
                         now,
                     ),
                 )
+                if review_receipt is not None:
+                    assert receipt_id is not None
+                    assert review_finding_ids_digest is not None
+                    candidate_record, assignment, _current = self._receipt_candidate_and_assignment(
+                        row=row, receipt=review_receipt, expected_kind="REVIEW"
+                    )
+                    trusted_digest = receipt_digest(
+                        {
+                            "protocol": REVIEW_RECEIPT_PROTOCOL,
+                            "receipt": review_receipt,
+                            "activity_id": activity_id,
+                            "attempt_id": attempt_id,
+                            "attempt_generation": generation,
+                            "assignment_digest": assignment.assignment_digest,
+                            "execution_profile_id": row["execution_profile_id"],
+                            "worker_profile": row["worker_profile"],
+                            "provider": row["provider"],
+                            "model": row["model"],
+                            "provider_account_ref": row["provider_account_ref"],
+                            "provider_family": row["provider_family"],
+                            "model_family": row["model_family"],
+                            "classification_revision": row["classification_revision"],
+                            "launch_attestation_id": launch_attestation_id,
+                        }
+                    )
+                    self.conn.execute(
+                        "INSERT INTO review_receipts(receipt_id, attempt_result_id, run_id, "
+                        "candidate_id, object_format, oid, activity_id, attempt_id, "
+                        "attempt_generation, specification_generation, policy_hash, "
+                        "panel_round, reviewer_slot, role, subject_refs_digest, "
+                        "context_digest, execution_profile_id, worker_profile, provider, "
+                        "model, provider_account_ref, provider_family, model_family, "
+                        "classification_revision, launch_attestation_id, verdict, "
+                        "fills_slot, finding_ids_digest, receipt_digest, accepted_at_ms) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            receipt_id,
+                            attempt_result_id,
+                            row["run_id"],
+                            candidate_record.candidate_id,
+                            candidate_record.object_format,
+                            candidate_record.oid,
+                            activity_id,
+                            attempt_id,
+                            generation,
+                            row["specification_generation"],
+                            row["activity_policy_hash"],
+                            assignment.panel_round,
+                            assignment.reviewer_slot,
+                            assignment.role,
+                            assignment.subject_refs_digest,
+                            assignment.context_digest,
+                            row["execution_profile_id"],
+                            row["worker_profile"],
+                            row["provider"],
+                            row["model"],
+                            row["provider_account_ref"],
+                            row["provider_family"],
+                            row["model_family"],
+                            row["classification_revision"],
+                            launch_attestation_id,
+                            review_receipt["verdict"],
+                            1 if review_fills_slot else 0,
+                            review_finding_ids_digest,
+                            trusted_digest,
+                            now,
+                        ),
+                    )
+                if adjudication_receipt is not None:
+                    assert receipt_id is not None
+                    assert adjudication_summary is not None
+                    candidate_record, assignment, _current = self._receipt_candidate_and_assignment(
+                        row=row, receipt=adjudication_receipt, expected_kind="ADJUDICATE"
+                    )
+                    trusted_digest = receipt_digest(
+                        {
+                            "protocol": ADJUDICATION_RECEIPT_PROTOCOL,
+                            "receipt": adjudication_receipt,
+                            "activity_id": activity_id,
+                            "attempt_id": attempt_id,
+                            "attempt_generation": generation,
+                            "assignment_digest": assignment.assignment_digest,
+                            "execution_profile_id": row["execution_profile_id"],
+                            "worker_profile": row["worker_profile"],
+                            "provider": row["provider"],
+                            "model": row["model"],
+                            "provider_account_ref": row["provider_account_ref"],
+                            "provider_family": row["provider_family"],
+                            "model_family": row["model_family"],
+                            "classification_revision": row["classification_revision"],
+                            "launch_attestation_id": launch_attestation_id,
+                        }
+                    )
+                    self.conn.execute(
+                        "INSERT INTO adjudication_receipts(receipt_id, attempt_result_id, "
+                        "run_id, candidate_id, object_format, oid, activity_id, attempt_id, "
+                        "attempt_generation, specification_generation, policy_hash, "
+                        "panel_round, adjudication_round, adjudicator_slot, "
+                        "subject_refs_digest, context_digest, execution_profile_id, "
+                        "worker_profile, provider, model, provider_account_ref, "
+                        "provider_family, model_family, classification_revision, "
+                        "launch_attestation_id, disposition_summary, fills_slot, "
+                        "receipt_digest, accepted_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            receipt_id,
+                            attempt_result_id,
+                            row["run_id"],
+                            candidate_record.candidate_id,
+                            candidate_record.object_format,
+                            candidate_record.oid,
+                            activity_id,
+                            attempt_id,
+                            generation,
+                            row["specification_generation"],
+                            row["activity_policy_hash"],
+                            assignment.panel_round,
+                            assignment.adjudication_round,
+                            assignment.adjudicator_slot,
+                            assignment.subject_refs_digest,
+                            assignment.context_digest,
+                            row["execution_profile_id"],
+                            row["worker_profile"],
+                            row["provider"],
+                            row["model"],
+                            row["provider_account_ref"],
+                            row["provider_family"],
+                            row["model_family"],
+                            row["classification_revision"],
+                            launch_attestation_id,
+                            adjudication_summary,
+                            1 if adjudication_fills_slot else 0,
+                            trusted_digest,
+                            now,
+                        ),
+                    )
                 self.conn.execute(
                     "UPDATE attempts SET state = ?, terminal_reason = ? "
                     "WHERE attempt_id = ? AND state = 'CLAIMED'",
@@ -13971,6 +14441,18 @@ class RunStore:
                                 "activity_kind": row["activity_kind"],
                                 "candidate_id": candidate_id,
                                 "failure_class": failure_class,
+                                "verification_outcome": receipt.get("outcome")
+                                if row["activity_kind"] == "VERIFY" and isinstance(receipt, Mapping)
+                                else None,
+                                "fills_slot": review_fills_slot or adjudication_fills_slot,
+                                "panel_complete": self._review_panel_complete(
+                                    run_id=str(row["run_id"]),
+                                    candidate_id=str(row["activity_candidate_id"]),
+                                    panel_round=int(review_receipt["panel_round"]),
+                                )
+                                if review_receipt is not None
+                                else None,
+                                "disposition": adjudication_summary,
                                 "structured_output_protocol": (
                                     structured_output.get("protocol_version")
                                     if isinstance(structured_output, Mapping)
