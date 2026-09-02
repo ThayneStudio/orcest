@@ -14,6 +14,12 @@ from orcest.workflow_reducer.graph import (
     activity_execution_class,
     is_terminal_state,
 )
+from orcest.workflow_reducer.recovery import (
+    HealthObservationRef,
+    RecoveryEvidenceInput,
+    classify_recovery_category,
+    select_recovery_decision,
+)
 from orcest.workflow_reducer.types import (
     IllegalTransitionError,
     PendingContinuation,
@@ -1158,16 +1164,21 @@ def _handle_reconciliation_fact(view: RunView, trigger: Trigger) -> Reduction | 
 def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | None:
     if view.state != "RECOVERING":
         return None
-    tactic = trigger.fact("selected_tactic", view.recovery_tactic)
+    decision = _recovery_decision_from_trigger(view, trigger)
+    tactic = decision.selected_tactic
     origin = view.recovery_origin_state or "PLANNING"
-    if tactic == "RETRY_EXECUTION":
+    if tactic in {"RETRY_EXECUTION", "REDELIVER", "REPLACE_CAPACITY", "REPAIR_SCHEMA"}:
         return _reduction(
             view,
             trigger,
             kind=ReductionKind.ADVANCE,
             next_state=origin,
-            reason_code="RETRY_EXECUTION",
-            pointer_updates={"recovery_origin_state": None, "recovery_tactic": None},
+            reason_code=str(tactic),
+            pointer_updates={
+                "recovery_origin_state": None,
+                "recovery_tactic": None,
+                "current_recovery_evidence_id": trigger.trigger_id,
+            },
         )
     if tactic == "DIAGNOSE":
         return _reduction(
@@ -1177,6 +1188,7 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             next_state="DIAGNOSING",
             reason_code="DIAGNOSE",
             plan="DIAGNOSE",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
         )
     if tactic == "REPLAN":
         return _reduction(
@@ -1186,6 +1198,80 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             next_state="REPLANNING",
             reason_code="REPLAN",
             plan="REPLAN",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "ALTERNATIVE_CANDIDATE":
+        plan_kind = (
+            "BUILD"
+            if view.current_candidate_id is None
+            else "PR_REMEDIATE"
+            if view.change_request_external_id is not None or view.publication_state == "ACTIVE"
+            else "REMEDIATE"
+        )
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state=(
+                "BUILDING"
+                if plan_kind == "BUILD"
+                else "PR_REMEDIATING"
+                if plan_kind == "PR_REMEDIATE"
+                else "REMEDIATING"
+            ),
+            reason_code="ALTERNATIVE_CANDIDATE",
+            plan=plan_kind,
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "ADJUDICATE":
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="ADJUDICATING",
+            reason_code="ADJUDICATE",
+            plan="ADJUDICATE",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "REBASE":
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="REMEDIATING",
+            reason_code="REBASE",
+            plan="REBASE",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "IMPORT_EXTERNAL_HEAD":
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="PR_REMEDIATING",
+            reason_code="IMPORT_EXTERNAL_HEAD",
+            plan="IMPORT",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "RECONSTRUCT_FOREIGN_HEAD":
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="REMEDIATING",
+            reason_code="RECONSTRUCT_FOREIGN_HEAD",
+            plan="REMEDIATE",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+        )
+    if tactic == "RECONCILE":
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="PUBLISHING" if view.publication_id else origin,
+            reason_code="RECONCILE",
+            plan="RECONCILE",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
         )
     if tactic in {
         "WAIT_CAPACITY",
@@ -1207,7 +1293,7 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             "WAIT_BACKOFF": "BACKOFF",
             "WAIT_RATE_LIMIT": "RATE_LIMIT",
             "WAIT_BUDGET": "BUDGET",
-            "WAIT_EXTERNAL": "FORGE_UNAVAILABLE",
+            "WAIT_EXTERNAL": _external_wait_reason(decision.category),
             "WAIT_EVIDENCE": "EVIDENCE",
         }[str(tactic)]
         return _reduction(
@@ -1216,7 +1302,10 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             kind=ReductionKind.ADVANCE,
             next_state="WAITING",
             reason_code=str(tactic),
-            pointer_updates={"wait_reason": reason},
+            pointer_updates={
+                "wait_reason": reason,
+                "current_recovery_evidence_id": trigger.trigger_id,
+            },
         )
     if tactic == "ENTER_HUMAN_BOUNDARY":
         return _reduction(
@@ -1225,6 +1314,7 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             kind=ReductionKind.ADVANCE,
             next_state="NEEDS_HUMAN",
             reason_code="ENTER_HUMAN_BOUNDARY",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
         )
     if tactic == "STAFF_PANEL":
         origin_panel = origin if origin in {"REVIEWING", "ADJUDICATING"} else "REVIEWING"
@@ -1253,9 +1343,75 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             kind=ReductionKind.SAME_STATE_AUDIT,
             next_state="RECOVERING",
             reason_code="PROBE_INTEGRITY",
+            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
             emits_semantic_work=False,
         )
     return None
+
+
+def _external_wait_reason(category: str) -> str:
+    return {
+        "CREDENTIAL": "SECRET_RECOVERY",
+        "EXTERNAL_DEPENDENCY": "EXTERNAL_DEPENDENCY",
+        "FORGE_TRANSIENT": "FORGE_UNAVAILABLE",
+        "STORAGE": "STORAGE_RECOVERY",
+    }.get(category, "FORGE_UNAVAILABLE")
+
+
+def _recovery_decision_from_trigger(view: RunView, trigger: Trigger) -> Any:
+    source_kind = str(trigger.fact("source_kind", trigger.fact("causal_source_kind", "INTERNAL")))
+    source_id = str(trigger.fact("source_id", trigger.fact("causal_source_id", trigger.trigger_id)))
+    category = trigger.fact("category")
+    if category is None:
+        category = classify_recovery_category(source_kind, trigger.facts)
+    evidence = RecoveryEvidenceInput(
+        source_kind=source_kind,
+        source_id=source_id,
+        category=str(category),
+        activity_id=trigger.fact("activity_id", view.recovery_activity_id),
+        attempt_id=trigger.fact("attempt_id"),
+        specification_generation=int(
+            trigger.fact("specification_generation", view.specification_generation)
+        ),
+        candidate_id=trigger.fact("candidate_id", view.current_candidate_id),
+        forge_observation_id=trigger.fact("forge_observation_id"),
+        failure_scope=trigger.fact("failure_scope", {}),
+        bounded_evidence=trigger.fact("bounded_evidence", {}),
+        prior_attempt_count=int(
+            trigger.fact("prior_attempt_count", trigger.fact("attempt_count", 0))
+        ),
+        prior_repair_cycle_count=int(
+            trigger.fact("prior_repair_cycle_count", trigger.fact("repair_cycle_count", 0))
+        ),
+        prior_diagnosis_count=int(
+            trigger.fact("prior_diagnosis_count", trigger.fact("diagnosis_count", 0))
+        ),
+        rescue_epoch=int(trigger.fact("rescue_epoch", 0)),
+        accepted_at_ms=int(trigger.fact("accepted_at_ms", 0)),
+        provider_retry_after_ms=trigger.fact("provider_retry_after_ms"),
+        fallback_order=tuple(trigger.fact("fallback_order", ())),
+        exhausted_autonomous=trigger.fact_true("exhausted_autonomous"),
+        resumed_wait_condition_id=trigger.fact("resumed_wait_condition_id"),
+        resumed_human_boundary_id=trigger.fact("resumed_human_boundary_id"),
+        human_resolution_id=trigger.fact("human_resolution_id"),
+    )
+    health_refs = tuple(
+        HealthObservationRef(
+            health_observation_id=str(item["health_observation_id"]),
+            scope_kind=str(item["scope_kind"]),
+            scope_id=str(item["scope_id"]),
+            health_sequence=int(item["health_sequence"]),
+        )
+        for item in trigger.fact("health_observations", ())
+    )
+    decision = select_recovery_decision(evidence, health_observations=health_refs)
+    selected_tactic = trigger.fact("selected_tactic", view.recovery_tactic)
+    if selected_tactic is not None and selected_tactic != decision.selected_tactic:
+        raise IllegalTransitionError(
+            f"recovery evidence tactic {selected_tactic!r} does not match deterministic "
+            f"selection {decision.selected_tactic!r}"
+        )
+    return decision
 
 
 def _handle_secret_version(view: RunView, trigger: Trigger) -> Reduction | None:
