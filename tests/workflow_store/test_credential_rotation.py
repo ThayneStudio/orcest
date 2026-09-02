@@ -441,6 +441,30 @@ def test_rotation_rejects_mismatched_attempt_fence(
         )
 
 
+def test_rotation_rejects_secret_id_not_bound_to_attempt(
+    store: RunStore, secret_store: SecretStore, rotation_context: str
+) -> None:
+    """An Attempt fenced to one secret cannot rotate a different secret_id.
+
+    Even with a correct ``expected_prior_version`` for the other secret,
+    the fence must be scoped to ``attempt.provider_secret_ref`` -- not just
+    to "any claimed model-backed Attempt" -- mirroring the
+    ``provider_secret_ref`` drift check ``accept_launch_attestation``
+    performs against the frozen claim.
+    """
+    bound_secret_id = rotation_context
+    other_secret_id = str(uuid.uuid4())
+    _provision_initial_secret(store, secret_store, other_secret_id)
+    assert other_secret_id != bound_secret_id
+
+    with pytest.raises(CasMismatchError):
+        _rotate(store, secret_store, other_secret_id)
+
+    current = store.get_secret_current_version(other_secret_id)
+    assert current is not None
+    assert current.current_version == 1
+
+
 def test_rotation_denied_at_or_after_execution_deadline(
     store: RunStore, secret_store: SecretStore, rotation_context: str
 ) -> None:

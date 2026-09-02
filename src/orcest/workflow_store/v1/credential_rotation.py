@@ -80,6 +80,7 @@ def apply_credential_rotation(
         attempt_capability_digest=attempt_capability_digest,
         launch_attestation_id=launch_attestation_id,
         provider_account_ref=provider_account_ref,
+        secret_id=secret_id,
     )
 
     staging = secret_store.stage_for_request(credential_rotation_request_id, secret_bytes)

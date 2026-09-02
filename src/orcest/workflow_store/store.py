@@ -7345,6 +7345,7 @@ class RunStore:
         attempt_capability_digest: str,
         launch_attestation_id: str,
         provider_account_ref: str | None,
+        secret_id: str,
     ) -> None:
         """Fail closed unless this is the exact current claimed model-backed Attempt fence.
 
@@ -7352,9 +7353,14 @@ class RunStore:
         acceptance of a Credential Rotation Request -- with its accepted
         Launch Attestation and matching provider account (worker-protocol.md,
         "Credential rotation handoff"). Deterministic ``VERIFY`` Attempts
-        (``provider_secret_ref is None``) can never rotate a credential.
+        (``provider_secret_ref is None``) can never rotate a credential, and
+        an Attempt can only rotate the exact secret bound to it -- never an
+        arbitrary ``secret_id`` -- mirroring the ``provider_secret_ref``
+        drift check :meth:`accept_launch_attestation` performs against the
+        frozen claim.
         """
         require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(secret_id, field="secret_id")
         attempt = self.get_attempt(attempt_id)
         if attempt is None:
             raise RunStoreError(f"attempt {attempt_id!r} was not found")
@@ -7371,6 +7377,10 @@ class RunStore:
             raise CasMismatchError("credential rotation does not match the current claimed attempt")
         if attempt.provider_secret_ref is None:
             raise CasMismatchError("deterministic attempt cannot rotate a provider credential")
+        if attempt.provider_secret_ref != secret_id:
+            raise CasMismatchError(
+                "credential rotation secret_id does not match the attempt's bound secret"
+            )
         if attempt.execution_deadline_ms is None or _now_ms() >= attempt.execution_deadline_ms:
             raise CasMismatchError("credential rotation arrived at or after the execution deadline")
 
