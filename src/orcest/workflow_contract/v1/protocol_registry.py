@@ -64,6 +64,8 @@ WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
 ATTEMPT_LIVENESS_PROTOCOL = "orcest.attempt-liveness/1"
 ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
 VERIFICATION_RECEIPT_PROTOCOL = "orcest.verification-receipt/1"
+REVIEW_RECEIPT_PROTOCOL = "orcest.review-receipt/1"
+ADJUDICATION_RECEIPT_PROTOCOL = "orcest.adjudication-receipt/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
@@ -93,6 +95,8 @@ __all__ = [
     "ATTEMPT_LIVENESS_PROTOCOL",
     "ATTEMPT_LIVENESS_RESULT_PROTOCOL",
     "VERIFICATION_RECEIPT_PROTOCOL",
+    "REVIEW_RECEIPT_PROTOCOL",
+    "ADJUDICATION_RECEIPT_PROTOCOL",
 ]
 
 
@@ -788,6 +792,109 @@ register_envelope(
     },
     protocol_field="protocol",
     object_validator=_verification_receipt_invariant,
+)
+
+
+_REVIEW_ASSESSMENT_SCHEMA = Schema(
+    {
+        "subject_ref": Field(validator=_is_nonempty_str),
+        "outcome": Field(enum=_enum_values(enums.ReviewAssessmentOutcome)),
+        "evidence_refs": Field(required=False, validator=_is_bounded_evidence_list),
+    }
+)
+_REVIEW_FINDING_SCHEMA = Schema(
+    {
+        "finding_key": Field(validator=_is_nonempty_str),
+        "subject_ref": Field(validator=_is_nonempty_str),
+        "severity": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "summary": Field(validator=_is_nonempty_str),
+        "evidence_refs": Field(required=False, validator=_is_bounded_evidence_list),
+        "disputed": Field(required=False, validator=_is_bool),
+    }
+)
+
+
+def _review_receipt_invariant(value: Mapping[str, Any]) -> None:
+    assessments = value.get("assessments")
+    if not isinstance(assessments, list) or not assessments:
+        raise ProtocolValidationError("assessments must be a non-empty array")
+    subject_refs = [item.get("subject_ref") for item in assessments if isinstance(item, Mapping)]
+    if len(set(subject_refs)) != len(subject_refs):
+        raise ProtocolValidationError("assessments contain duplicate subject_ref values")
+    verdict = value.get("verdict")
+    findings = value.get("findings")
+    abstention_code = value.get("abstention_code")
+    if verdict == "ABSTAIN":
+        _require(
+            isinstance(abstention_code, str) and bool(abstention_code),
+            "ABSTAIN requires abstention_code",
+        )
+        _require(findings == [], "ABSTAIN must not carry findings")
+    else:
+        _require(abstention_code is None, "abstention_code is present only for ABSTAIN")
+
+
+register_envelope(
+    REVIEW_RECEIPT_PROTOCOL,
+    {
+        "candidate": Field(schema=_VERIFICATION_CANDIDATE_SCHEMA),
+        "panel_round": Field(validator=_is_nonneg_int),
+        "reviewer_slot": Field(validator=_is_nonempty_str),
+        "role": Field(validator=_is_nonempty_str),
+        "subject_refs_digest": Field(validator=_is_digest),
+        "context_digest": Field(validator=_is_digest),
+        "assessments": Field(item_schema=_REVIEW_ASSESSMENT_SCHEMA),
+        "verdict": Field(enum=_enum_values(enums.ReviewVerdict)),
+        "findings": Field(item_schema=_REVIEW_FINDING_SCHEMA),
+        "abstention_code": Field(required=False, nullable=True, validator=_is_nonempty_str),
+    },
+    protocol_field="protocol",
+    object_validator=_review_receipt_invariant,
+)
+
+_ADJUDICATION_DISPOSITION_SCHEMA = Schema(
+    {
+        "finding_id": Field(validator=_is_nonempty_str),
+        "disposition": Field(enum=_enum_values(enums.AdjudicationDisposition)),
+        "evidence_refs": Field(required=False, validator=_is_bounded_evidence_list),
+    }
+)
+
+
+def _adjudication_receipt_invariant(value: Mapping[str, Any]) -> None:
+    dispositions = value.get("dispositions")
+    abstention_code = value.get("abstention_code")
+    new_findings = value.get("new_findings")
+    if abstention_code is not None:
+        _require(dispositions == [], "abstaining adjudication must not carry dispositions")
+        _require(new_findings == [], "abstaining adjudication must not carry new_findings")
+    else:
+        _require(
+            isinstance(dispositions, list) and bool(dispositions),
+            "adjudication requires dispositions",
+        )
+    if not isinstance(dispositions, list):
+        raise ProtocolValidationError("dispositions must be an array")
+    finding_ids = [item.get("finding_id") for item in dispositions if isinstance(item, Mapping)]
+    if len(set(finding_ids)) != len(finding_ids):
+        raise ProtocolValidationError("dispositions contain duplicate finding_id values")
+
+
+register_envelope(
+    ADJUDICATION_RECEIPT_PROTOCOL,
+    {
+        "candidate": Field(schema=_VERIFICATION_CANDIDATE_SCHEMA),
+        "panel_round": Field(validator=_is_nonneg_int),
+        "adjudication_round": Field(validator=_is_nonneg_int),
+        "adjudicator_slot": Field(enum=frozenset({"default"})),
+        "subject_refs_digest": Field(validator=_is_digest),
+        "context_digest": Field(validator=_is_digest),
+        "dispositions": Field(item_schema=_ADJUDICATION_DISPOSITION_SCHEMA),
+        "new_findings": Field(item_schema=_REVIEW_FINDING_SCHEMA),
+        "abstention_code": Field(required=False, nullable=True, validator=_is_nonempty_str),
+    },
+    protocol_field="protocol",
+    object_validator=_adjudication_receipt_invariant,
 )
 
 

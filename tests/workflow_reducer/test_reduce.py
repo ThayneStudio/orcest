@@ -86,6 +86,61 @@ def test_verify_fail_below_threshold_remediates() -> None:
     assert any(activity.kind == "REMEDIATE" for activity in reduction.planned_activities)
 
 
+def test_adjudication_overrule_opens_fresh_full_review_panel() -> None:
+    view = default_view(
+        "ADJUDICATING",
+        "ATTEMPT_RESULT",
+        filling_review_slots=("correctness", "security"),
+        unfilled_review_slots=(),
+        panel_complete=True,
+    )
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="ATTEMPT_RESULT",
+            trigger_id="attempt-adj",
+            facts={
+                "outcome": "SUCCEEDED",
+                "activity_kind": "ADJUDICATE",
+                "disposition": "OVERRULE",
+                "review_slots": ("correctness", "security"),
+                "next_panel_round": 2,
+            },
+        ),
+    )
+
+    assert reduction.next_state == "REVIEWING"
+    assert reduction.pointer_updates["filling_review_slots"] == ()
+    assert reduction.pointer_updates["unfilled_review_slots"] == ("correctness", "security")
+    assert [activity.slot for activity in reduction.planned_activities] == [
+        "correctness",
+        "security",
+    ]
+    assert all(
+        activity.semantic_input["panel_round"] == 2 for activity in reduction.planned_activities
+    )
+
+
+def test_adjudication_abstain_stays_non_filling_in_adjudication() -> None:
+    view = default_view("ADJUDICATING", "ATTEMPT_RESULT")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="ATTEMPT_RESULT",
+            trigger_id="attempt-adj",
+            facts={
+                "outcome": "ABSTAINED",
+                "activity_kind": "ADJUDICATE",
+                "fills_slot": False,
+            },
+        ),
+    )
+
+    assert reduction.kind is ReductionKind.SAME_STATE_AUDIT
+    assert reduction.next_state == "ADJUDICATING"
+    assert reduction.reason_code == "ADJUDICATION_NON_FILLING"
+
+
 def test_candidate_producing_success_without_candidate_enters_recovery() -> None:
     view = default_view("BUILDING", "ATTEMPT_RESULT")
     reduction = reduce(

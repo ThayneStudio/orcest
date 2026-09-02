@@ -720,6 +720,10 @@ def _handle_attempt_result(view: RunView, trigger: Trigger) -> Reduction | None:
                 plan="REMEDIATE",
             )
         if disposition == "OVERRULE":
+            slots = tuple(str(slot) for slot in trigger.fact("review_slots", ())) or (
+                view.unfilled_review_slots or view.filling_review_slots or ("slot-a", "slot-b")
+            )
+            next_panel_round = int(trigger.fact("next_panel_round", 1))
             return _reduction(
                 view,
                 trigger,
@@ -727,9 +731,20 @@ def _handle_attempt_result(view: RunView, trigger: Trigger) -> Reduction | None:
                 next_state="REVIEWING",
                 reason_code="ADJUDICATION_OVERRULE",
                 extra_plans=tuple(
-                    _plan("REVIEW", view, offer=True, slot=slot)
-                    for slot in (view.unfilled_review_slots or ("slot-a", "slot-b"))
+                    _plan(
+                        "REVIEW",
+                        view,
+                        offer=True,
+                        slot=slot,
+                        semantic_input={"panel_round": next_panel_round},
+                    )
+                    for slot in slots
                 ),
+                pointer_updates={
+                    "filling_review_slots": (),
+                    "unfilled_review_slots": slots,
+                    "panel_complete": False,
+                },
             )
         if disposition in {"INCONCLUSIVE", "ABSTAIN"}:
             return _reduction(
@@ -812,6 +827,24 @@ def _handle_attempt_result(view: RunView, trigger: Trigger) -> Reduction | None:
             pointer_updates=updates,
         )
     if outcome in {"FAILED_RETRYABLE", "FAILED_PERMANENT", "ABSTAINED"}:
+        if state == "ADJUDICATING" and activity_kind == "ADJUDICATE":
+            return _reduction(
+                view,
+                trigger,
+                kind=ReductionKind.SAME_STATE_AUDIT,
+                next_state="ADJUDICATING",
+                reason_code="ADJUDICATION_NON_FILLING",
+                emits_semantic_work=False,
+            )
+        if state == "REVIEWING" and activity_kind == "REVIEW":
+            return _reduction(
+                view,
+                trigger,
+                kind=ReductionKind.SAME_STATE_AUDIT,
+                next_state="REVIEWING",
+                reason_code="PANEL_NON_FILLING",
+                emits_semantic_work=False,
+            )
         if state == "VERIFYING" and trigger.fact("failure_class") == "VERIFICATION_ERROR":
             return _reduction(
                 view,
