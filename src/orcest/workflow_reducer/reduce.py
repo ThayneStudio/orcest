@@ -1457,10 +1457,12 @@ def _recovery_decision_from_trigger(view: RunView, trigger: Trigger) -> Any:
 
 
 def _handle_secret_version(view: RunView, trigger: Trigger) -> Reduction | None:
+    boundary_id = trigger.fact("human_boundary_id")
     if (
         view.state == "NEEDS_HUMAN"
         and trigger.fact_true("satisfies_boundary")
-        and trigger.fact("human_boundary_id") == view.human_boundary_id
+        and boundary_id is not None
+        and boundary_id == view.human_boundary_id
     ):
         return _reduction(
             view,
@@ -1477,10 +1479,12 @@ def _handle_secret_version(view: RunView, trigger: Trigger) -> Reduction | None:
 
 
 def _handle_storage_restoration(view: RunView, trigger: Trigger) -> Reduction | None:
+    boundary_id = trigger.fact("human_boundary_id")
     if (
         view.state == "NEEDS_HUMAN"
         and trigger.fact_true("matches_object")
-        and trigger.fact("human_boundary_id") == view.human_boundary_id
+        and boundary_id is not None
+        and boundary_id == view.human_boundary_id
     ):
         return _reduction(
             view,

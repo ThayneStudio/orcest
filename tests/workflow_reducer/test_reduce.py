@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from orcest.workflow_reducer.contract import default_view
@@ -487,6 +489,19 @@ def test_secret_version_satisfies_boundary_requires_matching_boundary_id() -> No
     assert reduction.kind == ReductionKind.STALE
 
 
+def test_secret_version_satisfies_boundary_rejects_missing_boundary_id() -> None:
+    view = replace(default_view("NEEDS_HUMAN", "SECRET_VERSION"), human_boundary_id=None)
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="SECRET_VERSION",
+            trigger_id="secret:1",
+            facts={"satisfies_boundary": True},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
 def test_storage_restoration_matches_object_requires_matching_boundary_id() -> None:
     view = default_view("NEEDS_HUMAN", "STORAGE_RESTORATION")
     reduction = reduce(
@@ -495,6 +510,19 @@ def test_storage_restoration_matches_object_requires_matching_boundary_id() -> N
             kind="STORAGE_RESTORATION",
             trigger_id="srf-1",
             facts={"matches_object": True, "human_boundary_id": "some-other-boundary"},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
+def test_storage_restoration_matches_object_rejects_missing_boundary_id() -> None:
+    view = replace(default_view("NEEDS_HUMAN", "STORAGE_RESTORATION"), human_boundary_id=None)
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="STORAGE_RESTORATION",
+            trigger_id="srf-1",
+            facts={"matches_object": True},
         ),
     )
     assert reduction.kind == ReductionKind.STALE
