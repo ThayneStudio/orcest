@@ -73,6 +73,11 @@ def _candidate_bundle(
     return bundle.read_bytes(), {"object_format": "sha1", "oid": base}, tip
 
 
+def _corrupt_bytes(data: bytes) -> bytes:
+    assert data
+    return data[:-1] + bytes([data[-1] ^ 0xFF])
+
+
 @pytest.fixture
 def stores(tmp_path: Path) -> tuple[RunStore, CandidateObjectStore]:
     layout = ControlLayout(tmp_path / "control")
@@ -321,7 +326,7 @@ def test_corrupt_wrong_base_and_wrong_repository_uploads_do_not_promote(
         store.put_candidate_upload_content(
             candidate_store=candidate_store,
             upload_id=UPLOAD_ID,
-            bundle_bytes=bundle[:-1] + b"x",
+            bundle_bytes=_corrupt_bytes(bundle),
             now_ms=FUTURE_MS + 1,
         )
     assert store.get_candidate_upload(UPLOAD_ID).state == "RECEIVING"

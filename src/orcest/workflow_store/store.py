@@ -27,6 +27,7 @@ from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.canonical import canonical_json_text
 from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
+    attempt_result_receipt_digest,
     attempt_terminal_fact_digest,
     bare_canonical_digest,
     budget_report_digest,
@@ -46,6 +47,7 @@ from orcest.workflow_contract.v1.digest import (
     request_digest,
     resolution_digest,
     response_digest,
+    result_digest,
     review_assignment_digest,
     specification_digest,
     subject_refs_digest,
@@ -56,6 +58,8 @@ from orcest.workflow_contract.v1.digest import (
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
     ATTEMPT_CLAIM_PROTOCOL,
+    ATTEMPT_RESULT_ACCEPTED_PROTOCOL,
+    ATTEMPT_RESULT_PROTOCOL,
     BUDGET_REPORT_RESULT_PROTOCOL,
     CANDIDATE_UPLOAD_EXPIRED_PROTOCOL,
     CAPABILITY_KEY_OPERATION_PROTOCOL,
@@ -64,6 +68,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CAPACITY_REPORT_RESULT_PROTOCOL,
     CONTROLLER_MODE_OPERATION_PROTOCOL,
     CONTROLLER_MODE_RESULT_PROTOCOL,
+    ERROR_PROTOCOL,
     FORGE_OBSERVATION_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
@@ -74,7 +79,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     WORKER_LOSS_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -1136,6 +1141,58 @@ class WorkerLossReportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptResultRecord:
+    attempt_result_id: str
+    result_request_id: str
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    outcome: str
+    result_digest: str
+    body_json: str
+    failure_class: str | None
+    failure_json: str | None
+    evidence_refs_json: str | None
+    retry_delay_ms: int | None
+    receipt_id: str | None
+    receipt_json: str | None
+    receipt_digest: str | None
+    candidate_id: str | None
+    accepted_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResultRequestRecord:
+    result_request_id: str
+    attempt_result_id: str | None
+    attempt_id: str
+    activity_id: str
+    attempt_generation: int
+    worker_id: str
+    worker_session_id: str
+    attempt_capability_digest: str
+    request_digest: str
+    result_digest: str
+    disposition: str
+    stale_reason: str | None
+    accepted_result_created: bool
+    candidate_upload_id: str | None
+    attempt_terminal_fact_id: str | None
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    created_at_ms: int
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptResultSubmissionResult:
+    request: ResultRequestRecord
+    attempt_result: AttemptResultRecord | None
+    candidate: CandidateRecord | None
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetReportResult:
     budget_report_id: str
     project_id: str
@@ -2170,6 +2227,53 @@ def _row_to_candidate(row: sqlite3.Row) -> CandidateRecord:
         base_commit_json=row["base_commit_json"],
         bundle_digest=row["bundle_digest"],
         created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_attempt_result(row: sqlite3.Row) -> AttemptResultRecord:
+    return AttemptResultRecord(
+        attempt_result_id=row["attempt_result_id"],
+        result_request_id=row["result_request_id"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        outcome=row["outcome"],
+        result_digest=row["result_digest"],
+        body_json=row["body_json"],
+        failure_class=row["failure_class"],
+        failure_json=row["failure_json"],
+        evidence_refs_json=row["evidence_refs_json"],
+        retry_delay_ms=row["retry_delay_ms"],
+        receipt_id=row["receipt_id"],
+        receipt_json=row["receipt_json"],
+        receipt_digest=row["receipt_digest"],
+        candidate_id=row["candidate_id"],
+        accepted_at_ms=row["accepted_at_ms"],
+    )
+
+
+def _row_to_result_request(row: sqlite3.Row, *, replayed: bool) -> ResultRequestRecord:
+    return ResultRequestRecord(
+        result_request_id=row["result_request_id"],
+        attempt_result_id=row["attempt_result_id"],
+        attempt_id=row["attempt_id"],
+        activity_id=row["activity_id"],
+        attempt_generation=row["attempt_generation"],
+        worker_id=row["worker_id"],
+        worker_session_id=row["worker_session_id"],
+        attempt_capability_digest=row["attempt_capability_digest"],
+        request_digest=row["request_digest"],
+        result_digest=row["result_digest"],
+        disposition=row["disposition"],
+        stale_reason=row["stale_reason"],
+        accepted_result_created=bool(row["accepted_result_created"]),
+        candidate_upload_id=row["candidate_upload_id"],
+        attempt_terminal_fact_id=row["attempt_terminal_fact_id"],
+        response_http_status=row["response_http_status"],
+        response_json=_response_json_with_replayed(row["response_json"], replayed=replayed),
+        response_digest=row["response_digest"],
+        created_at_ms=row["created_at_ms"],
+        replayed=replayed,
     )
 
 
@@ -3597,6 +3701,79 @@ CREATE TABLE IF NOT EXISTS candidates (
   )
 );
 
+CREATE TABLE IF NOT EXISTS attempt_results (
+  attempt_result_id TEXT PRIMARY KEY,
+  result_request_id TEXT NOT NULL UNIQUE,
+  attempt_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  outcome TEXT NOT NULL CHECK (outcome IN ({_sql_in(_enum_values("attempt_result.outcome"))})),
+  result_digest TEXT NOT NULL UNIQUE,
+  body_json TEXT NOT NULL,
+  failure_class TEXT CHECK (
+    failure_class IN ({_sql_in(_enum_values("attempt_result.failure_class"))})
+  ),
+  failure_json TEXT,
+  evidence_refs_json TEXT,
+  retry_delay_ms INTEGER CHECK (retry_delay_ms IS NULL OR retry_delay_ms >= 0),
+  receipt_id TEXT UNIQUE,
+  receipt_json TEXT,
+  receipt_digest TEXT UNIQUE,
+  candidate_id TEXT UNIQUE REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (attempt_id, activity_id, attempt_generation),
+  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
+    REFERENCES attempts(attempt_id, activity_id, generation),
+  CHECK (
+    (outcome = 'SUCCEEDED' AND failure_class IS NULL AND failure_json IS NULL)
+    OR (outcome != 'SUCCEEDED' AND failure_class IS NOT NULL AND failure_json IS NOT NULL)
+  ),
+  CHECK ((receipt_id IS NULL) = (receipt_json IS NULL)),
+  CHECK ((receipt_id IS NULL) = (receipt_digest IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS result_requests (
+  result_request_id TEXT PRIMARY KEY,
+  attempt_result_id TEXT REFERENCES attempt_results(attempt_result_id) ON DELETE RESTRICT,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
+  worker_id TEXT NOT NULL,
+  worker_session_id TEXT NOT NULL,
+  attempt_capability_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK (
+    disposition IN ({_sql_in(_enum_values("result_request.disposition"))})
+  ),
+  stale_reason TEXT CHECK (
+    stale_reason IN ({_sql_in(_enum_values("result_request.stale_reason"))})
+  ),
+  accepted_result_created INTEGER NOT NULL CHECK (accepted_result_created IN (0, 1)),
+  candidate_upload_id TEXT REFERENCES candidate_uploads(upload_id) ON DELETE RESTRICT,
+  attempt_terminal_fact_id TEXT
+    REFERENCES attempt_terminal_facts(attempt_terminal_fact_id) ON DELETE RESTRICT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (attempt_id, request_digest),
+  CHECK (
+    (disposition = 'ACCEPTED' AND attempt_result_id IS NOT NULL AND stale_reason IS NULL)
+    OR (disposition = 'STALE_ATTEMPT' AND attempt_result_id IS NULL
+      AND stale_reason IS NOT NULL AND attempt_terminal_fact_id IS NULL)
+    OR (disposition = 'UPLOAD_EXPIRED' AND attempt_result_id IS NULL
+      AND stale_reason IS NULL AND candidate_upload_id IS NOT NULL
+      AND attempt_terminal_fact_id IS NULL)
+    OR (disposition IN ('EXPIRED_CURRENT', 'ALREADY_TERMINAL')
+      AND attempt_result_id IS NULL AND stale_reason IS NULL
+      AND attempt_terminal_fact_id IS NOT NULL)
+    OR (disposition = 'RESULT_ALREADY_ACCEPTED' AND attempt_result_id IS NULL
+      AND stale_reason IS NULL AND attempt_terminal_fact_id IS NULL)
+  ),
+  CHECK (disposition = 'ACCEPTED' OR accepted_result_created = 0)
+);
+
 CREATE TABLE IF NOT EXISTS controller_operation_facts (
   controller_operation_fact_id TEXT PRIMARY KEY,
   activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
@@ -4360,7 +4537,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -4596,7 +4773,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
+            elif current == 10:
                 assert current == 10
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
                 self.conn.execute(
@@ -4605,6 +4782,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-capacity-budget-worker-loss-reports",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 11
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-idempotent-results-terminal-facts",
                         _now_ms(),
                     ),
                 )
@@ -10804,6 +10993,786 @@ class RunStore:
             installed_at_ms=row["artifact_installed_at_ms"],
         )
         return CandidateDownloadRecord(candidate=candidate, bundle=bundle)
+
+    def get_result_request(self, result_request_id: str) -> ResultRequestRecord | None:
+        require_lowercase_uuid(result_request_id, field="result_request_id")
+        row = self.conn.execute(
+            "SELECT * FROM result_requests WHERE result_request_id = ?", (result_request_id,)
+        ).fetchone()
+        return None if row is None else _row_to_result_request(row, replayed=True)
+
+    def get_attempt_result(self, attempt_result_id: str) -> AttemptResultRecord | None:
+        require_lowercase_uuid(attempt_result_id, field="attempt_result_id")
+        row = self.conn.execute(
+            "SELECT * FROM attempt_results WHERE attempt_result_id = ?", (attempt_result_id,)
+        ).fetchone()
+        return None if row is None else _row_to_attempt_result(row)
+
+    def _attempt_result_body(
+        self,
+        *,
+        idempotency_key: str,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        launch_attestation_id: str | None,
+        outcome: str,
+        candidate_upload_id: str | None,
+        receipt: Any | None,
+        structured_output: Any | None,
+        failure: Any | None,
+        summary: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "protocol": ATTEMPT_RESULT_PROTOCOL,
+            "idempotency_key": idempotency_key,
+            "attempt_id": attempt_id,
+            "activity_id": activity_id,
+            "generation": generation,
+            "launch_attestation_id": launch_attestation_id,
+            "outcome": outcome,
+            "candidate_upload_id": candidate_upload_id,
+            "receipt": receipt,
+            "structured_output": structured_output,
+            "failure": failure,
+            "summary": summary,
+        }
+
+    def _attempt_result_semantic_body(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        semantic = dict(body)
+        semantic.pop("idempotency_key", None)
+        return semantic
+
+    def _attempt_result_accepted_response(
+        self,
+        *,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        outcome: str,
+        candidate_id: str | None,
+        receipt_id: str | None,
+    ) -> tuple[int, str, str]:
+        body = {
+            "protocol": ATTEMPT_RESULT_ACCEPTED_PROTOCOL,
+            "attempt_id": attempt_id,
+            "activity_id": activity_id,
+            "generation": generation,
+            "outcome": outcome,
+            "candidate_id": candidate_id,
+            "receipt_id": receipt_id,
+            "replayed": False,
+        }
+        return (
+            200,
+            canonical_json_text(body),
+            response_digest({"http_status": 200, "body": _response_digest_preimage(body)}),
+        )
+
+    def _attempt_result_error_response(
+        self,
+        *,
+        http_status: int,
+        code: str,
+        attempt_id: str,
+        current_attempt_generation: int | None,
+    ) -> tuple[int, str, str]:
+        body: dict[str, Any] = {
+            "protocol": ERROR_PROTOCOL,
+            "code": code,
+            "attempt_id": attempt_id,
+            "current_attempt_generation": current_attempt_generation,
+            "retryable": False,
+            "replayed": False,
+        }
+        return (
+            http_status,
+            canonical_json_text(body),
+            response_digest({"http_status": http_status, "body": _response_digest_preimage(body)}),
+        )
+
+    def _result_request_from_row(
+        self, row: sqlite3.Row, *, replayed: bool
+    ) -> AttemptResultSubmissionResult:
+        request = _row_to_result_request(row, replayed=replayed)
+        result = None
+        candidate = None
+        if request.attempt_result_id is not None:
+            result_row = self.conn.execute(
+                "SELECT * FROM attempt_results WHERE attempt_result_id = ?",
+                (request.attempt_result_id,),
+            ).fetchone()
+            assert result_row is not None
+            result = _row_to_attempt_result(result_row)
+            if result.candidate_id is not None:
+                candidate = self.get_candidate(result.candidate_id)
+                assert candidate is not None
+        return AttemptResultSubmissionResult(
+            request=request, attempt_result=result, candidate=candidate
+        )
+
+    def submit_attempt_result(
+        self,
+        *,
+        candidate_store: Any,
+        result_request_id: str,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        outcome: str,
+        launch_attestation_id: str | None = None,
+        candidate_upload_id: str | None = None,
+        receipt: Any | None = None,
+        structured_output: Any | None = None,
+        failure: Any | None = None,
+        summary: str | None = None,
+        now_ms: int | None = None,
+    ) -> AttemptResultSubmissionResult:
+        require_lowercase_uuid(result_request_id, field="result_request_id")
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        if launch_attestation_id is not None:
+            require_lowercase_uuid(launch_attestation_id, field="launch_attestation_id")
+        if candidate_upload_id is not None:
+            require_lowercase_uuid(candidate_upload_id, field="candidate_upload_id")
+        _require_positive_int(generation, field="generation")
+        _require_nonempty_text(worker_id, field="worker_id")
+        _require_nonempty_text(worker_session_id, field="worker_session_id")
+        _require_digest(attempt_capability_digest, field="attempt_capability_digest")
+        enums.parse_enum("attempt_result.outcome", outcome)
+        if (outcome == "SUCCEEDED") == (failure is not None):
+            raise ValueError("failure is required only for non-SUCCEEDED Attempt Results")
+        failure_class = None
+        evidence_refs_json = None
+        retry_delay_ms = None
+        failure_json = None
+        if failure is not None:
+            if not isinstance(failure, Mapping):
+                raise ValueError("failure must be a JSON object")
+            failure_class = str(failure.get("failure_class", ""))
+            enums.parse_enum("attempt_result.failure_class", failure_class)
+            evidence_refs = failure.get("evidence_refs")
+            if evidence_refs is not None:
+                evidence_refs_json = canonical_json_text(evidence_refs)
+            retry_delay = failure.get("retry_delay_ms")
+            if retry_delay is not None:
+                if not isinstance(retry_delay, int) or retry_delay < 0:
+                    raise ValueError("failure.retry_delay_ms must be a nonnegative integer")
+                retry_delay_ms = retry_delay
+            failure_json = canonical_json_text(failure)
+
+        body = self._attempt_result_body(
+            idempotency_key=result_request_id,
+            attempt_id=attempt_id,
+            activity_id=activity_id,
+            generation=generation,
+            launch_attestation_id=launch_attestation_id,
+            outcome=outcome,
+            candidate_upload_id=candidate_upload_id,
+            receipt=receipt,
+            structured_output=structured_output,
+            failure=failure,
+            summary=summary,
+        )
+        req_digest = request_digest(body)
+        res_digest = result_digest(self._attempt_result_semantic_body(body))
+        receipt_json = None if receipt is None else canonical_json_text(receipt)
+        receipt_digest_value = (
+            None
+            if receipt is None
+            else attempt_result_receipt_digest(
+                {
+                    "result_request_id": result_request_id,
+                    "attempt_id": attempt_id,
+                    "activity_id": activity_id,
+                    "generation": generation,
+                    "receipt": receipt,
+                }
+            )
+        )
+        now = _now_ms() if now_ms is None else now_ms
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM result_requests WHERE result_request_id = ?",
+                (result_request_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_digest"] == req_digest
+                    and existing["result_digest"] == res_digest
+                    and existing["attempt_id"] == attempt_id
+                    and existing["activity_id"] == activity_id
+                    and existing["attempt_generation"] == generation
+                    and existing["worker_id"] == worker_id
+                    and existing["worker_session_id"] == worker_session_id
+                    and existing["attempt_capability_digest"] == attempt_capability_digest
+                ):
+                    attempt = self.get_attempt(attempt_id)
+                    if (
+                        attempt is not None
+                        and attempt.capability_auth_expires_at_ms is not None
+                        and now >= attempt.capability_auth_expires_at_ms
+                    ):
+                        raise CasMismatchError("attempt capability authentication expired")
+                    return self._result_request_from_row(existing, replayed=True)
+                raise IdempotencyConflictError("result request key was reused")
+
+            evaluation = self._controller_gate_evaluation()
+            if not evaluation.permissions.first_result_mutation:
+                raise WorkflowGateClosedError(
+                    "controller mode does not allow first Result mutation"
+                )
+
+            row = self.conn.execute(
+                "SELECT attempts.*, activities.run_id AS run_id, activities.kind AS activity_kind, "
+                "activities.state AS activity_state, activities.execution_class AS execution_class "
+                "FROM attempts JOIN activities ON activities.activity_id = attempts.activity_id "
+                "WHERE attempts.attempt_id = ? AND attempts.activity_id = ? "
+                "ORDER BY attempts.generation DESC LIMIT 1",
+                (attempt_id, activity_id),
+            ).fetchone()
+            if row is None:
+                raise AttemptUnknownError(
+                    f"no Attempt with attempt_id={attempt_id!r} activity_id={activity_id!r} "
+                    f"generation={generation!r}"
+                )
+            if row["execution_deadline_ms"] is None:
+                raise CasMismatchError("attempt has no execution deadline")
+            if (
+                row["capability_auth_expires_at_ms"] is not None
+                and now >= row["capability_auth_expires_at_ms"]
+            ):
+                raise CasMismatchError("attempt capability authentication expired")
+
+            binding_ok = (
+                row["claimed_worker_id"] == worker_id
+                and row["claimed_worker_session_id"] == worker_session_id
+                and row["attempt_capability_digest"] == attempt_capability_digest
+            )
+
+            accepted = self.conn.execute(
+                "SELECT result_requests.* FROM result_requests "
+                "JOIN attempt_results ON attempt_results.attempt_result_id = "
+                "result_requests.attempt_result_id "
+                "WHERE result_requests.attempt_id = ? "
+                "AND result_requests.activity_id = ? "
+                "AND result_requests.attempt_generation = ? "
+                "AND result_requests.result_digest = ? "
+                "AND result_requests.disposition = 'ACCEPTED' "
+                "ORDER BY result_requests.created_at_ms LIMIT 1",
+                (attempt_id, activity_id, generation, res_digest),
+            ).fetchone()
+            if accepted is not None and binding_ok:
+                result_row = self.conn.execute(
+                    "SELECT * FROM attempt_results WHERE attempt_result_id = ?",
+                    (accepted["attempt_result_id"],),
+                ).fetchone()
+                assert result_row is not None
+                result = _row_to_attempt_result(result_row)
+                http_status, body_json, resp_digest = self._attempt_result_accepted_response(
+                    attempt_id=attempt_id,
+                    activity_id=activity_id,
+                    generation=generation,
+                    outcome=outcome,
+                    candidate_id=result.candidate_id,
+                    receipt_id=result.receipt_id,
+                )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACCEPTED', NULL, 0, ?, NULL, "
+                    "?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        result.attempt_result_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
+            prior_any = self.conn.execute(
+                "SELECT * FROM attempt_results WHERE attempt_id = ? AND activity_id = ? "
+                "AND attempt_generation = ?",
+                (attempt_id, activity_id, generation),
+            ).fetchone()
+            if prior_any is not None:
+                if not binding_ok:
+                    raise CasMismatchError("attempt is stale")
+                http_status, body_json, resp_digest = self._attempt_result_error_response(
+                    http_status=409,
+                    code="RESULT_ALREADY_ACCEPTED",
+                    attempt_id=attempt_id,
+                    current_attempt_generation=generation,
+                )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'RESULT_ALREADY_ACCEPTED', "
+                    "NULL, 0, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
+            before_execution_deadline = now < row["execution_deadline_ms"]
+            if row["generation"] != generation:
+                http_status, body_json, resp_digest = self._attempt_result_error_response(
+                    http_status=409,
+                    code="ATTEMPT_STALE",
+                    attempt_id=attempt_id,
+                    current_attempt_generation=row["generation"],
+                )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'STALE_ATTEMPT', "
+                    "'GENERATION_SUPERSEDED', 0, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
+            if before_execution_deadline and (row["state"] != "CLAIMED" or not binding_ok):
+                stale_reason = "TERMINAL_BEFORE_DEADLINE"
+                if not binding_ok:
+                    stale_reason = "CLAIM_BINDING_CHANGED"
+                http_status, body_json, resp_digest = self._attempt_result_error_response(
+                    http_status=409,
+                    code="ATTEMPT_STALE",
+                    attempt_id=attempt_id,
+                    current_attempt_generation=row["generation"],
+                )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'STALE_ATTEMPT', ?, 0, ?, "
+                    "NULL, ?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        stale_reason,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
+            if before_execution_deadline:
+                candidate_id = None
+                candidate = None
+                if candidate_upload_id is not None:
+                    upload = self.get_candidate_upload(candidate_upload_id)
+                    if upload is None:
+                        raise RunStoreError(
+                            f"candidate upload {candidate_upload_id!r} was not found"
+                        )
+                    if (
+                        upload.attempt_id != attempt_id
+                        or upload.activity_id != activity_id
+                        or upload.attempt_generation != generation
+                    ):
+                        raise CasMismatchError("candidate upload does not match Attempt Result")
+                    if now >= upload.expires_at_ms:
+                        self._expire_candidate_upload_row(
+                            upload, candidate_store=candidate_store, now_ms=now
+                        )
+                        expired_row = self.conn.execute(
+                            "SELECT * FROM candidate_uploads WHERE upload_id = ?",
+                            (candidate_upload_id,),
+                        ).fetchone()
+                        assert expired_row is not None
+                        expired = _row_to_candidate_upload(expired_row)
+                        http_status = 410
+                        body_obj = self.candidate_upload_expired_body(expired)
+                        body_obj["replayed"] = False
+                        body_json = canonical_json_text(body_obj)
+                        resp_digest = response_digest(
+                            {
+                                "http_status": http_status,
+                                "body": _response_digest_preimage(body_obj),
+                            }
+                        )
+                        self.conn.execute(
+                            "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                            "attempt_id, activity_id, attempt_generation, worker_id, "
+                            "worker_session_id, attempt_capability_digest, request_digest, "
+                            "result_digest, disposition, stale_reason, accepted_result_created, "
+                            "candidate_upload_id, attempt_terminal_fact_id, response_http_status, "
+                            "response_json, response_digest, created_at_ms) "
+                            "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'UPLOAD_EXPIRED', NULL, "
+                            "0, ?, NULL, ?, ?, ?, ?)",
+                            (
+                                result_request_id,
+                                attempt_id,
+                                activity_id,
+                                generation,
+                                worker_id,
+                                worker_session_id,
+                                attempt_capability_digest,
+                                req_digest,
+                                res_digest,
+                                candidate_upload_id,
+                                http_status,
+                                body_json,
+                                resp_digest,
+                                now,
+                            ),
+                        )
+                        inserted = self.conn.execute(
+                            "SELECT * FROM result_requests WHERE result_request_id = ?",
+                            (result_request_id,),
+                        ).fetchone()
+                        assert inserted is not None
+                        return self._result_request_from_row(inserted, replayed=False)
+                    if upload.state != "PROMOTED":
+                        raise CasMismatchError("Attempt Result requires a PROMOTED upload")
+                    if upload.artifact_bundle_digest is None or upload.verified_tip_json is None:
+                        raise CasMismatchError("PROMOTED upload is missing artifact identity")
+                    tip = json.loads(upload.verified_tip_json)
+                    candidate_id = str(uuid.uuid4())
+                    generation_row = self.conn.execute(
+                        "SELECT COALESCE(MAX(candidate_generation), 0) + 1 "
+                        "FROM candidates WHERE run_id = ?",
+                        (row["run_id"],),
+                    ).fetchone()
+                    candidate_generation = int(generation_row[0])
+                    self.conn.execute(
+                        "INSERT INTO candidates(candidate_id, run_id, candidate_generation, "
+                        "provenance_kind, producing_activity_id, worker_attempt_id, "
+                        "worker_attempt_generation, object_format, oid, base_commit_json, "
+                        "bundle_digest, created_at_ms) "
+                        "VALUES (?, ?, ?, 'WORKER_ATTEMPT', ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            candidate_id,
+                            row["run_id"],
+                            candidate_generation,
+                            activity_id,
+                            attempt_id,
+                            generation,
+                            tip["object_format"],
+                            tip["oid"],
+                            upload.expected_base_commit_json,
+                            upload.artifact_bundle_digest,
+                            now,
+                        ),
+                    )
+                    self.conn.execute(
+                        "UPDATE candidate_uploads SET state = 'CONSUMED', "
+                        "consumed_candidate_id = ?, updated_at_ms = ? "
+                        "WHERE upload_id = ? AND state = 'PROMOTED'",
+                        (candidate_id, now, candidate_upload_id),
+                    )
+                    candidate = self.get_candidate(candidate_id)
+                    assert candidate is not None
+
+                attempt_result_id = str(uuid.uuid4())
+                receipt_id = str(uuid.uuid4()) if receipt_json is not None else None
+                http_status, body_json, resp_digest = self._attempt_result_accepted_response(
+                    attempt_id=attempt_id,
+                    activity_id=activity_id,
+                    generation=generation,
+                    outcome=outcome,
+                    candidate_id=candidate_id,
+                    receipt_id=receipt_id,
+                )
+                self.conn.execute(
+                    "INSERT INTO attempt_results(attempt_result_id, result_request_id, "
+                    "attempt_id, activity_id, attempt_generation, outcome, result_digest, "
+                    "body_json, failure_class, failure_json, evidence_refs_json, retry_delay_ms, "
+                    "receipt_id, receipt_json, receipt_digest, candidate_id, accepted_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        attempt_result_id,
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        outcome,
+                        res_digest,
+                        canonical_json_text(self._attempt_result_semantic_body(body)),
+                        failure_class,
+                        failure_json,
+                        evidence_refs_json,
+                        retry_delay_ms,
+                        receipt_id,
+                        receipt_json,
+                        receipt_digest_value,
+                        candidate_id,
+                        now,
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE attempts SET state = ?, terminal_reason = ? "
+                    "WHERE attempt_id = ? AND state = 'CLAIMED'",
+                    (
+                        "SUCCEEDED"
+                        if outcome == "SUCCEEDED"
+                        else "ABSTAINED"
+                        if outcome == "ABSTAINED"
+                        else "FAILED",
+                        outcome,
+                        attempt_id,
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE activities SET state = ?, candidate_id = COALESCE(?, candidate_id), "
+                    "updated_at_ms = ? WHERE activity_id = ?",
+                    (
+                        "SUCCEEDED" if outcome == "SUCCEEDED" else "FAILED",
+                        candidate_id,
+                        now,
+                        activity_id,
+                    ),
+                )
+                from orcest.workflow_reducer.ledger import apply, load_view
+                from orcest.workflow_reducer.types import Trigger
+
+                view = load_view(self, row["run_id"])
+                if view is not None:
+                    apply(
+                        self,
+                        view,
+                        Trigger(
+                            kind="ATTEMPT_RESULT",
+                            trigger_id=attempt_result_id,
+                            facts={
+                                "outcome": outcome,
+                                "activity_kind": row["activity_kind"],
+                                "candidate_id": candidate_id,
+                                "failure_class": failure_class,
+                            },
+                        ),
+                        run_id=row["run_id"],
+                    )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACCEPTED', NULL, 1, ?, NULL, "
+                    "?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_result_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
+            terminal_kind = (
+                "EXECUTION_DEADLINE"
+                if row["state"] == "CLAIMED" and binding_ok
+                else "RESULT_AFTER_TERMINAL"
+            )
+            disposition = (
+                "EXPIRED_CURRENT" if terminal_kind == "EXECUTION_DEADLINE" else "ALREADY_TERMINAL"
+            )
+            fact_id = str(uuid.uuid4())
+            fact_digest = attempt_terminal_fact_digest(
+                {
+                    "attempt_id": attempt_id,
+                    "activity_id": activity_id,
+                    "attempt_generation": generation,
+                    "kind": terminal_kind,
+                    "source_kind": "RESULT_REQUEST",
+                    "source_id": result_request_id,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO attempt_terminal_facts(attempt_terminal_fact_id, attempt_id, "
+                "activity_id, attempt_generation, kind, source_kind, source_id, "
+                "health_observation_id, fact_digest, recorded_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'RESULT_REQUEST', ?, NULL, ?, ?)",
+                (
+                    fact_id,
+                    attempt_id,
+                    activity_id,
+                    generation,
+                    terminal_kind,
+                    result_request_id,
+                    fact_digest,
+                    now,
+                ),
+            )
+            if disposition == "EXPIRED_CURRENT":
+                self.conn.execute(
+                    "UPDATE attempts SET state = 'EXPIRED', terminal_reason = 'EXECUTION_DEADLINE' "
+                    "WHERE attempt_id = ? AND state = 'CLAIMED'",
+                    (attempt_id,),
+                )
+                self.conn.execute(
+                    "UPDATE activities SET state = 'PLANNED', updated_at_ms = ? "
+                    "WHERE activity_id = ? AND state = 'ACTIVE'",
+                    (now, activity_id),
+                )
+            from orcest.workflow_reducer.ledger import apply, load_view
+            from orcest.workflow_reducer.types import Trigger
+
+            view = load_view(self, row["run_id"])
+            if view is not None:
+                apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="ATTEMPT_TERMINAL",
+                        trigger_id=fact_id,
+                        facts={
+                            "kind": terminal_kind,
+                            "already_terminal": disposition == "ALREADY_TERMINAL",
+                        },
+                    ),
+                    run_id=row["run_id"],
+                )
+            http_status, body_json, resp_digest = self._attempt_result_error_response(
+                http_status=410 if disposition == "EXPIRED_CURRENT" else 409,
+                code="EXECUTION_DEADLINE_EXCEEDED"
+                if disposition == "EXPIRED_CURRENT"
+                else "ATTEMPT_STALE",
+                attempt_id=attempt_id,
+                current_attempt_generation=row["generation"],
+            )
+            self.conn.execute(
+                "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                "attempt_capability_digest, request_digest, result_digest, disposition, "
+                "stale_reason, accepted_result_created, candidate_upload_id, "
+                "attempt_terminal_fact_id, response_http_status, response_json, "
+                "response_digest, created_at_ms) "
+                "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, ?)",
+                (
+                    result_request_id,
+                    attempt_id,
+                    activity_id,
+                    generation,
+                    worker_id,
+                    worker_session_id,
+                    attempt_capability_digest,
+                    req_digest,
+                    res_digest,
+                    disposition,
+                    candidate_upload_id,
+                    fact_id,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            inserted = self.conn.execute(
+                "SELECT * FROM result_requests WHERE result_request_id = ?",
+                (result_request_id,),
+            ).fetchone()
+            assert inserted is not None
+            return self._result_request_from_row(inserted, replayed=False)
 
     # -- Health Observation ------------------------------------------------
 

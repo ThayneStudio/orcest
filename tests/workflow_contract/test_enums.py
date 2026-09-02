@@ -46,13 +46,14 @@ def test_failure_class_is_closed_to_fourteen_values() -> None:
     assert len(list(enums.FailureClass)) == 14
 
 
-def test_result_request_disposition_is_closed_to_five_values() -> None:
+def test_result_request_disposition_is_closed_to_six_values() -> None:
     assert {member.value for member in enums.ResultRequestDisposition} == {
         "ACCEPTED",
         "UPLOAD_EXPIRED",
         "STALE_ATTEMPT",
         "EXPIRED_CURRENT",
         "ALREADY_TERMINAL",
+        "RESULT_ALREADY_ACCEPTED",
     }
 
 
