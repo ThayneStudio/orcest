@@ -109,6 +109,7 @@ __all__ = [
     "attempt_terminal_fact_health_membership_digest",
     "timer_fact_digest",
     "budget_report_digest",
+    "wait_condition_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -543,6 +544,15 @@ def failure_evidence_digest(evidence: Any) -> str:
 def recovery_evidence_digest(evidence: Any) -> str:
     """Digest of a complete canonical Recovery Evidence record."""
     return generic_domain_digest("orcest-recovery-evidence-v1", evidence)
+
+
+def wait_condition_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Wait Condition's complete immutable predicate and binding
+    fields (``condition_digest``, domain-model.md "Wait Condition"). Covers
+    every normalized immutable predicate/binding, both membership digests,
+    ``created_from_kind``/``created_from_id``, and the creating Transition;
+    excludes only informational ``created_at_ms``."""
+    return generic_domain_digest("orcest-wait-condition-v1", fields)
 
 
 def response_digest(response_json: Any) -> str:
