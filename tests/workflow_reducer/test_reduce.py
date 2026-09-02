@@ -6,7 +6,7 @@ import pytest
 
 from orcest.workflow_reducer.contract import default_view
 from orcest.workflow_reducer.reduce import reduce
-from orcest.workflow_reducer.types import ReductionKind, Trigger
+from orcest.workflow_reducer.types import IllegalTransitionError, ReductionKind, Trigger
 
 pytestmark = pytest.mark.unit
 
@@ -219,3 +219,60 @@ def test_stale_health_fanout_does_not_change_state() -> None:
     )
     assert reduction.kind is ReductionKind.STALE
     assert reduction.next_state == "BUILDING"
+
+
+def test_recovery_evidence_rejects_tactic_that_does_not_match_evidence() -> None:
+    view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    with pytest.raises(IllegalTransitionError, match="does not match deterministic selection"):
+        reduce(
+            view,
+            Trigger(
+                kind="RECOVERY_EVIDENCE",
+                trigger_id="re-1",
+                facts={
+                    "source_kind": "BUDGET_REPORT",
+                    "source_id": "budget-1",
+                    "category": "BUDGET",
+                    "selected_tactic": "RETRY_EXECUTION",
+                },
+            ),
+        )
+
+
+def test_recovery_evidence_applies_deterministic_wait_tactic() -> None:
+    view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="RECOVERY_EVIDENCE",
+            trigger_id="re-budget",
+            facts={
+                "source_kind": "BUDGET_REPORT",
+                "source_id": "budget-1",
+                "category": "BUDGET",
+                "selected_tactic": "WAIT_BUDGET",
+            },
+        ),
+    )
+    assert reduction.next_state == "WAITING"
+    assert reduction.reason_code == "WAIT_BUDGET"
+    assert reduction.pointer_updates["current_recovery_evidence_id"] == "re-budget"
+
+
+def test_recovery_evidence_external_wait_reason_comes_from_category() -> None:
+    view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="RECOVERY_EVIDENCE",
+            trigger_id="re-secret",
+            facts={
+                "source_kind": "SECRET_VERSION",
+                "source_id": "secret:1",
+                "category": "CREDENTIAL",
+                "selected_tactic": "WAIT_EXTERNAL",
+            },
+        ),
+    )
+    assert reduction.next_state == "WAITING"
+    assert reduction.pointer_updates["wait_reason"] == "SECRET_RECOVERY"
