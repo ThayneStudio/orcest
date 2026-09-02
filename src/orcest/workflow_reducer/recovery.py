@@ -8,6 +8,7 @@ from typing import Any
 
 from orcest.workflow_contract.v1 import enums
 from orcest.workflow_contract.v1.digest import bare_canonical_digest, request_digest
+from orcest.workflow_reducer.human_boundary import CATEGORY_HUMAN_BOUNDARY_REASONS
 
 __all__ = [
     "DEFAULT_RECOVERY_LIMITS",
@@ -72,6 +73,7 @@ class RecoveryEvidenceInput:
     resumed_wait_condition_id: str | None = None
     resumed_human_boundary_id: str | None = None
     human_resolution_id: str | None = None
+    human_boundary_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,7 @@ class RecoveryDecision:
     ordered_health_observation_ids: tuple[str, ...]
     health_observation_ids_digest: str
     next_eligible_at_ms: int | None
+    human_boundary_reason: str | None = None
 
 
 _SOURCE_CATEGORIES: Mapping[str, frozenset[str]] = {
@@ -419,6 +422,10 @@ def select_recovery_decision(
         next_eligible_at_ms = _backoff_wait(evidence, limits)
         rescue_epoch += 1
 
+    human_boundary_reason: str | None = None
+    if tactic == "ENTER_HUMAN_BOUNDARY":
+        human_boundary_reason = _resolve_human_boundary_reason(category, evidence)
+
     enums.parse_enum("recovery_evidence.selected_tactic", tactic)
     return RecoveryDecision(
         category=category,
@@ -429,6 +436,7 @@ def select_recovery_decision(
         repair_cycle_count=repair_count,
         diagnosis_count=diagnosis_count,
         rescue_epoch=rescue_epoch,
+        human_boundary_reason=human_boundary_reason,
         selected_fallback=selected_fallback,
         ordered_health_observation_ids=health_ids,
         health_observation_ids_digest=bare_canonical_digest(list(health_ids)),
@@ -455,6 +463,35 @@ def _backoff_wait(evidence: RecoveryEvidenceInput, limits: RecoveryLimits) -> in
     return evidence.accepted_at_ms + min(
         limits.backoff_initial_ms * (2**evidence.rescue_epoch), limits.backoff_max_ms
     )
+
+
+def _resolve_human_boundary_reason(category: str, evidence: RecoveryEvidenceInput) -> str:
+    """The exact allowlisted Human Boundary reason an ``ENTER_HUMAN_BOUNDARY``
+    tactic must carry (domain-model.md "Human Boundary" ``reason``).
+
+    ``PUBLICATION_OWNERSHIP_CONFLICT`` has the sole direct Reconciliation
+    Fact path and can never be produced here. The caller-supplied
+    ``human_boundary_reason`` is code -- never raw agent prose -- so this
+    only asserts it is one of the reasons this category may legally carry;
+    it never invents or defaults one, which would let a convenience
+    escalation through.
+    """
+    allowed = CATEGORY_HUMAN_BOUNDARY_REASONS.get(category)
+    if not allowed:
+        raise ValueError(f"recovery category {category!r} cannot select ENTER_HUMAN_BOUNDARY")
+    reason = evidence.human_boundary_reason
+    if reason is None:
+        raise ValueError(
+            f"ENTER_HUMAN_BOUNDARY for category {category!r} requires an explicit "
+            "human_boundary_reason"
+        )
+    enums.parse_enum("human_boundary.reason", reason)
+    if reason not in allowed:
+        raise ValueError(
+            f"human_boundary_reason {reason!r} is not allowlisted for category {category!r} "
+            f"(allowed: {sorted(allowed)})"
+        )
+    return reason
 
 
 def _evidence_flag(evidence: RecoveryEvidenceInput, *names: str) -> bool:

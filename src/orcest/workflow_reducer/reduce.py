@@ -1058,6 +1058,9 @@ def _handle_management_command(view: RunView, trigger: Trigger) -> Reduction | N
     if kind == "RESOLVE_HUMAN_BOUNDARY":
         if view.state != "NEEDS_HUMAN":
             return _stale(view, trigger)
+        boundary_id = trigger.fact("human_boundary_id")
+        if boundary_id is None or boundary_id != view.human_boundary_id:
+            return _stale(view, trigger, "STALE_HUMAN_BOUNDARY")
         return _reduction(
             view,
             trigger,
@@ -1066,6 +1069,7 @@ def _handle_management_command(view: RunView, trigger: Trigger) -> Reduction | N
             reason_code="HUMAN_RESOLUTION",
             pointer_updates={
                 "human_boundary_id": None,
+                "human_boundary_reason": None,
                 "recovery_origin_state": view.recovery_origin_state,
             },
             continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
@@ -1145,7 +1149,10 @@ def _handle_reconciliation_fact(view: RunView, trigger: Trigger) -> Reduction | 
             kind=ReductionKind.ADVANCE,
             next_state="NEEDS_HUMAN",
             reason_code="OWNERSHIP_CONFLICT",
-            pointer_updates={"human_boundary_reason": "PUBLICATION_OWNERSHIP_CONFLICT"},
+            pointer_updates={
+                "human_boundary_reason": "PUBLICATION_OWNERSHIP_CONFLICT",
+                "human_boundary_id": trigger.fact("pending_human_boundary_id"),
+            },
         )
     if fact_kind in {"REDUNDANT_PUBLICATIONS_PROVEN", "NO_ACTIONABLE_DUPLICATE"}:
         return _audit(view, trigger, "RECONCILE")
@@ -1344,7 +1351,11 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             kind=ReductionKind.ADVANCE,
             next_state="NEEDS_HUMAN",
             reason_code="ENTER_HUMAN_BOUNDARY",
-            pointer_updates={"current_recovery_evidence_id": trigger.trigger_id},
+            pointer_updates={
+                "current_recovery_evidence_id": trigger.trigger_id,
+                "human_boundary_reason": decision.human_boundary_reason,
+                "human_boundary_id": trigger.fact("pending_human_boundary_id"),
+            },
         )
     if tactic == "STAFF_PANEL":
         origin_panel = origin if origin in {"REVIEWING", "ADJUDICATING"} else "REVIEWING"
@@ -1424,6 +1435,7 @@ def _recovery_decision_from_trigger(view: RunView, trigger: Trigger) -> Any:
         resumed_wait_condition_id=trigger.fact("resumed_wait_condition_id"),
         resumed_human_boundary_id=trigger.fact("resumed_human_boundary_id"),
         human_resolution_id=trigger.fact("human_resolution_id"),
+        human_boundary_reason=trigger.fact("human_boundary_reason"),
     )
     health_refs = tuple(
         HealthObservationRef(
@@ -1445,14 +1457,20 @@ def _recovery_decision_from_trigger(view: RunView, trigger: Trigger) -> Any:
 
 
 def _handle_secret_version(view: RunView, trigger: Trigger) -> Reduction | None:
-    if view.state == "NEEDS_HUMAN" and trigger.fact_true("satisfies_boundary"):
+    boundary_id = trigger.fact("human_boundary_id")
+    if (
+        view.state == "NEEDS_HUMAN"
+        and trigger.fact_true("satisfies_boundary")
+        and boundary_id is not None
+        and boundary_id == view.human_boundary_id
+    ):
         return _reduction(
             view,
             trigger,
             kind=ReductionKind.ADVANCE,
             next_state="RECOVERING",
             reason_code="HUMAN_RESOLUTION",
-            pointer_updates={"human_boundary_id": None},
+            pointer_updates={"human_boundary_id": None, "human_boundary_reason": None},
             continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
         )
     if view.state == "WAITING" and trigger.fact_true("wakes_wait"):
@@ -1461,14 +1479,20 @@ def _handle_secret_version(view: RunView, trigger: Trigger) -> Reduction | None:
 
 
 def _handle_storage_restoration(view: RunView, trigger: Trigger) -> Reduction | None:
-    if view.state == "NEEDS_HUMAN" and trigger.fact_true("matches_object"):
+    boundary_id = trigger.fact("human_boundary_id")
+    if (
+        view.state == "NEEDS_HUMAN"
+        and trigger.fact_true("matches_object")
+        and boundary_id is not None
+        and boundary_id == view.human_boundary_id
+    ):
         return _reduction(
             view,
             trigger,
             kind=ReductionKind.ADVANCE,
             next_state="RECOVERING",
             reason_code="HUMAN_RESOLUTION",
-            pointer_updates={"human_boundary_id": None},
+            pointer_updates={"human_boundary_id": None, "human_boundary_reason": None},
             continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
         )
     if view.state == "WAITING" and trigger.fact_true("wakes_wait"):

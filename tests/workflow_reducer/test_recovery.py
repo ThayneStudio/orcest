@@ -243,3 +243,57 @@ def test_evidence_details_select_specialized_recovery_tactics(
         )
     )
     assert decision.selected_tactic == expected_tactic
+
+
+def test_enter_human_boundary_requires_an_explicit_allowlisted_reason() -> None:
+    with pytest.raises(ValueError, match="requires an explicit human_boundary_reason"):
+        select_recovery_decision(
+            RecoveryEvidenceInput(
+                source_kind="MANAGEMENT_COMMAND",
+                source_id="cmd-1",
+                category="POLICY",
+                exhausted_autonomous=True,
+            )
+        )
+
+
+def test_enter_human_boundary_rejects_reason_outside_the_category_allowlist() -> None:
+    with pytest.raises(ValueError, match="not allowlisted for category"):
+        select_recovery_decision(
+            RecoveryEvidenceInput(
+                source_kind="MANAGEMENT_COMMAND",
+                source_id="cmd-1",
+                category="POLICY",
+                exhausted_autonomous=True,
+                human_boundary_reason="INTEGRITY_FAILURE",
+            )
+        )
+
+
+def test_enter_human_boundary_rejects_publication_ownership_conflict() -> None:
+    """The sole direct path for PUBLICATION_OWNERSHIP_CONFLICT is a positive
+    ownership Reconciliation Fact, never Recovery Evidence."""
+    with pytest.raises(ValueError, match="not allowlisted for category"):
+        select_recovery_decision(
+            RecoveryEvidenceInput(
+                source_kind="MANAGEMENT_COMMAND",
+                source_id="cmd-1",
+                category="POLICY",
+                exhausted_autonomous=True,
+                human_boundary_reason="PUBLICATION_OWNERSHIP_CONFLICT",
+            )
+        )
+
+
+def test_enter_human_boundary_accepts_integrity_failure_for_integrity_suspected() -> None:
+    decision = select_recovery_decision(
+        RecoveryEvidenceInput(
+            source_kind="HEALTH_OBSERVATION",
+            source_id="health-1",
+            category="INTEGRITY_SUSPECTED",
+            exhausted_autonomous=True,
+            human_boundary_reason="INTEGRITY_FAILURE",
+        )
+    )
+    assert decision.selected_tactic == "ENTER_HUMAN_BOUNDARY"
+    assert decision.human_boundary_reason == "INTEGRITY_FAILURE"

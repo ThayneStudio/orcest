@@ -257,12 +257,18 @@ def _default_facts(state: str | None, trigger: str) -> tuple[str, dict[str, Any]
             },
         )
     if trigger == "SECRET_VERSION":
-        return ("secret:1", {"satisfies_boundary": state == "NEEDS_HUMAN"})
+        facts = {"satisfies_boundary": state == "NEEDS_HUMAN"}
+        if state == "NEEDS_HUMAN":
+            facts["human_boundary_id"] = "44444444-4444-4444-4444-444444444444"
+        return ("secret:1", facts)
     if trigger == "STORAGE_RESTORATION":
-        return (
-            "srf-1",
-            {"matches_object": state == "NEEDS_HUMAN", "stale_member": state != "NEEDS_HUMAN"},
-        )
+        facts = {
+            "matches_object": state == "NEEDS_HUMAN",
+            "stale_member": state != "NEEDS_HUMAN",
+        }
+        if state == "NEEDS_HUMAN":
+            facts["human_boundary_id"] = "44444444-4444-4444-4444-444444444444"
+        return ("srf-1", facts)
     if trigger == "TIMER_FACT":
         return (
             "timer-1",

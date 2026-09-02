@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from orcest.workflow_reducer.contract import default_view
@@ -358,6 +360,18 @@ def test_recovery_evidence_external_wait_reason_comes_from_category() -> None:
             "PLANNING",
             "REDELIVER",
         ),
+        (
+            {
+                "source_kind": "CONTROLLER_OPERATION",
+                "source_id": "cop-1",
+                "category": "POLICY",
+                "exhausted_autonomous": True,
+                "human_boundary_reason": "MISSING_AUTHORITY",
+                "selected_tactic": "ENTER_HUMAN_BOUNDARY",
+            },
+            "NEEDS_HUMAN",
+            "ENTER_HUMAN_BOUNDARY",
+        ),
     ],
 )
 def test_recovery_evidence_selected_specialized_tactics_reach_handlers(
@@ -370,3 +384,145 @@ def test_recovery_evidence_selected_specialized_tactics_reach_handlers(
     )
     assert reduction.next_state == expected_state
     assert reduction.reason_code == expected_reason
+
+
+def test_recovery_evidence_enter_human_boundary_records_reason_pointer() -> None:
+    view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    boundary_id = "44444444-4444-4444-4444-444444444444"
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="RECOVERY_EVIDENCE",
+            trigger_id="re-boundary",
+            facts={
+                "source_kind": "CONTROLLER_OPERATION",
+                "source_id": "cop-1",
+                "category": "POLICY",
+                "exhausted_autonomous": True,
+                "human_boundary_reason": "SECURITY_POLICY_BOUNDARY",
+                "selected_tactic": "ENTER_HUMAN_BOUNDARY",
+                "pending_human_boundary_id": boundary_id,
+            },
+        ),
+    )
+    assert reduction.next_state == "NEEDS_HUMAN"
+    assert reduction.pointer_updates["human_boundary_reason"] == "SECURITY_POLICY_BOUNDARY"
+    assert reduction.pointer_updates["human_boundary_id"] == boundary_id
+    assert reduction.pointer_updates["current_recovery_evidence_id"] == "re-boundary"
+
+
+def test_reconciliation_ownership_conflict_records_human_boundary_pointer() -> None:
+    view = default_view("PUBLISHING", "RECONCILIATION_FACT")
+    boundary_id = "44444444-4444-4444-4444-444444444444"
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="RECONCILIATION_FACT",
+            trigger_id="reconcile-ownership",
+            facts={
+                "kind": "OWNERSHIP_CONFLICT",
+                "pending_human_boundary_id": boundary_id,
+            },
+        ),
+    )
+    assert reduction.next_state == "NEEDS_HUMAN"
+    assert reduction.pointer_updates["human_boundary_reason"] == "PUBLICATION_OWNERSHIP_CONFLICT"
+    assert reduction.pointer_updates["human_boundary_id"] == boundary_id
+
+
+def test_resolve_human_boundary_rejects_mismatched_boundary_id() -> None:
+    view = default_view("NEEDS_HUMAN", "MANAGEMENT_COMMAND")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="MANAGEMENT_COMMAND",
+            trigger_id="cmd-1",
+            facts={"kind": "RESOLVE_HUMAN_BOUNDARY", "human_boundary_id": "not-the-current-one"},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+    assert reduction.next_state == "NEEDS_HUMAN"
+
+
+def test_resolve_human_boundary_rejects_missing_boundary_id() -> None:
+    view = default_view("NEEDS_HUMAN", "MANAGEMENT_COMMAND")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="MANAGEMENT_COMMAND",
+            trigger_id="cmd-1",
+            facts={"kind": "RESOLVE_HUMAN_BOUNDARY"},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
+def test_resolve_human_boundary_clears_reason_pointer_on_success() -> None:
+    view = default_view("NEEDS_HUMAN", "MANAGEMENT_COMMAND")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="MANAGEMENT_COMMAND",
+            trigger_id="cmd-1",
+            facts={
+                "kind": "RESOLVE_HUMAN_BOUNDARY",
+                "human_boundary_id": view.human_boundary_id,
+            },
+        ),
+    )
+    assert reduction.kind == ReductionKind.ADVANCE
+    assert reduction.next_state == "RECOVERING"
+    assert reduction.pointer_updates["human_boundary_id"] is None
+    assert reduction.pointer_updates["human_boundary_reason"] is None
+
+
+def test_secret_version_satisfies_boundary_requires_matching_boundary_id() -> None:
+    view = default_view("NEEDS_HUMAN", "SECRET_VERSION")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="SECRET_VERSION",
+            trigger_id="secret:1",
+            facts={"satisfies_boundary": True, "human_boundary_id": "some-other-boundary"},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
+def test_secret_version_satisfies_boundary_rejects_missing_boundary_id() -> None:
+    view = replace(default_view("NEEDS_HUMAN", "SECRET_VERSION"), human_boundary_id=None)
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="SECRET_VERSION",
+            trigger_id="secret:1",
+            facts={"satisfies_boundary": True},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
+def test_storage_restoration_matches_object_requires_matching_boundary_id() -> None:
+    view = default_view("NEEDS_HUMAN", "STORAGE_RESTORATION")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="STORAGE_RESTORATION",
+            trigger_id="srf-1",
+            facts={"matches_object": True, "human_boundary_id": "some-other-boundary"},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
+
+
+def test_storage_restoration_matches_object_rejects_missing_boundary_id() -> None:
+    view = replace(default_view("NEEDS_HUMAN", "STORAGE_RESTORATION"), human_boundary_id=None)
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="STORAGE_RESTORATION",
+            trigger_id="srf-1",
+            facts={"matches_object": True},
+        ),
+    )
+    assert reduction.kind == ReductionKind.STALE
