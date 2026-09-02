@@ -1288,6 +1288,26 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
                 "WAIT_EVIDENCE_ALREADY_MET",
                 continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
             )
+        if tactic != "WAIT_EVIDENCE" and trigger.fact_true("predicate_already_met"):
+            # The writer already rechecked this Wait's wake predicate against
+            # current durable state before this Transition and found it met
+            # (persistence-and-recovery.md "GUARDED ... rechecks ... If
+            # qualifying success is already current, it inserts no Wait and
+            # appends a successor RecoveryEvidence selecting the origin-valid
+            # retry/resume tactic"). Go straight back to origin instead of
+            # freezing a Wait that would be woken the instant it existed.
+            return _reduction(
+                view,
+                trigger,
+                kind=ReductionKind.ADVANCE,
+                next_state=origin,
+                reason_code=f"{tactic}_ALREADY_MET",
+                pointer_updates={
+                    "recovery_origin_state": None,
+                    "recovery_tactic": None,
+                    "current_recovery_evidence_id": trigger.trigger_id,
+                },
+            )
         reason = {
             "WAIT_CAPACITY": "CAPACITY",
             "WAIT_BACKOFF": "BACKOFF",
@@ -1304,6 +1324,7 @@ def _handle_recovery_evidence(view: RunView, trigger: Trigger) -> Reduction | No
             reason_code=str(tactic),
             pointer_updates={
                 "wait_reason": reason,
+                "wait_condition_id": trigger.fact("pending_wait_condition_id"),
                 "current_recovery_evidence_id": trigger.trigger_id,
             },
         )

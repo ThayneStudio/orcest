@@ -54,6 +54,7 @@ from orcest.workflow_contract.v1.digest import (
     specification_digest,
     subject_refs_digest,
     timer_fact_digest,
+    wait_condition_digest,
     work_item_discovery_set_digest,
     worker_loss_report_digest,
     workflow_blob_digest,
@@ -90,7 +91,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1185,6 +1186,88 @@ class RecoveryEvidenceRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class WaitConditionPanelSlotInput:
+    """One still-unfilled panel slot to freeze into a panel-scoped ``CAPACITY``
+    Wait (domain-model.md "Wait Condition Panel Slot")."""
+
+    activity_id: str
+    assignment_kind: str
+    panel_round: int
+    slot_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WaitConditionPanelSlotRecord:
+    slot_ordinal: int
+    activity_id: str
+    assignment_kind: str
+    panel_round: int
+    slot_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WaitConditionRecord:
+    wait_condition_id: str
+    run_id: str
+    reason: str
+    resume_state: str
+    specification_generation: int
+    policy_hash: str
+    health_observation_ids_digest: str
+    panel_slots_digest: str
+    created_from_kind: str
+    created_from_id: str
+    condition_digest: str
+    created_transition_sequence: int
+    created_at_ms: int
+    candidate_id: str | None = None
+    forge_observation_id: str | None = None
+    not_before_ms: int | None = None
+    wake_kind: str | None = None
+    wake_identity: Mapping[str, Any] | None = None
+    health_observation_ids: tuple[str, ...] = ()
+    panel_slots: tuple[WaitConditionPanelSlotRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WaitPredicateCheck:
+    """Result of rechecking a Wait's wake predicate under the writer lock
+    before inserting it (domain-model.md "Wait Condition": Budget/Forge/
+    Evidence/Secret "GUARDED ... rechecks ..." paragraphs).
+
+    ``already_satisfied`` is ``True`` exactly when live durable state already
+    meets the predicate the caller was about to freeze into a Wait; the
+    caller MUST NOT call :meth:`RunStore.create_wait_condition` in that case
+    and instead appends a successor Recovery Evidence naming
+    ``satisfying_source_kind``/``satisfying_source_id``.
+    """
+
+    already_satisfied: bool
+    satisfying_source_kind: str | None = None
+    satisfying_source_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEvidenceOutcome:
+    """Result of :meth:`RunStore.submit_recovery_evidence`.
+
+    ``wait_condition`` is non-``None`` exactly when the applied Reduction
+    entered ``WAITING`` and a fresh Wait Condition was frozen for it.
+    ``predicate_check`` is always present when the deterministically selected
+    tactic was a ``WAIT_*`` tactic (``None`` for every other tactic) and
+    records whether the writer-lock recheck found the predicate already met,
+    in which case no Wait was created and the Run instead returned directly
+    to its recovery-origin state.
+    """
+
+    recovery_evidence: RecoveryEvidenceRecord
+    applied: Any
+    selected_tactic: str
+    wait_condition: WaitConditionRecord | None = None
+    predicate_check: WaitPredicateCheck | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CapacityReportResult:
     capacity_report_id: str
     pool_manager_id: str
@@ -2265,6 +2348,110 @@ def _row_to_recovery_evidence(
     )
 
 
+def _row_to_wait_condition(
+    row: sqlite3.Row,
+    *,
+    health_observation_ids: Sequence[str] = (),
+    panel_slots: Sequence[WaitConditionPanelSlotRecord] = (),
+) -> WaitConditionRecord:
+    wake_identity_json = row["wake_identity_json"]
+    return WaitConditionRecord(
+        wait_condition_id=row["wait_condition_id"],
+        run_id=row["run_id"],
+        reason=row["reason"],
+        resume_state=row["resume_state"],
+        specification_generation=row["specification_generation"],
+        candidate_id=row["candidate_id"],
+        policy_hash=row["policy_hash"],
+        forge_observation_id=row["forge_observation_id"],
+        not_before_ms=row["not_before_ms"],
+        wake_kind=row["wake_kind"],
+        wake_identity=json.loads(wake_identity_json) if wake_identity_json is not None else None,
+        health_observation_ids_digest=row["health_observation_ids_digest"],
+        panel_slots_digest=row["panel_slots_digest"],
+        created_from_kind=row["created_from_kind"],
+        created_from_id=row["created_from_id"],
+        condition_digest=row["condition_digest"],
+        created_transition_sequence=row["created_transition_sequence"],
+        created_at_ms=row["created_at_ms"],
+        health_observation_ids=tuple(health_observation_ids),
+        panel_slots=tuple(panel_slots),
+    )
+
+
+_WAIT_REASON_WAKE_RULES: Mapping[
+    str, Callable[[int | None, str | None, Mapping[str, Any] | None], bool]
+] = {
+    "CAPACITY": lambda not_before_ms, wake_kind, wake_identity: (
+        wake_kind == "CAPACITY" and not_before_ms is None
+    ),
+    "RATE_LIMIT": lambda not_before_ms, wake_kind, wake_identity: (
+        not_before_ms is not None and wake_kind in (None, "RATE_LIMIT_RESET")
+    ),
+    "BUDGET": lambda not_before_ms, wake_kind, wake_identity: (
+        not_before_ms is not None and wake_kind == "BUDGET_WINDOW"
+    ),
+    "BACKOFF": lambda not_before_ms, wake_kind, wake_identity: (
+        not_before_ms is not None and wake_kind is None and wake_identity is None
+    ),
+    "EXTERNAL_DEPENDENCY": lambda not_before_ms, wake_kind, wake_identity: (
+        wake_kind == "DEPENDENCY"
+    ),
+    "FORGE_UNAVAILABLE": lambda not_before_ms, wake_kind, wake_identity: (
+        not_before_ms is not None and wake_kind == "FORGE"
+    ),
+    "STORAGE_RECOVERY": lambda not_before_ms, wake_kind, wake_identity: wake_kind == "STORAGE",
+    "SECRET_RECOVERY": lambda not_before_ms, wake_kind, wake_identity: wake_kind == "SECRET",
+    "EVIDENCE": lambda not_before_ms, wake_kind, wake_identity: (
+        not_before_ms is not None and wake_kind == "EVIDENCE"
+    ),
+}
+
+
+def _validate_wait_condition_shape(
+    *,
+    reason: str,
+    not_before_ms: int | None,
+    wake_kind: str | None,
+    wake_identity: Mapping[str, Any] | None,
+) -> None:
+    """The exhaustive Wait reason/wake compatibility matrix (domain-model.md
+    "Wait Condition" CHECK clause), enforced in Python ahead of the mirrored
+    SQL CHECK so a violation raises a legible error before it ever reaches
+    SQLite."""
+    enums.parse_enum("wait_condition.reason", reason)
+    if wake_kind is not None:
+        enums.parse_enum("wait_condition.wake_kind", wake_kind)
+    if (wake_kind is None) != (wake_identity is None):
+        raise ValueError(
+            "wait condition wake_kind and wake_identity must both be set or both be null"
+        )
+    if not_before_ms is None and wake_kind is None:
+        raise ValueError("wait condition requires not_before_ms and/or a wake predicate")
+    if not_before_ms is not None and not_before_ms < 0:
+        raise ValueError("wait condition not_before_ms must be nonnegative")
+    rule = _WAIT_REASON_WAKE_RULES[reason]
+    if not rule(not_before_ms, wake_kind, wake_identity):
+        raise ValueError(
+            f"wait condition reason={reason!r} is incompatible with "
+            f"not_before_ms={not_before_ms!r} wake_kind={wake_kind!r}"
+        )
+
+
+def _external_wait_reason(category: str) -> str:
+    """Mirrors ``orcest.workflow_reducer.reduce._external_wait_reason`` --
+    the closed category -> ``WAIT_EXTERNAL`` reason mapping is defined once
+    there (a pure reducer decision) and must stay identical here so the
+    store recognizes the exact same reason the Transition it is about to
+    freeze a Wait for actually selected."""
+    return {
+        "CREDENTIAL": "SECRET_RECOVERY",
+        "EXTERNAL_DEPENDENCY": "EXTERNAL_DEPENDENCY",
+        "FORGE_TRANSIENT": "FORGE_UNAVAILABLE",
+        "STORAGE": "STORAGE_RECOVERY",
+    }.get(category, "FORGE_UNAVAILABLE")
+
+
 def _row_to_activity_review_assignment(
     row: sqlite3.Row,
     *,
@@ -2887,6 +3074,7 @@ CREATE TABLE IF NOT EXISTS runs (
     OR supersede_requested_transition_sequence > 0
   ),
   current_recovery_evidence_id TEXT,
+  wait_condition_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -4091,6 +4279,73 @@ CREATE TABLE IF NOT EXISTS recovery_evidence_health_observations (
   UNIQUE (recovery_evidence_id, health_observation_id)
 );
 
+CREATE TABLE IF NOT EXISTS wait_conditions (
+  wait_condition_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  reason TEXT NOT NULL CHECK (reason IN ({_sql_in(_enum_values("wait_condition.reason"))})),
+  resume_state TEXT NOT NULL CHECK (resume_state IN ({_sql_in(_enum_values("run.state"))})),
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
+  candidate_id TEXT,
+  policy_hash TEXT NOT NULL,
+  forge_observation_id TEXT,
+  not_before_ms INTEGER CHECK (not_before_ms IS NULL OR not_before_ms >= 0),
+  wake_kind TEXT CHECK (
+    wake_kind IS NULL OR wake_kind IN ({_sql_in(_enum_values("wait_condition.wake_kind"))})
+  ),
+  wake_identity_json TEXT,
+  health_observation_ids_digest TEXT NOT NULL,
+  panel_slots_digest TEXT NOT NULL,
+  created_from_kind TEXT NOT NULL CHECK (
+    created_from_kind IN ({_sql_in(_enum_values("wait_condition.created_from_kind"))})
+  ),
+  created_from_id TEXT NOT NULL,
+  condition_digest TEXT NOT NULL UNIQUE,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (run_id, wait_condition_id),
+  UNIQUE (created_from_kind, created_from_id),
+  CHECK (not_before_ms IS NOT NULL OR wake_kind IS NOT NULL),
+  CHECK ((wake_kind IS NULL) = (wake_identity_json IS NULL)),
+  CHECK (
+    (reason = 'CAPACITY' AND wake_kind = 'CAPACITY' AND not_before_ms IS NULL)
+    OR (reason = 'RATE_LIMIT' AND not_before_ms IS NOT NULL
+        AND (wake_kind IS NULL OR wake_kind = 'RATE_LIMIT_RESET'))
+    OR (reason = 'BUDGET' AND not_before_ms IS NOT NULL AND wake_kind = 'BUDGET_WINDOW')
+    OR (reason = 'BACKOFF' AND not_before_ms IS NOT NULL
+        AND wake_kind IS NULL AND wake_identity_json IS NULL)
+    OR (reason = 'EXTERNAL_DEPENDENCY' AND wake_kind = 'DEPENDENCY')
+    OR (reason = 'FORGE_UNAVAILABLE' AND not_before_ms IS NOT NULL AND wake_kind = 'FORGE')
+    OR (reason = 'STORAGE_RECOVERY' AND wake_kind = 'STORAGE')
+    OR (reason = 'SECRET_RECOVERY' AND wake_kind = 'SECRET')
+    OR (reason = 'EVIDENCE' AND not_before_ms IS NOT NULL AND wake_kind = 'EVIDENCE')
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_wait_conditions_reason ON wait_conditions(reason, run_id);
+
+CREATE TABLE IF NOT EXISTS wait_condition_health_observations (
+  wait_condition_id TEXT NOT NULL
+    REFERENCES wait_conditions(wait_condition_id) ON DELETE RESTRICT,
+  observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+  health_observation_id TEXT NOT NULL
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (wait_condition_id, observation_ordinal),
+  UNIQUE (wait_condition_id, health_observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS wait_condition_panel_slots (
+  wait_condition_id TEXT NOT NULL
+    REFERENCES wait_conditions(wait_condition_id) ON DELETE RESTRICT,
+  slot_ordinal INTEGER NOT NULL CHECK (slot_ordinal >= 0),
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('REVIEW', 'ADJUDICATE')),
+  panel_round INTEGER NOT NULL CHECK (panel_round > 0),
+  slot_id TEXT NOT NULL,
+  PRIMARY KEY (wait_condition_id, slot_ordinal),
+  UNIQUE (wait_condition_id, activity_id),
+  UNIQUE (wait_condition_id, assignment_kind, panel_round, slot_id)
+);
+
 CREATE TABLE IF NOT EXISTS capacity_reports (
   capacity_report_id TEXT PRIMARY KEY,
   pool_manager_id TEXT NOT NULL,
@@ -4646,6 +4901,7 @@ CREATE TABLE runs_v2 (
     OR supersede_requested_transition_sequence > 0
   ),
   current_recovery_evidence_id TEXT,
+  wait_condition_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -4835,6 +5091,10 @@ _ADD_CURRENT_RECOVERY_EVIDENCE_ID = """
 ALTER TABLE runs ADD COLUMN current_recovery_evidence_id TEXT;
 """
 
+_ADD_WAIT_CONDITION_ID = """
+ALTER TABLE runs ADD COLUMN wait_condition_id TEXT;
+"""
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -5008,7 +5268,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -5033,6 +5293,11 @@ class RunStore:
         add_recovery_pointer = (
             _ADD_CURRENT_RECOVERY_EVIDENCE_ID
             if current >= 2 and "current_recovery_evidence_id" not in run_columns
+            else ""
+        )
+        add_wait_condition_pointer = (
+            _ADD_WAIT_CONDITION_ID
+            if current >= 2 and "wait_condition_id" not in run_columns
             else ""
         )
         try:
@@ -5084,6 +5349,7 @@ class RunStore:
                     + v6_to_v7
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5107,6 +5373,7 @@ class RunStore:
                     + v6_to_v7
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5133,6 +5400,7 @@ class RunStore:
                     + v6_to_v7
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5165,6 +5433,7 @@ class RunStore:
                     + v6_to_v7
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5208,6 +5477,7 @@ class RunStore:
                     + v6_to_v7
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5230,6 +5500,7 @@ class RunStore:
                     + _SCHEMA
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5252,6 +5523,7 @@ class RunStore:
                     + v13_to_v14
                     + "\n"
                     + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5265,7 +5537,13 @@ class RunStore:
             elif current == 9:
                 assert current == 9
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5279,7 +5557,13 @@ class RunStore:
             elif current == 10:
                 assert current == 10
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5292,7 +5576,13 @@ class RunStore:
                 )
             elif current == 11:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5305,7 +5595,13 @@ class RunStore:
                 )
             elif current == 12:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5318,7 +5614,13 @@ class RunStore:
                 )
             elif current == 13:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5329,10 +5631,13 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 14
+            elif current == 14:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + add_recovery_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + add_recovery_pointer
+                    + add_wait_condition_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5340,6 +5645,20 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-recovery-evidence",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 15
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + add_wait_condition_pointer
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-wait-and-wake-processing",
                         _now_ms(),
                     ),
                 )
@@ -13095,6 +13414,61 @@ class RunStore:
         Health observations are frozen in spec order regardless of caller order:
         ``(scope_kind, scope_id, health_sequence, health_observation_id)``.
         """
+        with self.transaction():
+            return self._create_recovery_evidence(
+                recovery_evidence_id=recovery_evidence_id,
+                run_id=run_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                category=category,
+                failure_fingerprint=failure_fingerprint,
+                strategy_index=strategy_index,
+                selected_tactic=selected_tactic,
+                attempt_count=attempt_count,
+                repair_cycle_count=repair_cycle_count,
+                diagnosis_count=diagnosis_count,
+                rescue_epoch=rescue_epoch,
+                health_observations=health_observations,
+                specification_generation=specification_generation,
+                resumed_wait_condition_id=resumed_wait_condition_id,
+                resumed_human_boundary_id=resumed_human_boundary_id,
+                human_resolution_id=human_resolution_id,
+                activity_id=activity_id,
+                attempt_id=attempt_id,
+                candidate_id=candidate_id,
+                forge_observation_id=forge_observation_id,
+                selected_fallback=selected_fallback,
+                next_eligible_at_ms=next_eligible_at_ms,
+            )
+
+    def _create_recovery_evidence(
+        self,
+        *,
+        recovery_evidence_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        category: str,
+        failure_fingerprint: str,
+        strategy_index: int,
+        selected_tactic: str,
+        attempt_count: int,
+        repair_cycle_count: int,
+        diagnosis_count: int,
+        rescue_epoch: int,
+        health_observations: Sequence[HealthObservationRecord] = (),
+        specification_generation: int = 0,
+        resumed_wait_condition_id: str | None = None,
+        resumed_human_boundary_id: str | None = None,
+        human_resolution_id: str | None = None,
+        activity_id: str | None = None,
+        attempt_id: str | None = None,
+        candidate_id: str | None = None,
+        forge_observation_id: str | None = None,
+        selected_fallback: str | None = None,
+        next_eligible_at_ms: int | None = None,
+    ) -> RecoveryEvidenceRecord:
+        """Must run inside a caller-held ``self.transaction()``."""
         require_lowercase_uuid(recovery_evidence_id, field="recovery_evidence_id")
         require_lowercase_uuid(run_id, field="run_id")
         enums.parse_enum("recovery_evidence.source_kind", source_kind)
@@ -13131,136 +13505,821 @@ class RunStore:
             raise ValueError("health observation membership contains duplicate ids")
         health_digest = bare_canonical_digest(list(health_ids))
 
-        with self.transaction():
-            existing = self.conn.execute(
-                "SELECT * FROM recovery_evidence WHERE run_id = ? "
-                "AND source_kind = ? AND source_id = ?",
-                (run_id, source_kind, source_id),
+        existing = self.conn.execute(
+            "SELECT * FROM recovery_evidence WHERE run_id = ? "
+            "AND source_kind = ? AND source_id = ?",
+            (run_id, source_kind, source_id),
+        ).fetchone()
+        if existing is not None:
+            record = self.get_recovery_evidence(str(existing["recovery_evidence_id"]))
+            assert record is not None
+            if (
+                record.recovery_evidence_id == recovery_evidence_id
+                and record.category == category
+                and record.failure_fingerprint == failure_fingerprint
+                and record.strategy_index == strategy_index
+                and record.selected_tactic == selected_tactic
+                and record.attempt_count == attempt_count
+                and record.repair_cycle_count == repair_cycle_count
+                and record.diagnosis_count == diagnosis_count
+                and record.rescue_epoch == rescue_epoch
+                and record.resumed_wait_condition_id == resumed_wait_condition_id
+                and record.resumed_human_boundary_id == resumed_human_boundary_id
+                and record.human_resolution_id == human_resolution_id
+                and record.activity_id == activity_id
+                and record.attempt_id == attempt_id
+                and record.candidate_id == candidate_id
+                and record.forge_observation_id == forge_observation_id
+                and record.selected_fallback == selected_fallback
+                and record.health_observation_ids == health_ids
+                and record.next_eligible_at_ms == next_eligible_at_ms
+                and record.specification_generation == specification_generation
+            ):
+                return record
+            raise IdempotencyConflictError(
+                "recovery evidence source identity was reused with different content"
+            )
+
+        recovery_sequence = self._next_recovery_sequence(run_id)
+        now = _now_ms()
+        evidence_preimage = {
+            "recovery_evidence_id": recovery_evidence_id,
+            "run_id": run_id,
+            "recovery_sequence": recovery_sequence,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "resumed_wait_condition_id": resumed_wait_condition_id,
+            "resumed_human_boundary_id": resumed_human_boundary_id,
+            "human_resolution_id": human_resolution_id,
+            "activity_id": activity_id,
+            "attempt_id": attempt_id,
+            "specification_generation": specification_generation,
+            "candidate_id": candidate_id,
+            "forge_observation_id": forge_observation_id,
+            "category": category,
+            "failure_fingerprint": failure_fingerprint,
+            "strategy_index": strategy_index,
+            "selected_tactic": selected_tactic,
+            "attempt_count": attempt_count,
+            "repair_cycle_count": repair_cycle_count,
+            "diagnosis_count": diagnosis_count,
+            "rescue_epoch": rescue_epoch,
+            "selected_fallback": selected_fallback,
+            "health_observation_ids_digest": health_digest,
+            "next_eligible_at_ms": next_eligible_at_ms,
+        }
+        evidence_digest = recovery_evidence_digest(evidence_preimage)
+        self.conn.execute(
+            "INSERT INTO recovery_evidence(recovery_evidence_id, run_id, "
+            "recovery_sequence, source_kind, source_id, resumed_wait_condition_id, "
+            "resumed_human_boundary_id, human_resolution_id, activity_id, attempt_id, "
+            "specification_generation, candidate_id, forge_observation_id, category, "
+            "failure_fingerprint, strategy_index, selected_tactic, attempt_count, "
+            "repair_cycle_count, diagnosis_count, rescue_epoch, selected_fallback, "
+            "health_observation_ids_digest, next_eligible_at_ms, evidence_digest, "
+            "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                recovery_evidence_id,
+                run_id,
+                recovery_sequence,
+                source_kind,
+                source_id,
+                resumed_wait_condition_id,
+                resumed_human_boundary_id,
+                human_resolution_id,
+                activity_id,
+                attempt_id,
+                specification_generation,
+                candidate_id,
+                forge_observation_id,
+                category,
+                failure_fingerprint,
+                strategy_index,
+                selected_tactic,
+                attempt_count,
+                repair_cycle_count,
+                diagnosis_count,
+                rescue_epoch,
+                selected_fallback,
+                health_digest,
+                next_eligible_at_ms,
+                evidence_digest,
+                now,
+            ),
+        )
+        for ordinal, observation in enumerate(ordered_health):
+            self.conn.execute(
+                "INSERT INTO recovery_evidence_health_observations("
+                "recovery_evidence_id, observation_ordinal, health_observation_id) "
+                "VALUES (?, ?, ?)",
+                (recovery_evidence_id, ordinal, observation.health_observation_id),
+            )
+        self.conn.execute(
+            "UPDATE runs SET current_recovery_evidence_id = ?, updated_at_ms = ? WHERE run_id = ?",
+            (recovery_evidence_id, now, run_id),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM recovery_evidence WHERE recovery_evidence_id = ?",
+            (recovery_evidence_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_recovery_evidence(row, health_observation_ids=health_ids)
+
+    # -- Wait Condition ----------------------------------------------------
+
+    def get_wait_condition(self, wait_condition_id: str) -> WaitConditionRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM wait_conditions WHERE wait_condition_id = ?", (wait_condition_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        health_rows = self.conn.execute(
+            "SELECT health_observation_id FROM wait_condition_health_observations "
+            "WHERE wait_condition_id = ? ORDER BY observation_ordinal",
+            (wait_condition_id,),
+        ).fetchall()
+        panel_rows = self.conn.execute(
+            "SELECT * FROM wait_condition_panel_slots WHERE wait_condition_id = ? "
+            "ORDER BY slot_ordinal",
+            (wait_condition_id,),
+        ).fetchall()
+        return _row_to_wait_condition(
+            row,
+            health_observation_ids=tuple(
+                str(item["health_observation_id"]) for item in health_rows
+            ),
+            panel_slots=tuple(
+                WaitConditionPanelSlotRecord(
+                    slot_ordinal=item["slot_ordinal"],
+                    activity_id=item["activity_id"],
+                    assignment_kind=item["assignment_kind"],
+                    panel_round=item["panel_round"],
+                    slot_id=item["slot_id"],
+                )
+                for item in panel_rows
+            ),
+        )
+
+    def get_current_wait_condition(self, run_id: str) -> WaitConditionRecord | None:
+        """The Run's live Wait, resolved through its durable pointer.
+
+        A Wait Condition row is never mutated or deleted once created
+        (domain-model.md "Wait Condition": "immutable history, current only
+        through Run.wait_condition_id"); this is the only way to tell a
+        still-open Wait from one a later wake or replan already closed.
+        """
+        from orcest.workflow_reducer.ledger import load_view
+
+        view = load_view(self, run_id)
+        if view is None or view.wait_condition_id is None:
+            return None
+        return self.get_wait_condition(view.wait_condition_id)
+
+    def create_wait_condition(
+        self,
+        *,
+        wait_condition_id: str,
+        run_id: str,
+        reason: str,
+        resume_state: str,
+        specification_generation: int,
+        policy_hash: str,
+        created_from_kind: str,
+        created_from_id: str,
+        created_transition_sequence: int,
+        candidate_id: str | None = None,
+        forge_observation_id: str | None = None,
+        not_before_ms: int | None = None,
+        wake_kind: str | None = None,
+        wake_identity: Mapping[str, Any] | None = None,
+        health_observations: Sequence[HealthObservationRecord] = (),
+        panel_slots: Sequence[WaitConditionPanelSlotInput] = (),
+    ) -> WaitConditionRecord:
+        """Insert one immutable Wait Condition (or return the identical replay).
+
+        Callers MUST hold the same writer transaction that already rechecked
+        the wake predicate is not currently satisfied
+        (persistence-and-recovery.md "WaitCondition" GUARDED paragraphs for
+        Budget/Forge/Evidence/Secret/Capacity) -- this method freezes exactly
+        what it is given and never itself recomputes or reverifies a
+        predicate, so calling it unconditionally would risk creating a Wait
+        that a concurrent wake already raced past.
+
+        ``(created_from_kind, created_from_id)`` is the idempotent creation
+        identity: replaying the same creating Transition/trigger returns the
+        already-recorded Wait instead of a second row.
+        """
+        require_lowercase_uuid(wait_condition_id, field="wait_condition_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("run.state", resume_state)
+        enums.parse_enum("wait_condition.created_from_kind", created_from_kind)
+        _validate_wait_condition_shape(
+            reason=reason,
+            not_before_ms=not_before_ms,
+            wake_kind=wake_kind,
+            wake_identity=wake_identity,
+        )
+        if specification_generation < 0:
+            raise ValueError("wait condition specification_generation must be nonnegative")
+
+        ordered_health = tuple(
+            sorted(
+                health_observations,
+                key=lambda item: (
+                    item.scope_kind,
+                    item.scope_id,
+                    item.health_sequence,
+                    item.health_observation_id,
+                ),
+            )
+        )
+        health_ids = tuple(item.health_observation_id for item in ordered_health)
+        if len(set(health_ids)) != len(health_ids):
+            raise ValueError("wait condition health observation membership contains duplicate ids")
+        health_digest = bare_canonical_digest(list(health_ids))
+
+        if panel_slots and reason != "CAPACITY":
+            raise ValueError("only a CAPACITY wait condition may freeze panel-slot membership")
+        ordered_panel = tuple(
+            sorted(
+                panel_slots, key=lambda item: (item.assignment_kind, item.panel_round, item.slot_id)
+            )
+        )
+        panel_activity_ids = tuple(item.activity_id for item in ordered_panel)
+        if len(set(panel_activity_ids)) != len(panel_activity_ids):
+            raise ValueError("wait condition panel slot membership contains duplicate activities")
+        if len(
+            {(item.assignment_kind, item.panel_round, item.slot_id) for item in ordered_panel}
+        ) != len(ordered_panel):
+            raise ValueError(
+                "wait condition panel slot membership contains a duplicate "
+                "(assignment_kind, panel_round, slot_id)"
+            )
+        for slot in ordered_panel:
+            activity = self.get_activity(slot.activity_id)
+            if activity is None or activity.run_id != run_id:
+                raise ValueError(
+                    f"panel slot activity {slot.activity_id!r} is not owned by this run"
+                )
+            if activity.state != "PLANNED":
+                raise ValueError(
+                    f"panel slot activity {slot.activity_id!r} is not PLANNED "
+                    f"(state={activity.state!r})"
+                )
+            live = self.conn.execute(
+                "SELECT 1 FROM attempts WHERE activity_id = ? AND state IN ('OFFERED', 'CLAIMED')",
+                (slot.activity_id,),
             ).fetchone()
-            if existing is not None:
-                record = self.get_recovery_evidence(str(existing["recovery_evidence_id"]))
-                assert record is not None
-                if (
-                    record.recovery_evidence_id == recovery_evidence_id
-                    and record.category == category
-                    and record.failure_fingerprint == failure_fingerprint
-                    and record.strategy_index == strategy_index
-                    and record.selected_tactic == selected_tactic
-                    and record.attempt_count == attempt_count
-                    and record.repair_cycle_count == repair_cycle_count
-                    and record.diagnosis_count == diagnosis_count
-                    and record.rescue_epoch == rescue_epoch
-                    and record.resumed_wait_condition_id == resumed_wait_condition_id
-                    and record.resumed_human_boundary_id == resumed_human_boundary_id
-                    and record.human_resolution_id == human_resolution_id
-                    and record.activity_id == activity_id
-                    and record.attempt_id == attempt_id
-                    and record.candidate_id == candidate_id
-                    and record.forge_observation_id == forge_observation_id
-                    and record.selected_fallback == selected_fallback
-                    and record.health_observation_ids == health_ids
-                    and record.next_eligible_at_ms == next_eligible_at_ms
-                    and record.specification_generation == specification_generation
-                ):
-                    return record
-                raise IdempotencyConflictError(
-                    "recovery evidence source identity was reused with different content"
+            if live is not None:
+                raise ValueError(
+                    f"panel slot activity {slot.activity_id!r} still has a live "
+                    "OFFERED/CLAIMED Attempt"
+                )
+        panel_preimage = [
+            {
+                "activity_id": item.activity_id,
+                "assignment_kind": item.assignment_kind,
+                "panel_round": item.panel_round,
+                "slot_id": item.slot_id,
+            }
+            for item in ordered_panel
+        ]
+        panel_digest = bare_canonical_digest(panel_preimage)
+
+        wake_identity_payload = dict(wake_identity) if wake_identity is not None else None
+        wake_identity_json = (
+            canonical_json_text(wake_identity_payload)
+            if wake_identity_payload is not None
+            else None
+        )
+
+        existing = self.conn.execute(
+            "SELECT * FROM wait_conditions WHERE created_from_kind = ? AND created_from_id = ?",
+            (created_from_kind, created_from_id),
+        ).fetchone()
+        if existing is not None:
+            record = self.get_wait_condition(str(existing["wait_condition_id"]))
+            assert record is not None
+            same_panel = tuple(
+                (item.activity_id, item.assignment_kind, item.panel_round, item.slot_id)
+                for item in record.panel_slots
+            ) == tuple(
+                (item.activity_id, item.assignment_kind, item.panel_round, item.slot_id)
+                for item in ordered_panel
+            )
+            if (
+                record.wait_condition_id == wait_condition_id
+                and record.run_id == run_id
+                and record.reason == reason
+                and record.resume_state == resume_state
+                and record.specification_generation == specification_generation
+                and record.policy_hash == policy_hash
+                and record.candidate_id == candidate_id
+                and record.forge_observation_id == forge_observation_id
+                and record.not_before_ms == not_before_ms
+                and record.wake_kind == wake_kind
+                and record.wake_identity == wake_identity_payload
+                and record.health_observation_ids == health_ids
+                and same_panel
+            ):
+                return record
+            raise IdempotencyConflictError(
+                "wait condition creating Transition was reused with different content"
+            )
+
+        run_row = self.conn.execute(
+            "SELECT wait_condition_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run_row is None:
+            raise RunStoreError(f"run {run_id!r} was not found")
+        if run_row["wait_condition_id"] is not None:
+            raise ValueError(
+                f"run {run_id!r} already has a current wait condition "
+                f"({run_row['wait_condition_id']!r}); at most one can be current"
+            )
+
+        condition_preimage = {
+            "wait_condition_id": wait_condition_id,
+            "run_id": run_id,
+            "reason": reason,
+            "resume_state": resume_state,
+            "specification_generation": specification_generation,
+            "policy_hash": policy_hash,
+            "candidate_id": candidate_id,
+            "forge_observation_id": forge_observation_id,
+            "not_before_ms": not_before_ms,
+            "wake_kind": wake_kind,
+            "wake_identity": wake_identity_payload,
+            "health_observation_ids_digest": health_digest,
+            "panel_slots_digest": panel_digest,
+            "created_from_kind": created_from_kind,
+            "created_from_id": created_from_id,
+            "created_transition_sequence": created_transition_sequence,
+        }
+        digest = wait_condition_digest(condition_preimage)
+        now = _now_ms()
+        self.conn.execute(
+            "INSERT INTO wait_conditions(wait_condition_id, run_id, reason, resume_state, "
+            "specification_generation, candidate_id, policy_hash, forge_observation_id, "
+            "not_before_ms, wake_kind, wake_identity_json, health_observation_ids_digest, "
+            "panel_slots_digest, created_from_kind, created_from_id, condition_digest, "
+            "created_transition_sequence, created_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wait_condition_id,
+                run_id,
+                reason,
+                resume_state,
+                specification_generation,
+                candidate_id,
+                policy_hash,
+                forge_observation_id,
+                not_before_ms,
+                wake_kind,
+                wake_identity_json,
+                health_digest,
+                panel_digest,
+                created_from_kind,
+                created_from_id,
+                digest,
+                created_transition_sequence,
+                now,
+            ),
+        )
+        for ordinal, observation in enumerate(ordered_health):
+            self.conn.execute(
+                "INSERT INTO wait_condition_health_observations("
+                "wait_condition_id, observation_ordinal, health_observation_id) "
+                "VALUES (?, ?, ?)",
+                (wait_condition_id, ordinal, observation.health_observation_id),
+            )
+        for ordinal, slot in enumerate(ordered_panel):
+            self.conn.execute(
+                "INSERT INTO wait_condition_panel_slots(wait_condition_id, slot_ordinal, "
+                "activity_id, assignment_kind, panel_round, slot_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    wait_condition_id,
+                    ordinal,
+                    slot.activity_id,
+                    slot.assignment_kind,
+                    slot.panel_round,
+                    slot.slot_id,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE runs SET wait_condition_id = ?, updated_at_ms = ? WHERE run_id = ?",
+            (wait_condition_id, now, run_id),
+        )
+        record = self.get_wait_condition(wait_condition_id)
+        assert record is not None
+        return record
+
+    def _capacity_wait_satisfied(
+        self, *, scope_kind: str, scope_id: str, now_ms: int
+    ) -> WaitPredicateCheck:
+        observation = self.get_latest_health_observation(scope_kind, scope_id, now_ms=now_ms)
+        if observation is not None and observation.kind == "AVAILABLE":
+            return WaitPredicateCheck(
+                already_satisfied=True,
+                satisfying_source_kind="HEALTH_OBSERVATION",
+                satisfying_source_id=observation.health_observation_id,
+            )
+        return WaitPredicateCheck(already_satisfied=False)
+
+    def _panel_wait_satisfied(
+        self, slots: Sequence[WaitConditionPanelSlotInput], *, now_ms: int
+    ) -> WaitPredicateCheck:
+        """All-or-none: every named slot's Activity must itself still be
+        unfilled and compatibly available, or the panel Wait stays open
+        (domain-model.md "Wait Condition Panel Slot": "Partial staffing
+        cannot commit or be reconstructed")."""
+        if not slots:
+            return WaitPredicateCheck(already_satisfied=True)
+        for slot in slots:
+            activity = self.get_activity(slot.activity_id)
+            if activity is None or activity.state not in {"PLANNED", "READY"}:
+                return WaitPredicateCheck(already_satisfied=False)
+            if not self._activity_has_compatible_capacity(activity, now_ms=now_ms):
+                return WaitPredicateCheck(already_satisfied=False)
+        return WaitPredicateCheck(
+            already_satisfied=True, satisfying_source_kind="HEALTH_OBSERVATION"
+        )
+
+    def _budget_wait_satisfied(
+        self, wake_identity: Mapping[str, Any], *, now_ms: int
+    ) -> WaitPredicateCheck:
+        project_id = str(wake_identity["project_id"])
+        accounting_scope_id = str(wake_identity["accounting_scope_id"])
+        minimum_source_sequence = int(wake_identity["minimum_source_sequence"])
+        row = self.conn.execute(
+            "SELECT * FROM budget_reports WHERE project_id = ? AND accounting_scope_id = ? "
+            "ORDER BY source_sequence DESC LIMIT 1",
+            (project_id, accounting_scope_id),
+        ).fetchone()
+        if (
+            row is not None
+            and row["availability"] == "AVAILABLE"
+            and int(row["source_sequence"]) >= minimum_source_sequence
+        ):
+            return WaitPredicateCheck(
+                already_satisfied=True,
+                satisfying_source_kind="BUDGET_REPORT",
+                satisfying_source_id=row["budget_report_id"],
+            )
+        return WaitPredicateCheck(already_satisfied=False)
+
+    def _secret_recovery_wait_satisfied(
+        self, wake_identity: Mapping[str, Any]
+    ) -> WaitPredicateCheck:
+        secret_id = str(wake_identity["secret_id"])
+        minimum_version = int(wake_identity["minimum_version"])
+        projection = self.get_secret_current_version(secret_id)
+        if projection is not None and projection.current_version >= minimum_version:
+            return WaitPredicateCheck(
+                already_satisfied=True,
+                satisfying_source_kind="SECRET_VERSION",
+                satisfying_source_id=f"{secret_id}/{projection.current_version}",
+            )
+        return WaitPredicateCheck(already_satisfied=False)
+
+    def _external_dependency_wait_satisfied(
+        self, wake_identity: Mapping[str, Any]
+    ) -> WaitPredicateCheck:
+        project_id = str(wake_identity["project_id"])
+        target_kind = str(wake_identity["target_kind"])
+        target_id = str(wake_identity["target_id"])
+        minimum_observation_sequence = int(wake_identity["minimum_observation_sequence"])
+        row = self.conn.execute(
+            "SELECT * FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+            "AND target_id = ? AND kind = 'DEPENDENCY_STATE' AND observation_sequence >= ? "
+            "ORDER BY observation_sequence DESC LIMIT 1",
+            (project_id, target_kind, target_id, minimum_observation_sequence),
+        ).fetchone()
+        if row is not None:
+            fact = json.loads(row["fact_json"])
+            if fact.get("satisfied"):
+                return WaitPredicateCheck(
+                    already_satisfied=True,
+                    satisfying_source_kind="FORGE_OBSERVATION",
+                    satisfying_source_id=row["forge_observation_id"],
+                )
+        return WaitPredicateCheck(already_satisfied=False)
+
+    def _timer_wait_satisfied(
+        self, not_before_ms: int | None, *, now_ms: int
+    ) -> WaitPredicateCheck:
+        if not_before_ms is not None and now_ms >= not_before_ms:
+            return WaitPredicateCheck(already_satisfied=True, satisfying_source_kind="TIMER_FACT")
+        return WaitPredicateCheck(already_satisfied=False)
+
+    def submit_recovery_evidence(
+        self,
+        *,
+        recovery_evidence_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        category: str | None = None,
+        facts: Mapping[str, Any] | None = None,
+        activity_id: str | None = None,
+        attempt_id: str | None = None,
+        candidate_id: str | None = None,
+        forge_observation_id: str | None = None,
+        health_observations: Sequence[HealthObservationRecord] = (),
+        fallback_order: Sequence[str] = (),
+        exhausted_autonomous: bool = False,
+        resumed_wait_condition_id: str | None = None,
+        resumed_human_boundary_id: str | None = None,
+        human_resolution_id: str | None = None,
+        provider_retry_after_ms: int | None = None,
+        bounded_evidence: Mapping[str, Any] | None = None,
+        capacity_wake_identity: Mapping[str, str] | None = None,
+        panel_wait_slots: Sequence[WaitConditionPanelSlotInput] = (),
+        budget_wake_identity: Mapping[str, Any] | None = None,
+        external_wake_identity: Mapping[str, Any] | None = None,
+        accepted_at_ms: int | None = None,
+    ) -> RecoveryEvidenceOutcome:
+        """Classify one accepted failure, persist its Recovery Evidence,
+        apply the deterministic Transition it selects, and -- exactly when
+        that selects a ``WAIT_*`` tactic -- either durably freeze the Wait it
+        names or, when the writer-lock recheck finds the predicate already
+        met, skip the Wait entirely and return straight to the recovery
+        origin state (workflow-lifecycle.md/persistence-and-recovery.md
+        "Wait Condition"). The whole classify-recheck-insert sequence runs in
+        one writer transaction so a wake racing the insertion cannot be lost.
+        """
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.recovery import (
+            DEFAULT_RECOVERY_LIMITS,
+            HealthObservationRef,
+            RecoveryEvidenceInput,
+            classify_recovery_category,
+            select_recovery_decision,
+        )
+        from orcest.workflow_reducer.types import Trigger
+
+        require_lowercase_uuid(recovery_evidence_id, field="recovery_evidence_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        resolved_facts = dict(facts or {})
+        now = _now_ms() if accepted_at_ms is None else accepted_at_ms
+
+        with self.transaction():
+            view = load_view(self, run_id)
+            if view is None or view.state != "RECOVERING":
+                raise RunStoreError(
+                    f"run {run_id!r} is not RECOVERING; cannot submit recovery evidence"
                 )
 
-            recovery_sequence = self._next_recovery_sequence(run_id)
-            now = _now_ms()
-            evidence_preimage = {
-                "recovery_evidence_id": recovery_evidence_id,
-                "run_id": run_id,
-                "recovery_sequence": recovery_sequence,
+            prior = (
+                self.get_recovery_evidence(view.current_recovery_evidence_id)
+                if view.current_recovery_evidence_id is not None
+                else None
+            )
+            resolved_category = (
+                category
+                if category is not None
+                else classify_recovery_category(source_kind, resolved_facts)
+            )
+            resolved_activity_id = (
+                activity_id if activity_id is not None else view.recovery_activity_id
+            )
+            resolved_candidate_id = (
+                candidate_id if candidate_id is not None else view.current_candidate_id
+            )
+            evidence_input = RecoveryEvidenceInput(
+                source_kind=source_kind,
+                source_id=source_id,
+                category=resolved_category,
+                activity_id=resolved_activity_id,
+                attempt_id=attempt_id,
+                specification_generation=view.specification_generation,
+                candidate_id=resolved_candidate_id,
+                forge_observation_id=forge_observation_id,
+                failure_scope=resolved_facts.get("failure_scope", {}),
+                bounded_evidence=bounded_evidence or {},
+                prior_attempt_count=prior.attempt_count if prior is not None else 0,
+                prior_repair_cycle_count=prior.repair_cycle_count if prior is not None else 0,
+                prior_diagnosis_count=prior.diagnosis_count if prior is not None else 0,
+                rescue_epoch=prior.rescue_epoch if prior is not None else 0,
+                accepted_at_ms=now,
+                provider_retry_after_ms=provider_retry_after_ms,
+                fallback_order=tuple(fallback_order),
+                exhausted_autonomous=exhausted_autonomous,
+                resumed_wait_condition_id=resumed_wait_condition_id,
+                resumed_human_boundary_id=resumed_human_boundary_id,
+                human_resolution_id=human_resolution_id,
+            )
+            health_refs = tuple(
+                HealthObservationRef(
+                    health_observation_id=item.health_observation_id,
+                    scope_kind=item.scope_kind,
+                    scope_id=item.scope_id,
+                    health_sequence=item.health_sequence,
+                )
+                for item in health_observations
+            )
+            decision = select_recovery_decision(
+                evidence_input, health_observations=health_refs, limits=DEFAULT_RECOVERY_LIMITS
+            )
+
+            predicate_check: WaitPredicateCheck | None = None
+            wait_wake_kind: str | None = None
+            wait_wake_identity: Mapping[str, Any] | None = None
+            wait_not_before_ms: int | None = None
+            resolved_panel_slots: tuple[WaitConditionPanelSlotInput, ...] = ()
+
+            if decision.selected_tactic == "WAIT_CAPACITY":
+                if panel_wait_slots:
+                    resolved_panel_slots = tuple(panel_wait_slots)
+                    predicate_check = self._panel_wait_satisfied(resolved_panel_slots, now_ms=now)
+                    wait_wake_kind = "CAPACITY"
+                    wait_wake_identity = {
+                        "assignment_kind": resolved_panel_slots[0].assignment_kind,
+                        "panel_round": resolved_panel_slots[0].panel_round,
+                    }
+                else:
+                    if capacity_wake_identity is None:
+                        raise ValueError("WAIT_CAPACITY requires capacity_wake_identity")
+                    predicate_check = self._capacity_wait_satisfied(
+                        scope_kind=str(capacity_wake_identity["scope_kind"]),
+                        scope_id=str(capacity_wake_identity["scope_id"]),
+                        now_ms=now,
+                    )
+                    wait_wake_kind = "CAPACITY"
+                    wait_wake_identity = dict(capacity_wake_identity)
+            elif decision.selected_tactic == "WAIT_BUDGET":
+                if budget_wake_identity is None:
+                    raise ValueError("WAIT_BUDGET requires budget_wake_identity")
+                predicate_check = self._budget_wait_satisfied(budget_wake_identity, now_ms=now)
+                wait_wake_kind = "BUDGET_WINDOW"
+                wait_wake_identity = dict(budget_wake_identity)
+                wait_not_before_ms = int(budget_wake_identity["reset_at_ms"])
+            elif decision.selected_tactic in {"WAIT_BACKOFF", "WAIT_RATE_LIMIT"}:
+                wait_not_before_ms = decision.next_eligible_at_ms
+                predicate_check = self._timer_wait_satisfied(wait_not_before_ms, now_ms=now)
+            elif decision.selected_tactic == "WAIT_EXTERNAL":
+                reason = _external_wait_reason(decision.category)
+                if external_wake_identity is None:
+                    raise ValueError(f"WAIT_EXTERNAL/{reason} requires external_wake_identity")
+                if reason == "SECRET_RECOVERY":
+                    predicate_check = self._secret_recovery_wait_satisfied(external_wake_identity)
+                    wait_wake_kind = "SECRET"
+                    wait_wake_identity = dict(external_wake_identity)
+                elif reason == "EXTERNAL_DEPENDENCY":
+                    predicate_check = self._external_dependency_wait_satisfied(
+                        external_wake_identity
+                    )
+                    wait_wake_kind = "DEPENDENCY"
+                    wait_wake_identity = dict(external_wake_identity)
+                else:
+                    # FORGE_UNAVAILABLE / STORAGE_RECOVERY: no automatic
+                    # recheck source is wired yet (the health-probe leaf
+                    # this reuses has not landed); the Wait is always
+                    # created and a future health-probe leaf wakes it.
+                    predicate_check = WaitPredicateCheck(already_satisfied=False)
+                    wait_wake_kind = "FORGE" if reason == "FORGE_UNAVAILABLE" else "STORAGE"
+                    wait_wake_identity = dict(external_wake_identity)
+                    if reason == "FORGE_UNAVAILABLE":
+                        wait_not_before_ms = int(external_wake_identity["not_before_ms"])
+            elif decision.selected_tactic == "WAIT_EVIDENCE":
+                if external_wake_identity is None:
+                    raise ValueError("WAIT_EVIDENCE requires external_wake_identity")
+                wait_wake_kind = "EVIDENCE"
+                wait_wake_identity = dict(external_wake_identity)
+                wait_not_before_ms = int(external_wake_identity["not_before_ms"])
+                # Evidence membership/predicate revalidation is owned by the
+                # caller (it alone knows the applicable Candidate/panel/
+                # dispute/specification/policy/Change-Request bindings this
+                # predicate_digest covers); this leaf only freezes the Wait.
+                predicate_check = WaitPredicateCheck(already_satisfied=False)
+
+            predicate_already_met = bool(
+                predicate_check is not None and predicate_check.already_satisfied
+            )
+            pending_wait_condition_id = (
+                str(uuid.uuid4())
+                if predicate_check is not None and not predicate_already_met
+                else None
+            )
+
+            evidence = self._create_recovery_evidence(
+                recovery_evidence_id=recovery_evidence_id,
+                run_id=run_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                category=decision.category,
+                failure_fingerprint=decision.failure_fingerprint,
+                strategy_index=decision.strategy_index,
+                selected_tactic=decision.selected_tactic,
+                attempt_count=decision.attempt_count,
+                repair_cycle_count=decision.repair_cycle_count,
+                diagnosis_count=decision.diagnosis_count,
+                rescue_epoch=decision.rescue_epoch,
+                health_observations=health_observations,
+                specification_generation=view.specification_generation,
+                resumed_wait_condition_id=resumed_wait_condition_id,
+                resumed_human_boundary_id=resumed_human_boundary_id,
+                human_resolution_id=human_resolution_id,
+                activity_id=resolved_activity_id,
+                attempt_id=attempt_id,
+                candidate_id=resolved_candidate_id,
+                forge_observation_id=forge_observation_id,
+                selected_fallback=decision.selected_fallback,
+                next_eligible_at_ms=decision.next_eligible_at_ms,
+            )
+
+            trigger_facts: dict[str, Any] = {
+                **resolved_facts,
                 "source_kind": source_kind,
                 "source_id": source_id,
+                "category": decision.category,
+                "activity_id": resolved_activity_id,
+                "attempt_id": attempt_id,
+                "specification_generation": view.specification_generation,
+                "candidate_id": resolved_candidate_id,
+                "forge_observation_id": forge_observation_id,
+                "prior_attempt_count": evidence_input.prior_attempt_count,
+                "prior_repair_cycle_count": evidence_input.prior_repair_cycle_count,
+                "prior_diagnosis_count": evidence_input.prior_diagnosis_count,
+                "rescue_epoch": evidence_input.rescue_epoch,
+                "accepted_at_ms": now,
+                "provider_retry_after_ms": provider_retry_after_ms,
+                "fallback_order": tuple(fallback_order),
+                "exhausted_autonomous": exhausted_autonomous,
                 "resumed_wait_condition_id": resumed_wait_condition_id,
                 "resumed_human_boundary_id": resumed_human_boundary_id,
                 "human_resolution_id": human_resolution_id,
-                "activity_id": activity_id,
-                "attempt_id": attempt_id,
-                "specification_generation": specification_generation,
-                "candidate_id": candidate_id,
-                "forge_observation_id": forge_observation_id,
-                "category": category,
-                "failure_fingerprint": failure_fingerprint,
-                "strategy_index": strategy_index,
-                "selected_tactic": selected_tactic,
-                "attempt_count": attempt_count,
-                "repair_cycle_count": repair_cycle_count,
-                "diagnosis_count": diagnosis_count,
-                "rescue_epoch": rescue_epoch,
-                "selected_fallback": selected_fallback,
-                "health_observation_ids_digest": health_digest,
-                "next_eligible_at_ms": next_eligible_at_ms,
+                "selected_tactic": decision.selected_tactic,
+                "health_observations": [
+                    {
+                        "health_observation_id": item.health_observation_id,
+                        "scope_kind": item.scope_kind,
+                        "scope_id": item.scope_id,
+                        "health_sequence": item.health_sequence,
+                    }
+                    for item in health_observations
+                ],
+                "pending_wait_condition_id": pending_wait_condition_id,
             }
-            evidence_digest = recovery_evidence_digest(evidence_preimage)
-            self.conn.execute(
-                "INSERT INTO recovery_evidence(recovery_evidence_id, run_id, "
-                "recovery_sequence, source_kind, source_id, resumed_wait_condition_id, "
-                "resumed_human_boundary_id, human_resolution_id, activity_id, attempt_id, "
-                "specification_generation, candidate_id, forge_observation_id, category, "
-                "failure_fingerprint, strategy_index, selected_tactic, attempt_count, "
-                "repair_cycle_count, diagnosis_count, rescue_epoch, selected_fallback, "
-                "health_observation_ids_digest, next_eligible_at_ms, evidence_digest, "
-                "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    recovery_evidence_id,
-                    run_id,
-                    recovery_sequence,
-                    source_kind,
-                    source_id,
-                    resumed_wait_condition_id,
-                    resumed_human_boundary_id,
-                    human_resolution_id,
-                    activity_id,
-                    attempt_id,
-                    specification_generation,
-                    candidate_id,
-                    forge_observation_id,
-                    category,
-                    failure_fingerprint,
-                    strategy_index,
-                    selected_tactic,
-                    attempt_count,
-                    repair_cycle_count,
-                    diagnosis_count,
-                    rescue_epoch,
-                    selected_fallback,
-                    health_digest,
-                    next_eligible_at_ms,
-                    evidence_digest,
-                    now,
+            if predicate_check is not None:
+                trigger_facts["predicate_already_met"] = predicate_already_met
+
+            applied = apply(
+                self,
+                view,
+                Trigger(
+                    kind="RECOVERY_EVIDENCE", trigger_id=recovery_evidence_id, facts=trigger_facts
                 ),
+                run_id=run_id,
             )
-            for ordinal, observation in enumerate(ordered_health):
-                self.conn.execute(
-                    "INSERT INTO recovery_evidence_health_observations("
-                    "recovery_evidence_id, observation_ordinal, health_observation_id) "
-                    "VALUES (?, ?, ?)",
-                    (recovery_evidence_id, ordinal, observation.health_observation_id),
+
+            wait_condition: WaitConditionRecord | None = None
+            if (
+                not applied.replayed
+                and applied.reduction is not None
+                and applied.reduction.next_state == "WAITING"
+                and pending_wait_condition_id is not None
+            ):
+                resume_state = view.recovery_origin_state or "PLANNING"
+                wait_condition = self.create_wait_condition(
+                    wait_condition_id=pending_wait_condition_id,
+                    run_id=run_id,
+                    reason=str(applied.reduction.pointer_updates.get("wait_reason")),
+                    resume_state=resume_state,
+                    specification_generation=applied.reduction.specification_generation,
+                    policy_hash=view.policy_hash,
+                    created_from_kind="RECOVERY_EVIDENCE",
+                    created_from_id=recovery_evidence_id,
+                    created_transition_sequence=applied.transition.transition_sequence,
+                    candidate_id=resolved_candidate_id,
+                    forge_observation_id=forge_observation_id,
+                    not_before_ms=wait_not_before_ms,
+                    wake_kind=wait_wake_kind,
+                    wake_identity=wait_wake_identity,
+                    health_observations=health_observations,
+                    panel_slots=resolved_panel_slots,
                 )
-            self.conn.execute(
-                "UPDATE runs SET current_recovery_evidence_id = ?, updated_at_ms = ? "
-                "WHERE run_id = ?",
-                (recovery_evidence_id, now, run_id),
+
+            return RecoveryEvidenceOutcome(
+                recovery_evidence=evidence,
+                applied=applied,
+                selected_tactic=decision.selected_tactic,
+                wait_condition=wait_condition,
+                predicate_check=predicate_check,
             )
-            row = self.conn.execute(
-                "SELECT * FROM recovery_evidence WHERE recovery_evidence_id = ?",
-                (recovery_evidence_id,),
-            ).fetchone()
-            assert row is not None
-            return _row_to_recovery_evidence(row, health_observation_ids=health_ids)
 
     def _waiting_run_ids(self, *, wait_reason: str, project_id: str | None = None) -> list[str]:
         """Bytewise-sorted ``run_id``s currently ``WAITING`` for ``wait_reason``.
 
-        Runs are cheap projections reconstructed from durable pointers, not a
-        dedicated Wait Condition table (not yet built by any landed leaf);
-        this is the exact information the pure reducer already exposes via
-        ``RunView.wait_reason``.
+        A cheap candidate scan over ``state = 'WAITING'`` Runs, reconstructed
+        from durable pointers -- the exact information the pure reducer
+        already exposes via ``RunView.wait_reason``. Wake callers MUST still
+        resolve each candidate's actual current Wait Condition (via
+        :meth:`get_current_wait_condition`) and match its typed
+        ``wake_kind``/``wake_identity`` before proposing a wake: this scan
+        alone cannot distinguish two Waits sharing one reason but different
+        wake bindings.
         """
         from orcest.workflow_reducer.ledger import load_view
 
@@ -13277,51 +14336,246 @@ class RunStore:
         ]
         return sorted(matching)
 
+    def _clear_run_wait_pointer(self, run_id: str) -> None:
+        self.conn.execute(
+            "UPDATE runs SET wait_condition_id = NULL, updated_at_ms = ? WHERE run_id = ?",
+            (_now_ms(), run_id),
+        )
+
+    def _wake_wait_condition(
+        self,
+        *,
+        run_id: str,
+        view: Any,
+        trigger_kind: str,
+        trigger_id: str,
+    ) -> bool:
+        """Apply one wake Trigger to a Run already confirmed to be
+        ``WAITING`` on a Wait Condition whose typed wake predicate this
+        specific input satisfies. Clears the SQL ``runs.wait_condition_id``
+        pointer (the JSON pointer projection is cleared by the reducer's own
+        ``_wake`` reduction inside ``apply``) and returns whether this call
+        actually closed the Wait."""
+        from orcest.workflow_reducer.ledger import apply
+        from orcest.workflow_reducer.types import Trigger
+
+        applied = apply(
+            self,
+            view,
+            Trigger(kind=trigger_kind, trigger_id=trigger_id, facts={"wakes_wait": True}),
+            run_id=run_id,
+        )
+        if (
+            not applied.replayed
+            and applied.reduction is not None
+            and applied.reduction.reason_code == "WAIT_WAKE"
+        ):
+            self._clear_run_wait_pointer(run_id)
+            return True
+        return False
+
     def _wake_capacity_waits(self, observations: Sequence[HealthObservationRecord]) -> list[str]:
-        """Apply each ``AVAILABLE`` capacity Health Observation to every current
-        ``WAITING``/``CAPACITY`` Run, in bytewise Run-ID order, and return the
-        distinct ``wait_condition_id``s actually cleared.
+        """Apply each ``AVAILABLE`` capacity Health Observation to every
+        current ``WAITING``/``CAPACITY`` Run whose actual Wait Condition
+        names a matching scope (or, for a panel-scoped Wait, whose every
+        named slot is now compatibly available -- all or none), in bytewise
+        Run-ID order, and return the distinct ``wait_condition_id``s
+        actually cleared.
 
         Must run inside the same writer transaction as the Capacity Report and
         its Health Observations (domain-model.md "Capacity Report": "The
         Capacity Report, all Health Observations, per-Run wake
         Transitions/outboxes, and response commit in one writer
-        transaction"). ``UNAVAILABLE`` never proposes a wake here; only the
-        lifecycle reducer's own Health Observation handling may later use it.
+        transaction"). ``UNAVAILABLE`` never proposes a wake here. A Run
+        whose Wait names a scope this Report never touched, or a panel Wait
+        with any slot still incompatible, is left untouched -- an unrelated
+        or partial capacity signal cannot close it.
         """
         available = [obs for obs in observations if obs.kind == "AVAILABLE"]
         if not available:
             return []
-        from orcest.workflow_reducer.ledger import apply, load_view
-        from orcest.workflow_reducer.types import Trigger
+        available_by_scope = {(obs.scope_kind, obs.scope_id): obs for obs in available}
+        from orcest.workflow_reducer.ledger import load_view
 
+        now = _now_ms()
         woken: list[str] = []
         for run_id in self._waiting_run_ids(wait_reason="CAPACITY"):
             view = load_view(self, run_id)
             if view is None or view.state != "WAITING" or view.wait_reason != "CAPACITY":
                 continue
-            prior_wait_condition_id = view.wait_condition_id
-            for observation in available:
-                applied = apply(
-                    self,
-                    view,
-                    Trigger(
-                        kind="HEALTH_OBSERVATION",
-                        trigger_id=observation.health_observation_id,
-                        facts={"wakes_wait": True},
-                    ),
-                    run_id=run_id,
+            wait_condition_id = view.wait_condition_id
+            if wait_condition_id is None:
+                continue
+            wait = self.get_wait_condition(wait_condition_id)
+            if wait is None:
+                continue
+            if wait.panel_slots:
+                slots = tuple(
+                    WaitConditionPanelSlotInput(
+                        activity_id=slot.activity_id,
+                        assignment_kind=slot.assignment_kind,
+                        panel_round=slot.panel_round,
+                        slot_id=slot.slot_id,
+                    )
+                    for slot in wait.panel_slots
                 )
-                view = applied.view
-                if (
-                    not applied.replayed
-                    and applied.reduction is not None
-                    and applied.reduction.reason_code == "WAIT_WAKE"
-                ):
-                    if prior_wait_condition_id is not None:
-                        woken.append(prior_wait_condition_id)
-                    break
+                if not self._panel_wait_satisfied(slots, now_ms=now).already_satisfied:
+                    continue
+                trigger_id = available[0].health_observation_id
+            else:
+                identity = wait.wake_identity or {}
+                scope = (identity.get("scope_kind"), identity.get("scope_id"))
+                observation = available_by_scope.get(scope)  # type: ignore[arg-type]
+                if observation is None:
+                    continue
+                trigger_id = observation.health_observation_id
+            if self._wake_wait_condition(
+                run_id=run_id, view=view, trigger_kind="HEALTH_OBSERVATION", trigger_id=trigger_id
+            ):
+                woken.append(wait_condition_id)
         return woken
+
+    def _budget_wait_matching_run_ids(
+        self, *, project_id: str, accounting_scope_id: str, source_sequence: int
+    ) -> list[str]:
+        """Bytewise-sorted ``run_id``s currently ``WAITING``/``BUDGET`` in
+        this Project whose actual Wait Condition names this exact
+        accounting scope and whose minimum source sequence
+        ``source_sequence`` meets -- never every ``BUDGET``-reason Run in
+        the Project regardless of which exhausted scope/sequence it is
+        actually bound to (persistence-and-recovery.md "WAIT_BUDGET"
+        GUARDED paragraph)."""
+        from orcest.workflow_reducer.ledger import load_view
+
+        matching: list[str] = []
+        for run_id in self._waiting_run_ids(wait_reason="BUDGET", project_id=project_id):
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_reason != "BUDGET":
+                continue
+            if view.wait_condition_id is None:
+                continue
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.wake_identity is None:
+                continue
+            identity = wait.wake_identity
+            if (
+                identity.get("project_id") != project_id
+                or identity.get("accounting_scope_id") != accounting_scope_id
+                or source_sequence < int(identity.get("minimum_source_sequence", 0))
+            ):
+                continue
+            matching.append(run_id)
+        return matching
+
+    def wake_due_wait_timers(
+        self,
+        *,
+        source_kind: str = "SCHEDULED_SWEEP",
+        source_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> list[str]:
+        """Scheduled-sweep/startup-reconciliation pass over every currently
+        ``WAITING`` Run whose Wait's ``not_before_ms`` is now due.
+
+        Records one scope/deadline-unique ``WAIT_CONDITION_NOT_BEFORE`` Timer
+        Fact per due Wait (idempotent via :meth:`_record_timer_fact`'s
+        ``UNIQUE (scope_kind, scope_id, fired_for_ms)``: a repeated sweep
+        over a still-due Wait, or the exact same due deadline reappearing
+        after a Run's generation changes, records no second Fact and applies
+        no second wake) and, only on the call that actually records the
+        Fact, wakes the Run. Returns the distinct ``wait_condition_id``s
+        actually cleared.
+        """
+        enums.parse_enum("timer_fact.source_kind", source_kind)
+        now = _now_ms() if now_ms is None else now_ms
+        resolved_source_id = source_id if source_id is not None else str(uuid.uuid4())
+        from orcest.workflow_reducer.ledger import load_view
+
+        woken: list[str] = []
+        run_ids = sorted(
+            row["run_id"]
+            for row in self.conn.execute(
+                "SELECT run_id FROM runs WHERE state = 'WAITING'"
+            ).fetchall()
+        )
+        for run_id in run_ids:
+            view = load_view(self, run_id)
+            if view is None or view.state != "WAITING" or view.wait_condition_id is None:
+                continue
+            wait = self.get_wait_condition(view.wait_condition_id)
+            if wait is None or wait.not_before_ms is None or now < wait.not_before_ms:
+                continue
+            timer_fact = self._record_timer_fact(
+                scope_kind="WAIT_CONDITION_NOT_BEFORE",
+                scope_id=wait.wait_condition_id,
+                fired_for_ms=wait.not_before_ms,
+                source_kind=source_kind,
+                source_id=resolved_source_id,
+                run_id=run_id,
+                now_ms=now,
+            )
+            already_fired = self.conn.execute(
+                "SELECT 1 FROM transitions WHERE run_id = ? AND trigger_kind = 'TIMER_FACT' "
+                "AND trigger_id = ?",
+                (run_id, timer_fact.timer_fact_id),
+            ).fetchone()
+            if already_fired is not None:
+                continue
+            if self._wake_wait_condition(
+                run_id=run_id,
+                view=view,
+                trigger_kind="TIMER_FACT",
+                trigger_id=timer_fact.timer_fact_id,
+            ):
+                woken.append(wait.wait_condition_id)
+        return woken
+
+    def wake_secret_recovery_wait(self, run_id: str, *, secret_version_id: str) -> bool:
+        """Wake one ``WAITING``/``SECRET_RECOVERY`` Run whose Wait names the
+        exact logical Secret ID and whose now-current verified version meets
+        its ``minimum_version`` fence -- never a mutable-current tag or a
+        stale frozen SecretRef (persistence-and-recovery.md "SECRET_RECOVERY
+        Waits")."""
+        from orcest.workflow_reducer.ledger import load_view
+
+        view = load_view(self, run_id)
+        if view is None or view.state != "WAITING" or view.wait_reason != "SECRET_RECOVERY":
+            return False
+        if view.wait_condition_id is None:
+            return False
+        wait = self.get_wait_condition(view.wait_condition_id)
+        if wait is None or wait.wake_identity is None:
+            return False
+        check = self._secret_recovery_wait_satisfied(wait.wake_identity)
+        if not check.already_satisfied:
+            return False
+        return self._wake_wait_condition(
+            run_id=run_id, view=view, trigger_kind="SECRET_VERSION", trigger_id=secret_version_id
+        )
+
+    def wake_external_dependency_wait(self, run_id: str, *, forge_observation_id: str) -> bool:
+        """Wake one ``WAITING``/``EXTERNAL_DEPENDENCY`` Run whose Wait names
+        the exact Project/target and whose observation sequence/satisfaction
+        the accepted Forge Observation meets."""
+        from orcest.workflow_reducer.ledger import load_view
+
+        view = load_view(self, run_id)
+        if view is None or view.state != "WAITING" or view.wait_reason != "EXTERNAL_DEPENDENCY":
+            return False
+        if view.wait_condition_id is None:
+            return False
+        wait = self.get_wait_condition(view.wait_condition_id)
+        if wait is None or wait.wake_identity is None:
+            return False
+        check = self._external_dependency_wait_satisfied(wait.wake_identity)
+        if not check.already_satisfied:
+            return False
+        return self._wake_wait_condition(
+            run_id=run_id,
+            view=view,
+            trigger_kind="FORGE_OBSERVATION",
+            trigger_id=forge_observation_id,
+        )
 
     # -- Capacity Report -----------------------------------------------
 
@@ -14691,7 +15945,11 @@ class RunStore:
             availability = "AVAILABLE" if consumed_microunits < limit_microunits else "EXHAUSTED"
 
             member_run_ids = (
-                self._waiting_run_ids(wait_reason="BUDGET", project_id=project_id)
+                self._budget_wait_matching_run_ids(
+                    project_id=project_id,
+                    accounting_scope_id=accounting_scope_id,
+                    source_sequence=source_sequence,
+                )
                 if availability == "AVAILABLE"
                 else []
             )
@@ -14777,8 +16035,7 @@ class RunStore:
 
     def _run_budget_report_fanout(self, budget_report_id: str) -> None:
         """Must run inside ``self.transaction()``."""
-        from orcest.workflow_reducer.ledger import apply, load_view
-        from orcest.workflow_reducer.types import Trigger
+        from orcest.workflow_reducer.ledger import load_view
 
         row = self.conn.execute(
             "SELECT * FROM budget_reports WHERE budget_report_id = ?", (budget_report_id,)
@@ -14794,16 +16051,12 @@ class RunStore:
         ).fetchall()
         for member in members:
             view = load_view(self, member["run_id"])
-            if view is not None:
-                apply(
-                    self,
-                    view,
-                    Trigger(
-                        kind="BUDGET_REPORT",
-                        trigger_id=budget_report_id,
-                        facts={"wakes_wait": True},
-                    ),
+            if view is not None and view.state == "WAITING":
+                self._wake_wait_condition(
                     run_id=member["run_id"],
+                    view=view,
+                    trigger_kind="BUDGET_REPORT",
+                    trigger_id=budget_report_id,
                 )
             self.conn.execute(
                 "UPDATE budget_reports SET next_member_ordinal = ? WHERE budget_report_id = ?",
