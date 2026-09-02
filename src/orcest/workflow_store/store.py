@@ -14019,18 +14019,8 @@ class RunStore:
         if existing_request is not None and existing_request.state == "COMPLETED":
             if existing_request.health_probe_fact_id != health_probe_fact_id:
                 raise IdempotencyConflictError("health probe completion fact id changed")
-            applied, evidences = self.run_health_probe_fact_fanout(health_probe_fact_id)
-            completion = self._health_probe_completion_from_fact_id(
-                health_probe_fact_id, replayed=True
-            )
-            return HealthProbeCompletion(
-                request=completion.request,
-                fact=completion.fact,
-                observation=completion.observation,
-                applied_run_ids=tuple(applied),
-                recovery_evidence_ids=tuple(evidences),
-                replayed=True,
-            )
+            self.run_health_probe_fact_fanout(health_probe_fact_id)
+            return self._health_probe_completion_from_fact_id(health_probe_fact_id, replayed=True)
         with self.transaction():
             request_row = self.conn.execute(
                 "SELECT * FROM health_probe_requests WHERE health_probe_request_id = ?",
@@ -14148,18 +14138,8 @@ class RunStore:
                 (now, health_probe_fact_id, health_probe_request_id),
             )
 
-        applied, evidences = self.run_health_probe_fact_fanout(health_probe_fact_id)
-        completion = self._health_probe_completion_from_fact_id(
-            health_probe_fact_id, replayed=False
-        )
-        return HealthProbeCompletion(
-            request=completion.request,
-            fact=completion.fact,
-            observation=completion.observation,
-            applied_run_ids=tuple(applied),
-            recovery_evidence_ids=tuple(evidences),
-            replayed=False,
-        )
+        self.run_health_probe_fact_fanout(health_probe_fact_id)
+        return self._health_probe_completion_from_fact_id(health_probe_fact_id, replayed=False)
 
     def _health_probe_completion_from_fact_id(
         self, health_probe_fact_id: str, *, replayed: bool

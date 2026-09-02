@@ -128,6 +128,10 @@ def test_health_probe_unavailable_suspends_only_frozen_members_and_replays_once(
     assert replay.replayed is True
     assert first.fact.affected_run_ids == (affected,)
     assert replay.fact.affected_run_ids == (affected,)
+    assert first.applied_run_ids == (affected,)
+    assert replay.applied_run_ids == (affected,)
+    assert first.recovery_evidence_ids
+    assert replay.recovery_evidence_ids == first.recovery_evidence_ids
     assert store.conn.execute("SELECT COUNT(*) FROM health_probe_facts").fetchone()[0] == 1
     assert store.conn.execute("SELECT COUNT(*) FROM health_observations").fetchone()[0] == 1
     assert (
