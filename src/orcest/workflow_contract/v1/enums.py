@@ -810,10 +810,15 @@ HealthProbeKind = _register_enum(
 HealthProbeRequestState = _register_enum(
     "health_probe_request.state", "HealthProbeRequestState", ["PENDING", "COMPLETED", "SUPERSEDED"]
 )
+HealthProbeFactOutcome = _register_enum(
+    "health_probe_fact.outcome",
+    "HealthProbeFactOutcome",
+    ["AVAILABLE", "UNAVAILABLE", "RATE_LIMITED", "EXHAUSTED"],
+)
 HealthProbeIntegrityFailureCode = _register_enum(
     "health_probe_fact.integrity_failure_code",
     "HealthProbeIntegrityFailureCode",
-    ["UNAVAILABLE", "MISSING", "UNREADABLE", "DIGEST_MISMATCH", "KEYED_ATTESTATION_MISMATCH"],
+    ["MISSING", "UNREADABLE", "DIGEST_MISMATCH", "KEYED_ATTESTATION_MISMATCH"],
 )
 HealthScopeKind = _register_enum(
     "health_probe.scope_kind",

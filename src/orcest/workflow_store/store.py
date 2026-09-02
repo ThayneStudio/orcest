@@ -41,6 +41,9 @@ from orcest.workflow_contract.v1.digest import (
     forge_observation_schedule_digest,
     forge_request_failure_fact_digest,
     health_observation_payload_digest,
+    health_probe_fact_digest,
+    health_probe_request_digest,
+    health_probe_run_membership_digest,
     is_valid_content_digest,
     launch_capability_claims_digest,
     policy_digest,
@@ -76,6 +79,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     CREDENTIAL_ROTATION_RESULT_PROTOCOL,
     ERROR_PROTOCOL,
     FORGE_OBSERVATION_REQUEST_PROTOCOL,
+    HEALTH_PROBE_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
@@ -91,7 +95,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1155,6 +1159,62 @@ class HealthObservationRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class HealthProbeRequestRecord:
+    health_probe_request_id: str
+    protocol_version: str
+    probe_kind: str
+    scope_kind: str
+    scope_id: str
+    request_identity: str
+    subject_bindings_json: str
+    expected_revision: int | None
+    implementation_digest: str
+    input_digest: str
+    evidence_digest: str
+    request_digest: str
+    state: str
+    outbox_id: str
+    created_at_ms: int
+    not_after_ms: int | None = None
+    completed_at_ms: int | None = None
+    health_probe_fact_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HealthProbeFactRecord:
+    health_probe_fact_id: str
+    health_probe_request_id: str
+    probe_kind: str
+    scope_kind: str
+    scope_id: str
+    request_identity: str
+    outcome: str
+    observed_revision: int | None
+    implementation_digest: str
+    input_digest: str
+    evidence_digest: str
+    integrity_failure_code: str | None
+    subject_bindings_json: str
+    affected_run_ids_digest: str
+    health_observation_id: str
+    fact_digest: str
+    recorded_at_ms: int
+    affected_run_ids: tuple[str, ...] = ()
+    fanout_cursor_ordinal: int = 0
+    fanout_completed_at_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HealthProbeCompletion:
+    request: HealthProbeRequestRecord
+    fact: HealthProbeFactRecord
+    observation: HealthObservationRecord
+    applied_run_ids: tuple[str, ...]
+    recovery_evidence_ids: tuple[str, ...]
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveryEvidenceRecord:
     recovery_evidence_id: str
     run_id: str
@@ -1744,11 +1804,142 @@ def _validate_capacity_report_entries(entries: Sequence["CapacityReportEntryInpu
                 raise ValueError("WORKER_PROFILE must not carry session_evidence")
             if entry.worker_profile != entry.scope_id:
                 raise ValueError("WORKER_PROFILE scope_id must equal worker_profile")
+
         else:
             if entry.session_evidence is not None or entry.worker_profile is not None:
                 raise ValueError("CAPACITY_POOL must not carry worker_profile/session_evidence")
             if entry.capacity_pool_id != entry.scope_id:
                 raise ValueError("CAPACITY_POOL scope_id must equal capacity_pool_id")
+
+
+_HEALTH_PROBE_SCOPE_MATRIX: Mapping[str, frozenset[str]] = {
+    "FORGE_CONNECTIVITY": frozenset({"FORGE"}),
+    "PROVIDER_ACCOUNT_STATUS": frozenset({"PROVIDER_ACCOUNT"}),
+    "STORAGE_OBJECT_INTEGRITY": frozenset({"STORAGE"}),
+    "SECRET_VERSION_INTEGRITY": frozenset({"SECRET"}),
+}
+
+_HEALTH_PROBE_OUTCOME_MATRIX: Mapping[str, frozenset[str]] = {
+    "FORGE_CONNECTIVITY": frozenset({"AVAILABLE", "UNAVAILABLE"}),
+    "PROVIDER_ACCOUNT_STATUS": frozenset({"AVAILABLE", "UNAVAILABLE", "RATE_LIMITED", "EXHAUSTED"}),
+    "STORAGE_OBJECT_INTEGRITY": frozenset({"AVAILABLE", "UNAVAILABLE"}),
+    "SECRET_VERSION_INTEGRITY": frozenset({"AVAILABLE", "UNAVAILABLE"}),
+}
+
+_HEALTH_PROBE_INTEGRITY_FAILURE_MATRIX: Mapping[str, frozenset[str]] = {
+    "STORAGE_OBJECT_INTEGRITY": frozenset({"MISSING", "UNREADABLE", "DIGEST_MISMATCH"}),
+    "SECRET_VERSION_INTEGRITY": frozenset({"MISSING", "UNREADABLE", "KEYED_ATTESTATION_MISMATCH"}),
+}
+
+
+def _validate_health_probe_matrix(*, probe_kind: str, scope_kind: str) -> None:
+    allowed_scopes = _HEALTH_PROBE_SCOPE_MATRIX.get(probe_kind)
+    if allowed_scopes is None:
+        enums.parse_enum("health_probe.probe_kind", probe_kind)
+        raise ValueError(f"unsupported health probe kind {probe_kind!r}")
+    if scope_kind not in allowed_scopes:
+        raise ValueError(f"{probe_kind} cannot probe health scope {scope_kind}")
+
+
+def _validate_health_probe_outcome(*, probe_kind: str, scope_kind: str, outcome: str) -> None:
+    _validate_health_probe_matrix(probe_kind=probe_kind, scope_kind=scope_kind)
+    allowed = _HEALTH_PROBE_OUTCOME_MATRIX[probe_kind]
+    if outcome not in allowed:
+        raise ValueError(f"{probe_kind} cannot produce outcome {outcome}")
+
+
+def _validate_health_probe_integrity_failure(
+    *, probe_kind: str, outcome: str, integrity_failure_code: str | None
+) -> None:
+    allowed = _HEALTH_PROBE_INTEGRITY_FAILURE_MATRIX.get(probe_kind)
+    if outcome == "UNAVAILABLE" and allowed is not None:
+        if integrity_failure_code not in allowed:
+            raise ValueError(
+                f"{probe_kind} UNAVAILABLE requires integrity_failure_code in {sorted(allowed)!r}"
+            )
+        return
+    if integrity_failure_code is not None:
+        raise ValueError(f"{probe_kind} outcome {outcome} must not carry integrity_failure_code")
+
+
+def _health_probe_subject(fact: "HealthProbeFactRecord") -> dict[str, Any]:
+    subject = json.loads(fact.subject_bindings_json)
+    if not isinstance(subject, dict):
+        raise RunStoreError("health probe fact subject bindings are corrupt")
+    return {key: value for key, value in subject.items() if key != "probe_evidence"}
+
+
+def _parse_secret_version_scope(
+    scope_id: str, subject_bindings: Mapping[str, Any]
+) -> tuple[str, int]:
+    secret_id = subject_bindings.get("secret_id")
+    version = subject_bindings.get("version")
+    if secret_id is None or version is None:
+        left, sep, right = scope_id.partition("/")
+        if sep:
+            secret_id = left
+            version = right
+    if secret_id is None or version is None:
+        raise ValueError("SECRET_VERSION_INTEGRITY requires secret_id/version bindings")
+    require_lowercase_uuid(str(secret_id), field="secret_id")
+    parsed_version = int(version)
+    if parsed_version < 1:
+        raise ValueError("secret version must be positive")
+    return str(secret_id), parsed_version
+
+
+def _health_probe_recovery_category(fact: "HealthProbeFactRecord") -> str:
+    if fact.outcome == "AVAILABLE":
+        if fact.probe_kind in {"STORAGE_OBJECT_INTEGRITY", "SECRET_VERSION_INTEGRITY"}:
+            return "INTEGRITY_SUSPECTED"
+        if fact.scope_kind == "PROVIDER_ACCOUNT":
+            return "CAPACITY"
+        if fact.scope_kind == "FORGE":
+            return "FORGE_TRANSIENT"
+    if fact.scope_kind == "SECRET":
+        return "CREDENTIAL"
+    if fact.scope_kind == "STORAGE":
+        return "STORAGE"
+    if fact.scope_kind == "PROVIDER_ACCOUNT":
+        return "PROVIDER_RATE_LIMIT" if fact.outcome == "RATE_LIMITED" else "CAPACITY"
+    if fact.scope_kind == "FORGE":
+        return "PROVIDER_RATE_LIMIT" if fact.outcome == "RATE_LIMITED" else "FORGE_TRANSIENT"
+    raise ValueError(f"cannot map health probe fact {fact.health_probe_fact_id!r} to recovery")
+
+
+def _health_probe_wait_kind(fact: "HealthProbeFactRecord", selected_tactic: str) -> str | None:
+    if selected_tactic in {"WAIT_BACKOFF", "RETRY_EXECUTION"}:
+        return None
+    if selected_tactic == "WAIT_RATE_LIMIT":
+        return "RATE_LIMIT_RESET"
+    if selected_tactic == "WAIT_CAPACITY":
+        return "CAPACITY"
+    if fact.scope_kind == "SECRET":
+        return "SECRET"
+    if fact.scope_kind == "STORAGE":
+        return "STORAGE"
+    if fact.scope_kind == "FORGE":
+        return "FORGE"
+    return None
+
+
+def _health_probe_wait_identity(
+    fact: "HealthProbeFactRecord", selected_tactic: str
+) -> dict[str, Any] | None:
+    if selected_tactic in {"WAIT_BACKOFF", "RETRY_EXECUTION"}:
+        return None
+    if selected_tactic in {"WAIT_CAPACITY", "WAIT_RATE_LIMIT"}:
+        return {"scope_kind": fact.scope_kind, "scope_id": fact.scope_id}
+    subject = _health_probe_subject(fact)
+    if fact.scope_kind == "SECRET":
+        secret_id, version = _parse_secret_version_scope(fact.scope_id, subject)
+        return {"secret_id": secret_id, "minimum_version": version}
+    return {
+        "scope_kind": fact.scope_kind,
+        "scope_id": fact.scope_id,
+        "object_kind": subject.get("object_kind"),
+        "object_id": subject.get("object_id", fact.scope_id),
+    }
 
 
 def _require_target_id(observation: "ForgeObservationInput", *, field: str) -> str:
@@ -2345,6 +2536,56 @@ def _row_to_recovery_evidence(
         evidence_digest=row["evidence_digest"],
         recorded_at_ms=row["recorded_at_ms"],
         health_observation_ids=tuple(health_observation_ids),
+    )
+
+
+def _row_to_health_probe_request(row: sqlite3.Row) -> HealthProbeRequestRecord:
+    return HealthProbeRequestRecord(
+        health_probe_request_id=row["health_probe_request_id"],
+        protocol_version=row["protocol_version"],
+        probe_kind=row["probe_kind"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        request_identity=row["request_identity"],
+        subject_bindings_json=row["subject_bindings_json"],
+        expected_revision=row["expected_revision"],
+        implementation_digest=row["implementation_digest"],
+        input_digest=row["input_digest"],
+        evidence_digest=row["evidence_digest"],
+        request_digest=row["request_digest"],
+        state=row["state"],
+        outbox_id=row["outbox_id"],
+        not_after_ms=row["not_after_ms"],
+        completed_at_ms=row["completed_at_ms"],
+        health_probe_fact_id=row["health_probe_fact_id"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_health_probe_fact(
+    row: sqlite3.Row, *, affected_run_ids: Sequence[str] = ()
+) -> HealthProbeFactRecord:
+    return HealthProbeFactRecord(
+        health_probe_fact_id=row["health_probe_fact_id"],
+        health_probe_request_id=row["health_probe_request_id"],
+        probe_kind=row["probe_kind"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        request_identity=row["request_identity"],
+        outcome=row["outcome"],
+        observed_revision=row["observed_revision"],
+        implementation_digest=row["implementation_digest"],
+        input_digest=row["input_digest"],
+        evidence_digest=row["evidence_digest"],
+        integrity_failure_code=row["integrity_failure_code"],
+        subject_bindings_json=row["subject_bindings_json"],
+        affected_run_ids_digest=row["affected_run_ids_digest"],
+        health_observation_id=row["health_observation_id"],
+        fact_digest=row["fact_digest"],
+        fanout_cursor_ordinal=row["fanout_cursor_ordinal"],
+        fanout_completed_at_ms=row["fanout_completed_at_ms"],
+        recorded_at_ms=row["recorded_at_ms"],
+        affected_run_ids=tuple(affected_run_ids),
     )
 
 
@@ -4206,6 +4447,127 @@ CREATE TABLE IF NOT EXISTS controller_operation_facts (
     OR (outcome = 'FAILED' AND failure_category IS NOT NULL AND candidate_id IS NULL)
   )
 );
+
+CREATE TABLE IF NOT EXISTS health_probe_requests (
+  health_probe_request_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  probe_kind TEXT NOT NULL CHECK (
+    probe_kind IN ({_sql_in(_enum_values("health_probe.probe_kind"))})
+  ),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  request_identity TEXT NOT NULL,
+  subject_bindings_json TEXT NOT NULL,
+  expected_revision INTEGER,
+  implementation_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("health_probe_request.state"))})
+  ),
+  outbox_id TEXT NOT NULL UNIQUE REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
+  not_after_ms INTEGER CHECK (not_after_ms IS NULL OR not_after_ms > created_at_ms),
+  completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  health_probe_fact_id TEXT UNIQUE,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (probe_kind, scope_kind, scope_id, request_identity),
+  CHECK (
+    (state = 'PENDING' AND completed_at_ms IS NULL AND health_probe_fact_id IS NULL)
+    OR (state = 'COMPLETED' AND completed_at_ms IS NOT NULL AND health_probe_fact_id IS NOT NULL)
+    OR (state = 'SUPERSEDED' AND completed_at_ms IS NOT NULL AND health_probe_fact_id IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_probe_requests_pending
+ON health_probe_requests(state, not_after_ms) WHERE state = 'PENDING';
+
+CREATE TABLE IF NOT EXISTS health_probe_facts (
+  health_probe_fact_id TEXT PRIMARY KEY,
+  health_probe_request_id TEXT NOT NULL UNIQUE
+    REFERENCES health_probe_requests(health_probe_request_id) ON DELETE RESTRICT,
+  probe_kind TEXT NOT NULL CHECK (
+    probe_kind IN ({_sql_in(_enum_values("health_probe.probe_kind"))})
+  ),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  request_identity TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("health_probe_fact.outcome"))})
+  ),
+  observed_revision INTEGER,
+  implementation_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  integrity_failure_code TEXT CHECK (
+    integrity_failure_code IS NULL
+    OR integrity_failure_code IN ({
+    _sql_in(_enum_values("health_probe_fact.integrity_failure_code"))
+})
+  ),
+  subject_bindings_json TEXT NOT NULL,
+  affected_run_ids_digest TEXT NOT NULL,
+  health_observation_id TEXT NOT NULL UNIQUE,
+  fact_digest TEXT NOT NULL UNIQUE,
+  fanout_cursor_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (fanout_cursor_ordinal >= 0),
+  fanout_completed_at_ms INTEGER CHECK (
+    fanout_completed_at_ms IS NULL OR fanout_completed_at_ms >= recorded_at_ms
+  ),
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (probe_kind, scope_kind, scope_id, request_identity),
+  CHECK (
+    (
+      probe_kind = 'STORAGE_OBJECT_INTEGRITY'
+      AND (
+        (outcome = 'AVAILABLE' AND integrity_failure_code IS NULL)
+        OR (
+          outcome = 'UNAVAILABLE'
+          AND integrity_failure_code IN ('MISSING', 'UNREADABLE', 'DIGEST_MISMATCH')
+        )
+      )
+    )
+    OR (
+      probe_kind = 'SECRET_VERSION_INTEGRITY'
+      AND (
+        (outcome = 'AVAILABLE' AND integrity_failure_code IS NULL)
+        OR (
+          outcome = 'UNAVAILABLE'
+          AND integrity_failure_code IN ('MISSING', 'UNREADABLE', 'KEYED_ATTESTATION_MISMATCH')
+        )
+      )
+    )
+    OR (
+      probe_kind = 'FORGE_CONNECTIVITY'
+      AND outcome IN ('AVAILABLE', 'UNAVAILABLE')
+      AND integrity_failure_code IS NULL
+    )
+    OR (
+      probe_kind = 'PROVIDER_ACCOUNT_STATUS'
+      AND outcome IN ('AVAILABLE', 'UNAVAILABLE', 'RATE_LIMITED', 'EXHAUSTED')
+      AND integrity_failure_code IS NULL
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS health_probe_fact_runs (
+  health_probe_fact_id TEXT NOT NULL
+    REFERENCES health_probe_facts(health_probe_fact_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  transition_sequence INTEGER,
+  recovery_evidence_id TEXT,
+  PRIMARY KEY (health_probe_fact_id, member_ordinal),
+  UNIQUE (health_probe_fact_id, run_id),
+  CHECK (
+    (transition_sequence IS NULL AND recovery_evidence_id IS NULL)
+    OR transition_sequence IS NOT NULL
+  )
+);
+
 CREATE TABLE IF NOT EXISTS health_observations (
   health_observation_id TEXT PRIMARY KEY,
   scope_kind TEXT NOT NULL CHECK (
@@ -5095,6 +5457,125 @@ _ADD_WAIT_CONDITION_ID = """
 ALTER TABLE runs ADD COLUMN wait_condition_id TEXT;
 """
 
+_V16_TO_V17 = f"""
+CREATE TABLE IF NOT EXISTS health_probe_requests (
+  health_probe_request_id TEXT PRIMARY KEY,
+  protocol_version TEXT NOT NULL,
+  probe_kind TEXT NOT NULL CHECK (
+    probe_kind IN ({_sql_in(_enum_values("health_probe.probe_kind"))})
+  ),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  request_identity TEXT NOT NULL,
+  subject_bindings_json TEXT NOT NULL,
+  expected_revision INTEGER,
+  implementation_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("health_probe_request.state"))})
+  ),
+  outbox_id TEXT NOT NULL UNIQUE REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
+  not_after_ms INTEGER CHECK (not_after_ms IS NULL OR not_after_ms > created_at_ms),
+  completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  health_probe_fact_id TEXT UNIQUE,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (probe_kind, scope_kind, scope_id, request_identity),
+  CHECK (
+    (state = 'PENDING' AND completed_at_ms IS NULL AND health_probe_fact_id IS NULL)
+    OR (state = 'COMPLETED' AND completed_at_ms IS NOT NULL AND health_probe_fact_id IS NOT NULL)
+    OR (state = 'SUPERSEDED' AND completed_at_ms IS NOT NULL AND health_probe_fact_id IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_health_probe_requests_pending
+ON health_probe_requests(state, not_after_ms) WHERE state = 'PENDING';
+CREATE TABLE IF NOT EXISTS health_probe_facts (
+  health_probe_fact_id TEXT PRIMARY KEY,
+  health_probe_request_id TEXT NOT NULL UNIQUE
+    REFERENCES health_probe_requests(health_probe_request_id) ON DELETE RESTRICT,
+  probe_kind TEXT NOT NULL CHECK (
+    probe_kind IN ({_sql_in(_enum_values("health_probe.probe_kind"))})
+  ),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("health_probe.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  request_identity TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ({_sql_in(_enum_values("health_probe_fact.outcome"))})
+  ),
+  observed_revision INTEGER,
+  implementation_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  integrity_failure_code TEXT CHECK (
+    integrity_failure_code IS NULL
+    OR integrity_failure_code IN ({
+    _sql_in(_enum_values("health_probe_fact.integrity_failure_code"))
+})
+  ),
+  subject_bindings_json TEXT NOT NULL,
+  affected_run_ids_digest TEXT NOT NULL,
+  health_observation_id TEXT NOT NULL UNIQUE,
+  fact_digest TEXT NOT NULL UNIQUE,
+  fanout_cursor_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (fanout_cursor_ordinal >= 0),
+  fanout_completed_at_ms INTEGER CHECK (
+    fanout_completed_at_ms IS NULL OR fanout_completed_at_ms >= recorded_at_ms
+  ),
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (probe_kind, scope_kind, scope_id, request_identity),
+  CHECK (
+    (
+      probe_kind = 'STORAGE_OBJECT_INTEGRITY'
+      AND (
+        (outcome = 'AVAILABLE' AND integrity_failure_code IS NULL)
+        OR (
+          outcome = 'UNAVAILABLE'
+          AND integrity_failure_code IN ('MISSING', 'UNREADABLE', 'DIGEST_MISMATCH')
+        )
+      )
+    )
+    OR (
+      probe_kind = 'SECRET_VERSION_INTEGRITY'
+      AND (
+        (outcome = 'AVAILABLE' AND integrity_failure_code IS NULL)
+        OR (
+          outcome = 'UNAVAILABLE'
+          AND integrity_failure_code IN ('MISSING', 'UNREADABLE', 'KEYED_ATTESTATION_MISMATCH')
+        )
+      )
+    )
+    OR (
+      probe_kind = 'FORGE_CONNECTIVITY'
+      AND outcome IN ('AVAILABLE', 'UNAVAILABLE')
+      AND integrity_failure_code IS NULL
+    )
+    OR (
+      probe_kind = 'PROVIDER_ACCOUNT_STATUS'
+      AND outcome IN ('AVAILABLE', 'UNAVAILABLE', 'RATE_LIMITED', 'EXHAUSTED')
+      AND integrity_failure_code IS NULL
+    )
+  )
+);
+CREATE TABLE IF NOT EXISTS health_probe_fact_runs (
+  health_probe_fact_id TEXT NOT NULL
+    REFERENCES health_probe_facts(health_probe_fact_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  transition_sequence INTEGER,
+  recovery_evidence_id TEXT,
+  PRIMARY KEY (health_probe_fact_id, member_ordinal),
+  UNIQUE (health_probe_fact_id, run_id),
+  CHECK (
+    (transition_sequence IS NULL AND recovery_evidence_id IS NULL)
+    OR transition_sequence IS NOT NULL
+  )
+);
+"""
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -5268,7 +5749,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -5648,8 +6129,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 15
+            elif current == 15:
                 self.conn.executescript(
                     "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + add_wait_condition_pointer
                 )
@@ -5659,6 +6139,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-wait-and-wake-processing",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 16
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V16_TO_V17)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-health-probes",
                         _now_ms(),
                     ),
                 )
@@ -13354,6 +13846,657 @@ class RunStore:
             (scope_kind, scope_id, now),
         ).fetchone()
         return None if row is None else self._row_to_health_observation(row)
+
+    def get_health_probe_request(
+        self, health_probe_request_id: str
+    ) -> HealthProbeRequestRecord | None:
+        require_lowercase_uuid(health_probe_request_id, field="health_probe_request_id")
+        row = self.conn.execute(
+            "SELECT * FROM health_probe_requests WHERE health_probe_request_id = ?",
+            (health_probe_request_id,),
+        ).fetchone()
+        return None if row is None else _row_to_health_probe_request(row)
+
+    def get_health_probe_fact(self, health_probe_fact_id: str) -> HealthProbeFactRecord | None:
+        require_lowercase_uuid(health_probe_fact_id, field="health_probe_fact_id")
+        row = self.conn.execute(
+            "SELECT * FROM health_probe_facts WHERE health_probe_fact_id = ?",
+            (health_probe_fact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        members = self.conn.execute(
+            "SELECT run_id FROM health_probe_fact_runs WHERE health_probe_fact_id = ? "
+            "ORDER BY member_ordinal",
+            (health_probe_fact_id,),
+        ).fetchall()
+        return _row_to_health_probe_fact(
+            row, affected_run_ids=tuple(member["run_id"] for member in members)
+        )
+
+    def create_health_probe_request(
+        self,
+        *,
+        health_probe_request_id: str,
+        probe_kind: str,
+        scope_kind: str,
+        scope_id: str,
+        request_identity: str,
+        subject_bindings: Mapping[str, Any],
+        implementation_digest: str,
+        input_digest: str,
+        evidence_digest: str,
+        expected_revision: int | None = None,
+        outbox_id: str | None = None,
+        destination: str = "controller",
+        not_after_ms: int | None = None,
+        now_ms: int | None = None,
+    ) -> HealthProbeRequestRecord:
+        """Persist a Health Probe Request and outbox before probe I/O.
+
+        ``request_identity`` is the deterministic replay key for the exact
+        probe target and implementation/input/evidence digests. Replaying it
+        returns the original request/outbox rather than creating a second
+        authority source.
+        """
+        require_lowercase_uuid(health_probe_request_id, field="health_probe_request_id")
+        enums.parse_enum("health_probe.probe_kind", probe_kind)
+        enums.parse_enum("health_probe.scope_kind", scope_kind)
+        _validate_health_probe_matrix(probe_kind=probe_kind, scope_kind=scope_kind)
+        _require_digest(implementation_digest, field="implementation_digest")
+        _require_digest(input_digest, field="input_digest")
+        _require_digest(evidence_digest, field="evidence_digest")
+        if expected_revision is not None and expected_revision < 0:
+            raise ValueError("expected_revision must be nonnegative")
+        now = _now_ms() if now_ms is None else now_ms
+        if not_after_ms is not None and not_after_ms <= now:
+            raise ValueError("not_after_ms must be after creation time")
+        payload = {
+            "protocol": HEALTH_PROBE_REQUEST_PROTOCOL,
+            "probe_kind": probe_kind,
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
+            "request_identity": request_identity,
+            "subject_bindings": dict(subject_bindings),
+            "expected_revision": expected_revision,
+            "implementation_digest": implementation_digest,
+            "input_digest": input_digest,
+            "evidence_digest": evidence_digest,
+            "not_after_ms": not_after_ms,
+        }
+        req_digest = health_probe_request_digest(payload)
+        outbox_payload_digest = request_digest(payload)
+        resolved_outbox_id = outbox_id or str(uuid.uuid4())
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM health_probe_requests WHERE probe_kind = ? AND scope_kind = ? "
+                "AND scope_id = ? AND request_identity = ?",
+                (probe_kind, scope_kind, scope_id, request_identity),
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_health_probe_request(existing)
+                if (
+                    record.health_probe_request_id == health_probe_request_id
+                    and record.subject_bindings_json == canonical_json_text(subject_bindings)
+                    and record.expected_revision == expected_revision
+                    and record.implementation_digest == implementation_digest
+                    and record.input_digest == input_digest
+                    and record.evidence_digest == evidence_digest
+                    and record.request_digest == req_digest
+                    and record.not_after_ms == not_after_ms
+                ):
+                    return record
+                raise IdempotencyConflictError(
+                    "health probe request identity was reused with different content"
+                )
+            self.insert_outbox(
+                outbox_id=resolved_outbox_id,
+                source_kind="HEALTH_PROBE_REQUEST",
+                source_id=health_probe_request_id,
+                destination=destination,
+                protocol_version=HEALTH_PROBE_REQUEST_PROTOCOL,
+                payload_digest=outbox_payload_digest,
+                payload=payload,
+                next_delivery_at_ms=now,
+            )
+            self.conn.execute(
+                "INSERT INTO health_probe_requests(health_probe_request_id, protocol_version, "
+                "probe_kind, scope_kind, scope_id, request_identity, subject_bindings_json, "
+                "expected_revision, implementation_digest, input_digest, evidence_digest, "
+                "request_digest, state, outbox_id, not_after_ms, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
+                (
+                    health_probe_request_id,
+                    HEALTH_PROBE_REQUEST_PROTOCOL,
+                    probe_kind,
+                    scope_kind,
+                    scope_id,
+                    request_identity,
+                    canonical_json_text(subject_bindings),
+                    expected_revision,
+                    implementation_digest,
+                    input_digest,
+                    evidence_digest,
+                    req_digest,
+                    resolved_outbox_id,
+                    not_after_ms,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM health_probe_requests WHERE health_probe_request_id = ?",
+                (health_probe_request_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_health_probe_request(row)
+
+    def complete_health_probe_request(
+        self,
+        *,
+        health_probe_request_id: str,
+        health_probe_fact_id: str,
+        outcome: str,
+        evidence: Mapping[str, Any],
+        integrity_failure_code: str | None = None,
+        observed_revision: int | None = None,
+        expires_at_ms: int | None = None,
+        affected_run_ids: Sequence[str] | None = None,
+        now_ms: int | None = None,
+    ) -> HealthProbeCompletion:
+        """Complete one persisted Health Probe Request and resume fanout.
+
+        Completion is idempotent by the deterministic request identity: after
+        response loss, callers replay the same request and get the same Fact,
+        Observation, and cursor-driven reductions.
+        """
+        require_lowercase_uuid(health_probe_request_id, field="health_probe_request_id")
+        require_lowercase_uuid(health_probe_fact_id, field="health_probe_fact_id")
+        enums.parse_enum("health_probe_fact.outcome", outcome)
+        if integrity_failure_code is not None:
+            enums.parse_enum("health_probe_fact.integrity_failure_code", integrity_failure_code)
+        now = _now_ms() if now_ms is None else now_ms
+        existing_request = self.get_health_probe_request(health_probe_request_id)
+        if existing_request is not None and existing_request.state == "COMPLETED":
+            if existing_request.health_probe_fact_id != health_probe_fact_id:
+                raise IdempotencyConflictError("health probe completion fact id changed")
+            self.run_health_probe_fact_fanout(health_probe_fact_id)
+            return self._health_probe_completion_from_fact_id(health_probe_fact_id, replayed=True)
+        with self.transaction():
+            request_row = self.conn.execute(
+                "SELECT * FROM health_probe_requests WHERE health_probe_request_id = ?",
+                (health_probe_request_id,),
+            ).fetchone()
+            if request_row is None:
+                raise RunStoreError(f"health probe request {health_probe_request_id!r} not found")
+            request_record = _row_to_health_probe_request(request_row)
+            if request_record.state == "COMPLETED":
+                if request_record.health_probe_fact_id != health_probe_fact_id:
+                    raise IdempotencyConflictError("health probe completion fact id changed")
+                raise CasMismatchError("health probe request completed concurrently")
+            if request_record.state != "PENDING":
+                raise CasMismatchError("health probe request is not pending")
+            _validate_health_probe_outcome(
+                probe_kind=request_record.probe_kind,
+                scope_kind=request_record.scope_kind,
+                outcome=outcome,
+            )
+            _validate_health_probe_integrity_failure(
+                probe_kind=request_record.probe_kind,
+                outcome=outcome,
+                integrity_failure_code=integrity_failure_code,
+            )
+            subject_bindings = json.loads(request_record.subject_bindings_json)
+            if not isinstance(subject_bindings, dict):
+                raise RunStoreError("health probe request bindings are corrupt")
+            members = tuple(
+                sorted(
+                    dict.fromkeys(
+                        affected_run_ids
+                        if affected_run_ids is not None
+                        else self._health_probe_affected_run_ids(
+                            probe_kind=request_record.probe_kind,
+                            scope_kind=request_record.scope_kind,
+                            scope_id=request_record.scope_id,
+                            subject_bindings=subject_bindings,
+                        )
+                    )
+                )
+            )
+            for run_id in members:
+                require_lowercase_uuid(run_id, field="affected_run_ids[]")
+            membership_digest = health_probe_run_membership_digest(members)
+            fact_preimage = {
+                "health_probe_request_id": health_probe_request_id,
+                "probe_kind": request_record.probe_kind,
+                "scope_kind": request_record.scope_kind,
+                "scope_id": request_record.scope_id,
+                "request_identity": request_record.request_identity,
+                "outcome": outcome,
+                "observed_revision": observed_revision,
+                "implementation_digest": request_record.implementation_digest,
+                "input_digest": request_record.input_digest,
+                "evidence_digest": request_record.evidence_digest,
+                "integrity_failure_code": integrity_failure_code,
+                "subject_bindings": subject_bindings,
+                "probe_evidence": dict(evidence),
+                "affected_run_ids_digest": membership_digest,
+            }
+            fact_digest = health_probe_fact_digest(fact_preimage)
+            observation = self._insert_health_observation(
+                scope_kind=request_record.scope_kind,
+                scope_id=request_record.scope_id,
+                kind=outcome,
+                source_kind="HEALTH_PROBE_FACT",
+                source_id=health_probe_fact_id,
+                subject_bindings={
+                    **subject_bindings,
+                    "health_probe_request_id": health_probe_request_id,
+                    "request_identity": request_record.request_identity,
+                    "probe_kind": request_record.probe_kind,
+                    "integrity_failure_code": integrity_failure_code,
+                },
+                observed_revision=observed_revision,
+                effective_at_ms=now,
+                expires_at_ms=expires_at_ms,
+            )
+            self.conn.execute(
+                "INSERT INTO health_probe_facts(health_probe_fact_id, health_probe_request_id, "
+                "probe_kind, scope_kind, scope_id, request_identity, outcome, observed_revision, "
+                "implementation_digest, input_digest, evidence_digest, integrity_failure_code, "
+                "subject_bindings_json, affected_run_ids_digest, health_observation_id, "
+                "fact_digest, recorded_at_ms) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    health_probe_fact_id,
+                    health_probe_request_id,
+                    request_record.probe_kind,
+                    request_record.scope_kind,
+                    request_record.scope_id,
+                    request_record.request_identity,
+                    outcome,
+                    observed_revision,
+                    request_record.implementation_digest,
+                    request_record.input_digest,
+                    request_record.evidence_digest,
+                    integrity_failure_code,
+                    canonical_json_text({**subject_bindings, "probe_evidence": dict(evidence)}),
+                    membership_digest,
+                    observation.health_observation_id,
+                    fact_digest,
+                    now,
+                ),
+            )
+            for ordinal, run_id in enumerate(members):
+                self.conn.execute(
+                    "INSERT INTO health_probe_fact_runs(health_probe_fact_id, member_ordinal, "
+                    "run_id) VALUES (?, ?, ?)",
+                    (health_probe_fact_id, ordinal, run_id),
+                )
+            self.conn.execute(
+                "UPDATE health_probe_requests SET state = 'COMPLETED', completed_at_ms = ?, "
+                "health_probe_fact_id = ? WHERE health_probe_request_id = ?",
+                (now, health_probe_fact_id, health_probe_request_id),
+            )
+
+        self.run_health_probe_fact_fanout(health_probe_fact_id)
+        return self._health_probe_completion_from_fact_id(health_probe_fact_id, replayed=False)
+
+    def _health_probe_completion_from_fact_id(
+        self, health_probe_fact_id: str, *, replayed: bool
+    ) -> HealthProbeCompletion:
+        fact = self.get_health_probe_fact(health_probe_fact_id)
+        if fact is None:
+            raise RunStoreError(f"health probe fact {health_probe_fact_id!r} not found")
+        request = self.get_health_probe_request(fact.health_probe_request_id)
+        if request is None:
+            raise RunStoreError("health probe fact is missing its reciprocal request")
+        observation = self.conn.execute(
+            "SELECT * FROM health_observations WHERE health_observation_id = ?",
+            (fact.health_observation_id,),
+        ).fetchone()
+        if observation is None:
+            raise RunStoreError("health probe fact is missing its reciprocal observation")
+        applied_rows = self.conn.execute(
+            "SELECT run_id, recovery_evidence_id FROM health_probe_fact_runs "
+            "WHERE health_probe_fact_id = ? AND transition_sequence IS NOT NULL "
+            "ORDER BY member_ordinal",
+            (health_probe_fact_id,),
+        ).fetchall()
+        return HealthProbeCompletion(
+            request=request,
+            fact=fact,
+            observation=self._row_to_health_observation(observation),
+            applied_run_ids=tuple(row["run_id"] for row in applied_rows),
+            recovery_evidence_ids=tuple(
+                row["recovery_evidence_id"]
+                for row in applied_rows
+                if row["recovery_evidence_id"] is not None
+            ),
+            replayed=replayed,
+        )
+
+    def run_health_probe_fact_fanout(
+        self, health_probe_fact_id: str
+    ) -> tuple[list[str], list[str]]:
+        """Resume cursor-driven per-Run Health Probe Fact fanout."""
+        require_lowercase_uuid(health_probe_fact_id, field="health_probe_fact_id")
+        applied: list[str] = []
+        evidences: list[str] = []
+        while True:
+            with self.transaction():
+                row = self.conn.execute(
+                    "SELECT * FROM health_probe_facts WHERE health_probe_fact_id = ?",
+                    (health_probe_fact_id,),
+                ).fetchone()
+                if row is None:
+                    raise RunStoreError(f"health probe fact {health_probe_fact_id!r} not found")
+                fact = _row_to_health_probe_fact(row)
+                member = self.conn.execute(
+                    "SELECT * FROM health_probe_fact_runs WHERE health_probe_fact_id = ? "
+                    "AND member_ordinal = ?",
+                    (health_probe_fact_id, fact.fanout_cursor_ordinal),
+                ).fetchone()
+                if member is None:
+                    if fact.fanout_completed_at_ms is None:
+                        self.conn.execute(
+                            "UPDATE health_probe_facts SET fanout_completed_at_ms = ? "
+                            "WHERE health_probe_fact_id = ?",
+                            (_now_ms(), health_probe_fact_id),
+                        )
+                    return applied, evidences
+                if member["transition_sequence"] is not None:
+                    self.conn.execute(
+                        "UPDATE health_probe_facts SET fanout_cursor_ordinal = ? "
+                        "WHERE health_probe_fact_id = ?",
+                        (fact.fanout_cursor_ordinal + 1, health_probe_fact_id),
+                    )
+                    continue
+                run_id = str(member["run_id"])
+                result = self._apply_health_probe_fact_member(fact, run_id)
+                self.conn.execute(
+                    "UPDATE health_probe_fact_runs SET transition_sequence = ?, "
+                    "recovery_evidence_id = ? WHERE health_probe_fact_id = ? "
+                    "AND member_ordinal = ?",
+                    (
+                        result[0],
+                        result[1],
+                        health_probe_fact_id,
+                        fact.fanout_cursor_ordinal,
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE health_probe_facts SET fanout_cursor_ordinal = ? "
+                    "WHERE health_probe_fact_id = ?",
+                    (fact.fanout_cursor_ordinal + 1, health_probe_fact_id),
+                )
+                applied.append(run_id)
+                if result[1] is not None:
+                    evidences.append(result[1])
+
+    def _apply_health_probe_fact_member(
+        self, fact: HealthProbeFactRecord, run_id: str
+    ) -> tuple[int, str | None]:
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.recovery import (
+            HealthObservationRef,
+            RecoveryEvidenceInput,
+            select_recovery_decision,
+        )
+        from orcest.workflow_reducer.types import Trigger
+
+        view = load_view(self, run_id)
+        if view is None:
+            raise RunStoreError(f"health probe fanout run {run_id!r} disappeared")
+        subject = _health_probe_subject(fact)
+        facts = {
+            "integrity_unavailable": fact.outcome == "UNAVAILABLE",
+            "integrity_available": fact.outcome == "AVAILABLE"
+            and fact.probe_kind in {"STORAGE_OBJECT_INTEGRITY", "SECRET_VERSION_INTEGRITY"},
+            "health_unavailable": fact.outcome in {"UNAVAILABLE", "RATE_LIMITED", "EXHAUSTED"},
+            "health_available": fact.outcome == "AVAILABLE",
+            "wakes_wait": fact.outcome == "AVAILABLE"
+            and self._health_probe_matches_current_wait(fact, view),
+            "probe_kind": fact.probe_kind,
+            "scope_kind": fact.scope_kind,
+            "scope_id": fact.scope_id,
+            "request_identity": fact.request_identity,
+            "object_kind": subject.get("object_kind"),
+            "object_id": subject.get("object_id", fact.scope_id),
+        }
+        applied = apply(
+            self,
+            view,
+            Trigger(kind="HEALTH_OBSERVATION", trigger_id=fact.health_observation_id, facts=facts),
+            run_id=run_id,
+        )
+        recovery_evidence_id: str | None = None
+        if (
+            fact.outcome in {"AVAILABLE", "UNAVAILABLE", "RATE_LIMITED", "EXHAUSTED"}
+            and not applied.replayed
+        ):
+            refreshed = load_view(self, run_id)
+            if refreshed is not None and refreshed.state == "RECOVERING":
+                category = _health_probe_recovery_category(fact)
+                bounded_evidence: dict[str, Any] = {
+                    "health_probe_fact_id": fact.health_probe_fact_id,
+                    "integrity_failure_code": fact.integrity_failure_code,
+                }
+                if fact.outcome == "AVAILABLE":
+                    bounded_evidence["probe_available"] = True
+                evidence_input = RecoveryEvidenceInput(
+                    source_kind="HEALTH_OBSERVATION",
+                    source_id=fact.health_observation_id,
+                    category=category,
+                    specification_generation=refreshed.specification_generation,
+                    candidate_id=refreshed.current_candidate_id,
+                    failure_scope={
+                        "scope_kind": fact.scope_kind,
+                        "scope_id": fact.scope_id,
+                        "object_kind": subject.get("object_kind"),
+                        "object_id": subject.get("object_id", fact.scope_id),
+                    },
+                    bounded_evidence={
+                        **bounded_evidence,
+                    },
+                    accepted_at_ms=fact.recorded_at_ms,
+                )
+                decision = select_recovery_decision(
+                    evidence_input,
+                    health_observations=(
+                        HealthObservationRef(
+                            health_observation_id=fact.health_observation_id,
+                            scope_kind=fact.scope_kind,
+                            scope_id=fact.scope_id,
+                            health_sequence=self._health_observation_sequence(
+                                fact.health_observation_id
+                            ),
+                        ),
+                    ),
+                )
+                recovery_evidence_id = str(uuid.uuid4())
+                evidence = self._create_recovery_evidence(
+                    recovery_evidence_id=recovery_evidence_id,
+                    run_id=run_id,
+                    source_kind="HEALTH_OBSERVATION",
+                    source_id=fact.health_observation_id,
+                    category=decision.category,
+                    failure_fingerprint=decision.failure_fingerprint,
+                    strategy_index=decision.strategy_index,
+                    selected_tactic=decision.selected_tactic,
+                    attempt_count=decision.attempt_count,
+                    repair_cycle_count=decision.repair_cycle_count,
+                    diagnosis_count=decision.diagnosis_count,
+                    rescue_epoch=decision.rescue_epoch,
+                    health_observations=(
+                        self._health_observation_record(fact.health_observation_id),
+                    ),
+                    specification_generation=refreshed.specification_generation,
+                    candidate_id=refreshed.current_candidate_id,
+                    next_eligible_at_ms=decision.next_eligible_at_ms,
+                )
+                recovery_applied = apply(
+                    self,
+                    refreshed,
+                    Trigger(
+                        kind="RECOVERY_EVIDENCE",
+                        trigger_id=evidence.recovery_evidence_id,
+                        facts={
+                            "source_kind": "HEALTH_OBSERVATION",
+                            "source_id": fact.health_observation_id,
+                            "category": decision.category,
+                            "selected_tactic": decision.selected_tactic,
+                            "candidate_id": refreshed.current_candidate_id,
+                            "accepted_at_ms": fact.recorded_at_ms,
+                            "failure_scope": evidence_input.failure_scope,
+                            "bounded_evidence": bounded_evidence,
+                            "health_observations": [
+                                {
+                                    "health_observation_id": fact.health_observation_id,
+                                    "scope_kind": fact.scope_kind,
+                                    "scope_id": fact.scope_id,
+                                    "health_sequence": self._health_observation_sequence(
+                                        fact.health_observation_id
+                                    ),
+                                }
+                            ],
+                            "pending_wait_condition_id": str(uuid.uuid4()),
+                        },
+                    ),
+                    run_id=run_id,
+                )
+                if (
+                    recovery_applied.reduction is not None
+                    and recovery_applied.reduction.next_state == "WAITING"
+                ):
+                    self.create_wait_condition(
+                        wait_condition_id=str(
+                            recovery_applied.reduction.pointer_updates["wait_condition_id"]
+                            if "wait_condition_id" in recovery_applied.reduction.pointer_updates
+                            else recovery_applied.transition.transition_id
+                        ),
+                        run_id=run_id,
+                        reason=str(recovery_applied.reduction.pointer_updates["wait_reason"]),
+                        resume_state=(
+                            refreshed.recovery_origin_state or refreshed.state or "PLANNING"
+                        ),
+                        specification_generation=recovery_applied.reduction.specification_generation,
+                        policy_hash=refreshed.policy_hash,
+                        created_from_kind="RECOVERY_EVIDENCE",
+                        created_from_id=evidence.recovery_evidence_id,
+                        created_transition_sequence=recovery_applied.transition.transition_sequence,
+                        not_before_ms=decision.next_eligible_at_ms,
+                        wake_kind=_health_probe_wait_kind(fact, decision.selected_tactic),
+                        wake_identity=_health_probe_wait_identity(fact, decision.selected_tactic),
+                        health_observations=(
+                            self._health_observation_record(fact.health_observation_id),
+                        ),
+                    )
+        return applied.transition.transition_sequence, recovery_evidence_id
+
+    def _health_probe_matches_current_wait(self, fact: HealthProbeFactRecord, view: Any) -> bool:
+        if view.state != "WAITING" or view.wait_condition_id is None:
+            return False
+        wait = self.get_wait_condition(view.wait_condition_id)
+        if wait is None:
+            return False
+        observation = self._health_observation_record(fact.health_observation_id)
+        if wait.health_observation_ids:
+            max_bound_sequence = max(
+                self._health_observation_record(observation_id).health_sequence
+                for observation_id in wait.health_observation_ids
+            )
+            if observation.health_sequence <= max_bound_sequence:
+                return False
+        expected_kind = _health_probe_wait_kind(fact, "WAIT_EXTERNAL")
+        if wait.wake_kind == expected_kind and wait.wake_identity == _health_probe_wait_identity(
+            fact, "WAIT_EXTERNAL"
+        ):
+            return True
+        if wait.wake_kind == "CAPACITY" and wait.wake_identity == {
+            "scope_kind": fact.scope_kind,
+            "scope_id": fact.scope_id,
+        }:
+            return True
+        if wait.wake_kind == "RATE_LIMIT_RESET" and wait.wake_identity == {
+            "scope_kind": fact.scope_kind,
+            "scope_id": fact.scope_id,
+        }:
+            return True
+        return False
+
+    def _health_observation_record(self, health_observation_id: str) -> HealthObservationRecord:
+        row = self.conn.execute(
+            "SELECT * FROM health_observations WHERE health_observation_id = ?",
+            (health_observation_id,),
+        ).fetchone()
+        if row is None:
+            raise RunStoreError(f"health observation {health_observation_id!r} not found")
+        return self._row_to_health_observation(row)
+
+    def _health_observation_sequence(self, health_observation_id: str) -> int:
+        return self._health_observation_record(health_observation_id).health_sequence
+
+    def _health_probe_affected_run_ids(
+        self,
+        *,
+        probe_kind: str,
+        scope_kind: str,
+        scope_id: str,
+        subject_bindings: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        if probe_kind == "STORAGE_OBJECT_INTEGRITY":
+            object_kind = str(subject_bindings.get("object_kind", ""))
+            object_id = str(subject_bindings.get("object_id", scope_id))
+            if object_kind == "CANDIDATE_ARTIFACT":
+                rows = self.conn.execute(
+                    "SELECT DISTINCT runs.run_id FROM runs "
+                    "JOIN candidates ON candidates.run_id = runs.run_id "
+                    "WHERE runs.terminal_outcome IS NULL AND candidates.bundle_digest = ?",
+                    (object_id,),
+                ).fetchall()
+            elif object_kind == "WORKFLOW_BLOB":
+                rows = self.conn.execute(
+                    "SELECT DISTINCT runs.run_id FROM runs "
+                    "JOIN work_item_snapshots s ON s.run_id = runs.run_id "
+                    "WHERE runs.terminal_outcome IS NULL AND "
+                    "(s.normalized_workflow_blob_digest = ? OR s.effective_policy_blob_digest = ? "
+                    "OR s.normalized_prompt_blobs_json LIKE ?)",
+                    (object_id, object_id, f"%{object_id}%"),
+                ).fetchall()
+            else:
+                raise ValueError("STORAGE_OBJECT_INTEGRITY requires object_kind/object_id bindings")
+            return tuple(sorted(row["run_id"] for row in rows))
+        if probe_kind == "SECRET_VERSION_INTEGRITY":
+            secret_id, version = _parse_secret_version_scope(scope_id, subject_bindings)
+            rows = self.conn.execute(
+                "SELECT DISTINCT runs.run_id FROM runs "
+                "JOIN projects ON projects.project_id = runs.project_id "
+                "WHERE runs.terminal_outcome IS NULL AND ("
+                "(projects.source_read_secret_id = ? "
+                "AND projects.registration_source_read_secret_version = ?) "
+                "OR (projects.publication_secret_id = ? "
+                "AND projects.registration_publication_secret_version = ?))",
+                (secret_id, version, secret_id, version),
+            ).fetchall()
+            return tuple(sorted(row["run_id"] for row in rows))
+        if scope_kind == "PROVIDER_ACCOUNT":
+            rows = self.conn.execute(
+                "SELECT DISTINCT runs.run_id FROM runs "
+                "JOIN activities ON activities.run_id = runs.run_id "
+                "JOIN attempts ON attempts.activity_id = activities.activity_id "
+                "WHERE runs.terminal_outcome IS NULL AND attempts.provider_account_ref = ?",
+                (scope_id,),
+            ).fetchall()
+            return tuple(sorted(row["run_id"] for row in rows))
+        if scope_kind == "FORGE":
+            rows = self.conn.execute(
+                "SELECT DISTINCT runs.run_id FROM runs "
+                "JOIN projects ON projects.project_id = runs.project_id "
+                "WHERE runs.terminal_outcome IS NULL AND projects.forge_instance_id = ?",
+                (scope_id,),
+            ).fetchall()
+            return tuple(sorted(row["run_id"] for row in rows))
+        return ()
 
     def _next_recovery_sequence(self, run_id: str) -> int:
         row = self.conn.execute(

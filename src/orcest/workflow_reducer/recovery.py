@@ -317,6 +317,16 @@ def select_recovery_decision(
     ):
         tactic = "REDELIVER"
         strategy_index = 3
+    elif category in {
+        "CAPACITY",
+        "CREDENTIAL",
+        "FORGE_TRANSIENT",
+        "INTEGRITY_SUSPECTED",
+        "PROVIDER_RATE_LIMIT",
+        "STORAGE",
+    } and _evidence_flag(evidence, "integrity_available", "probe_available"):
+        tactic = "RETRY_EXECUTION"
+        strategy_index = 3
     elif category in {"WORKER_LOST", "TIMEOUT", "PROVIDER_TRANSIENT", "SOURCE_READ"}:
         if selected_fallback is not None:
             tactic = "REPLACE_CAPACITY"
