@@ -276,3 +276,97 @@ def test_recovery_evidence_external_wait_reason_comes_from_category() -> None:
     )
     assert reduction.next_state == "WAITING"
     assert reduction.pointer_updates["wait_reason"] == "SECRET_RECOVERY"
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected_state", "expected_reason"),
+    [
+        (
+            {
+                "source_kind": "FORGE_REQUEST_FAILURE",
+                "source_id": "forge-request-1",
+                "category": "FORGE_TRANSIENT",
+                "accepted_at_ms": 1_700_000_000_000,
+                "selected_tactic": "WAIT_BACKOFF",
+            },
+            "WAITING",
+            "WAIT_BACKOFF",
+        ),
+        (
+            {
+                "source_kind": "TIMER_FACT",
+                "source_id": "timer-1",
+                "category": "CAPACITY",
+                "resumed_wait_condition_id": "wait-1",
+                "selected_tactic": "WAIT_EVIDENCE",
+            },
+            "WAITING",
+            "WAIT_EVIDENCE",
+        ),
+        (
+            {
+                "source_kind": "HEALTH_OBSERVATION",
+                "source_id": "health-1",
+                "category": "CAPACITY",
+                "bounded_evidence": {"staff_panel": True},
+                "selected_tactic": "STAFF_PANEL",
+            },
+            "REVIEWING",
+            "STAFF_PANEL",
+        ),
+        (
+            {
+                "source_kind": "FORGE_OBSERVATION",
+                "source_id": "forge-1",
+                "category": "BASE_CONFLICT",
+                "bounded_evidence": {"external_head_importable": True},
+                "selected_tactic": "IMPORT_EXTERNAL_HEAD",
+            },
+            "PR_REMEDIATING",
+            "IMPORT_EXTERNAL_HEAD",
+        ),
+        (
+            {
+                "source_kind": "FORGE_OBSERVATION",
+                "source_id": "forge-2",
+                "category": "BASE_CONFLICT",
+                "bounded_evidence": {"reconstruct_foreign_head": True},
+                "selected_tactic": "RECONSTRUCT_FOREIGN_HEAD",
+            },
+            "REMEDIATING",
+            "RECONSTRUCT_FOREIGN_HEAD",
+        ),
+        (
+            {
+                "source_kind": "FORGE_OBSERVATION",
+                "source_id": "forge-3",
+                "category": "REVIEW_DISAGREEMENT",
+                "bounded_evidence": {"reconcile_publication": True},
+                "selected_tactic": "RECONCILE",
+            },
+            "PLANNING",
+            "RECONCILE",
+        ),
+        (
+            {
+                "source_kind": "RECONCILIATION_FACT",
+                "source_id": "reconcile-1",
+                "category": "FORGE_TRANSIENT",
+                "bounded_evidence": {"effect_absent": True},
+                "selected_tactic": "REDELIVER",
+            },
+            "PLANNING",
+            "REDELIVER",
+        ),
+    ],
+)
+def test_recovery_evidence_selected_specialized_tactics_reach_handlers(
+    facts: dict[str, object], expected_state: str, expected_reason: str
+) -> None:
+    view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    reduction = reduce(
+        view,
+        Trigger(kind="RECOVERY_EVIDENCE", trigger_id="re-specialized", facts=facts),
+    )
+    assert reduction.next_state == expected_state
+    assert reduction.reason_code == expected_reason

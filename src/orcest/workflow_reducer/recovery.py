@@ -289,7 +289,35 @@ def select_recovery_decision(
     next_eligible_at_ms: int | None = None
 
     category = evidence.category
-    if category in {"WORKER_LOST", "TIMEOUT", "PROVIDER_TRANSIENT", "SOURCE_READ"}:
+    if evidence.resumed_wait_condition_id is not None:
+        tactic = "WAIT_EVIDENCE"
+        strategy_index = 10
+    elif category == "BASE_CONFLICT" and _evidence_flag(
+        evidence, "import_external_head", "external_head_importable", "prelink_ref_importable"
+    ):
+        tactic = "IMPORT_EXTERNAL_HEAD"
+        strategy_index = 8
+    elif category == "BASE_CONFLICT" and _evidence_flag(
+        evidence, "reconstruct_foreign_head", "foreign_head_reconstructable"
+    ):
+        tactic = "RECONSTRUCT_FOREIGN_HEAD"
+        strategy_index = 8
+    elif category == "CAPACITY" and _evidence_flag(
+        evidence, "staff_panel", "panel_staffing", "review_panel_capacity"
+    ):
+        tactic = "STAFF_PANEL"
+        strategy_index = 10
+    elif _evidence_flag(
+        evidence, "reconcile", "reconcile_publication", "publication_reconciliation"
+    ):
+        tactic = "RECONCILE"
+        strategy_index = 9
+    elif category == "FORGE_TRANSIENT" and _evidence_flag(
+        evidence, "redeliver", "effect_absent", "delivery_effect_absent"
+    ):
+        tactic = "REDELIVER"
+        strategy_index = 3
+    elif category in {"WORKER_LOST", "TIMEOUT", "PROVIDER_TRANSIENT", "SOURCE_READ"}:
         if selected_fallback is not None:
             tactic = "REPLACE_CAPACITY"
             strategy_index = 4
@@ -360,7 +388,7 @@ def select_recovery_decision(
         tactic = "REBASE"
         strategy_index = 8
     elif category == "FORGE_TRANSIENT":
-        tactic = "WAIT_EXTERNAL"
+        tactic = "WAIT_BACKOFF"
         strategy_index = 10
     elif category == "EXTERNAL_DEPENDENCY":
         tactic = "WAIT_EXTERNAL"
@@ -378,9 +406,7 @@ def select_recovery_decision(
         raise ValueError(f"unhandled recovery category {category}")
 
     if tactic == "WAIT_BACKOFF":
-        next_eligible_at_ms = evidence.accepted_at_ms + min(
-            limits.backoff_initial_ms * (2**rescue_epoch), limits.backoff_max_ms
-        )
+        next_eligible_at_ms = _backoff_wait(evidence, limits)
         rescue_epoch += 1
 
     enums.parse_enum("recovery_evidence.selected_tactic", tactic)
@@ -401,8 +427,31 @@ def select_recovery_decision(
 
 
 def _clamped_rate_limit_wait(evidence: RecoveryEvidenceInput, limits: RecoveryLimits) -> int:
+    if evidence.accepted_at_ms <= 0:
+        raise ValueError("accepted_at_ms must be present and positive for timed recovery waits")
     lower = evidence.accepted_at_ms
     upper = lower + limits.max_provider_rate_limit_wait_ms
     if evidence.provider_retry_after_ms is None:
         return upper
-    return min(max(evidence.provider_retry_after_ms, lower), upper)
+    if evidence.provider_retry_after_ms < 0:
+        raise ValueError("provider_retry_after_ms must be nonnegative")
+    requested_until = lower + evidence.provider_retry_after_ms
+    return min(max(requested_until, lower), upper)
+
+
+def _backoff_wait(evidence: RecoveryEvidenceInput, limits: RecoveryLimits) -> int:
+    if evidence.accepted_at_ms <= 0:
+        raise ValueError("accepted_at_ms must be present and positive for timed recovery waits")
+    return evidence.accepted_at_ms + min(
+        limits.backoff_initial_ms * (2**evidence.rescue_epoch), limits.backoff_max_ms
+    )
+
+
+def _evidence_flag(evidence: RecoveryEvidenceInput, *names: str) -> bool:
+    for facts in (evidence.bounded_evidence, evidence.failure_scope):
+        if facts is None:
+            continue
+        for name in names:
+            if bool(facts.get(name)):
+                return True
+    return False
