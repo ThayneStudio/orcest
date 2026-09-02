@@ -606,6 +606,106 @@ def test_submit_recovery_evidence_wait_budget_not_satisfied_creates_wait(
     assert run_row["state"] == "WAITING"
 
 
+def test_submit_recovery_evidence_drops_panel_slot_raced_to_live_attempt(
+    store: RunStore,
+) -> None:
+    """A named panel slot that raced to a live OFFERED/CLAIMED Attempt (e.g.
+    another writer staffed it) between the caller gathering
+    ``panel_wait_slots`` and this writer-lock recheck must be dropped from
+    the frozen Wait's membership rather than reaching
+    ``create_wait_condition``, which rejects anything but a PLANNED activity
+    with no live Attempt."""
+    run_id = _uid()
+    _create_recovering_run(store, run_id, recovery_origin_state="BUILDING")
+    blocked_activity = _plan_review_activity(
+        store,
+        run_id=run_id,
+        state="PLANNED",
+        activity_ordinal=1,
+        reviewer_slot="slot-a",
+        worker_profile="codex",
+    )
+    raced_activity = _plan_review_activity(
+        store,
+        run_id=run_id,
+        state="READY",
+        activity_ordinal=2,
+        reviewer_slot="slot-b",
+        worker_profile="claude",
+    )
+
+    outcome = store.submit_recovery_evidence(
+        recovery_evidence_id=_uid(),
+        run_id=run_id,
+        source_kind="HEALTH_OBSERVATION",
+        source_id=_uid(),
+        facts={"kind": "UNAVAILABLE"},
+        panel_wait_slots=(
+            WaitConditionPanelSlotInput(
+                activity_id=blocked_activity,
+                assignment_kind="REVIEW",
+                panel_round=1,
+                slot_id="slot-a",
+            ),
+            WaitConditionPanelSlotInput(
+                activity_id=raced_activity,
+                assignment_kind="REVIEW",
+                panel_round=1,
+                slot_id="slot-b",
+            ),
+        ),
+        accepted_at_ms=_now_ms(),
+    )
+
+    assert outcome.selected_tactic == "WAIT_CAPACITY"
+    assert outcome.predicate_check is not None
+    assert outcome.predicate_check.already_satisfied is False
+    assert outcome.wait_condition is not None
+    assert [slot.activity_id for slot in outcome.wait_condition.panel_slots] == [blocked_activity]
+
+
+def test_submit_recovery_evidence_panel_already_satisfied_when_all_slots_race_away(
+    store: RunStore,
+) -> None:
+    """If every named panel slot has since raced to a live Attempt, the
+    original capacity failure is moot -- the Run returns straight to its
+    recovery origin instead of freezing an empty panel Wait."""
+    run_id = _uid()
+    _create_recovering_run(store, run_id, recovery_origin_state="BUILDING")
+    raced_activity = _plan_review_activity(
+        store,
+        run_id=run_id,
+        state="READY",
+        activity_ordinal=1,
+        reviewer_slot="slot-a",
+        worker_profile="codex",
+    )
+
+    outcome = store.submit_recovery_evidence(
+        recovery_evidence_id=_uid(),
+        run_id=run_id,
+        source_kind="HEALTH_OBSERVATION",
+        source_id=_uid(),
+        facts={"kind": "UNAVAILABLE"},
+        panel_wait_slots=(
+            WaitConditionPanelSlotInput(
+                activity_id=raced_activity,
+                assignment_kind="REVIEW",
+                panel_round=1,
+                slot_id="slot-a",
+            ),
+        ),
+        accepted_at_ms=_now_ms(),
+    )
+
+    assert outcome.selected_tactic == "WAIT_CAPACITY"
+    assert outcome.predicate_check is not None
+    assert outcome.predicate_check.already_satisfied is True
+    assert outcome.wait_condition is None
+    run_row = store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    assert run_row["state"] == "BUILDING"
+
+
 # -- Timer-driven wake --------------------------------------------------
 
 

@@ -13939,7 +13939,7 @@ class RunStore:
             return WaitPredicateCheck(already_satisfied=True)
         for slot in slots:
             activity = self.get_activity(slot.activity_id)
-            if activity is None or activity.state not in {"PLANNED", "READY"}:
+            if activity is None or activity.state != "PLANNED":
                 return WaitPredicateCheck(already_satisfied=False)
             if not self._activity_has_compatible_capacity(activity, now_ms=now_ms):
                 return WaitPredicateCheck(already_satisfied=False)
@@ -14132,12 +14132,25 @@ class RunStore:
 
             if decision.selected_tactic == "WAIT_CAPACITY":
                 if panel_wait_slots:
-                    resolved_panel_slots = tuple(panel_wait_slots)
+                    # Re-derive against current durable state under the writer
+                    # lock: a named slot may have raced to a live
+                    # OFFERED/CLAIMED Attempt (activity no longer PLANNED)
+                    # since the caller gathered panel_wait_slots. Such a slot
+                    # is no longer "still unfilled" and must be dropped here
+                    # rather than freed into create_wait_condition's
+                    # panel-slot membership, which rejects anything but a
+                    # PLANNED activity with no live OFFERED/CLAIMED Attempt.
+                    resolved_panel_slots = tuple(
+                        slot
+                        for slot in panel_wait_slots
+                        if (activity := self.get_activity(slot.activity_id)) is not None
+                        and activity.state == "PLANNED"
+                    )
                     predicate_check = self._panel_wait_satisfied(resolved_panel_slots, now_ms=now)
                     wait_wake_kind = "CAPACITY"
                     wait_wake_identity = {
-                        "assignment_kind": resolved_panel_slots[0].assignment_kind,
-                        "panel_round": resolved_panel_slots[0].panel_round,
+                        "assignment_kind": panel_wait_slots[0].assignment_kind,
+                        "panel_round": panel_wait_slots[0].panel_round,
                     }
                 else:
                     if capacity_wake_identity is None:
