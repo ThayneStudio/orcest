@@ -62,6 +62,7 @@ WORKER_LOSS_PROTOCOL = "orcest.worker-loss/1"
 WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
 ATTEMPT_LIVENESS_PROTOCOL = "orcest.attempt-liveness/1"
 ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
+VERIFICATION_RECEIPT_PROTOCOL = "orcest.verification-receipt/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
@@ -90,6 +91,7 @@ __all__ = [
     "WORKER_LOSS_RESULT_PROTOCOL",
     "ATTEMPT_LIVENESS_PROTOCOL",
     "ATTEMPT_LIVENESS_RESULT_PROTOCOL",
+    "VERIFICATION_RECEIPT_PROTOCOL",
 ]
 
 
@@ -669,6 +671,122 @@ register_envelope(
         "replayed": Field(validator=_is_bool),
     },
     protocol_field="protocol",
+)
+
+
+# ---------------------------------------------------------------------------
+# Verification Receipt
+# ---------------------------------------------------------------------------
+
+
+def _is_git_oid(value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise ProtocolValidationError("oid must be a non-empty string")
+
+
+def _commit_ref_invariant(value: Mapping[str, Any]) -> None:
+    object_format = value.get("object_format")
+    oid = value.get("oid")
+    expected_len = 40 if object_format == "sha1" else 64 if object_format == "sha256" else None
+    if expected_len is None:
+        raise ProtocolValidationError("object_format must be sha1 or sha256")
+    if (
+        not isinstance(oid, str)
+        or len(oid) != expected_len
+        or any(ch not in "0123456789abcdef" for ch in oid)
+    ):
+        raise ProtocolValidationError("oid does not match object_format")
+
+
+_GIT_COMMIT_REF_SCHEMA = Schema(
+    {
+        "object_format": Field(enum=frozenset({"sha1", "sha256"})),
+        "oid": Field(validator=_is_git_oid),
+    },
+    object_validator=_commit_ref_invariant,
+)
+_VERIFICATION_CANDIDATE_SCHEMA = Schema(
+    {
+        "candidate_id": Field(validator=_is_uuid),
+        "commit": Field(schema=_GIT_COMMIT_REF_SCHEMA),
+    }
+)
+
+
+def _is_exit_code(value: Any) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 255):
+        raise ProtocolValidationError("exit_code must be an integer 0..255")
+
+
+def _is_bounded_evidence_list(value: Any) -> None:
+    if not isinstance(value, list) or len(value) > 50:
+        raise ProtocolValidationError("evidence must be an array of at most 50 records")
+
+
+def _verification_check_invariant(value: Mapping[str, Any]) -> None:
+    termination = value.get("termination")
+    exit_code = value.get("exit_code")
+    # The wiki does not enumerate a closed signal-name value set; accept any
+    # non-empty string rather than inventing one.
+    signal_name = value.get("signal_name")
+    if termination == "EXITED":
+        _require(exit_code is not None, "EXITED requires exit_code")
+    else:
+        _require(exit_code is None, "exit_code is present only for EXITED")
+    if termination == "SIGNALED":
+        _require(
+            isinstance(signal_name, str) and bool(signal_name), "SIGNALED requires signal_name"
+        )
+    else:
+        _require(signal_name is None, "signal_name is present only for SIGNALED")
+
+
+_VERIFICATION_CHECK_SCHEMA = Schema(
+    {
+        "command_id": Field(validator=_is_nonempty_str),
+        "invocation_digest": Field(validator=_is_digest),
+        "termination": Field(enum=_enum_values(enums.VerificationCheckTermination)),
+        "exit_code": Field(required=False, nullable=True, validator=_is_exit_code),
+        "signal_name": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "stdout_digest": Field(validator=_is_digest),
+        "stderr_digest": Field(validator=_is_digest),
+        "evidence": Field(required=False, validator=_is_bounded_evidence_list),
+    },
+    object_validator=_verification_check_invariant,
+)
+_VERIFICATION_ERROR_SCHEMA = Schema(
+    {
+        "code": Field(enum=_enum_values(enums.VerificationErrorCode)),
+        "command_id": Field(required=False, nullable=True, validator=_is_nonempty_str),
+        "evidence": Field(required=False, validator=_is_bounded_evidence_list),
+    }
+)
+
+
+def _verification_receipt_invariant(value: Mapping[str, Any]) -> None:
+    checks = value.get("checks")
+    if not isinstance(checks, list) or not checks:
+        raise ProtocolValidationError("checks must be a non-empty array")
+    outcome = value.get("outcome")
+    error = value.get("error")
+    if outcome == "ERROR":
+        _require(error is not None, "ERROR outcome requires error")
+    else:
+        _require(error is None, "error is present only for ERROR outcome")
+
+
+register_envelope(
+    VERIFICATION_RECEIPT_PROTOCOL,
+    {
+        "candidate": Field(schema=_VERIFICATION_CANDIDATE_SCHEMA),
+        "profile_id": Field(enum=frozenset({"default"})),
+        "profile_hash": Field(validator=_is_digest),
+        "checks": Field(item_schema=_VERIFICATION_CHECK_SCHEMA),
+        "outcome": Field(enum=_enum_values(enums.VerificationReceiptOutcome)),
+        "error": Field(required=False, nullable=True, schema=_VERIFICATION_ERROR_SCHEMA),
+    },
+    protocol_field="protocol",
+    object_validator=_verification_receipt_invariant,
 )
 
 
