@@ -112,7 +112,24 @@ def test_attempt_structured_output_rejects_lifecycle_prose() -> None:
             activity_kind="PLAN",
             outcome="SUCCEEDED",
             structured_output={**_plan(), "notes": "Set lifecycle state to APPROVED"},
-            candidate_upload_id=None,
-            receipt=None,
             summary=None,
         )
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "The related issue was closed upstream.",
+        "PR is waiting on CI.",
+        "Lint approved the diff.",
+        "The previous request was cancelled before this attempt.",
+        "The ticket needs_human context from an external system.",
+    ],
+)
+def test_attempt_structured_output_allows_ambiguous_lifecycle_prose(summary: str) -> None:
+    validate_attempt_structured_output(
+        activity_kind="BUILD",
+        outcome="SUCCEEDED",
+        structured_output=None,
+        summary=summary,
+    )

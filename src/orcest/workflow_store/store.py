@@ -11248,15 +11248,6 @@ class RunStore:
                 and now >= row["capability_auth_expires_at_ms"]
             ):
                 raise CasMismatchError("attempt capability authentication expired")
-            validate_attempt_structured_output(
-                activity_kind=str(row["activity_kind"]),
-                outcome=outcome,
-                structured_output=structured_output,
-                candidate_upload_id=candidate_upload_id,
-                receipt=receipt,
-                summary=summary,
-            )
-
             binding_ok = (
                 row["claimed_worker_id"] == worker_id
                 and row["claimed_worker_session_id"] == worker_session_id
@@ -11563,6 +11554,13 @@ class RunStore:
                     )
                     candidate = self.get_candidate(candidate_id)
                     assert candidate is not None
+
+                validate_attempt_structured_output(
+                    activity_kind=str(row["activity_kind"]),
+                    outcome=outcome,
+                    structured_output=structured_output,
+                    summary=summary,
+                )
 
                 attempt_result_id = str(uuid.uuid4())
                 receipt_id = str(uuid.uuid4()) if receipt_json is not None else None

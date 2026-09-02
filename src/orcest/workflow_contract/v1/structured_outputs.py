@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -51,24 +52,24 @@ _LIFECYCLE_WORDS = frozenset(
         "CANCELLED",
     }
 )
-_DIRECTIVE_WORDS = frozenset(
+_DIRECTIVE_VERBS = frozenset(
     {
-        "STATE",
+        "SET",
+        "MARK",
+        "MOVE",
+        "CHANGE",
+        "ADVANCE",
         "TRANSITION",
-        "LIFECYCLE",
         "APPROVE",
-        "APPROVED",
         "MERGE",
         "PUBLISH",
         "CANCEL",
-        "CANCELLED",
         "CLOSE",
-        "CLOSED",
-        "NEEDS_HUMAN",
         "WAIT",
-        "WAITING",
     }
 )
+_DIRECTIVE_NOUNS = frozenset({"STATE", "STATUS", "LIFECYCLE"})
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
 def structured_output_protocol(activity_kind: str) -> str | None:
@@ -81,14 +82,12 @@ def validate_attempt_structured_output(
     activity_kind: str,
     outcome: str,
     structured_output: Any | None,
-    candidate_upload_id: str | None,
-    receipt: Any | None,
     summary: str | None,
 ) -> None:
     """Validate the model/result payload before it can mutate lifecycle state.
 
-    PLAN, REPLAN, and DIAGNOSE success require closed typed envelopes. Candidate
-    and receipt Activities use controller-owned artifacts/receipts. Prose is
+    PLAN, REPLAN, and DIAGNOSE success require closed typed envelopes. Other
+    Activities may not carry model-authored structured output in v1. Prose is
     retained only as non-authoritative summary text and may not carry lifecycle
     directives.
     """
@@ -156,11 +155,22 @@ def _iter_strings(
 def _reject_lifecycle_directive_prose(text: str | None, *, field_path: str = "summary") -> None:
     if not text:
         return
-    tokens = {
-        token.strip(".,:;!?()[]{}<>\"'`").upper()
-        for token in text.replace("/", " ").replace("-", "_").split()
-    }
-    if tokens & _LIFECYCLE_WORDS and tokens & _DIRECTIVE_WORDS:
+    tokens = [token.upper() for token in _TOKEN_RE.findall(text.replace("-", "_"))]
+    if _has_lifecycle_directive_phrase(tokens):
         raise StructuredOutputValidationError(
             f"{field_path} appears to contain lifecycle directives"
         )
+
+
+def _has_lifecycle_directive_phrase(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token not in _LIFECYCLE_WORDS:
+            continue
+        window = tokens[max(0, index - 5) : index]
+        if any(item in _DIRECTIVE_VERBS for item in window):
+            return True
+        if any(item in _DIRECTIVE_NOUNS for item in window) and any(
+            item in _DIRECTIVE_VERBS for item in tokens[:index]
+        ):
+            return True
+    return False

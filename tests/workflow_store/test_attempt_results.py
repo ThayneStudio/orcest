@@ -11,6 +11,7 @@ import pytest
 
 from orcest.workflow_contract.v1.digest import content_digest, request_digest
 from orcest.workflow_contract.v1.protocol import validate_envelope
+from orcest.workflow_contract.v1.structured_outputs import StructuredOutputValidationError
 from orcest.workflow_store import (
     AttemptOfferInput,
     AttemptUnknownError,
@@ -388,6 +389,28 @@ def test_different_result_after_acceptance_is_audited(
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
 
 
+def test_different_result_after_acceptance_audits_before_structured_output_validation(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+    _submit(store, candidate_store)
+
+    result = _submit(
+        store,
+        candidate_store,
+        structured_output={"unexpected": True},
+        summary="Set lifecycle state to APPROVED",
+    )
+
+    assert result.request.disposition == "RESULT_ALREADY_ACCEPTED"
+    assert result.request.response_http_status == 409
+    assert json.loads(result.request.response_json)["code"] == "RESULT_ALREADY_ACCEPTED"
+    assert result.attempt_result is None
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 2
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
 def test_execution_deadline_equality_expires_current_attempt(
     stores: tuple[RunStore, CandidateObjectStore],
 ) -> None:
@@ -468,6 +491,65 @@ def test_superseded_generation_creates_stale_request_only(
     assert result.request.attempt_generation == 1
     assert json.loads(result.request.response_json)["current_attempt_generation"] == 2
     assert result.request.attempt_terminal_fact_id is None
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
+
+
+def test_superseded_generation_audits_before_structured_output_validation(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+    with store.transaction():
+        store.conn.execute(
+            "UPDATE attempts SET generation = 2 WHERE attempt_id = ?",
+            (ATTEMPT_ID,),
+        )
+
+    result = _submit(
+        store,
+        candidate_store,
+        structured_output={"unexpected": True},
+        summary="Set lifecycle state to APPROVED",
+    )
+
+    assert result.request.disposition == "STALE_ATTEMPT"
+    assert result.request.stale_reason == "GENERATION_SUPERSEDED"
+    assert result.attempt_result is None
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 1
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
+
+
+def test_claim_binding_change_audits_before_structured_output_validation(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+
+    result = _submit(
+        store,
+        candidate_store,
+        worker_id="worker-2",
+        structured_output={"unexpected": True},
+        summary="Set lifecycle state to APPROVED",
+    )
+
+    assert result.request.disposition == "STALE_ATTEMPT"
+    assert result.request.stale_reason == "CLAIM_BINDING_CHANGED"
+    assert result.attempt_result is None
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 1
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
+
+
+def test_accept_path_still_validates_structured_output(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+
+    with pytest.raises(StructuredOutputValidationError, match="structured_output"):
+        _submit(store, candidate_store, structured_output={"unexpected": True})
+
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 0
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
 
 
