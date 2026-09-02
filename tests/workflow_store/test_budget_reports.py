@@ -38,7 +38,14 @@ def store(tmp_path: Path) -> RunStore:
         yield store
 
 
-def _waiting_run(store: RunStore, run_id: str, *, project_id: str = PROJECT_ID) -> str:
+def _waiting_run(
+    store: RunStore,
+    run_id: str,
+    *,
+    project_id: str = PROJECT_ID,
+    accounting_scope_id: str = ACCOUNTING_SCOPE_ID,
+    minimum_source_sequence: int = 1,
+) -> str:
     wait_condition_id = _uid()
     with store.transaction():
         store.create_run(
@@ -55,6 +62,29 @@ def _waiting_run(store: RunStore, run_id: str, *, project_id: str = PROJECT_ID) 
             expected_revision=0,
             payload_digest=request_digest(payload),
             payload=payload,
+        )
+        store.create_wait_condition(
+            wait_condition_id=wait_condition_id,
+            run_id=run_id,
+            reason="BUDGET",
+            resume_state="BUILDING",
+            specification_generation=1,
+            policy_hash="sha256:" + "0" * 64,
+            created_from_kind="RECOVERY_EVIDENCE",
+            created_from_id=_uid(),
+            created_transition_sequence=1,
+            not_before_ms=_now_ms() + 3_600_000,
+            wake_kind="BUDGET_WINDOW",
+            wake_identity={
+                "project_id": project_id,
+                "accounting_scope_id": accounting_scope_id,
+                "budget_policy_ref": "default",
+                "budget_reset_window_ref": "default",
+                "budget_report_id": _uid(),
+                "window_id": "window-0",
+                "reset_at_ms": _now_ms(),
+                "minimum_source_sequence": minimum_source_sequence,
+            },
         )
     return wait_condition_id
 

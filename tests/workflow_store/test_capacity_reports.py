@@ -287,6 +287,7 @@ def test_multiple_entries_get_ordered_health_observations(store: RunStore) -> No
 def test_wakes_waiting_capacity_run_and_returns_wait_condition_id(store: RunStore) -> None:
     run_id = _uid()
     wait_condition_id = _uid()
+    worker_session_id = _uid()
     with store.transaction():
         store.create_run(
             run_id=run_id,
@@ -303,8 +304,21 @@ def test_wakes_waiting_capacity_run_and_returns_wait_condition_id(store: RunStor
             payload_digest=request_digest(payload),
             payload=payload,
         )
+        store.create_wait_condition(
+            wait_condition_id=wait_condition_id,
+            run_id=run_id,
+            reason="CAPACITY",
+            resume_state="BUILDING",
+            specification_generation=1,
+            policy_hash="sha256:" + "0" * 64,
+            created_from_kind="RECOVERY_EVIDENCE",
+            created_from_id=_uid(),
+            created_transition_sequence=1,
+            wake_kind="CAPACITY",
+            wake_identity={"scope_kind": "WORKER_SESSION", "scope_id": worker_session_id},
+        )
 
-    result = _submit(store, entries=[_session_entry(worker_session_id=_uid())])
+    result = _submit(store, entries=[_session_entry(worker_session_id=worker_session_id)])
     assert result.woken_wait_condition_ids == (wait_condition_id,)
 
     run_row = store.conn.execute("SELECT state FROM runs WHERE run_id = ?", (run_id,)).fetchone()
