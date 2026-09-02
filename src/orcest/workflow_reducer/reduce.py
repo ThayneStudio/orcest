@@ -1022,7 +1022,16 @@ def _handle_health_observation(view: RunView, trigger: Trigger) -> Reduction | N
     if view.state == "WAITING" and trigger.fact_true("wakes_wait"):
         return _wake(view, trigger)
     if (
-        trigger.fact_true("integrity_unavailable")
+        trigger.fact_true("integrity_available") or trigger.fact_true("health_available")
+    ) and view.state == "RECOVERING":
+        return _audit(
+            view,
+            trigger,
+            "HEALTH_AVAILABLE",
+            continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
+        )
+    if (
+        (trigger.fact_true("integrity_unavailable") or trigger.fact_true("health_unavailable"))
         and view.state is not None
         and not is_terminal_state(view.state)
     ):

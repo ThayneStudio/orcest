@@ -1321,7 +1321,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION == 17
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -2004,6 +2004,12 @@ _WAIT_CONDITION_TABLES = (
     "wait_condition_panel_slots",
 )
 
+_HEALTH_PROBE_TABLES = (
+    "health_probe_requests",
+    "health_probe_facts",
+    "health_probe_fact_runs",
+)
+
 
 def _write_v15_shaped_database(db_path: Path) -> None:
     """Build a real v16 database, then strip it back to the v15 shape."""
@@ -2036,3 +2042,30 @@ def test_v15_database_migrates_wait_condition_tables(tmp_path: Path) -> None:
             row["name"] for row in store.conn.execute("PRAGMA table_info(runs)").fetchall()
         }
         assert "wait_condition_id" in run_columns
+
+
+def _write_v16_shaped_database(db_path: Path) -> None:
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in reversed(_HEALTH_PROBE_TABLES):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 17")
+        conn.execute("PRAGMA user_version=16")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v16_database_migrates_health_probe_tables(tmp_path: Path) -> None:
+    _write_v16_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _HEALTH_PROBE_TABLES:
+            assert expected_table in tables

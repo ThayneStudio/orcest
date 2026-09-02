@@ -104,6 +104,9 @@ __all__ = [
     "forge_request_failure_fact_digest",
     "capacity_report_digest",
     "health_observation_payload_digest",
+    "health_probe_fact_digest",
+    "health_probe_request_digest",
+    "health_probe_run_membership_digest",
     "worker_loss_report_digest",
     "attempt_terminal_fact_digest",
     "attempt_terminal_fact_health_membership_digest",
@@ -475,6 +478,21 @@ def health_observation_payload_digest(fields: Mapping[str, Any]) -> str:
     """Digest of a Health Observation's bounded normalized non-secret health
     fields (``payload_digest``, domain-model.md "Health Observation")."""
     return generic_domain_digest("orcest-health-observation-payload-v1", fields)
+
+
+def health_probe_request_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Health Probe Request's immutable pre-I/O probe intent."""
+    return generic_domain_digest("orcest-health-probe-request-v1", fields)
+
+
+def health_probe_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Health Probe Fact's typed controller-owned probe result."""
+    return generic_domain_digest("orcest-health-probe-fact-v1", fields)
+
+
+def health_probe_run_membership_digest(run_ids: Sequence[str]) -> str:
+    """Digest of the frozen bytewise-ordered Health Probe Fact Run membership."""
+    return generic_domain_digest("orcest-health-probe-run-membership-v1", list(run_ids))
 
 
 def worker_loss_report_digest(fields: Mapping[str, Any]) -> str:
