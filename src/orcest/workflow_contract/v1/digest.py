@@ -94,6 +94,7 @@ __all__ = [
     "checkpoint_digest",
     "affected_run_ids_digest",
     "failure_evidence_digest",
+    "recovery_evidence_digest",
     "resolution_digest",
     "forge_observation_schedule_digest",
     "forge_observation_payload_digest",
@@ -525,6 +526,11 @@ def failure_evidence_digest(evidence: Any) -> str:
     ``failure_evidence_digest``). ``evidence`` MUST NOT contain secret bytes,
     a reusable Secret Store locator, or a secret-derived unkeyed digest."""
     return generic_domain_digest("orcest-failure-evidence-v1", evidence)
+
+
+def recovery_evidence_digest(evidence: Any) -> str:
+    """Digest of a complete canonical Recovery Evidence record."""
+    return generic_domain_digest("orcest-recovery-evidence-v1", evidence)
 
 
 def response_digest(response_json: Any) -> str:

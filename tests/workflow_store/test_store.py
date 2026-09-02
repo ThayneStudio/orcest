@@ -1321,7 +1321,7 @@ def test_unsupported_reducer_version_can_fail_closed_as_maintenance(tmp_path: Pa
 
 
 def test_schema_v2_allows_generation_zero_and_none_prior_state(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 14
+    assert SCHEMA_VERSION == 15
     with RunStore(tmp_path, verify_local_filesystem=False) as store:
         with store.transaction():
             store.create_run(
@@ -1958,3 +1958,41 @@ def test_v12_database_migrates_credential_rotation_tables(tmp_path: Path) -> Non
         }
         for expected_table in _CREDENTIAL_ROTATION_TABLES:
             assert expected_table in tables
+
+
+_RECOVERY_EVIDENCE_TABLES = (
+    "recovery_evidence",
+    "recovery_evidence_health_observations",
+)
+
+
+def _write_v13_shaped_database(db_path: Path) -> None:
+    """Build a real v14 database, then strip it back to the v13 shape."""
+    with RunStore(db_path.parent, verify_local_filesystem=False):
+        pass
+    conn = sqlite3.connect(db_path)
+    try:
+        for table in _RECOVERY_EVIDENCE_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 14")
+        conn.execute("PRAGMA user_version=13")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v13_database_migrates_recovery_evidence_tables(tmp_path: Path) -> None:
+    _write_v13_shaped_database(tmp_path / "workflow.db")
+
+    with RunStore(tmp_path, verify_local_filesystem=False) as store:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for expected_table in _RECOVERY_EVIDENCE_TABLES:
+            assert expected_table in tables
+        run_columns = {
+            row["name"] for row in store.conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        assert "current_recovery_evidence_id" in run_columns

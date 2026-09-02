@@ -45,6 +45,7 @@ from orcest.workflow_contract.v1.digest import (
     launch_capability_claims_digest,
     policy_digest,
     receipt_digest,
+    recovery_evidence_digest,
     request_digest,
     resolution_digest,
     response_digest,
@@ -84,7 +85,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
 )
 from orcest.workflow_contract.v1.structured_outputs import validate_attempt_structured_output
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1148,6 +1149,37 @@ class HealthObservationRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryEvidenceRecord:
+    recovery_evidence_id: str
+    run_id: str
+    recovery_sequence: int
+    source_kind: str
+    source_id: str
+    category: str
+    failure_fingerprint: str
+    strategy_index: int
+    selected_tactic: str
+    attempt_count: int
+    repair_cycle_count: int
+    diagnosis_count: int
+    rescue_epoch: int
+    health_observation_ids_digest: str
+    evidence_digest: str
+    recorded_at_ms: int
+    resumed_wait_condition_id: str | None = None
+    resumed_human_boundary_id: str | None = None
+    human_resolution_id: str | None = None
+    activity_id: str | None = None
+    attempt_id: str | None = None
+    candidate_id: str | None = None
+    forge_observation_id: str | None = None
+    selected_fallback: str | None = None
+    next_eligible_at_ms: int | None = None
+    health_observation_ids: tuple[str, ...] = ()
+    specification_generation: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class CapacityReportResult:
     capacity_report_id: str
     pool_manager_id: str
@@ -2194,6 +2226,40 @@ def _row_to_activity(
     )
 
 
+def _row_to_recovery_evidence(
+    row: sqlite3.Row, *, health_observation_ids: Sequence[str] = ()
+) -> RecoveryEvidenceRecord:
+    return RecoveryEvidenceRecord(
+        recovery_evidence_id=row["recovery_evidence_id"],
+        run_id=row["run_id"],
+        recovery_sequence=row["recovery_sequence"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        resumed_wait_condition_id=row["resumed_wait_condition_id"],
+        resumed_human_boundary_id=row["resumed_human_boundary_id"],
+        human_resolution_id=row["human_resolution_id"],
+        activity_id=row["activity_id"],
+        attempt_id=row["attempt_id"],
+        specification_generation=row["specification_generation"],
+        candidate_id=row["candidate_id"],
+        forge_observation_id=row["forge_observation_id"],
+        category=row["category"],
+        failure_fingerprint=row["failure_fingerprint"],
+        strategy_index=row["strategy_index"],
+        selected_tactic=row["selected_tactic"],
+        attempt_count=row["attempt_count"],
+        repair_cycle_count=row["repair_cycle_count"],
+        diagnosis_count=row["diagnosis_count"],
+        rescue_epoch=row["rescue_epoch"],
+        selected_fallback=row["selected_fallback"],
+        health_observation_ids_digest=row["health_observation_ids_digest"],
+        next_eligible_at_ms=row["next_eligible_at_ms"],
+        evidence_digest=row["evidence_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
+        health_observation_ids=tuple(health_observation_ids),
+    )
+
+
 def _row_to_activity_review_assignment(
     row: sqlite3.Row,
     *,
@@ -2815,6 +2881,7 @@ CREATE TABLE IF NOT EXISTS runs (
     supersede_requested_transition_sequence IS NULL
     OR supersede_requested_transition_sequence > 0
   ),
+  current_recovery_evidence_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -3971,6 +4038,54 @@ CREATE TABLE IF NOT EXISTS health_observations (
 CREATE INDEX IF NOT EXISTS idx_health_observations_scope_sequence
 ON health_observations(scope_kind, scope_id, health_sequence);
 
+CREATE TABLE IF NOT EXISTS recovery_evidence (
+  recovery_evidence_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  recovery_sequence INTEGER NOT NULL CHECK (recovery_sequence > 0),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("recovery_evidence.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  resumed_wait_condition_id TEXT,
+  resumed_human_boundary_id TEXT,
+  human_resolution_id TEXT,
+  activity_id TEXT,
+  attempt_id TEXT,
+  specification_generation INTEGER NOT NULL CHECK (specification_generation >= 0),
+  candidate_id TEXT,
+  forge_observation_id TEXT,
+  category TEXT NOT NULL CHECK (
+    category IN ({_sql_in(_enum_values("recovery_evidence.category"))})
+  ),
+  failure_fingerprint TEXT NOT NULL,
+  strategy_index INTEGER NOT NULL CHECK (strategy_index >= 0),
+  selected_tactic TEXT NOT NULL CHECK (
+    selected_tactic IN ({_sql_in(_enum_values("recovery_evidence.selected_tactic"))})
+  ),
+  attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+  repair_cycle_count INTEGER NOT NULL CHECK (repair_cycle_count >= 0),
+  diagnosis_count INTEGER NOT NULL CHECK (diagnosis_count >= 0),
+  rescue_epoch INTEGER NOT NULL CHECK (rescue_epoch >= 0),
+  selected_fallback TEXT,
+  health_observation_ids_digest TEXT NOT NULL,
+  next_eligible_at_ms INTEGER CHECK (next_eligible_at_ms IS NULL OR next_eligible_at_ms >= 0),
+  evidence_digest TEXT NOT NULL UNIQUE,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (run_id, recovery_sequence),
+  UNIQUE (run_id, source_kind, source_id),
+  CHECK ((resumed_human_boundary_id IS NULL) = (human_resolution_id IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS recovery_evidence_health_observations (
+  recovery_evidence_id TEXT NOT NULL
+    REFERENCES recovery_evidence(recovery_evidence_id) ON DELETE RESTRICT,
+  observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+  health_observation_id TEXT NOT NULL
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (recovery_evidence_id, observation_ordinal),
+  UNIQUE (recovery_evidence_id, health_observation_id)
+);
+
 CREATE TABLE IF NOT EXISTS capacity_reports (
   capacity_report_id TEXT PRIMARY KEY,
   pool_manager_id TEXT NOT NULL,
@@ -4525,6 +4640,7 @@ CREATE TABLE runs_v2 (
     supersede_requested_transition_sequence IS NULL
     OR supersede_requested_transition_sequence > 0
   ),
+  current_recovery_evidence_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -4710,6 +4826,10 @@ ALTER TABLE runs ADD COLUMN supersede_requested INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN supersede_requested_transition_sequence INTEGER;
 """
 
+_ADD_CURRENT_RECOVERY_EVIDENCE_ID = """
+ALTER TABLE runs ADD COLUMN current_recovery_evidence_id TEXT;
+"""
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -4883,7 +5003,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -4905,6 +5025,11 @@ class RunStore:
         }
         v6_to_v7 = "" if "current_snapshot_id" in run_columns else _V6_TO_V7
         v13_to_v14 = self._v13_to_v14_script()
+        add_recovery_pointer = (
+            _ADD_CURRENT_RECOVERY_EVIDENCE_ID
+            if current >= 2 and "current_recovery_evidence_id" not in run_columns
+            else ""
+        )
         try:
             if current == 0:
                 self.conn.executescript(
@@ -4953,6 +5078,8 @@ class RunStore:
                     + "\n"
                     + v6_to_v7
                     + "\n"
+                    + add_recovery_pointer
+                    + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
@@ -4973,6 +5100,8 @@ class RunStore:
                     + _SCHEMA
                     + "\n"
                     + v6_to_v7
+                    + "\n"
+                    + add_recovery_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -4997,6 +5126,8 @@ class RunStore:
                     + _SCHEMA
                     + "\n"
                     + v6_to_v7
+                    + "\n"
+                    + add_recovery_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5027,6 +5158,8 @@ class RunStore:
                     + _V5_TO_V6
                     + "\n"
                     + v6_to_v7
+                    + "\n"
+                    + add_recovery_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5069,6 +5202,8 @@ class RunStore:
                     + "\n"
                     + v6_to_v7
                     + "\n"
+                    + add_recovery_pointer
+                    + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
@@ -5086,7 +5221,12 @@ class RunStore:
                 # activities/attempts/attempt_claims tables and later additive
                 # tables (all CREATE TABLE IF NOT EXISTS).
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + _FORGE_OBSERVATION_SCHEDULE_INDEXES
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + add_recovery_pointer
+                    + "\n"
+                    + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5099,7 +5239,14 @@ class RunStore:
                 )
             elif current == 8:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _V8_TO_V9 + "\n" + _SCHEMA + "\n" + v13_to_v14
+                    "BEGIN EXCLUSIVE;\n"
+                    + _V8_TO_V9
+                    + "\n"
+                    + _SCHEMA
+                    + "\n"
+                    + v13_to_v14
+                    + "\n"
+                    + add_recovery_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -5112,7 +5259,9 @@ class RunStore:
                 )
             elif current == 9:
                 assert current == 9
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -5124,7 +5273,9 @@ class RunStore:
                 )
             elif current == 10:
                 assert current == 10
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -5135,7 +5286,9 @@ class RunStore:
                     ),
                 )
             elif current == 11:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -5146,7 +5299,9 @@ class RunStore:
                     ),
                 )
             elif current == 12:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -5156,15 +5311,30 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 13
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+            elif current == 13:
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14 + "\n" + add_recovery_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-liveness-and-deadline-processing",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 14
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + add_recovery_pointer
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-recovery-evidence",
                         _now_ms(),
                     ),
                 )
@@ -12785,6 +12955,224 @@ class RunStore:
             (scope_kind, scope_id, now),
         ).fetchone()
         return None if row is None else self._row_to_health_observation(row)
+
+    def _next_recovery_sequence(self, run_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(recovery_sequence), 0) AS seq FROM recovery_evidence "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return int(row["seq"]) + 1
+
+    def get_recovery_evidence(self, recovery_evidence_id: str) -> RecoveryEvidenceRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM recovery_evidence WHERE recovery_evidence_id = ?",
+            (recovery_evidence_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        health_rows = self.conn.execute(
+            "SELECT health_observation_id FROM recovery_evidence_health_observations "
+            "WHERE recovery_evidence_id = ? ORDER BY observation_ordinal",
+            (recovery_evidence_id,),
+        ).fetchall()
+        return _row_to_recovery_evidence(
+            row,
+            health_observation_ids=tuple(
+                str(item["health_observation_id"]) for item in health_rows
+            ),
+        )
+
+    def create_recovery_evidence(
+        self,
+        *,
+        recovery_evidence_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        category: str,
+        failure_fingerprint: str,
+        strategy_index: int,
+        selected_tactic: str,
+        attempt_count: int,
+        repair_cycle_count: int,
+        diagnosis_count: int,
+        rescue_epoch: int,
+        health_observations: Sequence[HealthObservationRecord] = (),
+        specification_generation: int = 0,
+        resumed_wait_condition_id: str | None = None,
+        resumed_human_boundary_id: str | None = None,
+        human_resolution_id: str | None = None,
+        activity_id: str | None = None,
+        attempt_id: str | None = None,
+        candidate_id: str | None = None,
+        forge_observation_id: str | None = None,
+        selected_fallback: str | None = None,
+        next_eligible_at_ms: int | None = None,
+    ) -> RecoveryEvidenceRecord:
+        """Insert one immutable source-unique Recovery Evidence record.
+
+        Health observations are frozen in spec order regardless of caller order:
+        ``(scope_kind, scope_id, health_sequence, health_observation_id)``.
+        """
+        require_lowercase_uuid(recovery_evidence_id, field="recovery_evidence_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("recovery_evidence.source_kind", source_kind)
+        enums.parse_enum("recovery_evidence.category", category)
+        enums.parse_enum("recovery_evidence.selected_tactic", selected_tactic)
+        _require_digest(failure_fingerprint, field="failure_fingerprint")
+        if (
+            min(
+                strategy_index,
+                attempt_count,
+                repair_cycle_count,
+                diagnosis_count,
+                rescue_epoch,
+                specification_generation,
+            )
+            < 0
+        ):
+            raise ValueError("Recovery Evidence counters and generations must be nonnegative")
+        if (resumed_human_boundary_id is None) != (human_resolution_id is None):
+            raise ValueError("human boundary recovery requires both boundary and resolution ids")
+        ordered_health = tuple(
+            sorted(
+                health_observations,
+                key=lambda item: (
+                    item.scope_kind,
+                    item.scope_id,
+                    item.health_sequence,
+                    item.health_observation_id,
+                ),
+            )
+        )
+        health_ids = tuple(item.health_observation_id for item in ordered_health)
+        if len(set(health_ids)) != len(health_ids):
+            raise ValueError("health observation membership contains duplicate ids")
+        health_digest = bare_canonical_digest(list(health_ids))
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM recovery_evidence WHERE run_id = ? "
+                "AND source_kind = ? AND source_id = ?",
+                (run_id, source_kind, source_id),
+            ).fetchone()
+            if existing is not None:
+                record = self.get_recovery_evidence(str(existing["recovery_evidence_id"]))
+                assert record is not None
+                if (
+                    record.recovery_evidence_id == recovery_evidence_id
+                    and record.category == category
+                    and record.failure_fingerprint == failure_fingerprint
+                    and record.strategy_index == strategy_index
+                    and record.selected_tactic == selected_tactic
+                    and record.attempt_count == attempt_count
+                    and record.repair_cycle_count == repair_cycle_count
+                    and record.diagnosis_count == diagnosis_count
+                    and record.rescue_epoch == rescue_epoch
+                    and record.resumed_wait_condition_id == resumed_wait_condition_id
+                    and record.resumed_human_boundary_id == resumed_human_boundary_id
+                    and record.human_resolution_id == human_resolution_id
+                    and record.activity_id == activity_id
+                    and record.attempt_id == attempt_id
+                    and record.candidate_id == candidate_id
+                    and record.forge_observation_id == forge_observation_id
+                    and record.selected_fallback == selected_fallback
+                    and record.health_observation_ids == health_ids
+                    and record.next_eligible_at_ms == next_eligible_at_ms
+                    and record.specification_generation == specification_generation
+                ):
+                    return record
+                raise IdempotencyConflictError(
+                    "recovery evidence source identity was reused with different content"
+                )
+
+            recovery_sequence = self._next_recovery_sequence(run_id)
+            now = _now_ms()
+            evidence_preimage = {
+                "recovery_evidence_id": recovery_evidence_id,
+                "run_id": run_id,
+                "recovery_sequence": recovery_sequence,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "resumed_wait_condition_id": resumed_wait_condition_id,
+                "resumed_human_boundary_id": resumed_human_boundary_id,
+                "human_resolution_id": human_resolution_id,
+                "activity_id": activity_id,
+                "attempt_id": attempt_id,
+                "specification_generation": specification_generation,
+                "candidate_id": candidate_id,
+                "forge_observation_id": forge_observation_id,
+                "category": category,
+                "failure_fingerprint": failure_fingerprint,
+                "strategy_index": strategy_index,
+                "selected_tactic": selected_tactic,
+                "attempt_count": attempt_count,
+                "repair_cycle_count": repair_cycle_count,
+                "diagnosis_count": diagnosis_count,
+                "rescue_epoch": rescue_epoch,
+                "selected_fallback": selected_fallback,
+                "health_observation_ids_digest": health_digest,
+                "next_eligible_at_ms": next_eligible_at_ms,
+            }
+            evidence_digest = recovery_evidence_digest(evidence_preimage)
+            self.conn.execute(
+                "INSERT INTO recovery_evidence(recovery_evidence_id, run_id, "
+                "recovery_sequence, source_kind, source_id, resumed_wait_condition_id, "
+                "resumed_human_boundary_id, human_resolution_id, activity_id, attempt_id, "
+                "specification_generation, candidate_id, forge_observation_id, category, "
+                "failure_fingerprint, strategy_index, selected_tactic, attempt_count, "
+                "repair_cycle_count, diagnosis_count, rescue_epoch, selected_fallback, "
+                "health_observation_ids_digest, next_eligible_at_ms, evidence_digest, "
+                "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    recovery_evidence_id,
+                    run_id,
+                    recovery_sequence,
+                    source_kind,
+                    source_id,
+                    resumed_wait_condition_id,
+                    resumed_human_boundary_id,
+                    human_resolution_id,
+                    activity_id,
+                    attempt_id,
+                    specification_generation,
+                    candidate_id,
+                    forge_observation_id,
+                    category,
+                    failure_fingerprint,
+                    strategy_index,
+                    selected_tactic,
+                    attempt_count,
+                    repair_cycle_count,
+                    diagnosis_count,
+                    rescue_epoch,
+                    selected_fallback,
+                    health_digest,
+                    next_eligible_at_ms,
+                    evidence_digest,
+                    now,
+                ),
+            )
+            for ordinal, observation in enumerate(ordered_health):
+                self.conn.execute(
+                    "INSERT INTO recovery_evidence_health_observations("
+                    "recovery_evidence_id, observation_ordinal, health_observation_id) "
+                    "VALUES (?, ?, ?)",
+                    (recovery_evidence_id, ordinal, observation.health_observation_id),
+                )
+            self.conn.execute(
+                "UPDATE runs SET current_recovery_evidence_id = ?, updated_at_ms = ? "
+                "WHERE run_id = ?",
+                (recovery_evidence_id, now, run_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM recovery_evidence WHERE recovery_evidence_id = ?",
+                (recovery_evidence_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_recovery_evidence(row, health_observation_ids=health_ids)
 
     def _waiting_run_ids(self, *, wait_reason: str, project_id: str | None = None) -> list[str]:
         """Bytewise-sorted ``run_id``s currently ``WAITING`` for ``wait_reason``.

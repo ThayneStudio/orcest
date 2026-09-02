@@ -248,7 +248,13 @@ def _default_facts(state: str | None, trigger: str) -> tuple[str, dict[str, Any]
     if trigger == "RECOVERY_EVIDENCE":
         return (
             "re-1",
-            {"selected_tactic": "RETRY_EXECUTION", "next_eligible_at_ms": None},
+            {
+                "source_kind": "ATTEMPT_RESULT",
+                "source_id": "attempt-1",
+                "category": "WORKER_LOST",
+                "selected_tactic": "RETRY_EXECUTION",
+                "next_eligible_at_ms": None,
+            },
         )
     if trigger == "SECRET_VERSION":
         return ("secret:1", {"satisfies_boundary": state == "NEEDS_HUMAN"})
