@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from orcest.workflow_contract.v1 import enums
+from orcest.workflow_contract.v1.protocol_registry import DIAGNOSIS_PROTOCOL, PLAN_PROTOCOL
 from orcest.workflow_reducer.continuation import ContinuationWinner, arbitrate_internal_continuation
 from orcest.workflow_reducer.contract import is_legal_pair
 from orcest.workflow_reducer.graph import (
@@ -39,6 +40,51 @@ _AUDIT_TRIGGERS = frozenset(
         "TIMER_FACT",
     }
 )
+
+_MODE_ENVELOPES: Mapping[str, Mapping[str, str]] = {
+    "PLAN": {
+        "mode": "PLAN",
+        "profile_source": "implementation.profile",
+        "prompt_source": "implementation.prompt",
+        "output_protocol": PLAN_PROTOCOL,
+    },
+    "BUILD": {
+        "mode": "BUILD",
+        "profile_source": "implementation.profile",
+        "prompt_source": "implementation.prompt",
+        "candidate_context": "accepted_plan",
+    },
+    "DIAGNOSE": {
+        "mode": "DIAGNOSE",
+        "profile_source": "implementation.profile",
+        "prompt_source": "implementation.prompt",
+        "output_protocol": DIAGNOSIS_PROTOCOL,
+    },
+    "REPLAN": {
+        "mode": "REPLAN",
+        "profile_source": "implementation.profile",
+        "prompt_source": "implementation.prompt",
+        "output_protocol": PLAN_PROTOCOL,
+    },
+    "REMEDIATE": {
+        "mode": "REMEDIATE",
+        "profile_source": "verification.repair.profile",
+        "prompt_source": "verification.repair.prompt",
+        "candidate_context": "current_candidate",
+    },
+    "REBASE": {
+        "mode": "REBASE",
+        "profile_source": "verification.repair.profile",
+        "prompt_source": "verification.repair.prompt",
+        "candidate_context": "current_candidate",
+    },
+    "PR_REMEDIATE": {
+        "mode": "PR_REMEDIATE",
+        "profile_source": "verification.repair.profile",
+        "prompt_source": "verification.repair.prompt",
+        "candidate_context": "current_candidate",
+    },
+}
 
 
 def reduce(view: RunView, trigger: Trigger) -> Reduction:
@@ -90,7 +136,7 @@ def _plan(
         role=kind.lower(),
         candidate_id=candidate_id if candidate_id is not None else view.current_candidate_id,
         forge_observation_id=forge_observation_id,
-        semantic_input=dict(semantic_input or {}),
+        semantic_input={**dict(_MODE_ENVELOPES.get(kind, {})), **dict(semantic_input or {})},
         recovery_tactic=recovery_tactic,
         recovery_evidence_id=recovery_evidence_id,
         slot=slot,
@@ -538,6 +584,23 @@ def _handle_attempt_result(view: RunView, trigger: Trigger) -> Reduction | None:
     state = view.state
     if state is None or activity_kind is None or outcome is None:
         return None
+    missing_structured_protocol = str(activity_kind) in {
+        "PLAN",
+        "REPLAN",
+        "DIAGNOSE",
+    } and trigger.fact("structured_output_protocol") != (
+        DIAGNOSIS_PROTOCOL if activity_kind == "DIAGNOSE" else PLAN_PROTOCOL
+    )
+    if outcome == "SUCCEEDED" and missing_structured_protocol:
+        return _reduction(
+            view,
+            trigger,
+            kind=ReductionKind.ADVANCE,
+            next_state="RECOVERING",
+            reason_code="INVALID_STRUCTURED_OUTPUT",
+            pointer_updates={"recovery_origin_state": state},
+            continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
+        )
     if trigger.fact_true("repeated_non_progress"):
         return _reduction(
             view,
@@ -720,11 +783,19 @@ def _handle_attempt_result(view: RunView, trigger: Trigger) -> Reduction | None:
         if mapped is None:
             return None
         next_state, plan, reason = mapped
+        if plan == "VERIFY" and trigger.fact("candidate_id") is None:
+            return _reduction(
+                view,
+                trigger,
+                kind=ReductionKind.ADVANCE,
+                next_state="RECOVERING",
+                reason_code="MISSING_CANDIDATE",
+                pointer_updates={"recovery_origin_state": state},
+                continuation=PendingContinuation(kind="RECOVERY_EVIDENCE"),
+            )
         updates: dict[str, Any] = {}
         if plan == "VERIFY":
-            updates["current_candidate_id"] = trigger.fact(
-                "candidate_id", view.current_candidate_id or "candidate-1"
-            )
+            updates["current_candidate_id"] = trigger.fact("candidate_id")
         return _reduction(
             view,
             trigger,

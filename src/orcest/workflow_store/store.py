@@ -78,6 +78,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     WORKER_LOSS_PROTOCOL,
     WORKER_LOSS_RESULT_PROTOCOL,
 )
+from orcest.workflow_contract.v1.structured_outputs import validate_attempt_structured_output
 
 SCHEMA_VERSION = 12
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
@@ -11247,6 +11248,14 @@ class RunStore:
                 and now >= row["capability_auth_expires_at_ms"]
             ):
                 raise CasMismatchError("attempt capability authentication expired")
+            validate_attempt_structured_output(
+                activity_kind=str(row["activity_kind"]),
+                outcome=outcome,
+                structured_output=structured_output,
+                candidate_upload_id=candidate_upload_id,
+                receipt=receipt,
+                summary=summary,
+            )
 
             binding_ok = (
                 row["claimed_worker_id"] == worker_id
@@ -11630,6 +11639,11 @@ class RunStore:
                                 "activity_kind": row["activity_kind"],
                                 "candidate_id": candidate_id,
                                 "failure_class": failure_class,
+                                "structured_output_protocol": (
+                                    structured_output.get("protocol_version")
+                                    if isinstance(structured_output, Mapping)
+                                    else None
+                                ),
                             },
                         ),
                         run_id=row["run_id"],

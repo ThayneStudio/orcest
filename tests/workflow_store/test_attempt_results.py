@@ -220,7 +220,7 @@ def _submit(
         outcome="SUCCEEDED",
         candidate_upload_id=None,
         receipt={"ok": True},
-        structured_output={"status": "done"},
+        structured_output=None,
         summary="done",
         now_ms=FUTURE_MS + 10,
     )

@@ -84,6 +84,63 @@ def test_verify_fail_below_threshold_remediates() -> None:
     assert any(activity.kind == "REMEDIATE" for activity in reduction.planned_activities)
 
 
+def test_candidate_producing_success_without_candidate_enters_recovery() -> None:
+    view = default_view("BUILDING", "ATTEMPT_RESULT")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="ATTEMPT_RESULT",
+            trigger_id="attempt-build",
+            facts={"outcome": "SUCCEEDED", "activity_kind": "BUILD"},
+        ),
+    )
+    assert reduction.next_state == "RECOVERING"
+    assert reduction.reason_code == "MISSING_CANDIDATE"
+    assert reduction.pending_continuation is not None
+    assert reduction.pending_continuation.kind == "RECOVERY_EVIDENCE"
+
+
+def test_plan_success_requires_validated_structured_output_protocol() -> None:
+    view = default_view("PLANNING", "ATTEMPT_RESULT")
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="ATTEMPT_RESULT",
+            trigger_id="attempt-plan",
+            facts={"outcome": "SUCCEEDED", "activity_kind": "PLAN"},
+        ),
+    )
+    assert reduction.next_state == "RECOVERING"
+    assert reduction.reason_code == "INVALID_STRUCTURED_OUTPUT"
+
+
+def test_policy_only_replan_reselects_prior_candidate_after_identity_revalidation() -> None:
+    view = default_view(
+        "REPLANNING",
+        "ATTEMPT_RESULT",
+        policy_replan_candidate_id="66666666-6666-4666-8666-666666666666",
+    )
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="ATTEMPT_RESULT",
+            trigger_id="attempt-replan",
+            facts={
+                "outcome": "SUCCEEDED",
+                "activity_kind": "REPLAN",
+                "structured_output_protocol": "orcest.plan/1",
+                "policy_identity_holds": True,
+            },
+        ),
+    )
+    assert reduction.next_state == "VERIFYING"
+    assert reduction.reason_code == "POLICY_REPLAN_RESELECT"
+    assert reduction.pointer_updates["current_candidate_id"] == (
+        "66666666-6666-4666-8666-666666666666"
+    )
+    assert any(activity.kind == "VERIFY" for activity in reduction.planned_activities)
+
+
 def test_cancellation_suppresses_semantic_work() -> None:
     view = default_view(
         "PLANNING",

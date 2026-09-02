@@ -49,6 +49,8 @@ CONTROLLER_MODE_OPERATION_PROTOCOL = "orcest.controller-mode-operation/1"
 CONTROLLER_MODE_RESULT_PROTOCOL = "orcest.controller-mode-result/1"
 ERROR_PROTOCOL = "orcest.error/1"
 FORGE_OBSERVATION_REQUEST_PROTOCOL = "orcest.forge-observation-request/1"
+PLAN_PROTOCOL = "orcest.plan/1"
+DIAGNOSIS_PROTOCOL = "orcest.diagnosis/1"
 PROJECT_REGISTRATION_PROTOCOL = "orcest.project-registration/1"
 PROJECT_REGISTRATION_RESULT_PROTOCOL = "orcest.project-registration-result/1"
 SECRET_PROVISION_REQUEST_PROTOCOL = "orcest.secret-provision/1"
@@ -71,6 +73,8 @@ __all__ = [
     "CONTROLLER_MODE_RESULT_PROTOCOL",
     "ERROR_PROTOCOL",
     "FORGE_OBSERVATION_REQUEST_PROTOCOL",
+    "PLAN_PROTOCOL",
+    "DIAGNOSIS_PROTOCOL",
     "PROJECT_REGISTRATION_PROTOCOL",
     "PROJECT_REGISTRATION_RESULT_PROTOCOL",
     "SECRET_PROVISION_REQUEST_PROTOCOL",
@@ -819,12 +823,182 @@ register_envelope("orcest.secret-provision/1", {})
 
 
 # ---------------------------------------------------------------------------
-# Structured-output payload protocols and controller-operation input refs --
-# full schemas are owned by the planning contract / other leaf issues.
+# Structured-output payload protocols and controller-operation input refs.
 # ---------------------------------------------------------------------------
 
-register_envelope("orcest.plan/1", {})
-register_envelope("orcest.diagnosis/1", {})
+_PLAN_ITEM_SCHEMA = Schema(
+    {
+        "id": Field(validator=_is_nonempty_str),
+        "summary": Field(validator=_is_nonempty_str),
+        "depends_on": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+    }
+)
+_PLAN_STEP_SCHEMA = Schema(
+    {
+        "id": Field(validator=_is_nonempty_str),
+        "summary": Field(validator=_is_nonempty_str),
+        "requirement_ids": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+        "depends_on": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+        "verification_ids": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+    }
+)
+_PLAN_VERIFICATION_SCHEMA = Schema(
+    {
+        "id": Field(validator=_is_nonempty_str),
+        "summary": Field(validator=_is_nonempty_str),
+        "command_ids": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+    }
+)
+
+
+def _field_id_list(value: Mapping[str, Any], field_name: str) -> list[str]:
+    items = value.get(field_name)
+    if not isinstance(items, list):
+        raise ProtocolValidationError(f"{field_name} must be an array")
+    ids: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+            raise ProtocolValidationError(f"{field_name} members must be id objects")
+        ids.append(str(item["id"]))
+    return ids
+
+
+def _assert_unique(ids: list[str], field_name: str) -> None:
+    if len(ids) != len(set(ids)):
+        raise ProtocolValidationError(f"{field_name} contains duplicate ids")
+
+
+def _assert_refs_known(refs: list[str], known: set[str], field_name: str) -> None:
+    missing = sorted(set(refs) - known)
+    if missing:
+        raise ProtocolValidationError(f"{field_name} references unknown ids {missing!r}")
+
+
+def _assert_acyclic(edges: Mapping[str, list[str]], field_name: str) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in visited:
+            return
+        if node in visiting:
+            raise ProtocolValidationError(f"{field_name} contains a cycle")
+        visiting.add(node)
+        for dependency in edges[node]:
+            visit(dependency)
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in sorted(edges):
+        visit(node)
+
+
+def _plan_invariant(value: Mapping[str, Any]) -> None:
+    requirements = value.get("requirements")
+    steps = value.get("steps")
+    verifications = value.get("verification_mapping")
+    if not isinstance(requirements, list) or not requirements:
+        raise ProtocolValidationError("requirements must be a non-empty array")
+    if not isinstance(steps, list) or not steps:
+        raise ProtocolValidationError("steps must be a non-empty array")
+    if not isinstance(verifications, list) or not verifications:
+        raise ProtocolValidationError("verification_mapping must be a non-empty array")
+    requirement_ids = _field_id_list(value, "requirements")
+    step_ids = _field_id_list(value, "steps")
+    verification_ids = _field_id_list(value, "verification_mapping")
+    _assert_unique(requirement_ids, "requirements")
+    _assert_unique(step_ids, "steps")
+    _assert_unique(verification_ids, "verification_mapping")
+    requirement_set = set(requirement_ids)
+    step_set = set(step_ids)
+    verification_set = set(verification_ids)
+    requirement_edges: dict[str, list[str]] = {}
+    for requirement in requirements:
+        assert isinstance(requirement, Mapping)
+        deps = [str(item["id"]) for item in requirement["depends_on"]]
+        _assert_refs_known(deps, requirement_set, "requirements.depends_on")
+        requirement_edges[str(requirement["id"])] = deps
+    step_edges: dict[str, list[str]] = {}
+    covered_requirements: set[str] = set()
+    covered_verifications: set[str] = set()
+    for step in steps:
+        assert isinstance(step, Mapping)
+        deps = [str(item["id"]) for item in step["depends_on"]]
+        reqs = [str(item["id"]) for item in step["requirement_ids"]]
+        checks = [str(item["id"]) for item in step["verification_ids"]]
+        _assert_refs_known(deps, step_set, "steps.depends_on")
+        _assert_refs_known(reqs, requirement_set, "steps.requirement_ids")
+        _assert_refs_known(checks, verification_set, "steps.verification_ids")
+        step_edges[str(step["id"])] = deps
+        covered_requirements.update(reqs)
+        covered_verifications.update(checks)
+    if covered_requirements != requirement_set:
+        missing = sorted(requirement_set - covered_requirements)
+        raise ProtocolValidationError(f"requirements not mapped to steps {missing!r}")
+    if covered_verifications != verification_set:
+        missing = sorted(verification_set - covered_verifications)
+        raise ProtocolValidationError(f"verification_mapping not mapped to steps {missing!r}")
+    _assert_acyclic(requirement_edges, "requirements.depends_on")
+    _assert_acyclic(step_edges, "steps.depends_on")
+
+
+register_envelope(
+    PLAN_PROTOCOL,
+    {
+        "plan_id": Field(validator=_is_uuid),
+        "snapshot_id": Field(validator=_is_uuid),
+        "policy_hash": Field(validator=_is_digest),
+        "requirements": Field(item_schema=_PLAN_ITEM_SCHEMA),
+        "steps": Field(item_schema=_PLAN_STEP_SCHEMA),
+        "verification_mapping": Field(item_schema=_PLAN_VERIFICATION_SCHEMA),
+        "notes": Field(required=False, validator=_is_str),
+    },
+    object_validator=_plan_invariant,
+)
+
+_DIAGNOSIS_FINDING_SCHEMA = Schema(
+    {
+        "id": Field(validator=_is_nonempty_str),
+        "category": Field(
+            enum=frozenset(
+                {
+                    "NO_PROGRESS",
+                    "REPEATED_FAILURE",
+                    "CONFLICTING_EVIDENCE",
+                    "INVALID_PLAN",
+                    "TRANSIENT_INFRASTRUCTURE",
+                }
+            )
+        ),
+        "summary": Field(validator=_is_nonempty_str),
+        "evidence_refs": Field(item_schema=Schema({"id": Field(validator=_is_nonempty_str)})),
+    }
+)
+
+
+def _diagnosis_invariant(value: Mapping[str, Any]) -> None:
+    findings = value.get("findings")
+    if not isinstance(findings, list) or not findings:
+        raise ProtocolValidationError("findings must be a non-empty array")
+    finding_ids = _field_id_list(value, "findings")
+    _assert_unique(finding_ids, "findings")
+
+
+register_envelope(
+    DIAGNOSIS_PROTOCOL,
+    {
+        "diagnosis_id": Field(validator=_is_uuid),
+        "snapshot_id": Field(validator=_is_uuid),
+        "candidate_id": Field(required=False, nullable=True, validator=_is_uuid),
+        "policy_hash": Field(validator=_is_digest),
+        "findings": Field(item_schema=_DIAGNOSIS_FINDING_SCHEMA),
+        "recommended_tactic": Field(
+            enum=frozenset({"RETRY_EXECUTION", "REPAIR", "REBASE", "REPLAN", "WAIT_EVIDENCE"})
+        ),
+        "summary": Field(validator=_is_nonempty_str),
+    },
+    object_validator=_diagnosis_invariant,
+)
 register_envelope("orcest.redundant-publication-cleanup/1", {})
 register_envelope("orcest.run-marker-repair/1", {})
 register_envelope(FORGE_OBSERVATION_REQUEST_PROTOCOL, {})
