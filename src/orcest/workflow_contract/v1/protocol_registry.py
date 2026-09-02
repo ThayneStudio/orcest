@@ -58,6 +58,8 @@ CREDENTIAL_ROTATION_REQUEST_PROTOCOL = "orcest.credential-rotation/1"
 CREDENTIAL_ROTATION_RESULT_PROTOCOL = "orcest.credential-rotation-result/1"
 WORKER_LOSS_PROTOCOL = "orcest.worker-loss/1"
 WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
+ATTEMPT_LIVENESS_PROTOCOL = "orcest.attempt-liveness/1"
+ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
@@ -82,6 +84,8 @@ __all__ = [
     "CREDENTIAL_ROTATION_RESULT_PROTOCOL",
     "WORKER_LOSS_PROTOCOL",
     "WORKER_LOSS_RESULT_PROTOCOL",
+    "ATTEMPT_LIVENESS_PROTOCOL",
+    "ATTEMPT_LIVENESS_RESULT_PROTOCOL",
 ]
 
 
@@ -707,7 +711,7 @@ register_envelope(CREDENTIAL_ROTATION_REQUEST_PROTOCOL, {})
 # ---------------------------------------------------------------------------
 
 register_envelope(
-    "orcest.attempt-liveness/1",
+    ATTEMPT_LIVENESS_PROTOCOL,
     {
         "activity_id": Field(validator=_is_uuid),
         "generation": Field(validator=_is_nonneg_int),
@@ -719,7 +723,7 @@ register_envelope(
     protocol_field="protocol",
 )
 register_envelope(
-    "orcest.attempt-liveness-result/1",
+    ATTEMPT_LIVENESS_RESULT_PROTOCOL,
     {
         "attempt_id": Field(validator=_is_uuid),
         "activity_id": Field(validator=_is_uuid),

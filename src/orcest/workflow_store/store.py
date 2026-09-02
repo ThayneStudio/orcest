@@ -29,6 +29,7 @@ from orcest.workflow_contract.v1.digest import (
     affected_run_ids_digest,
     attempt_result_receipt_digest,
     attempt_terminal_fact_digest,
+    attempt_terminal_fact_health_membership_digest,
     bare_canonical_digest,
     budget_report_digest,
     capability_public_key_digest,
@@ -51,6 +52,7 @@ from orcest.workflow_contract.v1.digest import (
     review_assignment_digest,
     specification_digest,
     subject_refs_digest,
+    timer_fact_digest,
     work_item_discovery_set_digest,
     worker_loss_report_digest,
     workflow_blob_digest,
@@ -58,6 +60,7 @@ from orcest.workflow_contract.v1.digest import (
 from orcest.workflow_contract.v1.identity import is_lowercase_uuid, require_lowercase_uuid
 from orcest.workflow_contract.v1.protocol_registry import (
     ATTEMPT_CLAIM_PROTOCOL,
+    ATTEMPT_LIVENESS_RESULT_PROTOCOL,
     ATTEMPT_RESULT_ACCEPTED_PROTOCOL,
     ATTEMPT_RESULT_PROTOCOL,
     BUDGET_REPORT_RESULT_PROTOCOL,
@@ -80,7 +83,19 @@ from orcest.workflow_contract.v1.protocol_registry import (
     WORKER_LOSS_RESULT_PROTOCOL,
 )
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
+_NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
+    "expected_deadline_ms": "INTEGER",
+    "controller_now_ms": "INTEGER",
+    "capacity_disposition": "TEXT",
+    "health_observation_ids_digest": "TEXT",
+    "resolved_provider_secret_ref": "TEXT",
+    "controller_mode_revision": "INTEGER",
+    "controller_mode": "TEXT",
+    "capability_registry_revision": "INTEGER",
+    "selected_issuance_key_id": "TEXT",
+    "replacement_offer_disposition": "TEXT",
+}
 DEFAULT_REDUCER_VERSION = "workflow-control-v1/reducer-0"
 SUPPORTED_REDUCER_VERSIONS = frozenset({DEFAULT_REDUCER_VERSION})
 CONTROLLER_ID = "ORCEST_V1"
@@ -965,6 +980,7 @@ class AttemptRecord:
     execution_deadline_ms: int | None = None
     capability_auth_expires_at_ms: int | None = None
     last_liveness_observed_ms: int | None = None
+    last_liveness_sequence: int | None = None
     attempt_capability_jti: str | None = None
     attempt_capability_digest: str | None = None
     attempt_capability_signing_key_id: str | None = None
@@ -1165,6 +1181,65 @@ class WorkerLossReportResult:
     response_digest: str
     accepted_at_ms: int
     replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptLivenessResult:
+    """Response to one ``PUT /api/v1/attempts/{attempt_id}/liveness`` call.
+
+    Liveness has no idempotency key or durable request/response ledger
+    (worker-protocol.md "Liveness, control, and deadlines"): every call is
+    freshly derived from current durable state and this result is never
+    stored. ``liveness_recorded`` reflects only the disposable Redis-backed
+    lease this store has no client for, so it is always ``False`` here; the
+    durable ``last_liveness_observed_ms``/``last_liveness_sequence`` columns
+    are an informational courtesy checkpoint, not correctness authority.
+    """
+
+    attempt_id: str
+    activity_id: str
+    generation: int
+    control: str
+    execution_deadline_ms: int
+    liveness_recorded: bool
+    sequence_advanced: bool
+    response_http_status: int
+    response_json: str
+    response_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimerFactRecord:
+    timer_fact_id: str
+    run_id: str | None
+    scope_kind: str
+    scope_id: str
+    fired_for_ms: int
+    controller_now_ms: int
+    source_kind: str
+    source_id: str
+    fact_digest: str
+    recorded_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptDeadlineExpiryResult:
+    """Outcome of one scheduled-sweep/reconciliation Attempt-deadline pass.
+
+    ``outcome`` is ``EXPIRED`` when this call won the terminal fence and
+    created the Attempt Terminal Fact, or ``STALE`` when the referenced
+    Attempt had already moved past the scope this Timer Fact was about (a
+    prior claim, an already-terminal Attempt, or a deadline that no longer
+    matches the durable object) -- the Timer Fact is still durably recorded
+    as evidence either way, per "Timer Facts are evidence, not a second
+    terminal trigger".
+    """
+
+    timer_fact_id: str
+    outcome: str
+    attempt_terminal_fact_id: str | None = None
+    capacity_disposition: str | None = None
+    replacement_offer_disposition: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2187,6 +2262,7 @@ def _row_to_attempt(row: sqlite3.Row) -> AttemptRecord:
         execution_deadline_ms=row["execution_deadline_ms"],
         capability_auth_expires_at_ms=row["capability_auth_expires_at_ms"],
         last_liveness_observed_ms=row["last_liveness_observed_ms"],
+        last_liveness_sequence=row["last_liveness_sequence"],
         attempt_capability_jti=row["attempt_capability_jti"],
         attempt_capability_digest=row["attempt_capability_digest"],
         attempt_capability_signing_key_id=row["attempt_capability_signing_key_id"],
@@ -2198,6 +2274,21 @@ def _row_to_attempt(row: sqlite3.Row) -> AttemptRecord:
         launch_capability_consumed_at_ms=row["launch_capability_consumed_at_ms"],
         terminal_reason=row["terminal_reason"],
         created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_timer_fact(row: sqlite3.Row) -> TimerFactRecord:
+    return TimerFactRecord(
+        timer_fact_id=row["timer_fact_id"],
+        run_id=row["run_id"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        fired_for_ms=row["fired_for_ms"],
+        controller_now_ms=row["controller_now_ms"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        fact_digest=row["fact_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
     )
 
 
@@ -3543,6 +3634,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   execution_deadline_ms INTEGER,
   capability_auth_expires_at_ms INTEGER,
   last_liveness_observed_ms INTEGER,
+  last_liveness_sequence INTEGER
+    CHECK (last_liveness_sequence IS NULL OR last_liveness_sequence > 0),
   attempt_capability_jti TEXT,
   attempt_capability_digest TEXT,
   attempt_capability_signing_key_id TEXT,
@@ -3923,11 +4016,12 @@ CREATE TABLE IF NOT EXISTS capacity_report_entries (
   UNIQUE (capacity_report_id, scope_kind, scope_id)
 );
 
--- Narrow slice of domain-model.md's "Attempt Terminal Fact" closed matrix:
--- this leaf (#680) only ever inserts the pool-loss WORKER_LOST/HEALTH_OBSERVATION
--- member. The idempotent-Results/terminal-fact-reduction leaf widens this table
--- (CLAIM_DEADLINE/EXECUTION_DEADLINE/RESULT_AFTER_TERMINAL columns) via the same
--- rebuild-and-rename migration style used elsewhere in this schema.
+-- domain-model.md "Attempt Terminal Fact" closed matrix. This leaf (#683)
+-- widens the table #680 originally narrowed to the pool-loss
+-- WORKER_LOST/HEALTH_OBSERVATION member: the additional columns are the
+-- frozen claim-deadline capacity classifier evidence (mode/issuance-key gate
+-- plus health membership), populated only for `kind = 'CLAIM_DEADLINE'` and
+-- otherwise left NULL for every other Fact kind.
 CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
   attempt_terminal_fact_id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL,
@@ -3940,13 +4034,65 @@ CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
   source_id TEXT NOT NULL,
   health_observation_id TEXT
     REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  expected_deadline_ms INTEGER,
+  controller_now_ms INTEGER CHECK (
+    controller_now_ms IS NULL OR expected_deadline_ms IS NULL
+    OR controller_now_ms >= expected_deadline_ms
+  ),
+  capacity_disposition TEXT CHECK (
+    capacity_disposition IS NULL
+    OR capacity_disposition IN (
+      {_sql_in(_enum_values("attempt_terminal_fact.capacity_disposition"))}
+    )
+  ),
+  health_observation_ids_digest TEXT,
+  resolved_provider_secret_ref TEXT,
+  controller_mode_revision INTEGER,
+  controller_mode TEXT,
+  capability_registry_revision INTEGER,
+  selected_issuance_key_id TEXT,
+  replacement_offer_disposition TEXT CHECK (
+    replacement_offer_disposition IS NULL
+    OR replacement_offer_disposition IN (
+      {_sql_in(_enum_values("attempt_terminal_fact.replacement_offer_disposition"))}
+    )
+  ),
   fact_digest TEXT NOT NULL,
   recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
   UNIQUE (attempt_id, kind, source_kind, source_id),
   CHECK (
     kind != 'WORKER_LOST'
     OR (source_kind = 'HEALTH_OBSERVATION' AND health_observation_id IS NOT NULL)
-  )
+  ),
+  CHECK (kind = 'CLAIM_DEADLINE' OR capacity_disposition IS NULL),
+  CHECK (kind = 'CLAIM_DEADLINE' OR replacement_offer_disposition IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS attempt_terminal_fact_health_observations (
+  attempt_terminal_fact_id TEXT NOT NULL
+    REFERENCES attempt_terminal_facts(attempt_terminal_fact_id) ON DELETE RESTRICT,
+  observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+  health_observation_id TEXT NOT NULL UNIQUE
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (attempt_terminal_fact_id, observation_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS timer_facts (
+  timer_fact_id TEXT PRIMARY KEY,
+  run_id TEXT,
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("timer_fact.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  fired_for_ms INTEGER NOT NULL CHECK (fired_for_ms >= 0),
+  controller_now_ms INTEGER NOT NULL CHECK (controller_now_ms >= fired_for_ms),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("timer_fact.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  fact_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (scope_kind, scope_id, fired_for_ms)
 );
 
 CREATE TABLE IF NOT EXISTS worker_loss_reports (
@@ -4209,11 +4355,12 @@ CREATE TABLE IF NOT EXISTS capacity_report_entries (
   UNIQUE (capacity_report_id, scope_kind, scope_id)
 );
 
--- Narrow slice of domain-model.md's "Attempt Terminal Fact" closed matrix:
--- this leaf (#680) only ever inserts the pool-loss WORKER_LOST/HEALTH_OBSERVATION
--- member. The idempotent-Results/terminal-fact-reduction leaf widens this table
--- (CLAIM_DEADLINE/EXECUTION_DEADLINE/RESULT_AFTER_TERMINAL columns) via the same
--- rebuild-and-rename migration style used elsewhere in this schema.
+-- domain-model.md "Attempt Terminal Fact" closed matrix. This leaf (#683)
+-- widens the table #680 originally narrowed to the pool-loss
+-- WORKER_LOST/HEALTH_OBSERVATION member: the additional columns are the
+-- frozen claim-deadline capacity classifier evidence (mode/issuance-key gate
+-- plus health membership), populated only for `kind = 'CLAIM_DEADLINE'` and
+-- otherwise left NULL for every other Fact kind.
 CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
   attempt_terminal_fact_id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL,
@@ -4226,13 +4373,65 @@ CREATE TABLE IF NOT EXISTS attempt_terminal_facts (
   source_id TEXT NOT NULL,
   health_observation_id TEXT
     REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  expected_deadline_ms INTEGER,
+  controller_now_ms INTEGER CHECK (
+    controller_now_ms IS NULL OR expected_deadline_ms IS NULL
+    OR controller_now_ms >= expected_deadline_ms
+  ),
+  capacity_disposition TEXT CHECK (
+    capacity_disposition IS NULL
+    OR capacity_disposition IN (
+      {_sql_in(_enum_values("attempt_terminal_fact.capacity_disposition"))}
+    )
+  ),
+  health_observation_ids_digest TEXT,
+  resolved_provider_secret_ref TEXT,
+  controller_mode_revision INTEGER,
+  controller_mode TEXT,
+  capability_registry_revision INTEGER,
+  selected_issuance_key_id TEXT,
+  replacement_offer_disposition TEXT CHECK (
+    replacement_offer_disposition IS NULL
+    OR replacement_offer_disposition IN (
+      {_sql_in(_enum_values("attempt_terminal_fact.replacement_offer_disposition"))}
+    )
+  ),
   fact_digest TEXT NOT NULL,
   recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
   UNIQUE (attempt_id, kind, source_kind, source_id),
   CHECK (
     kind != 'WORKER_LOST'
     OR (source_kind = 'HEALTH_OBSERVATION' AND health_observation_id IS NOT NULL)
-  )
+  ),
+  CHECK (kind = 'CLAIM_DEADLINE' OR capacity_disposition IS NULL),
+  CHECK (kind = 'CLAIM_DEADLINE' OR replacement_offer_disposition IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS attempt_terminal_fact_health_observations (
+  attempt_terminal_fact_id TEXT NOT NULL
+    REFERENCES attempt_terminal_facts(attempt_terminal_fact_id) ON DELETE RESTRICT,
+  observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+  health_observation_id TEXT NOT NULL UNIQUE
+    REFERENCES health_observations(health_observation_id) ON DELETE RESTRICT,
+  PRIMARY KEY (attempt_terminal_fact_id, observation_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS timer_facts (
+  timer_fact_id TEXT PRIMARY KEY,
+  run_id TEXT,
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ({_sql_in(_enum_values("timer_fact.scope_kind"))})
+  ),
+  scope_id TEXT NOT NULL,
+  fired_for_ms INTEGER NOT NULL CHECK (fired_for_ms >= 0),
+  controller_now_ms INTEGER NOT NULL CHECK (controller_now_ms >= fired_for_ms),
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("timer_fact.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  fact_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  UNIQUE (scope_kind, scope_id, fired_for_ms)
 );
 
 CREATE TABLE IF NOT EXISTS worker_loss_reports (
@@ -4642,6 +4841,37 @@ class RunStore:
             raise StartupIntegrityError("SQLite foreign_keys=ON could not be enabled")
         return conn
 
+    def _existing_columns(self, table: str) -> set[str] | None:
+        """``None`` if ``table`` does not exist yet, else its current column names."""
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if exists is None:
+            return None
+        return {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _v13_to_v14_script(self) -> str:
+        """``ALTER TABLE ADD COLUMN`` fragments for #683's new liveness/deadline columns.
+
+        A pre-v14 database only lacks these columns on tables that already
+        existed (``attempts`` since v8, ``attempt_terminal_facts`` since
+        v10); ``_SCHEMA``'s own ``CREATE TABLE IF NOT EXISTS`` already
+        creates both in their final v14 shape for any database fresh enough
+        to not have them yet, so this fragment is empty in that case.
+        """
+        statements: list[str] = []
+        attempt_columns = self._existing_columns("attempts")
+        if attempt_columns is not None and "last_liveness_sequence" not in attempt_columns:
+            statements.append("ALTER TABLE attempts ADD COLUMN last_liveness_sequence INTEGER;")
+        terminal_fact_columns = self._existing_columns("attempt_terminal_facts")
+        if terminal_fact_columns is not None:
+            for name, decl in _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS.items():
+                if name not in terminal_fact_columns:
+                    statements.append(
+                        f"ALTER TABLE attempt_terminal_facts ADD COLUMN {name} {decl};"
+                    )
+        return "\n".join(statements)
+
     def _migrate(self) -> None:
         current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         if current > SCHEMA_VERSION:
@@ -4652,7 +4882,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -4673,6 +4903,7 @@ class RunStore:
             str(row["name"]) for row in self.conn.execute("PRAGMA table_info(runs)").fetchall()
         }
         v6_to_v7 = "" if "current_snapshot_id" in run_columns else _V6_TO_V7
+        v13_to_v14 = self._v13_to_v14_script()
         try:
             if current == 0:
                 self.conn.executescript(
@@ -4866,7 +5097,9 @@ class RunStore:
                     ),
                 )
             elif current == 8:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V8_TO_V9 + "\n" + _SCHEMA)
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _V8_TO_V9 + "\n" + _SCHEMA + "\n" + v13_to_v14
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -4878,7 +5111,7 @@ class RunStore:
                 )
             elif current == 9:
                 assert current == 9
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -4890,7 +5123,7 @@ class RunStore:
                 )
             elif current == 10:
                 assert current == 10
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -4901,7 +5134,7 @@ class RunStore:
                     ),
                 )
             elif current == 11:
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
@@ -4911,15 +5144,26 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 12
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA)
+            elif current == 12:
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-credential-rotation",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 13
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + v13_to_v14)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-liveness-and-deadline-processing",
                         _now_ms(),
                     ),
                 )
@@ -13179,6 +13423,676 @@ class RunStore:
                 accepted_at_ms=accepted_at_ms,
                 replayed=False,
             )
+
+    # -- Attempt Liveness -------------------------------------------------
+
+    def submit_attempt_liveness(
+        self,
+        *,
+        attempt_id: str,
+        activity_id: str,
+        generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        sequence: int,
+        observed_at_ms: int,
+        state: str,
+        now_ms: int | None = None,
+    ) -> AttemptLivenessResult:
+        """Accept one ``PUT /api/v1/attempts/{attempt_id}/liveness`` update.
+
+        worker-protocol.md "Liveness, control, and deadlines": liveness has
+        no idempotency key, durable request row, or original-response
+        replay, so this never durably rejects a replayed, skipped, or
+        out-of-order ``sequence`` -- it is disposable current-control
+        evidence, not a second terminal trigger. A lower-or-equal sequence
+        "never rewinds state": it still gets a freshly derived response, it
+        just does not advance the informational
+        ``last_liveness_observed_ms``/``last_liveness_sequence`` high-water
+        mark. The response ``control`` is always freshly derived from the
+        current durable Attempt/Run state, so replay, a skipped sequence, an
+        ambiguous (timed-out) prior call, and post-restart reconstruction
+        all resolve to the same one ordered conversation instead of a
+        second/competing one.
+
+        Source access, upload, credential rotation, liveness, and launch all
+        end at ``execution_deadline_ms`` (domain-model.md "Attempt"): a
+        liveness call at or after that fixed deadline is not merely told to
+        ``CANCEL``, it is refused outright, mirroring
+        ``require_current_rotation_authority``'s identical cutoff for
+        credential rotation. Equality belongs to the deadline, never to this
+        call arriving "first".
+        """
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        _require_positive_int(generation, field="generation")
+        _require_positive_int(sequence, field="sequence")
+        enums.parse_enum("attempt_liveness.state", state)
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            attempt = self.get_attempt(attempt_id)
+            if attempt is None or attempt.activity_id != activity_id:
+                raise AttemptUnknownError(
+                    f"no Attempt with attempt_id={attempt_id!r} activity_id={activity_id!r}"
+                )
+            if (
+                attempt.generation != generation
+                or attempt.state != "CLAIMED"
+                or attempt.claimed_worker_id != worker_id
+                or attempt.claimed_worker_session_id != worker_session_id
+                or attempt.attempt_capability_digest != attempt_capability_digest
+            ):
+                raise CasMismatchError("liveness update does not match the current claimed attempt")
+            assert attempt.execution_deadline_ms is not None
+            if now >= attempt.execution_deadline_ms:
+                raise CasMismatchError("liveness update arrived at or after the execution deadline")
+
+            activity = self.get_activity(activity_id)
+            assert activity is not None
+            from orcest.workflow_reducer.ledger import load_view
+
+            view = load_view(self, activity.run_id)
+            control = "CANCEL" if view is not None and view.cancellation_pending else "CONTINUE"
+
+            sequence_advanced = (
+                attempt.last_liveness_sequence is None or sequence > attempt.last_liveness_sequence
+            )
+            if sequence_advanced:
+                self.conn.execute(
+                    "UPDATE attempts SET last_liveness_observed_ms = ?, "
+                    "last_liveness_sequence = ? WHERE attempt_id = ?",
+                    (observed_at_ms, sequence, attempt_id),
+                )
+
+            body = {
+                "protocol": ATTEMPT_LIVENESS_RESULT_PROTOCOL,
+                "attempt_id": attempt_id,
+                "activity_id": activity_id,
+                "generation": generation,
+                "control": control,
+                "execution_deadline_ms": attempt.execution_deadline_ms,
+                "liveness_recorded": False,
+            }
+            resp_digest = response_digest({"http_status": 202, "body": body})
+            return AttemptLivenessResult(
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                generation=generation,
+                control=control,
+                execution_deadline_ms=attempt.execution_deadline_ms,
+                liveness_recorded=False,
+                sequence_advanced=sequence_advanced,
+                response_http_status=202,
+                response_json=canonical_json_text(body),
+                response_digest=resp_digest,
+            )
+
+    # -- Timer Fact ---------------------------------------------------------
+
+    def _record_timer_fact(
+        self,
+        *,
+        scope_kind: str,
+        scope_id: str,
+        fired_for_ms: int,
+        source_kind: str,
+        source_id: str,
+        now_ms: int,
+        run_id: str | None = None,
+    ) -> TimerFactRecord:
+        """Insert-or-reuse; MUST run inside a caller-held ``self.transaction()``."""
+        enums.parse_enum("timer_fact.scope_kind", scope_kind)
+        enums.parse_enum("timer_fact.source_kind", source_kind)
+        if now_ms < fired_for_ms:
+            raise ValueError("timer fact fired_for_ms has not yet occurred")
+        existing = self.conn.execute(
+            "SELECT * FROM timer_facts WHERE scope_kind = ? AND scope_id = ? AND fired_for_ms = ?",
+            (scope_kind, scope_id, fired_for_ms),
+        ).fetchone()
+        if existing is not None:
+            return _row_to_timer_fact(existing)
+        timer_fact_id = str(uuid.uuid4())
+        fact_digest = timer_fact_digest(
+            {
+                "scope_kind": scope_kind,
+                "scope_id": scope_id,
+                "fired_for_ms": fired_for_ms,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "run_id": run_id,
+            }
+        )
+        self.conn.execute(
+            "INSERT INTO timer_facts(timer_fact_id, run_id, scope_kind, scope_id, "
+            "fired_for_ms, controller_now_ms, source_kind, source_id, fact_digest, "
+            "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                timer_fact_id,
+                run_id,
+                scope_kind,
+                scope_id,
+                fired_for_ms,
+                now_ms,
+                source_kind,
+                source_id,
+                fact_digest,
+                now_ms,
+            ),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM timer_facts WHERE timer_fact_id = ?", (timer_fact_id,)
+        ).fetchone()
+        assert row is not None
+        return _row_to_timer_fact(row)
+
+    def record_timer_fact(
+        self,
+        *,
+        scope_kind: str,
+        scope_id: str,
+        fired_for_ms: int,
+        source_kind: str,
+        source_id: str,
+        run_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> TimerFactRecord:
+        """Durably prove the controller evaluated one due deadline.
+
+        ``(scope_kind, scope_id, fired_for_ms)`` is the durable identity
+        (domain-model.md "Timer Fact"): replaying the exact same due
+        deadline for the same scope returns the already-recorded Fact
+        instead of a second row, so repeated scheduled-sweep passes over a
+        still-due deadline never fabricate distinct evidence. Insertion
+        alone carries no consequence -- a Timer Fact is evidence, never a
+        second terminal trigger for ``ATTEMPT_CLAIM_DEADLINE``/
+        ``ATTEMPT_EXECUTION_DEADLINE`` scopes.
+        """
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            return self._record_timer_fact(
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+                fired_for_ms=fired_for_ms,
+                source_kind=source_kind,
+                source_id=source_id,
+                run_id=run_id,
+                now_ms=now,
+            )
+
+    # -- Attempt-deadline capacity classifier + Terminal Fact -------------
+
+    def _claim_deadline_offer_gate(self) -> tuple[str, _ControllerGateEvaluation]:
+        gate = self._controller_gate_evaluation()
+        if gate.permissions.mode not in {"RUNNING", "INTAKE_PAUSED"}:
+            return "MODE_BLOCKED", gate
+        if gate.selected_key is None:
+            return "ISSUANCE_KEY_UNAVAILABLE", gate
+        return "OFFER_ALLOWED", gate
+
+    def _panel_has_claimed_peer(self, activity: ActivityRecord) -> bool:
+        assignment = self._get_activity_review_assignment(activity.activity_id)
+        if assignment is None:
+            return False
+        siblings = self.conn.execute(
+            "SELECT a.activity_id FROM activities a "
+            "JOIN activity_review_assignments r ON r.activity_id = a.activity_id "
+            "WHERE a.run_id = ? AND r.assignment_kind = ? AND r.panel_round = ? "
+            "AND a.activity_id != ?",
+            (
+                activity.run_id,
+                assignment.assignment_kind,
+                assignment.panel_round,
+                activity.activity_id,
+            ),
+        ).fetchall()
+        for sibling in siblings:
+            claimed = self.conn.execute(
+                "SELECT 1 FROM attempts WHERE activity_id = ? AND state = 'CLAIMED'",
+                (sibling["activity_id"],),
+            ).fetchone()
+            if claimed is not None:
+                return True
+        return False
+
+    def expire_attempt_claim_deadline(
+        self,
+        *,
+        attempt_id: str,
+        source_kind: str = "SCHEDULED_SWEEP",
+        source_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> AttemptDeadlineExpiryResult:
+        """Evaluate one due ``ATTEMPT_CLAIM_DEADLINE`` for a still-``OFFERED`` Attempt.
+
+        domain-model.md "Timer Fact" / "Attempt Terminal Fact": re-reads the
+        still-current Attempt and its exact ``claim_deadline_ms``, records
+        the scope/deadline-unique Timer Fact, then -- only if the Attempt is
+        still exactly the ``OFFERED`` generation this deadline names --
+        freezes the Controller Mode/Capability Registry offer gate and the
+        highest applicable unexpired Worker Profile Health Observation into
+        one complete Attempt Terminal Fact, expires the Attempt, returns its
+        Activity to ``PLANNED``, and applies the Fact's sole
+        ``T(ATTEMPT_TERMINAL, attempt_terminal_fact_id)`` Transition. A
+        replayed or already-superseded call still durably records the Timer
+        Fact as evidence but creates no second Terminal Fact and mutates
+        nothing else (``outcome="STALE"``).
+
+        For a ``REVIEW``/``ADJUDICATE`` panel slot with a still-``CLAIMED``
+        peer in the same panel round, the reducer's own
+        ``PANEL_CLAIM_DEADLINE`` handling (reduce.py) coalesces this into the
+        Run's existing single pending staffing recheck rather than starting
+        independent recovery -- this method supplies that real
+        ``claimed_unfilled_peer`` fact instead of leaving it at its always-
+        ``False`` default so that coalescing actually engages.
+
+        Scoping note: capacity evidence here is frozen at Worker-Profile
+        granularity only (no Capacity-Pool linkage is tracked on an Attempt
+        today), and ``resolved_provider_secret_ref`` is the Attempt's own
+        bound secret id without re-verifying its current version under the
+        Secret Store lock. Both are narrower than the full wiki algorithm
+        and are intentional simplifications for this leaf.
+        """
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        enums.parse_enum("timer_fact.source_kind", source_kind)
+        now = _now_ms() if now_ms is None else now_ms
+        resolved_source_id = source_id if source_id is not None else str(uuid.uuid4())
+        with self.transaction():
+            attempt = self.get_attempt(attempt_id)
+            if attempt is None:
+                raise AttemptUnknownError(f"no Attempt with attempt_id={attempt_id!r}")
+            activity = self.get_activity(attempt.activity_id)
+            assert activity is not None
+            fired_for_ms = attempt.claim_deadline_ms
+            if now < fired_for_ms:
+                raise ValueError("claim deadline has not yet occurred")
+
+            timer_fact = self._record_timer_fact(
+                scope_kind="ATTEMPT_CLAIM_DEADLINE",
+                scope_id=attempt_id,
+                fired_for_ms=fired_for_ms,
+                source_kind=source_kind,
+                source_id=resolved_source_id,
+                run_id=activity.run_id,
+                now_ms=now,
+            )
+
+            existing_fact = self.conn.execute(
+                "SELECT * FROM attempt_terminal_facts WHERE attempt_id = ? "
+                "AND kind = 'CLAIM_DEADLINE' AND source_kind = 'TIMER_FACT' AND source_id = ?",
+                (attempt_id, timer_fact.timer_fact_id),
+            ).fetchone()
+            if existing_fact is not None:
+                return AttemptDeadlineExpiryResult(
+                    timer_fact_id=timer_fact.timer_fact_id,
+                    outcome="EXPIRED",
+                    attempt_terminal_fact_id=existing_fact["attempt_terminal_fact_id"],
+                    capacity_disposition=existing_fact["capacity_disposition"],
+                    replacement_offer_disposition=existing_fact["replacement_offer_disposition"],
+                )
+
+            current = self.get_attempt(attempt_id)
+            assert current is not None
+            if current.state != "OFFERED" or current.claim_deadline_ms != fired_for_ms:
+                return AttemptDeadlineExpiryResult(
+                    timer_fact_id=timer_fact.timer_fact_id, outcome="STALE"
+                )
+
+            replacement_offer_disposition, gate = self._claim_deadline_offer_gate()
+            profile_health = self.get_latest_health_observation(
+                "WORKER_PROFILE", current.worker_profile, now_ms=now
+            )
+            membership_ids = (
+                [profile_health.health_observation_id] if profile_health is not None else []
+            )
+            capacity_disposition = (
+                "COMPATIBLE_AVAILABLE"
+                if profile_health is not None and profile_health.kind == "AVAILABLE"
+                else "NO_COMPATIBLE_AVAILABLE"
+            )
+            membership_digest = attempt_terminal_fact_health_membership_digest(membership_ids)
+
+            resolved_provider_secret_ref = None
+            if current.provider_secret_ref is not None:
+                secret_version = self.get_secret_current_version(current.provider_secret_ref)
+                if secret_version is not None:
+                    resolved_provider_secret_ref = current.provider_secret_ref
+
+            selected_issuance_key_id = (
+                gate.selected_key.capability_signing_key_id
+                if gate.selected_key is not None
+                else None
+            )
+            attempt_terminal_fact_id = str(uuid.uuid4())
+            fact_digest = attempt_terminal_fact_digest(
+                {
+                    "attempt_id": attempt_id,
+                    "activity_id": activity.activity_id,
+                    "attempt_generation": current.generation,
+                    "kind": "CLAIM_DEADLINE",
+                    "source_kind": "TIMER_FACT",
+                    "source_id": timer_fact.timer_fact_id,
+                    "expected_deadline_ms": fired_for_ms,
+                    "controller_now_ms": now,
+                    "capacity_disposition": capacity_disposition,
+                    "health_observation_ids_digest": membership_digest,
+                    "resolved_provider_secret_ref": resolved_provider_secret_ref,
+                    "controller_mode_revision": gate.permissions.mode_revision,
+                    "controller_mode": gate.permissions.mode,
+                    "capability_registry_revision": gate.permissions.registry_revision,
+                    "selected_issuance_key_id": selected_issuance_key_id,
+                    "replacement_offer_disposition": replacement_offer_disposition,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO attempt_terminal_facts(attempt_terminal_fact_id, attempt_id, "
+                "activity_id, attempt_generation, kind, source_kind, source_id, "
+                "health_observation_id, expected_deadline_ms, controller_now_ms, "
+                "capacity_disposition, health_observation_ids_digest, "
+                "resolved_provider_secret_ref, controller_mode_revision, controller_mode, "
+                "capability_registry_revision, selected_issuance_key_id, "
+                "replacement_offer_disposition, fact_digest, recorded_at_ms) "
+                "VALUES (?, ?, ?, ?, 'CLAIM_DEADLINE', 'TIMER_FACT', ?, NULL, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?)",
+                (
+                    attempt_terminal_fact_id,
+                    attempt_id,
+                    activity.activity_id,
+                    current.generation,
+                    timer_fact.timer_fact_id,
+                    fired_for_ms,
+                    now,
+                    capacity_disposition,
+                    membership_digest,
+                    resolved_provider_secret_ref,
+                    gate.permissions.mode_revision,
+                    gate.permissions.mode,
+                    gate.permissions.registry_revision,
+                    selected_issuance_key_id,
+                    replacement_offer_disposition,
+                    fact_digest,
+                    now,
+                ),
+            )
+            for ordinal, health_observation_id in enumerate(membership_ids):
+                self.conn.execute(
+                    "INSERT INTO attempt_terminal_fact_health_observations("
+                    "attempt_terminal_fact_id, observation_ordinal, health_observation_id) "
+                    "VALUES (?, ?, ?)",
+                    (attempt_terminal_fact_id, ordinal, health_observation_id),
+                )
+
+            cur = self.conn.execute(
+                "UPDATE attempts SET state = 'EXPIRED', terminal_reason = 'CLAIM_DEADLINE' "
+                "WHERE attempt_id = ? AND state = 'OFFERED'",
+                (attempt_id,),
+            )
+            if cur.rowcount != 1:
+                raise CasMismatchError("attempt claim was won between the match check and expiry")
+            self.conn.execute(
+                "UPDATE activities SET state = 'PLANNED', updated_at_ms = ? "
+                "WHERE activity_id = ? AND state = 'READY'",
+                (now, activity.activity_id),
+            )
+
+            panel_peer_claimed = (
+                self._panel_has_claimed_peer(activity)
+                if activity.kind in {"REVIEW", "ADJUDICATE"}
+                else False
+            )
+
+            from orcest.workflow_reducer.ledger import apply, load_view
+            from orcest.workflow_reducer.types import Trigger
+
+            view = load_view(self, activity.run_id)
+            if view is not None:
+                if activity.kind in {"REVIEW", "ADJUDICATE"}:
+                    view = dataclasses.replace(view, claimed_unfilled_peer=panel_peer_claimed)
+                apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="ATTEMPT_TERMINAL",
+                        trigger_id=attempt_terminal_fact_id,
+                        facts={"kind": "CLAIM_DEADLINE", "already_terminal": False},
+                    ),
+                    run_id=activity.run_id,
+                )
+
+            return AttemptDeadlineExpiryResult(
+                timer_fact_id=timer_fact.timer_fact_id,
+                outcome="EXPIRED",
+                attempt_terminal_fact_id=attempt_terminal_fact_id,
+                capacity_disposition=capacity_disposition,
+                replacement_offer_disposition=replacement_offer_disposition,
+            )
+
+    def expire_attempt_execution_deadline(
+        self,
+        *,
+        attempt_id: str,
+        source_kind: str = "SCHEDULED_SWEEP",
+        source_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> AttemptDeadlineExpiryResult:
+        """Proactively evaluate one due ``ATTEMPT_EXECUTION_DEADLINE`` Timer Fact.
+
+        The reactive counterpart -- a late Result Request arriving after
+        ``execution_deadline_ms`` -- is ``submit_attempt_result``'s existing
+        ``EXECUTION_DEADLINE`` path. This is the scheduled-sweep/startup-
+        reconciliation counterpart for a Claimed Attempt whose worker never
+        submits a Result or liveness update at all. ``capacity_disposition``
+        and ``replacement_offer_disposition`` are ``NULL`` for this kind
+        (domain-model.md "Attempt Terminal Fact": only ``CLAIM_DEADLINE``
+        carries a capacity classification).
+        """
+        require_lowercase_uuid(attempt_id, field="attempt_id")
+        enums.parse_enum("timer_fact.source_kind", source_kind)
+        now = _now_ms() if now_ms is None else now_ms
+        resolved_source_id = source_id if source_id is not None else str(uuid.uuid4())
+        with self.transaction():
+            attempt = self.get_attempt(attempt_id)
+            if attempt is None:
+                raise AttemptUnknownError(f"no Attempt with attempt_id={attempt_id!r}")
+            activity = self.get_activity(attempt.activity_id)
+            assert activity is not None
+            if attempt.execution_deadline_ms is None:
+                raise ValueError("attempt has no execution deadline (never claimed)")
+            fired_for_ms = attempt.execution_deadline_ms
+            if now < fired_for_ms:
+                raise ValueError("execution deadline has not yet occurred")
+
+            timer_fact = self._record_timer_fact(
+                scope_kind="ATTEMPT_EXECUTION_DEADLINE",
+                scope_id=attempt_id,
+                fired_for_ms=fired_for_ms,
+                source_kind=source_kind,
+                source_id=resolved_source_id,
+                run_id=activity.run_id,
+                now_ms=now,
+            )
+
+            existing_fact = self.conn.execute(
+                "SELECT * FROM attempt_terminal_facts WHERE attempt_id = ? "
+                "AND kind = 'EXECUTION_DEADLINE' AND source_kind = 'TIMER_FACT' "
+                "AND source_id = ?",
+                (attempt_id, timer_fact.timer_fact_id),
+            ).fetchone()
+            if existing_fact is not None:
+                return AttemptDeadlineExpiryResult(
+                    timer_fact_id=timer_fact.timer_fact_id,
+                    outcome="EXPIRED",
+                    attempt_terminal_fact_id=existing_fact["attempt_terminal_fact_id"],
+                )
+
+            current = self.get_attempt(attempt_id)
+            assert current is not None
+            if current.state != "CLAIMED" or current.execution_deadline_ms != fired_for_ms:
+                return AttemptDeadlineExpiryResult(
+                    timer_fact_id=timer_fact.timer_fact_id, outcome="STALE"
+                )
+
+            attempt_terminal_fact_id = str(uuid.uuid4())
+            fact_digest = attempt_terminal_fact_digest(
+                {
+                    "attempt_id": attempt_id,
+                    "activity_id": activity.activity_id,
+                    "attempt_generation": current.generation,
+                    "kind": "EXECUTION_DEADLINE",
+                    "source_kind": "TIMER_FACT",
+                    "source_id": timer_fact.timer_fact_id,
+                    "expected_deadline_ms": fired_for_ms,
+                    "controller_now_ms": now,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO attempt_terminal_facts(attempt_terminal_fact_id, attempt_id, "
+                "activity_id, attempt_generation, kind, source_kind, source_id, "
+                "health_observation_id, expected_deadline_ms, controller_now_ms, fact_digest, "
+                "recorded_at_ms) "
+                "VALUES (?, ?, ?, ?, 'EXECUTION_DEADLINE', 'TIMER_FACT', ?, NULL, ?, ?, ?, ?)",
+                (
+                    attempt_terminal_fact_id,
+                    attempt_id,
+                    activity.activity_id,
+                    current.generation,
+                    timer_fact.timer_fact_id,
+                    fired_for_ms,
+                    now,
+                    fact_digest,
+                    now,
+                ),
+            )
+            cur = self.conn.execute(
+                "UPDATE attempts SET state = 'EXPIRED', terminal_reason = 'EXECUTION_DEADLINE' "
+                "WHERE attempt_id = ? AND state = 'CLAIMED'",
+                (attempt_id,),
+            )
+            if cur.rowcount != 1:
+                raise CasMismatchError(
+                    "attempt result was accepted between the match check and expiry"
+                )
+            self.conn.execute(
+                "UPDATE activities SET state = 'PLANNED', updated_at_ms = ? "
+                "WHERE activity_id = ? AND state = 'ACTIVE'",
+                (now, activity.activity_id),
+            )
+
+            from orcest.workflow_reducer.ledger import apply, load_view
+            from orcest.workflow_reducer.types import Trigger
+
+            view = load_view(self, activity.run_id)
+            if view is not None:
+                apply(
+                    self,
+                    view,
+                    Trigger(
+                        kind="ATTEMPT_TERMINAL",
+                        trigger_id=attempt_terminal_fact_id,
+                        facts={"kind": "EXECUTION_DEADLINE", "already_terminal": False},
+                    ),
+                    run_id=activity.run_id,
+                )
+
+            return AttemptDeadlineExpiryResult(
+                timer_fact_id=timer_fact.timer_fact_id,
+                outcome="EXPIRED",
+                attempt_terminal_fact_id=attempt_terminal_fact_id,
+            )
+
+    def _unfilled_panel_activities(
+        self, *, run_id: str, assignment_kind: str, panel_round: int
+    ) -> list[ActivityRecord]:
+        rows = self.conn.execute(
+            "SELECT a.* FROM activities a "
+            "JOIN activity_review_assignments r ON r.activity_id = a.activity_id "
+            "WHERE a.run_id = ? AND r.assignment_kind = ? AND r.panel_round = ? "
+            "AND a.state = 'PLANNED'",
+            (run_id, assignment_kind, panel_round),
+        ).fetchall()
+        return [
+            _row_to_activity(
+                row, review_assignment=self._get_activity_review_assignment(row["activity_id"])
+            )
+            for row in rows
+        ]
+
+    def resolve_panel_staffing_recheck(
+        self,
+        *,
+        run_id: str,
+        assignment_kind: str,
+        panel_round: int,
+        now_ms: int | None = None,
+    ) -> Any | None:
+        """Resolve one Run's coalesced panel-staffing recheck, if one is pending.
+
+        Returns the reducer's ``AppliedReduction`` (see
+        ``orcest.workflow_reducer.types``) or ``None`` when no recheck is
+        pending.
+
+        Applies the reducer's single coalesced ``INTERNAL`` continuation
+        (``latest_staffing_recheck_transition_sequence``) with ``staffable``
+        computed from the same mode/issuance-key/capacity gates
+        :meth:`expire_attempt_claim_deadline` freezes, evaluated against
+        *every* still-unfilled Activity in ``(assignment_kind, panel_round)``
+        -- never a subset -- so the panel is staffed completely or not at
+        all (never a partial restaffing) and a stale/duplicate recheck can
+        never re-fire once the reducer's own sequence match has moved on.
+        Returns ``None`` when no recheck is pending for this Run.
+        """
+        enums.parse_enum("activity_review_assignment.assignment_kind", assignment_kind)
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            view = load_view(self, run_id)
+            if view is None or view.latest_staffing_recheck_transition_sequence is None:
+                return None
+            unfilled = self._unfilled_panel_activities(
+                run_id=run_id, assignment_kind=assignment_kind, panel_round=panel_round
+            )
+            if not unfilled:
+                staffable = True
+            else:
+                replacement_offer_disposition, _gate = self._claim_deadline_offer_gate()
+                staffable = replacement_offer_disposition == "OFFER_ALLOWED" and all(
+                    self._activity_has_compatible_capacity(activity, now_ms=now)
+                    for activity in unfilled
+                )
+            applied = apply(
+                self,
+                view,
+                Trigger(
+                    kind="INTERNAL",
+                    trigger_id=str(view.latest_staffing_recheck_transition_sequence),
+                    facts={"staffable": staffable, "no_complete_staffing": not staffable},
+                ),
+                run_id=run_id,
+            )
+            return applied
+
+    def _activity_has_compatible_capacity(self, activity: ActivityRecord, *, now_ms: int) -> bool:
+        """Best-effort capacity check for a not-currently-offered panel slot.
+
+        Reuses the most recent (highest-generation) Attempt this Activity
+        ever had for its ``worker_profile`` target -- there is no other
+        durable source of an unoffered slot's intended execution profile.
+        An Activity that never had any Attempt yet is treated as
+        incompatible (fail closed) rather than assumed available.
+        """
+        row = self.conn.execute(
+            "SELECT worker_profile FROM attempts WHERE activity_id = ? "
+            "ORDER BY generation DESC LIMIT 1",
+            (activity.activity_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        observation = self.get_latest_health_observation(
+            "WORKER_PROFILE", row["worker_profile"], now_ms=now_ms
+        )
+        return observation is not None and observation.kind == "AVAILABLE"
 
     # -- Budget Report ---------------------------------------------------
 
