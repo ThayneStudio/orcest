@@ -103,6 +103,8 @@ __all__ = [
     "health_observation_payload_digest",
     "worker_loss_report_digest",
     "attempt_terminal_fact_digest",
+    "attempt_terminal_fact_health_membership_digest",
+    "timer_fact_digest",
     "budget_report_digest",
 ]
 
@@ -471,6 +473,22 @@ def attempt_terminal_fact_digest(fields: Mapping[str, Any]) -> str:
     """Digest of an Attempt Terminal Fact's normalized immutable fields
     (``fact_digest``, domain-model.md "Attempt Terminal Fact")."""
     return generic_domain_digest("orcest-attempt-terminal-fact-v1", fields)
+
+
+def attempt_terminal_fact_health_membership_digest(observation_ids: Sequence[str]) -> str:
+    """Digest of a ``CLAIM_DEADLINE`` Attempt Terminal Fact's frozen ordered
+    Health Observation membership (``health_observation_ids_digest``,
+    domain-model.md "Attempt Terminal Fact Health Observation"). Required
+    even for the canonical empty membership."""
+    return generic_domain_digest(
+        "orcest-attempt-terminal-fact-health-membership-v1", list(observation_ids)
+    )
+
+
+def timer_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Timer Fact's normalized immutable fields (``fact_digest``,
+    domain-model.md "Timer Fact")."""
+    return generic_domain_digest("orcest-timer-fact-v1", fields)
 
 
 def budget_report_digest(fields: Mapping[str, Any]) -> str:
