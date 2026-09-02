@@ -573,6 +573,23 @@ def wait_condition_digest(fields: Mapping[str, Any]) -> str:
     return generic_domain_digest("orcest-wait-condition-v1", fields)
 
 
+def human_boundary_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Human Boundary's complete normalized decision packet
+    (``packet_digest``, domain-model.md "Human Boundary"). Covers every
+    binding, the bounded evidence/attempted-strategy/choice arrays, and the
+    creating ``created_from_kind``/``created_from_id``; excludes only
+    informational ``created_at_ms``."""
+    return generic_domain_digest("orcest-human-boundary-v1", fields)
+
+
+def human_resolution_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Human Resolution's complete normalized, secret-free
+    resolution and copied boundary bindings (``resolution_digest``,
+    domain-model.md "Human Resolution"); excludes only informational
+    ``accepted_at_ms``."""
+    return generic_domain_digest("orcest-human-resolution-v1", fields)
+
+
 def response_digest(response_json: Any) -> str:
     """Digest of a complete canonical terminal replay response (``response_digest``).
 

@@ -44,6 +44,8 @@ from orcest.workflow_contract.v1.digest import (
     health_probe_fact_digest,
     health_probe_request_digest,
     health_probe_run_membership_digest,
+    human_boundary_digest,
+    human_resolution_digest,
     is_valid_content_digest,
     launch_capability_claims_digest,
     policy_digest,
@@ -95,7 +97,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1325,6 +1327,84 @@ class RecoveryEvidenceOutcome:
     selected_tactic: str
     wait_condition: WaitConditionRecord | None = None
     predicate_check: WaitPredicateCheck | None = None
+    human_boundary: "HumanBoundaryRecord | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class HumanBoundaryChoice:
+    """One ordered, bounded permitted choice inside a Human Boundary packet
+    (domain-model.md "Human Boundary" ``choices``)."""
+
+    choice_id: str
+    resolution_kind: str
+    consequence: str
+
+
+@dataclass(frozen=True, slots=True)
+class HumanBoundaryRecord:
+    """The controller-issued immutable exceptional decision packet for one
+    exact Run state (domain-model.md "Human Boundary")."""
+
+    human_boundary_id: str
+    run_id: str
+    reason: str
+    resume_state: str
+    minimum_request: str
+    required_resolution_kinds: tuple[str, ...]
+    created_from_kind: str
+    created_from_id: str
+    packet_digest: str
+    created_transition_sequence: int
+    created_at_ms: int
+    specification_generation: int | None = None
+    candidate_id: str | None = None
+    policy_hash: str | None = None
+    forge_observation_id: str | None = None
+    publication_id: str | None = None
+    publication_effect_generation: int | None = None
+    ownership_project_id: str | None = None
+    ownership_deterministic_ref: str | None = None
+    ownership_change_request_external_id: str | None = None
+    ownership_run_marker: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    attempted_strategy_digests: tuple[str, ...] = ()
+    choices: tuple[HumanBoundaryChoice, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HumanResolutionRecord:
+    """One immutable, authenticated resolution accepted for an exact Human
+    Boundary (domain-model.md "Human Resolution")."""
+
+    human_resolution_id: str
+    human_boundary_id: str
+    run_id: str
+    idempotency_key: str
+    source_kind: str
+    source_id: str
+    authenticated_principal_id: str
+    resolution_kind: str
+    resolution: Mapping[str, Any]
+    resolution_digest: str
+    accepted_at_ms: int
+    specification_generation: int | None = None
+    candidate_id: str | None = None
+    policy_hash: str | None = None
+    forge_observation_id: str | None = None
+    publication_id: str | None = None
+    publication_effect_generation: int | None = None
+    ownership_project_id: str | None = None
+    ownership_deterministic_ref: str | None = None
+    ownership_change_request_external_id: str | None = None
+    ownership_run_marker: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HumanResolutionOutcome:
+    """Result of :meth:`RunStore.submit_human_resolution`."""
+
+    human_resolution: HumanResolutionRecord
+    applied: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -2620,6 +2700,68 @@ def _row_to_wait_condition(
     )
 
 
+def _row_to_human_boundary(
+    row: sqlite3.Row,
+    *,
+    evidence_refs: Sequence[str] = (),
+    attempted_strategy_digests: Sequence[str] = (),
+    required_resolution_kinds: Sequence[str] = (),
+    choices: Sequence["HumanBoundaryChoice"] = (),
+) -> "HumanBoundaryRecord":
+    return HumanBoundaryRecord(
+        human_boundary_id=row["human_boundary_id"],
+        run_id=row["run_id"],
+        reason=row["reason"],
+        resume_state=row["resume_state"],
+        minimum_request=row["minimum_request"],
+        required_resolution_kinds=tuple(required_resolution_kinds),
+        created_from_kind=row["created_from_kind"],
+        created_from_id=row["created_from_id"],
+        packet_digest=row["packet_digest"],
+        created_transition_sequence=row["created_transition_sequence"],
+        created_at_ms=row["created_at_ms"],
+        specification_generation=row["specification_generation"],
+        candidate_id=row["candidate_id"],
+        policy_hash=row["policy_hash"],
+        forge_observation_id=row["forge_observation_id"],
+        publication_id=row["publication_id"],
+        publication_effect_generation=row["publication_effect_generation"],
+        ownership_project_id=row["ownership_project_id"],
+        ownership_deterministic_ref=row["ownership_deterministic_ref"],
+        ownership_change_request_external_id=row["ownership_change_request_external_id"],
+        ownership_run_marker=row["ownership_run_marker"],
+        evidence_refs=tuple(evidence_refs),
+        attempted_strategy_digests=tuple(attempted_strategy_digests),
+        choices=tuple(choices),
+    )
+
+
+def _row_to_human_resolution(row: sqlite3.Row) -> "HumanResolutionRecord":
+    return HumanResolutionRecord(
+        human_resolution_id=row["human_resolution_id"],
+        human_boundary_id=row["human_boundary_id"],
+        run_id=row["run_id"],
+        idempotency_key=row["idempotency_key"],
+        source_kind=row["source_kind"],
+        source_id=row["source_id"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        resolution_kind=row["resolution_kind"],
+        resolution=json.loads(row["resolution_json"]),
+        resolution_digest=row["resolution_digest"],
+        accepted_at_ms=row["accepted_at_ms"],
+        specification_generation=row["specification_generation"],
+        candidate_id=row["candidate_id"],
+        policy_hash=row["policy_hash"],
+        forge_observation_id=row["forge_observation_id"],
+        publication_id=row["publication_id"],
+        publication_effect_generation=row["publication_effect_generation"],
+        ownership_project_id=row["ownership_project_id"],
+        ownership_deterministic_ref=row["ownership_deterministic_ref"],
+        ownership_change_request_external_id=row["ownership_change_request_external_id"],
+        ownership_run_marker=row["ownership_run_marker"],
+    )
+
+
 _WAIT_REASON_WAKE_RULES: Mapping[
     str, Callable[[int | None, str | None, Mapping[str, Any] | None], bool]
 ] = {
@@ -3316,6 +3458,7 @@ CREATE TABLE IF NOT EXISTS runs (
   ),
   current_recovery_evidence_id TEXT,
   wait_condition_id TEXT,
+  human_boundary_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -4708,6 +4851,104 @@ CREATE TABLE IF NOT EXISTS wait_condition_panel_slots (
   UNIQUE (wait_condition_id, assignment_kind, panel_round, slot_id)
 );
 
+CREATE TABLE IF NOT EXISTS human_boundaries (
+  human_boundary_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  reason TEXT NOT NULL CHECK (
+    reason IN ({_sql_in(_enum_values("human_boundary.reason"))})
+  ),
+  resume_state TEXT NOT NULL CHECK (resume_state IN ({_sql_in(_enum_values("run.state"))})),
+  specification_generation INTEGER CHECK (
+    specification_generation IS NULL OR specification_generation >= 0
+  ),
+  candidate_id TEXT,
+  policy_hash TEXT,
+  forge_observation_id TEXT,
+  publication_id TEXT,
+  publication_effect_generation INTEGER CHECK (
+    publication_effect_generation IS NULL OR publication_effect_generation > 0
+  ),
+  ownership_project_id TEXT,
+  ownership_deterministic_ref TEXT,
+  ownership_change_request_external_id TEXT,
+  ownership_run_marker TEXT,
+  minimum_request TEXT NOT NULL CHECK (length(minimum_request) BETWEEN 1 AND 2048),
+  evidence_refs_json TEXT NOT NULL,
+  attempted_strategy_digests_json TEXT NOT NULL,
+  required_resolution_kinds_json TEXT NOT NULL,
+  created_from_kind TEXT NOT NULL CHECK (
+    created_from_kind IN ({_sql_in(_enum_values("human_boundary.created_from_kind"))})
+  ),
+  created_from_id TEXT NOT NULL,
+  packet_digest TEXT NOT NULL UNIQUE,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (created_from_kind, created_from_id),
+  CHECK (
+    (ownership_project_id IS NULL) = (ownership_deterministic_ref IS NULL)
+    AND (ownership_project_id IS NULL) = (ownership_change_request_external_id IS NULL)
+    AND (ownership_project_id IS NULL) = (ownership_run_marker IS NULL)
+  ),
+  CHECK (
+    (
+      reason = 'PUBLICATION_OWNERSHIP_CONFLICT'
+      AND ownership_project_id IS NOT NULL
+      AND created_from_kind = 'RECONCILIATION_FACT'
+    )
+    OR (
+      reason != 'PUBLICATION_OWNERSHIP_CONFLICT'
+      AND ownership_project_id IS NULL
+      AND created_from_kind = 'RECOVERY_EVIDENCE'
+    )
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_human_boundaries_run ON human_boundaries(run_id);
+
+CREATE TABLE IF NOT EXISTS human_boundary_choices (
+  human_boundary_id TEXT NOT NULL
+    REFERENCES human_boundaries(human_boundary_id) ON DELETE RESTRICT,
+  choice_ordinal INTEGER NOT NULL CHECK (choice_ordinal >= 0),
+  choice_id TEXT NOT NULL,
+  resolution_kind TEXT NOT NULL CHECK (
+    resolution_kind IN ({_sql_in(_enum_values("human_resolution.resolution_kind"))})
+  ),
+  consequence TEXT NOT NULL CHECK (length(consequence) BETWEEN 1 AND 2048),
+  PRIMARY KEY (human_boundary_id, choice_ordinal),
+  UNIQUE (human_boundary_id, choice_id),
+  UNIQUE (human_boundary_id, resolution_kind)
+);
+
+CREATE TABLE IF NOT EXISTS human_resolutions (
+  human_resolution_id TEXT PRIMARY KEY,
+  human_boundary_id TEXT NOT NULL UNIQUE
+    REFERENCES human_boundaries(human_boundary_id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  idempotency_key TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("human_resolution.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  authenticated_principal_id TEXT NOT NULL,
+  resolution_kind TEXT NOT NULL CHECK (
+    resolution_kind IN ({_sql_in(_enum_values("human_resolution.resolution_kind"))})
+  ),
+  resolution_json TEXT NOT NULL,
+  specification_generation INTEGER,
+  candidate_id TEXT,
+  policy_hash TEXT,
+  forge_observation_id TEXT,
+  publication_id TEXT,
+  publication_effect_generation INTEGER,
+  ownership_project_id TEXT,
+  ownership_deterministic_ref TEXT,
+  ownership_change_request_external_id TEXT,
+  ownership_run_marker TEXT,
+  resolution_digest TEXT NOT NULL UNIQUE,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (source_kind, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS capacity_reports (
   capacity_report_id TEXT PRIMARY KEY,
   pool_manager_id TEXT NOT NULL,
@@ -5264,6 +5505,7 @@ CREATE TABLE runs_v2 (
   ),
   current_recovery_evidence_id TEXT,
   wait_condition_id TEXT,
+  human_boundary_id TEXT,
   terminal_outcome TEXT CHECK (
     terminal_outcome IN ({_sql_in(_enum_values("run.terminal_outcome"))})
   ),
@@ -5576,6 +5818,107 @@ CREATE TABLE IF NOT EXISTS health_probe_fact_runs (
 );
 """
 
+_ADD_HUMAN_BOUNDARY_ID = """
+ALTER TABLE runs ADD COLUMN human_boundary_id TEXT;
+"""
+
+_V17_TO_V18 = f"""
+CREATE TABLE IF NOT EXISTS human_boundaries (
+  human_boundary_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  reason TEXT NOT NULL CHECK (
+    reason IN ({_sql_in(_enum_values("human_boundary.reason"))})
+  ),
+  resume_state TEXT NOT NULL CHECK (resume_state IN ({_sql_in(_enum_values("run.state"))})),
+  specification_generation INTEGER CHECK (
+    specification_generation IS NULL OR specification_generation >= 0
+  ),
+  candidate_id TEXT,
+  policy_hash TEXT,
+  forge_observation_id TEXT,
+  publication_id TEXT,
+  publication_effect_generation INTEGER CHECK (
+    publication_effect_generation IS NULL OR publication_effect_generation > 0
+  ),
+  ownership_project_id TEXT,
+  ownership_deterministic_ref TEXT,
+  ownership_change_request_external_id TEXT,
+  ownership_run_marker TEXT,
+  minimum_request TEXT NOT NULL CHECK (length(minimum_request) BETWEEN 1 AND 2048),
+  evidence_refs_json TEXT NOT NULL,
+  attempted_strategy_digests_json TEXT NOT NULL,
+  required_resolution_kinds_json TEXT NOT NULL,
+  created_from_kind TEXT NOT NULL CHECK (
+    created_from_kind IN ({_sql_in(_enum_values("human_boundary.created_from_kind"))})
+  ),
+  created_from_id TEXT NOT NULL,
+  packet_digest TEXT NOT NULL UNIQUE,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (created_from_kind, created_from_id),
+  CHECK (
+    (ownership_project_id IS NULL) = (ownership_deterministic_ref IS NULL)
+    AND (ownership_project_id IS NULL) = (ownership_change_request_external_id IS NULL)
+    AND (ownership_project_id IS NULL) = (ownership_run_marker IS NULL)
+  ),
+  CHECK (
+    (
+      reason = 'PUBLICATION_OWNERSHIP_CONFLICT'
+      AND ownership_project_id IS NOT NULL
+      AND created_from_kind = 'RECONCILIATION_FACT'
+    )
+    OR (
+      reason != 'PUBLICATION_OWNERSHIP_CONFLICT'
+      AND ownership_project_id IS NULL
+      AND created_from_kind = 'RECOVERY_EVIDENCE'
+    )
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_human_boundaries_run ON human_boundaries(run_id);
+CREATE TABLE IF NOT EXISTS human_boundary_choices (
+  human_boundary_id TEXT NOT NULL
+    REFERENCES human_boundaries(human_boundary_id) ON DELETE RESTRICT,
+  choice_ordinal INTEGER NOT NULL CHECK (choice_ordinal >= 0),
+  choice_id TEXT NOT NULL,
+  resolution_kind TEXT NOT NULL CHECK (
+    resolution_kind IN ({_sql_in(_enum_values("human_resolution.resolution_kind"))})
+  ),
+  consequence TEXT NOT NULL CHECK (length(consequence) BETWEEN 1 AND 2048),
+  PRIMARY KEY (human_boundary_id, choice_ordinal),
+  UNIQUE (human_boundary_id, choice_id),
+  UNIQUE (human_boundary_id, resolution_kind)
+);
+CREATE TABLE IF NOT EXISTS human_resolutions (
+  human_resolution_id TEXT PRIMARY KEY,
+  human_boundary_id TEXT NOT NULL UNIQUE
+    REFERENCES human_boundaries(human_boundary_id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  idempotency_key TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ({_sql_in(_enum_values("human_resolution.source_kind"))})
+  ),
+  source_id TEXT NOT NULL,
+  authenticated_principal_id TEXT NOT NULL,
+  resolution_kind TEXT NOT NULL CHECK (
+    resolution_kind IN ({_sql_in(_enum_values("human_resolution.resolution_kind"))})
+  ),
+  resolution_json TEXT NOT NULL,
+  specification_generation INTEGER,
+  candidate_id TEXT,
+  policy_hash TEXT,
+  forge_observation_id TEXT,
+  publication_id TEXT,
+  publication_effect_generation INTEGER,
+  ownership_project_id TEXT,
+  ownership_deterministic_ref TEXT,
+  ownership_change_request_external_id TEXT,
+  ownership_run_marker TEXT,
+  resolution_digest TEXT NOT NULL UNIQUE,
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  UNIQUE (source_kind, idempotency_key)
+);
+"""
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -5749,7 +6092,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -5779,6 +6122,11 @@ class RunStore:
         add_wait_condition_pointer = (
             _ADD_WAIT_CONDITION_ID
             if current >= 2 and "wait_condition_id" not in run_columns
+            else ""
+        )
+        add_human_boundary_pointer = (
+            _ADD_HUMAN_BOUNDARY_ID
+            if current >= 2 and "human_boundary_id" not in run_columns
             else ""
         )
         try:
@@ -5831,6 +6179,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5855,6 +6204,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5882,6 +6232,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5915,6 +6266,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5959,6 +6311,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -5982,6 +6335,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                     + "\n"
                     + _FORGE_OBSERVATION_SCHEDULE_INDEXES
                 )
@@ -6005,6 +6359,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6025,6 +6380,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6045,6 +6401,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6064,6 +6421,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6083,6 +6441,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6102,6 +6461,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6119,6 +6479,7 @@ class RunStore:
                     + "\n"
                     + add_recovery_pointer
                     + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6131,7 +6492,11 @@ class RunStore:
                 )
             elif current == 15:
                 self.conn.executescript(
-                    "BEGIN EXCLUSIVE;\n" + _SCHEMA + "\n" + add_wait_condition_pointer
+                    "BEGIN EXCLUSIVE;\n"
+                    + _SCHEMA
+                    + "\n"
+                    + add_wait_condition_pointer
+                    + add_human_boundary_pointer
                 )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -6142,15 +6507,35 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 16
-                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V16_TO_V17)
+            elif current == 16:
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n"
+                    + _V16_TO_V17
+                    + "\n"
+                    + _V17_TO_V18
+                    + "\n"
+                    + add_human_boundary_pointer
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
                     "VALUES (?, ?, ?)",
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-health-probes",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 17
+                self.conn.executescript(
+                    "BEGIN EXCLUSIVE;\n" + _V17_TO_V18 + "\n" + add_human_boundary_pointer
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-human-boundary-resolution",
                         _now_ms(),
                     ),
                 )
@@ -15183,6 +15568,11 @@ class RunStore:
         budget_wake_identity: Mapping[str, Any] | None = None,
         external_wake_identity: Mapping[str, Any] | None = None,
         accepted_at_ms: int | None = None,
+        human_boundary_reason: str | None = None,
+        human_boundary_minimum_request: str | None = None,
+        human_boundary_choice_consequences: Mapping[str, str] | None = None,
+        human_boundary_evidence_refs: Sequence[str] = (),
+        human_boundary_attempted_strategy_digests: Sequence[str] = (),
     ) -> RecoveryEvidenceOutcome:
         """Classify one accepted failure, persist its Recovery Evidence,
         apply the deterministic Transition it selects, and -- exactly when
@@ -15253,6 +15643,7 @@ class RunStore:
                 resumed_wait_condition_id=resumed_wait_condition_id,
                 resumed_human_boundary_id=resumed_human_boundary_id,
                 human_resolution_id=human_resolution_id,
+                human_boundary_reason=human_boundary_reason,
             )
             health_refs = tuple(
                 HealthObservationRef(
@@ -15359,6 +15750,9 @@ class RunStore:
                 if predicate_check is not None and not predicate_already_met
                 else None
             )
+            pending_human_boundary_id = (
+                str(uuid.uuid4()) if decision.selected_tactic == "ENTER_HUMAN_BOUNDARY" else None
+            )
 
             evidence = self._create_recovery_evidence(
                 recovery_evidence_id=recovery_evidence_id,
@@ -15418,6 +15812,8 @@ class RunStore:
                     for item in health_observations
                 ],
                 "pending_wait_condition_id": pending_wait_condition_id,
+                "human_boundary_reason": human_boundary_reason,
+                "pending_human_boundary_id": pending_human_boundary_id,
             }
             if predicate_check is not None:
                 trigger_facts["predicate_already_met"] = predicate_already_met
@@ -15458,13 +15854,641 @@ class RunStore:
                     panel_slots=resolved_panel_slots,
                 )
 
+            human_boundary: HumanBoundaryRecord | None = None
+            if (
+                not applied.replayed
+                and applied.reduction is not None
+                and applied.reduction.next_state == "NEEDS_HUMAN"
+                and decision.selected_tactic == "ENTER_HUMAN_BOUNDARY"
+            ):
+                if human_boundary_minimum_request is None:
+                    raise ValueError("ENTER_HUMAN_BOUNDARY requires human_boundary_minimum_request")
+                assert decision.human_boundary_reason is not None
+                assert pending_human_boundary_id is not None
+                resume_state = view.recovery_origin_state or "PLANNING"
+                human_boundary = self.create_human_boundary(
+                    human_boundary_id=pending_human_boundary_id,
+                    run_id=run_id,
+                    reason=decision.human_boundary_reason,
+                    resume_state=resume_state,
+                    minimum_request=human_boundary_minimum_request,
+                    created_from_kind="RECOVERY_EVIDENCE",
+                    created_from_id=recovery_evidence_id,
+                    created_transition_sequence=applied.transition.transition_sequence,
+                    evidence_refs=human_boundary_evidence_refs,
+                    attempted_strategy_digests=human_boundary_attempted_strategy_digests,
+                    choice_consequences=human_boundary_choice_consequences,
+                    specification_generation=view.specification_generation,
+                    candidate_id=resolved_candidate_id,
+                    policy_hash=view.policy_hash,
+                    forge_observation_id=forge_observation_id,
+                )
+
             return RecoveryEvidenceOutcome(
                 recovery_evidence=evidence,
                 applied=applied,
                 selected_tactic=decision.selected_tactic,
                 wait_condition=wait_condition,
                 predicate_check=predicate_check,
+                human_boundary=human_boundary,
             )
+
+    # -- Human Boundary / Human Resolution ----------------------------------
+
+    def get_human_boundary(self, human_boundary_id: str) -> HumanBoundaryRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM human_boundaries WHERE human_boundary_id = ?", (human_boundary_id,)
+        ).fetchone()
+        return None if row is None else self._load_human_boundary(row)
+
+    def get_current_human_boundary(self, run_id: str) -> HumanBoundaryRecord | None:
+        row = self.conn.execute(
+            "SELECT human_boundary_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None or row["human_boundary_id"] is None:
+            return None
+        return self.get_human_boundary(str(row["human_boundary_id"]))
+
+    def _load_human_boundary(self, row: sqlite3.Row) -> HumanBoundaryRecord:
+        choice_rows = self.conn.execute(
+            "SELECT * FROM human_boundary_choices WHERE human_boundary_id = ? "
+            "ORDER BY choice_ordinal",
+            (row["human_boundary_id"],),
+        ).fetchall()
+        return _row_to_human_boundary(
+            row,
+            evidence_refs=json.loads(row["evidence_refs_json"]),
+            attempted_strategy_digests=json.loads(row["attempted_strategy_digests_json"]),
+            required_resolution_kinds=json.loads(row["required_resolution_kinds_json"]),
+            choices=[
+                HumanBoundaryChoice(
+                    choice_id=item["choice_id"],
+                    resolution_kind=item["resolution_kind"],
+                    consequence=item["consequence"],
+                )
+                for item in choice_rows
+            ],
+        )
+
+    def create_human_boundary(
+        self,
+        *,
+        human_boundary_id: str,
+        run_id: str,
+        reason: str,
+        resume_state: str,
+        minimum_request: str,
+        created_from_kind: str,
+        created_from_id: str,
+        created_transition_sequence: int,
+        evidence_refs: Sequence[str] = (),
+        attempted_strategy_digests: Sequence[str] = (),
+        choice_consequences: Mapping[str, str] | None = None,
+        specification_generation: int | None = None,
+        candidate_id: str | None = None,
+        policy_hash: str | None = None,
+        forge_observation_id: str | None = None,
+        publication_id: str | None = None,
+        publication_effect_generation: int | None = None,
+        ownership_project_id: str | None = None,
+        ownership_deterministic_ref: str | None = None,
+        ownership_change_request_external_id: str | None = None,
+        ownership_run_marker: str | None = None,
+    ) -> HumanBoundaryRecord:
+        """Insert one immutable Human Boundary decision packet (domain-model.md
+        "Human Boundary"), or return the identical replay keyed by its
+        creating ``(created_from_kind, created_from_id)``.
+
+        Every worker/deadline/health/forge/policy/storage/secret problem must
+        first traverse autonomous recovery and can create a boundary only
+        through its Recovery Evidence; the sole direct exception is the
+        positive ownership-conflict Reconciliation Fact. ``reason``,
+        ``required_resolution_kinds``, and (for the ownership reason) the
+        single fixed choice are code-owned here, never caller-widened.
+        """
+        from orcest.workflow_reducer.human_boundary import (
+            MAX_BOUNDED_ENTRIES,
+            MAX_PROSE_LENGTH,
+            OWNERSHIP_CHOICE_ID,
+            required_resolution_kinds as _required_resolution_kinds,
+        )
+
+        require_lowercase_uuid(human_boundary_id, field="human_boundary_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("human_boundary.reason", reason)
+        enums.parse_enum("run.state", resume_state)
+        enums.parse_enum("human_boundary.created_from_kind", created_from_kind)
+        if created_transition_sequence <= 0:
+            raise ValueError("created_transition_sequence must be positive")
+
+        is_ownership = reason == "PUBLICATION_OWNERSHIP_CONFLICT"
+        if is_ownership != (created_from_kind == "RECONCILIATION_FACT"):
+            raise ValueError(
+                "PUBLICATION_OWNERSHIP_CONFLICT is the sole direct Reconciliation Fact "
+                "path; every other reason must be sourced from Recovery Evidence"
+            )
+        ownership_fields = (
+            ownership_project_id,
+            ownership_deterministic_ref,
+            ownership_change_request_external_id,
+            ownership_run_marker,
+        )
+        if is_ownership:
+            if any(field is None for field in ownership_fields):
+                raise ValueError(
+                    "PUBLICATION_OWNERSHIP_CONFLICT requires all four ownership bindings"
+                )
+        elif any(field is not None for field in ownership_fields):
+            raise ValueError("ownership bindings are only valid for PUBLICATION_OWNERSHIP_CONFLICT")
+
+        if not minimum_request.strip():
+            raise ValueError("minimum_request must not be blank")
+        if len(minimum_request) > MAX_PROSE_LENGTH:
+            raise ValueError(f"minimum_request exceeds {MAX_PROSE_LENGTH} scalars")
+
+        ordered_evidence_refs = tuple(dict.fromkeys(evidence_refs))
+        if len(ordered_evidence_refs) > MAX_BOUNDED_ENTRIES:
+            raise ValueError(f"evidence_refs exceeds {MAX_BOUNDED_ENTRIES} entries")
+        ordered_strategy_digests = tuple(dict.fromkeys(attempted_strategy_digests))
+        if len(ordered_strategy_digests) > MAX_BOUNDED_ENTRIES:
+            raise ValueError(f"attempted_strategy_digests exceeds {MAX_BOUNDED_ENTRIES} entries")
+
+        kinds = _required_resolution_kinds(reason)
+
+        choices: tuple[HumanBoundaryChoice, ...]
+        if is_ownership:
+            if choice_consequences:
+                raise ValueError(
+                    "PUBLICATION_OWNERSHIP_CONFLICT choices are fixed and cannot be overridden"
+                )
+            choices = (
+                HumanBoundaryChoice(
+                    choice_id=OWNERSHIP_CHOICE_ID,
+                    resolution_kind="PUBLICATION_OWNERSHIP_RESOLVED",
+                    consequence="Continue Orcest v1 ownership of this Change Request.",
+                ),
+            )
+        else:
+            consequences = dict(choice_consequences or {})
+            if set(consequences) != set(kinds):
+                raise ValueError(
+                    f"choice_consequences must supply exactly {list(kinds)}, "
+                    f"got {sorted(consequences)}"
+                )
+            for kind, consequence in consequences.items():
+                if not consequence.strip():
+                    raise ValueError(f"choice consequence for {kind} must not be blank")
+                if len(consequence) > MAX_PROSE_LENGTH:
+                    raise ValueError(
+                        f"choice consequence for {kind} exceeds {MAX_PROSE_LENGTH} scalars"
+                    )
+            choices = tuple(
+                HumanBoundaryChoice(
+                    choice_id=f"resolve-{kind.lower().replace('_', '-')}",
+                    resolution_kind=kind,
+                    consequence=consequences[kind],
+                )
+                for kind in kinds
+            )
+
+        existing = self.conn.execute(
+            "SELECT * FROM human_boundaries WHERE created_from_kind = ? AND created_from_id = ?",
+            (created_from_kind, created_from_id),
+        ).fetchone()
+        if existing is not None:
+            record = self._load_human_boundary(existing)
+            if (
+                record.human_boundary_id == human_boundary_id
+                and record.run_id == run_id
+                and record.reason == reason
+                and record.resume_state == resume_state
+                and record.minimum_request == minimum_request
+                and record.evidence_refs == ordered_evidence_refs
+                and record.attempted_strategy_digests == ordered_strategy_digests
+                and record.required_resolution_kinds == kinds
+                and record.choices == choices
+                and record.specification_generation == specification_generation
+                and record.candidate_id == candidate_id
+                and record.policy_hash == policy_hash
+                and record.forge_observation_id == forge_observation_id
+                and record.publication_id == publication_id
+                and record.publication_effect_generation == publication_effect_generation
+                and record.ownership_project_id == ownership_project_id
+                and record.ownership_deterministic_ref == ownership_deterministic_ref
+                and record.ownership_change_request_external_id
+                == ownership_change_request_external_id
+                and record.ownership_run_marker == ownership_run_marker
+                and record.created_transition_sequence == created_transition_sequence
+            ):
+                return record
+            raise IdempotencyConflictError(
+                "human boundary creating Transition was reused with different content"
+            )
+
+        run_row = self.conn.execute(
+            "SELECT human_boundary_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run_row is None:
+            raise RunStoreError(f"run {run_id!r} was not found")
+        if run_row["human_boundary_id"] is not None:
+            raise ValueError(
+                f"run {run_id!r} already has a current human boundary "
+                f"({run_row['human_boundary_id']!r}); at most one can be current"
+            )
+
+        packet_preimage = {
+            "human_boundary_id": human_boundary_id,
+            "run_id": run_id,
+            "reason": reason,
+            "resume_state": resume_state,
+            "specification_generation": specification_generation,
+            "candidate_id": candidate_id,
+            "policy_hash": policy_hash,
+            "forge_observation_id": forge_observation_id,
+            "publication_id": publication_id,
+            "publication_effect_generation": publication_effect_generation,
+            "ownership_project_id": ownership_project_id,
+            "ownership_deterministic_ref": ownership_deterministic_ref,
+            "ownership_change_request_external_id": ownership_change_request_external_id,
+            "ownership_run_marker": ownership_run_marker,
+            "minimum_request": minimum_request,
+            "evidence_refs": list(ordered_evidence_refs),
+            "attempted_strategy_digests": list(ordered_strategy_digests),
+            "required_resolution_kinds": list(kinds),
+            "choices": [
+                {
+                    "choice_id": choice.choice_id,
+                    "resolution_kind": choice.resolution_kind,
+                    "consequence": choice.consequence,
+                }
+                for choice in choices
+            ],
+            "created_from_kind": created_from_kind,
+            "created_from_id": created_from_id,
+            "created_transition_sequence": created_transition_sequence,
+        }
+        digest = human_boundary_digest(packet_preimage)
+        now = _now_ms()
+        columns = [
+            "human_boundary_id",
+            "run_id",
+            "reason",
+            "resume_state",
+            "specification_generation",
+            "candidate_id",
+            "policy_hash",
+            "forge_observation_id",
+            "publication_id",
+            "publication_effect_generation",
+            "ownership_project_id",
+            "ownership_deterministic_ref",
+            "ownership_change_request_external_id",
+            "ownership_run_marker",
+            "minimum_request",
+            "evidence_refs_json",
+            "attempted_strategy_digests_json",
+            "required_resolution_kinds_json",
+            "created_from_kind",
+            "created_from_id",
+            "packet_digest",
+            "created_transition_sequence",
+            "created_at_ms",
+        ]
+        values = (
+            human_boundary_id,
+            run_id,
+            reason,
+            resume_state,
+            specification_generation,
+            candidate_id,
+            policy_hash,
+            forge_observation_id,
+            publication_id,
+            publication_effect_generation,
+            ownership_project_id,
+            ownership_deterministic_ref,
+            ownership_change_request_external_id,
+            ownership_run_marker,
+            minimum_request,
+            canonical_json_text(list(ordered_evidence_refs)),
+            canonical_json_text(list(ordered_strategy_digests)),
+            canonical_json_text(list(kinds)),
+            created_from_kind,
+            created_from_id,
+            digest,
+            created_transition_sequence,
+            now,
+        )
+        self.conn.execute(
+            f"INSERT INTO human_boundaries({', '.join(columns)}) "
+            f"VALUES ({', '.join(['?'] * len(columns))})",
+            values,
+        )
+        for ordinal, choice in enumerate(choices):
+            self.conn.execute(
+                "INSERT INTO human_boundary_choices(human_boundary_id, choice_ordinal, "
+                "choice_id, resolution_kind, consequence) VALUES (?, ?, ?, ?, ?)",
+                (
+                    human_boundary_id,
+                    ordinal,
+                    choice.choice_id,
+                    choice.resolution_kind,
+                    choice.consequence,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE runs SET human_boundary_id = ?, updated_at_ms = ? WHERE run_id = ?",
+            (human_boundary_id, now, run_id),
+        )
+        created = self.get_human_boundary(human_boundary_id)
+        assert created is not None
+        return created
+
+    def get_human_resolution(self, human_resolution_id: str) -> HumanResolutionRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM human_resolutions WHERE human_resolution_id = ?",
+            (human_resolution_id,),
+        ).fetchone()
+        return None if row is None else _row_to_human_resolution(row)
+
+    def get_human_resolution_for_boundary(
+        self, human_boundary_id: str
+    ) -> HumanResolutionRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM human_resolutions WHERE human_boundary_id = ?", (human_boundary_id,)
+        ).fetchone()
+        return None if row is None else _row_to_human_resolution(row)
+
+    def submit_human_resolution(
+        self,
+        *,
+        human_resolution_id: str,
+        human_boundary_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        authenticated_principal_id: str,
+        resolution_kind: str,
+        resolution: Mapping[str, Any],
+        accepted_at_ms: int | None = None,
+    ) -> HumanResolutionOutcome:
+        """Validate and persist one closed Human Resolution for the exact
+        current Human Boundary, then apply the Transition it resumes
+        (workflow-lifecycle.md "Resumption").
+
+        Only ``MANAGEMENT_COMMAND``/``SECRET_VERSION``/``STORAGE_RESTORATION``
+        sources are driven through the ledger here. ``SPECIFICATION_AMENDED``'s
+        ``FORGE_OBSERVATION``-sourced Snapshot capture and its separate
+        ``SPEC_SUPERSEDE`` continuation belong to the replanning leaf: "A
+        Management Command cannot synthesize SPECIFICATION_AMENDED" is
+        enforced below, and callers must drive that resolution kind through
+        that leaf's own transaction instead of this method.
+
+        Idempotent by ``(source_kind, source_id)`` -- an identical replay
+        (same boundary, resolution kind, payload, principal) returns the
+        original record and re-applies the already-committed Transition via
+        the ledger's own trigger-identity replay; a reused source identity
+        with different content is an integrity conflict; a fresh acceptance
+        requires ``human_boundary_id`` still be this Run's current boundary.
+        """
+        from orcest.workflow_reducer.human_boundary import (
+            SECRET_STORE_VERIFIER_PRINCIPAL_ID,
+            resolution_source_kinds,
+            validate_resolution_payload,
+        )
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        require_lowercase_uuid(human_resolution_id, field="human_resolution_id")
+        require_lowercase_uuid(human_boundary_id, field="human_boundary_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("human_resolution.source_kind", source_kind)
+        enums.parse_enum("human_resolution.resolution_kind", resolution_kind)
+        if not authenticated_principal_id.strip():
+            raise ValueError("authenticated_principal_id is required")
+        if source_kind not in resolution_source_kinds(resolution_kind):
+            raise ValueError(
+                f"{resolution_kind} cannot be sourced from {source_kind}; a generic "
+                "source may never synthesize a resolution kind reserved for another"
+            )
+        if source_kind not in {"MANAGEMENT_COMMAND", "SECRET_VERSION", "STORAGE_RESTORATION"}:
+            raise ValueError(
+                f"{source_kind} resolutions are applied by their own leaf's Transition "
+                "(e.g. FORGE_OBSERVATION/SPEC_SUPERSEDE for SPECIFICATION_AMENDED), "
+                "not submit_human_resolution"
+            )
+        validate_resolution_payload(resolution_kind, resolution)
+        if source_kind == "SECRET_VERSION":
+            parts = source_id.split(":")
+            if (
+                len(parts) != 2
+                or not is_lowercase_uuid(parts[0])
+                or not parts[1].isdigit()
+                or parts[1] != str(int(parts[1]))
+            ):
+                raise ValueError(
+                    "SECRET_VERSION source_id must be the canonical "
+                    "'<lowercase-uuid>:<base-10-version>' composite key"
+                )
+            if authenticated_principal_id != SECRET_STORE_VERIFIER_PRINCIPAL_ID:
+                raise ValueError(
+                    "an automatic SECRET_OR_PERMISSION_PROVIDED resolution from a Secret "
+                    "Version must be authenticated as the registered Secret-Store "
+                    "verifier/reconciler service principal"
+                )
+        else:
+            require_lowercase_uuid(source_id, field="source_id")
+
+        now = _now_ms() if accepted_at_ms is None else accepted_at_ms
+        resolution_payload = dict(resolution)
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM human_resolutions WHERE source_kind = ? AND idempotency_key = ?",
+                (source_kind, source_id),
+            ).fetchone()
+
+            boundary = self.get_human_boundary(human_boundary_id)
+            if boundary is None:
+                raise RunStoreError(f"human boundary {human_boundary_id!r} was not found")
+            if boundary.run_id != run_id:
+                raise ValueError("human boundary does not belong to this run")
+
+            if existing is not None:
+                record = _row_to_human_resolution(existing)
+                if not (
+                    record.human_resolution_id == human_resolution_id
+                    and record.human_boundary_id == human_boundary_id
+                    and record.run_id == run_id
+                    and record.authenticated_principal_id == authenticated_principal_id
+                    and record.resolution_kind == resolution_kind
+                    and record.resolution == resolution_payload
+                ):
+                    raise IdempotencyConflictError(
+                        "human resolution source identity was reused with different content"
+                    )
+            else:
+                run_row = self.conn.execute(
+                    "SELECT human_boundary_id FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if run_row is None:
+                    raise RunStoreError(f"run {run_id!r} was not found")
+                if run_row["human_boundary_id"] != human_boundary_id:
+                    raise RunStoreError(
+                        f"human boundary {human_boundary_id!r} is not current for run "
+                        f"{run_id!r}; the boundary was already resolved or superseded"
+                    )
+                if resolution_kind not in boundary.required_resolution_kinds:
+                    raise ValueError(
+                        f"{resolution_kind} is not permitted by boundary reason "
+                        f"{boundary.reason!r} (allowed: {list(boundary.required_resolution_kinds)})"
+                    )
+                if resolution_kind == "PUBLICATION_OWNERSHIP_RESOLVED":
+                    expected = {
+                        "project_id": boundary.ownership_project_id,
+                        "deterministic_ref": boundary.ownership_deterministic_ref,
+                        "change_request_external_id": (
+                            boundary.ownership_change_request_external_id
+                        ),
+                        "run_marker": boundary.ownership_run_marker,
+                    }
+                    for key, expected_value in expected.items():
+                        if resolution_payload[key] != expected_value:
+                            raise ValueError(
+                                f"PUBLICATION_OWNERSHIP_RESOLVED.{key} must equal the "
+                                "current boundary's copied ownership binding"
+                            )
+                if resolution_kind == "SECRET_OR_PERMISSION_PROVIDED" and source_kind == (
+                    "SECRET_VERSION"
+                ):
+                    secret_id, version_str = source_id.split(":")
+                    secret_version = self.get_secret_version(secret_id, int(version_str))
+                    if secret_version is None:
+                        raise ValueError(f"secret version {source_id!r} was not found")
+                    current = self.get_secret_current_version(secret_id)
+                    if current is None or current.current_version != int(version_str):
+                        raise ValueError(f"secret version {source_id!r} is not the current version")
+                    if resolution_payload["secret_version_key"] != source_id:
+                        raise ValueError("resolution.secret_version_key must equal source_id")
+                    if (
+                        resolution_payload["creation_receipt_id"]
+                        != secret_version.creation_receipt_id
+                    ):
+                        raise ValueError(
+                            "resolution.creation_receipt_id must match the Secret "
+                            "Version's creation Receipt"
+                        )
+
+                resolution_preimage = {
+                    "human_boundary_id": human_boundary_id,
+                    "run_id": run_id,
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                    "authenticated_principal_id": authenticated_principal_id,
+                    "resolution_kind": resolution_kind,
+                    "resolution": resolution_payload,
+                    "specification_generation": boundary.specification_generation,
+                    "candidate_id": boundary.candidate_id,
+                    "policy_hash": boundary.policy_hash,
+                    "forge_observation_id": boundary.forge_observation_id,
+                    "publication_id": boundary.publication_id,
+                    "publication_effect_generation": boundary.publication_effect_generation,
+                    "ownership_project_id": boundary.ownership_project_id,
+                    "ownership_deterministic_ref": boundary.ownership_deterministic_ref,
+                    "ownership_change_request_external_id": (
+                        boundary.ownership_change_request_external_id
+                    ),
+                    "ownership_run_marker": boundary.ownership_run_marker,
+                }
+                digest = human_resolution_digest(resolution_preimage)
+                columns = [
+                    "human_resolution_id",
+                    "human_boundary_id",
+                    "run_id",
+                    "idempotency_key",
+                    "source_kind",
+                    "source_id",
+                    "authenticated_principal_id",
+                    "resolution_kind",
+                    "resolution_json",
+                    "specification_generation",
+                    "candidate_id",
+                    "policy_hash",
+                    "forge_observation_id",
+                    "publication_id",
+                    "publication_effect_generation",
+                    "ownership_project_id",
+                    "ownership_deterministic_ref",
+                    "ownership_change_request_external_id",
+                    "ownership_run_marker",
+                    "resolution_digest",
+                    "accepted_at_ms",
+                ]
+                values = (
+                    human_resolution_id,
+                    human_boundary_id,
+                    run_id,
+                    source_id,
+                    source_kind,
+                    source_id,
+                    authenticated_principal_id,
+                    resolution_kind,
+                    canonical_json_text(resolution_payload),
+                    boundary.specification_generation,
+                    boundary.candidate_id,
+                    boundary.policy_hash,
+                    boundary.forge_observation_id,
+                    boundary.publication_id,
+                    boundary.publication_effect_generation,
+                    boundary.ownership_project_id,
+                    boundary.ownership_deterministic_ref,
+                    boundary.ownership_change_request_external_id,
+                    boundary.ownership_run_marker,
+                    digest,
+                    now,
+                )
+                self.conn.execute(
+                    f"INSERT INTO human_resolutions({', '.join(columns)}) "
+                    f"VALUES ({', '.join(['?'] * len(columns))})",
+                    values,
+                )
+
+            created = self.get_human_resolution(human_resolution_id)
+            assert created is not None
+
+            view = load_view(self, run_id)
+            if view is None:
+                raise RunStoreError(f"run {run_id!r} was not found")
+            trigger_facts: dict[str, Any] = {"human_boundary_id": human_boundary_id}
+            if source_kind == "MANAGEMENT_COMMAND":
+                trigger_kind = "MANAGEMENT_COMMAND"
+                trigger_facts["kind"] = "RESOLVE_HUMAN_BOUNDARY"
+            elif source_kind == "SECRET_VERSION":
+                trigger_kind = "SECRET_VERSION"
+                trigger_facts["satisfies_boundary"] = True
+            else:
+                trigger_kind = "STORAGE_RESTORATION"
+                trigger_facts["matches_object"] = True
+
+            applied = apply(
+                self,
+                view,
+                Trigger(kind=trigger_kind, trigger_id=source_id, facts=trigger_facts),
+                run_id=run_id,
+            )
+            if (
+                not applied.replayed
+                and applied.reduction is not None
+                and applied.reduction.reason_code == "HUMAN_RESOLUTION"
+            ):
+                self._clear_run_human_boundary_pointer(run_id)
+            return HumanResolutionOutcome(human_resolution=created, applied=applied)
+
+    def _clear_run_human_boundary_pointer(self, run_id: str) -> None:
+        self.conn.execute(
+            "UPDATE runs SET human_boundary_id = NULL, updated_at_ms = ? WHERE run_id = ?",
+            (_now_ms(), run_id),
+        )
 
     def _waiting_run_ids(self, *, wait_reason: str, project_id: str | None = None) -> list[str]:
         """Bytewise-sorted ``run_id``s currently ``WAITING`` for ``wait_reason``.
