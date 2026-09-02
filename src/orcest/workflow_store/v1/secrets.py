@@ -287,6 +287,82 @@ class SecretStore:
                 reference(handle)
             return handle
 
+    def stage_for_request(self, request_id: str, value: bytes) -> SecretStagingHandle:
+        """Idempotently stage bytes under a caller-assigned request identity.
+
+        Unlike :meth:`stage`, ``request_id`` -- the caller's own idempotency
+        key, e.g. a Credential Rotation Request id -- replaces the internal
+        random staging id. The returned attestation is then a pure function
+        of ``(request_id, value)``: an exact retry after a crash or lost
+        response reproduces the identical attestation without ever comparing
+        or exposing raw bytes outside this store, while different bytes
+        replayed under the same id fail closed as an integrity conflict.
+        """
+        require_lowercase_uuid(request_id, field="request_id")
+        staged = trusted_join(self._incoming, request_id)
+        meta_path = trusted_join(self._incoming, f"{request_id}.integrity")
+        attestation_id = str(uuid.uuid4())
+        authenticator = secret_staging_attestation(
+            self._integrity_key, staging_id=request_id, secret_bytes=value
+        )
+        if meta_path.is_file():
+            existing_meta = _load_integrity_meta(
+                meta_path, max_bytes=self._quota.max_object_bytes, kind="staging"
+            )
+            existing_authenticator = existing_meta.get("authenticator")
+            if not isinstance(existing_authenticator, str) or not hmac.compare_digest(
+                authenticator, existing_authenticator
+            ):
+                raise IntegrityConflictError("staged request integrity attestation mismatch")
+            if _require_int(existing_meta.get("byte_length"), field="byte_length") != len(value):
+                raise IntegrityConflictError("staged request length mismatch")
+            attestation_id = str(existing_meta["attestation_id"])
+        else:
+            meta_body = canonical_json_bytes(
+                {
+                    "staging_id": request_id,
+                    "attestation_id": attestation_id,
+                    "byte_length": len(value),
+                    "authenticator": authenticator,
+                }
+            )
+            self._promote_incoming_no_clobber(meta_path, meta_body)
+        self._promote_incoming_no_clobber(staged, value)
+        return SecretStagingHandle(
+            staging_id=request_id, byte_length=len(value), attestation_id=attestation_id
+        )
+
+    def quarantine_request_value(self, request_id: str) -> None:
+        """Reclaim only the staged value bytes for ``request_id``.
+
+        The integrity metadata is deliberately retained (unlike
+        :meth:`quarantine_staging`) so a later replay of the same
+        Credential Rotation Request can still reproduce the original
+        keyed request-attestation identity for audit.
+        """
+        require_lowercase_uuid(request_id, field="request_id")
+        with self._lock:
+            staged = trusted_join(self._incoming, request_id)
+            if staged.exists():
+                quarantine_file(src=staged, quarantine_dir=self._quarantine, store_root=self._root)
+
+    def _promote_incoming_no_clobber(self, dest: Path, data: bytes) -> None:
+        incoming = write_incoming_bytes(
+            self._incoming,
+            data,
+            store_root=self._root,
+            quota=self._quota,
+            usage_root=self._root,
+            free_space=self._free_space,
+        )
+        promote_no_clobber(
+            incoming=incoming,
+            dest=dest,
+            incoming_dir=self._incoming,
+            store_root=self._root,
+            expected=data,
+        )
+
     def quarantine_staging(self, staging_id: str) -> None:
         require_lowercase_uuid(staging_id, field="staging_id")
         with self._lock:

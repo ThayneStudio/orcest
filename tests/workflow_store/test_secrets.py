@@ -282,3 +282,75 @@ def test_meta_without_value_completes_on_retry(secret_store: SecretStore, layout
 def test_promote_missing_staging_is_not_found(secret_store: SecretStore) -> None:
     with pytest.raises(ObjectNotFoundError, match="staged secret"):
         secret_store.promote_version(staging_id=_secret_id(), secret_id=_secret_id(), version=1)
+
+
+def test_stage_for_request_is_a_pure_function_of_id_and_bytes(secret_store: SecretStore) -> None:
+    request_id = _secret_id()
+    first = secret_store.stage_for_request(request_id, SECRET)
+    second = secret_store.stage_for_request(request_id, SECRET)
+
+    assert first.staging_id == request_id
+    assert second.staging_id == request_id
+    assert first.attestation_id == second.attestation_id
+    assert SECRET not in repr(first).encode()
+
+
+def test_stage_for_request_rejects_different_bytes_under_same_id(
+    secret_store: SecretStore,
+) -> None:
+    request_id = _secret_id()
+    secret_store.stage_for_request(request_id, SECRET)
+
+    with pytest.raises(IntegrityConflictError):
+        secret_store.stage_for_request(request_id, OTHER)
+
+
+def test_quarantine_request_value_keeps_attestation_for_replay(
+    secret_store: SecretStore, layout: object
+) -> None:
+    from orcest.workflow_store.v1.fs import ControlLayout
+
+    assert isinstance(layout, ControlLayout)
+    request_id = _secret_id()
+    first = secret_store.stage_for_request(request_id, SECRET)
+
+    secret_store.quarantine_request_value(request_id)
+
+    staged = layout.secrets_root / "incoming" / request_id
+    meta = layout.secrets_root / "incoming" / f"{request_id}.integrity"
+    assert not staged.exists()
+    assert meta.exists()
+
+    # A later replay re-stages the exact same bytes under the same id and
+    # reproduces the original opaque attestation identity.
+    second = secret_store.stage_for_request(request_id, SECRET)
+    assert second.attestation_id == first.attestation_id
+
+
+def test_promote_version_precheck_can_abort_before_any_install(
+    secret_store: SecretStore,
+) -> None:
+    secret_id = _secret_id()
+    request_id = _secret_id()
+    staging = secret_store.stage_for_request(request_id, SECRET)
+
+    class _CasLost(Exception):
+        pass
+
+    def _precheck() -> None:
+        raise _CasLost()
+
+    with pytest.raises(_CasLost):
+        secret_store.promote_version(
+            staging_id=staging.staging_id,
+            secret_id=secret_id,
+            version=1,
+            precheck=_precheck,
+        )
+
+    with pytest.raises(ObjectNotFoundError):
+        secret_store.verify(secret_id, 1)
+    # The staged bytes survive an aborted precheck so the caller can still
+    # quarantine or retry them.
+    retried = secret_store.stage_for_request(request_id, SECRET)
+    assert retried.attestation_id == staging.attestation_id
