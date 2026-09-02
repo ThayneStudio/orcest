@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from orcest.workflow_contract.v1 import enums
+from orcest.workflow_contract.v1.protocol_registry import DIAGNOSIS_PROTOCOL, PLAN_PROTOCOL
 from orcest.workflow_reducer.graph import (
     ACTIVE_STATES,
     ALL_RUN_STATES,
@@ -200,6 +201,11 @@ def _default_facts(state: str | None, trigger: str) -> tuple[str, dict[str, Any]
         if state == "DIAGNOSING":
             facts["plan_assessment"] = "VIABLE"
             facts["below_replan_threshold"] = True
+            facts["structured_output_protocol"] = DIAGNOSIS_PROTOCOL
+        if state in {"PLANNING", "REPLANNING"}:
+            facts["structured_output_protocol"] = PLAN_PROTOCOL
+        if state in {"BUILDING", "REMEDIATING", "PR_REMEDIATING"}:
+            facts["candidate_id"] = "66666666-6666-4666-8666-666666666666"
         if state == "RECOVERING":
             facts["outcome"] = "FAILED_RETRYABLE"
         return ("attempt-1", facts)
