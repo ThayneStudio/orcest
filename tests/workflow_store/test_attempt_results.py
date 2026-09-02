@@ -450,6 +450,27 @@ def test_terminal_before_deadline_creates_stale_request_only(
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
 
 
+def test_superseded_generation_creates_stale_request_only(
+    stores: tuple[RunStore, CandidateObjectStore],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+    with store.transaction():
+        store.conn.execute(
+            "UPDATE attempts SET generation = 2 WHERE attempt_id = ?",
+            (ATTEMPT_ID,),
+        )
+
+    result = _submit(store, candidate_store)
+
+    assert result.request.disposition == "STALE_ATTEMPT"
+    assert result.request.stale_reason == "GENERATION_SUPERSEDED"
+    assert result.request.attempt_generation == 1
+    assert json.loads(result.request.response_json)["current_attempt_generation"] == 2
+    assert result.request.attempt_terminal_fact_id is None
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 0
+
+
 def test_expired_upload_result_records_upload_expired_without_terminalizing(
     stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
 ) -> None:

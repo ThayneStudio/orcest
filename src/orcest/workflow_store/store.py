@@ -3735,8 +3735,8 @@ CREATE TABLE IF NOT EXISTS attempt_results (
 CREATE TABLE IF NOT EXISTS result_requests (
   result_request_id TEXT PRIMARY KEY,
   attempt_result_id TEXT REFERENCES attempt_results(attempt_result_id) ON DELETE RESTRICT,
-  attempt_id TEXT NOT NULL,
-  activity_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  activity_id TEXT NOT NULL REFERENCES activities(activity_id) ON DELETE RESTRICT,
   attempt_generation INTEGER NOT NULL CHECK (attempt_generation > 0),
   worker_id TEXT NOT NULL,
   worker_session_id TEXT NOT NULL,
@@ -3771,9 +3771,7 @@ CREATE TABLE IF NOT EXISTS result_requests (
     OR (disposition = 'RESULT_ALREADY_ACCEPTED' AND attempt_result_id IS NULL
       AND stale_reason IS NULL AND attempt_terminal_fact_id IS NULL)
   ),
-  CHECK (disposition = 'ACCEPTED' OR accepted_result_created = 0),
-  FOREIGN KEY (attempt_id, activity_id, attempt_generation)
-    REFERENCES attempts(attempt_id, activity_id, generation)
+  CHECK (disposition = 'ACCEPTED' OR accepted_result_created = 0)
 );
 
 CREATE TABLE IF NOT EXISTS controller_operation_facts (
@@ -11234,8 +11232,8 @@ class RunStore:
                 "activities.state AS activity_state, activities.execution_class AS execution_class "
                 "FROM attempts JOIN activities ON activities.activity_id = attempts.activity_id "
                 "WHERE attempts.attempt_id = ? AND attempts.activity_id = ? "
-                "AND attempts.generation = ?",
-                (attempt_id, activity_id, generation),
+                "ORDER BY attempts.generation DESC LIMIT 1",
+                (attempt_id, activity_id),
             ).fetchone()
             if row is None:
                 raise AttemptUnknownError(
@@ -11365,11 +11363,49 @@ class RunStore:
                 return self._result_request_from_row(inserted, replayed=False)
 
             before_execution_deadline = now < row["execution_deadline_ms"]
+            if row["generation"] != generation:
+                http_status, body_json, resp_digest = self._attempt_result_error_response(
+                    http_status=409,
+                    code="ATTEMPT_STALE",
+                    attempt_id=attempt_id,
+                    current_attempt_generation=row["generation"],
+                )
+                self.conn.execute(
+                    "INSERT INTO result_requests(result_request_id, attempt_result_id, "
+                    "attempt_id, activity_id, attempt_generation, worker_id, worker_session_id, "
+                    "attempt_capability_digest, request_digest, result_digest, disposition, "
+                    "stale_reason, accepted_result_created, candidate_upload_id, "
+                    "attempt_terminal_fact_id, response_http_status, response_json, "
+                    "response_digest, created_at_ms) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'STALE_ATTEMPT', "
+                    "'GENERATION_SUPERSEDED', 0, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        result_request_id,
+                        attempt_id,
+                        activity_id,
+                        generation,
+                        worker_id,
+                        worker_session_id,
+                        attempt_capability_digest,
+                        req_digest,
+                        res_digest,
+                        candidate_upload_id,
+                        http_status,
+                        body_json,
+                        resp_digest,
+                        now,
+                    ),
+                )
+                inserted = self.conn.execute(
+                    "SELECT * FROM result_requests WHERE result_request_id = ?",
+                    (result_request_id,),
+                ).fetchone()
+                assert inserted is not None
+                return self._result_request_from_row(inserted, replayed=False)
+
             if before_execution_deadline and (row["state"] != "CLAIMED" or not binding_ok):
                 stale_reason = "TERMINAL_BEFORE_DEADLINE"
-                if row["generation"] != generation:
-                    stale_reason = "GENERATION_SUPERSEDED"
-                elif not binding_ok:
+                if not binding_ok:
                     stale_reason = "CLAIM_BINDING_CHANGED"
                 http_status, body_json, resp_digest = self._attempt_result_error_response(
                     http_status=409,
@@ -11420,7 +11456,11 @@ class RunStore:
                         raise RunStoreError(
                             f"candidate upload {candidate_upload_id!r} was not found"
                         )
-                    if upload.attempt_id != attempt_id or upload.activity_id != activity_id:
+                    if (
+                        upload.attempt_id != attempt_id
+                        or upload.activity_id != activity_id
+                        or upload.attempt_generation != generation
+                    ):
                         raise CasMismatchError("candidate upload does not match Attempt Result")
                     if now >= upload.expires_at_ms:
                         self._expire_candidate_upload_row(
