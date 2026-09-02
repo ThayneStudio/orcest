@@ -10,8 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from orcest.workflow_contract.v1.digest import content_digest, request_digest
-from orcest.workflow_contract.v1.protocol import validate_envelope
+from orcest.workflow_contract.v1.digest import (
+    capability_public_key_digest,
+    content_digest,
+    request_digest,
+    subject_refs_digest,
+)
+from orcest.workflow_contract.v1.protocol import ProtocolValidationError, validate_envelope
 from orcest.workflow_contract.v1.structured_outputs import StructuredOutputValidationError
 from orcest.workflow_contract.v1.verification import (
     VerificationReceiptRejectedError,
@@ -20,6 +25,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_hash,
 )
 from orcest.workflow_store import (
+    ActivityReviewAssignmentInput,
     AttemptOfferInput,
     AttemptUnknownError,
     CasMismatchError,
@@ -1009,3 +1015,758 @@ def test_verify_receipt_rejects_non_null_launch_attestation_id(
         )
 
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+
+
+# --- REVIEW / ADJUDICATE receipt admission -----------------------------------
+
+REVIEW_SUBJECTS = ("snapshot:overall", "plan:requirement:r1")
+AUTHZ_DIGEST = "sha256:" + "a" * 64
+KEY_ID = "77777777-7777-4777-8777-777777777777"
+
+
+def _digest(value: object) -> str:
+    return request_digest({"value": value})
+
+
+def _enable_claiming(store: RunStore) -> None:
+    public_key = bytes([1]) * 32
+    result = store.apply_capability_key_operation(
+        capability_key_operation_id="abababab-1111-4111-8111-abababababab",
+        kind="REGISTER",
+        expected_registry_revision=0,
+        expected_issuance_key_id=None,
+        target_capability_signing_key_id=KEY_ID,
+        register_public_verification_key=public_key,
+        register_public_key_digest=capability_public_key_digest(public_key),
+        register_private_signing_secret_ref="secret:key:1",
+        register_not_before_ms=0,
+        private_key_proof_valid=True,
+        authenticated_principal_id="key-operator",
+        authorization_context_digest=AUTHZ_DIGEST,
+    )
+    assert result.status == "SUCCEEDED"
+    result = store.apply_capability_key_operation(
+        capability_key_operation_id="bcbcbcbc-2222-4222-8222-bcbcbcbcbcbc",
+        kind="SELECT",
+        expected_registry_revision=1,
+        expected_issuance_key_id=None,
+        target_capability_signing_key_id=KEY_ID,
+        authenticated_principal_id="key-operator",
+        authorization_context_digest=AUTHZ_DIGEST,
+    )
+    assert result.status == "SUCCEEDED"
+
+
+def _claim_model_attempt(
+    store: RunStore,
+    *,
+    activity_id: str,
+    attempt_id: str,
+    outbox_id: str,
+    launch_attestation_id: str,
+    claim_id: str,
+    nonce_id: str,
+    slot_ordinal: int,
+) -> None:
+    if store.get_capability_key_registry().current_issuance_key_id is None:
+        _enable_claiming(store)
+    with store.transaction():
+        store.conn.execute("UPDATE runs SET state = 'ADMITTED' WHERE run_id = ?", (RUN_ID,))
+    launch_claims = {
+        "protocol": "orcest.launch-capability/1",
+        "jti": _uid(),
+        "attempt_id": attempt_id,
+        "activity_id": activity_id,
+        "generation": 1,
+        "worker_session_id": WORKER_SESSION_ID,
+        "launch_nonce_id": nonce_id,
+        "runner_principal_id": "runner-1",
+        "runner_registration_revision": 7,
+        "issued_at_ms": FUTURE_MS + 1,
+        "execution_deadline_ms": FUTURE_MS + 200_000,
+        "audience": f"/api/v1/attempts/{attempt_id}/launch-attestations",
+        "capability_signing_key_id": KEY_ID,
+        "signature_algorithm": "ED25519",
+        "provider": "codex",
+        "model": "gpt-5.3-codex",
+    }
+    claim = store.claim_attempt(
+        attempt_claim_id=claim_id,
+        attempt_id=attempt_id,
+        activity_id=activity_id,
+        generation=1,
+        offer_outbox_id=outbox_id,
+        worker_id="worker-1",
+        worker_session_id=WORKER_SESSION_ID,
+        worker_profile="codex",
+        worker_build_revision="git-sha",
+        request_digest=_digest({"claim": attempt_id}),
+        execution_deadline_ms=FUTURE_MS + 200_000,
+        attempt_capability_jti=_uid(),
+        attempt_capability_digest=ATTEMPT_CAPABILITY_DIGEST,
+        source_access_kind="SCOPED_CREDENTIAL",
+        source_access_descriptor={"clone_url": "https://example.test/repo.git"},
+        source_access_descriptor_digest=_digest({"clone_url": "https://example.test/repo.git"}),
+        response_contract_digest=_digest({"claim-response": attempt_id}),
+        source_read_secret_ref="secret:source:7",
+        provider_secret_ref="secret:provider:12",
+        launch_nonce_id=nonce_id,
+        launch_capability_jti=_uid(),
+        launch_capability_claims=launch_claims,
+    )
+    store.accept_launch_attestation(
+        launch_attestation_id=launch_attestation_id,
+        attempt_id=attempt_id,
+        activity_id=activity_id,
+        attempt_generation=1,
+        worker_id="worker-1",
+        worker_session_id=WORKER_SESSION_ID,
+        pool_manager_id="pool-1",
+        runner_principal_id="runner-1",
+        runner_image_digest="sha256:" + "3" * 64,
+        runner_registration_revision=7,
+        launch_nonce_id=claim.claim.launch_nonce_id,
+        launch_capability_digest=claim.claim.launch_capability_digest,
+        launch_capability_signing_key_id=claim.claim.launch_capability_signing_key_id,
+        launch_capability_signature_algorithm=claim.claim.launch_capability_signature_algorithm,
+        workspace_instance_id=f"aaaaaaaa-aaaa-4aaa-8aaa-{slot_ordinal:012d}",
+        context_instance_id=f"bbbbbbbb-bbbb-4bbb-8bbb-{slot_ordinal:012d}",
+        invocation_instance_id=f"cccccccc-cccc-4ccc-8ccc-{slot_ordinal:012d}",
+        workspace_parent_id=None,
+        context_parent_id=None,
+        invocation_parent_id=None,
+        fresh_workspace=True,
+        fresh_context=True,
+        fresh_invocation=True,
+        prepared_at_ms=FUTURE_MS + 10,
+        attested_at_ms=FUTURE_MS + 20,
+        runner_signing_key_id="runner-key-1",
+        runner_signature_algorithm="ED25519",
+        signature="base64-signature",
+        attestation_digest=_digest({"attestation": attempt_id}),
+        response_contract_digest=_digest({"launch-response": attempt_id}),
+        provider_material_descriptor={"provider": "codex", "model": "gpt-5.3-codex"},
+        provider_material_descriptor_digest=_digest({"provider": "codex"}),
+    )
+
+
+def _create_review_activity(
+    store: RunStore,
+    candidate_id: str,
+    *,
+    slot: str,
+    activity_id: str,
+    attempt_id: str,
+    outbox_id: str,
+    launch_attestation_id: str,
+    claim_id: str,
+    nonce_id: str,
+    slot_ordinal: int,
+) -> None:
+    assignment = ActivityReviewAssignmentInput(
+        assignment_kind="REVIEW",
+        panel_round=1,
+        role=slot,
+        context_digest="sha256:" + "4" * 64,
+        subject_refs=REVIEW_SUBJECTS,
+        reviewer_slot=slot,
+    )
+    store.create_activity(
+        activity_id=activity_id,
+        run_id=RUN_ID,
+        activity_ordinal=slot_ordinal,
+        specification_generation=1,
+        policy_hash=POLICY_HASH,
+        kind="REVIEW",
+        candidate_id=candidate_id,
+        execution_class="WORKER",
+        state="READY",
+        created_transition_sequence=1,
+        semantic_input={"slot": slot},
+        semantic_input_digest="sha256:" + f"{slot_ordinal}" * 64,
+        idempotency_key="sha256:" + f"{slot_ordinal + 1}" * 64,
+        slot=slot,
+        role=slot,
+        review_assignment=assignment,
+        attempt=AttemptOfferInput(
+            attempt_id=attempt_id,
+            generation=1,
+            protocol_version=activity_offer_protocol(),
+            worker_profile="codex",
+            execution_profile_id=f"profile-{slot}",
+            provider="codex",
+            model="gpt-5.3-codex",
+            provider_account_ref=f"account-{slot}",
+            provider_family="openai",
+            model_family=f"codex-{slot}",
+            classification_revision="class-v1",
+            offered_at_ms=FUTURE_MS,
+            claim_timeout_ms=300_000,
+        ),
+        outbox_id=outbox_id,
+    )
+    _claim_model_attempt(
+        store,
+        activity_id=activity_id,
+        attempt_id=attempt_id,
+        outbox_id=outbox_id,
+        launch_attestation_id=launch_attestation_id,
+        claim_id=claim_id,
+        nonce_id=nonce_id,
+        slot_ordinal=slot_ordinal,
+    )
+    with store.transaction():
+        store.conn.execute("UPDATE runs SET state = 'REVIEWING' WHERE run_id = ?", (RUN_ID,))
+
+
+def _review_receipt(
+    candidate,
+    *,
+    slot: str,
+    verdict: str = "APPROVE",
+    assessment_outcomes: tuple[str, ...] | None = None,
+    findings: list[dict] | None = None,
+) -> dict:
+    outcomes = assessment_outcomes or ("SATISFIED",) * len(REVIEW_SUBJECTS)
+    return {
+        "protocol": "orcest.review-receipt/1",
+        "candidate": {
+            "candidate_id": candidate.candidate_id,
+            "commit": {"object_format": candidate.object_format, "oid": candidate.oid},
+        },
+        "panel_round": 1,
+        "reviewer_slot": slot,
+        "role": slot,
+        "subject_refs_digest": subject_refs_digest(REVIEW_SUBJECTS),
+        "context_digest": "sha256:" + "4" * 64,
+        "assessments": [
+            {"subject_ref": subject, "outcome": outcome, "evidence_refs": []}
+            for subject, outcome in zip(REVIEW_SUBJECTS, outcomes)
+        ],
+        "verdict": verdict,
+        "findings": findings if findings is not None else [],
+        "abstention_code": "TOOL_UNAVAILABLE" if verdict == "ABSTAIN" else None,
+    }
+
+
+def test_review_receipt_persists_trusted_slot_and_fills_only_on_approve(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        outbox_id="14141414-1414-4141-8141-141414141414",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        claim_id="16161616-1616-4161-8161-161616161616",
+        nonce_id="17171717-1717-4171-8171-171717171717",
+        slot_ordinal=3,
+    )
+
+    result = _submit(
+        store,
+        candidate_store,
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        receipt=_review_receipt(candidate, slot="correctness"),
+    )
+
+    assert result.request.disposition == "ACCEPTED"
+    row = store.conn.execute("SELECT * FROM review_receipts").fetchone()
+    assert row["reviewer_slot"] == "correctness"
+    assert row["fills_slot"] == 1
+    assert row["provider_family"] == "openai"
+
+
+def test_review_abstain_never_fills_required_slot(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="security",
+        activity_id="22222222-aaaa-4aaa-8aaa-222222222222",
+        attempt_id="33333333-aaaa-4aaa-8aaa-333333333333",
+        outbox_id="44444444-aaaa-4aaa-8aaa-444444444444",
+        launch_attestation_id="55555555-aaaa-4aaa-8aaa-555555555555",
+        claim_id="66666666-aaaa-4aaa-8aaa-666666666666",
+        nonce_id="77777777-aaaa-4aaa-8aaa-777777777777",
+        slot_ordinal=4,
+    )
+
+    _submit(
+        store,
+        candidate_store,
+        attempt_id="33333333-aaaa-4aaa-8aaa-333333333333",
+        activity_id="22222222-aaaa-4aaa-8aaa-222222222222",
+        launch_attestation_id="55555555-aaaa-4aaa-8aaa-555555555555",
+        outcome="ABSTAINED",
+        receipt=_review_receipt(candidate, slot="security", verdict="ABSTAIN"),
+        failure={"failure_class": "PROVIDER_UNAVAILABLE"},
+    )
+
+    assert store.conn.execute("SELECT fills_slot FROM review_receipts").fetchone()[0] == 0
+
+
+def test_review_block_without_findings_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="22222222-bbbb-4bbb-8bbb-222222222222",
+        attempt_id="33333333-bbbb-4bbb-8bbb-333333333333",
+        outbox_id="44444444-bbbb-4bbb-8bbb-444444444444",
+        launch_attestation_id="55555555-bbbb-4bbb-8bbb-555555555555",
+        claim_id="66666666-bbbb-4bbb-8bbb-666666666666",
+        nonce_id="77777777-bbbb-4bbb-8bbb-777777777777",
+        slot_ordinal=4,
+    )
+
+    with pytest.raises(ProtocolValidationError, match="BLOCK requires at least one finding"):
+        _submit(
+            store,
+            candidate_store,
+            attempt_id="33333333-bbbb-4bbb-8bbb-333333333333",
+            activity_id="22222222-bbbb-4bbb-8bbb-222222222222",
+            launch_attestation_id="55555555-bbbb-4bbb-8bbb-555555555555",
+            receipt=_review_receipt(candidate, slot="correctness", verdict="BLOCK"),
+        )
+
+    assert store.conn.execute("SELECT COUNT(*) FROM review_receipts").fetchone()[0] == 0
+
+
+def test_review_block_with_finding_fills_required_slot(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="22222222-dddd-4ddd-8ddd-222222222222",
+        attempt_id="33333333-dddd-4ddd-8ddd-333333333333",
+        outbox_id="44444444-dddd-4ddd-8ddd-444444444444",
+        launch_attestation_id="55555555-dddd-4ddd-8ddd-555555555555",
+        claim_id="66666666-dddd-4ddd-8ddd-666666666666",
+        nonce_id="77777777-dddd-4ddd-8ddd-777777777777",
+        slot_ordinal=4,
+    )
+
+    result = _submit(
+        store,
+        candidate_store,
+        attempt_id="33333333-dddd-4ddd-8ddd-333333333333",
+        activity_id="22222222-dddd-4ddd-8ddd-222222222222",
+        launch_attestation_id="55555555-dddd-4ddd-8ddd-555555555555",
+        receipt=_review_receipt(
+            candidate,
+            slot="correctness",
+            verdict="BLOCK",
+            assessment_outcomes=("VIOLATED", "SATISFIED"),
+            findings=[
+                {
+                    "finding_key": "finding-1",
+                    "subject_ref": REVIEW_SUBJECTS[0],
+                    "severity": "HIGH",
+                    "summary": "does not satisfy requirement r1",
+                    "evidence_refs": [],
+                    "disputed": False,
+                }
+            ],
+        ),
+    )
+
+    assert result.request.disposition == "ACCEPTED"
+    assert store.conn.execute("SELECT fills_slot FROM review_receipts").fetchone()[0] == 1
+
+
+def test_review_receipt_for_replaced_candidate_is_stale(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="88888888-aaaa-4aaa-8aaa-888888888888",
+        attempt_id="99999999-aaaa-4aaa-8aaa-999999999999",
+        outbox_id="aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa",
+        launch_attestation_id="bbbbbbbb-1111-4bbb-8bbb-bbbbbbbbbbbb",
+        claim_id="cccccccc-1111-4ccc-8ccc-cccccccccccc",
+        nonce_id="dddddddd-1111-4ddd-8ddd-dddddddddddd",
+        slot_ordinal=5,
+    )
+    with store.transaction():
+        store.conn.execute(
+            "UPDATE revisioned_objects SET payload_json = json_set(payload_json, "
+            "'$.current_candidate_id', ?) WHERE object_kind = 'run_pointers' "
+            "AND object_id = ?",
+            (_uid(), RUN_ID),
+        )
+
+    with pytest.raises(CasMismatchError):
+        _submit(
+            store,
+            candidate_store,
+            attempt_id="99999999-aaaa-4aaa-8aaa-999999999999",
+            activity_id="88888888-aaaa-4aaa-8aaa-888888888888",
+            launch_attestation_id="bbbbbbbb-1111-4bbb-8bbb-bbbbbbbbbbbb",
+            receipt=_review_receipt(candidate, slot="correctness"),
+        )
+
+    assert store.conn.execute("SELECT COUNT(*) FROM review_receipts").fetchone()[0] == 0
+
+
+def test_consensus_decision_persists_real_aggregation_facts(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    """The ``consensus_decisions`` audit row must reflect the facts a real
+    consensus-outcome producer supplies to the ``AGGREGATING`` continuation,
+    not silently defaulted placeholders."""
+    from orcest.workflow_reducer.ledger import apply, load_view
+    from orcest.workflow_reducer.types import Trigger
+
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        outbox_id="14141414-1414-4141-8141-141414141414",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        claim_id="16161616-1616-4161-8161-161616161616",
+        nonce_id="17171717-1717-4171-8171-171717171717",
+        slot_ordinal=3,
+    )
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="completeness",
+        activity_id="22222222-cccc-4ccc-8ccc-222222222222",
+        attempt_id="33333333-cccc-4ccc-8ccc-333333333333",
+        outbox_id="44444444-cccc-4ccc-8ccc-444444444444",
+        launch_attestation_id="55555555-cccc-4ccc-8ccc-555555555555",
+        claim_id="66666666-cccc-4ccc-8ccc-666666666666",
+        nonce_id="77777777-cccc-4ccc-8ccc-777777777777",
+        slot_ordinal=4,
+    )
+    _submit(
+        store,
+        candidate_store,
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        receipt=_review_receipt(candidate, slot="correctness"),
+    )
+    result = _submit(
+        store,
+        candidate_store,
+        attempt_id="33333333-cccc-4ccc-8ccc-333333333333",
+        activity_id="22222222-cccc-4ccc-8ccc-222222222222",
+        launch_attestation_id="55555555-cccc-4ccc-8ccc-555555555555",
+        receipt=_review_receipt(candidate, slot="completeness"),
+    )
+    assert result.request.disposition == "ACCEPTED"
+
+    view = load_view(store, RUN_ID)
+    assert view is not None
+    assert view.state == "AGGREGATING"
+    assert view.pending_internal_sequence is not None
+    assert store.conn.execute("SELECT COUNT(*) FROM consensus_decisions").fetchone()[0] == 0
+
+    review_receipt_ids = tuple(
+        str(row["receipt_id"])
+        for row in store.conn.execute(
+            "SELECT receipt_id FROM review_receipts ORDER BY receipt_id"
+        ).fetchall()
+    )
+    with store.transaction():
+        apply(
+            store,
+            view,
+            Trigger(
+                kind="INTERNAL",
+                trigger_id=str(view.pending_internal_sequence),
+                facts={
+                    "panel_round": 1,
+                    "consensus_outcome": "APPROVED",
+                    "review_receipt_ids": review_receipt_ids,
+                    "unresolved_finding_ids": (),
+                    "verification_receipt_id": "verify-1",
+                },
+            ),
+            run_id=RUN_ID,
+        )
+
+    row = store.conn.execute("SELECT * FROM consensus_decisions").fetchone()
+    assert row is not None
+    assert row["candidate_id"] == candidate.candidate_id
+    assert row["panel_round"] == 1
+    assert row["outcome"] == "APPROVED"
+    assert row["verification_receipt_id"] == "verify-1"
+    assert json.loads(row["review_receipt_ids_json"]) == sorted(review_receipt_ids)
+    assert json.loads(row["unresolved_finding_ids_json"]) == []
+
+
+def test_consensus_decision_not_persisted_without_real_aggregation_facts(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    """Until a real consensus-outcome producer is wired, the INTERNAL
+    continuation that resumes ``AGGREGATING`` still passes ``facts={}``
+    (see ``RunStore.plan_initial_activity``) -- no misleading audit row
+    should be written for that placeholder path."""
+    from orcest.workflow_reducer.ledger import apply, load_view
+    from orcest.workflow_reducer.types import Trigger
+
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        outbox_id="14141414-1414-4141-8141-141414141414",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        claim_id="16161616-1616-4161-8161-161616161616",
+        nonce_id="17171717-1717-4171-8171-171717171717",
+        slot_ordinal=3,
+    )
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="completeness",
+        activity_id="22222222-cccc-4ccc-8ccc-222222222222",
+        attempt_id="33333333-cccc-4ccc-8ccc-333333333333",
+        outbox_id="44444444-cccc-4ccc-8ccc-444444444444",
+        launch_attestation_id="55555555-cccc-4ccc-8ccc-555555555555",
+        claim_id="66666666-cccc-4ccc-8ccc-666666666666",
+        nonce_id="77777777-cccc-4ccc-8ccc-777777777777",
+        slot_ordinal=4,
+    )
+    _submit(
+        store,
+        candidate_store,
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        receipt=_review_receipt(candidate, slot="correctness"),
+    )
+    _submit(
+        store,
+        candidate_store,
+        attempt_id="33333333-cccc-4ccc-8ccc-333333333333",
+        activity_id="22222222-cccc-4ccc-8ccc-222222222222",
+        launch_attestation_id="55555555-cccc-4ccc-8ccc-555555555555",
+        receipt=_review_receipt(candidate, slot="completeness"),
+    )
+
+    view = load_view(store, RUN_ID)
+    assert view is not None
+    assert view.state == "AGGREGATING"
+    with store.transaction():
+        apply(
+            store,
+            view,
+            Trigger(kind="INTERNAL", trigger_id=str(view.pending_internal_sequence), facts={}),
+            run_id=RUN_ID,
+        )
+
+    assert store.conn.execute("SELECT COUNT(*) FROM consensus_decisions").fetchone()[0] == 0
+
+
+ADJUDICATE_SUBJECTS = ("snapshot:overall",)
+
+
+def _create_adjudicate_activity(
+    store: RunStore,
+    candidate_id: str,
+    *,
+    disputed_finding_ids: tuple[str, ...],
+    activity_id: str,
+    attempt_id: str,
+    outbox_id: str,
+    launch_attestation_id: str,
+    claim_id: str,
+    nonce_id: str,
+    slot_ordinal: int,
+) -> None:
+    assignment = ActivityReviewAssignmentInput(
+        assignment_kind="ADJUDICATE",
+        panel_round=1,
+        role="adjudicator",
+        context_digest="sha256:" + "5" * 64,
+        subject_refs=ADJUDICATE_SUBJECTS,
+        adjudication_round=1,
+        adjudicator_slot="default",
+        disputed_finding_ids=disputed_finding_ids,
+    )
+    store.create_activity(
+        activity_id=activity_id,
+        run_id=RUN_ID,
+        activity_ordinal=slot_ordinal,
+        specification_generation=1,
+        policy_hash=POLICY_HASH,
+        kind="ADJUDICATE",
+        candidate_id=candidate_id,
+        execution_class="WORKER",
+        state="READY",
+        created_transition_sequence=1,
+        semantic_input={"adjudicate": True},
+        semantic_input_digest="sha256:" + f"{slot_ordinal}" * 64,
+        idempotency_key="sha256:" + f"{slot_ordinal + 1}" * 64,
+        slot="default",
+        role="adjudicator",
+        review_assignment=assignment,
+        attempt=AttemptOfferInput(
+            attempt_id=attempt_id,
+            generation=1,
+            protocol_version=activity_offer_protocol(),
+            worker_profile="codex",
+            execution_profile_id="profile-adjudicate",
+            provider="codex",
+            model="gpt-5.3-codex",
+            provider_account_ref="account-adjudicate",
+            provider_family="openai",
+            model_family="codex-adjudicate",
+            classification_revision="class-v1",
+            offered_at_ms=FUTURE_MS,
+            claim_timeout_ms=300_000,
+        ),
+        outbox_id=outbox_id,
+    )
+    _claim_model_attempt(
+        store,
+        activity_id=activity_id,
+        attempt_id=attempt_id,
+        outbox_id=outbox_id,
+        launch_attestation_id=launch_attestation_id,
+        claim_id=claim_id,
+        nonce_id=nonce_id,
+        slot_ordinal=slot_ordinal,
+    )
+    with store.transaction():
+        store.conn.execute("UPDATE runs SET state = 'ADJUDICATING' WHERE run_id = ?", (RUN_ID,))
+
+
+def _adjudication_receipt(candidate, *, finding_id: str = "finding-1") -> dict:
+    return {
+        "protocol": "orcest.adjudication-receipt/1",
+        "candidate": {
+            "candidate_id": candidate.candidate_id,
+            "commit": {"object_format": candidate.object_format, "oid": candidate.oid},
+        },
+        "panel_round": 1,
+        "adjudication_round": 1,
+        "adjudicator_slot": "default",
+        "subject_refs_digest": subject_refs_digest(ADJUDICATE_SUBJECTS),
+        "context_digest": "sha256:" + "5" * 64,
+        "dispositions": [
+            {"finding_id": finding_id, "disposition": "OVERRULE", "evidence_refs": []}
+        ],
+        "new_findings": [],
+        "abstention_code": None,
+    }
+
+
+def test_adjudication_overrule_reopens_next_panel_round_with_real_slots(
+    stores: tuple[RunStore, CandidateObjectStore], tmp_path: Path
+) -> None:
+    """An OVERRULE adjudication must reopen a *new* panel_round with the
+    original panel's reviewer slots, not default back to panel_round 1 --
+    round 1's slots are already filled and would collide with the
+    ``idx_review_receipts_one_filling_slot`` unique index.
+    """
+    store, candidate_store = stores
+    candidate = _seeded_candidate(store, candidate_store, tmp_path)
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="correctness",
+        activity_id="12121212-1212-4121-8121-121212121212",
+        attempt_id="13131313-1313-4131-8131-131313131313",
+        outbox_id="14141414-1414-4141-8141-141414141414",
+        launch_attestation_id="15151515-1515-4151-8151-151515151515",
+        claim_id="16161616-1616-4161-8161-161616161616",
+        nonce_id="17171717-1717-4171-8171-171717171717",
+        slot_ordinal=3,
+    )
+    _create_review_activity(
+        store,
+        candidate.candidate_id,
+        slot="completeness",
+        activity_id="22222222-cccc-4ccc-8ccc-222222222222",
+        attempt_id="33333333-cccc-4ccc-8ccc-333333333333",
+        outbox_id="44444444-cccc-4ccc-8ccc-444444444444",
+        launch_attestation_id="55555555-cccc-4ccc-8ccc-555555555555",
+        claim_id="66666666-cccc-4ccc-8ccc-666666666666",
+        nonce_id="77777777-cccc-4ccc-8ccc-777777777777",
+        slot_ordinal=4,
+    )
+    _create_adjudicate_activity(
+        store,
+        candidate.candidate_id,
+        disputed_finding_ids=("finding-1",),
+        activity_id="88888888-cccc-4ccc-8ccc-888888888888",
+        attempt_id="99999999-cccc-4ccc-8ccc-999999999999",
+        outbox_id="aaaaaaaa-2222-4aaa-8aaa-aaaaaaaaaaaa",
+        launch_attestation_id="bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb",
+        claim_id="cccccccc-2222-4ccc-8ccc-cccccccccccc",
+        nonce_id="dddddddd-2222-4ddd-8ddd-dddddddddddd",
+        slot_ordinal=5,
+    )
+
+    result = _submit(
+        store,
+        candidate_store,
+        attempt_id="99999999-cccc-4ccc-8ccc-999999999999",
+        activity_id="88888888-cccc-4ccc-8ccc-888888888888",
+        launch_attestation_id="bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb",
+        receipt=_adjudication_receipt(candidate),
+    )
+
+    assert result.request.disposition == "ACCEPTED"
+    row = store.conn.execute("SELECT disposition_summary FROM adjudication_receipts").fetchone()
+    assert row["disposition_summary"] == "OVERRULE"
+
+    transition = store.conn.execute(
+        "SELECT * FROM transitions WHERE run_id = ? ORDER BY transition_sequence DESC LIMIT 1",
+        (RUN_ID,),
+    ).fetchone()
+    expected_digest = request_digest(
+        {
+            "trigger_kind": "ATTEMPT_RESULT",
+            "trigger_id": transition["trigger_id"],
+            "facts": {
+                "outcome": "SUCCEEDED",
+                "activity_kind": "ADJUDICATE",
+                "candidate_id": None,
+                "failure_class": None,
+                "verification_outcome": None,
+                "fills_slot": True,
+                "panel_complete": None,
+                "disposition": "OVERRULE",
+                "next_panel_round": 2,
+                "review_slots": ["completeness", "correctness"],
+                "structured_output_protocol": None,
+            },
+            "prior_state": "ADJUDICATING",
+            "reason_code": "ADJUDICATION_OVERRULE",
+        }
+    )
+    assert transition["input_digest"] == expected_digest
