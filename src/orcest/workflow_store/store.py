@@ -7359,6 +7359,31 @@ class RunStore:
         drift check :meth:`accept_launch_attestation` performs against the
         frozen claim.
         """
+        self._require_current_rotation_authority(
+            attempt_id=attempt_id,
+            activity_id=activity_id,
+            attempt_generation=attempt_generation,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+            attempt_capability_digest=attempt_capability_digest,
+            launch_attestation_id=launch_attestation_id,
+            provider_account_ref=provider_account_ref,
+            secret_id=secret_id,
+        )
+
+    def _require_current_rotation_authority(
+        self,
+        *,
+        attempt_id: str,
+        activity_id: str,
+        attempt_generation: int,
+        worker_id: str,
+        worker_session_id: str,
+        attempt_capability_digest: str,
+        launch_attestation_id: str,
+        provider_account_ref: str | None,
+        secret_id: str,
+    ) -> None:
         require_lowercase_uuid(attempt_id, field="attempt_id")
         require_lowercase_uuid(secret_id, field="secret_id")
         attempt = self.get_attempt(attempt_id)
@@ -7518,6 +7543,17 @@ class RunStore:
                 "affected_run_ids_digest, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
                 (secret_id, target_version, receipt_id, storage_path, affected_digest, now),
             )
+            self._require_current_rotation_authority(
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                worker_id=worker_id,
+                worker_session_id=worker_session_id,
+                attempt_capability_digest=attempt_capability_digest,
+                launch_attestation_id=launch_attestation_id,
+                provider_account_ref=provider_account_ref,
+                secret_id=secret_id,
+            )
             cur = self.conn.execute(
                 "UPDATE secret_current_versions SET current_version = ?, "
                 "last_operation_id = ?, updated_at_ms = ? "
@@ -7621,6 +7657,17 @@ class RunStore:
         require_lowercase_uuid(secret_request_attestation_id, field="secret_request_attestation_id")
         _require_positive_int(expected_prior_version, field="expected_prior_version")
         with self.transaction():
+            self._require_current_rotation_authority(
+                attempt_id=attempt_id,
+                activity_id=activity_id,
+                attempt_generation=attempt_generation,
+                worker_id=worker_id,
+                worker_session_id=worker_session_id,
+                attempt_capability_digest=attempt_capability_digest,
+                launch_attestation_id=launch_attestation_id,
+                provider_account_ref=provider_account_ref,
+                secret_id=secret_id,
+            )
             current = self.get_secret_current_version(secret_id)
             current_version = 0 if current is None else current.current_version
             now = _now_ms()

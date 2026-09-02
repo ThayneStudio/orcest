@@ -465,6 +465,74 @@ def test_rotation_rejects_secret_id_not_bound_to_attempt(
     assert current.current_version == 1
 
 
+def test_applied_rotation_rechecks_attempt_fence_at_install(
+    store: RunStore,
+    secret_store: SecretStore,
+    rotation_context: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_id = rotation_context
+    request_id = str(uuid.uuid4())
+    original = store.require_current_rotation_authority
+
+    def revoke_after_preflight(**kwargs) -> None:
+        original(**kwargs)
+        store.conn.execute(
+            "UPDATE attempts SET state = 'FAILED', terminal_reason = 'WORKER_LOST' "
+            "WHERE attempt_id = ?",
+            (ATTEMPT_ID,),
+        )
+        store.conn.commit()
+
+    monkeypatch.setattr(store, "require_current_rotation_authority", revoke_after_preflight)
+
+    with pytest.raises(CasMismatchError):
+        _rotate(store, secret_store, secret_id, credential_rotation_request_id=request_id)
+
+    current = store.get_secret_current_version(secret_id)
+    assert current is not None
+    assert current.current_version == 1
+    assert store.get_secret_version(secret_id, 2) is None
+    assert store.get_credential_rotation_request(request_id) is None
+    assert (
+        store.conn.execute("SELECT COUNT(*) FROM credential_rotation_receipts").fetchone()[0]
+        == 1  # only the initial MANAGEMENT_PROVISION receipt
+    )
+
+
+def test_cas_lost_rotation_rechecks_attempt_fence_before_ledgering(
+    store: RunStore,
+    secret_store: SecretStore,
+    rotation_context: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_id = rotation_context
+    request_id = str(uuid.uuid4())
+    original = store.require_current_rotation_authority
+
+    def revoke_after_preflight(**kwargs) -> None:
+        original(**kwargs)
+        store.conn.execute(
+            "UPDATE attempts SET state = 'FAILED', terminal_reason = 'WORKER_LOST' "
+            "WHERE attempt_id = ?",
+            (ATTEMPT_ID,),
+        )
+        store.conn.commit()
+
+    monkeypatch.setattr(store, "require_current_rotation_authority", revoke_after_preflight)
+
+    with pytest.raises(CasMismatchError):
+        _rotate(
+            store,
+            secret_store,
+            secret_id,
+            credential_rotation_request_id=request_id,
+            expected_prior_version=99,
+        )
+
+    assert store.get_credential_rotation_request(request_id) is None
+
+
 def test_rotation_denied_at_or_after_execution_deadline(
     store: RunStore, secret_store: SecretStore, rotation_context: str
 ) -> None:
