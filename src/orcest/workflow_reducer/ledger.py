@@ -336,7 +336,18 @@ def apply(
         specification_generation=reduction.specification_generation,
         admit_base_observation_id=reduction.admit_base_observation_id,
     )
-    if reduction.prior_state == "AGGREGATING" and reduction.reason_code.startswith("CONSENSUS_"):
+    _consensus_fact_keys = (
+        "panel_round",
+        "consensus_outcome",
+        "review_receipt_ids",
+        "unresolved_finding_ids",
+        "verification_receipt_id",
+    )
+    if (
+        reduction.prior_state == "AGGREGATING"
+        and reduction.reason_code.startswith("CONSENSUS_")
+        and all(key in trigger.facts for key in _consensus_fact_keys)
+    ):
         candidate_id = trigger.fact("candidate_id", working.current_candidate_id)
         panel_round = int(trigger.fact("panel_round", 1))
         outcome = str(trigger.fact("consensus_outcome", "APPROVED"))

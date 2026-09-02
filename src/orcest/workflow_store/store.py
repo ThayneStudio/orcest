@@ -13640,6 +13640,13 @@ class RunStore:
                 raise ProtocolValidationError("APPROVE must not carry findings")
             if any(item["outcome"] != "SATISFIED" for item in assessments):
                 raise ProtocolValidationError("APPROVE requires every subject to be SATISFIED")
+        elif verdict == "BLOCK":
+            if not validated["findings"]:
+                raise ProtocolValidationError("BLOCK requires at least one finding")
+            if all(item["outcome"] == "SATISFIED" for item in assessments):
+                raise ProtocolValidationError(
+                    "BLOCK requires at least one VIOLATED or UNVERIFIABLE assessment"
+                )
         expected_outcome = "SUCCEEDED" if fills_slot else "ABSTAINED"
         if outcome != expected_outcome:
             raise ProtocolValidationError(
@@ -13719,10 +13726,7 @@ class RunStore:
         )
         if not fills_slot:
             summary = "INCONCLUSIVE"
-        elif (
-            any(item["disposition"] == "SUSTAIN" for item in dispositions)
-            or validated["new_findings"]
-        ):
+        elif any(item["disposition"] == "SUSTAIN" for item in dispositions):
             summary = "SUSTAIN"
         else:
             summary = "OVERRULE"
