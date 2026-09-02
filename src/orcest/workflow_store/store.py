@@ -11235,6 +11235,12 @@ class RunStore:
             ):
                 raise CasMismatchError("attempt capability authentication expired")
 
+            binding_ok = (
+                row["claimed_worker_id"] == worker_id
+                and row["claimed_worker_session_id"] == worker_session_id
+                and row["attempt_capability_digest"] == attempt_capability_digest
+            )
+
             accepted = self.conn.execute(
                 "SELECT result_requests.* FROM result_requests "
                 "JOIN attempt_results ON attempt_results.attempt_result_id = "
@@ -11247,7 +11253,7 @@ class RunStore:
                 "ORDER BY result_requests.created_at_ms LIMIT 1",
                 (attempt_id, activity_id, generation, res_digest),
             ).fetchone()
-            if accepted is not None:
+            if accepted is not None and binding_ok:
                 result_row = self.conn.execute(
                     "SELECT * FROM attempt_results WHERE attempt_result_id = ?",
                     (accepted["attempt_result_id"],),
@@ -11310,11 +11316,6 @@ class RunStore:
                 )
                 raise CasMismatchError(body_json)
 
-            binding_ok = (
-                row["claimed_worker_id"] == worker_id
-                and row["claimed_worker_session_id"] == worker_session_id
-                and row["attempt_capability_digest"] == attempt_capability_digest
-            )
             before_execution_deadline = now < row["execution_deadline_ms"]
             if before_execution_deadline and (row["state"] != "CLAIMED" or not binding_ok):
                 stale_reason = "TERMINAL_BEFORE_DEADLINE"

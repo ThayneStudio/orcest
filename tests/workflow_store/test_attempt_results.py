@@ -271,6 +271,36 @@ def test_identical_semantic_result_replays_under_new_key(
     assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"worker_id": "worker-2"},
+        {"worker_session_id": "77777777-7777-4777-8777-777777777777"},
+        {"attempt_capability_digest": "sha256:" + "9" * 64},
+    ],
+)
+def test_identical_semantic_result_with_mismatched_binding_is_rejected(
+    stores: tuple[RunStore, CandidateObjectStore],
+    override: dict[str, str],
+) -> None:
+    store, candidate_store = stores
+    _claimed_build_attempt(store)
+    first = _submit(store, candidate_store)
+
+    with pytest.raises(CasMismatchError):
+        _submit(store, candidate_store, **override)
+
+    assert store.conn.execute("SELECT COUNT(*) FROM result_requests").fetchone()[0] == 1
+    assert store.conn.execute("SELECT COUNT(*) FROM attempt_results").fetchone()[0] == 1
+    row = store.conn.execute(
+        "SELECT worker_id, worker_session_id, attempt_capability_digest FROM result_requests"
+    ).fetchone()
+    assert row["worker_id"] == "worker-1"
+    assert row["worker_session_id"] == WORKER_SESSION_ID
+    assert row["attempt_capability_digest"] == ATTEMPT_CAPABILITY_DIGEST
+    assert first.request.disposition == "ACCEPTED"
+
+
 def test_key_reuse_with_different_body_conflicts(
     stores: tuple[RunStore, CandidateObjectStore],
 ) -> None:
