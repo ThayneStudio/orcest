@@ -361,7 +361,14 @@ FailureClass = _register_enum(
 ResultRequestDisposition = _register_enum(
     "result_request.disposition",
     "ResultRequestDisposition",
-    ["ACCEPTED", "UPLOAD_EXPIRED", "STALE_ATTEMPT", "EXPIRED_CURRENT", "ALREADY_TERMINAL"],
+    [
+        "ACCEPTED",
+        "UPLOAD_EXPIRED",
+        "STALE_ATTEMPT",
+        "EXPIRED_CURRENT",
+        "ALREADY_TERMINAL",
+        "RESULT_ALREADY_ACCEPTED",
+    ],
 )
 ResultRequestStaleReason = _register_enum(
     "result_request.stale_reason",

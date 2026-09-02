@@ -37,6 +37,8 @@ from orcest.workflow_contract.v1.protocol import (
 )
 
 ATTEMPT_CLAIM_PROTOCOL = "orcest.attempt-claim/1"
+ATTEMPT_RESULT_PROTOCOL = "orcest.attempt-result/1"
+ATTEMPT_RESULT_ACCEPTED_PROTOCOL = "orcest.attempt-result-accepted/1"
 BUDGET_REPORT_RESULT_PROTOCOL = "orcest.budget-report-result/1"
 CAPABILITY_KEY_OPERATION_PROTOCOL = "orcest.capability-key-operation/1"
 CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL = "orcest.capability-key-operation-result/1"
@@ -57,6 +59,8 @@ WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
+    "ATTEMPT_RESULT_PROTOCOL",
+    "ATTEMPT_RESULT_ACCEPTED_PROTOCOL",
     "BUDGET_REPORT_RESULT_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_PROTOCOL",
     "CAPABILITY_KEY_OPERATION_RESULT_PROTOCOL",
