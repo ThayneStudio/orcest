@@ -386,6 +386,7 @@ def test_recovery_evidence_selected_specialized_tactics_reach_handlers(
 
 def test_recovery_evidence_enter_human_boundary_records_reason_pointer() -> None:
     view = default_view("RECOVERING", "RECOVERY_EVIDENCE")
+    boundary_id = "44444444-4444-4444-4444-444444444444"
     reduction = reduce(
         view,
         Trigger(
@@ -398,12 +399,33 @@ def test_recovery_evidence_enter_human_boundary_records_reason_pointer() -> None
                 "exhausted_autonomous": True,
                 "human_boundary_reason": "SECURITY_POLICY_BOUNDARY",
                 "selected_tactic": "ENTER_HUMAN_BOUNDARY",
+                "pending_human_boundary_id": boundary_id,
             },
         ),
     )
     assert reduction.next_state == "NEEDS_HUMAN"
     assert reduction.pointer_updates["human_boundary_reason"] == "SECURITY_POLICY_BOUNDARY"
+    assert reduction.pointer_updates["human_boundary_id"] == boundary_id
     assert reduction.pointer_updates["current_recovery_evidence_id"] == "re-boundary"
+
+
+def test_reconciliation_ownership_conflict_records_human_boundary_pointer() -> None:
+    view = default_view("PUBLISHING", "RECONCILIATION_FACT")
+    boundary_id = "44444444-4444-4444-4444-444444444444"
+    reduction = reduce(
+        view,
+        Trigger(
+            kind="RECONCILIATION_FACT",
+            trigger_id="reconcile-ownership",
+            facts={
+                "kind": "OWNERSHIP_CONFLICT",
+                "pending_human_boundary_id": boundary_id,
+            },
+        ),
+    )
+    assert reduction.next_state == "NEEDS_HUMAN"
+    assert reduction.pointer_updates["human_boundary_reason"] == "PUBLICATION_OWNERSHIP_CONFLICT"
+    assert reduction.pointer_updates["human_boundary_id"] == boundary_id
 
 
 def test_resolve_human_boundary_rejects_mismatched_boundary_id() -> None:

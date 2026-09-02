@@ -1149,7 +1149,10 @@ def _handle_reconciliation_fact(view: RunView, trigger: Trigger) -> Reduction | 
             kind=ReductionKind.ADVANCE,
             next_state="NEEDS_HUMAN",
             reason_code="OWNERSHIP_CONFLICT",
-            pointer_updates={"human_boundary_reason": "PUBLICATION_OWNERSHIP_CONFLICT"},
+            pointer_updates={
+                "human_boundary_reason": "PUBLICATION_OWNERSHIP_CONFLICT",
+                "human_boundary_id": trigger.fact("pending_human_boundary_id"),
+            },
         )
     if fact_kind in {"REDUNDANT_PUBLICATIONS_PROVEN", "NO_ACTIONABLE_DUPLICATE"}:
         return _audit(view, trigger, "RECONCILE")
