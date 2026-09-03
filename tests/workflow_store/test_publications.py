@@ -63,8 +63,10 @@ def _create_run(store: RunStore, run_id: str = RUN_ID) -> None:
     )
 
 
-def _plan_effect(store: RunStore, *, publication_id: str = PUBLICATION_ID) -> tuple:
-    return store.plan_publish_effect(
+def _plan_effect(
+    store: RunStore, *, publication_id: str = PUBLICATION_ID, **overrides: object
+) -> tuple:
+    params = dict(
         publication_id=publication_id,
         run_id=RUN_ID,
         activity_id=ACTIVITY_ID,
@@ -86,6 +88,8 @@ def _plan_effect(store: RunStore, *, publication_id: str = PUBLICATION_ID) -> tu
         idempotency_key=request_digest({"kind": "PUBLISH", "publication_id": publication_id}),
         outbox_id=OUTBOX_ID,
     )
+    params.update(overrides)
+    return store.plan_publish_effect(**params)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -171,6 +175,30 @@ def test_plan_publish_effect_replay_conflict_checks_operation_digest(store: RunS
             idempotency_key=request_digest({"kind": "PUBLISH", "publication_id": PUBLICATION_ID}),
             outbox_id=OUTBOX_ID,
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"activity_ordinal": 2},
+        {"specification_generation": 1},
+        {"policy_hash": "sha256:" + "1" * 64},
+        {"created_transition_sequence": 2},
+        {
+            "semantic_input": {"publication_id": PUBLICATION_ID, "changed": True},
+            "semantic_input_digest": request_digest(
+                {"publication_id": PUBLICATION_ID, "changed": True}
+            ),
+        },
+        {"outbox_id": "44444444-4444-4444-8444-444444444446"},
+    ],
+)
+def test_plan_publish_effect_replay_conflict_checks_activity_and_outbox_fields(
+    store: RunStore, overrides: dict[str, object]
+) -> None:
+    _plan_effect(store)
+    with pytest.raises(IdempotencyConflictError):
+        _plan_effect(store, **overrides)
 
 
 def test_plan_publish_effect_second_generation_increments(store: RunStore) -> None:
@@ -413,6 +441,37 @@ def test_one_live_advances_to_change_request_observed(store: RunStore) -> None:
     assert publication is not None
     assert publication.state == "CHANGE_REQUEST_OBSERVED"
     assert publication.change_request_external_id == "1"
+
+
+def test_conflicting_one_live_after_prior_association_raises(store: RunStore) -> None:
+    _plan_effect(store)
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=(_member(change_request_external_id="1"),),
+        fresh_exact_object_confirmed=True,
+    )
+    with pytest.raises(RunStoreError, match="different live change request association"):
+        store.record_change_request_search_result(
+            change_request_search_result_id="88888888-8888-4888-8888-888888888889",
+            forge_observation_id="99999999-9999-4999-8999-999999999998",
+            publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+            publication_id=PUBLICATION_ID,
+            effect_generation=1,
+            project_id="project-a",
+            run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+            deterministic_ref=deterministic_publication_ref(RUN_ID),
+            external_revision="search-rev-2",
+            members=(_member(change_request_external_id="2"),),
+            fresh_exact_object_confirmed=True,
+        )
 
 
 def test_change_request_search_result_replay_after_terminalization_is_idempotent(
@@ -979,6 +1038,50 @@ def test_complete_terminal_duplicate_cleanup_action_rejects_wrong_outcome(
             terminal_duplicate_cleanup_action_id=ACTION_ID,
             outcome="MARKER_DETACHED",
             forge_observation_id=FORGE_OBS_ID,
+        )
+
+
+def test_complete_terminal_duplicate_cleanup_action_replay_conflict_raises(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    members = (
+        _member(member_class="LIVE", change_request_external_id="1"),
+        _member(
+            member_class="TERMINAL",
+            change_request_external_id="9",
+            terminal_state="MERGED",
+        ),
+    )
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=members,
+        terminal_publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        terminal_duplicate_cleanup_reservation_id=RESERVATION_ID,
+    )
+    store.record_terminal_duplicate_cleanup_action(
+        terminal_duplicate_cleanup_action_id=ACTION_ID,
+        terminal_duplicate_cleanup_reservation_id=RESERVATION_ID,
+        outbox_id=ACTION_OUTBOX_ID,
+    )
+    store.complete_terminal_duplicate_cleanup_action(
+        terminal_duplicate_cleanup_action_id=ACTION_ID,
+        outcome="CLOSED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    with pytest.raises(IdempotencyConflictError):
+        store.complete_terminal_duplicate_cleanup_action(
+            terminal_duplicate_cleanup_action_id=ACTION_ID,
+            outcome="CLOSED",
+            forge_observation_id="99999999-9999-4999-8999-999999999998",
         )
 
 

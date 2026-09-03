@@ -14234,8 +14234,27 @@ class RunStore:
                 activity = _row_to_activity(existing_activity)
                 if (
                     activity.activity_id != activity_id
+                    or activity.activity_ordinal != activity_ordinal
+                    or activity.specification_generation != specification_generation
+                    or activity.policy_hash != policy_hash
                     or activity.kind != "PUBLISH"
+                    or activity.execution_class != "CONTROLLER"
+                    or activity.state != "ACTIVE"
                     or activity.candidate_id != candidate_id
+                    or activity.forge_observation_id is not None
+                    or activity.change_request_head_observation_id is not None
+                    or activity.observed_change_request_head_json is not None
+                    or activity.role is not None
+                    or activity.repair_cycle != 0
+                    or activity.recovery_cycle != 0
+                    or activity.strategy_index != 0
+                    or activity.recovery_tactic is not None
+                    or activity.recovery_evidence_id is not None
+                    or activity.rescue_epoch != 0
+                    or activity.slot is not None
+                    or activity.created_transition_sequence != created_transition_sequence
+                    or activity.semantic_input_json != semantic_input_json
+                    or activity.semantic_input_digest != semantic_input_digest
                 ):
                     raise IdempotencyConflictError(
                         "publish activity idempotency_key was reused with different content"
@@ -14243,15 +14262,21 @@ class RunStore:
                 effect_row = self.conn.execute(
                     "SELECT * FROM publication_effects WHERE activity_id = ?", (activity_id,)
                 ).fetchone()
-                publication_row = self.conn.execute(
-                    "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
-                ).fetchone()
                 outbox_row = self.conn.execute(
-                    "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                    "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' "
+                    "AND source_id = ? AND destination = ?",
+                    (activity_id, outbox_destination),
                 ).fetchone()
-                if effect_row is None or publication_row is None or outbox_row is None:
+                if effect_row is None or outbox_row is None:
                     raise RunStoreError("publish activity replay is missing its bound rows")
                 effect = _row_to_publication_effect(effect_row)
+                publication_row = self.conn.execute(
+                    "SELECT * FROM publications WHERE publication_id = ?",
+                    (effect.publication_id,),
+                ).fetchone()
+                if publication_row is None:
+                    raise RunStoreError("publish activity replay is missing its bound rows")
+                outbox = _row_to_outbox(outbox_row)
                 expected_operation_digest = publication_effect_operation_digest(
                     {
                         "publication_id": publication_id,
@@ -14268,7 +14293,39 @@ class RunStore:
                         "run_marker": run_marker,
                     }
                 )
-                if effect.operation_digest != expected_operation_digest:
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "activity_id": activity_id,
+                        "mode": "INITIAL",
+                    }
+                )
+                if (
+                    effect.publication_id != publication_id
+                    or effect.activity_id != activity_id
+                    or effect.mode != "INITIAL"
+                    or effect.candidate_id != candidate_id
+                    or effect.desired_commit_json != desired.as_json()
+                    or effect.expected_remote_commit is not None
+                    or effect.publication_secret_id != publication_secret_id
+                    or effect.publication_secret_version != publication_secret_version
+                    or effect.base_ref != base_ref
+                    or effect.base_commit_json != base.as_json()
+                    or effect.base_movement_policy != base_movement_policy
+                    or effect.operation_digest != expected_operation_digest
+                    or effect.superseded
+                    or effect.created_transition_sequence != created_transition_sequence
+                    or outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != expected_operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                    or outbox.publication_id != publication_id
+                    or outbox.effect_generation != effect.effect_generation
+                ):
                     raise IdempotencyConflictError(
                         "publish activity idempotency_key was reused with different content"
                     )
@@ -14276,7 +14333,7 @@ class RunStore:
                     _row_to_publication(publication_row),
                     effect,
                     activity,
-                    _row_to_outbox(outbox_row),
+                    outbox,
                 )
 
             existing_publication_row = self.conn.execute(
@@ -15089,6 +15146,10 @@ class RunStore:
                                 now,
                                 publication_id,
                             ),
+                        )
+                    elif publication.change_request_external_id != outcome.selected_external_id:
+                        raise RunStoreError(
+                            "publication already has a different live change request association"
                         )
                 elif outcome.outcome in ("ZERO_LIVE_CLOSED_TERMINAL", "MERGED_TERMINAL"):
                     if terminal_publication_effect_checkpoint_id is None:
@@ -15912,6 +15973,10 @@ class RunStore:
                 )
             action = _row_to_terminal_duplicate_cleanup_action(action_row)
             if action.state == "COMPLETED":
+                if action.outcome != outcome or action.forge_observation_id != forge_observation_id:
+                    raise IdempotencyConflictError(
+                        "terminal duplicate cleanup action was replayed with different content"
+                    )
                 reservation = self.get_terminal_duplicate_cleanup_reservation(
                     action.terminal_duplicate_cleanup_reservation_id
                 )
