@@ -38,6 +38,7 @@ SECRET_ID = "66666666-6666-4666-8666-666666666666"
 CHECKPOINT_ID_1 = "77777777-7777-4777-8777-777777777771"
 CHECKPOINT_ID_2 = "77777777-7777-4777-8777-777777777772"
 CHECKPOINT_ID_3 = "77777777-7777-4777-8777-777777777773"
+CHECKPOINT_ID_4 = "77777777-7777-4777-8777-777777777774"
 SEARCH_RESULT_ID = "88888888-8888-4888-8888-888888888888"
 FORGE_OBS_ID = "99999999-9999-4999-8999-999999999999"
 RESERVATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -585,6 +586,51 @@ def test_complete_publication_effect_replay_after_active_returns_checkpoint(
         observed_external_revision="a" * 40,
     )
     assert second == first
+
+
+def test_complete_publication_effect_replay_after_active_with_fresh_checkpoint_id(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=(_member(),),
+        fresh_exact_object_confirmed=True,
+    )
+    store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="BASE_READ_POST",
+        status="OBSERVED_SATISFIED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    first = store.complete_publication_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_3,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision="a" * 40,
+    )
+    second = store.complete_publication_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision="a" * 40,
+    )
+
+    assert second == first
+    checkpoints = store.list_publication_effect_checkpoints(PUBLICATION_ID, 1)
+    assert [c.suboperation_kind for c in checkpoints].count("COMPLETE") == 1
 
 
 def test_stale_complete_checkpoint_is_audit_only(store: RunStore) -> None:

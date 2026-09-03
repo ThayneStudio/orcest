@@ -14485,33 +14485,19 @@ class RunStore:
             (publication_effect_checkpoint_id,),
         ).fetchone()
         if existing is not None:
-            record = _row_to_publication_effect_checkpoint(existing)
-            expected_digest = publication_effect_checkpoint_digest(
-                {
-                    "publication_id": publication_id,
-                    "effect_generation": effect_generation,
-                    "checkpoint_sequence": record.checkpoint_sequence,
-                    "suboperation_kind": suboperation_kind,
-                    "status": status,
-                    "request_idempotency_key": request_idempotency_key,
-                    "forge_observation_id": forge_observation_id,
-                    "observed_external_revision": observed_external_revision,
-                }
-            )
-            if (
-                record.publication_id != publication_id
-                or record.effect_generation != effect_generation
-                or record.suboperation_kind != suboperation_kind
-                or record.status != status
-                or record.request_idempotency_key != request_idempotency_key
-                or record.forge_observation_id != forge_observation_id
-                or record.observed_external_revision != observed_external_revision
-                or record.checkpoint_digest != expected_digest
-            ):
-                raise IdempotencyConflictError(
+            return self._publication_effect_checkpoint_replay_record(
+                existing,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind=suboperation_kind,
+                status=status,
+                request_idempotency_key=request_idempotency_key,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=observed_external_revision,
+                conflict_message=(
                     "publication effect checkpoint id was reused with different content"
-                )
-            return record
+                ),
+            )
         if status == "REQUEST_READY":
             existing_ready = self.conn.execute(
                 "SELECT * FROM publication_effect_checkpoints "
@@ -14520,29 +14506,19 @@ class RunStore:
                 (publication_id, effect_generation, suboperation_kind),
             ).fetchone()
             if existing_ready is not None:
-                record = _row_to_publication_effect_checkpoint(existing_ready)
-                expected_digest = publication_effect_checkpoint_digest(
-                    {
-                        "publication_id": publication_id,
-                        "effect_generation": effect_generation,
-                        "checkpoint_sequence": record.checkpoint_sequence,
-                        "suboperation_kind": suboperation_kind,
-                        "status": status,
-                        "request_idempotency_key": request_idempotency_key,
-                        "forge_observation_id": forge_observation_id,
-                        "observed_external_revision": observed_external_revision,
-                    }
-                )
-                if (
-                    record.request_idempotency_key != request_idempotency_key
-                    or record.forge_observation_id != forge_observation_id
-                    or record.observed_external_revision != observed_external_revision
-                    or record.checkpoint_digest != expected_digest
-                ):
-                    raise IdempotencyConflictError(
+                return self._publication_effect_checkpoint_replay_record(
+                    existing_ready,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind=suboperation_kind,
+                    status=status,
+                    request_idempotency_key=request_idempotency_key,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    conflict_message=(
                         "publication effect request checkpoint was replayed with different content"
-                    )
-                return record
+                    ),
+                )
         next_sequence = self.conn.execute(
             "SELECT COALESCE(MAX(checkpoint_sequence), 0) + 1 FROM publication_effect_checkpoints "
             "WHERE publication_id = ? AND effect_generation = ?",
@@ -14587,6 +14563,45 @@ class RunStore:
         ).fetchone()
         assert row is not None
         return _row_to_publication_effect_checkpoint(row)
+
+    def _publication_effect_checkpoint_replay_record(
+        self,
+        row: sqlite3.Row,
+        *,
+        publication_id: str,
+        effect_generation: int,
+        suboperation_kind: str,
+        status: str,
+        request_idempotency_key: str | None,
+        forge_observation_id: str | None,
+        observed_external_revision: str | None,
+        conflict_message: str,
+    ) -> PublicationEffectCheckpointRecord:
+        record = _row_to_publication_effect_checkpoint(row)
+        expected_digest = publication_effect_checkpoint_digest(
+            {
+                "publication_id": publication_id,
+                "effect_generation": effect_generation,
+                "checkpoint_sequence": record.checkpoint_sequence,
+                "suboperation_kind": suboperation_kind,
+                "status": status,
+                "request_idempotency_key": request_idempotency_key,
+                "forge_observation_id": forge_observation_id,
+                "observed_external_revision": observed_external_revision,
+            }
+        )
+        if (
+            record.publication_id != publication_id
+            or record.effect_generation != effect_generation
+            or record.suboperation_kind != suboperation_kind
+            or record.status != status
+            or record.request_idempotency_key != request_idempotency_key
+            or record.forge_observation_id != forge_observation_id
+            or record.observed_external_revision != observed_external_revision
+            or record.checkpoint_digest != expected_digest
+        ):
+            raise IdempotencyConflictError(conflict_message)
+        return record
 
     def record_publication_effect_checkpoint(
         self,
@@ -15355,12 +15370,13 @@ class RunStore:
             if publication.state == "ACTIVE":
                 existing_checkpoint = self.conn.execute(
                     "SELECT * FROM publication_effect_checkpoints "
-                    "WHERE publication_effect_checkpoint_id = ?",
-                    (publication_effect_checkpoint_id,),
+                    "WHERE publication_id = ? AND effect_generation = ? "
+                    "AND suboperation_kind = 'COMPLETE' AND status = 'COMPLETED'",
+                    (publication_id, effect_generation),
                 ).fetchone()
                 if existing_checkpoint is not None:
-                    return self._insert_publication_effect_checkpoint_row(
-                        publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    return self._publication_effect_checkpoint_replay_record(
+                        existing_checkpoint,
                         publication_id=publication_id,
                         effect_generation=effect_generation,
                         suboperation_kind="COMPLETE",
@@ -15368,7 +15384,10 @@ class RunStore:
                         request_idempotency_key=None,
                         forge_observation_id=forge_observation_id,
                         observed_external_revision=observed_external_revision,
-                        now=now,
+                        conflict_message=(
+                            "publication effect complete checkpoint was replayed "
+                            "with different content"
+                        ),
                     )
             if publication.state != "CHANGE_REQUEST_OBSERVED":
                 raise RunStoreError(
