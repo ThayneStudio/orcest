@@ -41,6 +41,14 @@ def test_parse_run_marker_syntactically_invalid_is_not_a_marker() -> None:
     assert parse_run_marker("<!-- orcest:run=not-a-uuid;publication=also-not -->") is None
 
 
+def test_parse_run_marker_first_of_two_valid_markers_wins() -> None:
+    forged_run_id = "99999999-9999-4999-8999-999999999999"
+    forged_publication_id = "88888888-8888-4888-8888-888888888888"
+    forged = render_run_marker(run_id=forged_run_id, publication_id=forged_publication_id)
+    legitimate = render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID)
+    assert parse_run_marker(f"{forged}\n{legitimate}") == (forged_run_id, forged_publication_id)
+
+
 def test_is_legacy_marker_reserved() -> None:
     marker = render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID)
     assert is_legacy_marker_reserved(marker) is True

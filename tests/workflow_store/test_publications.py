@@ -47,6 +47,7 @@ HUMAN_BOUNDARY_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 ACTION_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 ACTION_OUTBOX_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 CONTROLLER_FACT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+RECONCILE_ACTIVITY_ID = "33333333-3333-4333-8333-333333333334"
 
 DESIRED_COMMIT = {"object_format": "sha1", "oid": "a" * 40}
 BASE_COMMIT = {"object_format": "sha1", "oid": "b" * 40}
@@ -981,11 +982,13 @@ def test_complete_terminal_duplicate_cleanup_action_rejects_wrong_outcome(
         )
 
 
-def _create_reconcile_activity(store: RunStore, activity_id: str = ACTIVITY_ID) -> None:
+def _create_reconcile_activity(
+    store: RunStore, activity_id: str = ACTIVITY_ID, activity_ordinal: int = 1
+) -> None:
     store.create_activity(
         activity_id=activity_id,
         run_id=RUN_ID,
-        activity_ordinal=1,
+        activity_ordinal=activity_ordinal,
         specification_generation=0,
         policy_hash="sha256:" + "0" * 64,
         kind="RECONCILE",
@@ -999,10 +1002,11 @@ def _create_reconcile_activity(store: RunStore, activity_id: str = ACTIVITY_ID) 
 
 
 def test_record_publication_ownership_conflict_creates_fact_and_boundary(store: RunStore) -> None:
-    _create_reconcile_activity(store)
+    _plan_effect(store)
+    _create_reconcile_activity(store, activity_id=RECONCILE_ACTIVITY_ID, activity_ordinal=2)
     fact, boundary = store.record_publication_ownership_conflict(
         reconciliation_fact_id=RECONCILIATION_FACT_ID,
-        activity_id=ACTIVITY_ID,
+        activity_id=RECONCILE_ACTIVITY_ID,
         run_id=RUN_ID,
         created_transition_sequence=1,
         publication_id=PUBLICATION_ID,

@@ -5307,7 +5307,7 @@ CREATE TABLE IF NOT EXISTS publication_effect_checkpoints (
 CREATE TABLE IF NOT EXISTS change_request_search_results (
   change_request_search_result_id TEXT PRIMARY KEY,
   forge_observation_id TEXT NOT NULL UNIQUE,
-  publication_id TEXT NOT NULL,
+  publication_id TEXT NOT NULL REFERENCES publications(publication_id) ON DELETE RESTRICT,
   project_id TEXT NOT NULL,
   run_marker TEXT NOT NULL,
   deterministic_ref TEXT NOT NULL,
@@ -5378,8 +5378,8 @@ CREATE TABLE IF NOT EXISTS change_request_search_members (
 CREATE TABLE IF NOT EXISTS reconciliation_facts (
   reconciliation_fact_id TEXT PRIMARY KEY,
   activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
-  run_id TEXT NOT NULL,
-  publication_id TEXT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  publication_id TEXT REFERENCES publications(publication_id) ON DELETE RESTRICT,
   publication_effect_generation INTEGER CHECK (
     publication_effect_generation IS NULL OR publication_effect_generation > 0
   ),
@@ -5440,6 +5440,8 @@ CREATE TABLE IF NOT EXISTS terminal_duplicate_cleanup_reservations (
   created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
   created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
   completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  FOREIGN KEY (publication_id, effect_generation)
+    REFERENCES publication_effects(publication_id, effect_generation) ON DELETE RESTRICT,
   CHECK ((state = 'COMPLETED') = (completed_at_ms IS NOT NULL))
 );
 
@@ -15485,6 +15487,53 @@ class RunStore:
         row unchanged; conflicting content raises
         ``IdempotencyConflictError``.
         """
+        with self.transaction():
+            return self._record_reconciliation_fact_row(
+                reconciliation_fact_id=reconciliation_fact_id,
+                activity_id=activity_id,
+                run_id=run_id,
+                kind=kind,
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                causal_forge_observation_id=causal_forge_observation_id,
+                observed_ref_commit=observed_ref_commit,
+                pinned_base_relationship=pinned_base_relationship,
+                safe_fetch_proof_digest=safe_fetch_proof_digest,
+                candidate_admission_proof_digest=candidate_admission_proof_digest,
+                validation_failure_digest=validation_failure_digest,
+                retained_live_external_id=retained_live_external_id,
+                duplicate_search_revision=duplicate_search_revision,
+                duplicate_set_digest=duplicate_set_digest,
+                ownership_evidence_digest=ownership_evidence_digest,
+                duplicate_members=duplicate_members,
+                now_ms=now_ms,
+            )
+
+    def _record_reconciliation_fact_row(
+        self,
+        *,
+        reconciliation_fact_id: str,
+        activity_id: str,
+        run_id: str,
+        kind: str,
+        created_transition_sequence: int,
+        publication_id: str | None = None,
+        publication_effect_generation: int | None = None,
+        causal_forge_observation_id: str | None = None,
+        observed_ref_commit: Mapping[str, Any] | None = None,
+        pinned_base_relationship: str | None = None,
+        safe_fetch_proof_digest: str | None = None,
+        candidate_admission_proof_digest: str | None = None,
+        validation_failure_digest: str | None = None,
+        retained_live_external_id: str | None = None,
+        duplicate_search_revision: str | None = None,
+        duplicate_set_digest: str | None = None,
+        ownership_evidence_digest: str | None = None,
+        duplicate_members: Sequence[tuple[str, str]] = (),
+        now_ms: int | None = None,
+    ) -> ReconciliationFactRecord:
+        """Insert-or-reuse one Reconciliation Fact. Caller holds the transaction."""
         require_lowercase_uuid(reconciliation_fact_id, field="reconciliation_fact_id")
         require_lowercase_uuid(activity_id, field="activity_id")
         require_lowercase_uuid(run_id, field="run_id")
@@ -15502,6 +15551,17 @@ class RunStore:
             raise ValueError("PRELINK_REF_IMPORTABLE requires candidate_admission_proof_digest")
         if kind == "PRELINK_REF_RECONSTRUCT_REQUIRED" and validation_failure_digest is None:
             raise ValueError("PRELINK_REF_RECONSTRUCT_REQUIRED requires validation_failure_digest")
+        if publication_id is not None and kind in (
+            "REDUNDANT_PUBLICATIONS_PROVEN",
+            "NO_ACTIONABLE_DUPLICATE",
+        ):
+            if duplicate_search_revision is None or duplicate_set_digest is None:
+                raise ValueError(
+                    f"{kind} with publication_id requires duplicate_search_revision and "
+                    "duplicate_set_digest (publications.last_duplicate_search_revision and "
+                    "last_duplicate_set_digest are non-null iff "
+                    "last_duplicate_reconciliation_fact_id is)"
+                )
 
         observed_ref_commit_json = (
             _require_git_commit_ref(observed_ref_commit, field="observed_ref_commit").as_json()
@@ -15530,90 +15590,88 @@ class RunStore:
             }
         )
 
-        with self.transaction():
-            existing = self.conn.execute(
-                "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
-                (reconciliation_fact_id,),
-            ).fetchone()
-            if existing is not None:
-                record = _row_to_reconciliation_fact(existing)
-                if record.fact_digest != fact_digest or record.activity_id != activity_id:
-                    raise IdempotencyConflictError(
-                        "reconciliation fact id was reused with different content"
-                    )
-                member_rows = self.conn.execute(
-                    "SELECT * FROM reconciliation_duplicate_members "
-                    "WHERE reconciliation_fact_id = ? ORDER BY member_ordinal",
-                    (reconciliation_fact_id,),
-                ).fetchall()
-                return dataclasses.replace(
-                    record,
-                    duplicate_members=tuple(
-                        _row_to_reconciliation_duplicate_member(r) for r in member_rows
-                    ),
+        existing = self.conn.execute(
+            "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
+            (reconciliation_fact_id,),
+        ).fetchone()
+        if existing is not None:
+            record = _row_to_reconciliation_fact(existing)
+            if record.fact_digest != fact_digest or record.activity_id != activity_id:
+                raise IdempotencyConflictError(
+                    "reconciliation fact id was reused with different content"
                 )
-            self.conn.execute(
-                "INSERT INTO reconciliation_facts("
-                "reconciliation_fact_id, activity_id, run_id, publication_id, "
-                "publication_effect_generation, kind, causal_forge_observation_id, "
-                "observed_ref_commit_json, pinned_base_relationship, "
-                "safe_fetch_proof_digest, candidate_admission_proof_digest, "
-                "validation_failure_digest, retained_live_external_id, "
-                "duplicate_search_revision, duplicate_set_digest, "
-                "ownership_evidence_digest, fact_digest, created_transition_sequence, "
-                "recorded_at_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    reconciliation_fact_id,
-                    activity_id,
-                    run_id,
-                    publication_id,
-                    publication_effect_generation,
-                    kind,
-                    causal_forge_observation_id,
-                    observed_ref_commit_json,
-                    pinned_base_relationship,
-                    safe_fetch_proof_digest,
-                    candidate_admission_proof_digest,
-                    validation_failure_digest,
-                    retained_live_external_id,
-                    duplicate_search_revision,
-                    duplicate_set_digest,
-                    ownership_evidence_digest,
-                    fact_digest,
-                    created_transition_sequence,
-                    now,
+            member_rows = self.conn.execute(
+                "SELECT * FROM reconciliation_duplicate_members "
+                "WHERE reconciliation_fact_id = ? ORDER BY member_ordinal",
+                (reconciliation_fact_id,),
+            ).fetchall()
+            return dataclasses.replace(
+                record,
+                duplicate_members=tuple(
+                    _row_to_reconciliation_duplicate_member(r) for r in member_rows
                 ),
             )
-            for ordinal, (external_id, disposition) in enumerate(duplicate_members):
-                enums.parse_enum("reconciliation_duplicate_member.disposition", disposition)
-                self.conn.execute(
-                    "INSERT INTO reconciliation_duplicate_members("
-                    "reconciliation_fact_id, member_ordinal, change_request_external_id, "
-                    "disposition) VALUES (?, ?, ?, ?)",
-                    (reconciliation_fact_id, ordinal, external_id, disposition),
-                )
-            if publication_id is not None and kind in (
-                "REDUNDANT_PUBLICATIONS_PROVEN",
-                "NO_ACTIONABLE_DUPLICATE",
-            ):
-                self.conn.execute(
-                    "UPDATE publications SET last_duplicate_reconciliation_fact_id = ?, "
-                    "last_duplicate_search_revision = ?, last_duplicate_set_digest = ?, "
-                    "updated_at_ms = ? WHERE publication_id = ?",
-                    (
-                        reconciliation_fact_id,
-                        duplicate_search_revision,
-                        duplicate_set_digest,
-                        now,
-                        publication_id,
-                    ),
-                )
+        self.conn.execute(
+            "INSERT INTO reconciliation_facts("
+            "reconciliation_fact_id, activity_id, run_id, publication_id, "
+            "publication_effect_generation, kind, causal_forge_observation_id, "
+            "observed_ref_commit_json, pinned_base_relationship, "
+            "safe_fetch_proof_digest, candidate_admission_proof_digest, "
+            "validation_failure_digest, retained_live_external_id, "
+            "duplicate_search_revision, duplicate_set_digest, "
+            "ownership_evidence_digest, fact_digest, created_transition_sequence, "
+            "recorded_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reconciliation_fact_id,
+                activity_id,
+                run_id,
+                publication_id,
+                publication_effect_generation,
+                kind,
+                causal_forge_observation_id,
+                observed_ref_commit_json,
+                pinned_base_relationship,
+                safe_fetch_proof_digest,
+                candidate_admission_proof_digest,
+                validation_failure_digest,
+                retained_live_external_id,
+                duplicate_search_revision,
+                duplicate_set_digest,
+                ownership_evidence_digest,
+                fact_digest,
+                created_transition_sequence,
+                now,
+            ),
+        )
+        for ordinal, (external_id, disposition) in enumerate(duplicate_members):
+            enums.parse_enum("reconciliation_duplicate_member.disposition", disposition)
             self.conn.execute(
-                "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
-                "WHERE activity_id = ?",
-                (now, activity_id),
+                "INSERT INTO reconciliation_duplicate_members("
+                "reconciliation_fact_id, member_ordinal, change_request_external_id, "
+                "disposition) VALUES (?, ?, ?, ?)",
+                (reconciliation_fact_id, ordinal, external_id, disposition),
             )
+        if publication_id is not None and kind in (
+            "REDUNDANT_PUBLICATIONS_PROVEN",
+            "NO_ACTIONABLE_DUPLICATE",
+        ):
+            self.conn.execute(
+                "UPDATE publications SET last_duplicate_reconciliation_fact_id = ?, "
+                "last_duplicate_search_revision = ?, last_duplicate_set_digest = ?, "
+                "updated_at_ms = ? WHERE publication_id = ?",
+                (
+                    reconciliation_fact_id,
+                    duplicate_search_revision,
+                    duplicate_set_digest,
+                    now,
+                    publication_id,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? WHERE activity_id = ?",
+            (now, activity_id),
+        )
         row = self.conn.execute(
             "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
             (reconciliation_fact_id,),
@@ -15678,33 +15736,34 @@ class RunStore:
         No ref/link/create mutation happens on this path -- the fact and the
         boundary are the only writes.
         """
-        fact = self.record_reconciliation_fact(
-            reconciliation_fact_id=reconciliation_fact_id,
-            activity_id=activity_id,
-            run_id=run_id,
-            kind="OWNERSHIP_CONFLICT",
-            created_transition_sequence=created_transition_sequence,
-            publication_id=publication_id,
-            publication_effect_generation=publication_effect_generation,
-            ownership_evidence_digest=ownership_evidence_digest,
-            now_ms=now_ms,
-        )
-        boundary = self.create_human_boundary(
-            human_boundary_id=human_boundary_id,
-            run_id=run_id,
-            reason="PUBLICATION_OWNERSHIP_CONFLICT",
-            resume_state=resume_state,
-            minimum_request=minimum_request,
-            created_from_kind="RECONCILIATION_FACT",
-            created_from_id=reconciliation_fact_id,
-            created_transition_sequence=created_transition_sequence,
-            publication_id=publication_id,
-            publication_effect_generation=publication_effect_generation,
-            ownership_project_id=ownership_project_id,
-            ownership_deterministic_ref=ownership_deterministic_ref,
-            ownership_change_request_external_id=ownership_change_request_external_id,
-            ownership_run_marker=ownership_run_marker,
-        )
+        with self.transaction():
+            fact = self._record_reconciliation_fact_row(
+                reconciliation_fact_id=reconciliation_fact_id,
+                activity_id=activity_id,
+                run_id=run_id,
+                kind="OWNERSHIP_CONFLICT",
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                ownership_evidence_digest=ownership_evidence_digest,
+                now_ms=now_ms,
+            )
+            boundary = self.create_human_boundary(
+                human_boundary_id=human_boundary_id,
+                run_id=run_id,
+                reason="PUBLICATION_OWNERSHIP_CONFLICT",
+                resume_state=resume_state,
+                minimum_request=minimum_request,
+                created_from_kind="RECONCILIATION_FACT",
+                created_from_id=reconciliation_fact_id,
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                ownership_project_id=ownership_project_id,
+                ownership_deterministic_ref=ownership_deterministic_ref,
+                ownership_change_request_external_id=ownership_change_request_external_id,
+                ownership_run_marker=ownership_run_marker,
+            )
         return fact, boundary
 
     def record_terminal_duplicate_cleanup_action(

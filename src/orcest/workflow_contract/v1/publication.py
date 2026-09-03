@@ -73,6 +73,14 @@ def parse_run_marker(body_text: str) -> tuple[str, str] | None:
     valid marker is present. A syntactically invalid/partial marker-like
     string is not a marker (forge-integration.md:398-405) -- callers must
     not infer ownership from it.
+
+    When ``body_text`` contains more than one syntactically valid marker
+    (e.g. a forged marker prepended ahead of the legitimate one), this is
+    an intentional first-match-wins choice, not incidental regex behavior:
+    a second marker never displaces the first found. It is not this
+    function's sole defense against a forged/duplicated marker -- that is
+    ``classify_member_ownership``'s other bindings (ref/desired-commit/head
+    evidence), which independently corroborate ownership.
     """
     match = _MARKER_RE.search(body_text)
     if match is None:
