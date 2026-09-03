@@ -144,6 +144,33 @@ def test_plan_publish_effect_replay_conflict_raises(store: RunStore) -> None:
         )
 
 
+def test_plan_publish_effect_replay_conflict_checks_operation_digest(store: RunStore) -> None:
+    _plan_effect(store)
+    with pytest.raises(IdempotencyConflictError):
+        store.plan_publish_effect(
+            publication_id=PUBLICATION_ID,
+            run_id=RUN_ID,
+            activity_id=ACTIVITY_ID,
+            activity_ordinal=1,
+            specification_generation=0,
+            policy_hash="sha256:" + "0" * 64,
+            created_transition_sequence=1,
+            candidate_id=CANDIDATE_ID,
+            desired_commit={"object_format": "sha1", "oid": "c" * 40},
+            publication_secret_id=SECRET_ID,
+            publication_secret_version=1,
+            base_ref="refs/heads/main",
+            base_commit=BASE_COMMIT,
+            base_movement_policy="REBASE_BEFORE_PUBLICATION",
+            deterministic_branch=deterministic_publication_ref(RUN_ID),
+            run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+            semantic_input={"publication_id": PUBLICATION_ID},
+            semantic_input_digest=request_digest({"publication_id": PUBLICATION_ID}),
+            idempotency_key=request_digest({"kind": "PUBLISH", "publication_id": PUBLICATION_ID}),
+            outbox_id=OUTBOX_ID,
+        )
+
+
 def test_plan_publish_effect_second_generation_increments(store: RunStore) -> None:
     _plan_effect(store)
     publication2, effect2, _activity2, _outbox2 = store.plan_publish_effect(
@@ -210,6 +237,60 @@ def test_checkpoint_sequence_strictly_increases_and_resumes(store: RunStore) -> 
     checkpoints = store.list_publication_effect_checkpoints(PUBLICATION_ID, 1)
     assert [c.checkpoint_sequence for c in checkpoints] == [1, 2]
     assert [c.suboperation_kind for c in checkpoints] == ["BASE_READ_PRE", "REF_READ"]
+
+
+def test_checkpoint_replay_returns_existing_row(store: RunStore) -> None:
+    _plan_effect(store)
+    first = store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="BASE_READ_PRE",
+        status="OBSERVED_SATISFIED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    second = store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="BASE_READ_PRE",
+        status="OBSERVED_SATISFIED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    assert second == first
+    assert len(store.list_publication_effect_checkpoints(PUBLICATION_ID, 1)) == 1
+
+
+def test_request_ready_checkpoint_replay_with_fresh_id_reuses_existing_row(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    first = store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="REF_CREATE",
+        status="REQUEST_READY",
+        request_idempotency_key="ref-create-1",
+    )
+    second = store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="REF_CREATE",
+        status="REQUEST_READY",
+        request_idempotency_key="ref-create-1",
+    )
+    assert second == first
+    with pytest.raises(IdempotencyConflictError):
+        store.record_publication_effect_checkpoint(
+            publication_effect_checkpoint_id=CHECKPOINT_ID_3,
+            publication_id=PUBLICATION_ID,
+            effect_generation=1,
+            suboperation_kind="REF_CREATE",
+            status="REQUEST_READY",
+            request_idempotency_key="ref-create-2",
+        )
 
 
 def test_checkpoint_matrix_rejects_missing_request_key(store: RunStore) -> None:
@@ -332,6 +413,75 @@ def test_one_live_advances_to_change_request_observed(store: RunStore) -> None:
     assert publication.change_request_external_id == "1"
 
 
+def test_change_request_search_result_replay_after_terminalization_is_idempotent(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    members = (
+        _member(
+            member_class="TERMINAL",
+            change_request_external_id="5",
+            terminal_state="CLOSED",
+        ),
+    )
+    first = store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=members,
+        terminal_publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+    )
+    second = store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=members,
+        terminal_publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+    )
+    assert second == first
+
+
+def test_change_request_search_result_replay_conflict_raises(store: RunStore) -> None:
+    _plan_effect(store)
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=(),
+    )
+    with pytest.raises(IdempotencyConflictError):
+        store.record_change_request_search_result(
+            change_request_search_result_id=SEARCH_RESULT_ID,
+            forge_observation_id=FORGE_OBS_ID,
+            publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+            publication_id=PUBLICATION_ID,
+            effect_generation=1,
+            project_id="project-a",
+            run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+            deterministic_ref=deterministic_publication_ref(RUN_ID),
+            external_revision="search-rev-2",
+            members=(),
+        )
+
+
 def test_complete_publication_effect_requires_base_read_post(store: RunStore) -> None:
     _plan_effect(store)
     store.record_change_request_search_result(
@@ -393,6 +543,86 @@ def test_complete_publication_effect_sets_active(store: RunStore) -> None:
     checkpoints = store.list_publication_effect_checkpoints(PUBLICATION_ID, 1)
     assert checkpoints[-1].suboperation_kind == "COMPLETE"
     assert checkpoints[-1].status == "COMPLETED"
+
+
+def test_complete_publication_effect_replay_after_active_returns_checkpoint(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=(_member(),),
+        fresh_exact_object_confirmed=True,
+    )
+    store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        suboperation_kind="BASE_READ_POST",
+        status="OBSERVED_SATISFIED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    first = store.complete_publication_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_3,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision="a" * 40,
+    )
+    second = store.complete_publication_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_3,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision="a" * 40,
+    )
+    assert second == first
+
+
+def test_stale_complete_checkpoint_is_audit_only(store: RunStore) -> None:
+    _plan_effect(store)
+    store.plan_publish_effect(
+        publication_id=PUBLICATION_ID,
+        run_id=RUN_ID,
+        activity_id="33333333-3333-4333-8333-333333333334",
+        activity_ordinal=2,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=2,
+        candidate_id=CANDIDATE_ID,
+        desired_commit={"object_format": "sha1", "oid": "c" * 40},
+        publication_secret_id=SECRET_ID,
+        publication_secret_version=1,
+        base_ref="refs/heads/main",
+        base_commit=BASE_COMMIT,
+        base_movement_policy="REBASE_BEFORE_PUBLICATION",
+        deterministic_branch=deterministic_publication_ref(RUN_ID),
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        semantic_input={"publication_id": PUBLICATION_ID, "gen": 2},
+        semantic_input_digest=request_digest({"publication_id": PUBLICATION_ID, "gen": 2}),
+        idempotency_key=request_digest({"kind": "PUBLISH", "gen": 2}),
+        outbox_id="44444444-4444-4444-8444-444444444445",
+    )
+    checkpoint = store.complete_publication_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision="a" * 40,
+    )
+    assert checkpoint.effect_generation == 1
+    publication = store.get_publication(PUBLICATION_ID)
+    assert publication is not None
+    assert publication.effect_generation == 2
+    assert publication.state == "PLANNED"
 
 
 def test_multiple_live_selects_bytewise_lowest_and_does_not_link(store: RunStore) -> None:
@@ -550,6 +780,50 @@ def test_merged_terminal_closes_publication_and_creates_reservation(store: RunSt
     planned = {m.change_request_external_id: m.planned_action for m in reservation.members}
     assert planned["1"] == "CLOSE"  # POSITIVE + canonical-empty external reliance
     assert planned["2"] == "RECORD_ONLY"  # INCOMPATIBLE
+
+
+def test_merged_terminal_replaces_prior_one_live_association(store: RunStore) -> None:
+    _plan_effect(store)
+    store.record_change_request_search_result(
+        change_request_search_result_id=SEARCH_RESULT_ID,
+        forge_observation_id=FORGE_OBS_ID,
+        publication_effect_checkpoint_id=CHECKPOINT_ID_1,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-1",
+        members=(_member(change_request_external_id="1"),),
+        fresh_exact_object_confirmed=True,
+    )
+    store.record_change_request_search_result(
+        change_request_search_result_id="88888888-8888-4888-8888-888888888889",
+        forge_observation_id="99999999-9999-4999-8999-999999999998",
+        publication_effect_checkpoint_id=CHECKPOINT_ID_2,
+        publication_id=PUBLICATION_ID,
+        effect_generation=1,
+        project_id="project-a",
+        run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
+        external_revision="search-rev-2",
+        members=(
+            _member(member_class="LIVE", change_request_external_id="1"),
+            _member(
+                member_class="TERMINAL",
+                change_request_external_id="9",
+                terminal_state="MERGED",
+                merge_commit=DESIRED_COMMIT,
+            ),
+        ),
+        terminal_publication_effect_checkpoint_id=CHECKPOINT_ID_3,
+        terminal_duplicate_cleanup_reservation_id=RESERVATION_ID,
+    )
+    publication = store.get_publication(PUBLICATION_ID)
+    assert publication is not None
+    assert publication.state == "CLOSED"
+    assert publication.change_request_external_id == "9"
+    assert publication.initial_link_retained_external_id == "9"
 
 
 def test_terminal_duplicate_cleanup_action_processes_one_member_at_a_time(
@@ -818,4 +1092,42 @@ def test_legacy_exclusion_false_for_unknown_ref(store: RunStore) -> None:
     _plan_effect(store)
     assert not store.is_change_request_excluded_from_legacy_engine(
         deterministic_ref="refs/heads/orcest/run/unrelated"
+    )
+
+
+def test_legacy_exclusion_aggregates_all_matching_publications(store: RunStore) -> None:
+    _plan_effect(store)
+    store.conn.execute(
+        "UPDATE runs SET state = 'CLOSED', terminal_outcome = 'CLOSED' WHERE run_id = ?",
+        (RUN_ID,),
+    )
+    second_run_id = "11111111-1111-4111-8111-111111111112"
+    second_publication_id = "22222222-2222-4222-8222-222222222223"
+    _create_run(store, run_id=second_run_id)
+    store.plan_publish_effect(
+        publication_id=second_publication_id,
+        run_id=second_run_id,
+        activity_id="33333333-3333-4333-8333-333333333334",
+        activity_ordinal=1,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=1,
+        candidate_id=CANDIDATE_ID,
+        desired_commit=DESIRED_COMMIT,
+        publication_secret_id=SECRET_ID,
+        publication_secret_version=1,
+        base_ref="refs/heads/main",
+        base_commit=BASE_COMMIT,
+        base_movement_policy="REBASE_BEFORE_PUBLICATION",
+        deterministic_branch=deterministic_publication_ref(RUN_ID),
+        run_marker=render_run_marker(run_id=second_run_id, publication_id=second_publication_id),
+        semantic_input={"publication_id": second_publication_id},
+        semantic_input_digest=request_digest({"publication_id": second_publication_id}),
+        idempotency_key=request_digest(
+            {"kind": "PUBLISH", "publication_id": second_publication_id}
+        ),
+        outbox_id="44444444-4444-4444-8444-444444444445",
+    )
+    assert store.is_change_request_excluded_from_legacy_engine(
+        deterministic_ref=deterministic_publication_ref(RUN_ID)
     )

@@ -14249,9 +14249,30 @@ class RunStore:
                 ).fetchone()
                 if effect_row is None or publication_row is None or outbox_row is None:
                     raise RunStoreError("publish activity replay is missing its bound rows")
+                effect = _row_to_publication_effect(effect_row)
+                expected_operation_digest = publication_effect_operation_digest(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "mode": "INITIAL",
+                        "candidate_id": candidate_id,
+                        "desired_commit": desired.as_json(),
+                        "publication_secret_id": publication_secret_id,
+                        "publication_secret_version": publication_secret_version,
+                        "base_ref": base_ref,
+                        "base_commit": base.as_json(),
+                        "base_movement_policy": base_movement_policy,
+                        "deterministic_branch": deterministic_branch,
+                        "run_marker": run_marker,
+                    }
+                )
+                if effect.operation_digest != expected_operation_digest:
+                    raise IdempotencyConflictError(
+                        "publish activity idempotency_key was reused with different content"
+                    )
                 return (
                     _row_to_publication(publication_row),
-                    _row_to_publication_effect(effect_row),
+                    effect,
                     activity,
                     _row_to_outbox(outbox_row),
                 )
@@ -14458,6 +14479,71 @@ class RunStore:
             request_idempotency_key=request_idempotency_key,
             forge_observation_id=forge_observation_id,
         )
+        existing = self.conn.execute(
+            "SELECT * FROM publication_effect_checkpoints "
+            "WHERE publication_effect_checkpoint_id = ?",
+            (publication_effect_checkpoint_id,),
+        ).fetchone()
+        if existing is not None:
+            record = _row_to_publication_effect_checkpoint(existing)
+            expected_digest = publication_effect_checkpoint_digest(
+                {
+                    "publication_id": publication_id,
+                    "effect_generation": effect_generation,
+                    "checkpoint_sequence": record.checkpoint_sequence,
+                    "suboperation_kind": suboperation_kind,
+                    "status": status,
+                    "request_idempotency_key": request_idempotency_key,
+                    "forge_observation_id": forge_observation_id,
+                    "observed_external_revision": observed_external_revision,
+                }
+            )
+            if (
+                record.publication_id != publication_id
+                or record.effect_generation != effect_generation
+                or record.suboperation_kind != suboperation_kind
+                or record.status != status
+                or record.request_idempotency_key != request_idempotency_key
+                or record.forge_observation_id != forge_observation_id
+                or record.observed_external_revision != observed_external_revision
+                or record.checkpoint_digest != expected_digest
+            ):
+                raise IdempotencyConflictError(
+                    "publication effect checkpoint id was reused with different content"
+                )
+            return record
+        if status == "REQUEST_READY":
+            existing_ready = self.conn.execute(
+                "SELECT * FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND suboperation_kind = ? AND status = 'REQUEST_READY'",
+                (publication_id, effect_generation, suboperation_kind),
+            ).fetchone()
+            if existing_ready is not None:
+                record = _row_to_publication_effect_checkpoint(existing_ready)
+                expected_digest = publication_effect_checkpoint_digest(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect_generation,
+                        "checkpoint_sequence": record.checkpoint_sequence,
+                        "suboperation_kind": suboperation_kind,
+                        "status": status,
+                        "request_idempotency_key": request_idempotency_key,
+                        "forge_observation_id": forge_observation_id,
+                        "observed_external_revision": observed_external_revision,
+                    }
+                )
+                if (
+                    record.request_idempotency_key != request_idempotency_key
+                    or record.forge_observation_id != forge_observation_id
+                    or record.observed_external_revision != observed_external_revision
+                    or record.checkpoint_digest != expected_digest
+                ):
+                    raise IdempotencyConflictError(
+                        "publication effect request checkpoint was replayed with "
+                        "different content"
+                    )
+                return record
         next_sequence = self.conn.execute(
             "SELECT COALESCE(MAX(checkpoint_sequence), 0) + 1 FROM publication_effect_checkpoints "
             "WHERE publication_id = ? AND effect_generation = ?",
@@ -14820,6 +14906,96 @@ class RunStore:
             publication = _row_to_publication(publication_row)
             is_current = effect_generation == publication.effect_generation
 
+            existing_result = self.conn.execute(
+                "SELECT * FROM change_request_search_results "
+                "WHERE change_request_search_result_id = ? OR forge_observation_id = ?",
+                (change_request_search_result_id, forge_observation_id),
+            ).fetchone()
+            if existing_result is not None:
+                if (
+                    existing_result["change_request_search_result_id"]
+                    != change_request_search_result_id
+                    or existing_result["forge_observation_id"] != forge_observation_id
+                    or existing_result["publication_id"] != publication_id
+                    or existing_result["project_id"] != project_id
+                    or existing_result["run_marker"] != run_marker
+                    or existing_result["deterministic_ref"] != deterministic_ref
+                    or existing_result["external_revision"] != external_revision
+                    or existing_result["live_cardinality"] != live_cardinality
+                    or existing_result["duplicate_set_digest"] != duplicate_set_digest
+                    or existing_result["publication_effect_generation"] != effect_generation
+                ):
+                    raise IdempotencyConflictError(
+                        "change request search result id was reused with different content"
+                    )
+                existing_member_rows = self.conn.execute(
+                    "SELECT * FROM change_request_search_members "
+                    "WHERE change_request_search_result_id = ? "
+                    "ORDER BY member_class, member_ordinal",
+                    (change_request_search_result_id,),
+                ).fetchall()
+                if len(existing_member_rows) != len(rows_to_insert):
+                    raise IdempotencyConflictError(
+                        "change request search result id was reused with different members"
+                    )
+                member_fields = (
+                    "member_class",
+                    "member_ordinal",
+                    "change_request_external_id",
+                    "observed_head_json",
+                    "terminal_state",
+                    "merge_commit_json",
+                    "source_ref",
+                    "run_marker",
+                    "observed_body_revision",
+                    "marker_set_digest",
+                    "ownership_status",
+                    "proof_kind",
+                    "proof_publication_effect_generation",
+                    "proof_create_checkpoint_id",
+                    "proof_create_request_idempotency_key",
+                    "creator_installation_or_account_ref",
+                    "proof_deterministic_ref",
+                    "proof_run_marker",
+                    "proof_desired_commit_json",
+                    "proof_observed_head_json",
+                    "head_evidence_observation_id",
+                    "ownership_defect_codes_json",
+                    "ownership_proof_digest",
+                    "external_reliance_digest",
+                    "member_digest",
+                )
+                for existing_member, expected_member in zip(
+                    existing_member_rows, rows_to_insert, strict=True
+                ):
+                    if tuple(existing_member[field] for field in member_fields) != expected_member:
+                        raise IdempotencyConflictError(
+                            "change request search result id was reused with different members"
+                        )
+                record = ChangeRequestSearchResultRecord(
+                    **{
+                        k: existing_result[k]
+                        for k in (
+                            "change_request_search_result_id",
+                            "forge_observation_id",
+                            "publication_id",
+                            "project_id",
+                            "run_marker",
+                            "deterministic_ref",
+                            "external_revision",
+                            "live_cardinality",
+                            "duplicate_set_digest",
+                            "created_at_ms",
+                            "publication_effect_generation",
+                        )
+                    },
+                    members=tuple(
+                        _row_to_change_request_search_member(row)
+                        for row in existing_member_rows
+                    ),
+                )
+                return record, outcome
+
             self.conn.execute(
                 "INSERT INTO change_request_search_results("
                 "change_request_search_result_id, forge_observation_id, publication_id, "
@@ -14921,11 +15097,7 @@ class RunStore:
                         observed_external_revision=external_revision,
                         now=now,
                     )
-                    change_request_external_id = (
-                        outcome.selected_external_id
-                        if publication.change_request_external_id is None
-                        else publication.change_request_external_id
-                    )
+                    change_request_external_id = outcome.selected_external_id
                     self.conn.execute(
                         "UPDATE publications SET state = 'CLOSED', "
                         "change_request_external_id = ?, "
@@ -15154,16 +15326,52 @@ class RunStore:
         require_lowercase_uuid(publication_id, field="publication_id")
         now = _now_ms() if now_ms is None else now_ms
         with self.transaction():
+            effect_row = self.conn.execute(
+                "SELECT 1 FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if effect_row is None:
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) was not found"
+                )
             publication_row = self.conn.execute(
                 "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
             ).fetchone()
             if publication_row is None:
                 raise RunStoreError(f"publication {publication_id!r} was not found")
             publication = _row_to_publication(publication_row)
-            if effect_generation != publication.effect_generation:
-                raise CasMismatchError(
-                    "cannot complete a Publication Effect that is not the current generation"
+            is_current = effect_generation == publication.effect_generation
+            if not is_current:
+                return self._insert_publication_effect_checkpoint_row(
+                    publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    now=now,
                 )
+            if publication.state == "ACTIVE":
+                existing_checkpoint = self.conn.execute(
+                    "SELECT * FROM publication_effect_checkpoints "
+                    "WHERE publication_effect_checkpoint_id = ?",
+                    (publication_effect_checkpoint_id,),
+                ).fetchone()
+                if existing_checkpoint is not None:
+                    return self._insert_publication_effect_checkpoint_row(
+                        publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                        publication_id=publication_id,
+                        effect_generation=effect_generation,
+                        suboperation_kind="COMPLETE",
+                        status="COMPLETED",
+                        request_idempotency_key=None,
+                        forge_observation_id=forge_observation_id,
+                        observed_external_revision=observed_external_revision,
+                        now=now,
+                    )
             if publication.state != "CHANGE_REQUEST_OBSERVED":
                 raise RunStoreError(
                     f"publication {publication_id!r} is {publication.state!r}, "
@@ -15840,22 +16048,20 @@ class RunStore:
         if deterministic_ref is not None:
             conditions.append("p.deterministic_branch = ?")
             params.append(deterministic_ref)
-        row = self.conn.execute(
-            "SELECT runs.state AS run_state, p.terminal_duplicate_cleanup_reservation_id, "
-            "r.state AS reservation_state "
+        rows = self.conn.execute(
+            "SELECT runs.state AS run_state, r.state AS reservation_state "
             "FROM publications p "
             "JOIN runs ON runs.run_id = p.run_id "
             "LEFT JOIN terminal_duplicate_cleanup_reservations r "
             "ON r.terminal_duplicate_cleanup_reservation_id = "
             "p.terminal_duplicate_cleanup_reservation_id "
-            f"WHERE ({' OR '.join(conditions)}) LIMIT 1",
+            f"WHERE ({' OR '.join(conditions)})",
             tuple(params),
-        ).fetchone()
-        if row is None:
-            return False
-        if not is_terminal_state(row["run_state"]):
-            return True
-        return row["reservation_state"] == "ACTIVE"
+        ).fetchall()
+        return any(
+            (not is_terminal_state(row["run_state"])) or row["reservation_state"] == "ACTIVE"
+            for row in rows
+        )
 
     def get_candidate(self, candidate_id: str) -> CandidateRecord | None:
         require_lowercase_uuid(candidate_id, field="candidate_id")
