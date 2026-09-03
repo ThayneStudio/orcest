@@ -14540,8 +14540,7 @@ class RunStore:
                     or record.checkpoint_digest != expected_digest
                 ):
                     raise IdempotencyConflictError(
-                        "publication effect request checkpoint was replayed with "
-                        "different content"
+                        "publication effect request checkpoint was replayed with different content"
                     )
                 return record
         next_sequence = self.conn.execute(
@@ -14990,8 +14989,7 @@ class RunStore:
                         )
                     },
                     members=tuple(
-                        _row_to_change_request_search_member(row)
-                        for row in existing_member_rows
+                        _row_to_change_request_search_member(row) for row in existing_member_rows
                     ),
                 )
                 return record, outcome
