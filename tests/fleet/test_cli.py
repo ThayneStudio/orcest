@@ -103,6 +103,7 @@ def _no_pending_workers_by_default(mocker, tmp_path):
         str(tmp_path / "fleet-operation.lock"),
     )
     mocker.patch("orcest.fleet.orchestrator.get_workers_with_pending_tasks", return_value=set())
+    mocker.patch("orcest.fleet.orchestrator.get_worker_heartbeat_details", return_value={})
     mocker.patch("orcest.fleet.orchestrator.set_workers_draining")
     mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_backend", return_value=None)
     mocker.patch("orcest.fleet.orchestrator.get_deployed_pool_vmid_range", return_value=None)
