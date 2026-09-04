@@ -138,6 +138,19 @@ _DEFAULT_DISCOVERY_INTERVAL_MS = 300_000
 _NON_MAINTENANCE_CONTROLLER_MODES = frozenset(
     {"RUNNING", "INTAKE_PAUSED", "DISPATCH_PAUSED", "DRAINING"}
 )
+# domain-model.md 777: the closed set of Activity kinds that may carry a
+# change_request_head_observation_id/observed_change_request_head SHA fence.
+CHANGE_REQUEST_HEAD_FENCED_ACTIVITY_KINDS = frozenset(
+    {
+        "IMPORT",
+        "PUBLISH",
+        "PR_REMEDIATE",
+        "REBASE",
+        "CLOSE_PUBLICATION",
+        "CLOSE_REDUNDANT_PUBLICATION",
+        "REPAIR_RUN_MARKER",
+    }
+)
 
 _FORBIDDEN_STATE_FS = {
     "9p",
@@ -13239,6 +13252,8 @@ class RunStore:
         idempotency_key: str,
         candidate_id: str | None = None,
         forge_observation_id: str | None = None,
+        change_request_head_observation_id: str | None = None,
+        observed_change_request_head: Mapping[str, Any] | None = None,
         role: str | None = None,
         repair_cycle: int = 0,
         recovery_cycle: int = 0,
@@ -13262,12 +13277,36 @@ class RunStore:
         ``(run_id, idempotency_key)`` and identical content returns the
         already-committed Activity unchanged; different content is a
         conflict.
+
+        ``change_request_head_observation_id``/``observed_change_request_head``
+        are the SHA fence for a Change-Request-head-bound Activity (domain-model.md
+        777: "for PR_REMEDIATE, post-link REBASE, Change Request IMPORT,
+        head-bound CLOSE_PUBLICATION, CLOSE_REDUNDANT_PUBLICATION,
+        REPAIR_RUN_MARKER, or any later head-fenced publication; otherwise
+        both NULL"). Nullable together, and only permitted for those closed
+        Activity kinds.
         """
         require_lowercase_uuid(activity_id, field="activity_id")
         require_lowercase_uuid(run_id, field="run_id")
         enums.parse_enum("activity.kind", kind)
         enums.parse_enum("activity.execution_class", execution_class)
         enums.parse_enum("activity.state", state)
+        if (change_request_head_observation_id is None) != (observed_change_request_head is None):
+            raise ValueError(
+                "change_request_head_observation_id and observed_change_request_head "
+                "must be given together"
+            )
+        observed_change_request_head_json: str | None = None
+        if change_request_head_observation_id is not None:
+            require_lowercase_uuid(
+                change_request_head_observation_id, field="change_request_head_observation_id"
+            )
+            if kind not in CHANGE_REQUEST_HEAD_FENCED_ACTIVITY_KINDS:
+                raise ValueError(f"{kind} may not carry a change_request_head_observation_id")
+            assert observed_change_request_head is not None
+            observed_change_request_head_json = _require_git_commit_ref(
+                observed_change_request_head, field="observed_change_request_head"
+            ).as_json()
         semantic_input_json = _require_json_text(semantic_input)
         if review_assignment is not None:
             enums.parse_enum(
@@ -13298,6 +13337,9 @@ class RunStore:
                     or record.state != state
                     or record.candidate_id != candidate_id
                     or record.forge_observation_id != forge_observation_id
+                    or record.change_request_head_observation_id
+                    != change_request_head_observation_id
+                    or record.observed_change_request_head_json != observed_change_request_head_json
                     or record.role != role
                     or record.repair_cycle != repair_cycle
                     or record.recovery_cycle != recovery_cycle
@@ -13392,7 +13434,7 @@ class RunStore:
                 "recovery_evidence_id, rescue_epoch, created_transition_sequence, "
                 "semantic_input_json, semantic_input_digest, idempotency_key, slot, "
                 "created_at_ms, updated_at_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "?, ?, ?, ?, ?, ?)",
                 (
                     activity_id,
@@ -13405,6 +13447,8 @@ class RunStore:
                     state,
                     candidate_id,
                     forge_observation_id,
+                    change_request_head_observation_id,
+                    observed_change_request_head_json,
                     role,
                     repair_cycle,
                     recovery_cycle,
@@ -14741,6 +14785,30 @@ class RunStore:
                     "WHERE publication_id = ?",
                     (observed_external_revision, forge_observation_id, now, publication_id),
                 )
+            if (
+                is_current
+                and suboperation_kind in ("REF_CREATE", "REF_UPDATE")
+                and status == "CAS_MISMATCH"
+            ):
+                # forge-integration.md 736-738: "A mismatch is a normal
+                # concurrent-mutation observation. It rejects the stale
+                # effect, records the newly observed head, and returns to
+                # reconciliation without consuming the old approval on the
+                # new head." Supersede this Effect and its still-pending
+                # dispatch Outbox before any further mutation is attempted
+                # under it.
+                self.conn.execute(
+                    "UPDATE publication_effects SET superseded = 1 "
+                    "WHERE publication_id = ? AND effect_generation = ? AND superseded = 0",
+                    (publication_id, effect_generation),
+                )
+                stale_outbox = self.conn.execute(
+                    "SELECT outbox_id FROM outbox WHERE publication_id = ? "
+                    "AND effect_generation = ? AND state = 'PENDING'",
+                    (publication_id, effect_generation),
+                ).fetchone()
+                if stale_outbox is not None:
+                    self._mark_outbox_superseded(stale_outbox["outbox_id"])
         return checkpoint
 
     def record_change_request_search_result(
@@ -16075,10 +16143,16 @@ class RunStore:
     ) -> ControllerOperationFactRecord:
         """Record the immutable terminal ``FAILED`` input for a definitive,
         non-resumable ``PUBLISH``/``RECONCILE``/``CLOSE_PUBLICATION``/
-        ``CLOSE_REDUNDANT_PUBLICATION`` Activity failure (domain-model.md
-        2493-2501; 2517: "PUBLISH... may create this Fact only with
-        FAILED"). A successful ``PUBLISH`` never creates this Fact -- it
-        terminalizes through its ``COMPLETE`` checkpoint instead (2521-2522).
+        ``CLOSE_REDUNDANT_PUBLICATION``/``REPAIR_RUN_MARKER`` Activity failure
+        (domain-model.md 2493-2501; 2517: "PUBLISH... may create this Fact
+        only with FAILED"). A successful ``PUBLISH`` never creates this Fact
+        -- it terminalizes through its ``COMPLETE`` checkpoint instead
+        (2521-2522). The failed-Fact category matrix is closed
+        (domain-model.md 2543-2546): ``PUBLISH``/``RECONCILE`` permit
+        ``BASE_CONFLICT``/``CREDENTIAL``/``STORAGE``/``INTEGRITY_SUSPECTED``/
+        ``POLICY``; ``CLOSE_PUBLICATION``/``CLOSE_REDUNDANT_PUBLICATION``/
+        ``REPAIR_RUN_MARKER`` permit only ``BASE_CONFLICT``/``CREDENTIAL``/
+        ``POLICY``.
         """
         require_lowercase_uuid(controller_operation_fact_id, field="controller_operation_fact_id")
         require_lowercase_uuid(activity_id, field="activity_id")
@@ -16089,6 +16163,7 @@ class RunStore:
             "RECONCILE",
             "CLOSE_PUBLICATION",
             "CLOSE_REDUNDANT_PUBLICATION",
+            "REPAIR_RUN_MARKER",
         ):
             raise ValueError(f"{operation_kind} is not a Publication-domain operation kind")
         if failure_category == "FORGE_TRANSIENT":
@@ -16098,6 +16173,12 @@ class RunStore:
             )
         if operation_kind == "PUBLISH" and failure_category == "SOURCE_READ":
             raise ValueError("SOURCE_READ is IMPORT-only")
+        if operation_kind in (
+            "CLOSE_PUBLICATION",
+            "CLOSE_REDUNDANT_PUBLICATION",
+            "REPAIR_RUN_MARKER",
+        ) and failure_category not in ("BASE_CONFLICT", "CREDENTIAL", "POLICY"):
+            raise ValueError(f"{operation_kind} permits only BASE_CONFLICT, CREDENTIAL, or POLICY")
         _require_digest(operation_digest, field="operation_digest")
         now = _now_ms() if now_ms is None else now_ms
         fact_digest = controller_operation_fact_digest(
@@ -16149,6 +16230,1079 @@ class RunStore:
         ).fetchone()
         assert row is not None
         return _row_to_controller_operation_fact(row)
+
+    # -- Post-publication monitoring and remediation (issue #693, V1-26) -
+    #
+    # This leaf owns exactly what the Publication-creation leaf (#692)
+    # deferred: ``UPDATE``-mode Publication Effects (SHA-fenced
+    # remediation), the ``CLOSE_PUBLICATION``/``REPAIR_RUN_MARKER``
+    # Activity completion paths, and monitoring Schedule creation. It does
+    # not implement steady-state post-``ACTIVE`` duplicate reconciliation
+    # search recording (that reuses ``record_reconciliation_fact``, already
+    # generic, but needs its own post-link search-result recorder) --
+    # intentionally left for a later leaf, since it is not required by any
+    # acceptance criterion of this issue and the reconciliation/reservation
+    # primitives it would call are already in place.
+
+    def plan_publish_update_effect(
+        self,
+        *,
+        publication_id: str,
+        run_id: str,
+        activity_id: str,
+        activity_ordinal: int,
+        specification_generation: int,
+        policy_hash: str,
+        created_transition_sequence: int,
+        candidate_id: str,
+        desired_commit: Mapping[str, Any],
+        change_request_head_observation_id: str,
+        observed_change_request_head: Mapping[str, Any],
+        publication_secret_id: str,
+        publication_secret_version: int,
+        base_ref: str,
+        base_commit: Mapping[str, Any],
+        base_movement_policy: str,
+        semantic_input: Mapping[str, Any],
+        semantic_input_digest: str,
+        idempotency_key: str,
+        outbox_id: str,
+        outbox_destination: str = "publication-effect-dispatch/1",
+        now_ms: int | None = None,
+    ) -> tuple[PublicationRecord, PublicationEffectRecord, ActivityRecord, OutboxRecord]:
+        """Plan one SHA-fenced ``UPDATE`` Publication Effect for post-publication
+        remediation (forge-integration.md 721-739 "SHA-fenced remediation"): a
+        ``PR_REMEDIATE``/``REBASE`` Candidate that passed the full
+        verification/review/consensus gate is republished against the exact
+        ``observed_change_request_head`` its producing Activity was bound to.
+
+        Requires the Publication already ``ACTIVE`` and linked -- this is
+        never the first Effect. The CAS fence itself is enforced later, at
+        ``REF_READ``/``REF_UPDATE`` time, by
+        ``decide_ref_cas``/``record_publication_effect_checkpoint`` (whose
+        ``CAS_MISMATCH`` branch supersedes this Effect on a foreign SHA:
+        "rejects the stale effect... without consuming the old approval on
+        the new head", forge-integration.md 736-738).
+
+        Bumps ``effect_generation`` and supersedes the Publication's current
+        Effect row, mirroring "the current initial effect is superseded"
+        (forge-integration.md 512-513) for the steady-state remediation
+        case. Idempotent on ``(run_id, idempotency_key)``.
+        """
+        require_lowercase_uuid(publication_id, field="publication_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(
+            change_request_head_observation_id, field="change_request_head_observation_id"
+        )
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        if publication_secret_version <= 0:
+            raise ValueError("publication_secret_version must be positive")
+        enums.parse_enum("snapshot.base_movement_policy", base_movement_policy)
+        desired = _require_git_commit_ref(desired_commit, field="desired_commit")
+        base = _require_git_commit_ref(base_commit, field="base_commit")
+        observed_head = _require_git_commit_ref(
+            observed_change_request_head, field="observed_change_request_head"
+        )
+        semantic_input_json = _require_json_text(semantic_input)
+        now = _now_ms() if now_ms is None else now_ms
+
+        with self.transaction():
+            existing_activity = self.conn.execute(
+                "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, idempotency_key),
+            ).fetchone()
+            if existing_activity is not None:
+                activity = _row_to_activity(existing_activity)
+                if (
+                    activity.activity_id != activity_id
+                    or activity.activity_ordinal != activity_ordinal
+                    or activity.specification_generation != specification_generation
+                    or activity.policy_hash != policy_hash
+                    or activity.kind != "PUBLISH"
+                    or activity.execution_class != "CONTROLLER"
+                    or activity.state != "ACTIVE"
+                    or activity.candidate_id != candidate_id
+                    or activity.change_request_head_observation_id
+                    != change_request_head_observation_id
+                    or activity.observed_change_request_head_json != observed_head.as_json()
+                    or activity.created_transition_sequence != created_transition_sequence
+                    or activity.semantic_input_json != semantic_input_json
+                    or activity.semantic_input_digest != semantic_input_digest
+                ):
+                    raise IdempotencyConflictError(
+                        "publish update activity idempotency_key was reused with different content"
+                    )
+                effect_row = self.conn.execute(
+                    "SELECT * FROM publication_effects WHERE activity_id = ?", (activity_id,)
+                ).fetchone()
+                outbox_row = self.conn.execute(
+                    "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' "
+                    "AND source_id = ? AND destination = ?",
+                    (activity_id, outbox_destination),
+                ).fetchone()
+                if effect_row is None or outbox_row is None:
+                    raise RunStoreError("publish update activity replay is missing its bound rows")
+                effect = _row_to_publication_effect(effect_row)
+                publication_row = self.conn.execute(
+                    "SELECT * FROM publications WHERE publication_id = ?",
+                    (effect.publication_id,),
+                ).fetchone()
+                if publication_row is None:
+                    raise RunStoreError("publish update activity replay is missing its bound rows")
+                outbox = _row_to_outbox(outbox_row)
+                expected_operation_digest = publication_effect_operation_digest(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "mode": "UPDATE",
+                        "candidate_id": candidate_id,
+                        "desired_commit": desired.as_json(),
+                        "expected_remote_commit": observed_head.oid,
+                        "publication_secret_id": publication_secret_id,
+                        "publication_secret_version": publication_secret_version,
+                        "base_ref": base_ref,
+                        "base_commit": base.as_json(),
+                        "base_movement_policy": base_movement_policy,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "activity_id": activity_id,
+                        "mode": "UPDATE",
+                    }
+                )
+                if (
+                    effect.publication_id != publication_id
+                    or effect.activity_id != activity_id
+                    or effect.mode != "UPDATE"
+                    or effect.candidate_id != candidate_id
+                    or effect.desired_commit_json != desired.as_json()
+                    or effect.expected_remote_commit != observed_head.oid
+                    or effect.publication_secret_id != publication_secret_id
+                    or effect.publication_secret_version != publication_secret_version
+                    or effect.base_ref != base_ref
+                    or effect.base_commit_json != base.as_json()
+                    or effect.base_movement_policy != base_movement_policy
+                    or effect.operation_digest != expected_operation_digest
+                    or effect.superseded
+                    or effect.created_transition_sequence != created_transition_sequence
+                    or outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != expected_operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                    or outbox.publication_id != publication_id
+                    or outbox.effect_generation != effect.effect_generation
+                ):
+                    raise IdempotencyConflictError(
+                        "publish update activity idempotency_key was reused with different content"
+                    )
+                return (
+                    _row_to_publication(publication_row),
+                    effect,
+                    activity,
+                    outbox,
+                )
+
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"publication {publication_id!r} was not found")
+            publication = _row_to_publication(publication_row)
+            if publication.run_id != run_id:
+                raise RunStoreError(
+                    f"publication {publication_id!r} does not belong to run {run_id!r}"
+                )
+            if publication.state != "ACTIVE":
+                raise RunStoreError(
+                    f"publication {publication_id!r} is {publication.state!r}, not ACTIVE"
+                )
+            if publication.change_request_external_id is None:
+                raise RunStoreError(f"publication {publication_id!r} has no linked Change Request")
+
+            next_generation = publication.effect_generation + 1
+            self.conn.execute(
+                "UPDATE publication_effects SET superseded = 1 "
+                "WHERE publication_id = ? AND effect_generation = ? AND superseded = 0",
+                (publication_id, publication.effect_generation),
+            )
+            self.conn.execute(
+                "UPDATE publications SET candidate_id = ?, approved_commit_json = ?, "
+                "effect_generation = ?, updated_at_ms = ? WHERE publication_id = ?",
+                (candidate_id, desired.as_json(), next_generation, now, publication_id),
+            )
+
+            operation_digest = publication_effect_operation_digest(
+                {
+                    "publication_id": publication_id,
+                    "effect_generation": next_generation,
+                    "mode": "UPDATE",
+                    "candidate_id": candidate_id,
+                    "desired_commit": desired.as_json(),
+                    "expected_remote_commit": observed_head.oid,
+                    "publication_secret_id": publication_secret_id,
+                    "publication_secret_version": publication_secret_version,
+                    "base_ref": base_ref,
+                    "base_commit": base.as_json(),
+                    "base_movement_policy": base_movement_policy,
+                    "change_request_head_observation_id": change_request_head_observation_id,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO activities("
+                "activity_id, run_id, activity_ordinal, specification_generation, policy_hash, "
+                "kind, execution_class, state, input_ref_json, candidate_id, "
+                "forge_observation_id, change_request_head_observation_id, "
+                "observed_change_request_head_json, role, repair_cycle, recovery_cycle, "
+                "strategy_index, recovery_tactic, recovery_evidence_id, rescue_epoch, "
+                "created_transition_sequence, semantic_input_json, semantic_input_digest, "
+                "idempotency_key, slot, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'PUBLISH', 'CONTROLLER', 'ACTIVE', NULL, ?, "
+                "NULL, ?, ?, NULL, 0, 0, 0, NULL, NULL, 0, ?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    activity_id,
+                    run_id,
+                    activity_ordinal,
+                    specification_generation,
+                    policy_hash,
+                    candidate_id,
+                    change_request_head_observation_id,
+                    observed_head.as_json(),
+                    created_transition_sequence,
+                    semantic_input_json,
+                    semantic_input_digest,
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO publication_effects("
+                "publication_id, effect_generation, activity_id, mode, candidate_id, "
+                "desired_commit_json, expected_remote_commit, publication_secret_id, "
+                "publication_secret_version, base_ref, base_commit_json, "
+                "base_movement_policy, operation_digest, superseded, "
+                "created_transition_sequence, created_at_ms) "
+                "VALUES (?, ?, ?, 'UPDATE', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (
+                    publication_id,
+                    next_generation,
+                    activity_id,
+                    candidate_id,
+                    desired.as_json(),
+                    observed_head.oid,
+                    publication_secret_id,
+                    publication_secret_version,
+                    base_ref,
+                    base.as_json(),
+                    base_movement_policy,
+                    operation_digest,
+                    created_transition_sequence,
+                    now,
+                ),
+            )
+            self.insert_outbox(
+                outbox_id=outbox_id,
+                source_kind="ACTIVITY",
+                source_id=activity_id,
+                destination=outbox_destination,
+                protocol_version=PUBLICATION_EFFECT_PROTOCOL,
+                payload_digest=operation_digest,
+                payload={
+                    "publication_id": publication_id,
+                    "effect_generation": next_generation,
+                    "activity_id": activity_id,
+                    "mode": "UPDATE",
+                },
+                next_delivery_at_ms=now,
+                publication_id=publication_id,
+                effect_generation=next_generation,
+            )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            effect_row = self.conn.execute(
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, next_generation),
+            ).fetchone()
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            outbox_row = self.conn.execute(
+                "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+            assert publication_row is not None
+            assert effect_row is not None
+            assert activity_row is not None
+            assert outbox_row is not None
+            return (
+                _row_to_publication(publication_row),
+                _row_to_publication_effect(effect_row),
+                _row_to_activity(activity_row),
+                _row_to_outbox(outbox_row),
+            )
+
+    def complete_publication_update_effect(
+        self,
+        *,
+        publication_effect_checkpoint_id: str,
+        publication_id: str,
+        effect_generation: int,
+        forge_observation_id: str,
+        observed_external_revision: str,
+        now_ms: int | None = None,
+    ) -> PublicationEffectCheckpointRecord:
+        """Append the ``COMPLETE`` checkpoint for one ``UPDATE`` Publication
+        Effect.
+
+        Unlike the ``INITIAL`` completion (``complete_publication_effect``),
+        this requires no base-read or marker-search checkpoint --
+        forge-integration.md 721-739 "SHA-fenced remediation" lists only the
+        observed-head/effect-generation CAS as the pre-mutation gate,
+        already enforced by ``record_publication_effect_checkpoint``'s
+        ``REF_READ``/``REF_UPDATE`` handling. Requires a prior
+        ``REF_READ``/``REF_UPDATE`` ``OBSERVED_SATISFIED`` checkpoint for
+        this exact generation and leaves the Publication ``ACTIVE``,
+        updating only its observed head -- mirroring
+        ``complete_publication_effect``'s "a response from an older effect
+        generation is audit evidence only" fencing for a stale/superseded
+        generation.
+        """
+        require_lowercase_uuid(publication_id, field="publication_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            effect_row = self.conn.execute(
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if effect_row is None:
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) was not found"
+                )
+            effect = _row_to_publication_effect(effect_row)
+            if effect.mode != "UPDATE":
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) "
+                    "is not mode UPDATE"
+                )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"publication {publication_id!r} was not found")
+            publication = _row_to_publication(publication_row)
+            is_current = effect_generation == publication.effect_generation
+            if not is_current:
+                return self._insert_publication_effect_checkpoint_row(
+                    publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    now=now,
+                )
+            existing_checkpoint = self.conn.execute(
+                "SELECT * FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND suboperation_kind = 'COMPLETE' AND status = 'COMPLETED'",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if existing_checkpoint is not None:
+                return self._publication_effect_checkpoint_replay_record(
+                    existing_checkpoint,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    conflict_message=(
+                        "publication update effect complete checkpoint was replayed "
+                        "with different content"
+                    ),
+                )
+            if publication.state != "ACTIVE":
+                return self._insert_publication_effect_checkpoint_row(
+                    publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    now=now,
+                )
+            satisfied = self.conn.execute(
+                "SELECT 1 FROM publication_effect_checkpoints WHERE publication_id = ? "
+                "AND effect_generation = ? AND suboperation_kind IN ('REF_READ', 'REF_UPDATE') "
+                "AND status = 'OBSERVED_SATISFIED' LIMIT 1",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if satisfied is None:
+                raise RunStoreError(
+                    "COMPLETE requires a prior REF_READ/REF_UPDATE OBSERVED_SATISFIED checkpoint"
+                )
+            checkpoint = self._insert_publication_effect_checkpoint_row(
+                publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind="COMPLETE",
+                status="COMPLETED",
+                request_idempotency_key=None,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=observed_external_revision,
+                now=now,
+            )
+            self.conn.execute(
+                "UPDATE publications SET observed_remote_commit = ?, "
+                "last_observation_id = ?, updated_at_ms = ? WHERE publication_id = ?",
+                (observed_external_revision, forge_observation_id, now, publication_id),
+            )
+        return checkpoint
+
+    def _supersede_active_controller_activity(self, *, run_id: str, kind: str, now: int) -> None:
+        """Supersede any still-``ACTIVE`` Activity of ``kind`` for this Run
+        and its still-``PENDING`` dispatch Outbox, before planning a
+        replacement.
+
+        This is the "later-command audit" / "no orphan PR window" fence
+        (forge-integration.md 298-301: "A head mismatch records a new
+        observation, supersedes that stale Activity, and plans another
+        immutable head-bound cleanup rather than overwriting code or
+        Activity inputs") -- at most one live ``CLOSE_PUBLICATION`` (or
+        ``REPAIR_RUN_MARKER``) Activity fences the Run at a time, so a fresh
+        observation always gets a fresh, exactly-bound Activity instead of
+        silently reusing or racing a stale one.
+        """
+        stale_rows = self.conn.execute(
+            "SELECT activity_id FROM activities WHERE run_id = ? AND kind = ? AND state = 'ACTIVE'",
+            (run_id, kind),
+        ).fetchall()
+        for row in stale_rows:
+            self.conn.execute(
+                "UPDATE activities SET state = 'SUPERSEDED', updated_at_ms = ? "
+                "WHERE activity_id = ?",
+                (now, row["activity_id"]),
+            )
+            outbox_row = self.conn.execute(
+                "SELECT outbox_id FROM outbox WHERE source_kind = 'ACTIVITY' "
+                "AND source_id = ? AND state = 'PENDING'",
+                (row["activity_id"],),
+            ).fetchone()
+            if outbox_row is not None:
+                self._mark_outbox_superseded(outbox_row["outbox_id"])
+
+    def plan_close_publication_activity(
+        self,
+        *,
+        activity_id: str,
+        run_id: str,
+        activity_ordinal: int,
+        specification_generation: int,
+        policy_hash: str,
+        created_transition_sequence: int,
+        semantic_input: Mapping[str, Any],
+        semantic_input_digest: str,
+        idempotency_key: str,
+        outbox_id: str,
+        change_request_head_observation_id: str | None = None,
+        observed_change_request_head: Mapping[str, Any] | None = None,
+        outbox_destination: str = "controller-close-publication/1",
+        now_ms: int | None = None,
+    ) -> tuple[ActivityRecord, OutboxRecord]:
+        """Plan one immutable ``CLOSE_PUBLICATION`` cancellation-cleanup
+        Activity (domain-model.md 882: "Perform one immutable cancellation
+        phase: either reconcile a possible stable create request or attempt
+        an idempotent close of one exact observed run-owned Change Request
+        head. Discovery or head movement requires a new Activity.").
+
+        ``change_request_head_observation_id``/``observed_change_request_head``
+        both ``None`` plans the pre-link "possible-create reconciliation"
+        phase (forge-integration.md 287-291: cancellation fences new work
+        and searches by the stable create-request identity because a
+        Change Request may already exist); both given plans the post-link
+        head-bound idempotent-close phase. Supersedes any prior still-
+        ``ACTIVE`` ``CLOSE_PUBLICATION`` Activity for this Run first, so a
+        fresh proof always drives a fresh Activity and no orphan open PR
+        window is left by a stale one. Idempotent on
+        ``(run_id, idempotency_key)``.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        if (change_request_head_observation_id is None) != (observed_change_request_head is None):
+            raise ValueError(
+                "change_request_head_observation_id and observed_change_request_head "
+                "must be given together"
+            )
+        observed_head_json: str | None = None
+        if change_request_head_observation_id is not None:
+            require_lowercase_uuid(
+                change_request_head_observation_id, field="change_request_head_observation_id"
+            )
+            assert observed_change_request_head is not None
+            observed_head_json = _require_git_commit_ref(
+                observed_change_request_head, field="observed_change_request_head"
+            ).as_json()
+        semantic_input_json = _require_json_text(semantic_input)
+        now = _now_ms() if now_ms is None else now_ms
+        operation_digest = controller_operation_fact_digest(
+            {
+                "activity_id": activity_id,
+                "operation_kind": "CLOSE_PUBLICATION",
+                "change_request_head_observation_id": change_request_head_observation_id,
+                "observed_change_request_head": observed_head_json,
+                "semantic_input_digest": semantic_input_digest,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                activity = _row_to_activity(existing)
+                if (
+                    activity.activity_id != activity_id
+                    or activity.activity_ordinal != activity_ordinal
+                    or activity.specification_generation != specification_generation
+                    or activity.policy_hash != policy_hash
+                    or activity.kind != "CLOSE_PUBLICATION"
+                    or activity.execution_class != "CONTROLLER"
+                    or activity.change_request_head_observation_id
+                    != change_request_head_observation_id
+                    or activity.observed_change_request_head_json != observed_head_json
+                    or activity.semantic_input_json != semantic_input_json
+                    or activity.semantic_input_digest != semantic_input_digest
+                    or activity.created_transition_sequence != created_transition_sequence
+                ):
+                    raise IdempotencyConflictError(
+                        "close publication activity idempotency_key was reused "
+                        "with different content"
+                    )
+                outbox_row = self.conn.execute(
+                    "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' AND source_id = ?",
+                    (activity.activity_id,),
+                ).fetchone()
+                if outbox_row is None:
+                    raise RunStoreError(
+                        "close publication activity replay is missing its bound outbox"
+                    )
+                outbox = _row_to_outbox(outbox_row)
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "activity_id": activity_id,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                if (
+                    outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                ):
+                    raise IdempotencyConflictError(
+                        "close publication activity idempotency_key was reused "
+                        "with different content"
+                    )
+                return activity, outbox
+
+            self._supersede_active_controller_activity(
+                run_id=run_id, kind="CLOSE_PUBLICATION", now=now
+            )
+            self.conn.execute(
+                "INSERT INTO activities("
+                "activity_id, run_id, activity_ordinal, specification_generation, policy_hash, "
+                "kind, execution_class, state, input_ref_json, candidate_id, "
+                "forge_observation_id, change_request_head_observation_id, "
+                "observed_change_request_head_json, role, repair_cycle, recovery_cycle, "
+                "strategy_index, recovery_tactic, recovery_evidence_id, rescue_epoch, "
+                "created_transition_sequence, semantic_input_json, semantic_input_digest, "
+                "idempotency_key, slot, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'CLOSE_PUBLICATION', 'CONTROLLER', 'ACTIVE', NULL, "
+                "NULL, NULL, ?, ?, NULL, 0, 0, 0, NULL, NULL, 0, ?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    activity_id,
+                    run_id,
+                    activity_ordinal,
+                    specification_generation,
+                    policy_hash,
+                    change_request_head_observation_id,
+                    observed_head_json,
+                    created_transition_sequence,
+                    semantic_input_json,
+                    semantic_input_digest,
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            outbox = self.insert_outbox(
+                outbox_id=outbox_id,
+                source_kind="ACTIVITY",
+                source_id=activity_id,
+                destination=outbox_destination,
+                protocol_version=PUBLICATION_EFFECT_PROTOCOL,
+                payload_digest=operation_digest,
+                payload={
+                    "activity_id": activity_id,
+                    "change_request_head_observation_id": change_request_head_observation_id,
+                },
+                next_delivery_at_ms=now,
+            )
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            assert activity_row is not None
+            return _row_to_activity(activity_row), outbox
+
+    def complete_close_publication_possible_create(
+        self,
+        *,
+        controller_operation_fact_id: str,
+        activity_id: str,
+        forge_observation_id: str,
+        operation_digest: str,
+        now_ms: int | None = None,
+    ) -> tuple[ControllerOperationFactRecord | None, PublicationRecord]:
+        """Terminalize a pre-link ``CLOSE_PUBLICATION`` Activity from proof
+        that its possible create request produced no Change Request
+        (domain-model.md 2522-2532: "``CLOSE_PUBLICATION/SUCCEEDED`` is
+        permitted only when the Fact names the exact current
+        ``CHANGE_REQUEST_ABSENT`` Forge Observation... For successful
+        pre-link ``CLOSE_PUBLICATION``, ``output_candidate_id = NULL``,
+        ``forge_observation_ids`` contains exactly the one bound
+        ``CHANGE_REQUEST_ABSENT``").
+
+        This is the one case where a successful ``CLOSE_PUBLICATION``
+        creates a Controller Operation Fact; the post-link head-bound case
+        terminalizes only through the close/merge Forge Observation itself
+        (``complete_close_publication_head_bound``). Marks the Activity
+        ``SUCCEEDED`` and the Publication ``CLOSED`` atomically with the
+        Fact -- no Change Request was ever created, so there is no orphan
+        open PR to leave behind.
+        """
+        require_lowercase_uuid(controller_operation_fact_id, field="controller_operation_fact_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(forge_observation_id, field="forge_observation_id")
+        _require_digest(operation_digest, field="operation_digest")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM controller_operation_facts WHERE controller_operation_fact_id = ?",
+                (controller_operation_fact_id,),
+            ).fetchone()
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            if activity_row is None:
+                raise RunStoreError(f"activity {activity_id!r} was not found")
+            activity = _row_to_activity(activity_row)
+            if activity.kind != "CLOSE_PUBLICATION" or activity.change_request_head_observation_id:
+                raise RunStoreError(
+                    f"activity {activity_id!r} is not a pre-link CLOSE_PUBLICATION Activity"
+                )
+            fact_digest = controller_operation_fact_digest(
+                {
+                    "activity_id": activity_id,
+                    "operation_kind": "CLOSE_PUBLICATION",
+                    "outcome": "SUCCEEDED",
+                    "operation_digest": operation_digest,
+                    "forge_observation_id": forge_observation_id,
+                }
+            )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE run_id = ?", (activity.run_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"run {activity.run_id!r} has no publication")
+            if existing is not None:
+                record = _row_to_controller_operation_fact(existing)
+                if record.fact_digest != fact_digest:
+                    raise IdempotencyConflictError(
+                        "controller operation fact id was reused with different content"
+                    )
+                return record, _row_to_publication(publication_row)
+            if activity.state != "ACTIVE":
+                # A superseded Activity cannot be completed by stale absence
+                # evidence. No successful Fact exists or should be created.
+                return None, _row_to_publication(publication_row)
+            self.conn.execute(
+                "INSERT INTO controller_operation_facts("
+                "controller_operation_fact_id, activity_id, operation_kind, outcome, "
+                "failure_category, candidate_id, forge_observation_id, operation_digest, "
+                "fact_digest, recorded_at_ms) "
+                "VALUES (?, ?, 'CLOSE_PUBLICATION', 'SUCCEEDED', NULL, NULL, ?, ?, ?, ?)",
+                (
+                    controller_operation_fact_id,
+                    activity_id,
+                    forge_observation_id,
+                    operation_digest,
+                    fact_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                "WHERE activity_id = ?",
+                (now, activity_id),
+            )
+            self.conn.execute(
+                "UPDATE publications SET state = 'CLOSED', last_observation_id = ?, "
+                "updated_at_ms = ? WHERE publication_id = ?",
+                (forge_observation_id, now, publication_row["publication_id"]),
+            )
+            fact_row = self.conn.execute(
+                "SELECT * FROM controller_operation_facts WHERE controller_operation_fact_id = ?",
+                (controller_operation_fact_id,),
+            ).fetchone()
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?",
+                (publication_row["publication_id"],),
+            ).fetchone()
+            assert fact_row is not None and publication_row is not None
+            return (
+                _row_to_controller_operation_fact(fact_row),
+                _row_to_publication(publication_row),
+            )
+
+    def complete_close_publication_head_bound(
+        self,
+        *,
+        activity_id: str,
+        forge_observation_id: str,
+        now_ms: int | None = None,
+    ) -> tuple[ActivityRecord, PublicationRecord]:
+        """Terminalize a post-link head-bound ``CLOSE_PUBLICATION`` Activity
+        from its authenticated close/merge Forge Observation (domain-model.md
+        2522-2526: "after linkage, close or merge observation terminalizes
+        the cleanup and no successful Controller Operation Fact is
+        created"). Marks the Activity ``SUCCEEDED`` and the Publication
+        ``CLOSED`` atomically; replaying against an already-terminal
+        Activity is a no-op that returns the current rows unchanged so a
+        second authenticated close observation for the same Activity never
+        double-mutates the Run.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(forge_observation_id, field="forge_observation_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            if activity_row is None:
+                raise RunStoreError(f"activity {activity_id!r} was not found")
+            activity = _row_to_activity(activity_row)
+            if (
+                activity.kind != "CLOSE_PUBLICATION"
+                or activity.change_request_head_observation_id is None
+            ):
+                raise RunStoreError(
+                    f"activity {activity_id!r} is not a head-bound CLOSE_PUBLICATION Activity"
+                )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE run_id = ?", (activity.run_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"run {activity.run_id!r} has no publication")
+            if activity.state != "ACTIVE":
+                # A superseded or already-terminal Activity cannot be
+                # (re)completed by stale/duplicate close evidence.
+                return activity, _row_to_publication(publication_row)
+            self.conn.execute(
+                "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                "WHERE activity_id = ?",
+                (now, activity_id),
+            )
+            self.conn.execute(
+                "UPDATE publications SET state = 'CLOSED', last_observation_id = ?, "
+                "updated_at_ms = ? WHERE publication_id = ?",
+                (forge_observation_id, now, publication_row["publication_id"]),
+            )
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?",
+                (publication_row["publication_id"],),
+            ).fetchone()
+            assert activity_row is not None and publication_row is not None
+            return _row_to_activity(activity_row), _row_to_publication(publication_row)
+
+    def plan_repair_run_marker_activity(
+        self,
+        *,
+        activity_id: str,
+        run_id: str,
+        activity_ordinal: int,
+        specification_generation: int,
+        policy_hash: str,
+        created_transition_sequence: int,
+        change_request_head_observation_id: str,
+        observed_change_request_head: Mapping[str, Any],
+        semantic_input: Mapping[str, Any],
+        semantic_input_digest: str,
+        idempotency_key: str,
+        outbox_id: str,
+        outbox_destination: str = "controller-repair-run-marker/1",
+        now_ms: int | None = None,
+    ) -> tuple[ActivityRecord, OutboxRecord]:
+        """Plan one immutable ``REPAIR_RUN_MARKER`` Activity (domain-model.md
+        884: "Restore exactly one canonical Orcest v1 Run/Publication marker
+        on an already-linked, exactly proved run-owned Change Request, or
+        collapse byte-identical duplicate copies; never adopt or transfer
+        ownership."). Bound to the exact ``CHANGE_REQUEST_MARKER``
+        Observation proving the marker set is ``MISSING`` or
+        ``DUPLICATED_IDENTICAL`` (forge-integration.md 661-666). Supersedes
+        any prior still-``ACTIVE`` ``REPAIR_RUN_MARKER`` Activity for this
+        Run first, so a changed marker Observation always drives a fresh
+        operation identity rather than an Activity bound to stale input.
+        Idempotent on ``(run_id, idempotency_key)``.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        require_lowercase_uuid(
+            change_request_head_observation_id, field="change_request_head_observation_id"
+        )
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        observed_head_json = _require_git_commit_ref(
+            observed_change_request_head, field="observed_change_request_head"
+        ).as_json()
+        semantic_input_json = _require_json_text(semantic_input)
+        now = _now_ms() if now_ms is None else now_ms
+        operation_digest = controller_operation_fact_digest(
+            {
+                "activity_id": activity_id,
+                "operation_kind": "REPAIR_RUN_MARKER",
+                "change_request_head_observation_id": change_request_head_observation_id,
+                "observed_change_request_head": observed_head_json,
+                "semantic_input_digest": semantic_input_digest,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                activity = _row_to_activity(existing)
+                if (
+                    activity.activity_id != activity_id
+                    or activity.activity_ordinal != activity_ordinal
+                    or activity.specification_generation != specification_generation
+                    or activity.policy_hash != policy_hash
+                    or activity.kind != "REPAIR_RUN_MARKER"
+                    or activity.execution_class != "CONTROLLER"
+                    or activity.change_request_head_observation_id
+                    != change_request_head_observation_id
+                    or activity.observed_change_request_head_json != observed_head_json
+                    or activity.semantic_input_json != semantic_input_json
+                    or activity.semantic_input_digest != semantic_input_digest
+                    or activity.created_transition_sequence != created_transition_sequence
+                ):
+                    raise IdempotencyConflictError(
+                        "repair run marker activity idempotency_key was reused "
+                        "with different content"
+                    )
+                outbox_row = self.conn.execute(
+                    "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' AND source_id = ?",
+                    (activity.activity_id,),
+                ).fetchone()
+                if outbox_row is None:
+                    raise RunStoreError(
+                        "repair run marker activity replay is missing its bound outbox"
+                    )
+                outbox = _row_to_outbox(outbox_row)
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "activity_id": activity_id,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                if (
+                    outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                ):
+                    raise IdempotencyConflictError(
+                        "repair run marker activity idempotency_key was reused "
+                        "with different content"
+                    )
+                return activity, outbox
+
+            self._supersede_active_controller_activity(
+                run_id=run_id, kind="REPAIR_RUN_MARKER", now=now
+            )
+            self.conn.execute(
+                "INSERT INTO activities("
+                "activity_id, run_id, activity_ordinal, specification_generation, policy_hash, "
+                "kind, execution_class, state, input_ref_json, candidate_id, "
+                "forge_observation_id, change_request_head_observation_id, "
+                "observed_change_request_head_json, role, repair_cycle, recovery_cycle, "
+                "strategy_index, recovery_tactic, recovery_evidence_id, rescue_epoch, "
+                "created_transition_sequence, semantic_input_json, semantic_input_digest, "
+                "idempotency_key, slot, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'REPAIR_RUN_MARKER', 'CONTROLLER', 'ACTIVE', NULL, "
+                "NULL, NULL, ?, ?, NULL, 0, 0, 0, NULL, NULL, 0, ?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    activity_id,
+                    run_id,
+                    activity_ordinal,
+                    specification_generation,
+                    policy_hash,
+                    change_request_head_observation_id,
+                    observed_head_json,
+                    created_transition_sequence,
+                    semantic_input_json,
+                    semantic_input_digest,
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            outbox = self.insert_outbox(
+                outbox_id=outbox_id,
+                source_kind="ACTIVITY",
+                source_id=activity_id,
+                destination=outbox_destination,
+                protocol_version=PUBLICATION_EFFECT_PROTOCOL,
+                payload_digest=operation_digest,
+                payload={
+                    "activity_id": activity_id,
+                    "change_request_head_observation_id": change_request_head_observation_id,
+                },
+                next_delivery_at_ms=now,
+            )
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            assert activity_row is not None
+            return _row_to_activity(activity_row), outbox
+
+    def complete_repair_run_marker(
+        self,
+        *,
+        activity_id: str,
+        forge_observation_id: str,
+        now_ms: int | None = None,
+    ) -> ActivityRecord:
+        """Terminalize a ``REPAIR_RUN_MARKER`` Activity from the exact
+        controller-bound ``CHANGE_REQUEST_MARKER`` Observation it described
+        (domain-model.md 2539-2541: "Successful ``REPAIR_RUN_MARKER``
+        likewise terminalizes only through the exact controller-bound
+        ``CHANGE_REQUEST_MARKER`` Observation described by its Activity; an
+        ambiguous repair remains active and no success Fact is
+        synthesized."). No Controller Operation Fact and no Publication
+        state change: marker repair proves exactly one code-derived desired
+        marker on the already-linked object and never adopts or transfers
+        ownership. Replaying against an already-terminal Activity is a
+        no-op.
+        """
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(forge_observation_id, field="forge_observation_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            if activity_row is None:
+                raise RunStoreError(f"activity {activity_id!r} was not found")
+            activity = _row_to_activity(activity_row)
+            if activity.kind != "REPAIR_RUN_MARKER":
+                raise RunStoreError(f"activity {activity_id!r} is not a REPAIR_RUN_MARKER Activity")
+            if activity.state != "ACTIVE":
+                return activity
+            self.conn.execute(
+                "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                "WHERE activity_id = ?",
+                (now, activity_id),
+            )
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            assert activity_row is not None
+            return _row_to_activity(activity_row)
+
+    def ensure_publication_monitoring_schedules(
+        self,
+        *,
+        publication_id: str,
+        change_request_poll_schedule_id: str,
+        ci_poll_schedule_id: str,
+        forge_instance_id: str,
+        minimum_interval_ms: int,
+        next_due_at_ms: int,
+    ) -> tuple[ForgeObservationScheduleRecord, ForgeObservationScheduleRecord]:
+        """Idempotently create the durable ``CHANGE_REQUEST_POLL`` and
+        ``CI_POLL`` Forge Observation Schedules that carry post-publication
+        monitoring (forge-integration.md 677-682 "Change Request
+        monitoring": "Once linked, the Run remains active. The controller
+        periodically records head-SHA-bound CI, review, discussion,
+        mergeability, and open/merged/closed observations."). Requires the
+        Publication already ``ACTIVE``. Reuses ``create_forge_observation_schedule``'s
+        existing identity-based idempotency, so calling this once per
+        ``ACTIVE`` transition (or replaying it) never creates a duplicate
+        Schedule.
+        """
+        require_lowercase_uuid(publication_id, field="publication_id")
+        publication = self.get_publication(publication_id)
+        if publication is None:
+            raise RunStoreError(f"publication {publication_id!r} was not found")
+        if publication.state != "ACTIVE":
+            raise RunStoreError(
+                f"publication {publication_id!r} is {publication.state!r}, not ACTIVE"
+            )
+        run = self.get_run(publication.run_id)
+        if run is None:
+            raise RunStoreError(f"run {publication.run_id!r} was not found")
+        change_request_poll = self.create_forge_observation_schedule(
+            forge_observation_schedule_id=change_request_poll_schedule_id,
+            schedule_kind="CHANGE_REQUEST_POLL",
+            project_id=run.project_id,
+            forge_instance_id=forge_instance_id,
+            target_kind="PUBLICATION",
+            target_id=publication_id,
+            minimum_interval_ms=minimum_interval_ms,
+            next_due_at_ms=next_due_at_ms,
+            run_id=publication.run_id,
+            publication_id=publication_id,
+        )
+        ci_poll = self.create_forge_observation_schedule(
+            forge_observation_schedule_id=ci_poll_schedule_id,
+            schedule_kind="CI_POLL",
+            project_id=run.project_id,
+            forge_instance_id=forge_instance_id,
+            target_kind="PUBLICATION",
+            target_id=publication_id,
+            minimum_interval_ms=minimum_interval_ms,
+            next_due_at_ms=next_due_at_ms,
+            run_id=publication.run_id,
+            publication_id=publication_id,
+        )
+        return change_request_poll, ci_poll
 
     def is_change_request_excluded_from_legacy_engine(
         self,
