@@ -16349,11 +16349,64 @@ class RunStore:
                 ).fetchone()
                 if publication_row is None:
                     raise RunStoreError("publish update activity replay is missing its bound rows")
+                outbox = _row_to_outbox(outbox_row)
+                expected_operation_digest = publication_effect_operation_digest(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "mode": "UPDATE",
+                        "candidate_id": candidate_id,
+                        "desired_commit": desired.as_json(),
+                        "expected_remote_commit": observed_head.oid,
+                        "publication_secret_id": publication_secret_id,
+                        "publication_secret_version": publication_secret_version,
+                        "base_ref": base_ref,
+                        "base_commit": base.as_json(),
+                        "base_movement_policy": base_movement_policy,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "activity_id": activity_id,
+                        "mode": "UPDATE",
+                    }
+                )
+                if (
+                    effect.publication_id != publication_id
+                    or effect.activity_id != activity_id
+                    or effect.mode != "UPDATE"
+                    or effect.candidate_id != candidate_id
+                    or effect.desired_commit_json != desired.as_json()
+                    or effect.expected_remote_commit != observed_head.oid
+                    or effect.publication_secret_id != publication_secret_id
+                    or effect.publication_secret_version != publication_secret_version
+                    or effect.base_ref != base_ref
+                    or effect.base_commit_json != base.as_json()
+                    or effect.base_movement_policy != base_movement_policy
+                    or effect.operation_digest != expected_operation_digest
+                    or effect.superseded
+                    or effect.created_transition_sequence != created_transition_sequence
+                    or outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != expected_operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                    or outbox.publication_id != publication_id
+                    or outbox.effect_generation != effect.effect_generation
+                ):
+                    raise IdempotencyConflictError(
+                        "publish update activity idempotency_key was reused with different content"
+                    )
                 return (
                     _row_to_publication(publication_row),
                     effect,
                     activity,
-                    _row_to_outbox(outbox_row),
+                    outbox,
                 )
 
             publication_row = self.conn.execute(
@@ -16737,7 +16790,27 @@ class RunStore:
                     raise RunStoreError(
                         "close publication activity replay is missing its bound outbox"
                     )
-                return activity, _row_to_outbox(outbox_row)
+                outbox = _row_to_outbox(outbox_row)
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "activity_id": activity_id,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                if (
+                    outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                ):
+                    raise IdempotencyConflictError(
+                        "close publication activity idempotency_key was reused "
+                        "with different content"
+                    )
+                return activity, outbox
 
             self._supersede_active_controller_activity(
                 run_id=run_id, kind="CLOSE_PUBLICATION", now=now
@@ -17043,7 +17116,27 @@ class RunStore:
                     raise RunStoreError(
                         "repair run marker activity replay is missing its bound outbox"
                     )
-                return activity, _row_to_outbox(outbox_row)
+                outbox = _row_to_outbox(outbox_row)
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "activity_id": activity_id,
+                        "change_request_head_observation_id": change_request_head_observation_id,
+                    }
+                )
+                if (
+                    outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                ):
+                    raise IdempotencyConflictError(
+                        "repair run marker activity idempotency_key was reused "
+                        "with different content"
+                    )
+                return activity, outbox
 
             self._supersede_active_controller_activity(
                 run_id=run_id, kind="REPAIR_RUN_MARKER", now=now

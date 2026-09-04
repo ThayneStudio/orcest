@@ -230,6 +230,36 @@ def test_plan_publish_update_effect_replay_conflict_raises(store: RunStore) -> N
         _plan_update_effect(store, candidate_id="55555555-5555-4555-8555-555555555559")
 
 
+def test_plan_publish_update_effect_replay_conflict_on_desired_commit_mismatch(
+    store: RunStore,
+) -> None:
+    """A replay with a different Effect-only field (not mirrored onto the
+    Activity row) must still be rejected, not silently return the stale
+    Effect/Outbox."""
+    _activate_publication(store)
+    _plan_update_effect(store)
+    with pytest.raises(IdempotencyConflictError):
+        _plan_update_effect(store, desired_commit={"object_format": "sha1", "oid": "d" * 40})
+
+
+def test_plan_publish_update_effect_replay_conflict_on_base_ref_mismatch(store: RunStore) -> None:
+    _activate_publication(store)
+    _plan_update_effect(store)
+    with pytest.raises(IdempotencyConflictError):
+        _plan_update_effect(store, base_ref="refs/heads/other")
+
+
+def test_plan_publish_update_effect_replay_conflict_on_outbox_id_mismatch(
+    store: RunStore,
+) -> None:
+    """A replay with a different ``outbox_id`` (not part of the lookup key,
+    which matches on source_id + destination) must still be rejected."""
+    _activate_publication(store)
+    _plan_update_effect(store)
+    with pytest.raises(IdempotencyConflictError):
+        _plan_update_effect(store, outbox_id="44444444-4444-4444-8444-444444444446")
+
+
 def test_plan_publish_update_effect_requires_linked_publication(store: RunStore) -> None:
     _plan_effect(store)
     # Force ACTIVE without ever linking a Change Request, to exercise the
@@ -449,6 +479,31 @@ def test_plan_close_publication_activity_replay_is_idempotent(store: RunStore) -
     first = store.plan_close_publication_activity(**kwargs)  # type: ignore[arg-type]
     second = store.plan_close_publication_activity(**kwargs)  # type: ignore[arg-type]
     assert first == second
+
+
+def test_plan_close_publication_activity_replay_conflict_on_outbox_destination_mismatch(
+    store: RunStore,
+) -> None:
+    """A replay with a different outbox-only field (not mirrored onto the
+    Activity row) must still be rejected, not silently return the stale
+    Outbox."""
+    kwargs = dict(
+        activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        run_id=RUN_ID,
+        activity_ordinal=2,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=2,
+        semantic_input={"cancel": 1},
+        semantic_input_digest=request_digest({"cancel": 1}),
+        idempotency_key=request_digest({"kind": "CLOSE_PUBLICATION"}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    )
+    store.plan_close_publication_activity(**kwargs)  # type: ignore[arg-type]
+    with pytest.raises(IdempotencyConflictError):
+        store.plan_close_publication_activity(  # type: ignore[arg-type]
+            **{**kwargs, "outbox_destination": "controller-close-publication/2"}
+        )
 
 
 def test_complete_close_publication_possible_create_closes_publication(store: RunStore) -> None:
@@ -676,6 +731,55 @@ def test_plan_repair_run_marker_activity_supersedes_prior_active(store: RunStore
     superseded_outbox = store.get_outbox(first_outbox.outbox_id)
     assert superseded_outbox is not None
     assert superseded_outbox.state == "SUPERSEDED"
+
+
+def test_plan_repair_run_marker_activity_replay_is_idempotent(store: RunStore) -> None:
+    _activate_publication(store)
+    kwargs = dict(
+        activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        run_id=RUN_ID,
+        activity_ordinal=2,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=2,
+        change_request_head_observation_id=HEAD_OBS_ID,
+        observed_change_request_head=DESIRED_COMMIT,
+        semantic_input={"marker": "MISSING"},
+        semantic_input_digest=request_digest({"marker": "MISSING"}),
+        idempotency_key=request_digest({"kind": "REPAIR_RUN_MARKER"}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    )
+    first = store.plan_repair_run_marker_activity(**kwargs)  # type: ignore[arg-type]
+    second = store.plan_repair_run_marker_activity(**kwargs)  # type: ignore[arg-type]
+    assert first == second
+
+
+def test_plan_repair_run_marker_activity_replay_conflict_on_outbox_destination_mismatch(
+    store: RunStore,
+) -> None:
+    """A replay with a different outbox-only field (not mirrored onto the
+    Activity row) must still be rejected, not silently return the stale
+    Outbox."""
+    _activate_publication(store)
+    kwargs = dict(
+        activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        run_id=RUN_ID,
+        activity_ordinal=2,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=2,
+        change_request_head_observation_id=HEAD_OBS_ID,
+        observed_change_request_head=DESIRED_COMMIT,
+        semantic_input={"marker": "MISSING"},
+        semantic_input_digest=request_digest({"marker": "MISSING"}),
+        idempotency_key=request_digest({"kind": "REPAIR_RUN_MARKER"}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    )
+    store.plan_repair_run_marker_activity(**kwargs)  # type: ignore[arg-type]
+    with pytest.raises(IdempotencyConflictError):
+        store.plan_repair_run_marker_activity(  # type: ignore[arg-type]
+            **{**kwargs, "outbox_destination": "controller-repair-run-marker/2"}
+        )
 
 
 def test_complete_repair_run_marker_replay_after_terminal_is_noop(store: RunStore) -> None:
