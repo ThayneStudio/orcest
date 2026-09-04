@@ -143,6 +143,7 @@ _NON_MAINTENANCE_CONTROLLER_MODES = frozenset(
 CHANGE_REQUEST_HEAD_FENCED_ACTIVITY_KINDS = frozenset(
     {
         "IMPORT",
+        "PUBLISH",
         "PR_REMEDIATE",
         "REBASE",
         "CLOSE_PUBLICATION",

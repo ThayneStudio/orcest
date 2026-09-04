@@ -175,14 +175,14 @@ networks:
     name: $network_name
 EOF
 
-if ! docker network inspect "$network_name" >/dev/null 2>&1; then
-  docker network create "$network_name" >/dev/null
-  network_created=1
-fi
-
 if [ -z "${DOCKER_CONFIG:-}" ] && { [ -z "${HOME:-}" ] || [ ! -w "$HOME" ]; }; then
   docker_config_dir="$(mktemp -d)"
   export DOCKER_CONFIG="$docker_config_dir"
+fi
+
+if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+  docker network create "$network_name" >/dev/null
+  network_created=1
 fi
 
 docker_pull_with_retry "redis:7"
