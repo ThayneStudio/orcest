@@ -16633,6 +16633,18 @@ class RunStore:
                         "with different content"
                     ),
                 )
+            if publication.state != "ACTIVE":
+                return self._insert_publication_effect_checkpoint_row(
+                    publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    now=now,
+                )
             satisfied = self.conn.execute(
                 "SELECT 1 FROM publication_effect_checkpoints WHERE publication_id = ? "
                 "AND effect_generation = ? AND suboperation_kind IN ('REF_READ', 'REF_UPDATE') "
@@ -16869,7 +16881,7 @@ class RunStore:
         forge_observation_id: str,
         operation_digest: str,
         now_ms: int | None = None,
-    ) -> tuple[ControllerOperationFactRecord, PublicationRecord]:
+    ) -> tuple[ControllerOperationFactRecord | None, PublicationRecord]:
         """Terminalize a pre-link ``CLOSE_PUBLICATION`` Activity from proof
         that its possible create request produced no Change Request
         (domain-model.md 2522-2532: "``CLOSE_PUBLICATION/SUCCEEDED`` is
@@ -16929,7 +16941,9 @@ class RunStore:
                     )
                 return record, _row_to_publication(publication_row)
             if activity.state != "ACTIVE":
-                raise RunStoreError(f"activity {activity_id!r} is not ACTIVE")
+                # A superseded Activity cannot be completed by stale absence
+                # evidence. No successful Fact exists or should be created.
+                return None, _row_to_publication(publication_row)
             self.conn.execute(
                 "INSERT INTO controller_operation_facts("
                 "controller_operation_fact_id, activity_id, operation_kind, outcome, "

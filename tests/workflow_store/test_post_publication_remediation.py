@@ -396,6 +396,55 @@ def test_complete_publication_update_effect_stale_generation_is_audit_only(store
     assert publication.observed_remote_commit != REMEDIATED_COMMIT["oid"]
 
 
+def test_complete_publication_update_effect_closed_publication_is_audit_only(
+    store: RunStore,
+) -> None:
+    _activate_publication(store)
+    _plan_update_effect(store)
+    store.record_publication_effect_checkpoint(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
+        publication_id=PUBLICATION_ID,
+        effect_generation=2,
+        suboperation_kind="REF_UPDATE",
+        status="OBSERVED_SATISFIED",
+        forge_observation_id=FORGE_OBS_ID,
+    )
+    close_activity, _outbox = store.plan_close_publication_activity(
+        activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        run_id=RUN_ID,
+        activity_ordinal=3,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=3,
+        semantic_input={"cancel": 1},
+        semantic_input_digest=request_digest({"cancel": 1}),
+        idempotency_key=request_digest({"kind": "CLOSE_PUBLICATION"}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        change_request_head_observation_id=HEAD_OBS_ID,
+        observed_change_request_head=DESIRED_COMMIT,
+    )
+    store.complete_close_publication_head_bound(
+        activity_id=close_activity.activity_id,
+        forge_observation_id=HEAD_OBS_ID,
+    )
+
+    checkpoint = store.complete_publication_update_effect(
+        publication_effect_checkpoint_id=CHECKPOINT_ID_5,
+        publication_id=PUBLICATION_ID,
+        effect_generation=2,
+        forge_observation_id=FORGE_OBS_ID,
+        observed_external_revision=REMEDIATED_COMMIT["oid"],
+    )
+
+    assert checkpoint.status == "COMPLETED"
+    publication = store.get_publication(PUBLICATION_ID)
+    assert publication is not None
+    assert publication.state == "CLOSED"
+    assert publication.effect_generation == 2
+    assert publication.observed_remote_commit == DESIRED_COMMIT["oid"]
+    assert publication.last_observation_id == HEAD_OBS_ID
+
+
 # -- plan_close_publication_activity / completion ----------------------------
 
 
@@ -558,6 +607,54 @@ def test_complete_close_publication_possible_create_replay_is_idempotent(store: 
     first = store.complete_close_publication_possible_create(**kwargs)  # type: ignore[arg-type]
     second = store.complete_close_publication_possible_create(**kwargs)  # type: ignore[arg-type]
     assert first == second
+
+
+def test_complete_close_publication_possible_create_superseded_is_noop(
+    store: RunStore,
+) -> None:
+    _plan_effect(store)
+    first, _first_outbox = store.plan_close_publication_activity(
+        activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        run_id=RUN_ID,
+        activity_ordinal=2,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=2,
+        semantic_input={"cancel": 1},
+        semantic_input_digest=request_digest({"cancel": 1}),
+        idempotency_key=request_digest({"kind": "CLOSE_PUBLICATION", "n": 1}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    )
+    store.plan_close_publication_activity(
+        activity_id="dddddddd-dddd-4ddd-8ddd-ddddddddddde",
+        run_id=RUN_ID,
+        activity_ordinal=3,
+        specification_generation=0,
+        policy_hash="sha256:" + "0" * 64,
+        created_transition_sequence=3,
+        semantic_input={"cancel": 2},
+        semantic_input_digest=request_digest({"cancel": 2}),
+        idempotency_key=request_digest({"kind": "CLOSE_PUBLICATION", "n": 2}),
+        outbox_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef",
+    )
+
+    fact, publication = store.complete_close_publication_possible_create(
+        controller_operation_fact_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+        activity_id=first.activity_id,
+        forge_observation_id=FORGE_OBS_ID,
+        operation_digest=request_digest({"op": "close"}),
+    )
+
+    assert fact is None
+    assert publication.state == "PLANNED"
+    first_after = store.get_activity(first.activity_id)
+    assert first_after is not None
+    assert first_after.state == "SUPERSEDED"
+    facts = store.conn.execute(
+        "SELECT COUNT(*) FROM controller_operation_facts WHERE activity_id = ?",
+        (first.activity_id,),
+    ).fetchone()[0]
+    assert facts == 0
 
 
 def test_complete_close_publication_possible_create_rejects_head_bound_activity(
