@@ -24,6 +24,7 @@ class ResultStreamHealth:
     retained_entries: int
     pending: int
     lag: int
+    consumers: int
     oldest_pending_idle_seconds: int | None
     max_delivery_count: int
     sampled_pending: int
@@ -32,6 +33,12 @@ class ResultStreamHealth:
     @property
     def work(self) -> int:
         return self.pending + self.lag
+
+    @property
+    def unconsumed(self) -> bool:
+        """True when the results consumer group has zero active consumers
+        but still has pending or lagging work -- i.e. nobody is reading."""
+        return self.consumers == 0 and self.work > 0
 
     @property
     def stale(self) -> bool:
@@ -83,7 +90,8 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
         group = matching[0]
         pending = _non_negative_int(group.get("pending"))
         raw_lag = _int_or_none(group.get("lag"))
-        if pending is None or raw_lag is None:
+        consumers = _non_negative_int(group.get("consumers"))
+        if pending is None or raw_lag is None or consumers is None:
             return _result(
                 stream,
                 stream_exists=True,
@@ -114,6 +122,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                     retained_entries=retained_entries,
                     pending=pending,
                     lag=lag,
+                    consumers=consumers,
                     inspection_error=f"{stream}: pending result entries are unavailable",
                 )
             oldest_idle_ms = 0
@@ -127,6 +136,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
                         retained_entries=retained_entries,
                         pending=pending,
                         lag=lag,
+                        consumers=consumers,
                         inspection_error=f"{stream}: pending result metadata is malformed",
                     )
                 oldest_idle_ms = max(oldest_idle_ms, idle_ms)
@@ -139,6 +149,7 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
             retained_entries=retained_entries,
             pending=pending,
             lag=lag,
+            consumers=consumers,
             oldest_pending_idle_seconds=oldest_idle_seconds,
             max_delivery_count=max_delivery_count,
             sampled_pending=sampled_pending,
@@ -148,9 +159,14 @@ def inspect_result_stream_raw(redis: RedisClient, stream: str) -> ResultStreamHe
 
 
 def format_result_stream_warning(health: ResultStreamHealth) -> str | None:
-    """Return a secret-free warning for stale or unreadable result handling."""
+    """Return a secret-free warning for unconsumed, stale, or unreadable result handling."""
     if health.inspection_error is not None:
         return f"RESULT STREAM UNHEALTHY {health.inspection_error}"
+    if health.unconsumed:
+        return (
+            f"UNCONSUMED result handling on {health.stream}: pending={health.pending} "
+            f"lag={health.lag} consumers=0"
+        )
     if not health.stale:
         return None
 
@@ -174,6 +190,7 @@ def _result(
     retained_entries: int = 0,
     pending: int = 0,
     lag: int = 0,
+    consumers: int = 0,
     oldest_pending_idle_seconds: int | None = None,
     max_delivery_count: int = 0,
     sampled_pending: int = 0,
@@ -184,6 +201,7 @@ def _result(
         group=RESULTS_GROUP,
         stream_exists=stream_exists,
         retained_entries=retained_entries,
+        consumers=consumers,
         pending=pending,
         lag=lag,
         oldest_pending_idle_seconds=oldest_pending_idle_seconds,

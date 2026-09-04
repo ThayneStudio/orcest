@@ -256,6 +256,33 @@ def test_rollout_health_fails_when_group_has_work_but_no_consumers(fake_redis_cl
     assert report["ok"] is False
 
 
+def test_rollout_health_fails_when_result_group_has_work_but_no_consumers(
+    fake_redis_client, mocker
+):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[
+            {
+                "name": "orchestrator",
+                "consumers": 0,
+                "pending": 0,
+                "lag": 1,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["unconsumed_results"] is True
+    consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
+    assert consumer_groups["passed"] is False
+    assert report["ok"] is False
+
+
 def test_rollout_health_requires_each_expected_backend_consumer(fake_redis_client, mocker):
     revision = "6" * 40
     mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)

@@ -392,7 +392,7 @@ def collect_rollout_health(
     result_work = result_health.work
     result_pending = result_health.pending
     result_lag = result_health.lag
-    unconsumed_results = result_health.inspection_error is not None and result_work > 0
+    unconsumed_results = result_health.unconsumed
     queue_depth = task_queue_depth + result_work
     pending = task_pending + result_pending
     lag = task_lag + result_lag
@@ -545,6 +545,7 @@ def collect_rollout_health(
         "result_retained_entries": result_health.retained_entries,
         "result_pending": result_pending,
         "result_lag": result_lag,
+        "result_consumers": result_health.consumers,
         "result_oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
         "result_max_delivery_count": result_health.max_delivery_count,
         "result_sampled_pending": result_health.sampled_pending,
