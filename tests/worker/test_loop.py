@@ -61,6 +61,7 @@ from orcest.worker.loop import (
     _make_abort_event,
     _publish_result_with_retry,
     _publish_task_output,
+    _refresh_worker_liveness,
     _runner_for_task,
     _signal_ephemeral_done,
     _stream_handoff_state,
@@ -196,6 +197,36 @@ def test_wait_for_redis_aborts_during_backoff():
 
     assert _wait_for_redis(redis, logging.getLogger("test.redis-wait"), abort) is False
     redis.health_check.assert_called_once()
+
+
+@pytest.mark.unit
+def test_worker_liveness_heartbeat_includes_bounded_provider_cli(local_worker_config, mocker):
+    revision = "a" * 40
+    mocker.patch("orcest.worker.loop.get_build_revision", return_value=revision)
+    redis = MagicMock()
+    provider_cli = {
+        "schema": 1,
+        "provider": "codex",
+        "desired_version": "0.149.1",
+        "template_version": "0.149.1",
+        "observed_version": "0.149.1",
+        "status": "ok",
+    }
+    local_worker_config.backend = "codex"
+
+    _refresh_worker_liveness(redis, local_worker_config, logging.getLogger("test"), provider_cli)
+
+    redis.set_ex.assert_called_once()
+    key, payload = redis.set_ex.call_args.args[:2]
+    assert key == f"workers:heartbeat:{local_worker_config.worker_id}"
+    heartbeat = json.loads(payload)
+    assert heartbeat == {
+        "backend": "codex",
+        "revision": revision,
+        "provider_cli": provider_cli,
+    }
+    assert "credential" not in payload.lower()
+    assert "home" not in payload.lower()
 
 
 @pytest.mark.unit
