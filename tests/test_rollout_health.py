@@ -5,6 +5,10 @@ import redis as redis_lib
 
 from orcest.rollout_health import collect_rollout_health
 from orcest.shared.provider_versions import desired_provider_cli_version
+from orcest.shared.result_stream_health import (
+    RESULT_PENDING_STALE_DELIVERIES,
+    RESULT_PENDING_STALE_IDLE_SECONDS,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -98,6 +102,109 @@ def test_rollout_health_counts_each_credential_checkpoint_once(fake_redis_client
     assert recovery["passed"] is True
 
 
+def test_rollout_health_allows_fresh_pending_result(fake_redis_client, mocker):
+    revision = "1" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1", "summary": "secret body"})
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is True
+    assert report["metrics"]["result_pending"] == 1
+    assert report["metrics"]["result_lag"] == 0
+    assert report["metrics"]["result_max_delivery_count"] == 1
+    fresh = next(c for c in report["checks"] if c["name"] == "result_handling_fresh")
+    assert fresh["passed"] is True
+
+
+def test_rollout_health_fails_on_stale_result_idle_age(fake_redis_client, mocker):
+    revision = "2" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        return_value=[
+            {
+                "message_id": "1-0",
+                "consumer": "orchestrator-main",
+                "time_since_delivered": RESULT_PENDING_STALE_IDLE_SECONDS * 1000,
+                "times_delivered": 1,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is False
+    assert report["metrics"]["result_oldest_pending_idle_seconds"] == (
+        RESULT_PENDING_STALE_IDLE_SECONDS
+    )
+    fresh = next(c for c in report["checks"] if c["name"] == "result_handling_fresh")
+    assert fresh["passed"] is False
+
+
+def test_rollout_health_fails_on_stale_result_delivery_count(fake_redis_client, mocker):
+    revision = "3" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        return_value=[
+            {
+                "message_id": "1-0",
+                "consumer": "orchestrator-main",
+                "time_since_delivered": 0,
+                "times_delivered": RESULT_PENDING_STALE_DELIVERIES,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is False
+    assert report["metrics"]["result_max_delivery_count"] == RESULT_PENDING_STALE_DELIVERIES
+    fresh = next(c for c in report["checks"] if c["name"] == "result_handling_fresh")
+    assert fresh["passed"] is False
+
+
+def test_rollout_health_treats_acked_retained_results_as_no_work(fake_redis_client, mocker):
+    revision = "4" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+    [(entry_id, _fields)] = fake_redis_client.xreadgroup(
+        "orchestrator", "orchestrator-main", "results", block_ms=None
+    )
+    fake_redis_client.xack("results", "orchestrator", entry_id)
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is True
+    assert report["metrics"]["result_retained_entries"] == 1
+    assert report["metrics"]["result_work"] == 0
+    assert report["metrics"]["result_pending"] == 0
+
+
+def test_rollout_health_allows_missing_result_stream_without_quiescence(mocker, fake_redis_client):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is True
+    assert report["metrics"]["result_retained_entries"] == 0
+    assert report["metrics"]["result_work"] == 0
+    assert report["metrics"]["result_stream_warning"] is None
+
+
 def test_rollout_health_fails_revision_mismatch(fake_redis_client, mocker):
     mocker.patch("orcest.rollout_health.get_build_revision", return_value="c" * 40)
 
@@ -144,6 +251,33 @@ def test_rollout_health_fails_when_group_has_work_but_no_consumers(fake_redis_cl
     report = collect_rollout_health(fake_redis_client, expected_revision=revision)
 
     assert report["metrics"]["unconsumed_task_streams"] == ["orcest:tasks:codex"]
+    consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
+    assert consumer_groups["passed"] is False
+    assert report["ok"] is False
+
+
+def test_rollout_health_fails_when_result_group_has_work_but_no_consumers(
+    fake_redis_client, mocker
+):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xinfo_groups",
+        return_value=[
+            {
+                "name": "orchestrator",
+                "consumers": 0,
+                "pending": 0,
+                "lag": 1,
+            }
+        ],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["metrics"]["unconsumed_results"] is True
     consumer_groups = next(c for c in report["checks"] if c["name"] == "consumer_groups")
     assert consumer_groups["passed"] is False
     assert report["ok"] is False
@@ -757,6 +891,63 @@ def test_rollout_health_fails_closed_when_results_key_has_wrong_type(fake_redis_
 
     assert report["ok"] is False
     assert "test:results: expected stream, found string" in report["metrics"]["inspection_errors"]
+
+
+def test_rollout_health_fails_closed_when_result_stream_has_no_group(fake_redis_client, mocker):
+    revision = "4" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is False
+    assert (
+        "test:results: results consumer group 'orchestrator' is missing"
+        in report["metrics"]["inspection_errors"]
+    )
+
+
+def test_rollout_health_fails_closed_when_result_group_inspection_errors(fake_redis_client, mocker):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    original_xinfo_groups = fake_redis_client.client.xinfo_groups
+
+    def fail_results_group(stream):
+        if stream == "test:results":
+            raise redis_lib.ResponseError("NOPERM secret detail")
+        return original_xinfo_groups(stream)
+
+    mocker.patch.object(fake_redis_client.client, "xinfo_groups", side_effect=fail_results_group)
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is False
+    assert "test:results: ResponseError" in report["metrics"]["inspection_errors"]
+    assert "secret detail" not in str(report)
+
+
+def test_rollout_health_fails_closed_when_result_pending_metadata_is_malformed(
+    fake_redis_client, mocker
+):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        return_value=[{"message_id": "1-0", "time_since_delivered": "bad"}],
+    )
+
+    report = collect_rollout_health(fake_redis_client, expected_revision=revision)
+
+    assert report["ok"] is False
+    assert (
+        "test:results: pending result metadata is malformed"
+        in report["metrics"]["inspection_errors"]
+    )
 
 
 def test_rollout_health_reads_pool_state_under_the_pool_prefix(fake_redis_client, mocker):
