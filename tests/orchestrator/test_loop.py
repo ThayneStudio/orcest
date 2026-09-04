@@ -1380,6 +1380,69 @@ def test_consume_results_completed_issue_disabled_verifier_keeps_legacy_path(
     gh_mock.remove_issue_label.assert_called_once()
 
 
+def test_consume_results_completed_issue_absent_ready_label_still_acks(
+    fake_redis_client, orchestrator_config, mocker
+):
+    """Regression for issue #777.
+
+    gh now reports an already-absent label as ``gh: Label does not exist
+    (HTTP 404)`` instead of a message containing "not found". Before the
+    fix, `gh.remove_issue_label` (unmocked here, only its subprocess call is
+    stubbed) raised on that response, `_handle_result` re-raised
+    `_RetryableResultError`, and the completed result was never ACKed.
+    """
+    import subprocess
+
+    from orcest.shared.config import IssueDeliveryVerifierConfig
+
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Label does not exist (HTTP 404)",
+        ),
+    )
+
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+    repo = orchestrator_config.github.repo
+    issue_number = 45
+    increment_issue_attempts(fake_redis_client, repo, issue_number)
+    result = _make_task_result(
+        status=ResultStatus.COMPLETED,
+        resource_type="issue",
+        resource_id=issue_number,
+        branch="issue-45-work",
+        snapshot_head_sha="a" * 40,
+    )
+    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
+
+    # The result was fully processed (not left pending/retried) ...
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, entry_id) == 0
+
+    # ... and replaying the same completed result is a no-op: no error, no
+    # regression of already-cleared state, nothing left pending.
+    _consume_results_for_project(
+        orchestrator_config.projects[0],
+        fake_redis_client,
+        orchestrator_config.labels,
+        logging.getLogger("test"),
+        max_transient_failures=orchestrator_config.max_transient_failures,
+        issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
+    )
+    assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+
+
 def test_consume_results_completed_does_not_clear_total_attempts(
     fake_redis_client, orchestrator_config, gh_mock
 ):
