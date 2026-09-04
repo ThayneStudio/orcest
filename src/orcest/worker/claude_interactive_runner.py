@@ -43,6 +43,20 @@ _COMPOSER_SETTLE_TICKS = 3
 _COMPOSER_SETTLE_FALLBACK_SECONDS = 20.0
 # A numbered selection row ("❯ 1. …"); the composer glyph is never numbered.
 _MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
+# The composer's bracketed-paste placeholder ("[Pasted text #1 +42 lines]").
+# Its presence after a submission keystroke means the Enter did not land.
+_PASTED_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
+# Bounded number of Enter-only resubmission attempts after the initial
+# submit keystroke, before giving up on confirming the prompt was accepted.
+_SUBMISSION_RETRY_LIMIT = 3
+# Minimum quiet time between submission keystrokes so a still-rendering TUI
+# frame is never mistaken for a stuck composer.
+_SUBMISSION_RETRY_SETTLE_SECONDS = 2.0
+# Hard cap on confirming Claude accepted the pasted prompt, independent of
+# (and far shorter than) the overall task timeout. A composer that never
+# clears and never shows activity fails fast here instead of consuming the
+# full runner timeout.
+_PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS = 60.0
 _USAGE_ERROR_LINE_RE = re.compile(
     r"^\s*(?:error:|api error:|claude(?: code)? error:|rate limit|usage limit|quota|"
     r"billing limit|token limit)",
@@ -270,9 +284,11 @@ class ClaudeInteractiveRunner:
         abort_event: threading.Event | None = None,
         timeout: float = 10.0,
     ) -> None:
-        # Bracketed paste keeps multi-line prompts intact in terminal UIs, then
-        # the final carriage return submits the completed prompt.
-        payload = f"\x1b[200~{prompt}\x1b[201~\r".encode("utf-8")
+        # Bracketed paste keeps multi-line prompts intact in terminal UIs.
+        # Submission is a separate keystroke (see _send_submit_keystroke) so
+        # a stuck composer can be recovered by retrying only the Enter, never
+        # by re-pasting the prompt.
+        payload = f"\x1b[200~{prompt}\x1b[201~".encode("utf-8")
         self._write_all(
             master_fd,
             payload,
@@ -280,7 +296,56 @@ class ClaudeInteractiveRunner:
             timeout=timeout,
         )
         if logger:
-            logger.info("Sent prompt to interactive Claude over PTY")
+            logger.info("Pasted prompt to interactive Claude over PTY")
+
+    def _send_submit_keystroke(
+        self,
+        master_fd: int,
+        logger: logging.Logger | None,
+        abort_event: threading.Event | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self._write_all(
+            master_fd,
+            b"\r",
+            abort_event=abort_event,
+            timeout=timeout,
+        )
+        if logger:
+            logger.info("Sent submission keystroke to interactive Claude")
+
+    def _submit_full_prompt(
+        self,
+        master_fd: int,
+        full_prompt: str,
+        logger: logging.Logger | None,
+        abort_event: threading.Event | None,
+        timeout: float,
+    ) -> None:
+        self._send_prompt(master_fd, full_prompt, logger, abort_event=abort_event, timeout=timeout)
+        self._send_submit_keystroke(master_fd, logger, abort_event=abort_event, timeout=timeout)
+
+    def _looks_like_activity_state(self, text: str) -> bool:
+        """True once Claude has visibly started working on the submitted prompt.
+
+        Claude Code's TUI shows an "esc to interrupt" status line while a
+        turn is in flight (spinner + tool calls). It is a single, unambiguous
+        marker unlike the composer's caret, so no render-settle debounce is
+        needed before trusting it.
+        """
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
+        normalized = re.sub(r"\s+", "", stripped).lower()
+        return "esctointerrupt" in normalized
+
+    def _looks_like_pending_paste_composer(self, text: str) -> bool:
+        """True while the composer still shows the bracketed-paste placeholder."""
+        stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text)).replace("\r", "\n")
+        caret_lines = [
+            unframed
+            for line in stripped.splitlines()
+            if (unframed := line.lstrip(" \t│┃║|")).startswith("❯")
+        ]
+        return any(_PASTED_PLACEHOLDER_RE.search(line) for line in caret_lines)
 
     def _looks_like_workspace_trust_prompt(self, text: str) -> bool:
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
@@ -481,7 +546,18 @@ class ClaudeInteractiveRunner:
                 workspace_trust_confirmed = False
                 bypass_permissions_confirmed = False
                 mcp_server_confirmed = False
-                prompt_sent = False
+                # prompt_pasted: bracketed-paste bytes were written.
+                # submission_confirmed: Claude positively started acting on the
+                # prompt (composer cleared or an activity signal was seen).
+                # These are tracked separately because writing the paste bytes
+                # only proves the write syscall succeeded, not that Claude's
+                # TUI accepted the submission.
+                prompt_pasted = False
+                submission_confirmed = False
+                submission_attempts = 0
+                last_submission_at = 0.0
+                paste_output_index = 0
+                pre_execution_deadline: float | None = None
                 setup_output_index = 0
                 quiet_ticks = 0
                 prompt_resends = 0
@@ -524,7 +600,7 @@ class ClaudeInteractiveRunner:
                                 summary="Claude usage limit reached",
                                 usage_exhausted=True,
                             )
-                        if not prompt_sent:
+                        if not prompt_pasted:
                             return RunnerResult(
                                 success=False,
                                 summary="Timed out waiting for interactive Claude input prompt",
@@ -533,6 +609,46 @@ class ClaudeInteractiveRunner:
                         return RunnerResult(
                             success=False,
                             summary=f"Timed out after {timeout}s",
+                            transient=True,
+                        )
+
+                    if (
+                        pre_execution_deadline is not None
+                        and not submission_confirmed
+                        and now >= pre_execution_deadline
+                    ):
+                        # Bytes were written but Claude never positively
+                        # confirmed the submission (composer stayed stuck on
+                        # the pasted placeholder). Fail fast instead of
+                        # burning the full task timeout on a session that
+                        # never started work.
+                        _kill_process_tree(proc)  # type: ignore[arg-type]
+                        self._drain_available_output(
+                            master_fd,
+                            terminal_output,
+                            on_output,
+                            logger,
+                            decoder,
+                        )
+                        self._finish_output_decoder(
+                            decoder,
+                            terminal_output,
+                            on_output,
+                            logger,
+                        )
+                        combined = "".join(terminal_output)
+                        if _is_interactive_usage_exhausted(combined, full_prompt):
+                            return RunnerResult(
+                                success=False,
+                                summary="Claude usage limit reached",
+                                usage_exhausted=True,
+                            )
+                        return RunnerResult(
+                            success=False,
+                            summary=(
+                                "Timed out confirming interactive Claude accepted the "
+                                "prompt submission"
+                            ),
                             transient=True,
                         )
 
@@ -562,20 +678,73 @@ class ClaudeInteractiveRunner:
                         # above.  Only now is a composer match trustworthy.
                         quiet_ticks += 1
                         if (
-                            not prompt_sent
+                            not prompt_pasted
                             and quiet_ticks >= _COMPOSER_SETTLE_TICKS
                             and self._looks_like_main_input_prompt(
                                 "".join(terminal_output[setup_output_index:])
                             )
                         ):
-                            self._send_prompt(
+                            remaining = max(0.0, attempt_deadline - time.monotonic())
+                            self._submit_full_prompt(
                                 master_fd,
                                 full_prompt,
                                 logger,
-                                abort_event=abort,
-                                timeout=max(0.0, attempt_deadline - time.monotonic()),
+                                abort,
+                                remaining,
                             )
-                            prompt_sent = True
+                            prompt_pasted = True
+                            paste_output_index = len(terminal_output)
+                            submission_attempts = 1
+                            last_submission_at = time.monotonic()
+                            pre_execution_deadline = min(
+                                time.monotonic() + _PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS,
+                                attempt_deadline,
+                            )
+                        elif (
+                            prompt_pasted
+                            and not submission_confirmed
+                            and quiet_ticks >= _COMPOSER_SETTLE_TICKS
+                        ):
+                            since_paste = "".join(terminal_output[paste_output_index:])
+                            if self._looks_like_activity_state(since_paste):
+                                submission_confirmed = True
+                                if logger:
+                                    logger.info(
+                                        "Detected Claude activity; prompt submission confirmed"
+                                    )
+                            elif self._looks_like_main_input_prompt(
+                                since_paste
+                            ) and not self._looks_like_pending_paste_composer(since_paste):
+                                submission_confirmed = True
+                                if logger:
+                                    logger.info(
+                                        "Composer cleared; treating prompt submission as confirmed"
+                                    )
+                            elif (
+                                submission_attempts < _SUBMISSION_RETRY_LIMIT
+                                and time.monotonic() - last_submission_at
+                                >= _SUBMISSION_RETRY_SETTLE_SECONDS
+                            ):
+                                self._send_submit_keystroke(
+                                    master_fd,
+                                    logger,
+                                    abort_event=abort,
+                                    timeout=max(0.0, attempt_deadline - time.monotonic()),
+                                )
+                                submission_attempts += 1
+                                last_submission_at = time.monotonic()
+                                # Rescope "since paste" to output after this
+                                # retry: a placeholder seen before an earlier
+                                # retry must not keep poisoning the composer-
+                                # cleared check once a later render drops it.
+                                paste_output_index = len(terminal_output)
+                                if logger:
+                                    logger.info(
+                                        "Composer still shows pasted placeholder; retrying "
+                                        "submission keystroke (attempt %d/%d)",
+                                        submission_attempts,
+                                        _SUBMISSION_RETRY_LIMIT,
+                                    )
                         continue
                     quiet_ticks = 0
                     if not self._read_available(
@@ -586,7 +755,7 @@ class ClaudeInteractiveRunner:
                         decoder,
                     ):
                         break
-                    if not prompt_sent:
+                    if not prompt_pasted:
                         if _is_interactive_usage_exhausted(
                             "".join(terminal_output),
                             full_prompt,
@@ -597,6 +766,16 @@ class ClaudeInteractiveRunner:
                                 summary="Claude usage limit reached",
                                 usage_exhausted=True,
                             )
+                    elif not submission_confirmed and self._looks_like_activity_state(
+                        "".join(terminal_output[paste_output_index:])
+                    ):
+                        # Activity can appear while the terminal is still
+                        # actively repainting (a spinner ticking), which never
+                        # satisfies the quiet-tick settle check above, so
+                        # activity is also checked here on every new read.
+                        submission_confirmed = True
+                        if logger:
+                            logger.info("Detected Claude activity; prompt submission confirmed")
 
                     # Setup dialogs are answered whenever they appear, not only
                     # before the task prompt goes out: Claude can raise one (the
@@ -634,20 +813,28 @@ class ClaudeInteractiveRunner:
                         confirmed_setup = True
                     if (
                         not confirmed_setup
-                        and not prompt_sent
+                        and not prompt_pasted
                         and time.monotonic() - last_setup_at >= _COMPOSER_SETTLE_FALLBACK_SECONDS
                         and self._looks_like_main_input_prompt(
                             "".join(terminal_output[setup_output_index:])
                         )
                     ):
-                        self._send_prompt(
+                        remaining = max(0.0, attempt_deadline - time.monotonic())
+                        self._submit_full_prompt(
                             master_fd,
                             full_prompt,
                             logger,
-                            abort_event=abort,
-                            timeout=max(0.0, attempt_deadline - time.monotonic()),
+                            abort,
+                            remaining,
                         )
-                        prompt_sent = True
+                        prompt_pasted = True
+                        paste_output_index = len(terminal_output)
+                        submission_attempts = 1
+                        last_submission_at = time.monotonic()
+                        pre_execution_deadline = min(
+                            time.monotonic() + _PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS,
+                            attempt_deadline,
+                        )
                     if confirmed_setup:
                         # Do not let a setup menu's rendering count as the
                         # later main prompt. Wait for new output after the
@@ -655,13 +842,18 @@ class ClaudeInteractiveRunner:
                         setup_output_index = len(terminal_output)
                         quiet_ticks = 0
                         last_setup_at = time.monotonic()
-                        if prompt_sent and prompt_resends < 1:
+                        if prompt_pasted and not submission_confirmed and prompt_resends < 1:
                             # A dialog we had to answer was on screen after the
                             # prompt went out, so the paste landed in that menu
                             # and its trailing carriage return picked the menu
                             # default -- Claude never received the task. Re-arm
                             # so the prompt is resent once the composer settles.
-                            prompt_sent = False
+                            # This can only happen before any activity signal:
+                            # once submission is confirmed, dialogs are still
+                            # answered above but never trigger a repaste.
+                            prompt_pasted = False
+                            submission_attempts = 0
+                            pre_execution_deadline = None
                             prompt_resends += 1
                             if logger:
                                 logger.info("Setup dialog consumed the task prompt; will resend it")

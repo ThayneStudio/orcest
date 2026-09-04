@@ -970,6 +970,375 @@ raise SystemExit(0)
     assert result.summary == "late bypass prompt confirmed"
 
 
+def test_looks_like_activity_state_detects_esc_to_interrupt() -> None:
+    runner = ClaudeInteractiveRunner()
+
+    assert runner._looks_like_activity_state("Cerebrating... (esc to interrupt)") is True
+    assert runner._looks_like_activity_state("❯ ") is False
+
+
+def test_looks_like_pending_paste_composer_detects_placeholder() -> None:
+    runner = ClaudeInteractiveRunner()
+
+    assert runner._looks_like_pending_paste_composer("❯ [Pasted text #1 +12 lines]") is True
+    assert runner._looks_like_pending_paste_composer("│ ❯ [Pasted text #2 +3 lines]") is True
+    assert runner._looks_like_pending_paste_composer("❯ ") is False
+
+
+def test_run_confirms_submission_on_first_enter_and_sends_exactly_one_enter(
+    tmp_path, monkeypatch
+) -> None:
+    """A composer that accepts the initial Enter must submit exactly once."""
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+# A real interactive TUI puts the tty in raw mode immediately, disabling
+# input echo and CR/NL translation. Match that so the fixture behaves like
+# the real Claude Code composer instead of a canonical-mode shell.
+tty.setraw(0)
+
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Drain any trailing submission-keystroke bytes still in flight.
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+# The composer clears and Claude starts working immediately.
+print("Cerebrating... (esc to interrupt)", flush=True)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+time.sleep(0.5)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("submitted on first enter\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    submit_calls: list[int] = []
+    original_submit = ClaudeInteractiveRunner._send_submit_keystroke
+
+    def counting_submit(self, *args, **kwargs):
+        submit_calls.append(1)
+        return original_submit(self, *args, **kwargs)
+
+    monkeypatch.setattr(ClaudeInteractiveRunner, "_send_submit_keystroke", counting_submit)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=8,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "submitted on first enter"
+    assert len(submit_calls) == 1
+
+
+def test_run_recovers_stuck_placeholder_with_later_enter(tmp_path, monkeypatch) -> None:
+    """A composer that keeps the pasted placeholder after the first Enter must
+    be recovered by a bounded, Enter-only retry -- never a repaste.
+    """
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.5,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+# A real interactive TUI puts the tty in raw mode immediately, disabling
+# input echo and CR/NL translation. Match that so the fixture behaves like
+# the real Claude Code composer instead of a canonical-mode shell.
+tty.setraw(0)
+
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Drain any bytes from the initial submission still in flight (e.g. its
+# trailing Enter) so they cannot be mistaken for the later retry keystroke.
+drain_deadline = time.time() + 0.5
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+# The composer stays stuck on the pasted placeholder: the first Enter did
+# not land.
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+
+retry = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    retry += chunk
+    if b"\\r" in retry:
+        break
+
+if retry.strip(b"\\r") != b"":
+    print(f"UNEXPECTED_RETRY_BYTES={retry!r}", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+
+print("❯ ", flush=True)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("recovered by later enter\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=10,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "recovered by later enter"
+
+
+def test_run_permanently_stuck_composer_fails_fast(tmp_path, monkeypatch) -> None:
+    """A composer that never clears must fail within the short pre-execution
+    deadline, not the full task timeout.
+    """
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.2,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import select
+import time
+import tty
+
+# A real interactive TUI puts the tty in raw mode immediately, disabling
+# input echo and CR/NL translation. Match that so the fixture behaves like
+# the real Claude Code composer instead of a canonical-mode shell.
+tty.setraw(0)
+
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    started = time.monotonic()
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=30,
+        credential="claude-token",
+    )
+
+    assert time.monotonic() - started < 10
+    assert result.success is False
+    assert result.transient is True
+    assert (
+        result.summary == "Timed out confirming interactive Claude accepted the prompt submission"
+    )
+
+
+def test_run_stops_recovery_once_activity_begins(tmp_path, monkeypatch) -> None:
+    """Once Claude shows activity, no further Enter or repaste may be sent,
+    even if activity is delayed enough that a bounded retry already fired.
+    """
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.5,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+# A real interactive TUI puts the tty in raw mode immediately, disabling
+# input echo and CR/NL translation. Match that so the fixture behaves like
+# the real Claude Code composer instead of a canonical-mode shell.
+tty.setraw(0)
+
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Stay silent long enough for the bounded retry to fire before revealing
+# activity, discarding whatever arrives during the silence.
+silent_deadline = time.time() + 2.0
+while time.time() < silent_deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        os.read(0, 65536)
+
+print("Cerebrating... (esc to interrupt)", flush=True)
+
+# Nothing further should ever arrive: no duplicate Enter, no repaste.
+extra = b""
+watch_deadline = time.time() + 2.5
+while time.time() < watch_deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    extra += chunk
+
+if extra:
+    print(f"UNEXPECTED_POST_ACTIVITY_BYTES={extra!r}", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    print("NO_RESULT_PATH", flush=True)
+    time.sleep(10)
+    raise SystemExit(1)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("delayed activity confirmed\\n")
+time.sleep(10)
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+
+    result = runner.run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=12,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "delayed activity confirmed"
+
+
 def test_run_does_not_send_prompt_into_a_partially_rendered_menu(tmp_path, monkeypatch) -> None:
     """The composer gate must not fire mid-render.
 
