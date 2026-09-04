@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,8 +34,13 @@ from orcest.workflow_contract.v1.digest import (
     budget_report_digest,
     capability_public_key_digest,
     capacity_report_digest,
+    change_request_search_member_digest,
+    change_request_search_member_external_reliance_digest,
+    change_request_search_member_ownership_proof_digest,
+    change_request_search_set_digest,
     checkpoint_digest,
     config_bundle_hash,
+    controller_operation_fact_digest,
     forge_observation_payload_digest,
     forge_observation_result_membership_digest,
     forge_observation_schedule_digest,
@@ -49,7 +54,10 @@ from orcest.workflow_contract.v1.digest import (
     is_valid_content_digest,
     launch_capability_claims_digest,
     policy_digest,
+    publication_effect_checkpoint_digest,
+    publication_effect_operation_digest,
     receipt_digest,
+    reconciliation_fact_digest,
     recovery_evidence_digest,
     request_digest,
     resolution_digest,
@@ -58,6 +66,8 @@ from orcest.workflow_contract.v1.digest import (
     review_assignment_digest,
     specification_digest,
     subject_refs_digest,
+    terminal_duplicate_cleanup_action_digest,
+    terminal_duplicate_cleanup_reservation_digest,
     timer_fact_digest,
     wait_condition_digest,
     work_item_discovery_set_digest,
@@ -86,12 +96,19 @@ from orcest.workflow_contract.v1.protocol_registry import (
     HEALTH_PROBE_REQUEST_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
+    PUBLICATION_EFFECT_PROTOCOL,
     REVIEW_RECEIPT_PROTOCOL,
     SECRET_PROVISION_ACCEPTED_PROTOCOL,
     SECRET_PROVISION_REQUEST_PROTOCOL,
     SECRET_PROVISION_RESULT_PROTOCOL,
+    TERMINAL_DUPLICATE_CLEANUP_PROTOCOL,
     WORKER_LOSS_PROTOCOL,
     WORKER_LOSS_RESULT_PROTOCOL,
+)
+from orcest.workflow_contract.v1.publication import (
+    SearchMember,
+    SearchPrecedenceOutcome,
+    search_precedence,
 )
 from orcest.workflow_contract.v1.structured_outputs import validate_attempt_structured_output
 from orcest.workflow_contract.v1.verification import (
@@ -100,7 +117,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1135,6 +1152,262 @@ class ControllerOperationFactRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationRecord:
+    """domain-model.md "Publication" -- the Run's reconciled external branch
+    and Change Request."""
+
+    publication_id: str
+    run_id: str
+    candidate_id: str
+    approved_commit_json: str
+    effect_generation: int
+    deterministic_branch: str
+    run_marker: str
+    state: str
+    created_transition_sequence: int
+    created_at_ms: int
+    updated_at_ms: int
+    expected_remote_commit: str | None = None
+    change_request_external_id: str | None = None
+    observed_remote_commit: str | None = None
+    initial_link_search_revision: str | None = None
+    initial_link_set_digest: str | None = None
+    initial_link_cardinality: str | None = None
+    initial_link_retained_external_id: str | None = None
+    initial_link_terminal_state: str | None = None
+    initial_link_terminal_search_observation_id: str | None = None
+    initial_link_terminal_member_ordinal: int | None = None
+    terminal_duplicate_cleanup_reservation_id: str | None = None
+    last_duplicate_reconciliation_fact_id: str | None = None
+    last_duplicate_search_revision: str | None = None
+    last_duplicate_set_digest: str | None = None
+    last_observation_id: str | None = None
+
+    @property
+    def approved_commit(self) -> Any:
+        return json.loads(self.approved_commit_json)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationEffectRecord:
+    """domain-model.md "Publication Effect" -- the immutable intended
+    external mutation workflow for one Publication generation."""
+
+    publication_id: str
+    effect_generation: int
+    activity_id: str
+    mode: str
+    candidate_id: str
+    desired_commit_json: str
+    publication_secret_id: str
+    publication_secret_version: int
+    base_ref: str
+    base_commit_json: str
+    base_movement_policy: str
+    operation_digest: str
+    created_transition_sequence: int
+    created_at_ms: int
+    expected_remote_commit: str | None = None
+    superseded: bool = False
+
+    @property
+    def desired_commit(self) -> Any:
+        return json.loads(self.desired_commit_json)
+
+    @property
+    def base_commit(self) -> Any:
+        return json.loads(self.base_commit_json)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationEffectCheckpointRecord:
+    """domain-model.md "Publication Effect Checkpoint" -- one immutable
+    ordered fact in a resumable Publication Effect."""
+
+    publication_effect_checkpoint_id: str
+    publication_id: str
+    effect_generation: int
+    checkpoint_sequence: int
+    suboperation_kind: str
+    status: str
+    checkpoint_digest: str
+    recorded_at_ms: int
+    request_idempotency_key: str | None = None
+    forge_observation_id: str | None = None
+    observed_external_revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeRequestSearchMemberRecord:
+    """domain-model.md "Change Request Search Member"."""
+
+    member_class: str
+    member_ordinal: int
+    change_request_external_id: str
+    observed_head_json: str
+    source_ref: str
+    run_marker: str
+    observed_body_revision: str
+    marker_set_digest: str
+    ownership_status: str
+    ownership_defect_codes: tuple[str, ...]
+    ownership_proof_digest: str
+    external_reliance_digest: str
+    member_digest: str
+    terminal_state: str | None = None
+    merge_commit_json: str | None = None
+    proof_kind: str | None = None
+    proof_publication_effect_generation: int | None = None
+    proof_create_checkpoint_id: str | None = None
+    proof_create_request_idempotency_key: str | None = None
+    creator_installation_or_account_ref: str | None = None
+    proof_deterministic_ref: str | None = None
+    proof_run_marker: str | None = None
+    proof_desired_commit_json: str | None = None
+    proof_observed_head_json: str | None = None
+    head_evidence_observation_id: str | None = None
+
+    @property
+    def observed_head(self) -> Any:
+        return json.loads(self.observed_head_json)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeRequestSearchMemberInput:
+    """Caller input for one member of a complete Change Request Search
+    (domain-model.md "Change Request Search Member"). ``ownership_status``
+    and ``ownership_defect_codes`` are the caller's already-computed
+    classification (``orcest.workflow_contract.v1.publication.
+    classify_member_ownership``); this input carries the raw evidence
+    ``record_change_request_search_result`` persists and digests."""
+
+    member_class: str
+    change_request_external_id: str
+    observed_head: Mapping[str, Any]
+    source_ref: str
+    run_marker: str
+    observed_body_revision: str
+    ownership_status: str
+    ownership_defect_codes: tuple[str, ...] = ()
+    terminal_state: str | None = None
+    merge_commit: Mapping[str, Any] | None = None
+    proof_kind: str | None = None
+    proof_publication_effect_generation: int | None = None
+    proof_create_checkpoint_id: str | None = None
+    proof_create_request_idempotency_key: str | None = None
+    creator_installation_or_account_ref: str | None = None
+    proof_deterministic_ref: str | None = None
+    proof_run_marker: str | None = None
+    proof_desired_commit: Mapping[str, Any] | None = None
+    proof_observed_head: Mapping[str, Any] | None = None
+    head_evidence_observation_id: str | None = None
+    external_reliance: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeRequestSearchResultRecord:
+    """domain-model.md "Forge Observation" ``CHANGE_REQUEST_SEARCH_RESULT``
+    plus its ordered "Change Request Search Member" children."""
+
+    change_request_search_result_id: str
+    forge_observation_id: str
+    publication_id: str
+    project_id: str
+    run_marker: str
+    deterministic_ref: str
+    external_revision: str
+    live_cardinality: str
+    duplicate_set_digest: str
+    created_at_ms: int
+    publication_effect_generation: int | None
+    members: tuple[ChangeRequestSearchMemberRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationDuplicateMemberRecord:
+    reconciliation_fact_id: str
+    member_ordinal: int
+    change_request_external_id: str
+    disposition: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationFactRecord:
+    """domain-model.md "Reconciliation Fact" -- the ``RECONCILE`` Activity's
+    terminal output."""
+
+    reconciliation_fact_id: str
+    activity_id: str
+    run_id: str
+    kind: str
+    fact_digest: str
+    created_transition_sequence: int
+    recorded_at_ms: int
+    publication_id: str | None = None
+    publication_effect_generation: int | None = None
+    causal_forge_observation_id: str | None = None
+    observed_ref_commit_json: str | None = None
+    pinned_base_relationship: str | None = None
+    safe_fetch_proof_digest: str | None = None
+    candidate_admission_proof_digest: str | None = None
+    validation_failure_digest: str | None = None
+    retained_live_external_id: str | None = None
+    duplicate_search_revision: str | None = None
+    duplicate_set_digest: str | None = None
+    ownership_evidence_digest: str | None = None
+    duplicate_members: tuple[ReconciliationDuplicateMemberRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDuplicateCleanupMemberRecord:
+    terminal_duplicate_cleanup_reservation_id: str
+    member_ordinal: int
+    change_request_external_id: str
+    observed_head_json: str
+    planned_action: str
+    record_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDuplicateCleanupReservationRecord:
+    """domain-model.md "Terminal Duplicate Cleanup Reservation"."""
+
+    terminal_duplicate_cleanup_reservation_id: str
+    publication_id: str
+    effect_generation: int
+    selected_terminal_external_id: str
+    selecting_search_observation_id: str
+    selecting_member_ordinal: int
+    state: str
+    next_member_ordinal: int
+    reservation_digest: str
+    created_transition_sequence: int
+    created_at_ms: int
+    completed_at_ms: int | None = None
+    members: tuple[TerminalDuplicateCleanupMemberRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDuplicateCleanupActionRecord:
+    """domain-model.md "Terminal Duplicate Cleanup Reservation" -- one
+    generation-at-a-time Action processing a Reservation's members."""
+
+    terminal_duplicate_cleanup_action_id: str
+    terminal_duplicate_cleanup_reservation_id: str
+    member_ordinal: int
+    change_request_external_id: str
+    planned_action: str
+    state: str
+    operation_digest: str
+    action_digest: str
+    created_at_ms: int
+    outcome: str | None = None
+    forge_observation_id: str | None = None
+    outbox_id: str | None = None
+    completed_at_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CapacityReportEntryInput:
     """One caller-submitted scope observation within a Capacity Report."""
 
@@ -1836,6 +2109,61 @@ def _require_controller_import_replay_match(
         raise IdempotencyConflictError(
             "controller operation fact id was reused with different content"
         )
+
+
+# domain-model.md "Publication Effect Checkpoint" 2287-2307: the closed
+# (suboperation_kind, status) matrix, plus whether request_idempotency_key /
+# forge_observation_id are required ("R"), forbidden ("F"), or optional
+# ("O", only valid alongside a reconciliation-adopted read-back).
+_PUBLICATION_CHECKPOINT_MATRIX: Mapping[str, Mapping[str, tuple[str, str]]] = {
+    "BASE_READ_PRE": {"OBSERVED_SATISFIED": ("F", "R"), "BASE_MISMATCH": ("F", "R")},
+    "REF_READ": {"OBSERVED_ABSENT": ("F", "R"), "OBSERVED_SATISFIED": ("F", "R")},
+    "REF_CREATE": {
+        "REQUEST_READY": ("R", "F"),
+        "AMBIGUOUS": ("R", "F"),
+        "OBSERVED_SATISFIED": ("O", "R"),
+        "CAS_MISMATCH": ("O", "R"),
+    },
+    "REF_UPDATE": {
+        "REQUEST_READY": ("R", "F"),
+        "AMBIGUOUS": ("R", "F"),
+        "OBSERVED_SATISFIED": ("O", "R"),
+        "CAS_MISMATCH": ("O", "R"),
+    },
+    "COMPLETE_MARKER_SEARCH": {"OBSERVED_SATISFIED": ("F", "R")},
+    "CHANGE_REQUEST_SEARCH": {"OBSERVED_ABSENT": ("F", "R"), "OBSERVED_SATISFIED": ("F", "R")},
+    "CHANGE_REQUEST_CREATE": {
+        "REQUEST_READY": ("R", "F"),
+        "AMBIGUOUS": ("R", "F"),
+        "OBSERVED_SATISFIED": ("O", "R"),
+    },
+    "BASE_READ_POST": {"OBSERVED_SATISFIED": ("F", "R"), "BASE_MISMATCH": ("F", "R")},
+    "COMPLETE": {"COMPLETED": ("F", "R")},
+}
+
+
+def _validate_checkpoint_matrix(
+    *,
+    suboperation_kind: str,
+    status: str,
+    request_idempotency_key: str | None,
+    forge_observation_id: str | None,
+) -> None:
+    statuses = _PUBLICATION_CHECKPOINT_MATRIX.get(suboperation_kind)
+    if statuses is None or status not in statuses:
+        raise ValueError(
+            f"{status!r} is not a valid Publication Effect Checkpoint status for "
+            f"suboperation {suboperation_kind!r}"
+        )
+    key_rule, observation_rule = statuses[status]
+    if key_rule == "R" and request_idempotency_key is None:
+        raise ValueError(f"{suboperation_kind}/{status} requires request_idempotency_key")
+    if key_rule == "F" and request_idempotency_key is not None:
+        raise ValueError(f"{suboperation_kind}/{status} forbids request_idempotency_key")
+    if observation_rule == "R" and forge_observation_id is None:
+        raise ValueError(f"{suboperation_kind}/{status} requires forge_observation_id")
+    if observation_rule == "F" and forge_observation_id is not None:
+        raise ValueError(f"{suboperation_kind}/{status} forbids forge_observation_id")
 
 
 _CAPACITY_SCOPE_ORDER = {"WORKER_SESSION": 0, "WORKER_PROFILE": 1, "CAPACITY_POOL": 2}
@@ -3052,6 +3380,199 @@ def _row_to_controller_operation_fact(row: sqlite3.Row) -> ControllerOperationFa
         operation_digest=row["operation_digest"],
         fact_digest=row["fact_digest"],
         recorded_at_ms=row["recorded_at_ms"],
+    )
+
+
+def _row_to_publication(row: sqlite3.Row) -> PublicationRecord:
+    return PublicationRecord(
+        publication_id=row["publication_id"],
+        run_id=row["run_id"],
+        candidate_id=row["candidate_id"],
+        approved_commit_json=row["approved_commit_json"],
+        effect_generation=row["effect_generation"],
+        deterministic_branch=row["deterministic_branch"],
+        run_marker=row["run_marker"],
+        expected_remote_commit=row["expected_remote_commit"],
+        change_request_external_id=row["change_request_external_id"],
+        observed_remote_commit=row["observed_remote_commit"],
+        initial_link_search_revision=row["initial_link_search_revision"],
+        initial_link_set_digest=row["initial_link_set_digest"],
+        initial_link_cardinality=row["initial_link_cardinality"],
+        initial_link_retained_external_id=row["initial_link_retained_external_id"],
+        initial_link_terminal_state=row["initial_link_terminal_state"],
+        initial_link_terminal_search_observation_id=row[
+            "initial_link_terminal_search_observation_id"
+        ],
+        initial_link_terminal_member_ordinal=row["initial_link_terminal_member_ordinal"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        last_duplicate_reconciliation_fact_id=row["last_duplicate_reconciliation_fact_id"],
+        last_duplicate_search_revision=row["last_duplicate_search_revision"],
+        last_duplicate_set_digest=row["last_duplicate_set_digest"],
+        state=row["state"],
+        last_observation_id=row["last_observation_id"],
+        created_transition_sequence=row["created_transition_sequence"],
+        created_at_ms=row["created_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
+    )
+
+
+def _row_to_publication_effect(row: sqlite3.Row) -> PublicationEffectRecord:
+    return PublicationEffectRecord(
+        publication_id=row["publication_id"],
+        effect_generation=row["effect_generation"],
+        activity_id=row["activity_id"],
+        mode=row["mode"],
+        candidate_id=row["candidate_id"],
+        desired_commit_json=row["desired_commit_json"],
+        expected_remote_commit=row["expected_remote_commit"],
+        publication_secret_id=row["publication_secret_id"],
+        publication_secret_version=row["publication_secret_version"],
+        base_ref=row["base_ref"],
+        base_commit_json=row["base_commit_json"],
+        base_movement_policy=row["base_movement_policy"],
+        operation_digest=row["operation_digest"],
+        superseded=bool(row["superseded"]),
+        created_transition_sequence=row["created_transition_sequence"],
+        created_at_ms=row["created_at_ms"],
+    )
+
+
+def _row_to_publication_effect_checkpoint(row: sqlite3.Row) -> PublicationEffectCheckpointRecord:
+    return PublicationEffectCheckpointRecord(
+        publication_effect_checkpoint_id=row["publication_effect_checkpoint_id"],
+        publication_id=row["publication_id"],
+        effect_generation=row["effect_generation"],
+        checkpoint_sequence=row["checkpoint_sequence"],
+        suboperation_kind=row["suboperation_kind"],
+        status=row["status"],
+        request_idempotency_key=row["request_idempotency_key"],
+        forge_observation_id=row["forge_observation_id"],
+        observed_external_revision=row["observed_external_revision"],
+        checkpoint_digest=row["checkpoint_digest"],
+        recorded_at_ms=row["recorded_at_ms"],
+    )
+
+
+def _row_to_change_request_search_member(row: sqlite3.Row) -> ChangeRequestSearchMemberRecord:
+    return ChangeRequestSearchMemberRecord(
+        member_class=row["member_class"],
+        member_ordinal=row["member_ordinal"],
+        change_request_external_id=row["change_request_external_id"],
+        observed_head_json=row["observed_head_json"],
+        terminal_state=row["terminal_state"],
+        merge_commit_json=row["merge_commit_json"],
+        source_ref=row["source_ref"],
+        run_marker=row["run_marker"],
+        observed_body_revision=row["observed_body_revision"],
+        marker_set_digest=row["marker_set_digest"],
+        ownership_status=row["ownership_status"],
+        proof_kind=row["proof_kind"],
+        proof_publication_effect_generation=row["proof_publication_effect_generation"],
+        proof_create_checkpoint_id=row["proof_create_checkpoint_id"],
+        proof_create_request_idempotency_key=row["proof_create_request_idempotency_key"],
+        creator_installation_or_account_ref=row["creator_installation_or_account_ref"],
+        proof_deterministic_ref=row["proof_deterministic_ref"],
+        proof_run_marker=row["proof_run_marker"],
+        proof_desired_commit_json=row["proof_desired_commit_json"],
+        proof_observed_head_json=row["proof_observed_head_json"],
+        head_evidence_observation_id=row["head_evidence_observation_id"],
+        ownership_defect_codes=tuple(json.loads(row["ownership_defect_codes_json"])),
+        ownership_proof_digest=row["ownership_proof_digest"],
+        external_reliance_digest=row["external_reliance_digest"],
+        member_digest=row["member_digest"],
+    )
+
+
+def _row_to_reconciliation_duplicate_member(
+    row: sqlite3.Row,
+) -> ReconciliationDuplicateMemberRecord:
+    return ReconciliationDuplicateMemberRecord(
+        reconciliation_fact_id=row["reconciliation_fact_id"],
+        member_ordinal=row["member_ordinal"],
+        change_request_external_id=row["change_request_external_id"],
+        disposition=row["disposition"],
+    )
+
+
+def _row_to_reconciliation_fact(
+    row: sqlite3.Row, *, duplicate_members: tuple[ReconciliationDuplicateMemberRecord, ...] = ()
+) -> ReconciliationFactRecord:
+    return ReconciliationFactRecord(
+        reconciliation_fact_id=row["reconciliation_fact_id"],
+        activity_id=row["activity_id"],
+        run_id=row["run_id"],
+        publication_id=row["publication_id"],
+        publication_effect_generation=row["publication_effect_generation"],
+        kind=row["kind"],
+        causal_forge_observation_id=row["causal_forge_observation_id"],
+        observed_ref_commit_json=row["observed_ref_commit_json"],
+        pinned_base_relationship=row["pinned_base_relationship"],
+        safe_fetch_proof_digest=row["safe_fetch_proof_digest"],
+        candidate_admission_proof_digest=row["candidate_admission_proof_digest"],
+        validation_failure_digest=row["validation_failure_digest"],
+        retained_live_external_id=row["retained_live_external_id"],
+        duplicate_search_revision=row["duplicate_search_revision"],
+        duplicate_set_digest=row["duplicate_set_digest"],
+        ownership_evidence_digest=row["ownership_evidence_digest"],
+        fact_digest=row["fact_digest"],
+        created_transition_sequence=row["created_transition_sequence"],
+        recorded_at_ms=row["recorded_at_ms"],
+        duplicate_members=duplicate_members,
+    )
+
+
+def _row_to_terminal_duplicate_cleanup_member(
+    row: sqlite3.Row,
+) -> TerminalDuplicateCleanupMemberRecord:
+    return TerminalDuplicateCleanupMemberRecord(
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        member_ordinal=row["member_ordinal"],
+        change_request_external_id=row["change_request_external_id"],
+        observed_head_json=row["observed_head_json"],
+        planned_action=row["planned_action"],
+        record_reason=row["record_reason"],
+    )
+
+
+def _row_to_terminal_duplicate_cleanup_reservation(
+    row: sqlite3.Row,
+    *,
+    members: tuple[TerminalDuplicateCleanupMemberRecord, ...] = (),
+) -> TerminalDuplicateCleanupReservationRecord:
+    return TerminalDuplicateCleanupReservationRecord(
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        publication_id=row["publication_id"],
+        effect_generation=row["effect_generation"],
+        selected_terminal_external_id=row["selected_terminal_external_id"],
+        selecting_search_observation_id=row["selecting_search_observation_id"],
+        selecting_member_ordinal=row["selecting_member_ordinal"],
+        state=row["state"],
+        next_member_ordinal=row["next_member_ordinal"],
+        reservation_digest=row["reservation_digest"],
+        created_transition_sequence=row["created_transition_sequence"],
+        created_at_ms=row["created_at_ms"],
+        completed_at_ms=row["completed_at_ms"],
+        members=members,
+    )
+
+
+def _row_to_terminal_duplicate_cleanup_action(
+    row: sqlite3.Row,
+) -> TerminalDuplicateCleanupActionRecord:
+    return TerminalDuplicateCleanupActionRecord(
+        terminal_duplicate_cleanup_action_id=row["terminal_duplicate_cleanup_action_id"],
+        terminal_duplicate_cleanup_reservation_id=row["terminal_duplicate_cleanup_reservation_id"],
+        member_ordinal=row["member_ordinal"],
+        change_request_external_id=row["change_request_external_id"],
+        planned_action=row["planned_action"],
+        state=row["state"],
+        outcome=row["outcome"],
+        operation_digest=row["operation_digest"],
+        forge_observation_id=row["forge_observation_id"],
+        outbox_id=row["outbox_id"],
+        action_digest=row["action_digest"],
+        created_at_ms=row["created_at_ms"],
+        completed_at_ms=row["completed_at_ms"],
     )
 
 
@@ -4691,6 +5212,286 @@ CREATE TABLE IF NOT EXISTS controller_operation_facts (
   )
 );
 
+CREATE TABLE IF NOT EXISTS publications (
+  publication_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id) ON DELETE RESTRICT,
+  candidate_id TEXT NOT NULL,
+  approved_commit_json TEXT NOT NULL,
+  effect_generation INTEGER NOT NULL CHECK (effect_generation > 0),
+  deterministic_branch TEXT NOT NULL,
+  run_marker TEXT NOT NULL,
+  expected_remote_commit TEXT,
+  change_request_external_id TEXT UNIQUE,
+  observed_remote_commit TEXT,
+  initial_link_search_revision TEXT,
+  initial_link_set_digest TEXT,
+  initial_link_cardinality TEXT CHECK (
+    initial_link_cardinality IS NULL
+    OR initial_link_cardinality IN ({_sql_in(_enum_values("publication.link_cardinality"))})
+  ),
+  initial_link_retained_external_id TEXT,
+  initial_link_terminal_state TEXT CHECK (
+    initial_link_terminal_state IS NULL
+    OR initial_link_terminal_state
+      IN ({_sql_in(_enum_values("publication.initial_link_terminal_state"))})
+  ),
+  initial_link_terminal_search_observation_id TEXT,
+  initial_link_terminal_member_ordinal INTEGER CHECK (
+    initial_link_terminal_member_ordinal IS NULL OR initial_link_terminal_member_ordinal >= 0
+  ),
+  terminal_duplicate_cleanup_reservation_id TEXT,
+  last_duplicate_reconciliation_fact_id TEXT,
+  last_duplicate_search_revision TEXT,
+  last_duplicate_set_digest TEXT,
+  state TEXT NOT NULL CHECK (state IN ({_sql_in(_enum_values("publication.state"))})),
+  last_observation_id TEXT,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  CHECK (
+    (last_duplicate_reconciliation_fact_id IS NULL) = (last_duplicate_search_revision IS NULL)
+  ),
+  CHECK ((last_duplicate_search_revision IS NULL) = (last_duplicate_set_digest IS NULL)),
+  CHECK (
+    (initial_link_terminal_state IS NULL) = (initial_link_terminal_search_observation_id IS NULL)
+  ),
+  CHECK (
+    (initial_link_terminal_state IS NULL) = (initial_link_terminal_member_ordinal IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS publication_effects (
+  publication_id TEXT NOT NULL REFERENCES publications(publication_id) ON DELETE RESTRICT,
+  effect_generation INTEGER NOT NULL CHECK (effect_generation > 0),
+  activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  mode TEXT NOT NULL CHECK (mode IN ({_sql_in(_enum_values("publication_effect.mode"))})),
+  candidate_id TEXT NOT NULL,
+  desired_commit_json TEXT NOT NULL,
+  expected_remote_commit TEXT,
+  publication_secret_id TEXT NOT NULL,
+  publication_secret_version INTEGER NOT NULL CHECK (publication_secret_version > 0),
+  base_ref TEXT NOT NULL,
+  base_commit_json TEXT NOT NULL,
+  base_movement_policy TEXT NOT NULL CHECK (
+    base_movement_policy IN ({_sql_in(_enum_values("snapshot.base_movement_policy"))})
+  ),
+  operation_digest TEXT NOT NULL,
+  superseded INTEGER NOT NULL DEFAULT 0 CHECK (superseded IN (0, 1)),
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  PRIMARY KEY (publication_id, effect_generation)
+);
+
+CREATE TABLE IF NOT EXISTS publication_effect_checkpoints (
+  publication_effect_checkpoint_id TEXT PRIMARY KEY,
+  publication_id TEXT NOT NULL,
+  effect_generation INTEGER NOT NULL,
+  checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+  suboperation_kind TEXT NOT NULL CHECK (
+    suboperation_kind
+      IN ({_sql_in(_enum_values("publication_effect_checkpoint.suboperation_kind"))})
+  ),
+  status TEXT NOT NULL CHECK (
+    status IN ({_sql_in(_enum_values("publication_effect_checkpoint.status"))})
+  ),
+  request_idempotency_key TEXT,
+  forge_observation_id TEXT,
+  observed_external_revision TEXT,
+  checkpoint_digest TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  FOREIGN KEY (publication_id, effect_generation)
+    REFERENCES publication_effects(publication_id, effect_generation) ON DELETE RESTRICT,
+  UNIQUE (publication_id, effect_generation, checkpoint_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS change_request_search_results (
+  change_request_search_result_id TEXT PRIMARY KEY,
+  forge_observation_id TEXT NOT NULL UNIQUE,
+  publication_id TEXT NOT NULL REFERENCES publications(publication_id) ON DELETE RESTRICT,
+  project_id TEXT NOT NULL,
+  run_marker TEXT NOT NULL,
+  deterministic_ref TEXT NOT NULL,
+  external_revision TEXT NOT NULL,
+  live_cardinality TEXT NOT NULL CHECK (
+    live_cardinality IN ({_sql_in(_enum_values("publication.link_cardinality"))})
+  ),
+  duplicate_set_digest TEXT NOT NULL,
+  publication_effect_generation INTEGER CHECK (
+    publication_effect_generation IS NULL OR publication_effect_generation > 0
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_request_search_results_publication
+ON change_request_search_results(publication_id, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS change_request_search_members (
+  change_request_search_result_id TEXT NOT NULL
+    REFERENCES change_request_search_results(change_request_search_result_id) ON DELETE RESTRICT,
+  member_class TEXT NOT NULL CHECK (
+    member_class IN ({_sql_in(_enum_values("change_request_search_member.member_class"))})
+  ),
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  change_request_external_id TEXT NOT NULL,
+  observed_head_json TEXT NOT NULL,
+  terminal_state TEXT CHECK (
+    terminal_state IS NULL
+    OR terminal_state IN ({_sql_in(_enum_values("change_request_search_member.terminal_state"))})
+  ),
+  merge_commit_json TEXT,
+  source_ref TEXT NOT NULL,
+  run_marker TEXT NOT NULL,
+  observed_body_revision TEXT NOT NULL,
+  marker_set_digest TEXT NOT NULL,
+  ownership_status TEXT NOT NULL CHECK (
+    ownership_status
+      IN ({_sql_in(_enum_values("change_request_search_member.ownership_status"))})
+  ),
+  proof_kind TEXT CHECK (
+    proof_kind IS NULL
+    OR proof_kind IN ({_sql_in(_enum_values("change_request_search_member.proof_kind"))})
+  ),
+  proof_publication_effect_generation INTEGER CHECK (
+    proof_publication_effect_generation IS NULL OR proof_publication_effect_generation > 0
+  ),
+  proof_create_checkpoint_id TEXT,
+  proof_create_request_idempotency_key TEXT,
+  creator_installation_or_account_ref TEXT,
+  proof_deterministic_ref TEXT,
+  proof_run_marker TEXT,
+  proof_desired_commit_json TEXT,
+  proof_observed_head_json TEXT,
+  head_evidence_observation_id TEXT,
+  ownership_defect_codes_json TEXT NOT NULL,
+  ownership_proof_digest TEXT NOT NULL,
+  external_reliance_digest TEXT NOT NULL,
+  member_digest TEXT NOT NULL,
+  PRIMARY KEY (change_request_search_result_id, member_class, member_ordinal),
+  UNIQUE (change_request_search_result_id, change_request_external_id),
+  CHECK (member_class = 'LIVE' OR terminal_state IS NOT NULL),
+  CHECK (member_class = 'TERMINAL' OR terminal_state IS NULL),
+  CHECK (terminal_state = 'MERGED' OR merge_commit_json IS NULL),
+  CHECK ((ownership_status = 'POSITIVE') = (proof_kind IS NOT NULL)),
+  CHECK (ownership_status = 'POSITIVE' OR creator_installation_or_account_ref IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_facts (
+  reconciliation_fact_id TEXT PRIMARY KEY,
+  activity_id TEXT NOT NULL UNIQUE REFERENCES activities(activity_id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  publication_id TEXT REFERENCES publications(publication_id) ON DELETE RESTRICT,
+  publication_effect_generation INTEGER CHECK (
+    publication_effect_generation IS NULL OR publication_effect_generation > 0
+  ),
+  kind TEXT NOT NULL CHECK (kind IN ({_sql_in(_enum_values("reconciliation_fact.kind"))})),
+  causal_forge_observation_id TEXT,
+  observed_ref_commit_json TEXT,
+  pinned_base_relationship TEXT CHECK (
+    pinned_base_relationship IS NULL
+    OR pinned_base_relationship
+      IN ({_sql_in(_enum_values("reconciliation_fact.pinned_base_relationship"))})
+  ),
+  safe_fetch_proof_digest TEXT,
+  candidate_admission_proof_digest TEXT,
+  validation_failure_digest TEXT,
+  retained_live_external_id TEXT,
+  duplicate_search_revision TEXT,
+  duplicate_set_digest TEXT,
+  ownership_evidence_digest TEXT,
+  fact_digest TEXT NOT NULL UNIQUE,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  CHECK (
+    kind != 'PRELINK_REF_IMPORTABLE'
+    OR (candidate_admission_proof_digest IS NOT NULL AND validation_failure_digest IS NULL)
+  ),
+  CHECK (
+    kind != 'PRELINK_REF_RECONSTRUCT_REQUIRED'
+    OR (validation_failure_digest IS NOT NULL AND candidate_admission_proof_digest IS NULL)
+  ),
+  CHECK (kind != 'OWNERSHIP_CONFLICT' OR ownership_evidence_digest IS NOT NULL),
+  CHECK (kind != 'REDUNDANT_PUBLICATIONS_PROVEN' OR retained_live_external_id IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_duplicate_members (
+  reconciliation_fact_id TEXT NOT NULL
+    REFERENCES reconciliation_facts(reconciliation_fact_id) ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  change_request_external_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK (
+    disposition IN ({_sql_in(_enum_values("reconciliation_duplicate_member.disposition"))})
+  ),
+  PRIMARY KEY (reconciliation_fact_id, member_ordinal),
+  UNIQUE (reconciliation_fact_id, change_request_external_id)
+);
+
+CREATE TABLE IF NOT EXISTS terminal_duplicate_cleanup_reservations (
+  terminal_duplicate_cleanup_reservation_id TEXT PRIMARY KEY,
+  publication_id TEXT NOT NULL,
+  effect_generation INTEGER NOT NULL CHECK (effect_generation > 0),
+  selected_terminal_external_id TEXT NOT NULL,
+  selecting_search_observation_id TEXT NOT NULL,
+  selecting_member_ordinal INTEGER NOT NULL CHECK (selecting_member_ordinal >= 0),
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_reservation.state"))})
+  ),
+  next_member_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_member_ordinal >= 0),
+  reservation_digest TEXT NOT NULL,
+  created_transition_sequence INTEGER NOT NULL CHECK (created_transition_sequence > 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  FOREIGN KEY (publication_id, effect_generation)
+    REFERENCES publication_effects(publication_id, effect_generation) ON DELETE RESTRICT,
+  CHECK ((state = 'COMPLETED') = (completed_at_ms IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS terminal_duplicate_cleanup_members (
+  terminal_duplicate_cleanup_reservation_id TEXT NOT NULL
+    REFERENCES terminal_duplicate_cleanup_reservations(terminal_duplicate_cleanup_reservation_id)
+    ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  change_request_external_id TEXT NOT NULL,
+  observed_head_json TEXT NOT NULL,
+  planned_action TEXT NOT NULL CHECK (
+    planned_action IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_member.planned_action"))})
+  ),
+  record_reason TEXT CHECK (
+    record_reason IS NULL
+    OR record_reason IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_action.record_reason"))})
+  ),
+  PRIMARY KEY (terminal_duplicate_cleanup_reservation_id, member_ordinal),
+  UNIQUE (terminal_duplicate_cleanup_reservation_id, change_request_external_id),
+  CHECK ((planned_action = 'RECORD_ONLY') = (record_reason IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS terminal_duplicate_cleanup_actions (
+  terminal_duplicate_cleanup_action_id TEXT PRIMARY KEY,
+  terminal_duplicate_cleanup_reservation_id TEXT NOT NULL
+    REFERENCES terminal_duplicate_cleanup_reservations(terminal_duplicate_cleanup_reservation_id)
+    ON DELETE RESTRICT,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  change_request_external_id TEXT NOT NULL,
+  planned_action TEXT NOT NULL CHECK (
+    planned_action IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_member.planned_action"))})
+  ),
+  state TEXT NOT NULL CHECK (
+    state IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_action.state"))})
+  ),
+  outcome TEXT CHECK (
+    outcome IS NULL
+    OR outcome IN ({_sql_in(_enum_values("terminal_duplicate_cleanup_action.outcome"))})
+  ),
+  operation_digest TEXT NOT NULL,
+  forge_observation_id TEXT,
+  outbox_id TEXT REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
+  action_digest TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= created_at_ms),
+  UNIQUE (terminal_duplicate_cleanup_reservation_id, member_ordinal),
+  CHECK ((state = 'COMPLETED') = (outcome IS NOT NULL AND completed_at_ms IS NOT NULL)),
+  CHECK (state != 'SUPERSEDED' OR completed_at_ms IS NOT NULL)
+);
+
 CREATE TABLE IF NOT EXISTS health_probe_requests (
   health_probe_request_id TEXT PRIMARY KEY,
   protocol_version TEXT NOT NULL,
@@ -6021,6 +6822,13 @@ CREATE TABLE IF NOT EXISTS human_resolutions (
 
 _V18_TO_V19 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS review_receipts") :]
 
+# publications and its sibling tables are appended directly after
+# controller_operation_facts, which is well before the true end of _SCHEMA,
+# so this slice (like _V18_TO_V19 above) also idempotently re-runs every
+# CREATE TABLE/INDEX IF NOT EXISTS statement after it -- harmless on tables
+# that already exist in their final shape.
+_V19_TO_V20 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS publications") :]
+
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
 # _V5_TO_V6 rename-dance for a real v5 one) so these two CREATE INDEX
@@ -6194,7 +7002,7 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -6648,8 +7456,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 18
+            elif current == 18:
                 self.conn.executescript(
                     "BEGIN EXCLUSIVE;\n" + add_human_boundary_pointer + "\n" + _V18_TO_V19
                 )
@@ -6659,6 +7466,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-review-consensus-panels",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 19
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V19_TO_V20)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-publication-creation",
                         _now_ms(),
                     ),
                 )
@@ -13341,6 +14160,2049 @@ class RunStore:
         except Exception:
             candidate_store.discard_staged(staged_path)
             raise
+
+    # -- Publication (domain-model.md "Publication" / "Publication Effect" /
+    # "Publication Effect Checkpoint") -----------------------------------
+    #
+    # This leaf (issue #692, "reconciled single-publication creation") owns
+    # Publication/Effect/Checkpoint creation, the complete marker search
+    # classifier, ref CAS, and Terminal Duplicate Cleanup Reservation
+    # creation for a positive merged-terminal selection. It does not own:
+    # ``UPDATE``-mode Effects (SHA-fenced remediation, ``PR_REMEDIATE``,
+    # ongoing ``PR_MONITORING``), ``REPAIR_RUN_MARKER`` (linked-CR marker
+    # repair), or steady-state post-``ACTIVE`` duplicate reconciliation --
+    # all later "workflow v1" leaves (docs/superpowers/plans/
+    # 2026-08-30-workflow-control-v1-github-issues.md, V1-26).
+
+    def plan_publish_effect(
+        self,
+        *,
+        publication_id: str,
+        run_id: str,
+        activity_id: str,
+        activity_ordinal: int,
+        specification_generation: int,
+        policy_hash: str,
+        created_transition_sequence: int,
+        candidate_id: str,
+        desired_commit: Mapping[str, Any],
+        publication_secret_id: str,
+        publication_secret_version: int,
+        base_ref: str,
+        base_commit: Mapping[str, Any],
+        base_movement_policy: str,
+        deterministic_branch: str,
+        run_marker: str,
+        semantic_input: Mapping[str, Any],
+        semantic_input_digest: str,
+        idempotency_key: str,
+        outbox_id: str,
+        outbox_destination: str = "publication-effect-dispatch/1",
+        now_ms: int | None = None,
+    ) -> tuple[PublicationRecord, PublicationEffectRecord, ActivityRecord, OutboxRecord]:
+        """Atomically plan one ``INITIAL`` Publication Effect.
+
+        Commits the controller ``PUBLISH`` Activity, the new immutable
+        Publication Effect, and its effect-bound Outbox record in one
+        transaction (domain-model.md "Publication Effect" 2244-2245,
+        4098-4100), creating the owning Publication row the first time a Run
+        is published and advancing ``effect_generation`` on a later replan.
+        Replaying the same ``(run_id, idempotency_key)`` with identical
+        content returns the already-committed rows unchanged.
+
+        Only ``mode="INITIAL"`` is implemented here -- ``UPDATE`` (SHA-fenced
+        remediation) is a later leaf's scope.
+        """
+        require_lowercase_uuid(publication_id, field="publication_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        if publication_secret_version <= 0:
+            raise ValueError("publication_secret_version must be positive")
+        enums.parse_enum("snapshot.base_movement_policy", base_movement_policy)
+        desired = _require_git_commit_ref(desired_commit, field="desired_commit")
+        base = _require_git_commit_ref(base_commit, field="base_commit")
+        semantic_input_json = _require_json_text(semantic_input)
+        now = _now_ms() if now_ms is None else now_ms
+
+        with self.transaction():
+            existing_activity = self.conn.execute(
+                "SELECT * FROM activities WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, idempotency_key),
+            ).fetchone()
+            if existing_activity is not None:
+                activity = _row_to_activity(existing_activity)
+                if (
+                    activity.activity_id != activity_id
+                    or activity.activity_ordinal != activity_ordinal
+                    or activity.specification_generation != specification_generation
+                    or activity.policy_hash != policy_hash
+                    or activity.kind != "PUBLISH"
+                    or activity.execution_class != "CONTROLLER"
+                    or activity.state != "ACTIVE"
+                    or activity.candidate_id != candidate_id
+                    or activity.forge_observation_id is not None
+                    or activity.change_request_head_observation_id is not None
+                    or activity.observed_change_request_head_json is not None
+                    or activity.role is not None
+                    or activity.repair_cycle != 0
+                    or activity.recovery_cycle != 0
+                    or activity.strategy_index != 0
+                    or activity.recovery_tactic is not None
+                    or activity.recovery_evidence_id is not None
+                    or activity.rescue_epoch != 0
+                    or activity.slot is not None
+                    or activity.created_transition_sequence != created_transition_sequence
+                    or activity.semantic_input_json != semantic_input_json
+                    or activity.semantic_input_digest != semantic_input_digest
+                ):
+                    raise IdempotencyConflictError(
+                        "publish activity idempotency_key was reused with different content"
+                    )
+                effect_row = self.conn.execute(
+                    "SELECT * FROM publication_effects WHERE activity_id = ?", (activity_id,)
+                ).fetchone()
+                outbox_row = self.conn.execute(
+                    "SELECT * FROM outbox WHERE source_kind = 'ACTIVITY' "
+                    "AND source_id = ? AND destination = ?",
+                    (activity_id, outbox_destination),
+                ).fetchone()
+                if effect_row is None or outbox_row is None:
+                    raise RunStoreError("publish activity replay is missing its bound rows")
+                effect = _row_to_publication_effect(effect_row)
+                publication_row = self.conn.execute(
+                    "SELECT * FROM publications WHERE publication_id = ?",
+                    (effect.publication_id,),
+                ).fetchone()
+                if publication_row is None:
+                    raise RunStoreError("publish activity replay is missing its bound rows")
+                outbox = _row_to_outbox(outbox_row)
+                expected_operation_digest = publication_effect_operation_digest(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "mode": "INITIAL",
+                        "candidate_id": candidate_id,
+                        "desired_commit": desired.as_json(),
+                        "publication_secret_id": publication_secret_id,
+                        "publication_secret_version": publication_secret_version,
+                        "base_ref": base_ref,
+                        "base_commit": base.as_json(),
+                        "base_movement_policy": base_movement_policy,
+                        "deterministic_branch": deterministic_branch,
+                        "run_marker": run_marker,
+                    }
+                )
+                expected_outbox_payload_json = _require_json_text(
+                    {
+                        "publication_id": publication_id,
+                        "effect_generation": effect.effect_generation,
+                        "activity_id": activity_id,
+                        "mode": "INITIAL",
+                    }
+                )
+                if (
+                    effect.publication_id != publication_id
+                    or effect.activity_id != activity_id
+                    or effect.mode != "INITIAL"
+                    or effect.candidate_id != candidate_id
+                    or effect.desired_commit_json != desired.as_json()
+                    or effect.expected_remote_commit is not None
+                    or effect.publication_secret_id != publication_secret_id
+                    or effect.publication_secret_version != publication_secret_version
+                    or effect.base_ref != base_ref
+                    or effect.base_commit_json != base.as_json()
+                    or effect.base_movement_policy != base_movement_policy
+                    or effect.operation_digest != expected_operation_digest
+                    or effect.superseded
+                    or effect.created_transition_sequence != created_transition_sequence
+                    or outbox.outbox_id != outbox_id
+                    or outbox.source_kind != "ACTIVITY"
+                    or outbox.source_id != activity_id
+                    or outbox.destination != outbox_destination
+                    or outbox.protocol_version != PUBLICATION_EFFECT_PROTOCOL
+                    or outbox.payload_digest != expected_operation_digest
+                    or outbox.payload_json != expected_outbox_payload_json
+                    or outbox.publication_id != publication_id
+                    or outbox.effect_generation != effect.effect_generation
+                ):
+                    raise IdempotencyConflictError(
+                        "publish activity idempotency_key was reused with different content"
+                    )
+                return (
+                    _row_to_publication(publication_row),
+                    effect,
+                    activity,
+                    outbox,
+                )
+
+            existing_publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing_publication_row is None:
+                effect_generation = 1
+                self.conn.execute(
+                    "INSERT INTO publications("
+                    "publication_id, run_id, candidate_id, approved_commit_json, "
+                    "effect_generation, deterministic_branch, run_marker, state, "
+                    "created_transition_sequence, created_at_ms, updated_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'PLANNED', ?, ?, ?)",
+                    (
+                        publication_id,
+                        run_id,
+                        candidate_id,
+                        desired.as_json(),
+                        effect_generation,
+                        deterministic_branch,
+                        run_marker,
+                        created_transition_sequence,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                existing_publication = _row_to_publication(existing_publication_row)
+                if existing_publication.publication_id != publication_id:
+                    raise RunStoreError(
+                        f"run {run_id!r} already has publication "
+                        f"{existing_publication.publication_id!r}"
+                    )
+                effect_generation = existing_publication.effect_generation + 1
+                self.conn.execute(
+                    "UPDATE publications SET candidate_id = ?, approved_commit_json = ?, "
+                    "effect_generation = ?, updated_at_ms = ? WHERE publication_id = ?",
+                    (candidate_id, desired.as_json(), effect_generation, now, publication_id),
+                )
+
+            operation_digest = publication_effect_operation_digest(
+                {
+                    "publication_id": publication_id,
+                    "effect_generation": effect_generation,
+                    "mode": "INITIAL",
+                    "candidate_id": candidate_id,
+                    "desired_commit": desired.as_json(),
+                    "publication_secret_id": publication_secret_id,
+                    "publication_secret_version": publication_secret_version,
+                    "base_ref": base_ref,
+                    "base_commit": base.as_json(),
+                    "base_movement_policy": base_movement_policy,
+                    "deterministic_branch": deterministic_branch,
+                    "run_marker": run_marker,
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO activities("
+                "activity_id, run_id, activity_ordinal, specification_generation, policy_hash, "
+                "kind, execution_class, state, input_ref_json, candidate_id, "
+                "forge_observation_id, change_request_head_observation_id, "
+                "observed_change_request_head_json, role, repair_cycle, recovery_cycle, "
+                "strategy_index, recovery_tactic, recovery_evidence_id, rescue_epoch, "
+                "created_transition_sequence, semantic_input_json, semantic_input_digest, "
+                "idempotency_key, slot, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'PUBLISH', 'CONTROLLER', 'ACTIVE', NULL, ?, "
+                "NULL, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, 0, ?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    activity_id,
+                    run_id,
+                    activity_ordinal,
+                    specification_generation,
+                    policy_hash,
+                    candidate_id,
+                    created_transition_sequence,
+                    semantic_input_json,
+                    semantic_input_digest,
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO publication_effects("
+                "publication_id, effect_generation, activity_id, mode, candidate_id, "
+                "desired_commit_json, expected_remote_commit, publication_secret_id, "
+                "publication_secret_version, base_ref, base_commit_json, "
+                "base_movement_policy, operation_digest, superseded, "
+                "created_transition_sequence, created_at_ms) "
+                "VALUES (?, ?, ?, 'INITIAL', ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (
+                    publication_id,
+                    effect_generation,
+                    activity_id,
+                    candidate_id,
+                    desired.as_json(),
+                    publication_secret_id,
+                    publication_secret_version,
+                    base_ref,
+                    base.as_json(),
+                    base_movement_policy,
+                    operation_digest,
+                    created_transition_sequence,
+                    now,
+                ),
+            )
+            self.insert_outbox(
+                outbox_id=outbox_id,
+                source_kind="ACTIVITY",
+                source_id=activity_id,
+                destination=outbox_destination,
+                protocol_version=PUBLICATION_EFFECT_PROTOCOL,
+                payload_digest=operation_digest,
+                payload={
+                    "publication_id": publication_id,
+                    "effect_generation": effect_generation,
+                    "activity_id": activity_id,
+                    "mode": "INITIAL",
+                },
+                next_delivery_at_ms=now,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+            )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            effect_row = self.conn.execute(
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            activity_row = self.conn.execute(
+                "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            outbox_row = self.conn.execute(
+                "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+            assert publication_row is not None
+            assert effect_row is not None
+            assert activity_row is not None
+            assert outbox_row is not None
+            return (
+                _row_to_publication(publication_row),
+                _row_to_publication_effect(effect_row),
+                _row_to_activity(activity_row),
+                _row_to_outbox(outbox_row),
+            )
+
+    def get_publication(self, publication_id: str) -> PublicationRecord | None:
+        require_lowercase_uuid(publication_id, field="publication_id")
+        row = self.conn.execute(
+            "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+        ).fetchone()
+        return None if row is None else _row_to_publication(row)
+
+    def get_publication_by_run(self, run_id: str) -> PublicationRecord | None:
+        require_lowercase_uuid(run_id, field="run_id")
+        row = self.conn.execute("SELECT * FROM publications WHERE run_id = ?", (run_id,)).fetchone()
+        return None if row is None else _row_to_publication(row)
+
+    def get_publication_effect(
+        self, publication_id: str, effect_generation: int
+    ) -> PublicationEffectRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM publication_effects WHERE publication_id = ? AND effect_generation = ?",
+            (publication_id, effect_generation),
+        ).fetchone()
+        return None if row is None else _row_to_publication_effect(row)
+
+    def list_publication_effect_checkpoints(
+        self, publication_id: str, effect_generation: int
+    ) -> tuple[PublicationEffectCheckpointRecord, ...]:
+        rows = self.conn.execute(
+            "SELECT * FROM publication_effect_checkpoints "
+            "WHERE publication_id = ? AND effect_generation = ? ORDER BY checkpoint_sequence",
+            (publication_id, effect_generation),
+        ).fetchall()
+        return tuple(_row_to_publication_effect_checkpoint(row) for row in rows)
+
+    def _insert_publication_effect_checkpoint_row(
+        self,
+        *,
+        publication_effect_checkpoint_id: str,
+        publication_id: str,
+        effect_generation: int,
+        suboperation_kind: str,
+        status: str,
+        request_idempotency_key: str | None,
+        forge_observation_id: str | None,
+        observed_external_revision: str | None,
+        now: int,
+    ) -> PublicationEffectCheckpointRecord:
+        """Insert one checkpoint row. Caller holds the transaction."""
+        require_lowercase_uuid(
+            publication_effect_checkpoint_id, field="publication_effect_checkpoint_id"
+        )
+        enums.parse_enum("publication_effect_checkpoint.suboperation_kind", suboperation_kind)
+        enums.parse_enum("publication_effect_checkpoint.status", status)
+        _validate_checkpoint_matrix(
+            suboperation_kind=suboperation_kind,
+            status=status,
+            request_idempotency_key=request_idempotency_key,
+            forge_observation_id=forge_observation_id,
+        )
+        existing = self.conn.execute(
+            "SELECT * FROM publication_effect_checkpoints "
+            "WHERE publication_effect_checkpoint_id = ?",
+            (publication_effect_checkpoint_id,),
+        ).fetchone()
+        if existing is not None:
+            return self._publication_effect_checkpoint_replay_record(
+                existing,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind=suboperation_kind,
+                status=status,
+                request_idempotency_key=request_idempotency_key,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=observed_external_revision,
+                conflict_message=(
+                    "publication effect checkpoint id was reused with different content"
+                ),
+            )
+        if status == "REQUEST_READY":
+            existing_ready = self.conn.execute(
+                "SELECT * FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND suboperation_kind = ? AND status = 'REQUEST_READY'",
+                (publication_id, effect_generation, suboperation_kind),
+            ).fetchone()
+            if existing_ready is not None:
+                return self._publication_effect_checkpoint_replay_record(
+                    existing_ready,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind=suboperation_kind,
+                    status=status,
+                    request_idempotency_key=request_idempotency_key,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    conflict_message=(
+                        "publication effect request checkpoint was replayed with different content"
+                    ),
+                )
+        next_sequence = self.conn.execute(
+            "SELECT COALESCE(MAX(checkpoint_sequence), 0) + 1 FROM publication_effect_checkpoints "
+            "WHERE publication_id = ? AND effect_generation = ?",
+            (publication_id, effect_generation),
+        ).fetchone()[0]
+        digest = publication_effect_checkpoint_digest(
+            {
+                "publication_id": publication_id,
+                "effect_generation": effect_generation,
+                "checkpoint_sequence": next_sequence,
+                "suboperation_kind": suboperation_kind,
+                "status": status,
+                "request_idempotency_key": request_idempotency_key,
+                "forge_observation_id": forge_observation_id,
+                "observed_external_revision": observed_external_revision,
+            }
+        )
+        self.conn.execute(
+            "INSERT INTO publication_effect_checkpoints("
+            "publication_effect_checkpoint_id, publication_id, effect_generation, "
+            "checkpoint_sequence, suboperation_kind, status, request_idempotency_key, "
+            "forge_observation_id, observed_external_revision, checkpoint_digest, "
+            "recorded_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                publication_effect_checkpoint_id,
+                publication_id,
+                effect_generation,
+                next_sequence,
+                suboperation_kind,
+                status,
+                request_idempotency_key,
+                forge_observation_id,
+                observed_external_revision,
+                digest,
+                now,
+            ),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM publication_effect_checkpoints "
+            "WHERE publication_effect_checkpoint_id = ?",
+            (publication_effect_checkpoint_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_publication_effect_checkpoint(row)
+
+    def _publication_effect_checkpoint_replay_record(
+        self,
+        row: sqlite3.Row,
+        *,
+        publication_id: str,
+        effect_generation: int,
+        suboperation_kind: str,
+        status: str,
+        request_idempotency_key: str | None,
+        forge_observation_id: str | None,
+        observed_external_revision: str | None,
+        conflict_message: str,
+    ) -> PublicationEffectCheckpointRecord:
+        record = _row_to_publication_effect_checkpoint(row)
+        expected_digest = publication_effect_checkpoint_digest(
+            {
+                "publication_id": publication_id,
+                "effect_generation": effect_generation,
+                "checkpoint_sequence": record.checkpoint_sequence,
+                "suboperation_kind": suboperation_kind,
+                "status": status,
+                "request_idempotency_key": request_idempotency_key,
+                "forge_observation_id": forge_observation_id,
+                "observed_external_revision": observed_external_revision,
+            }
+        )
+        if (
+            record.publication_id != publication_id
+            or record.effect_generation != effect_generation
+            or record.suboperation_kind != suboperation_kind
+            or record.status != status
+            or record.request_idempotency_key != request_idempotency_key
+            or record.forge_observation_id != forge_observation_id
+            or record.observed_external_revision != observed_external_revision
+            or record.checkpoint_digest != expected_digest
+        ):
+            raise IdempotencyConflictError(conflict_message)
+        return record
+
+    def record_publication_effect_checkpoint(
+        self,
+        *,
+        publication_effect_checkpoint_id: str,
+        publication_id: str,
+        effect_generation: int,
+        suboperation_kind: str,
+        status: str,
+        request_idempotency_key: str | None = None,
+        forge_observation_id: str | None = None,
+        observed_external_revision: str | None = None,
+        now_ms: int | None = None,
+    ) -> PublicationEffectCheckpointRecord:
+        """Durably record one ordered ``BASE_READ_PRE`` / ``REF_READ`` /
+        ``REF_CREATE`` / ``REF_UPDATE`` / ``CHANGE_REQUEST_SEARCH`` /
+        ``CHANGE_REQUEST_CREATE`` / ``BASE_READ_POST`` checkpoint.
+
+        (``COMPLETE_MARKER_SEARCH`` and ``COMPLETE`` are recorded by
+        ``record_change_request_search_result``/``complete_publication_effect``
+        instead, since those two require the search classification/final
+        state context this generic entry point does not have.)
+
+        Validates the closed (suboperation_kind, status) matrix (domain-model.md
+        2287-2307), assigns the next strictly-increasing ``checkpoint_sequence``
+        for this Effect (the crash-resumable ordering), and never mutates
+        Publication state for a Checkpoint whose ``effect_generation`` is not
+        the Publication's current one -- "a response from an older effect
+        generation is audit evidence only and cannot update Publication
+        state" (domain-model.md 2203).
+        """
+        if suboperation_kind in ("COMPLETE_MARKER_SEARCH", "COMPLETE"):
+            raise ValueError(
+                f"{suboperation_kind} must be recorded via record_change_request_search_result "
+                "or complete_publication_effect"
+            )
+        require_lowercase_uuid(publication_id, field="publication_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            effect_row = self.conn.execute(
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if effect_row is None:
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) was not found"
+                )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"publication {publication_id!r} was not found")
+            publication = _row_to_publication(publication_row)
+            is_current = effect_generation == publication.effect_generation
+
+            checkpoint = self._insert_publication_effect_checkpoint_row(
+                publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind=suboperation_kind,
+                status=status,
+                request_idempotency_key=request_idempotency_key,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=observed_external_revision,
+                now=now,
+            )
+
+            if (
+                is_current
+                and suboperation_kind == "REF_READ"
+                and status in ("OBSERVED_ABSENT", "OBSERVED_SATISFIED")
+                and publication.state == "PLANNED"
+            ):
+                self.conn.execute(
+                    "UPDATE publications SET state = 'BRANCH_OBSERVED', "
+                    "observed_remote_commit = ?, last_observation_id = ?, updated_at_ms = ? "
+                    "WHERE publication_id = ?",
+                    (observed_external_revision, forge_observation_id, now, publication_id),
+                )
+        return checkpoint
+
+    def record_change_request_search_result(
+        self,
+        *,
+        change_request_search_result_id: str,
+        forge_observation_id: str,
+        publication_effect_checkpoint_id: str,
+        publication_id: str,
+        effect_generation: int,
+        project_id: str,
+        run_marker: str,
+        deterministic_ref: str,
+        external_revision: str,
+        members: Sequence[ChangeRequestSearchMemberInput],
+        fresh_exact_object_confirmed: bool = False,
+        terminal_publication_effect_checkpoint_id: str | None = None,
+        terminal_duplicate_cleanup_reservation_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> tuple[ChangeRequestSearchResultRecord, SearchPrecedenceOutcome]:
+        """Persist one complete Change Request Search result and its ordered
+        members, record the ``COMPLETE_MARKER_SEARCH`` checkpoint, and apply
+        the fixed precedence/cardinality routing (domain-model.md 2142-2173,
+        forge-integration.md 477-499):
+
+        - ``MERGED_TERMINAL`` / ``ZERO_LIVE_CLOSED_TERMINAL``: terminalizes
+          the Publication (``CLOSED``) and appends the ``COMPLETE`` checkpoint
+          in this same transaction (a positive merged selection also creates
+          the Terminal Duplicate Cleanup Reservation for every live member).
+        - ``ONE_LIVE``: requires ``fresh_exact_object_confirmed=True`` (the
+          search result alone is never sufficient linkage evidence -- "fresh
+          proof before linkage", domain-model.md 2155) and advances the
+          Publication to ``CHANGE_REQUEST_OBSERVED``; the ``COMPLETE``
+          checkpoint follows separately via ``complete_publication_effect``
+          once ``BASE_READ_POST`` also proves satisfied.
+        - ``MULTIPLE_LIVE`` / ``ZERO_LIVE_NO_TERMINAL`` / ``INCOMPLETE_BACKOFF``
+          / ``OWNERSHIP_CONFLICT``: no Publication mutation; the caller
+          drives the next step (duplicate cleanup, search/create loop,
+          backoff, or ``record_reconciliation_fact`` + a Human Boundary).
+
+        A stale ``effect_generation`` (not the Publication's current one) is
+        persisted as audit evidence only -- never mutates Publication state
+        (domain-model.md 2203).
+        """
+        require_lowercase_uuid(
+            change_request_search_result_id, field="change_request_search_result_id"
+        )
+        require_lowercase_uuid(publication_id, field="publication_id")
+        now = _now_ms() if now_ms is None else now_ms
+
+        live_inputs = [m for m in members if m.member_class == "LIVE"]
+        terminal_inputs = [m for m in members if m.member_class == "TERMINAL"]
+        if len(live_inputs) + len(terminal_inputs) != len(members):
+            raise ValueError("member_class must be LIVE or TERMINAL")
+        live_cardinality = (
+            "ZERO" if not live_inputs else "ONE" if len(live_inputs) == 1 else "MULTIPLE"
+        )
+
+        ordered_inputs: list[tuple[ChangeRequestSearchMemberInput, int]] = [
+            (m, i) for i, m in enumerate(live_inputs)
+        ] + [(m, i) for i, m in enumerate(terminal_inputs)]
+
+        pure_members: list[SearchMember] = []
+        rows_to_insert: list[tuple[Any, ...]] = []
+        live_digest_entries: list[dict[str, Any]] = []
+        terminal_digest_entries: list[dict[str, Any]] = []
+        live_members_for_reservation: list[tuple[str, str, str, bool]] = []
+
+        for member_input, ordinal in ordered_inputs:
+            if member_input.member_class == "TERMINAL" and member_input.terminal_state is None:
+                raise ValueError("TERMINAL member requires terminal_state")
+            if member_input.member_class == "LIVE" and member_input.terminal_state is not None:
+                raise ValueError("LIVE member forbids terminal_state")
+            if member_input.ownership_status == "POSITIVE":
+                if member_input.proof_kind is None:
+                    raise ValueError("POSITIVE member requires proof_kind")
+                if member_input.ownership_defect_codes:
+                    raise ValueError("POSITIVE member forbids ownership_defect_codes")
+            else:
+                if not member_input.ownership_defect_codes:
+                    raise ValueError("non-POSITIVE member requires ownership_defect_codes")
+                if member_input.creator_installation_or_account_ref is not None:
+                    raise ValueError(
+                        "creator_installation_or_account_ref is only valid for POSITIVE members"
+                    )
+            observed_head = _require_git_commit_ref(
+                member_input.observed_head, field="observed_head"
+            )
+            merge_commit = (
+                _require_git_commit_ref(member_input.merge_commit, field="merge_commit")
+                if member_input.merge_commit is not None
+                else None
+            )
+            if merge_commit is not None and member_input.terminal_state != "MERGED":
+                raise ValueError("merge_commit is only valid for a MERGED terminal_state")
+            proof_desired_commit_json = (
+                _require_git_commit_ref(
+                    member_input.proof_desired_commit, field="proof_desired_commit"
+                ).as_json()
+                if member_input.proof_desired_commit is not None
+                else None
+            )
+            proof_observed_head_json = (
+                _require_git_commit_ref(
+                    member_input.proof_observed_head, field="proof_observed_head"
+                ).as_json()
+                if member_input.proof_observed_head is not None
+                else None
+            )
+            ownership_proof_digest = change_request_search_member_ownership_proof_digest(
+                {
+                    "ownership_status": member_input.ownership_status,
+                    "proof_kind": member_input.proof_kind,
+                    "ownership_defect_codes": list(member_input.ownership_defect_codes),
+                    "proof_publication_effect_generation": (
+                        member_input.proof_publication_effect_generation
+                    ),
+                    "proof_create_checkpoint_id": member_input.proof_create_checkpoint_id,
+                    "proof_create_request_idempotency_key": (
+                        member_input.proof_create_request_idempotency_key
+                    ),
+                    "creator_installation_or_account_ref": (
+                        member_input.creator_installation_or_account_ref
+                    ),
+                    "proof_deterministic_ref": member_input.proof_deterministic_ref,
+                    "proof_run_marker": member_input.proof_run_marker,
+                    "proof_desired_commit": proof_desired_commit_json,
+                    "proof_observed_head": proof_observed_head_json,
+                    "head_evidence_observation_id": member_input.head_evidence_observation_id,
+                }
+            )
+            external_reliance_digest = change_request_search_member_external_reliance_digest(
+                dict(member_input.external_reliance)
+            )
+            marker_set_digest = bare_canonical_digest(
+                {
+                    "observed_body_revision": member_input.observed_body_revision,
+                    "run_marker": member_input.run_marker,
+                }
+            )
+            member_digest = change_request_search_member_digest(
+                {
+                    "member_class": member_input.member_class,
+                    "change_request_external_id": member_input.change_request_external_id,
+                    "observed_head": observed_head.as_json(),
+                    "terminal_state": member_input.terminal_state,
+                    "merge_commit": merge_commit.as_json() if merge_commit is not None else None,
+                    "source_ref": member_input.source_ref,
+                    "run_marker": member_input.run_marker,
+                    "observed_body_revision": member_input.observed_body_revision,
+                    "ownership_status": member_input.ownership_status,
+                    "ownership_proof_digest": ownership_proof_digest,
+                    "external_reliance_digest": external_reliance_digest,
+                }
+            )
+            pure_members.append(
+                SearchMember(
+                    member_class=member_input.member_class,
+                    member_ordinal=ordinal,
+                    change_request_external_id=member_input.change_request_external_id,
+                    ownership_status=member_input.ownership_status,
+                    terminal_state=member_input.terminal_state,
+                )
+            )
+            digest_entry = {
+                "change_request_external_id": member_input.change_request_external_id,
+                "ownership_proof_digest": ownership_proof_digest,
+                "member_digest": member_digest,
+            }
+            if member_input.member_class == "LIVE":
+                live_digest_entries.append(digest_entry)
+                live_members_for_reservation.append(
+                    (
+                        member_input.change_request_external_id,
+                        observed_head.as_json(),
+                        member_input.ownership_status,
+                        not bool(member_input.external_reliance),
+                    )
+                )
+            else:
+                terminal_digest_entries.append(digest_entry)
+            rows_to_insert.append(
+                (
+                    member_input.member_class,
+                    ordinal,
+                    member_input.change_request_external_id,
+                    observed_head.as_json(),
+                    member_input.terminal_state,
+                    merge_commit.as_json() if merge_commit is not None else None,
+                    member_input.source_ref,
+                    member_input.run_marker,
+                    member_input.observed_body_revision,
+                    marker_set_digest,
+                    member_input.ownership_status,
+                    member_input.proof_kind,
+                    member_input.proof_publication_effect_generation,
+                    member_input.proof_create_checkpoint_id,
+                    member_input.proof_create_request_idempotency_key,
+                    member_input.creator_installation_or_account_ref,
+                    member_input.proof_deterministic_ref,
+                    member_input.proof_run_marker,
+                    proof_desired_commit_json,
+                    proof_observed_head_json,
+                    member_input.head_evidence_observation_id,
+                    json.dumps(list(member_input.ownership_defect_codes)),
+                    ownership_proof_digest,
+                    external_reliance_digest,
+                    member_digest,
+                )
+            )
+
+        duplicate_set_digest = change_request_search_set_digest(
+            {
+                "search_revision": external_revision,
+                "live": live_digest_entries,
+                "terminal": terminal_digest_entries,
+            }
+        )
+        outcome = search_precedence(pure_members)
+
+        with self.transaction():
+            effect_row = self.conn.execute(
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if effect_row is None:
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) was not found"
+                )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"publication {publication_id!r} was not found")
+            publication = _row_to_publication(publication_row)
+            is_current = effect_generation == publication.effect_generation
+
+            existing_result = self.conn.execute(
+                "SELECT * FROM change_request_search_results "
+                "WHERE change_request_search_result_id = ? OR forge_observation_id = ?",
+                (change_request_search_result_id, forge_observation_id),
+            ).fetchone()
+            if existing_result is not None:
+                if (
+                    existing_result["change_request_search_result_id"]
+                    != change_request_search_result_id
+                    or existing_result["forge_observation_id"] != forge_observation_id
+                    or existing_result["publication_id"] != publication_id
+                    or existing_result["project_id"] != project_id
+                    or existing_result["run_marker"] != run_marker
+                    or existing_result["deterministic_ref"] != deterministic_ref
+                    or existing_result["external_revision"] != external_revision
+                    or existing_result["live_cardinality"] != live_cardinality
+                    or existing_result["duplicate_set_digest"] != duplicate_set_digest
+                    or existing_result["publication_effect_generation"] != effect_generation
+                ):
+                    raise IdempotencyConflictError(
+                        "change request search result id was reused with different content"
+                    )
+                existing_member_rows = self.conn.execute(
+                    "SELECT * FROM change_request_search_members "
+                    "WHERE change_request_search_result_id = ? "
+                    "ORDER BY member_class, member_ordinal",
+                    (change_request_search_result_id,),
+                ).fetchall()
+                if len(existing_member_rows) != len(rows_to_insert):
+                    raise IdempotencyConflictError(
+                        "change request search result id was reused with different members"
+                    )
+                member_fields = (
+                    "member_class",
+                    "member_ordinal",
+                    "change_request_external_id",
+                    "observed_head_json",
+                    "terminal_state",
+                    "merge_commit_json",
+                    "source_ref",
+                    "run_marker",
+                    "observed_body_revision",
+                    "marker_set_digest",
+                    "ownership_status",
+                    "proof_kind",
+                    "proof_publication_effect_generation",
+                    "proof_create_checkpoint_id",
+                    "proof_create_request_idempotency_key",
+                    "creator_installation_or_account_ref",
+                    "proof_deterministic_ref",
+                    "proof_run_marker",
+                    "proof_desired_commit_json",
+                    "proof_observed_head_json",
+                    "head_evidence_observation_id",
+                    "ownership_defect_codes_json",
+                    "ownership_proof_digest",
+                    "external_reliance_digest",
+                    "member_digest",
+                )
+                for existing_member, expected_member in zip(
+                    existing_member_rows, rows_to_insert, strict=True
+                ):
+                    if tuple(existing_member[field] for field in member_fields) != expected_member:
+                        raise IdempotencyConflictError(
+                            "change request search result id was reused with different members"
+                        )
+                record = ChangeRequestSearchResultRecord(
+                    **{
+                        k: existing_result[k]
+                        for k in (
+                            "change_request_search_result_id",
+                            "forge_observation_id",
+                            "publication_id",
+                            "project_id",
+                            "run_marker",
+                            "deterministic_ref",
+                            "external_revision",
+                            "live_cardinality",
+                            "duplicate_set_digest",
+                            "created_at_ms",
+                            "publication_effect_generation",
+                        )
+                    },
+                    members=tuple(
+                        _row_to_change_request_search_member(row) for row in existing_member_rows
+                    ),
+                )
+                return record, outcome
+
+            self.conn.execute(
+                "INSERT INTO change_request_search_results("
+                "change_request_search_result_id, forge_observation_id, publication_id, "
+                "project_id, run_marker, deterministic_ref, external_revision, "
+                "live_cardinality, duplicate_set_digest, publication_effect_generation, "
+                "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    change_request_search_result_id,
+                    forge_observation_id,
+                    publication_id,
+                    project_id,
+                    run_marker,
+                    deterministic_ref,
+                    external_revision,
+                    live_cardinality,
+                    duplicate_set_digest,
+                    effect_generation,
+                    now,
+                ),
+            )
+            for row in rows_to_insert:
+                self.conn.execute(
+                    "INSERT INTO change_request_search_members("
+                    "change_request_search_result_id, member_class, member_ordinal, "
+                    "change_request_external_id, observed_head_json, terminal_state, "
+                    "merge_commit_json, source_ref, run_marker, observed_body_revision, "
+                    "marker_set_digest, ownership_status, proof_kind, "
+                    "proof_publication_effect_generation, proof_create_checkpoint_id, "
+                    "proof_create_request_idempotency_key, creator_installation_or_account_ref, "
+                    "proof_deterministic_ref, proof_run_marker, proof_desired_commit_json, "
+                    "proof_observed_head_json, head_evidence_observation_id, "
+                    "ownership_defect_codes_json, ownership_proof_digest, "
+                    "external_reliance_digest, member_digest) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?)",
+                    (change_request_search_result_id, *row),
+                )
+            self._insert_publication_effect_checkpoint_row(
+                publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind="COMPLETE_MARKER_SEARCH",
+                status="OBSERVED_SATISFIED",
+                request_idempotency_key=None,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=external_revision,
+                now=now,
+            )
+
+            if is_current:
+                self.conn.execute(
+                    "UPDATE publications SET last_observation_id = ?, updated_at_ms = ? "
+                    "WHERE publication_id = ?",
+                    (forge_observation_id, now, publication_id),
+                )
+
+                if outcome.outcome == "ONE_LIVE":
+                    if not fresh_exact_object_confirmed:
+                        raise ValueError(
+                            "ONE-live linkage requires a fresh exact-object observation "
+                            "before commit (domain-model.md 2155)"
+                        )
+                    if publication.change_request_external_id is None:
+                        self.conn.execute(
+                            "UPDATE publications SET state = 'CHANGE_REQUEST_OBSERVED', "
+                            "change_request_external_id = ?, "
+                            "initial_link_search_revision = ?, initial_link_set_digest = ?, "
+                            "initial_link_cardinality = 'ONE', "
+                            "initial_link_retained_external_id = ?, updated_at_ms = ? "
+                            "WHERE publication_id = ?",
+                            (
+                                outcome.selected_external_id,
+                                external_revision,
+                                duplicate_set_digest,
+                                outcome.selected_external_id,
+                                now,
+                                publication_id,
+                            ),
+                        )
+                    elif publication.change_request_external_id != outcome.selected_external_id:
+                        raise RunStoreError(
+                            "publication already has a different live change request association"
+                        )
+                elif outcome.outcome in ("ZERO_LIVE_CLOSED_TERMINAL", "MERGED_TERMINAL"):
+                    if terminal_publication_effect_checkpoint_id is None:
+                        raise ValueError(
+                            f"{outcome.outcome} requires terminal_publication_effect_checkpoint_id"
+                        )
+                    if publication.initial_link_terminal_state is not None:
+                        raise RunStoreError(
+                            "publication already has a permanent terminal association "
+                            "(domain-model.md 2220-2223)"
+                        )
+                    terminal_state = "MERGED" if outcome.outcome == "MERGED_TERMINAL" else "CLOSED"
+                    self._insert_publication_effect_checkpoint_row(
+                        publication_effect_checkpoint_id=terminal_publication_effect_checkpoint_id,
+                        publication_id=publication_id,
+                        effect_generation=effect_generation,
+                        suboperation_kind="COMPLETE",
+                        status="COMPLETED",
+                        request_idempotency_key=None,
+                        forge_observation_id=forge_observation_id,
+                        observed_external_revision=external_revision,
+                        now=now,
+                    )
+                    change_request_external_id = outcome.selected_external_id
+                    self.conn.execute(
+                        "UPDATE publications SET state = 'CLOSED', "
+                        "change_request_external_id = ?, "
+                        "initial_link_search_revision = ?, initial_link_set_digest = ?, "
+                        "initial_link_cardinality = ?, initial_link_retained_external_id = ?, "
+                        "initial_link_terminal_state = ?, "
+                        "initial_link_terminal_search_observation_id = ?, "
+                        "initial_link_terminal_member_ordinal = ?, updated_at_ms = ? "
+                        "WHERE publication_id = ?",
+                        (
+                            change_request_external_id,
+                            external_revision,
+                            duplicate_set_digest,
+                            live_cardinality,
+                            outcome.selected_external_id,
+                            terminal_state,
+                            forge_observation_id,
+                            outcome.selected_member_ordinal,
+                            now,
+                            publication_id,
+                        ),
+                    )
+                    if outcome.outcome == "MERGED_TERMINAL" and live_members_for_reservation:
+                        if terminal_duplicate_cleanup_reservation_id is None:
+                            raise ValueError(
+                                "a positive merged-terminal selection with live members "
+                                "requires terminal_duplicate_cleanup_reservation_id"
+                            )
+                        assert outcome.selected_external_id is not None
+                        assert outcome.selected_member_ordinal is not None
+                        self._create_terminal_duplicate_cleanup_reservation_row(
+                            terminal_duplicate_cleanup_reservation_id=(
+                                terminal_duplicate_cleanup_reservation_id
+                            ),
+                            publication_id=publication_id,
+                            effect_generation=effect_generation,
+                            selected_terminal_external_id=outcome.selected_external_id,
+                            selecting_search_observation_id=forge_observation_id,
+                            selecting_member_ordinal=outcome.selected_member_ordinal,
+                            live_members=live_members_for_reservation,
+                            created_transition_sequence=publication.created_transition_sequence,
+                            now=now,
+                        )
+
+            result_row = self.conn.execute(
+                "SELECT * FROM change_request_search_results "
+                "WHERE change_request_search_result_id = ?",
+                (change_request_search_result_id,),
+            ).fetchone()
+            member_rows = self.conn.execute(
+                "SELECT * FROM change_request_search_members "
+                "WHERE change_request_search_result_id = ? ORDER BY member_class, member_ordinal",
+                (change_request_search_result_id,),
+            ).fetchall()
+            assert result_row is not None
+            record = ChangeRequestSearchResultRecord(
+                **{
+                    k: result_row[k]
+                    for k in (
+                        "change_request_search_result_id",
+                        "forge_observation_id",
+                        "publication_id",
+                        "project_id",
+                        "run_marker",
+                        "deterministic_ref",
+                        "external_revision",
+                        "live_cardinality",
+                        "duplicate_set_digest",
+                        "created_at_ms",
+                        "publication_effect_generation",
+                    )
+                },
+                members=tuple(_row_to_change_request_search_member(row) for row in member_rows),
+            )
+        return record, outcome
+
+    def _create_terminal_duplicate_cleanup_reservation_row(
+        self,
+        *,
+        terminal_duplicate_cleanup_reservation_id: str,
+        publication_id: str,
+        effect_generation: int,
+        selected_terminal_external_id: str,
+        selecting_search_observation_id: str,
+        selecting_member_ordinal: int,
+        live_members: Sequence[tuple[str, str, str, bool]],
+        created_transition_sequence: int,
+        now: int,
+    ) -> None:
+        """Insert one Terminal Duplicate Cleanup Reservation and its member
+        rows (domain-model.md "Terminal Duplicate Cleanup Reservation") --
+        every and only ``LIVE`` member of the selecting search becomes a
+        member row (2966-2968); ``planned_action`` is code-owned: ``CLOSE``
+        for POSITIVE + canonical-empty external reliance, ``DETACH_MARKER``
+        for POSITIVE + non-empty reliance, ``RECORD_ONLY`` for every
+        INCOMPATIBLE/INCOMPLETE member (2976). Caller holds the transaction;
+        called only from a positive merged-terminal selection.
+        """
+        require_lowercase_uuid(
+            terminal_duplicate_cleanup_reservation_id,
+            field="terminal_duplicate_cleanup_reservation_id",
+        )
+        member_rows: list[tuple[int, str, str, str, str | None]] = []
+        for ordinal, (
+            external_id,
+            observed_head_json,
+            ownership_status,
+            reliance_empty,
+        ) in enumerate(live_members):
+            if ownership_status != "POSITIVE":
+                planned_action = "RECORD_ONLY"
+                record_reason = (
+                    "INCOMPATIBLE_OWNER"
+                    if ownership_status == "INCOMPATIBLE"
+                    else "INCOMPLETE_PROOF"
+                )
+            elif reliance_empty:
+                planned_action = "CLOSE"
+                record_reason = None
+            else:
+                planned_action = "DETACH_MARKER"
+                record_reason = None
+            member_rows.append(
+                (ordinal, external_id, observed_head_json, planned_action, record_reason)
+            )
+
+        state = "COMPLETED" if not member_rows else "ACTIVE"
+        completed_at_ms = now if state == "COMPLETED" else None
+        reservation_digest = terminal_duplicate_cleanup_reservation_digest(
+            {
+                "publication_id": publication_id,
+                "effect_generation": effect_generation,
+                "selected_terminal_external_id": selected_terminal_external_id,
+                "selecting_search_observation_id": selecting_search_observation_id,
+                "selecting_member_ordinal": selecting_member_ordinal,
+                "members": [
+                    {"change_request_external_id": r[1], "planned_action": r[3]}
+                    for r in member_rows
+                ],
+            }
+        )
+        self.conn.execute(
+            "INSERT INTO terminal_duplicate_cleanup_reservations("
+            "terminal_duplicate_cleanup_reservation_id, publication_id, effect_generation, "
+            "selected_terminal_external_id, selecting_search_observation_id, "
+            "selecting_member_ordinal, state, next_member_ordinal, reservation_digest, "
+            "created_transition_sequence, created_at_ms, completed_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+            (
+                terminal_duplicate_cleanup_reservation_id,
+                publication_id,
+                effect_generation,
+                selected_terminal_external_id,
+                selecting_search_observation_id,
+                selecting_member_ordinal,
+                state,
+                reservation_digest,
+                created_transition_sequence,
+                now,
+                completed_at_ms,
+            ),
+        )
+        for ordinal, external_id, observed_head_json, planned_action, record_reason in member_rows:
+            self.conn.execute(
+                "INSERT INTO terminal_duplicate_cleanup_members("
+                "terminal_duplicate_cleanup_reservation_id, member_ordinal, "
+                "change_request_external_id, observed_head_json, planned_action, "
+                "record_reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    terminal_duplicate_cleanup_reservation_id,
+                    ordinal,
+                    external_id,
+                    observed_head_json,
+                    planned_action,
+                    record_reason,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE publications SET terminal_duplicate_cleanup_reservation_id = ? "
+            "WHERE publication_id = ?",
+            (terminal_duplicate_cleanup_reservation_id, publication_id),
+        )
+
+    def get_terminal_duplicate_cleanup_reservation(
+        self, terminal_duplicate_cleanup_reservation_id: str
+    ) -> TerminalDuplicateCleanupReservationRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM terminal_duplicate_cleanup_reservations "
+            "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+            (terminal_duplicate_cleanup_reservation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        member_rows = self.conn.execute(
+            "SELECT * FROM terminal_duplicate_cleanup_members "
+            "WHERE terminal_duplicate_cleanup_reservation_id = ? ORDER BY member_ordinal",
+            (terminal_duplicate_cleanup_reservation_id,),
+        ).fetchall()
+        return _row_to_terminal_duplicate_cleanup_reservation(
+            row, members=tuple(_row_to_terminal_duplicate_cleanup_member(r) for r in member_rows)
+        )
+
+    def complete_publication_effect(
+        self,
+        *,
+        publication_effect_checkpoint_id: str,
+        publication_id: str,
+        effect_generation: int,
+        forge_observation_id: str,
+        observed_external_revision: str,
+        now_ms: int | None = None,
+    ) -> PublicationEffectCheckpointRecord:
+        """Append the ``COMPLETE`` checkpoint and set the Publication
+        ``ACTIVE`` -- only after this same Effect's ``BASE_READ_POST``
+        checkpoint already proved ``OBSERVED_SATISFIED`` (domain-model.md
+        2346-2348, forge-integration.md 522-526: "Only after the second base
+        read is OBSERVED_SATISFIED under its exact policy does the
+        controller append the completed initial-effect checkpoint... and set
+        the Publication ACTIVE.").
+
+        Used only for the ``ONE_LIVE`` path's final step -- the terminal
+        (``ZERO_LIVE_CLOSED_TERMINAL`` / ``MERGED_TERMINAL``) outcomes append
+        their own ``COMPLETE`` checkpoint inline in
+        ``record_change_request_search_result``.
+        """
+        require_lowercase_uuid(publication_id, field="publication_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            effect_row = self.conn.execute(
+                "SELECT 1 FROM publication_effects WHERE publication_id = ? "
+                "AND effect_generation = ?",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if effect_row is None:
+                raise RunStoreError(
+                    f"publication effect ({publication_id!r}, {effect_generation!r}) was not found"
+                )
+            publication_row = self.conn.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if publication_row is None:
+                raise RunStoreError(f"publication {publication_id!r} was not found")
+            publication = _row_to_publication(publication_row)
+            is_current = effect_generation == publication.effect_generation
+            if not is_current:
+                return self._insert_publication_effect_checkpoint_row(
+                    publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind="COMPLETE",
+                    status="COMPLETED",
+                    request_idempotency_key=None,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    now=now,
+                )
+            if publication.state == "ACTIVE":
+                existing_checkpoint = self.conn.execute(
+                    "SELECT * FROM publication_effect_checkpoints "
+                    "WHERE publication_id = ? AND effect_generation = ? "
+                    "AND suboperation_kind = 'COMPLETE' AND status = 'COMPLETED'",
+                    (publication_id, effect_generation),
+                ).fetchone()
+                if existing_checkpoint is not None:
+                    return self._publication_effect_checkpoint_replay_record(
+                        existing_checkpoint,
+                        publication_id=publication_id,
+                        effect_generation=effect_generation,
+                        suboperation_kind="COMPLETE",
+                        status="COMPLETED",
+                        request_idempotency_key=None,
+                        forge_observation_id=forge_observation_id,
+                        observed_external_revision=observed_external_revision,
+                        conflict_message=(
+                            "publication effect complete checkpoint was replayed "
+                            "with different content"
+                        ),
+                    )
+            if publication.state != "CHANGE_REQUEST_OBSERVED":
+                raise RunStoreError(
+                    f"publication {publication_id!r} is {publication.state!r}, "
+                    "not CHANGE_REQUEST_OBSERVED"
+                )
+            base_read_post_satisfied = self.conn.execute(
+                "SELECT 1 FROM publication_effect_checkpoints WHERE publication_id = ? "
+                "AND effect_generation = ? AND suboperation_kind = 'BASE_READ_POST' "
+                "AND status = 'OBSERVED_SATISFIED' LIMIT 1",
+                (publication_id, effect_generation),
+            ).fetchone()
+            if base_read_post_satisfied is None:
+                raise RunStoreError(
+                    "ACTIVE requires a prior BASE_READ_POST/OBSERVED_SATISFIED checkpoint"
+                )
+            checkpoint = self._insert_publication_effect_checkpoint_row(
+                publication_effect_checkpoint_id=publication_effect_checkpoint_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                suboperation_kind="COMPLETE",
+                status="COMPLETED",
+                request_idempotency_key=None,
+                forge_observation_id=forge_observation_id,
+                observed_external_revision=observed_external_revision,
+                now=now,
+            )
+            self.conn.execute(
+                "UPDATE publications SET state = 'ACTIVE', observed_remote_commit = ?, "
+                "last_observation_id = ?, updated_at_ms = ? WHERE publication_id = ?",
+                (observed_external_revision, forge_observation_id, now, publication_id),
+            )
+        return checkpoint
+
+    def get_change_request_search_result(
+        self, change_request_search_result_id: str
+    ) -> ChangeRequestSearchResultRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM change_request_search_results WHERE change_request_search_result_id = ?",
+            (change_request_search_result_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        member_rows = self.conn.execute(
+            "SELECT * FROM change_request_search_members "
+            "WHERE change_request_search_result_id = ? ORDER BY member_class, member_ordinal",
+            (change_request_search_result_id,),
+        ).fetchall()
+        return ChangeRequestSearchResultRecord(
+            change_request_search_result_id=row["change_request_search_result_id"],
+            forge_observation_id=row["forge_observation_id"],
+            publication_id=row["publication_id"],
+            project_id=row["project_id"],
+            run_marker=row["run_marker"],
+            deterministic_ref=row["deterministic_ref"],
+            external_revision=row["external_revision"],
+            live_cardinality=row["live_cardinality"],
+            duplicate_set_digest=row["duplicate_set_digest"],
+            created_at_ms=row["created_at_ms"],
+            publication_effect_generation=row["publication_effect_generation"],
+            members=tuple(_row_to_change_request_search_member(r) for r in member_rows),
+        )
+
+    def record_reconciliation_fact(
+        self,
+        *,
+        reconciliation_fact_id: str,
+        activity_id: str,
+        run_id: str,
+        kind: str,
+        created_transition_sequence: int,
+        publication_id: str | None = None,
+        publication_effect_generation: int | None = None,
+        causal_forge_observation_id: str | None = None,
+        observed_ref_commit: Mapping[str, Any] | None = None,
+        pinned_base_relationship: str | None = None,
+        safe_fetch_proof_digest: str | None = None,
+        candidate_admission_proof_digest: str | None = None,
+        validation_failure_digest: str | None = None,
+        retained_live_external_id: str | None = None,
+        duplicate_search_revision: str | None = None,
+        duplicate_set_digest: str | None = None,
+        ownership_evidence_digest: str | None = None,
+        duplicate_members: Sequence[tuple[str, str]] = (),
+        now_ms: int | None = None,
+    ) -> ReconciliationFactRecord:
+        """Insert one immutable Reconciliation Fact (domain-model.md
+        "Reconciliation Fact") -- the ``RECONCILE`` Activity's terminal
+        output; its Fact, Activity success, and Transition commit
+        atomically (2518-2520). ``duplicate_members`` is
+        ``(change_request_external_id, disposition)`` pairs, required (at
+        least the retained member plus one redundant member) for
+        ``REDUNDANT_PUBLICATIONS_PROVEN``. Idempotent on
+        ``reconciliation_fact_id``: an identical replay returns the existing
+        row unchanged; conflicting content raises
+        ``IdempotencyConflictError``.
+        """
+        with self.transaction():
+            return self._record_reconciliation_fact_row(
+                reconciliation_fact_id=reconciliation_fact_id,
+                activity_id=activity_id,
+                run_id=run_id,
+                kind=kind,
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                causal_forge_observation_id=causal_forge_observation_id,
+                observed_ref_commit=observed_ref_commit,
+                pinned_base_relationship=pinned_base_relationship,
+                safe_fetch_proof_digest=safe_fetch_proof_digest,
+                candidate_admission_proof_digest=candidate_admission_proof_digest,
+                validation_failure_digest=validation_failure_digest,
+                retained_live_external_id=retained_live_external_id,
+                duplicate_search_revision=duplicate_search_revision,
+                duplicate_set_digest=duplicate_set_digest,
+                ownership_evidence_digest=ownership_evidence_digest,
+                duplicate_members=duplicate_members,
+                now_ms=now_ms,
+            )
+
+    def _record_reconciliation_fact_row(
+        self,
+        *,
+        reconciliation_fact_id: str,
+        activity_id: str,
+        run_id: str,
+        kind: str,
+        created_transition_sequence: int,
+        publication_id: str | None = None,
+        publication_effect_generation: int | None = None,
+        causal_forge_observation_id: str | None = None,
+        observed_ref_commit: Mapping[str, Any] | None = None,
+        pinned_base_relationship: str | None = None,
+        safe_fetch_proof_digest: str | None = None,
+        candidate_admission_proof_digest: str | None = None,
+        validation_failure_digest: str | None = None,
+        retained_live_external_id: str | None = None,
+        duplicate_search_revision: str | None = None,
+        duplicate_set_digest: str | None = None,
+        ownership_evidence_digest: str | None = None,
+        duplicate_members: Sequence[tuple[str, str]] = (),
+        now_ms: int | None = None,
+    ) -> ReconciliationFactRecord:
+        """Insert-or-reuse one Reconciliation Fact. Caller holds the transaction."""
+        require_lowercase_uuid(reconciliation_fact_id, field="reconciliation_fact_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("reconciliation_fact.kind", kind)
+        if kind == "OWNERSHIP_CONFLICT" and ownership_evidence_digest is None:
+            raise ValueError("OWNERSHIP_CONFLICT requires ownership_evidence_digest")
+        if kind == "REDUNDANT_PUBLICATIONS_PROVEN":
+            if retained_live_external_id is None:
+                raise ValueError("REDUNDANT_PUBLICATIONS_PROVEN requires retained_live_external_id")
+            if not duplicate_members:
+                raise ValueError(
+                    "REDUNDANT_PUBLICATIONS_PROVEN requires at least one redundant duplicate member"
+                )
+        if kind == "PRELINK_REF_IMPORTABLE" and candidate_admission_proof_digest is None:
+            raise ValueError("PRELINK_REF_IMPORTABLE requires candidate_admission_proof_digest")
+        if kind == "PRELINK_REF_RECONSTRUCT_REQUIRED" and validation_failure_digest is None:
+            raise ValueError("PRELINK_REF_RECONSTRUCT_REQUIRED requires validation_failure_digest")
+        if publication_id is not None and kind in (
+            "REDUNDANT_PUBLICATIONS_PROVEN",
+            "NO_ACTIONABLE_DUPLICATE",
+        ):
+            if duplicate_search_revision is None or duplicate_set_digest is None:
+                raise ValueError(
+                    f"{kind} with publication_id requires duplicate_search_revision and "
+                    "duplicate_set_digest (publications.last_duplicate_search_revision and "
+                    "last_duplicate_set_digest are non-null iff "
+                    "last_duplicate_reconciliation_fact_id is)"
+                )
+
+        observed_ref_commit_json = (
+            _require_git_commit_ref(observed_ref_commit, field="observed_ref_commit").as_json()
+            if observed_ref_commit is not None
+            else None
+        )
+        now = _now_ms() if now_ms is None else now_ms
+        fact_digest = reconciliation_fact_digest(
+            {
+                "activity_id": activity_id,
+                "run_id": run_id,
+                "publication_id": publication_id,
+                "publication_effect_generation": publication_effect_generation,
+                "kind": kind,
+                "causal_forge_observation_id": causal_forge_observation_id,
+                "observed_ref_commit": observed_ref_commit_json,
+                "pinned_base_relationship": pinned_base_relationship,
+                "safe_fetch_proof_digest": safe_fetch_proof_digest,
+                "candidate_admission_proof_digest": candidate_admission_proof_digest,
+                "validation_failure_digest": validation_failure_digest,
+                "retained_live_external_id": retained_live_external_id,
+                "duplicate_search_revision": duplicate_search_revision,
+                "duplicate_set_digest": duplicate_set_digest,
+                "ownership_evidence_digest": ownership_evidence_digest,
+                "duplicate_members": [list(m) for m in duplicate_members],
+            }
+        )
+
+        existing = self.conn.execute(
+            "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
+            (reconciliation_fact_id,),
+        ).fetchone()
+        if existing is not None:
+            record = _row_to_reconciliation_fact(existing)
+            if record.fact_digest != fact_digest or record.activity_id != activity_id:
+                raise IdempotencyConflictError(
+                    "reconciliation fact id was reused with different content"
+                )
+            member_rows = self.conn.execute(
+                "SELECT * FROM reconciliation_duplicate_members "
+                "WHERE reconciliation_fact_id = ? ORDER BY member_ordinal",
+                (reconciliation_fact_id,),
+            ).fetchall()
+            return dataclasses.replace(
+                record,
+                duplicate_members=tuple(
+                    _row_to_reconciliation_duplicate_member(r) for r in member_rows
+                ),
+            )
+        self.conn.execute(
+            "INSERT INTO reconciliation_facts("
+            "reconciliation_fact_id, activity_id, run_id, publication_id, "
+            "publication_effect_generation, kind, causal_forge_observation_id, "
+            "observed_ref_commit_json, pinned_base_relationship, "
+            "safe_fetch_proof_digest, candidate_admission_proof_digest, "
+            "validation_failure_digest, retained_live_external_id, "
+            "duplicate_search_revision, duplicate_set_digest, "
+            "ownership_evidence_digest, fact_digest, created_transition_sequence, "
+            "recorded_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reconciliation_fact_id,
+                activity_id,
+                run_id,
+                publication_id,
+                publication_effect_generation,
+                kind,
+                causal_forge_observation_id,
+                observed_ref_commit_json,
+                pinned_base_relationship,
+                safe_fetch_proof_digest,
+                candidate_admission_proof_digest,
+                validation_failure_digest,
+                retained_live_external_id,
+                duplicate_search_revision,
+                duplicate_set_digest,
+                ownership_evidence_digest,
+                fact_digest,
+                created_transition_sequence,
+                now,
+            ),
+        )
+        for ordinal, (external_id, disposition) in enumerate(duplicate_members):
+            enums.parse_enum("reconciliation_duplicate_member.disposition", disposition)
+            self.conn.execute(
+                "INSERT INTO reconciliation_duplicate_members("
+                "reconciliation_fact_id, member_ordinal, change_request_external_id, "
+                "disposition) VALUES (?, ?, ?, ?)",
+                (reconciliation_fact_id, ordinal, external_id, disposition),
+            )
+        if publication_id is not None and kind in (
+            "REDUNDANT_PUBLICATIONS_PROVEN",
+            "NO_ACTIONABLE_DUPLICATE",
+        ):
+            self.conn.execute(
+                "UPDATE publications SET last_duplicate_reconciliation_fact_id = ?, "
+                "last_duplicate_search_revision = ?, last_duplicate_set_digest = ?, "
+                "updated_at_ms = ? WHERE publication_id = ?",
+                (
+                    reconciliation_fact_id,
+                    duplicate_search_revision,
+                    duplicate_set_digest,
+                    now,
+                    publication_id,
+                ),
+            )
+        self.conn.execute(
+            "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? WHERE activity_id = ?",
+            (now, activity_id),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
+            (reconciliation_fact_id,),
+        ).fetchone()
+        member_rows = self.conn.execute(
+            "SELECT * FROM reconciliation_duplicate_members WHERE reconciliation_fact_id = ? "
+            "ORDER BY member_ordinal",
+            (reconciliation_fact_id,),
+        ).fetchall()
+        assert row is not None
+        return _row_to_reconciliation_fact(
+            row,
+            duplicate_members=tuple(
+                _row_to_reconciliation_duplicate_member(r) for r in member_rows
+            ),
+        )
+
+    def get_reconciliation_fact(
+        self, reconciliation_fact_id: str
+    ) -> ReconciliationFactRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM reconciliation_facts WHERE reconciliation_fact_id = ?",
+            (reconciliation_fact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        member_rows = self.conn.execute(
+            "SELECT * FROM reconciliation_duplicate_members WHERE reconciliation_fact_id = ? "
+            "ORDER BY member_ordinal",
+            (reconciliation_fact_id,),
+        ).fetchall()
+        return _row_to_reconciliation_fact(
+            row,
+            duplicate_members=tuple(
+                _row_to_reconciliation_duplicate_member(r) for r in member_rows
+            ),
+        )
+
+    def record_publication_ownership_conflict(
+        self,
+        *,
+        reconciliation_fact_id: str,
+        activity_id: str,
+        run_id: str,
+        created_transition_sequence: int,
+        publication_id: str,
+        publication_effect_generation: int,
+        ownership_evidence_digest: str,
+        human_boundary_id: str,
+        resume_state: str,
+        minimum_request: str,
+        ownership_project_id: str,
+        ownership_deterministic_ref: str,
+        ownership_change_request_external_id: str,
+        ownership_run_marker: str,
+        now_ms: int | None = None,
+    ) -> tuple[ReconciliationFactRecord, HumanBoundaryRecord]:
+        """The sole path to ``PUBLICATION_OWNERSHIP_CONFLICT``: record the
+        ``OWNERSHIP_CONFLICT`` Reconciliation Fact, then create its Human
+        Boundary referencing it (domain-model.md 3901-3907: "the sole direct
+        exception is the positive ownership-conflict Reconciliation Fact").
+        No ref/link/create mutation happens on this path -- the fact and the
+        boundary are the only writes.
+        """
+        with self.transaction():
+            fact = self._record_reconciliation_fact_row(
+                reconciliation_fact_id=reconciliation_fact_id,
+                activity_id=activity_id,
+                run_id=run_id,
+                kind="OWNERSHIP_CONFLICT",
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                ownership_evidence_digest=ownership_evidence_digest,
+                now_ms=now_ms,
+            )
+            boundary = self.create_human_boundary(
+                human_boundary_id=human_boundary_id,
+                run_id=run_id,
+                reason="PUBLICATION_OWNERSHIP_CONFLICT",
+                resume_state=resume_state,
+                minimum_request=minimum_request,
+                created_from_kind="RECONCILIATION_FACT",
+                created_from_id=reconciliation_fact_id,
+                created_transition_sequence=created_transition_sequence,
+                publication_id=publication_id,
+                publication_effect_generation=publication_effect_generation,
+                ownership_project_id=ownership_project_id,
+                ownership_deterministic_ref=ownership_deterministic_ref,
+                ownership_change_request_external_id=ownership_change_request_external_id,
+                ownership_run_marker=ownership_run_marker,
+            )
+        return fact, boundary
+
+    def record_terminal_duplicate_cleanup_action(
+        self,
+        *,
+        terminal_duplicate_cleanup_action_id: str,
+        terminal_duplicate_cleanup_reservation_id: str,
+        outbox_id: str,
+        outbox_destination: str = "terminal-duplicate-cleanup-dispatch/1",
+        now_ms: int | None = None,
+    ) -> TerminalDuplicateCleanupActionRecord:
+        """Start processing the Reservation's ``next_member_ordinal`` member
+        -- "the controller processes members in ordinal order" (domain-model.md
+        3007). Commits the Action row and its effect-bound Outbox atomically
+        before I/O (domain-model.md 4105-4107, "creates no Run Activity or
+        new Effect generation"). A ``RECORD_ONLY`` planned action dispatches
+        no Outbox -- there is no external mutation to perform.
+        """
+        require_lowercase_uuid(
+            terminal_duplicate_cleanup_action_id, field="terminal_duplicate_cleanup_action_id"
+        )
+        require_lowercase_uuid(outbox_id, field="outbox_id")
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            reservation_row = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_reservations "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                (terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            if reservation_row is None:
+                raise RunStoreError(
+                    f"reservation {terminal_duplicate_cleanup_reservation_id!r} was not found"
+                )
+            reservation = _row_to_terminal_duplicate_cleanup_reservation(reservation_row)
+            if reservation.state != "ACTIVE":
+                raise RunStoreError("reservation is not ACTIVE")
+            existing_pending = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_actions "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ? "
+                "AND state IN ('PENDING', 'ACTIVE')",
+                (terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            if existing_pending is not None:
+                return _row_to_terminal_duplicate_cleanup_action(existing_pending)
+            member_row = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_members "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ? AND member_ordinal = ?",
+                (terminal_duplicate_cleanup_reservation_id, reservation.next_member_ordinal),
+            ).fetchone()
+            if member_row is None:
+                raise RunStoreError("reservation has no member at next_member_ordinal")
+            member = _row_to_terminal_duplicate_cleanup_member(member_row)
+            operation_digest = terminal_duplicate_cleanup_action_digest(
+                {
+                    "terminal_duplicate_cleanup_reservation_id": (
+                        terminal_duplicate_cleanup_reservation_id
+                    ),
+                    "member_ordinal": member.member_ordinal,
+                    "change_request_external_id": member.change_request_external_id,
+                    "planned_action": member.planned_action,
+                }
+            )
+            stored_outbox_id: str | None = None
+            if member.planned_action != "RECORD_ONLY":
+                self.insert_outbox(
+                    outbox_id=outbox_id,
+                    source_kind="TERMINAL_DUPLICATE_CLEANUP_ACTION",
+                    source_id=terminal_duplicate_cleanup_action_id,
+                    destination=outbox_destination,
+                    protocol_version=TERMINAL_DUPLICATE_CLEANUP_PROTOCOL,
+                    payload_digest=operation_digest,
+                    payload={
+                        "terminal_duplicate_cleanup_action_id": (
+                            terminal_duplicate_cleanup_action_id
+                        ),
+                        "change_request_external_id": member.change_request_external_id,
+                        "planned_action": member.planned_action,
+                    },
+                    next_delivery_at_ms=now,
+                    publication_id=reservation.publication_id,
+                    effect_generation=reservation.effect_generation,
+                )
+                stored_outbox_id = outbox_id
+            self.conn.execute(
+                "INSERT INTO terminal_duplicate_cleanup_actions("
+                "terminal_duplicate_cleanup_action_id, "
+                "terminal_duplicate_cleanup_reservation_id, member_ordinal, "
+                "change_request_external_id, planned_action, state, outcome, "
+                "operation_digest, forge_observation_id, outbox_id, action_digest, "
+                "created_at_ms, completed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, 'ACTIVE', NULL, ?, NULL, ?, ?, ?, NULL)",
+                (
+                    terminal_duplicate_cleanup_action_id,
+                    terminal_duplicate_cleanup_reservation_id,
+                    member.member_ordinal,
+                    member.change_request_external_id,
+                    member.planned_action,
+                    operation_digest,
+                    stored_outbox_id,
+                    operation_digest,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_actions "
+                "WHERE terminal_duplicate_cleanup_action_id = ?",
+                (terminal_duplicate_cleanup_action_id,),
+            ).fetchone()
+            assert row is not None
+            return _row_to_terminal_duplicate_cleanup_action(row)
+
+    def complete_terminal_duplicate_cleanup_action(
+        self,
+        *,
+        terminal_duplicate_cleanup_action_id: str,
+        outcome: str,
+        forge_observation_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> tuple[TerminalDuplicateCleanupActionRecord, TerminalDuplicateCleanupReservationRecord]:
+        """Terminalize one Action from its exact close proof.
+
+        ``CLOSE`` success requires an authenticated ``CHANGE_REQUEST_CLOSED``
+        Forge Observation for the exact redundant id/head (domain-model.md
+        2534-2536); "that observation does not close the Publication or
+        terminate the Run because it is not the retained
+        ``Publication.change_request_external_id``." Advances the
+        Reservation's ``next_member_ordinal`` and marks it ``COMPLETED``
+        only once every member has one terminal outcome (domain-model.md
+        3007-3008). Replaying an already-``COMPLETED`` action returns it
+        unchanged.
+        """
+        require_lowercase_uuid(
+            terminal_duplicate_cleanup_action_id, field="terminal_duplicate_cleanup_action_id"
+        )
+        enums.parse_enum("terminal_duplicate_cleanup_action.outcome", outcome)
+        now = _now_ms() if now_ms is None else now_ms
+        with self.transaction():
+            action_row = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_actions "
+                "WHERE terminal_duplicate_cleanup_action_id = ?",
+                (terminal_duplicate_cleanup_action_id,),
+            ).fetchone()
+            if action_row is None:
+                raise RunStoreError(
+                    f"action {terminal_duplicate_cleanup_action_id!r} was not found"
+                )
+            action = _row_to_terminal_duplicate_cleanup_action(action_row)
+            if action.state == "COMPLETED":
+                if action.outcome != outcome or action.forge_observation_id != forge_observation_id:
+                    raise IdempotencyConflictError(
+                        "terminal duplicate cleanup action was replayed with different content"
+                    )
+                reservation = self.get_terminal_duplicate_cleanup_reservation(
+                    action.terminal_duplicate_cleanup_reservation_id
+                )
+                assert reservation is not None
+                return action, reservation
+            if action.state != "ACTIVE":
+                raise RunStoreError(
+                    f"action {terminal_duplicate_cleanup_action_id!r} is not ACTIVE"
+                )
+            expected_outcome = {
+                "CLOSE": "CLOSED",
+                "DETACH_MARKER": "MARKER_DETACHED",
+                "RECORD_ONLY": "RETAINED_AUDIT",
+            }[action.planned_action]
+            if outcome != expected_outcome:
+                raise ValueError(
+                    f"planned_action {action.planned_action!r} requires outcome "
+                    f"{expected_outcome!r}"
+                )
+            if action.planned_action != "RECORD_ONLY" and forge_observation_id is None:
+                raise ValueError(
+                    f"{action.planned_action} requires an exact close-proof forge_observation_id"
+                )
+            self.conn.execute(
+                "UPDATE terminal_duplicate_cleanup_actions SET state = 'COMPLETED', "
+                "outcome = ?, forge_observation_id = ?, completed_at_ms = ? "
+                "WHERE terminal_duplicate_cleanup_action_id = ?",
+                (outcome, forge_observation_id, now, terminal_duplicate_cleanup_action_id),
+            )
+            reservation_row = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_reservations "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                (action.terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            assert reservation_row is not None
+            reservation = _row_to_terminal_duplicate_cleanup_reservation(reservation_row)
+            next_ordinal = reservation.next_member_ordinal + 1
+            member_count = self.conn.execute(
+                "SELECT COUNT(*) FROM terminal_duplicate_cleanup_members "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                (reservation.terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()[0]
+            if next_ordinal >= member_count:
+                self.conn.execute(
+                    "UPDATE terminal_duplicate_cleanup_reservations SET "
+                    "next_member_ordinal = ?, state = 'COMPLETED', completed_at_ms = ? "
+                    "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                    (
+                        next_ordinal,
+                        now,
+                        reservation.terminal_duplicate_cleanup_reservation_id,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE terminal_duplicate_cleanup_reservations SET "
+                    "next_member_ordinal = ? WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                    (next_ordinal, reservation.terminal_duplicate_cleanup_reservation_id),
+                )
+            action_row2 = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_actions "
+                "WHERE terminal_duplicate_cleanup_action_id = ?",
+                (terminal_duplicate_cleanup_action_id,),
+            ).fetchone()
+            reservation_row2 = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_reservations "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                (action.terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            member_rows = self.conn.execute(
+                "SELECT * FROM terminal_duplicate_cleanup_members "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ? ORDER BY member_ordinal",
+                (action.terminal_duplicate_cleanup_reservation_id,),
+            ).fetchall()
+            assert action_row2 is not None and reservation_row2 is not None
+            return (
+                _row_to_terminal_duplicate_cleanup_action(action_row2),
+                _row_to_terminal_duplicate_cleanup_reservation(
+                    reservation_row2,
+                    members=tuple(
+                        _row_to_terminal_duplicate_cleanup_member(r) for r in member_rows
+                    ),
+                ),
+            )
+
+    def record_publish_controller_operation_fact(
+        self,
+        *,
+        controller_operation_fact_id: str,
+        activity_id: str,
+        operation_kind: str,
+        failure_category: str,
+        operation_digest: str,
+        forge_observation_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> ControllerOperationFactRecord:
+        """Record the immutable terminal ``FAILED`` input for a definitive,
+        non-resumable ``PUBLISH``/``RECONCILE``/``CLOSE_PUBLICATION``/
+        ``CLOSE_REDUNDANT_PUBLICATION`` Activity failure (domain-model.md
+        2493-2501; 2517: "PUBLISH... may create this Fact only with
+        FAILED"). A successful ``PUBLISH`` never creates this Fact -- it
+        terminalizes through its ``COMPLETE`` checkpoint instead (2521-2522).
+        """
+        require_lowercase_uuid(controller_operation_fact_id, field="controller_operation_fact_id")
+        require_lowercase_uuid(activity_id, field="activity_id")
+        enums.parse_enum("controller_operation_fact.kind", operation_kind)
+        enums.parse_enum("controller_operation_fact.failure_category", failure_category)
+        if operation_kind not in (
+            "PUBLISH",
+            "RECONCILE",
+            "CLOSE_PUBLICATION",
+            "CLOSE_REDUNDANT_PUBLICATION",
+        ):
+            raise ValueError(f"{operation_kind} is not a Publication-domain operation kind")
+        if failure_category == "FORGE_TRANSIENT":
+            raise ValueError(
+                "FORGE_TRANSIENT is forbidden here; only a Forge Request Failure Fact "
+                "may establish that category"
+            )
+        if operation_kind == "PUBLISH" and failure_category == "SOURCE_READ":
+            raise ValueError("SOURCE_READ is IMPORT-only")
+        _require_digest(operation_digest, field="operation_digest")
+        now = _now_ms() if now_ms is None else now_ms
+        fact_digest = controller_operation_fact_digest(
+            {
+                "activity_id": activity_id,
+                "operation_kind": operation_kind,
+                "outcome": "FAILED",
+                "failure_category": failure_category,
+                "operation_digest": operation_digest,
+                "forge_observation_id": forge_observation_id,
+            }
+        )
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM controller_operation_facts WHERE controller_operation_fact_id = ?",
+                (controller_operation_fact_id,),
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_controller_operation_fact(existing)
+                if record.fact_digest != fact_digest:
+                    raise IdempotencyConflictError(
+                        "controller operation fact id was reused with different content"
+                    )
+                return record
+            self.conn.execute(
+                "INSERT INTO controller_operation_facts("
+                "controller_operation_fact_id, activity_id, operation_kind, outcome, "
+                "failure_category, candidate_id, forge_observation_id, operation_digest, "
+                "fact_digest, recorded_at_ms) "
+                "VALUES (?, ?, ?, 'FAILED', ?, NULL, ?, ?, ?, ?)",
+                (
+                    controller_operation_fact_id,
+                    activity_id,
+                    operation_kind,
+                    failure_category,
+                    forge_observation_id,
+                    operation_digest,
+                    fact_digest,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE activities SET state = 'FAILED', updated_at_ms = ? WHERE activity_id = ?",
+                (now, activity_id),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM controller_operation_facts WHERE controller_operation_fact_id = ?",
+            (controller_operation_fact_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_controller_operation_fact(row)
+
+    def is_change_request_excluded_from_legacy_engine(
+        self,
+        *,
+        change_request_external_id: str | None = None,
+        deterministic_ref: str | None = None,
+    ) -> bool:
+        """The association-based half of the unconditional legacy-engine
+        exclusion (domain-model.md 4692-4695, forge-integration.md 410-413):
+        "While a v1 Publication's Run is live, the legacy selector MUST
+        exclude its exact associated Change Request stable ID, when
+        present, and deterministic source ref unconditionally; marker
+        state and repair phase are not predicate inputs." Exclusion
+        continues past Run terminalization while an ``ACTIVE`` Terminal
+        Duplicate Cleanup Reservation still has an unresolved member
+        (domain-model.md 4697-4701).
+
+        Combine with ``orcest.workflow_contract.v1.publication.
+        is_legacy_marker_reserved`` (the marker-based half, evaluated over
+        the candidate Change Request's own body text) for the complete
+        predicate -- either half alone is sufficient to exclude. The legacy
+        selector (``src/orcest/orchestrator/pr_ops.py``) is a separate
+        package with no dependency on this store today; wiring this query
+        into that selector is a distinct integration task this leaf leaves
+        for whoever undertakes it, not implemented here.
+        """
+        if change_request_external_id is None and deterministic_ref is None:
+            raise ValueError(
+                "at least one of change_request_external_id or deterministic_ref is required"
+            )
+        from orcest.workflow_reducer.graph import is_terminal_state
+
+        conditions = []
+        params: list[str] = []
+        if change_request_external_id is not None:
+            conditions.append("p.change_request_external_id = ?")
+            params.append(change_request_external_id)
+        if deterministic_ref is not None:
+            conditions.append("p.deterministic_branch = ?")
+            params.append(deterministic_ref)
+        rows = self.conn.execute(
+            "SELECT runs.state AS run_state, r.state AS reservation_state "
+            "FROM publications p "
+            "JOIN runs ON runs.run_id = p.run_id "
+            "LEFT JOIN terminal_duplicate_cleanup_reservations r "
+            "ON r.terminal_duplicate_cleanup_reservation_id = "
+            "p.terminal_duplicate_cleanup_reservation_id "
+            f"WHERE ({' OR '.join(conditions)})",
+            tuple(params),
+        ).fetchall()
+        return any(
+            (not is_terminal_state(row["run_state"])) or row["reservation_state"] == "ACTIVE"
+            for row in rows
+        )
 
     def get_candidate(self, candidate_id: str) -> CandidateRecord | None:
         require_lowercase_uuid(candidate_id, field="candidate_id")
