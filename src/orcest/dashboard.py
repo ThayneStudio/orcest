@@ -28,6 +28,11 @@ from orcest.shared.provider_stream_health import (
     StreamHealthState,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.shared.result_stream_health import (
+    ResultStreamHealth,
+    format_result_stream_warning,
+    inspect_result_stream,
+)
 
 # Global (cross-project, unprefixed) key prefix PoolManager publishes canonical
 # per-stream health snapshots under (``provider-stream-health:{provider}:pr``
@@ -86,6 +91,7 @@ class SystemSnapshot:
     fetched_at: datetime
     queue_depths: dict[str, int] = field(default_factory=dict)
     results_depth: int = 0
+    result_stream_health: ResultStreamHealth | None = None
     dead_letter_count: int = 0
     locks: list[LockInfo] = field(default_factory=list)
     consumer_groups: list[ConsumerGroupInfo] = field(default_factory=list)
@@ -129,10 +135,8 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
     # Discover task streams
     task_streams = redis.scan_iter(match="tasks:*")
 
-    try:
-        results_depth: int = redis.xlen("results")
-    except redis_lib.ResponseError:
-        results_depth = 0
+    result_stream_health = inspect_result_stream(redis)
+    results_depth = result_stream_health.retained_entries
 
     try:
         dead_letter_count: int = redis.xlen(DEAD_LETTER_STREAM)
@@ -284,6 +288,7 @@ def _fetch_snapshot_inner(redis: RedisClient, max_results: int) -> SystemSnapsho
         fetched_at=datetime.now(timezone.utc),
         queue_depths=queue_depths,
         results_depth=results_depth,
+        result_stream_health=result_stream_health,
         dead_letter_count=dead_letter_count,
         locks=locks,
         consumer_groups=consumer_groups,
@@ -488,6 +493,16 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
         #stream-health-banner.visible {
             display: block;
         }
+        #result-health-banner {
+            height: auto;
+            background: $error;
+            color: $text;
+            padding: 0 1;
+            display: none;
+        }
+        #result-health-banner.visible {
+            display: block;
+        }
         .section-title {
             text-style: bold;
             color: $text;
@@ -546,6 +561,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             yield Header(show_clock=True)
             yield Static("", id="health-bar")
             yield Static("", id="stream-health-banner")
+            yield Static("", id="result-health-banner")
             with VerticalScroll(id="overview-container"):
                 yield Static("Queue Depths", classes="section-title")
                 yield DataTable(id="queues-table")
@@ -569,7 +585,7 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
 
         def on_mount(self) -> None:
             queues = self.query_one("#queues-table", DataTable)
-            queues.add_columns("Stream", "Pending")
+            queues.add_columns("Stream", "Work", "Retained XLEN")
 
             stream_health = self.query_one("#stream-health-table", DataTable)
             stream_health.add_columns(
@@ -642,12 +658,29 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             queues = self.query_one("#queues-table", DataTable)
             queues.clear()
             for stream, depth in snapshot.queue_depths.items():
-                queues.add_row(stream, str(depth))
+                queues.add_row(stream, str(depth), "--")
             if not snapshot.queue_depths:
-                queues.add_row("(no task streams)", "0")
+                queues.add_row("(no task streams)", "0", "--")
+            result_health = snapshot.result_stream_health
+            result_work = result_health.work if result_health is not None else 0
+            queues.add_row("results work", str(result_work), "--")
+            queues.add_row("results retained", "--", str(snapshot.results_depth))
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
-            queues.add_row(DEAD_LETTER_STREAM, dl_text)
+            queues.add_row(DEAD_LETTER_STREAM, dl_text, str(dl_count))
+
+            result_banner = self.query_one("#result-health-banner", Static)
+            warning = (
+                format_result_stream_warning(result_health)
+                if result_health is not None
+                else "RESULT STREAM UNHEALTHY results: inspection unavailable"
+            )
+            if warning:
+                result_banner.update(warning)
+                result_banner.add_class("visible")
+            else:
+                result_banner.update("")
+                result_banner.remove_class("visible")
 
             self._update_stream_health(snapshot)
 
