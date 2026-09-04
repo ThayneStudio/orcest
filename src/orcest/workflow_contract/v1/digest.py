@@ -113,6 +113,17 @@ __all__ = [
     "timer_fact_digest",
     "budget_report_digest",
     "wait_condition_digest",
+    "human_boundary_digest",
+    "human_resolution_digest",
+    "publication_effect_operation_digest",
+    "publication_effect_checkpoint_digest",
+    "change_request_search_member_digest",
+    "change_request_search_member_ownership_proof_digest",
+    "change_request_search_member_external_reliance_digest",
+    "reconciliation_fact_digest",
+    "terminal_duplicate_cleanup_reservation_digest",
+    "terminal_duplicate_cleanup_action_digest",
+    "controller_operation_fact_digest",
 ]
 
 CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -588,6 +599,67 @@ def human_resolution_digest(fields: Mapping[str, Any]) -> str:
     domain-model.md "Human Resolution"); excludes only informational
     ``accepted_at_ms``."""
     return generic_domain_digest("orcest-human-resolution-v1", fields)
+
+
+def publication_effect_operation_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Publication Effect's complete immutable intent fields plus
+    adapter-normalized Project/ref/CR target (``operation_digest``,
+    domain-model.md "Publication Effect")."""
+    return generic_domain_digest("orcest-publication-effect-operation-v1", fields)
+
+
+def publication_effect_checkpoint_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Publication Effect Checkpoint's Effect identity plus
+    normalized checkpoint fields (``checkpoint_digest``, domain-model.md
+    "Publication Effect Checkpoint")."""
+    return generic_domain_digest("orcest-publication-effect-checkpoint-v1", fields)
+
+
+def change_request_search_member_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of one Change Request Search Member's complete normalized
+    fields excluding parent/ordinal (``member_digest``, domain-model.md
+    "Change Request Search Member")."""
+    return generic_domain_digest("orcest-change-request-search-member-v1", fields)
+
+
+def change_request_search_member_ownership_proof_digest(fields: Mapping[str, Any]) -> str:
+    """Domain-separated digest of one member's ownership tag, proof, and
+    defect set (``ownership_proof_digest``, domain-model.md "Change Request
+    Search Member")."""
+    return generic_domain_digest("orcest-change-request-search-member-ownership-proof-v1", fields)
+
+
+def change_request_search_member_external_reliance_digest(fields: Mapping[str, Any]) -> str:
+    """Digest required for every Change Request Search Member, including the
+    canonical-empty case (``external_reliance_digest``, domain-model.md
+    "Change Request Search Member")."""
+    return generic_domain_digest("orcest-change-request-search-member-external-reliance-v1", fields)
+
+
+def reconciliation_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Reconciliation Fact's complete normalized kind-specific
+    fields (domain-model.md "Reconciliation Fact")."""
+    return generic_domain_digest("orcest-reconciliation-fact-v1", fields)
+
+
+def terminal_duplicate_cleanup_reservation_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Terminal Duplicate Cleanup Reservation's complete
+    normalized selection and membership fields (domain-model.md "Terminal
+    Duplicate Cleanup Reservation")."""
+    return generic_domain_digest("orcest-terminal-duplicate-cleanup-reservation-v1", fields)
+
+
+def terminal_duplicate_cleanup_action_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Terminal Duplicate Cleanup Action's complete normalized
+    operation identity (domain-model.md "Terminal Duplicate Cleanup
+    Reservation")."""
+    return generic_domain_digest("orcest-terminal-duplicate-cleanup-action-v1", fields)
+
+
+def controller_operation_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Controller Operation Fact's complete normalized outcome
+    fields (domain-model.md "Controller Operation Fact")."""
+    return generic_domain_digest("orcest-controller-operation-fact-v1", fields)
 
 
 def response_digest(response_json: Any) -> str:

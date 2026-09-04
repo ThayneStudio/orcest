@@ -61,6 +61,8 @@ CREDENTIAL_ROTATION_REQUEST_PROTOCOL = "orcest.credential-rotation/1"
 CREDENTIAL_ROTATION_RESULT_PROTOCOL = "orcest.credential-rotation-result/1"
 WORKER_LOSS_PROTOCOL = "orcest.worker-loss/1"
 WORKER_LOSS_RESULT_PROTOCOL = "orcest.worker-loss-result/1"
+PUBLICATION_EFFECT_PROTOCOL = "orcest.publication-effect/1"
+TERMINAL_DUPLICATE_CLEANUP_PROTOCOL = "orcest.terminal-duplicate-cleanup/1"
 ATTEMPT_LIVENESS_PROTOCOL = "orcest.attempt-liveness/1"
 ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
 VERIFICATION_RECEIPT_PROTOCOL = "orcest.verification-receipt/1"
@@ -92,6 +94,8 @@ __all__ = [
     "CREDENTIAL_ROTATION_RESULT_PROTOCOL",
     "WORKER_LOSS_PROTOCOL",
     "WORKER_LOSS_RESULT_PROTOCOL",
+    "PUBLICATION_EFFECT_PROTOCOL",
+    "TERMINAL_DUPLICATE_CLEANUP_PROTOCOL",
     "ATTEMPT_LIVENESS_PROTOCOL",
     "ATTEMPT_LIVENESS_RESULT_PROTOCOL",
     "VERIFICATION_RECEIPT_PROTOCOL",
@@ -588,6 +592,33 @@ register_envelope(
         "replayed": Field(validator=_is_bool),
         "health_observation_id": Field(required=False, nullable=True, validator=_is_uuid),
         "attempt_terminal_fact_id": Field(required=False, nullable=True, validator=_is_uuid),
+    },
+    protocol_field="protocol",
+)
+
+
+# ---------------------------------------------------------------------------
+# Publication Effect / Terminal Duplicate Cleanup Action dispatch (outbox)
+# ---------------------------------------------------------------------------
+
+register_envelope(
+    PUBLICATION_EFFECT_PROTOCOL,
+    {
+        "publication_id": Field(validator=_is_uuid),
+        "effect_generation": Field(validator=_is_nonneg_int),
+        "activity_id": Field(validator=_is_uuid),
+        "mode": Field(enum=_enum_values(enums.PublicationEffectMode)),
+    },
+    protocol_field="protocol",
+)
+register_envelope(
+    TERMINAL_DUPLICATE_CLEANUP_PROTOCOL,
+    {
+        "terminal_duplicate_cleanup_action_id": Field(validator=_is_uuid),
+        "change_request_external_id": Field(validator=_is_nonempty_str),
+        "planned_action": Field(
+            enum=_enum_values(enums.TerminalDuplicateCleanupMemberPlannedAction)
+        ),
     },
     protocol_field="protocol",
 )
