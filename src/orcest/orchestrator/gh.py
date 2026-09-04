@@ -54,6 +54,22 @@ class GhNotInstalledError(GhCliError):
     """Raised when the gh CLI binary is not found on PATH."""
 
 
+def _label_already_absent(stderr: str | None) -> bool:
+    """True when `stderr` means a label-removal target was already gone.
+
+    Covers gh's current REST error for a missing label
+    (``gh: Label does not exist (HTTP 404)``) and older phrasings that
+    likewise name the label (``label 'x' not found``). Both spellings must
+    mention the label specifically: a bare ``HTTP 404`` or "not found" with
+    no label context (missing/inaccessible repository, hidden resource,
+    etc.) is a real error and must not be swallowed.
+    """
+    text = (stderr or "").lower()
+    if "label" not in text:
+        return False
+    return "not found" in text or "does not exist" in text
+
+
 @dataclass(frozen=True)
 class PRReviewSnapshot:
     """Strictly validated review evidence for one PR head."""
@@ -766,7 +782,7 @@ def remove_label(repo: str, number: int, label: str, token: str) -> None:
             token,
         )
     except GhCliError as exc:
-        if "not found" in (exc.stderr or "").lower():
+        if _label_already_absent(exc.stderr):
             logger.debug(
                 "remove_label: label %r not on #%d, ignoring",
                 label,
@@ -1264,7 +1280,7 @@ def remove_issue_label(repo: str, number: int, label: str, token: str) -> None:
             token,
         )
     except GhCliError as exc:
-        if "not found" in (exc.stderr or "").lower():
+        if _label_already_absent(exc.stderr):
             logger.debug(
                 "remove_issue_label: label %r not on issue #%d, ignoring",
                 label,

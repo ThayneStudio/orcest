@@ -21,6 +21,7 @@ from orcest.orchestrator.gh import (
     GhRateLimitError,
     GhStaleSnapshotError,
     PRReviewSnapshot,
+    _label_already_absent,
     add_label,
     create_issue,
     get_ci_status,
@@ -36,6 +37,7 @@ from orcest.orchestrator.gh import (
     list_open_prs,
     merge_pr,
     post_comment,
+    remove_issue_label,
     remove_label,
     resolve_review_thread,
     update_branch,
@@ -530,6 +532,20 @@ def test_remove_label_swallows_not_found(mocker):
     remove_label(REPO, 5, "orcest:queued", TOKEN)
 
 
+def test_remove_label_swallows_absent_label_http_404(mocker):
+    """Regression for issue #777: gh's current 'Label does not exist' 404 is idempotent."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Label does not exist (HTTP 404)",
+        ),
+    )
+    # Should NOT raise
+    remove_label(REPO, 5, "orcest:queued", TOKEN)
+
+
 def test_remove_label_reraises_other_errors(mocker):
     """remove_label re-raises GhCliError for non-'not found' errors."""
     mocker.patch(
@@ -542,6 +558,128 @@ def test_remove_label_reraises_other_errors(mocker):
     )
     with pytest.raises(GhCliError):
         remove_label(REPO, 5, "orcest:queued", TOKEN)
+
+
+def test_remove_label_reraises_generic_http_404(mocker):
+    """A bare 404 with no label context (e.g. missing repository) must propagate."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Not Found (HTTP 404)",
+        ),
+    )
+    with pytest.raises(GhCliError):
+        remove_label(REPO, 5, "orcest:queued", TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# remove_issue_label
+# ---------------------------------------------------------------------------
+
+
+def test_remove_issue_label_swallows_not_found(mocker):
+    """remove_issue_label silently swallows GhCliError when label not present."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="label 'orcest:ready' not found",
+        ),
+    )
+    # Should NOT raise
+    remove_issue_label(REPO, 5, "orcest:ready", TOKEN)
+
+
+def test_remove_issue_label_swallows_absent_label_http_404(mocker):
+    """Regression for issue #777: exact production fixture must be idempotent."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Label does not exist (HTTP 404)",
+        ),
+    )
+    # Should NOT raise
+    remove_issue_label(REPO, 5, "orcest:ready", TOKEN)
+
+
+def test_remove_issue_label_reraises_generic_http_404(mocker):
+    """A bare 404 with no label context (e.g. missing repository) must propagate."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Not Found (HTTP 404)",
+        ),
+    )
+    with pytest.raises(GhCliError):
+        remove_issue_label(REPO, 5, "orcest:ready", TOKEN)
+
+
+def test_remove_issue_label_reraises_permission_hidden_404(mocker):
+    """A permission-hidden resource surfaces as a 404 too and must not be swallowed."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="gh: Not Found (HTTP 404)\n"
+            "This may be due to the repository not existing or your lack of "
+            "access to it.",
+        ),
+    )
+    with pytest.raises(GhCliError):
+        remove_issue_label(REPO, 5, "orcest:ready", TOKEN)
+
+
+def test_remove_issue_label_reraises_other_errors(mocker):
+    """remove_issue_label re-raises GhCliError for non-'not found' errors."""
+    mocker.patch(
+        "orcest.orchestrator.gh.subprocess.run",
+        side_effect=subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["gh", "api"],
+            stderr="authentication required",
+        ),
+    )
+    with pytest.raises(GhCliError):
+        remove_issue_label(REPO, 5, "orcest:ready", TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# _label_already_absent (shared classifier)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Label does not exist (HTTP 404)",
+        "label 'orcest:queued' not found",
+        "Label 'orcest:ready' Not Found",
+    ],
+)
+def test_label_already_absent_true_for_label_specific_messages(stderr):
+    assert _label_already_absent(stderr) is True
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Not Found (HTTP 404)",
+        "repository acme/widgets not found",
+        "authentication required",
+        "",
+        None,
+    ],
+)
+def test_label_already_absent_false_without_label_context(stderr):
+    assert _label_already_absent(stderr) is False
 
 
 # ---------------------------------------------------------------------------
