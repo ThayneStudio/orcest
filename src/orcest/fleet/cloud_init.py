@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from orcest.fleet.config import normalize_worker_runner_for_backend
+from orcest.shared.provider_versions import PROVIDER_CLI_DESIRED_VERSIONS
 
 # C1c: interactive (PTY) Claude workers (ClaudeInteractiveRunner) never
 # route through _BaseCliRunner/tracker_factory -- they have no
@@ -84,7 +85,7 @@ _SUPABASE_VERSION = "2.95.4"
 # Grok (xAI Grok Build) CLI — beta; the streaming-json event schema can shift
 # between releases, so pin it and re-validate the GrokRunner parsers
 # (tests/worker/test_grok_runner.py) on bump.
-_GROK_VERSION = "0.1.216"
+_GROK_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["grok"]
 # SHA-256 of the exact linux-x86_64 Grok binary for _GROK_VERSION. The worker
 # cloud image is amd64, so download the versioned artifact directly instead of
 # executing xAI's mutable bootstrap as root. The x.ai primary and the official
@@ -105,7 +106,7 @@ _GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d
 # parsed by CodexRunner (tests/worker/test_codex_runner.py) is tied to this
 # version, so re-validate fixtures + parser on bump. 0.149.1 is the first pin
 # that accepts ``max`` / ``ultra`` reasoning effort (0.131.0 rejected ``max``).
-_CODEX_VERSION = "0.149.1"
+_CODEX_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["codex"]
 
 # Anthropic Claude Code CLI — published as an npm package. Pinned for the same
 # reason as the others, plus one specific to this provider: the interactive
@@ -116,7 +117,7 @@ _CODEX_VERSION = "0.149.1"
 # MCP consent menu and burned ~27% of clauder tasks on the wall-clock timeout
 # (see claude_interactive_runner's dialog handling + its regression tests).
 # On bump: re-run those tests and smoke a real interactive task before shipping.
-_CLAUDE_VERSION = "2.1.235"
+_CLAUDE_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["claude"]
 
 # Provider CLIs that ``_worker_tooling_runcmd`` installs and which a worker
 # MUST be able to exec (as the non-root ``orcest`` user) for any provider task

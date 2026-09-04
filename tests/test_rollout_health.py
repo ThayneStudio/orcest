@@ -4,8 +4,23 @@ import pytest
 import redis as redis_lib
 
 from orcest.rollout_health import collect_rollout_health
+from orcest.shared.provider_versions import desired_provider_cli_version
 
 pytestmark = pytest.mark.unit
+
+
+def _provider_cli(provider: str, **overrides):
+    version = desired_provider_cli_version(provider)
+    payload = {
+        "schema": 1,
+        "provider": provider,
+        "desired_version": version,
+        "template_version": version,
+        "observed_version": version,
+        "status": "ok",
+    }
+    payload.update(overrides)
+    return payload
 
 
 def test_rollout_health_passes_clean_quiescent_snapshot(fake_redis_client, mocker):
@@ -359,6 +374,226 @@ def test_rollout_health_rejects_unexpected_live_backend(fake_redis_client, mocke
     assert backend_check["passed"] is False
     assert backend_check["actual"] == ["orcest-worker-301:grok"]
     assert report["metrics"]["unexpected_worker_backends"] == ["orcest-worker-301:grok"]
+
+
+def test_rollout_health_accepts_matching_provider_cli_versions(fake_redis_client, mocker):
+    revision = "1" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    for index, backend in enumerate(("claude", "grok", "codex"), start=300):
+        worker_id = f"orcest-worker-{index}"
+        fake_redis_client.set_ex(
+            f"workers:heartbeat:{worker_id}",
+            json.dumps(
+                {
+                    "backend": backend,
+                    "revision": revision,
+                    "provider_cli": _provider_cli(backend),
+                }
+            ),
+            ttl=150,
+        )
+        for stream in (f"tasks:{backend}", f"tasks:issue:{backend}"):
+            fake_redis_client.ensure_consumer_group(stream, "workers")
+            fake_redis_client.xreadgroup(
+                group="workers",
+                consumer=worker_id,
+                stream=stream,
+                count=1,
+                block_ms=None,
+            )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("claude", "grok", "codex"),
+    )
+
+    check = next(c for c in report["checks"] if c["name"] == "provider_cli_versions")
+    assert check["passed"] is True
+    assert report["metrics"]["provider_cli_diagnostics"] == []
+
+
+@pytest.mark.parametrize(
+    ("payload_overrides", "expected_fragment"),
+    [
+        (
+            {"template_version": "0.131.0", "status": "version_mismatch"},
+            "desired provider CLI version 0.149.1 != baked template 0.131.0",
+        ),
+        (
+            {"observed_version": "0.150.0", "status": "version_mismatch"},
+            "desired provider CLI version 0.149.1 != observed executable 0.150.0",
+        ),
+        (
+            {
+                "template_version": "0.150.0",
+                "observed_version": "0.149.1",
+                "status": "version_mismatch",
+            },
+            "baked template provider CLI version 0.150.0 != observed executable 0.149.1",
+        ),
+    ],
+)
+def test_rollout_health_fails_provider_cli_pairwise_mismatch(
+    fake_redis_client, mocker, payload_overrides, expected_fragment
+):
+    revision = "2" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.set_ex(
+        "workers:heartbeat:orcest-worker-300",
+        json.dumps(
+            {
+                "backend": "codex",
+                "revision": revision,
+                "provider_cli": _provider_cli("codex", **payload_overrides),
+            }
+        ),
+        ttl=150,
+    )
+    for stream in ("tasks:codex", "tasks:issue:codex"):
+        fake_redis_client.ensure_consumer_group(stream, "workers")
+        fake_redis_client.xreadgroup(
+            group="workers",
+            consumer="orcest-worker-300",
+            stream=stream,
+            count=1,
+            block_ms=None,
+        )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("codex",),
+    )
+
+    check = next(c for c in report["checks"] if c["name"] == "provider_cli_versions")
+    assert check["passed"] is False
+    assert any(expected_fragment in item for item in check["actual"])
+    assert report["ok"] is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["missing_template_metadata", "probe_timeout", "probe_output_unparseable"],
+)
+def test_rollout_health_fails_provider_cli_probe_status(fake_redis_client, mocker, status):
+    revision = "3" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.set_ex(
+        "workers:heartbeat:orcest-worker-300",
+        json.dumps(
+            {
+                "backend": "grok",
+                "revision": revision,
+                "provider_cli": _provider_cli(
+                    "grok",
+                    template_version=None if status == "missing_template_metadata" else "0.1.216",
+                    observed_version=None if status != "ok" else "0.1.216",
+                    status=status,
+                ),
+            }
+        ),
+        ttl=150,
+    )
+    for stream in ("tasks:grok", "tasks:issue:grok"):
+        fake_redis_client.ensure_consumer_group(stream, "workers")
+        fake_redis_client.xreadgroup(
+            group="workers",
+            consumer="orcest-worker-300",
+            stream=stream,
+            count=1,
+            block_ms=None,
+        )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("grok",),
+    )
+
+    assert report["ok"] is False
+    assert any(status in item for item in report["metrics"]["provider_cli_diagnostics"])
+
+
+def test_rollout_health_aggregates_repeated_provider_cli_diagnostics(fake_redis_client, mocker):
+    revision = "4" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    for vmid in (300, 301):
+        worker_id = f"orcest-worker-{vmid}"
+        fake_redis_client.set_ex(
+            f"workers:heartbeat:{worker_id}",
+            json.dumps(
+                {
+                    "backend": "codex",
+                    "revision": revision,
+                    "provider_cli": _provider_cli(
+                        "codex",
+                        observed_version=None,
+                        status="missing_binary",
+                    ),
+                }
+            ),
+            ttl=150,
+        )
+        for stream in ("tasks:codex", "tasks:issue:codex"):
+            fake_redis_client.ensure_consumer_group(stream, "workers")
+            fake_redis_client.xreadgroup(
+                group="workers",
+                consumer=worker_id,
+                stream=stream,
+                count=1,
+                block_ms=None,
+            )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("codex", "codex"),
+    )
+
+    diagnostics = report["metrics"]["provider_cli_diagnostics"]
+    status_lines = [
+        item for item in diagnostics if "provider CLI probe status missing_binary" in item
+    ]
+    assert status_lines == [
+        "provider CLI probe status missing_binary; rebake required: "
+        "orcest-worker-300/codex, orcest-worker-301/codex"
+    ]
+
+
+def test_rollout_health_skips_provider_cli_for_mixed_revision_worker(fake_redis_client, mocker):
+    revision = "5" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    fake_redis_client.set_ex(
+        "workers:heartbeat:orcest-worker-300",
+        json.dumps(
+            {
+                "backend": "codex",
+                "revision": "6" * 40,
+                "provider_cli": _provider_cli(
+                    "codex",
+                    template_version="0.131.0",
+                    observed_version="0.131.0",
+                    status="version_mismatch",
+                ),
+            }
+        ),
+        ttl=150,
+    )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("codex",),
+    )
+
+    assert report["metrics"]["provider_cli_diagnostics"] == []
+    assert report["metrics"]["worker_revision_mismatches"] == ["orcest-worker-300"]
 
 
 def test_rollout_health_does_not_let_stray_heartbeat_mask_dead_pool_slot(fake_redis_client, mocker):
