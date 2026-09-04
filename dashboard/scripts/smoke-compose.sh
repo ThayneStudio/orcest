@@ -22,6 +22,7 @@ PY
 env_file="$(mktemp)"
 compose_file="$(mktemp)"
 compose_state_file="$(mktemp)"
+docker_config_dir=""
 network_created=0
 
 cleanup() {
@@ -32,6 +33,9 @@ cleanup() {
   if [ "$network_created" = "1" ]; then
     docker network rm "$network_name" >/dev/null 2>&1 || true
   fi
+  if [ -n "$docker_config_dir" ]; then
+    rm -rf "$docker_config_dir"
+  fi
   rm -f "$env_file" "$compose_file" "$compose_state_file"
 }
 
@@ -39,6 +43,19 @@ trap cleanup EXIT INT TERM
 
 redis_cli() {
   docker exec "$redis_name" redis-cli --no-auth-warning -a "$redis_password" "$@"
+}
+
+docker_pull_with_retry() {
+  image="$1"
+  attempt=0
+  until docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 5 ]; then
+      echo "Could not pull required smoke image after retries: $image" >&2
+      return 1
+    fi
+    sleep $((attempt * 2))
+  done
 }
 
 wait_for_redis() {
@@ -162,6 +179,14 @@ if ! docker network inspect "$network_name" >/dev/null 2>&1; then
   docker network create "$network_name" >/dev/null
   network_created=1
 fi
+
+if [ -z "${DOCKER_CONFIG:-}" ] && { [ -z "${HOME:-}" ] || [ ! -w "$HOME" ]; }; then
+  docker_config_dir="$(mktemp -d)"
+  export DOCKER_CONFIG="$docker_config_dir"
+fi
+
+docker_pull_with_retry "redis:7"
+docker_pull_with_retry "$node_image"
 
 docker run -d --name "$redis_name" --network "$network_name" redis:7 \
   redis-server --requirepass "$redis_password" >/dev/null
