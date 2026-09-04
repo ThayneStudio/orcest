@@ -17,6 +17,13 @@ from orcest.shared.provider_versions import (
     desired_provider_cli_version,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.shared.result_stream_health import (
+    RESULT_PENDING_STALE_DELIVERIES,
+    RESULT_PENDING_STALE_IDLE_SECONDS,
+    RESULTS_STREAM,
+    format_result_stream_warning,
+    inspect_result_stream_raw,
+)
 
 
 def _check(name: str, passed: bool, actual: Any, expected: str) -> dict[str, Any]:
@@ -370,16 +377,22 @@ def collect_rollout_health(
         if unconsumed:
             unconsumed_task_streams.append(stream_name)
 
-    result_stream = redis._prefixed("results")
-    (
-        result_work,
-        result_pending,
-        result_lag,
-        unconsumed_results,
-        result_error,
-    ) = _raw_stream_work(redis, result_stream, require_present=require_quiescent)
-    if result_error is not None:
-        inspection_errors.append(result_error)
+    result_stream = redis._prefixed(RESULTS_STREAM)
+    result_health = inspect_result_stream_raw(redis, result_stream)
+    if (
+        require_quiescent
+        and not result_health.stream_exists
+        and result_health.inspection_error is None
+    ):
+        # A quiescent project-prefix gate is commonly used to catch checking
+        # the wrong project. Preserve that stricter absent-stream behavior.
+        inspection_errors.append(f"{result_stream}: stream is absent")
+    elif result_health.inspection_error is not None:
+        inspection_errors.append(result_health.inspection_error)
+    result_work = result_health.work
+    result_pending = result_health.pending
+    result_lag = result_health.lag
+    unconsumed_results = result_health.unconsumed
     queue_depth = task_queue_depth + result_work
     pending = task_pending + result_pending
     lag = task_lag + result_lag
@@ -529,8 +542,15 @@ def collect_rollout_health(
         "task_pending": task_pending,
         "task_lag": task_lag,
         "result_work": result_work,
+        "result_retained_entries": result_health.retained_entries,
         "result_pending": result_pending,
         "result_lag": result_lag,
+        "result_consumers": result_health.consumers,
+        "result_oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
+        "result_max_delivery_count": result_health.max_delivery_count,
+        "result_sampled_pending": result_health.sampled_pending,
+        "result_stream": result_health.stream,
+        "result_stream_warning": format_result_stream_warning(result_health),
         "unconsumed_task_streams": sorted(unconsumed_task_streams),
         "unconsumed_results": unconsumed_results,
         "dead_letters": dead_letters,
@@ -574,6 +594,22 @@ def collect_rollout_health(
             not unconsumed_task_streams and not unconsumed_results,
             sorted(unconsumed_task_streams) + ([result_stream] if unconsumed_results else []),
             "every work-bearing stream has a consumer group with an active consumer",
+        )
+    )
+    checks.append(
+        _check(
+            "result_handling_fresh",
+            not result_health.stale and result_health.inspection_error is None,
+            {
+                "stream": result_health.stream,
+                "pending": result_health.pending,
+                "lag": result_health.lag,
+                "oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
+                "max_delivery_count": result_health.max_delivery_count,
+                "sampled_pending": result_health.sampled_pending,
+            },
+            f"idle < {RESULT_PENDING_STALE_IDLE_SECONDS}s and deliveries < "
+            f"{RESULT_PENDING_STALE_DELIVERIES}",
         )
     )
     if baseline_dead_letters is not None:

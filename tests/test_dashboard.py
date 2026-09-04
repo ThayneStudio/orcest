@@ -27,6 +27,7 @@ from orcest.shared.provider_stream_health import (
     StreamHealthState,
     stream_health_snapshot_key,
 )
+from orcest.shared.result_stream_health import RESULT_PENDING_STALE_IDLE_SECONDS
 
 
 def test_empty_redis_returns_valid_snapshot(fake_redis_client):
@@ -74,6 +75,50 @@ def test_results_depth(fake_redis_client):
     snap = fetch_snapshot(fake_redis_client)
 
     assert snap.results_depth == 2
+
+
+def test_result_stream_health_reports_pending_lag_and_retained_xlen(fake_redis_client):
+    """Reports results work independently of retained stream entries."""
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "acked"})
+    fake_redis_client.xadd("results", {"task_id": "pending"})
+    fake_redis_client.xadd("results", {"task_id": "lagged"})
+    entries = fake_redis_client.xreadgroup(
+        "orchestrator", "orchestrator-main", "results", count=2, block_ms=None
+    )
+    fake_redis_client.xack("results", "orchestrator", entries[0][0])
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    assert snap.results_depth == 3
+    assert snap.result_stream_health is not None
+    assert snap.result_stream_health.retained_entries == 3
+    assert snap.result_stream_health.pending == 1
+    assert snap.result_stream_health.lag == 1
+    assert snap.result_stream_health.work == 2
+
+
+def test_result_stream_health_marks_stale_pending(fake_redis_client, mocker):
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "task-1"})
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        return_value=[
+            {
+                "message_id": "1-0",
+                "consumer": "orchestrator-main",
+                "time_since_delivered": RESULT_PENDING_STALE_IDLE_SECONDS * 1000,
+                "times_delivered": 1,
+            }
+        ],
+    )
+
+    snap = fetch_snapshot(fake_redis_client)
+
+    assert snap.result_stream_health is not None
+    assert snap.result_stream_health.stale is True
 
 
 def test_active_locks(fake_redis_client):

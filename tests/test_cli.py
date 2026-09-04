@@ -430,14 +430,14 @@ def test_status_once_wrongtype_tasks_key_does_not_raise(fake_redis_client):
 def test_status_once_wrongtype_results_key_does_not_raise(fake_redis_client):
     """_status_once handles WRONGTYPE on the results key without crashing."""
     # A non-stream value at results triggers WRONGTYPE on xlen
-    fake_redis_client.client.set("results", "some-value")
+    fake_redis_client.client.set("test:results", "some-value")
     _status_once(fake_redis_client)
 
 
 def test_status_once_wrongtype_both_does_not_raise(fake_redis_client):
     """_status_once handles WRONGTYPE on both tasks:* and results keys."""
     fake_redis_client.client.set("tasks:bad-key", "oops")
-    fake_redis_client.client.set("results", "also-bad")
+    fake_redis_client.client.set("test:results", "also-bad")
     _status_once(fake_redis_client)
 
 
@@ -456,19 +456,54 @@ def test_status_once_wrongtype_tasks_key_excluded_from_output(fake_redis_client)
 
 def test_status_once_wrongtype_results_key_shows_zero(fake_redis_client):
     """A WRONGTYPE results key falls back to 0 in the queue depths table."""
-    fake_redis_client.client.set("results", "some-value")
+    fake_redis_client.client.set("test:results", "some-value")
     buf = io.StringIO()
     with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
         _status_once(fake_redis_client)
 
     output = buf.getvalue()
-    # fetch_snapshot catches the ResponseError and returns results_depth=0
-    # Assert the results row in the table specifically shows 0, not just that "0"
-    # appears somewhere in the output.
-    assert re.search(r"│\s*results\s*│\s*0\b", output), (
-        "Expected 'results' table row to show depth 0, got:\n" + output
+    # The status table distinguishes unprocessed result work from retained XLEN.
+    assert re.search(r"│\s*results retained\s*│\s*--\s*│\s*0\b", output), (
+        "Expected retained results table row to show XLEN 0, got:\n" + output
     )
+    assert "RESULT STREAM UNHEALTHY" in output
     assert "Orcest System Status" in output
+
+
+def test_status_once_warns_for_stale_results_without_result_body(fake_redis_client, mocker):
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd(
+        "results",
+        {
+            "task_id": "task-1",
+            "status": "failed",
+            "summary": "super-secret failure body",
+        },
+    )
+    fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    mocker.patch.object(
+        fake_redis_client.client,
+        "xpending_range",
+        return_value=[
+            {
+                "message_id": "1-0",
+                "consumer": "orchestrator-main",
+                "time_since_delivered": 15 * 60 * 1000,
+                "times_delivered": 1,
+            }
+        ],
+    )
+    buf = io.StringIO()
+    with patch("orcest.cli.Console", return_value=Console(file=buf, highlight=False)):
+        _status_once(fake_redis_client)
+
+    output = buf.getvalue()
+    assert "STALE result handling on test:results" in output
+    assert "pending=1" in output
+    assert "oldest_pending_idle=900s" in output
+    warning_lines = [line for line in output.splitlines() if "STALE result handling" in line]
+    assert warning_lines
+    assert "super-secret failure body" not in warning_lines[0]
 
 
 # ---------------------------------------------------------------------------
