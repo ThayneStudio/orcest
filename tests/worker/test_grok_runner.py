@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -196,6 +197,69 @@ def test_detect_exhaustion_from_stderr_rate_limit() -> None:
 
 
 @pytest.mark.unit
+def test_detect_exhaustion_live_402_usage_balance_stdout_fixture() -> None:
+    exhausted, resets_at = GrokRunner().detect_exhaustion(
+        _fixture("grok_usage_balance_exhausted_402.jsonl"),
+        "",
+    )
+    assert exhausted is True
+    assert resets_at == 0
+
+
+@pytest.mark.unit
+def test_detect_exhaustion_live_402_usage_balance_stderr_only() -> None:
+    stderr = (
+        "Internal error: {\n"
+        '  "message": "API error (status 402 Payment Required): '
+        'Grok Build usage balance exhausted",\n'
+        '  "http_status": 402\n'
+        "}"
+    )
+    exhausted, resets_at = GrokRunner().detect_exhaustion("", stderr)
+    assert exhausted is True
+    assert resets_at == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stdout, stderr",
+    [
+        (
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "API error (status 402 Payment Required): billing required",
+                }
+            ),
+            "",
+        ),
+        (_fixture("grok_error_403.jsonl"), ""),
+        (
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "API error (status 403 Forbidden): no credits available",
+                }
+            ),
+            "",
+        ),
+        ("", "Authentication failed: invalid API key"),
+        (
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "Internal error: max_turns exceeded",
+                }
+            ),
+            "",
+        ),
+    ],
+)
+def test_detect_exhaustion_402_usage_balance_negative_fixtures(stdout: str, stderr: str) -> None:
+    assert GrokRunner().detect_exhaustion(stdout, stderr) == (False, 0)
+
+
+@pytest.mark.unit
 def test_detect_exhaustion_403_no_credits_is_not_exhaustion() -> None:
     # A 403 "no credits/licenses" is a permanent billing/config problem, NOT a
     # transient rate limit — must not be mistaken for exhaustion.
@@ -206,6 +270,43 @@ def test_detect_exhaustion_403_no_credits_is_not_exhaustion() -> None:
 @pytest.mark.unit
 def test_detect_exhaustion_clean_output_is_false() -> None:
     assert GrokRunner().detect_exhaustion(_fixture("grok_simple_reply.jsonl"), "") == (False, 0)
+
+
+@pytest.mark.unit
+def test_run_usage_balance_exhausted_short_circuits_retries(tmp_path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    attempts = tmp_path / "attempts"
+    fake_grok = bin_dir / "grok"
+    fixture = FIXTURES / "grok_usage_balance_exhausted_402.jsonl"
+    fake_grok.write_text(
+        "#!/bin/sh\n"
+        f"count=$(cat {shlex.quote(str(attempts))} 2>/dev/null || echo 0)\n"
+        "count=$((count + 1))\n"
+        f'echo "$count" > {shlex.quote(str(attempts))}\n'
+        f"cat {shlex.quote(str(fixture))}\n"
+        "exit 1\n"
+    )
+    fake_grok.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    result = GrokRunner(max_retries=3, retry_backoff=0).run(
+        prompt="hello",
+        work_dir=tmp_path,
+        token="ghp_test",
+        timeout=10,
+        provider="grok",
+        credential="xai-test",
+        home_dir=home,
+    )
+
+    assert attempts.read_text().strip() == "1"
+    assert result.success is False
+    assert result.usage_exhausted is True
+    assert result.rate_limit_resets_at == 0
+    assert result.transient is False
 
 
 @pytest.mark.unit

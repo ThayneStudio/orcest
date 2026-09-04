@@ -6,7 +6,10 @@ and fake_redis_client for result stream operations.
 
 import json
 import logging
+import os
+import shlex
 import time
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +21,7 @@ from orcest.orchestrator.issue_ops import (
 )
 from orcest.orchestrator.loop import (
     _MAX_REVIEW_RERUN_FAILURES,
+    _PROVIDER_EXHAUSTED_SKIP_KEY,
     _SHARED_CREDENTIAL_OVERRIDES_KEY,
     _TASK_PROVIDER_ACCOUNT_PREFIX,
     _TASK_PROVIDER_ACCOUNTS_KEY,
@@ -1839,6 +1843,107 @@ def test_consume_results_usage_exhausted(fake_redis_client, orchestrator_config,
     # Cooldown marker must be set
     assert has_usage_exhausted_cooldown(fake_redis_client, repo, pr_number)
     assert 1700 <= fake_redis_client.ttl(f"pr:{repo}:{pr_number}:usage_cooldown") <= 1800
+
+
+@pytest.mark.integration
+def test_grok_402_usage_balance_result_benches_account_and_counts_skip(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    fake_redis_client,
+    orchestrator_config,
+    gh_mock,
+):
+    """Live-shaped Grok 402 usage-balance output reaches provider cooldown telemetry."""
+    from orcest.orchestrator.provider_pool import ProviderPool
+    from orcest.shared.providers import ProviderEntry
+    from orcest.worker.grok_runner import GrokRunner
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    attempts = tmp_path / "attempts"
+    fixture = (
+        Path(__file__).parents[1]
+        / "worker"
+        / "fixtures"
+        / ("grok_usage_balance_exhausted_402.jsonl")
+    )
+    fake_grok = bin_dir / "grok"
+    fake_grok.write_text(
+        "#!/bin/sh\n"
+        f"count=$(cat {shlex.quote(str(attempts))} 2>/dev/null || echo 0)\n"
+        "count=$((count + 1))\n"
+        f'echo "$count" > {shlex.quote(str(attempts))}\n'
+        f"cat {shlex.quote(str(fixture))}\n"
+        "exit 1\n"
+    )
+    fake_grok.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    entry = ProviderEntry(provider="grok", credential="xai-grok-test", model="grok-build")
+    pool = ProviderPool([entry])
+    task_id = "task-grok-402-usage-balance"
+    pool.register_task(task_id, entry)
+
+    runner_result = GrokRunner(max_retries=3, retry_backoff=0).run(
+        prompt="fix the issue",
+        work_dir=tmp_path,
+        token=orchestrator_config.github.token,
+        timeout=10,
+        provider="grok",
+        credential=entry.credential,
+        model=entry.model or "",
+        home_dir=tmp_path / "home",
+    )
+
+    assert attempts.read_text().strip() == "1"
+    assert runner_result.usage_exhausted is True
+    assert runner_result.transient is False
+
+    repo = orchestrator_config.github.repo
+    result = _make_task_result(
+        status=ResultStatus.USAGE_EXHAUSTED,
+        pr_number=778,
+        task_id=task_id,
+        summary=runner_result.summary,
+        rate_limit_resets_at=runner_result.rate_limit_resets_at,
+    )
+    result.provider_account = entry.account_key()
+
+    _handle_result(
+        orchestrator_config.projects[0],
+        orchestrator_config.labels,
+        fake_redis_client,
+        result,
+        logging.getLogger("test.grok-usage"),
+        token_pool=pool,
+    )
+
+    assert pool.available_count == 0
+    assert has_usage_exhausted_cooldown(fake_redis_client, repo, 778)
+    assert fake_redis_client.get(_USAGE_EXHAUSTED_RESULT_KEY) == "1"
+
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[_make_pr_state(number=779, action=PRAction.ENQUEUE_FIX)],
+    )
+    publish_mock = mocker.patch("orcest.orchestrator.loop.publish_fix_task")
+    mocker.patch("orcest.orchestrator.loop.publish_followup_task")
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    project_key = orchestrator_config.projects[0].key_prefix
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {project_key: pool},
+        logging.getLogger("test.grok-usage-poll"),
+        3600,
+    )
+
+    publish_mock.assert_not_called()
+    assert fake_redis_client.get(_PROVIDER_EXHAUSTED_SKIP_KEY) == "1"
+    assert fake_redis_client.get("providers:grok:exhausted_skip") == "1"
 
 
 def test_consume_results_usage_exhausted_pr_cooldown_ttl_uses_reset_time(

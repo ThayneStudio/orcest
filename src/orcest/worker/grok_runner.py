@@ -44,6 +44,15 @@ _GROK_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Grok Build currently reports a depleted account as HTTP 402 with this
+# semantic message. Keep this separate from the generic rate-limit matcher so
+# unrelated 402/403 billing, auth, or configuration failures are not treated as
+# temporary usage exhaustion.
+_GROK_USAGE_BALANCE_EXHAUSTED_RE = re.compile(
+    r"\busage\s+balance\s+exhausted\b",
+    re.IGNORECASE,
+)
+
 # Transient server overload (5xx / explicit overload). Conservative so generic
 # "Internal error" text (e.g. a max-turns error) is not treated as transient.
 _GROK_OVERLOAD_RE = re.compile(
@@ -150,7 +159,10 @@ class GrokRunner(_BaseCliRunner):
     def detect_exhaustion(self, stdout: str, stderr: str) -> tuple[bool, int]:
         # grok events carry no reset timestamp, so resets_at is always 0
         # (unknown) → the orchestrator applies its default cooldown.
-        if _GROK_RATE_LIMIT_RE.search(_grok_error_text(stdout, stderr)):
+        error_text = _grok_error_text(stdout, stderr)
+        if _GROK_RATE_LIMIT_RE.search(error_text) or _GROK_USAGE_BALANCE_EXHAUSTED_RE.search(
+            error_text
+        ):
             return True, 0
         return False, 0
 
