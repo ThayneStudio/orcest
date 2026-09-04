@@ -920,8 +920,8 @@ def set_workers_draining(
         raise RuntimeError(f"Failed to {action} worker drain state: {failure}")
 
 
-def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
-    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+def get_worker_heartbeat_details(ssh_target: str) -> dict[str, dict[str, object]]:
+    """Return live worker heartbeat records with bounded provider CLI metadata."""
     pattern = "orcest:workers:heartbeat:*"
     result = _ssh(
         ssh_target,
@@ -929,7 +929,7 @@ def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
     )
     _require_redis_cli_success(result, "Failed to scan worker heartbeats")
     keys = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
-    heartbeats: dict[str, tuple[str, str]] = {}
+    heartbeats: dict[str, dict[str, object]] = {}
     for key in keys:
         if not key.startswith("orcest:workers:heartbeat:"):
             raise RuntimeError("Worker heartbeat scan returned an unexpected key")
@@ -954,8 +954,22 @@ def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
         worker_id = key.removeprefix("orcest:workers:heartbeat:")
         if not worker_id:
             raise RuntimeError("Worker heartbeat is missing its worker ID")
-        heartbeats[worker_id] = (backend, revision)
+        provider_cli = payload.get("provider_cli")
+        heartbeats[worker_id] = {
+            "backend": backend,
+            "revision": revision,
+            "provider_cli": provider_cli if isinstance(provider_cli, dict) else None,
+        }
     return heartbeats
+
+
+def get_worker_heartbeats(ssh_target: str) -> dict[str, tuple[str, str]]:
+    """Return live ``worker_id -> (backend, revision)`` heartbeat records."""
+    details = get_worker_heartbeat_details(ssh_target)
+    return {
+        worker_id: (str(record["backend"]), str(record["revision"]))
+        for worker_id, record in details.items()
+    }
 
 
 def clean_pending_tasks(ssh_target: str) -> int:

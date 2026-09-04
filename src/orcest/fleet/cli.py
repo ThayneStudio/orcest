@@ -17,7 +17,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, ParamSpec, TextIO, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterator, ParamSpec, TextIO, TypeVar
 
 import click
 from rich.console import Console
@@ -1391,6 +1391,58 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
     console.print("\n[bold]Fleet update complete.[/bold]")
 
 
+def _safe_cli_version(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
+        return value
+    return "[dim]missing[/dim]"
+
+
+def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> None:
+    """Display secret-free provider CLI version heartbeat fields."""
+    from orcest.fleet.orchestrator import get_worker_heartbeat_details
+
+    try:
+        details = get_worker_heartbeat_details(ssh_target)
+    except Exception as exc:
+        console.print(f"\n[yellow]Could not read worker heartbeats:[/yellow] {exc}")
+        return
+    if not details:
+        console.print("\n[dim]No live worker heartbeats.[/dim]")
+        return
+
+    table = Table(title="Worker Provider CLI Versions")
+    table.add_column("Worker", style="cyan")
+    table.add_column("Backend", style="white")
+    table.add_column("Revision", style="magenta")
+    table.add_column("Desired", style="green")
+    table.add_column("Template", style="yellow")
+    table.add_column("Observed", style="yellow")
+    table.add_column("Status", style="white")
+    for worker_id, record in sorted(details.items()):
+        backend = str(record.get("backend", ""))
+        revision = str(record.get("revision", ""))
+        provider_cli = record.get("provider_cli")
+        cli_payload: dict[str, Any] = provider_cli if isinstance(provider_cli, dict) else {}
+        status = cli_payload.get("status")
+        status_text = str(status) if isinstance(status, str) and len(status) <= 64 else "legacy"
+        if status_text == "ok":
+            status_text = "[green]ok[/green]"
+        elif status_text == "legacy":
+            status_text = "[dim]legacy[/dim]"
+        else:
+            status_text = f"[red]{status_text}[/red]"
+        table.add_row(
+            worker_id,
+            backend,
+            revision[:12],
+            _safe_cli_version(cli_payload.get("desired_version")),
+            _safe_cli_version(cli_payload.get("template_version")),
+            _safe_cli_version(cli_payload.get("observed_version")),
+            status_text,
+        )
+    console.print(table)
+
+
 @fleet.command()
 @click.option(
     "--config",
@@ -1509,6 +1561,8 @@ def status(config: str) -> None:
     pool_table.add_row("Worker Memory", f"{cfg.pool.worker_memory} MB")
     pool_table.add_row("Worker Cores", str(cfg.pool.worker_cores))
     console.print(pool_table)
+    if cfg.orchestrator.host:
+        _print_worker_provider_cli_heartbeats(console, cfg.ssh_target())
 
 
 def _resolve_image_checksum(image_url: str, cfg: FleetConfig, console: Console) -> str:
@@ -2152,6 +2206,8 @@ def pool_status(config: str) -> None:
     pool_table.add_row("Worker Disk Size", f"{cfg.pool.worker_disk_size} GB")
     pool_table.add_row("Max Task Duration", f"{cfg.pool.max_task_duration}s")
     console.print(pool_table)
+    if cfg.orchestrator.host:
+        _print_worker_provider_cli_heartbeats(console, cfg.ssh_target())
 
     if not active_template:
         console.print(

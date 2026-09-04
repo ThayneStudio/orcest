@@ -11,6 +11,11 @@ import redis as redis_lib
 
 from orcest.revision import get_build_revision, revision_is_attested
 from orcest.shared.models import CONSUMER_GROUP, require_valid_provider_name, task_stream_name
+from orcest.shared.provider_versions import (
+    PROVIDER_CLI_DESIRED_VERSIONS,
+    PROVIDER_CLI_HEARTBEAT_SCHEMA,
+    desired_provider_cli_version,
+)
 from orcest.shared.redis_client import RedisClient
 
 
@@ -111,11 +116,11 @@ def _raw_worker_heartbeats(
     *,
     task_prefix: str,
     expected_revision: str,
-) -> tuple[dict[str, str], list[str], list[str]]:
+) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
     """Return candidate worker IDs by backend plus mismatches and parse errors."""
     heartbeat_prefix = f"{task_prefix}:workers:heartbeat:" if task_prefix else "workers:heartbeat:"
     pattern = f"{heartbeat_prefix}*"
-    workers: dict[str, str] = {}
+    workers: dict[str, dict[str, Any]] = {}
     revision_mismatches: list[str] = []
     errors: list[str] = []
     try:
@@ -154,10 +159,88 @@ def _raw_worker_heartbeats(
             if revision != expected_revision.lower():
                 revision_mismatches.append(worker_id)
                 continue
-            workers[worker_id] = backend
+            workers[worker_id] = {"backend": backend, "provider_cli": payload.get("provider_cli")}
     except (redis_lib.RedisError, TypeError, ValueError) as exc:
         errors.append(f"{pattern}: {type(exc).__name__}")
     return workers, sorted(revision_mismatches), errors
+
+
+def _safe_version(value: Any) -> str | None:
+    if isinstance(value, str) and 0 < len(value) <= 64:
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
+            return value
+    return None
+
+
+def _worker_provider_cli_diagnostics(
+    worker_id: str,
+    backend: str,
+    payload: Any,
+) -> list[str]:
+    """Return secret-free provider CLI drift diagnostics for one same-revision worker."""
+    label = f"{worker_id}/{backend}"
+    expected_desired = desired_provider_cli_version(backend)
+    if expected_desired is None:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("schema") != PROVIDER_CLI_HEARTBEAT_SCHEMA:
+        return [f"{label}: provider CLI heartbeat schema unsupported; rebake required"]
+    if payload.get("provider") != backend:
+        return [f"{label}: provider CLI heartbeat backend mismatch; rebake required"]
+    status = payload.get("status")
+    if not isinstance(status, str) or len(status) > 64:
+        return [f"{label}: provider CLI heartbeat status invalid; rebake required"]
+    desired = _safe_version(payload.get("desired_version"))
+    template = _safe_version(payload.get("template_version"))
+    observed = _safe_version(payload.get("observed_version"))
+    diagnostics: list[str] = []
+    if desired != expected_desired:
+        diagnostics.append(
+            f"{label}: desired provider CLI version {desired or 'missing'} "
+            f"!= manifest {expected_desired}; rebake required"
+        )
+    if template is None:
+        diagnostics.append(f"{label}: baked template provider CLI version missing; rebake required")
+    if observed is None:
+        diagnostics.append(f"{label}: observed provider CLI version missing; rebake required")
+    if desired is not None and template is not None and desired != template:
+        diagnostics.append(
+            f"{label}: desired provider CLI version {desired} "
+            f"!= baked template {template}; rebake required"
+        )
+    if desired is not None and observed is not None and desired != observed:
+        diagnostics.append(
+            f"{label}: desired provider CLI version {desired} "
+            f"!= observed executable {observed}; rebake required"
+        )
+    if template is not None and observed is not None and template != observed:
+        diagnostics.append(
+            f"{label}: baked template provider CLI version {template} "
+            f"!= observed executable {observed}; rebake required"
+        )
+    if status != "ok":
+        diagnostics.append(f"{label}: provider CLI probe status {status}; rebake required")
+    return diagnostics
+
+
+def _aggregate_diagnostics(diagnostics: list[str]) -> list[str]:
+    """Collapse repeated reasons without hiding affected workers/backends."""
+    grouped: dict[str, list[str]] = {}
+    for diagnostic in diagnostics:
+        label, sep, reason = diagnostic.partition(": ")
+        if not sep:
+            grouped.setdefault(diagnostic, []).append("")
+            continue
+        grouped.setdefault(reason, []).append(label)
+    collapsed: list[str] = []
+    for reason, labels in sorted(grouped.items()):
+        labels = sorted(label for label in labels if label)
+        if labels:
+            collapsed.append(f"{reason}: {', '.join(labels)}")
+        else:
+            collapsed.append(reason)
+    return collapsed
 
 
 def _provider_metric_total(redis: RedisClient, metric: str) -> tuple[int, str | None]:
@@ -383,14 +466,15 @@ def collect_rollout_health(
                 f"{','.join(sorted(expected_worker_layout))}"
             )
         for worker_id, expected_backend in expected_worker_layout.items():
-            actual_backend = heartbeat_workers.get(worker_id)
+            heartbeat = heartbeat_workers.get(worker_id)
+            actual_backend = heartbeat.get("backend") if heartbeat is not None else None
             if actual_backend != expected_backend:
                 worker_layout_mismatches.append(
                     f"{worker_id}:{actual_backend or 'missing'}!={expected_backend}"
                 )
         candidate_heartbeat_workers = {
-            worker_id: backend
-            for worker_id, backend in heartbeat_workers.items()
+            worker_id: heartbeat
+            for worker_id, heartbeat in heartbeat_workers.items()
             if worker_id in tracked_worker_ids
         }
     else:
@@ -398,16 +482,27 @@ def collect_rollout_health(
     expected_backend_names = set(expected_backend_counts)
     unexpected_worker_backends = sorted(
         f"{worker_id}:{backend}"
-        for worker_id, backend in heartbeat_workers.items()
+        for worker_id, heartbeat in heartbeat_workers.items()
+        for backend in [str(heartbeat["backend"])]
         if backend not in expected_backend_names
         or (exact_pool_layout and worker_id not in tracked_worker_ids)
     )
+    provider_cli_diagnostics: list[str] = []
     for backend, expected_count in expected_backend_counts.items():
         candidate_workers = {
             worker_id
-            for worker_id, worker_backend in candidate_heartbeat_workers.items()
+            for worker_id, heartbeat in candidate_heartbeat_workers.items()
+            for worker_backend in [str(heartbeat["backend"])]
             if worker_backend == backend
         }
+        for worker_id in sorted(candidate_workers):
+            provider_cli_diagnostics.extend(
+                _worker_provider_cli_diagnostics(
+                    worker_id,
+                    backend,
+                    candidate_heartbeat_workers[worker_id].get("provider_cli"),
+                )
+            )
         stream_counts: dict[str, int] = {}
         for kind, logical_stream in (
             ("pr", task_stream_name(backend)),
@@ -453,6 +548,8 @@ def collect_rollout_health(
         "unexpected_worker_backends": unexpected_worker_backends,
         "expected_worker_layout": expected_worker_layout,
         "worker_layout_mismatches": sorted(worker_layout_mismatches),
+        "provider_cli_diagnostics": _aggregate_diagnostics(provider_cli_diagnostics),
+        "desired_provider_cli_versions": dict(PROVIDER_CLI_DESIRED_VERSIONS),
         "inspection_errors": sorted(inspection_errors),
     }
     checks.append(
@@ -529,6 +626,13 @@ def collect_rollout_health(
                     + sorted(worker_layout_mismatches),
                     "the exact expected worker capacity has heartbeats and matching "
                     "PR/issue consumers",
+                ),
+                _check(
+                    "provider_cli_versions",
+                    not provider_cli_diagnostics,
+                    _aggregate_diagnostics(provider_cli_diagnostics),
+                    "desired, baked-template, and observed executable versions match "
+                    "for each same-revision expected worker",
                 ),
                 _check(
                     "worker_revisions",

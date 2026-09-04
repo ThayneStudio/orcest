@@ -62,6 +62,7 @@ from orcest.shared.output_streams import (
     OUTPUT_STREAM_TTL_SECONDS as _OUTPUT_STREAM_TTL_SECONDS,
     iter_capped_output_fields,
 )
+from orcest.shared.provider_versions import collect_provider_cli_probe
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 from orcest.worker._runner_base import _BaseCliRunner
 from orcest.worker.heartbeat import Heartbeat
@@ -71,8 +72,10 @@ from orcest.worker.runner import (
     Runner,
     RunnerResult,
     create_runner,
+    get_provider_recipe,
     get_unsupported_reason,
     prime_provider_binaries,
+    resolve_provider_binary,
 )
 from orcest.worker.workspace import Workspace, WorkspaceError
 
@@ -92,11 +95,17 @@ _EPHEMERAL_RESULT_RETRY_SECONDS = 5
 
 
 def _refresh_worker_liveness(
-    redis: RedisClient, config: WorkerConfig, logger: logging.Logger
+    redis: RedisClient,
+    config: WorkerConfig,
+    logger: logging.Logger,
+    provider_cli: dict[str, Any] | None = None,
 ) -> None:
     """Publish an expiring, non-secret worker process/backend/revision heartbeat."""
+    heartbeat: dict[str, Any] = {"backend": config.backend, "revision": get_build_revision()}
+    if provider_cli is not None:
+        heartbeat["provider_cli"] = provider_cli
     payload = json.dumps(
-        {"backend": config.backend, "revision": get_build_revision()},
+        heartbeat,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1108,6 +1117,28 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
         ", ".join(f"{name}={'ok' if path else 'MISSING'}" for name, path in sorted(baked.items()))
         or "none",
     )
+    recipe = get_provider_recipe(config.backend)
+    provider_cli = (
+        collect_provider_cli_probe(
+            config.backend,
+            binary=recipe.binary,
+            binary_path=resolve_provider_binary(recipe.binary) if recipe.binary else None,
+        ).to_heartbeat()
+        if recipe is not None
+        else collect_provider_cli_probe(
+            config.backend,
+            binary="",
+            binary_path=None,
+        ).to_heartbeat()
+    )
+    logger.info(
+        "Provider CLI version: provider=%s desired=%s template=%s observed=%s status=%s",
+        provider_cli.get("provider"),
+        provider_cli.get("desired_version"),
+        provider_cli.get("template_version"),
+        provider_cli.get("observed_version"),
+        provider_cli.get("status"),
+    )
     redis = RedisClient(config.redis)
     runner = create_runner(config.runner)
 
@@ -1201,7 +1232,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
     )
 
     while not shutdown and (stop_event is None or not stop_event.is_set()):
-        _refresh_worker_liveness(redis, config, logger)
+        _refresh_worker_liveness(redis, config, logger, provider_cli)
         try:
             if redis.sismember(_POOL_DRAINING_KEY, config.worker_id) is True:
                 logger.info(
@@ -1465,7 +1496,7 @@ def run_worker(config: WorkerConfig, stop_event: threading.Event | None = None) 
             interval=HEARTBEAT_INTERVAL,
             logger=logger,
             on_lock_lost=lock_lost.set,
-            on_refreshed=lambda: _refresh_worker_liveness(redis, config, logger),
+            on_refreshed=lambda: _refresh_worker_liveness(redis, config, logger, provider_cli),
         )
         heartbeat.start()
 

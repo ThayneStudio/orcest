@@ -1,5 +1,6 @@
 """Tests for orcest.fleet.orchestrator pure functions."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from orcest.fleet.orchestrator import (
     generate_orchestrator_config,
     get_deployed_pool_backend,
     get_deployed_pool_vmid_range,
+    get_worker_heartbeat_details,
     get_worker_heartbeats,
     image_exists,
     upload_fleet_config,
@@ -101,6 +103,44 @@ def test_get_worker_heartbeats_returns_backend_and_revision(mocker):
 
     assert get_worker_heartbeats("user@host") == {"orcest-worker-10001": ("codex", "a" * 40)}
     assert ssh.call_count == 2
+
+
+def test_get_worker_heartbeat_details_returns_provider_cli_metadata(mocker):
+    key = "orcest:workers:heartbeat:orcest-worker-10001"
+    provider_cli = {
+        "schema": 1,
+        "provider": "codex",
+        "desired_version": "0.149.1",
+        "template_version": "0.149.1",
+        "observed_version": "0.131.0",
+        "status": "version_mismatch",
+    }
+    mocker.patch(
+        "orcest.fleet.orchestrator._ssh",
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=f"{key}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "backend": "codex",
+                        "revision": "a" * 40,
+                        "provider_cli": provider_cli,
+                    }
+                ),
+                stderr="",
+            ),
+        ],
+    )
+
+    assert get_worker_heartbeat_details("user@host") == {
+        "orcest-worker-10001": {
+            "backend": "codex",
+            "revision": "a" * 40,
+            "provider_cli": provider_cli,
+        }
+    }
 
 
 class TestValidateProjectName:
