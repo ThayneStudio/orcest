@@ -85,6 +85,8 @@ from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
     PROVIDER_NAME_RE,
+    RESULTS_GROUP,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -95,9 +97,6 @@ from orcest.shared.models import (
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
 from orcest.workflow_store import load_legacy_change_request_exclusion_snapshot
-
-RESULTS_STREAM = "results"
-RESULTS_GROUP = "orchestrator"
 
 # Observability counters (Task 8 hygiene).
 # Per-provider under providers:{provider}: namespace, project-scoped via key_prefix.

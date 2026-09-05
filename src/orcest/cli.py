@@ -23,7 +23,10 @@ from orcest.shared.models import (
     REDACTED_FIELDS,
 )
 from orcest.shared.provider_stream_health import StreamHealthState
-from orcest.shared.result_stream_health import format_result_stream_warning
+from orcest.shared.result_stream_health import (
+    format_result_stream_metrics,
+    format_result_stream_warning,
+)
 
 if TYPE_CHECKING:
     from orcest.shared.config import RedisConfig
@@ -484,7 +487,7 @@ def _status_once(redis: RedisClient) -> None:
     if not snapshot.queue_depths:
         table.add_row("tasks:*", "0", "--")
     result_health = snapshot.result_stream_health
-    result_work = result_health.work if result_health is not None else 0
+    result_work = result_health.work
     table.add_row("results work", str(result_work), "--")
     table.add_row("results retained", "--", str(snapshot.results_depth))
     table.add_row(
@@ -494,11 +497,14 @@ def _status_once(redis: RedisClient) -> None:
     )
     console.print(table)
 
-    result_warning = (
-        format_result_stream_warning(result_health)
-        if result_health is not None
-        else "RESULT STREAM UNHEALTHY results: inspection unavailable"
-    )
+    result_table = Table(title="Result Stream Health")
+    result_table.add_column("Metric")
+    result_table.add_column("Value")
+    for metric, value in format_result_stream_metrics(result_health):
+        result_table.add_row(metric, value)
+    console.print(result_table)
+
+    result_warning = format_result_stream_warning(result_health)
     if result_warning:
         console.print(f"[bold red]{result_warning}[/bold red]")
 

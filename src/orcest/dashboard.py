@@ -20,7 +20,7 @@ from typing import Any
 import redis as redis_lib
 from rich.markup import escape as rich_escape
 
-from orcest.shared.models import DEAD_LETTER_STREAM
+from orcest.shared.models import DEAD_LETTER_STREAM, RESULTS_STREAM
 from orcest.shared.output_streams import is_output_continuation
 from orcest.shared.provider_stream_health import (
     STREAM_HEALTH_KEY_PREFIX,
@@ -30,8 +30,10 @@ from orcest.shared.provider_stream_health import (
 from orcest.shared.redis_client import RedisClient
 from orcest.shared.result_stream_health import (
     ResultStreamHealth,
+    format_result_stream_metrics,
     format_result_stream_warning,
     inspect_result_stream,
+    unavailable_result_stream_health,
 )
 
 # Global (cross-project, unprefixed) key prefix PoolManager publishes canonical
@@ -89,9 +91,11 @@ class SystemSnapshot:
 
     redis_ok: bool
     fetched_at: datetime
+    # Always populated. A disconnected snapshot carries an explicit unavailable
+    # value, so renderers never need an unreachable Redis-OK/None fallback.
+    result_stream_health: ResultStreamHealth
     queue_depths: dict[str, int] = field(default_factory=dict)
     results_depth: int = 0
-    result_stream_health: ResultStreamHealth | None = None
     dead_letter_count: int = 0
     locks: list[LockInfo] = field(default_factory=list)
     consumer_groups: list[ConsumerGroupInfo] = field(default_factory=list)
@@ -110,6 +114,7 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
         return SystemSnapshot(
             redis_ok=False,
             fetched_at=datetime.now(timezone.utc),
+            result_stream_health=unavailable_result_stream_health(redis._prefixed(RESULTS_STREAM)),
         )
 
     try:
@@ -123,6 +128,7 @@ def fetch_snapshot(redis: RedisClient, max_results: int = 20) -> SystemSnapshot:
         return SystemSnapshot(
             redis_ok=False,
             fetched_at=datetime.now(timezone.utc),
+            result_stream_health=unavailable_result_stream_health(redis._prefixed(RESULTS_STREAM)),
         )
 
 
@@ -565,6 +571,8 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             with VerticalScroll(id="overview-container"):
                 yield Static("Queue Depths", classes="section-title")
                 yield DataTable(id="queues-table")
+                yield Static("Result Stream Health", classes="section-title")
+                yield DataTable(id="result-health-table")
                 yield Static("Provider Stream Health", classes="section-title")
                 yield DataTable(id="stream-health-table")
                 yield Static("Active Locks", classes="section-title")
@@ -586,6 +594,9 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
         def on_mount(self) -> None:
             queues = self.query_one("#queues-table", DataTable)
             queues.add_columns("Stream", "Work", "Retained XLEN")
+
+            result_health = self.query_one("#result-health-table", DataTable)
+            result_health.add_columns("Metric", "Value")
 
             stream_health = self.query_one("#stream-health-table", DataTable)
             stream_health.add_columns(
@@ -662,19 +673,20 @@ def run_dashboard(redis: RedisClient, refresh_interval: float = 3.0) -> None:
             if not snapshot.queue_depths:
                 queues.add_row("(no task streams)", "0", "--")
             result_health = snapshot.result_stream_health
-            result_work = result_health.work if result_health is not None else 0
+            result_work = result_health.work
             queues.add_row("results work", str(result_work), "--")
             queues.add_row("results retained", "--", str(snapshot.results_depth))
             dl_count = snapshot.dead_letter_count
             dl_text = Text(str(dl_count), style="red bold") if dl_count > 0 else Text(str(dl_count))
             queues.add_row(DEAD_LETTER_STREAM, dl_text, str(dl_count))
 
+            result_table = self.query_one("#result-health-table", DataTable)
+            result_table.clear()
+            for metric, value in format_result_stream_metrics(result_health):
+                result_table.add_row(metric, value)
+
             result_banner = self.query_one("#result-health-banner", Static)
-            warning = (
-                format_result_stream_warning(result_health)
-                if result_health is not None
-                else "RESULT STREAM UNHEALTHY results: inspection unavailable"
-            )
+            warning = format_result_stream_warning(result_health)
             if warning:
                 result_banner.update(warning)
                 result_banner.add_class("visible")

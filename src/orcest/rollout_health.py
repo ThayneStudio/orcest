@@ -10,7 +10,12 @@ from typing import Any, cast
 import redis as redis_lib
 
 from orcest.revision import get_build_revision, revision_is_attested
-from orcest.shared.models import CONSUMER_GROUP, require_valid_provider_name, task_stream_name
+from orcest.shared.models import (
+    CONSUMER_GROUP,
+    RESULTS_STREAM,
+    require_valid_provider_name,
+    task_stream_name,
+)
 from orcest.shared.provider_versions import (
     PROVIDER_CLI_DESIRED_VERSIONS,
     PROVIDER_CLI_HEARTBEAT_SCHEMA,
@@ -20,7 +25,6 @@ from orcest.shared.redis_client import RedisClient
 from orcest.shared.result_stream_health import (
     RESULT_PENDING_STALE_DELIVERIES,
     RESULT_PENDING_STALE_IDLE_SECONDS,
-    RESULTS_STREAM,
     format_result_stream_warning,
     inspect_result_stream_raw,
 )
@@ -546,9 +550,16 @@ def collect_rollout_health(
         "result_pending": result_pending,
         "result_lag": result_lag,
         "result_consumers": result_health.consumers,
+        "result_live_consumers": result_health.live_consumers,
+        "result_youngest_consumer_idle_seconds": result_health.youngest_consumer_idle_seconds,
         "result_oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
         "result_max_delivery_count": result_health.max_delivery_count,
+        "result_sampled_oldest_pending_idle_seconds": (
+            result_health.sampled_oldest_pending_idle_seconds
+        ),
+        "result_sampled_max_delivery_count": result_health.sampled_max_delivery_count,
         "result_sampled_pending": result_health.sampled_pending,
+        "result_pending_inspection_complete": result_health.pending_inspection_complete,
         "result_stream": result_health.stream,
         "result_stream_warning": format_result_stream_warning(result_health),
         "unconsumed_task_streams": sorted(unconsumed_task_streams),
@@ -604,9 +615,17 @@ def collect_rollout_health(
                 "stream": result_health.stream,
                 "pending": result_health.pending,
                 "lag": result_health.lag,
+                "live_consumers": result_health.live_consumers,
+                "registered_consumers": result_health.consumers,
+                "youngest_consumer_idle_seconds": (result_health.youngest_consumer_idle_seconds),
                 "oldest_pending_idle_seconds": result_health.oldest_pending_idle_seconds,
                 "max_delivery_count": result_health.max_delivery_count,
+                "sampled_oldest_pending_idle_seconds": (
+                    result_health.sampled_oldest_pending_idle_seconds
+                ),
+                "sampled_max_delivery_count": result_health.sampled_max_delivery_count,
                 "sampled_pending": result_health.sampled_pending,
+                "pending_inspection_complete": result_health.pending_inspection_complete,
             },
             f"idle < {RESULT_PENDING_STALE_IDLE_SECONDS}s and deliveries < "
             f"{RESULT_PENDING_STALE_DELIVERIES}",
