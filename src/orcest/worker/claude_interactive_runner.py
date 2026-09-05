@@ -373,9 +373,13 @@ class ClaudeInteractiveRunner:
     @staticmethod
     def _is_composer_footer_line(line: str) -> bool:
         """Return whether *line* is known inert chrome below the composer."""
+        if not line.strip():
+            return True
         unframed = line.strip(" \t│┃║|")
         compact = re.sub(r"[ \t\u00a0]+", "", unframed).lower()
-        return not compact or any(
+        # A nonblank row made empty only by removing vertical framing can be
+        # modal chrome. It is unknown evidence, not an inert blank footer.
+        return bool(compact) and any(
             pattern.fullmatch(compact) for pattern in _COMPOSER_FOOTER_COMPACT_RES
         )
 

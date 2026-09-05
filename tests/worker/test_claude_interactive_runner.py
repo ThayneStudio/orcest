@@ -1091,6 +1091,23 @@ def test_post_submit_box_borders_do_not_make_historical_placeholder_current() ->
         )
 
 
+def test_post_submit_blank_modal_rows_do_not_make_historical_placeholder_current() -> None:
+    """Vertical framing cannot collapse a modal row into an inert blank line."""
+    runner = ClaudeInteractiveRunner()
+    placeholder = "\x1b[2K\r│ ❯ [Pasted text #1 +12 lines]\r\n"
+
+    for modal_row in ("│", "│   │", "┃   ┃", "║   ║", "|   |", "│││"):
+        assert (
+            runner._classify_post_submit_state(placeholder + modal_row)
+            is _PostSubmitState.AMBIGUOUS
+        )
+
+    # Source rows containing only whitespace remain inert, and framing around
+    # an actually captured footer row is still removed before matching it.
+    assert runner._is_composer_footer_line(" \t\u00a0") is True
+    assert runner._is_composer_footer_line("│ ? for shortcuts · 87% until auto-compact │") is True
+
+
 def test_looks_like_pending_paste_composer_detects_placeholder() -> None:
     runner = ClaudeInteractiveRunner()
 
@@ -1729,9 +1746,10 @@ while time.time() < drain_deadline:
     os.read(0, 65536)
 
 # Reproduce the append-only transcript shape that triggered the regression:
-# an old pending-paste row followed by newer top and bottom dialog borders.
+# an old pending-paste row followed by newer top, empty body, and bottom rows.
 print("\\x1b[2K\\r│ ❯ [Pasted text #1 +12 lines]", flush=True)
 print("\\x1b[2K\\r╭────────────────────────────────╮", flush=True)
+print("\\x1b[2K\\r│                                │", flush=True)
 print("\\x1b[2K\\r╰────────────────────────────────╯", flush=True)
 
 # Stay quiet longer than the default three 0.25-second settle ticks. If box
@@ -1746,10 +1764,25 @@ if unexpected:
     print(f"UNEXPECTED_BOX_DIALOG_INPUT={unexpected!r}", flush=True)
     raise SystemExit(2)
 
+# Start a fresh append-only frame whose only newer row is an empty modal body.
+# This independently covers vertical framing: the previous box borders precede
+# this newest caret and therefore cannot determine its classification.
+print("\\x1b[2K\\r│ ❯ [Pasted text #2 +12 lines]", flush=True)
+print("\\x1b[2K\\r│                                │", flush=True)
+unexpected = b""
+deadline = time.time() + 1.3
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_BLANK_MODAL_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(3)
+
 decoded = buf.decode("utf-8", errors="replace")
 match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
 if not match:
-    raise SystemExit(3)
+    raise SystemExit(4)
 with open(match.group(1), "w", encoding="utf-8") as result:
     result.write("box-bordered dialog left untouched\\n")
 time.sleep(10)
