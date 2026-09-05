@@ -14,6 +14,7 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import redis
@@ -55,6 +56,10 @@ from orcest.orchestrator.pr_ops import (
     set_review_retrigger_sha,
     set_stale_retrigger_sha,
     set_usage_exhausted_cooldown,
+)
+from orcest.orchestrator.provider_capacity import (
+    CapacityReservation,
+    reserve_provider_capacity,
 )
 from orcest.orchestrator.provider_pool import ProviderPool, provider_credential_is_usable
 from orcest.orchestrator.task_publisher import (
@@ -139,6 +144,13 @@ _LEGACY_HEARTBEAT_STALE_FLOOR = 180
 
 class _RetryableResultError(RuntimeError):
     """Result handling failed before its durable side effects committed."""
+
+
+@dataclass(frozen=True)
+class _ProviderSelection:
+    entry: ProviderEntry
+    task_id: str
+    capacity_reservation: CapacityReservation | None = None
 
 
 def _configured_task_providers(
@@ -2017,12 +2029,12 @@ def _poll_project(
     token = project.token
     key_prefix = project.key_prefix
 
-    def _select_provider_entry() -> ProviderEntry | None:
-        """Pick the next ProviderEntry from the pool using the lean surface only
-        (provider/credential/model/identity()).
+    def _select_provider_entry() -> _ProviderSelection | None:
+        """Quota-filter accounts, then reserve a proven backend capacity slot.
 
         Returns None if all entries are exhausted/cooling (caller should skip enqueue
-        and the skip counter is incremented for observability).
+        and the skip counter is incremented for observability), or if no eligible
+        backend has a complete snapshot with effective spare capacity.
 
         Falls back to synthesizing a lean claude entry from project.claude_token when
         no pool was configured for the project (single-token legacy or test paths).
@@ -2060,15 +2072,31 @@ def _poll_project(
                     project.repo,
                 )
                 return None
-            return ProviderEntry(
+            entry = ProviderEntry(
                 provider="claude",
                 credential=cred,
                 model=None,
                 source="legacy_claude_tokens",
             )
+            task_id = str(uuid.uuid4())
+            # Startup normally materializes even one legacy token as a pool,
+            # but direct compatibility callers must obey capacity admission too.
+            backend = _published_provider_for_entry(entry, config.default_runner)
+            capacity_reservation = reserve_provider_capacity(
+                task_redis,
+                [backend],
+                task_id,
+                logger,
+            )
+            if capacity_reservation is None:
+                return None
+            return _ProviderSelection(entry, task_id, capacity_reservation)
 
-        entry = token_pool.next_entry()
-        if entry is None:
+        # Quota/account eligibility is deliberately evaluated before any
+        # operational-capacity score. Multiple eligible credentials for one
+        # backend are collapsed below and never inflate worker capacity.
+        available_entries = token_pool.available_entries()
+        if not available_entries:
             # Increment aggregate (compat) + per-provider exhausted_skip counters
             # (Task 8). Uses only provider name from lean surface.
             try:
@@ -2094,7 +2122,36 @@ def _poll_project(
                     )
             # Debug log includes masked identities only (from pool __repr__)
             logger.debug("Provider pool exhausted during selection: %r", token_pool)
-        return entry
+            return None
+
+        entries_by_backend: dict[str, list[ProviderEntry]] = {}
+        for entry in available_entries:
+            backend = _published_provider_for_entry(entry, config.default_runner)
+            entries_by_backend.setdefault(backend, []).append(entry)
+
+        task_id = str(uuid.uuid4())
+        capacity_reservation = reserve_provider_capacity(
+            task_redis,
+            list(entries_by_backend),
+            task_id,
+            logger,
+        )
+        if capacity_reservation is None:
+            return None
+
+        selected_entry = token_pool.next_entry_from(
+            entries_by_backend[capacity_reservation.provider]
+        )
+        if selected_entry is None:
+            # A same-process cooldown raced the capacity read. Do not hold a
+            # backend slot for an account that is no longer quota eligible.
+            capacity_reservation.release()
+            return None
+        return _ProviderSelection(
+            entry=selected_entry,
+            task_id=task_id,
+            capacity_reservation=capacity_reservation,
+        )
 
     def _register_task(task_id: str, entry: ProviderEntry | str) -> None:
         """Record which provider entry (lean surface) was used for a task id
@@ -2109,7 +2166,7 @@ def _poll_project(
                 )
 
     def _try_publish(
-        entry: ProviderEntry,
+        selection: _ProviderSelection,
         publish_fn: Callable[..., Task | None],
         **publish_kwargs: Any,
     ) -> Task | None:
@@ -2119,25 +2176,32 @@ def _poll_project(
         key_prefix, task_redis. Calls task_completed on None-return or exception.
         Re-raises so callers can do site-specific logging. Returns publish result.
         """
-        task_id = str(uuid.uuid4())
-        _register_task(task_id, entry)
-        # Use the latest written-back credential blob if the CLI rotated it
-        # (OAuth-blob providers). Refresh this account from shared Redis at
-        # handoff time because each project orchestrator has its own local pool.
-        if token_pool is not None:
-            _refresh_shared_credential_override(
-                task_redis,
-                token_pool,
-                entry.account_key(),
-                logger,
-            )
-        cred = (
-            token_pool.effective_credential(entry) if token_pool is not None else entry.credential
-        )
-        published_provider = _published_provider_for_entry(entry, config.default_runner)
+        entry = selection.entry
+        task_id = selection.task_id
         try:
+            _register_task(task_id, entry)
+            # Use the latest written-back credential blob if the CLI rotated it
+            # (OAuth-blob providers). Refresh this account from shared Redis at
+            # handoff time because each project orchestrator has its own local pool.
+            if token_pool is not None:
+                _refresh_shared_credential_override(
+                    task_redis,
+                    token_pool,
+                    entry.account_key(),
+                    logger,
+                )
+            cred = (
+                token_pool.effective_credential(entry)
+                if token_pool is not None
+                else entry.credential
+            )
+            published_provider = _published_provider_for_entry(entry, config.default_runner)
+            capacity_kwargs: dict[str, object] = {}
+            if selection.capacity_reservation is not None:
+                capacity_kwargs["capacity_reservation"] = selection.capacity_reservation
             res = publish_fn(
                 **publish_kwargs,
+                **capacity_kwargs,
                 claude_token=cred if is_claude_provider(published_provider) else "",
                 key_prefix=key_prefix,
                 task_redis=task_redis,
@@ -2156,6 +2220,9 @@ def _poll_project(
                 token_pool.task_completed(task_id)
                 _clear_task_provider_account(project_redis, task_id, logger)
             raise
+        finally:
+            if selection.capacity_reservation is not None:
+                selection.capacity_reservation.release()
 
     labels = config.labels
 
@@ -2288,7 +2355,7 @@ def _poll_project(
                     entry = _select_provider_entry()
                     if entry is None:
                         logger.warning(
-                            "All providers exhausted, skipping rebase task for PR #%d",
+                            "No provider capacity available, skipping rebase task for PR #%d",
                             pr_state.number,
                         )
                         continue
@@ -2477,7 +2544,7 @@ def _poll_project(
                     entry = _select_provider_entry()
                     if entry is None:
                         logger.warning(
-                            "All providers exhausted, skipping proactive rebase for PR #%d",
+                            "No provider capacity available, skipping proactive rebase for PR #%d",
                             other_pr.number,
                         )
                         continue
@@ -2523,7 +2590,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping fix task for PR #%d",
+                    "No provider capacity available, skipping fix task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2555,7 +2622,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping followup task for PR #%d",
+                    "No provider capacity available, skipping followup task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2590,7 +2657,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping rebase task for PR #%d",
+                    "No provider capacity available, skipping rebase task for PR #%d",
                     pr_state.number,
                 )
             else:
@@ -2944,7 +3011,7 @@ def _poll_project(
             entry = _select_provider_entry()
             if entry is None:
                 logger.warning(
-                    "All providers exhausted, skipping issue task for issue #%d",
+                    "No provider capacity available, skipping issue task for issue #%d",
                     issue_state.number,
                 )
             else:
