@@ -192,7 +192,12 @@ def _worker_provider_cli_diagnostics(
         return [f"{label}: desired provider CLI manifest entry missing; configuration required"]
     if not isinstance(payload, dict):
         return [f"{label}: provider CLI heartbeat missing or malformed; rebake required"]
-    if payload.get("schema") != PROVIDER_CLI_HEARTBEAT_SCHEMA:
+    schema = payload.get("schema")
+    if (
+        not isinstance(schema, int)
+        or isinstance(schema, bool)
+        or schema != PROVIDER_CLI_HEARTBEAT_SCHEMA
+    ):
         return [f"{label}: provider CLI heartbeat schema unsupported; rebake required"]
     if payload.get("provider") != backend:
         return [f"{label}: provider CLI heartbeat backend mismatch; rebake required"]

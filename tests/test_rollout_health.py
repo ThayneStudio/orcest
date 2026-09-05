@@ -599,6 +599,31 @@ def test_rollout_health_fails_closed_for_missing_or_malformed_same_revision_atte
     assert report["ok"] is False
 
 
+@pytest.mark.parametrize("schema", [True, 1.0], ids=["boolean", "float"])
+def test_rollout_health_rejects_non_integer_provider_cli_schema(fake_redis_client, mocker, schema):
+    revision = "7" * 40
+    mocker.patch("orcest.rollout_health.get_build_revision", return_value=revision)
+    _install_worker_heartbeat(
+        fake_redis_client,
+        revision=revision,
+        provider_cli=_provider_cli("codex", schema=schema),
+    )
+
+    report = collect_rollout_health(
+        fake_redis_client,
+        expected_revision=revision,
+        task_prefix="test",
+        expected_backends=("codex",),
+    )
+
+    check = next(c for c in report["checks"] if c["name"] == "provider_cli_versions")
+    assert check["passed"] is False
+    assert check["actual"] == [
+        "provider CLI heartbeat schema unsupported; rebake required: orcest-worker-300/codex"
+    ]
+    assert report["ok"] is False
+
+
 def test_rollout_health_fails_closed_when_backend_is_absent_from_desired_manifest(
     fake_redis_client, mocker
 ):
