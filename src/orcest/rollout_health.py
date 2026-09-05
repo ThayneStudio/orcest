@@ -14,6 +14,7 @@ from orcest.shared.models import CONSUMER_GROUP, require_valid_provider_name, ta
 from orcest.shared.provider_versions import (
     PROVIDER_CLI_DESIRED_VERSIONS,
     PROVIDER_CLI_HEARTBEAT_SCHEMA,
+    PROVIDER_CLI_PROBE_STATUSES,
     desired_provider_cli_version,
 )
 from orcest.shared.redis_client import RedisClient
@@ -188,15 +189,15 @@ def _worker_provider_cli_diagnostics(
     label = f"{worker_id}/{backend}"
     expected_desired = desired_provider_cli_version(backend)
     if expected_desired is None:
-        return []
+        return [f"{label}: desired provider CLI manifest entry missing; configuration required"]
     if not isinstance(payload, dict):
-        return []
+        return [f"{label}: provider CLI heartbeat missing or malformed; rebake required"]
     if payload.get("schema") != PROVIDER_CLI_HEARTBEAT_SCHEMA:
         return [f"{label}: provider CLI heartbeat schema unsupported; rebake required"]
     if payload.get("provider") != backend:
         return [f"{label}: provider CLI heartbeat backend mismatch; rebake required"]
     status = payload.get("status")
-    if not isinstance(status, str) or len(status) > 64:
+    if not isinstance(status, str) or status not in PROVIDER_CLI_PROBE_STATUSES:
         return [f"{label}: provider CLI heartbeat status invalid; rebake required"]
     desired = _safe_version(payload.get("desired_version"))
     template = _safe_version(payload.get("template_version"))

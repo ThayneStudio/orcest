@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import selectors
+import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -30,6 +33,23 @@ PROVIDER_CLI_TEMPLATE_KEYS = MappingProxyType(
 
 TEMPLATE_VERSIONS_PATH = Path("/etc/orcest/template.versions")
 PROVIDER_CLI_HEARTBEAT_SCHEMA = 1
+PROVIDER_CLI_PROBE_STATUSES = frozenset(
+    {
+        "missing_desired_version",
+        "missing_template_metadata",
+        "template_metadata_unreadable",
+        "template_metadata_oversized",
+        "template_metadata_unparseable",
+        "missing_template_version",
+        "missing_binary",
+        "ok",
+        "version_mismatch",
+        "probe_timeout",
+        "probe_failed",
+        "probe_output_oversized",
+        "probe_output_unparseable",
+    }
+)
 MAX_VERSION_OUTPUT_BYTES = 4096
 MAX_TEMPLATE_VERSIONS_BYTES = 8192
 VERSION_RE = re.compile(
@@ -142,23 +162,25 @@ def _probe_binary_version(binary_path: str, *, timeout_seconds: float) -> str | 
         "LC_ALL": "C.UTF-8",
     }
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [binary_path, "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
             env=env,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return {"status": "probe_timeout"}
     except OSError:
         return {"status": "probe_failed"}
-    output = (result.stdout or b"") + b"\n" + (result.stderr or b"")
-    if len(output) > MAX_VERSION_OUTPUT_BYTES:
-        return {"status": "probe_output_oversized"}
-    if result.returncode != 0:
+
+    stdout, stderr, error_status = _read_bounded_probe_output(
+        process,
+        timeout_seconds=timeout_seconds,
+    )
+    if error_status is not None:
+        return {"status": error_status}
+    if process.returncode != 0:
         return {"status": "probe_failed"}
+    output = stdout + b"\n" + stderr
     try:
         text = output.decode("utf-8", errors="replace")
     except AttributeError:
@@ -167,3 +189,93 @@ def _probe_binary_version(binary_path: str, *, timeout_seconds: float) -> str | 
     if version is None:
         return {"status": "probe_output_unparseable"}
     return version
+
+
+def _read_bounded_probe_output(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
+) -> tuple[bytes, bytes, str | None]:
+    """Drain both probe pipes without retaining more than the configured bound."""
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    selector = selectors.DefaultSelector()
+    streams = (
+        (process.stdout, stdout_buffer),
+        (process.stderr, stderr_buffer),
+    )
+    try:
+        for stream, buffer in streams:
+            if stream is None:
+                continue
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, (stream, buffer))
+
+        while selector.get_map():
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                _terminate_and_reap_probe(process)
+                return bytes(stdout_buffer), bytes(stderr_buffer), "probe_timeout"
+            events = selector.select(remaining_seconds)
+            if not events:
+                _terminate_and_reap_probe(process)
+                return bytes(stdout_buffer), bytes(stderr_buffer), "probe_timeout"
+            for key, _events in events:
+                stream, buffer = key.data
+                retained = len(stdout_buffer) + len(stderr_buffer)
+                read_size = min(64 * 1024, MAX_VERSION_OUTPUT_BYTES + 1 - retained)
+                try:
+                    chunk = os.read(key.fd, read_size)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    _terminate_and_reap_probe(process)
+                    return bytes(stdout_buffer), bytes(stderr_buffer), "probe_failed"
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                buffer.extend(chunk)
+                if len(stdout_buffer) + len(stderr_buffer) > MAX_VERSION_OUTPUT_BYTES:
+                    _terminate_and_reap_probe(process)
+                    return (
+                        bytes(stdout_buffer),
+                        bytes(stderr_buffer),
+                        "probe_output_oversized",
+                    )
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            _terminate_and_reap_probe(process)
+            return bytes(stdout_buffer), bytes(stderr_buffer), "probe_timeout"
+        try:
+            process.wait(timeout=remaining_seconds)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap_probe(process)
+            return bytes(stdout_buffer), bytes(stderr_buffer), "probe_timeout"
+        return bytes(stdout_buffer), bytes(stderr_buffer), None
+    finally:
+        selector.close()
+        for stream, _buffer in streams:
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def _terminate_and_reap_probe(process: subprocess.Popen[bytes]) -> None:
+    """Stop the isolated probe process group and always reap its leader."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    # Signal the group even if the leader exited after SIGTERM: descendants
+    # may still hold inherited output pipes or ignore the graceful signal.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()

@@ -21,6 +21,14 @@ from orcest.fleet.cloud_init import (
 pytestmark = pytest.mark.unit
 
 
+def test_provider_cli_bump_comments_point_to_canonical_desired_manifest() -> None:
+    source = Path(__file__).resolve().parents[2] / "src" / "orcest" / "fleet" / "cloud_init.py"
+    text = source.read_text(encoding="utf-8")
+
+    assert "shared/provider_versions.py:PROVIDER_CLI_DESIRED_VERSIONS" in text
+    assert "Change the canonical desired-version manifest on bump" in text
+
+
 def test_manual_setup_codex_pin_matches_cloud_init() -> None:
     """Shell and Python Codex pins must stay identical; silent drift would
     ship a CLI the parser fixtures were not validated against."""

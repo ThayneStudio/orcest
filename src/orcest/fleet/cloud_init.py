@@ -82,9 +82,11 @@ _PLAYWRIGHT_MAJOR = "1"  # 1.x line — npx resolves latest 1.x at install time
 # Bump when rebaking; verify against https://github.com/supabase/cli/releases
 _SUPABASE_VERSION = "2.95.4"
 
+# Provider CLI desired versions are changed only in
+# shared/provider_versions.py:PROVIDER_CLI_DESIRED_VERSIONS. These derived
+# constants keep cloud-init and runtime health checks on the same manifest.
 # Grok (xAI Grok Build) CLI — beta; the streaming-json event schema can shift
-# between releases, so pin it and re-validate the GrokRunner parsers
-# (tests/worker/test_grok_runner.py) on bump.
+# between releases, so re-validate tests/worker/test_grok_runner.py on bump.
 _GROK_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["grok"]
 # SHA-256 of the exact linux-x86_64 Grok binary for _GROK_VERSION. The worker
 # cloud image is amd64, so download the versioned artifact directly instead of
@@ -97,7 +99,7 @@ _GROK_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["grok"]
 # tasks early-reject with a rebake instruction, never a stuck task or secret
 # leak.
 #
-# Re-pin deliberately with _GROK_VERSION after validating GrokRunner fixtures:
+# Re-pin this digest for the manifest's Grok version after validating fixtures:
 #   curl -fsSL https://x.ai/cli/grok-VERSION-linux-x86_64 | sha256sum
 _GROK_BINARY_SHA256 = "01044edfadcddebdb1197195e692f351ad87569e079324b7feac6a08d692d8af"
 
@@ -116,7 +118,8 @@ _CODEX_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["codex"]
 # on 2026-08-14, when a floating upgrade began pasting the task prompt into the
 # MCP consent menu and burned ~27% of clauder tasks on the wall-clock timeout
 # (see claude_interactive_runner's dialog handling + its regression tests).
-# On bump: re-run those tests and smoke a real interactive task before shipping.
+# Change the canonical desired-version manifest on bump, then re-run those tests
+# and smoke a real interactive task before shipping.
 _CLAUDE_VERSION = PROVIDER_CLI_DESIRED_VERSIONS["claude"]
 
 # Provider CLIs that ``_worker_tooling_runcmd`` installs and which a worker

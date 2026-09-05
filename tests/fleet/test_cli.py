@@ -2,6 +2,7 @@
 
 import subprocess
 import time
+from io import StringIO
 from pathlib import Path
 
 import click
@@ -27,6 +28,53 @@ from orcest.fleet.config import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_provider_cli_status_renderer_accepts_only_canonical_vocabulary():
+    from orcest.fleet.cli import _safe_provider_cli_status
+    from orcest.shared.provider_versions import PROVIDER_CLI_PROBE_STATUSES
+
+    for status in PROVIDER_CLI_PROBE_STATUSES:
+        rendered = _safe_provider_cli_status(status, has_payload=True)
+        assert rendered.plain == status
+        assert rendered.style == ("green" if status == "ok" else "red")
+
+    assert _safe_provider_cli_status("anything-else", has_payload=True).plain == "invalid"
+    assert _safe_provider_cli_status(["ok"], has_payload=True).plain == "invalid"
+    assert _safe_provider_cli_status(None, has_payload=False).plain == "legacy"
+
+
+def test_provider_cli_heartbeat_table_does_not_render_untrusted_status_markup(mocker):
+    from rich.console import Console
+
+    from orcest.fleet.cli import _print_worker_provider_cli_heartbeats
+
+    malicious = "[bold red]forged[/bold red]"
+    mocker.patch(
+        "orcest.fleet.orchestrator.get_worker_heartbeat_details",
+        return_value={
+            "orcest-worker-300": {
+                "backend": "codex",
+                "revision": "a" * 40,
+                "provider_cli": {
+                    "desired_version": "0.149.1",
+                    "template_version": "0.149.1",
+                    "observed_version": "0.149.1",
+                    "status": malicious,
+                },
+            }
+        },
+    )
+    output = StringIO()
+
+    _print_worker_provider_cli_heartbeats(
+        Console(file=output, force_terminal=False, color_system=None),
+        "orcest@example.test",
+    )
+
+    rendered = output.getvalue()
+    assert "invalid" in rendered
+    assert "forged" not in rendered
 
 
 @pytest.fixture
