@@ -1,4 +1,10 @@
-# Orchestrator State Model
+# Current Orchestrator State Model
+
+> **Status:** This document describes the currently implemented orchestrator
+> behavior. It is not the proposed durable pre-PR workflow specification.
+
+See the [wiki index](README.md) for the accepted workflow-control
+specification and its completed writing plan.
 
 GitHub PRs and issues are the source of truth. Redis is coordination state:
 queues, locks, pending markers, cooldowns, and retry counters. Redis state may
@@ -42,10 +48,10 @@ ACKed after matching coordination cleanup and do not mutate GitHub.
 
 If GitHub validation cannot be performed, the worker treats that as transient
 infrastructure failure before execution. During result handling, validation
-fails closed: the result is ACKed after coordination cleanup, but GitHub labels,
-comments, backoff, cooldowns, and attempt escalation are not mutated. The next
-heartbeat re-reads GitHub and enqueues new work if the source-of-truth snapshot
-still requires it.
+fails closed by raising a retryable result error. The result remains unACKed in
+the Redis pending-entry list, and GitHub labels, comments, backoff, cooldowns,
+and attempt escalation are not mutated. A later result-consumption pass retries
+the pending entry after GitHub access recovers.
 
 ## Decision Coverage
 
@@ -63,7 +69,11 @@ Tests should cover the decision tree, not just line coverage:
 
 The introduction of `ProviderEntry` / `ProviderPool` and per-`task.provider` dispatch (early registry lookup on the worker) does not alter the core state machine above. Task identity, PR snapshots, pending markers, locks, and result validation remain unchanged. The only additions are:
 
-- Task records now carry `provider` + `credential` (redacted) + `model`.
+- Serialized Redis task records carry the raw GitHub token, legacy Claude token,
+  and provider credential needed by the worker. Diagnostic representations and
+  projections redact those values, but the stream payload itself does not.
+- Task records also carry `provider`, `model`, and a non-secret provider-account
+  identity.
 - Worker early-rejects (permanent FAILED) for unknown providers before any snapshot validation or runner work.
 - Exhaustion and "rebake required" outcomes are tracked under per-provider Redis keys (`providers:<prov>:exhausted_skip`, `providers:<prov>:rebake_required_failures`).
 - All of the decision coverage items continue to apply identically for Claude, Grok, or future providers.

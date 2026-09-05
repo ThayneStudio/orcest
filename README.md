@@ -29,7 +29,7 @@ baked templates; each blocks on a Redis stream via `XREADGROUP`, claims
 one task, clones the target repo into a workspace, and invokes the
 appropriate agent CLI. PRs and issues remain the source of truth — Redis
 can delay work, but never permanently redefines what GitHub says is
-actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-machine.md)).
+actionable (see [`docs/wiki/current-orchestrator-state-model.md`](docs/wiki/current-orchestrator-state-model.md)).
 
 - **Orchestrator** — single instance per project, deployed via Docker
   Compose. Owns GitHub polling, CI triage, issue triage, task publishing,
@@ -696,7 +696,7 @@ Notes:
   `Issue #<n>: deferred, waiting on open blocker(s): #<a>, #<b>`.
 - **State machine semantics** for what the orchestrator is doing per
   task are in
-  [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-machine.md).
+  [`docs/wiki/current-orchestrator-state-model.md`](docs/wiki/current-orchestrator-state-model.md).
 
 ## Operational pitfalls
 
@@ -764,7 +764,9 @@ real IP (or DNS name) in fleet config and retry.
 
 ## Further reading
 
-- [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-machine.md) — per-task state transitions.
+- [`docs/wiki/`](docs/wiki/) — current orchestration behavior and the proposed
+  workflow-control specification plan.
+- [`docs/wiki/current-orchestrator-state-model.md`](docs/wiki/current-orchestrator-state-model.md) — currently implemented per-task state transitions.
 - [`docs/adding-a-provider.md`](docs/adding-a-provider.md) — end-to-end recipe for a new agent.
 - [`docs/rollout-multi-provider.md`](docs/rollout-multi-provider.md) — provider rollout playbook.
 - [`docs/issue-dependencies.md`](docs/issue-dependencies.md) — body-text dependency syntax.
