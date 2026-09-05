@@ -238,10 +238,19 @@ def _authorize(
     kind: str,
     resolution_kind: str | None,
 ) -> None:
+    _authorize_command_shape(principal, kind=kind, resolution_kind=resolution_kind)
+    if not principal.authorizes_project(project_id):
+        raise TransportError(404, "RUN_NOT_FOUND", "run was not found")
+
+
+def _authorize_command_shape(
+    principal: RunCommandPrincipalRecord,
+    *,
+    kind: str,
+    resolution_kind: str | None,
+) -> None:
     if kind not in principal.authorized_command_kinds:
         raise TransportError(403, "CAPABILITY_DENIED", f"principal lacks {kind} authority")
-    if not principal.authorizes_project(project_id):
-        raise TransportError(403, "CAPABILITY_DENIED", "principal cannot act on this project")
     if kind == "RESOLVE_HUMAN_BOUNDARY":
         assert resolution_kind is not None
         if resolution_kind not in principal.authorized_resolution_kinds:
@@ -284,6 +293,11 @@ def submit_run_command(
     """
     request = parse_run_command_request(raw_body, path_run_id=path_run_id)
     principal = _require_principal(catalog, authenticated_principal_id)
+    _authorize_command_shape(
+        principal,
+        kind=request["kind"],
+        resolution_kind=request["resolution_kind"],
+    )
 
     run = run_store.get_run(request["run_id"])
     if run is None:

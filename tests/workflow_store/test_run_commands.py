@@ -262,7 +262,28 @@ def test_principal_without_command_kind_is_403_and_audited(store: RunStore) -> N
     assert store.get_run(run_id).state == "RECOVERING"
 
 
-def test_principal_scoped_to_other_project_is_403(store: RunStore) -> None:
+def test_principal_without_command_kind_cannot_probe_run_existence(store: RunStore) -> None:
+    run_id = _uid()
+    _create_recovering_run(store, run_id)
+    missing_run_id = _uid()
+    catalog = _catalog(
+        RunCommandPrincipalRecord(principal_id="readonly", authorized_command_kinds=frozenset())
+    )
+
+    for candidate_run_id in (run_id, missing_run_id):
+        with pytest.raises(TransportError) as exc:
+            submit_run_command(
+                store,
+                catalog=catalog,
+                raw_body=_cancel_body(command_id=_uid(), run_id=candidate_run_id, expected=0),
+                path_run_id=candidate_run_id,
+                authenticated_principal_id="readonly",
+            )
+        assert exc.value.http_status == 403
+        assert exc.value.code == "CAPABILITY_DENIED"
+
+
+def test_principal_scoped_to_other_project_is_hidden_as_not_found(store: RunStore) -> None:
     run_id = _uid()
     _create_recovering_run(store, run_id, project_id=PROJECT_A)
     expected = _last_transition_sequence(store, run_id)
@@ -282,7 +303,33 @@ def test_principal_scoped_to_other_project_is_403(store: RunStore) -> None:
             path_run_id=run_id,
             authenticated_principal_id="scoped-op",
         )
-    assert exc.value.http_status == 403
+    assert exc.value.http_status == 404
+    assert exc.value.code == "RUN_NOT_FOUND"
+
+
+def test_project_scoped_principal_cannot_probe_run_existence(store: RunStore) -> None:
+    out_of_scope_run_id = _uid()
+    _create_recovering_run(store, out_of_scope_run_id, project_id=PROJECT_A)
+    missing_run_id = _uid()
+    catalog = _catalog(
+        RunCommandPrincipalRecord(
+            principal_id="scoped-op",
+            authorized_command_kinds=frozenset({"CANCEL"}),
+            authorized_project_ids=frozenset({PROJECT_B}),
+        )
+    )
+
+    for candidate_run_id in (out_of_scope_run_id, missing_run_id):
+        with pytest.raises(TransportError) as exc:
+            submit_run_command(
+                store,
+                catalog=catalog,
+                raw_body=_cancel_body(command_id=_uid(), run_id=candidate_run_id, expected=0),
+                path_run_id=candidate_run_id,
+                authenticated_principal_id="scoped-op",
+            )
+        assert exc.value.http_status == 404
+        assert exc.value.code == "RUN_NOT_FOUND"
 
 
 # -- schema / fencing failures ------------------------------------------------
