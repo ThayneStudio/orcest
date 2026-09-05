@@ -422,7 +422,14 @@ export function createDashboardServer(
     const cookie = authCookieHeader(req);
     if (cookie) res.setHeader("Set-Cookie", cookie);
     if (!isAuthorized(req)) {
-      if (req.accepts(["html", "json"]) === "html" && String(req.headers.accept || "").includes("text/html")) { res.redirect(303, "/sign-in"); return; }
+      // A wildcard Accept header from a CLI should receive JSON, not a login redirect.
+      if (
+        req.accepts(["html", "json"]) === "html" &&
+        String(req.headers.accept || "").includes("text/html")
+      ) {
+        res.redirect(303, "/sign-in");
+        return;
+      }
       res.status(401).json({ error: "Unauthorized" });
       return;
     }

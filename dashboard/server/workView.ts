@@ -303,15 +303,24 @@ export async function fetchWorkView(
     scanKeysMany(dashboardRedisKeyPatterns(["dashboard:project"])),
     scanKeysMany(dashboardRedisKeyPatterns(["workers:heartbeat:*"])),
   ]);
-  const keys = allKeys
+  let keys = allKeys
     .filter((k) => /dashboard:work:(issue|pr):[^:]+:\d+$/.test(k))
     .slice(0, 5000);
+  const inventoryTruncated =
+    allKeys.filter((k) => /dashboard:work:(issue|pr):[^:]+:\d+$/.test(k))
+      .length > keys.length;
   const [stored, projects] = await Promise.all([
     readHashes(keys),
     readHashes(projectKeys),
   ]);
+  // SCAN and HGETALL are not atomic: an observation can expire between them.
+  // Keep keys paired with their hashes before deriving identity or run indices.
+  const present = stored.flatMap((fields, i) =>
+    Object.keys(fields).length ? [{ key: keys[i], fields }] : [],
+  );
+  keys = present.map(({ key }) => key);
   // Physical keys establish scope. Hash fields cannot redirect follow-up reads.
-  const fields = stored.map((f, i) => {
+  const fields = present.map(({ fields: f }, i) => {
     const m = keys[i].match(
       /^(?:(.*):)?dashboard:work:(issue|pr):([^:]+):(\d+)$/,
     )!;
@@ -471,7 +480,7 @@ export async function fetchWorkView(
     notices.push(
       "Some source observations are stale. Last-known work is retained.",
     );
-  if (allKeys.filter((k) => /\d+$/.test(k)).length > keys.length)
+  if (inventoryTruncated)
     notices.push("Work inventory is limited to 5,000 records.");
   if (
     items.some(

@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "http";
 import { tokenMatches } from "./token.js";
+import { requestIsSecure } from "./transport.js";
 export { tokenMatches } from "./token.js";
 
 import { sessionAuthorized } from "./signIn.js";
@@ -36,26 +37,20 @@ function tokenFromCookie(req: IncomingMessage): string | null {
   return null;
 }
 
-function firstHeaderValue(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value) || "";
-}
-
-function forwardedProto(req: IncomingMessage): string {
-  return firstHeaderValue(req.headers["x-forwarded-proto"])
-    .split(",")[0]
-    .trim()
-    .toLowerCase();
-}
-
 export function isAuthorized(req: IncomingMessage): boolean {
   const token = process.env.DASHBOARD_TOKEN;
   // Fail CLOSED: with no configured token there is no way to authenticate,
   // so deny every request rather than authorize them all.
   if (!token) return false;
   if (sessionAuthorized(req)) return true;
-  const auth = (req as { headers: Record<string, string | string[] | undefined> }).headers
-    .authorization;
-  if (typeof auth === "string" && auth.startsWith("Bearer ") && tokenMatches(auth.slice(7)))
+  const auth = (
+    req as { headers: Record<string, string | string[] | undefined> }
+  ).headers.authorization;
+  if (
+    typeof auth === "string" &&
+    auth.startsWith("Bearer ") &&
+    tokenMatches(auth.slice(7))
+  )
     return true;
   const cookieToken = tokenFromCookie(req);
   if (cookieToken !== null && tokenMatches(cookieToken)) return true;
@@ -71,9 +66,7 @@ export function authCookieHeader(req: IncomingMessage): string | null {
   if (queryToken === null || !tokenMatches(queryToken)) return null;
 
   const encoded = encodeURIComponent(queryToken);
-  const secure =
-    Boolean((req.socket as { encrypted?: boolean } | undefined)?.encrypted) ||
-    forwardedProto(req) === "https";
+  const secure = requestIsSecure(req);
   return [
     `${AUTH_COOKIE}=${encoded}`,
     "Path=/",
@@ -81,5 +74,7 @@ export function authCookieHeader(req: IncomingMessage): string | null {
     "SameSite=Strict",
     "Max-Age=604800",
     secure ? "Secure" : "",
-  ].filter(Boolean).join("; ");
+  ]
+    .filter(Boolean)
+    .join("; ");
 }
