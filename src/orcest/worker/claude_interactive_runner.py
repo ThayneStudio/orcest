@@ -47,23 +47,24 @@ _MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
 # The composer's bracketed-paste placeholder ("[Pasted text #1 +42 lines]").
 # Its presence after a submission keystroke means the Enter did not land.
 _PASTED_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
-# Static rows Claude Code 2.1.235 paints below the composer. These are terminal
-# chrome, not evidence that a turn started. Keep the allowlist deliberately
-# narrow: an unknown trailing row (especially a dialog instruction) remains
-# ambiguous and can never authorize a bare Enter.
-_COMPOSER_FOOTER_RES = (
+# Static rows Claude Code 2.1.235 paints below the composer. Ink often places
+# words with absolute-column CSI sequences instead of literal spaces; those
+# sequences disappear from our append-only transcript, so match a compacted
+# representation of only the captured inert rows. Unknown trailing rows
+# (especially dialog instructions) remain ambiguous and never authorize Enter.
+_COMPOSER_FOOTER_COMPACT_RES = (
     re.compile(r"^[─━]+$"),
+    re.compile(r"^\?forshortcuts(?:[·|]?\d{1,3}%(?:untilauto-compact|contextused))?$"),
+    re.compile(r"^\d{1,3}%(?:untilauto-compact|contextused)$"),
+    # Multiline bracketed paste help. The second spelling is the exact raw-PTY
+    # 2.1.235 delta after absolute-column moves are removed (unchanged letters
+    # already present on the terminal grid are absent from the transcript).
+    re.compile(r"^(?:pasteagaintoexpand|pastegaintoexpad)$"),
     re.compile(
-        r"^\? for shortcuts(?:\s+(?:[·|]\s*)?"
-        r"context left until auto-compact:\s*\d{1,3}%)?$",
-        re.IGNORECASE,
+        r"^⏵⏵bypasspermissionson\(shift\+tabtocycle\)"
+        r"(?:·←foragents)?(?:●(?:low|medium|high|xhigh|max)·/effort)?$"
     ),
-    re.compile(r"^context left until auto-compact:\s*\d{1,3}%$", re.IGNORECASE),
-    re.compile(
-        r"^⏵⏵\s+[^\r\n]{1,80}\bpermissions?\b[^\r\n]{0,80}"
-        r"\(shift\+tab to cycle\)$",
-        re.IGNORECASE,
-    ),
+    re.compile(r"^●(?:low|medium|high|xhigh|max)·/effort$"),
 )
 # Total number of submission keystrokes, INCLUDING the initial Enter. A value
 # of 3 permits the initial submission plus two evidence-backed retries. Keep
@@ -373,7 +374,10 @@ class ClaudeInteractiveRunner:
     def _is_composer_footer_line(line: str) -> bool:
         """Return whether *line* is known inert chrome below the composer."""
         unframed = line.strip(" \t│┃║|")
-        return not unframed or any(pattern.fullmatch(unframed) for pattern in _COMPOSER_FOOTER_RES)
+        compact = re.sub(r"[ \t\u00a0]+", "", unframed).lower()
+        return not compact or any(
+            pattern.fullmatch(compact) for pattern in _COMPOSER_FOOTER_COMPACT_RES
+        )
 
     def _classify_post_submit_state(self, text: str) -> _PostSubmitState:
         """Classify only the latest settled post-submit terminal evidence.

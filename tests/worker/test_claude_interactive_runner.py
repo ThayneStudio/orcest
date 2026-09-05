@@ -1011,12 +1011,21 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
         "activity": "esc to interrupt",
         "composer_cleared": ("latest settled non-menu composer has no pasted-text placeholder"),
     }
+    assert capture["captured_inert_footer_rows"] == [
+        "horizontal separator",
+        "bypass permissions on (shift+tab to cycle) / agents / effort status",
+        "paste again to expand",
+    ]
     assert (
         runner._classify_post_submit_state(frames["explicitly_stuck"])
         is _PostSubmitState.EXPLICITLY_STUCK
     )
     assert (
         runner._classify_post_submit_state(frames["explicitly_stuck_with_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_multiline_paste_hint"])
         is _PostSubmitState.EXPLICITLY_STUCK
     )
     assert (
@@ -1034,6 +1043,26 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
     assert runner._classify_post_submit_state(frames["executing"]) is _PostSubmitState.EXECUTING
     assert runner._classify_post_submit_state(frames["unknown_menu"]) is _PostSubmitState.AMBIGUOUS
     assert runner._classify_post_submit_state(frames["unrecognized"]) is _PostSubmitState.AMBIGUOUS
+
+
+def test_post_submit_footer_allowlist_rejects_dialog_lookalikes() -> None:
+    """Known chrome cannot hide a newer unknown instruction or menu row."""
+    runner = ClaudeInteractiveRunner()
+    placeholder = "❯ [Pasted text #1 +12 lines]\n"
+
+    lookalikes = (
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · Enter to confirm",
+        "● high · /effort · Enter to confirm",
+        "paste again to expand or press Enter to confirm",
+        "? for shortcuts · 87% until auto-compact · Accept default",
+        "────────────────\nEnter to confirm / Esc to cancel",
+    )
+
+    for trailing_row in lookalikes:
+        assert (
+            runner._classify_post_submit_state(placeholder + trailing_row)
+            is _PostSubmitState.AMBIGUOUS
+        )
 
 
 def test_looks_like_pending_paste_composer_detects_placeholder() -> None:
@@ -1178,9 +1207,21 @@ while time.time() < drain_deadline:
     os.read(0, 65536)
 
 # The composer stays stuck on the pasted placeholder: the first Enter did
-# not land.
+# not land. These are the compacted shapes from the raw 2.1.235 120-column
+# composer footer and multiline-paste hint, including absolute-column CSI.
 print("❯ [Pasted text #1 +12 lines]", flush=True)
-print("? for shortcuts  Context left until auto-compact: 87%", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
+print(
+    "\\x1b[27mpaste \\x1b[10Ggain to expa\\x1b[23Gd\\x1b[25G\\x1b[K",
+    flush=True,
+)
 
 retry = b""
 deadline = time.time() + 5
@@ -1478,8 +1519,24 @@ while time.time() < drain_deadline:
     os.read(0, 65536)
 
 print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
 time.sleep(0.2)
 print("\\x1b[2K\\r│ ❯ ", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
 
 unexpected = b""
 deadline = time.time() + 1.2
