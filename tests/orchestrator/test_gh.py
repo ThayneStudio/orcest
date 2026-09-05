@@ -674,11 +674,19 @@ def test_label_already_absent_true_for_label_specific_messages(stderr):
         "gh: Not Found (HTTP 404)",
         "repository acme/widgets not found",
         "authentication required",
+        "gh: Label does not exist (HTTP 403)",
+        "gh: Label not found (HTTP 500)",
+        "Label does not exist",
+        "gh: Label not found",
+        "label 'orcest:ready' does not exist",
+        "gh: Label does not exist (HTTP 404)\nauthentication required",
+        "gh: Resource label not found (HTTP 404)",
+        "label 'orcest:ready' not found because repository not found",
         "",
         None,
     ],
 )
-def test_label_already_absent_false_without_label_context(stderr):
+def test_label_already_absent_false_for_unrelated_or_non_404_errors(stderr):
     assert _label_already_absent(stderr) is False
 
 
