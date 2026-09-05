@@ -20,7 +20,7 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Gate | Evidence required | Current state |
 | --- | --- | --- |
 | Review findings | Every comment fixed or explicitly explained; review of final candidate | Original PR fixes implemented and dispositions recorded; candidate review pending |
-| Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container smoke in progress |
+| Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container authentication/assets/bundle smoke passed |
 | Dependency security | Audit locked dependencies; no unexplained high/critical findings | Updated lockfile reports zero npm advisories on 2026-09-05 |
 | Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; live candidate validation pending |
 | Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |

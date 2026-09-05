@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import redis
 
@@ -64,6 +64,7 @@ def run():
     assert (dashboard / "build/server/index.js").exists(), "Run npm run build first"
     subprocess.run([node, "scripts/check-node-version.mjs"], cwd=dashboard, check=True)
     token = secrets.token_hex(24)
+    http = build_opener(ProxyHandler({}))  # Never route local fixture tokens via an env proxy.
     owned = []
     clients = []
     checks = []
@@ -147,7 +148,7 @@ def run():
                 data=json.dumps(body).encode() if body is not None else None,
             )
             try:
-                with urlopen(req, timeout=8) as response:
+                with http.open(req, timeout=8) as response:
                     return response.status, json.load(response), response.headers
             except HTTPError as error:
                 return error.code, json.load(error), error.headers
