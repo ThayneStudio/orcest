@@ -19,6 +19,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_LABEL_ALREADY_ABSENT_RE = re.compile(
+    r"(?:gh:\s*)?label(?:\s+(?:'[^'\r\n]+'|\"[^\"\r\n]+\"))?\s+"
+    r"(?:does not exist|not found)(?:\s+\(http\s+404\))?",
+    re.IGNORECASE,
+)
 
 _MAX_PAGES = 50  # safety cap; each page fetches up to 100 threads (50 × 100 = 5 000 total)
 
@@ -58,16 +63,13 @@ def _label_already_absent(stderr: str | None) -> bool:
     """True when `stderr` means a label-removal target was already gone.
 
     Covers gh's current REST error for a missing label
-    (``gh: Label does not exist (HTTP 404)``) and older phrasings that
-    likewise name the label (``label 'x' not found``). Both spellings must
-    mention the label specifically: a bare ``HTTP 404`` or "not found" with
-    no label context (missing/inaccessible repository, hidden resource,
-    etc.) is a real error and must not be swallowed.
+    (``gh: Label does not exist (HTTP 404)``) and narrowly anchored older
+    phrasings that name the label (``label 'x' not found``). A response with
+    an HTTP status is idempotent only when that status is 404. Additional
+    lines or context are rejected so permission, authentication, repository,
+    and server failures cannot be hidden by incidental label wording.
     """
-    text = (stderr or "").lower()
-    if "label" not in text:
-        return False
-    return "not found" in text or "does not exist" in text
+    return _LABEL_ALREADY_ABSENT_RE.fullmatch((stderr or "").strip()) is not None
 
 
 @dataclass(frozen=True)

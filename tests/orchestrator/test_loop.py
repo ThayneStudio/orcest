@@ -1399,7 +1399,7 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
 
     from orcest.shared.config import IssueDeliveryVerifierConfig
 
-    mocker.patch(
+    gh_run = mocker.patch(
         "orcest.orchestrator.gh.subprocess.run",
         side_effect=subprocess.CalledProcessError(
             returncode=1,
@@ -1419,7 +1419,7 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
         branch="issue-45-work",
         snapshot_head_sha="a" * 40,
     )
-    entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
+    first_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
 
     _consume_results_for_project(
         orchestrator_config.projects[0],
@@ -1432,10 +1432,17 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
 
     # The result was fully processed (not left pending/retried) ...
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
-    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, entry_id) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, first_entry_id) == 0
+    from orcest.orchestrator.loop import _make_result_side_effects_processed_key
 
-    # ... and replaying the same completed result is a no-op: no error, no
-    # regression of already-cleared state, nothing left pending.
+    side_effects_key = _make_result_side_effects_processed_key(result.task_id)
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert gh_run.call_count == 1
+
+    # Redeliver the exact payload under a new stream ID. The durable task
+    # checkpoint must suppress a second GitHub call while still allowing the
+    # duplicate entry to be ACKed and cleaned up normally.
+    duplicate_entry_id = fake_redis_client.xadd(RESULTS_STREAM, result.to_dict())
     _consume_results_for_project(
         orchestrator_config.projects[0],
         fake_redis_client,
@@ -1445,6 +1452,9 @@ def test_consume_results_completed_issue_absent_ready_label_still_acks(
         issue_delivery_verifier=IssueDeliveryVerifierConfig(enabled=False),
     )
     assert get_issue_attempt_count(fake_redis_client, repo, issue_number) == 0
+    assert fake_redis_client.xpending_count(RESULTS_STREAM, RESULTS_GROUP, duplicate_entry_id) == 0
+    assert fake_redis_client.get(side_effects_key) == "1"
+    assert gh_run.call_count == 1
 
 
 def test_consume_results_completed_does_not_clear_total_attempts(
