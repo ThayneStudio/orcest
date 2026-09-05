@@ -94,6 +94,7 @@ from orcest.workflow_contract.v1.protocol_registry import (
     ERROR_PROTOCOL,
     FORGE_OBSERVATION_REQUEST_PROTOCOL,
     HEALTH_PROBE_REQUEST_PROTOCOL,
+    MANAGEMENT_COMMAND_RESULT_PROTOCOL,
     PROJECT_REGISTRATION_PROTOCOL,
     PROJECT_REGISTRATION_RESULT_PROTOCOL,
     PUBLICATION_EFFECT_PROTOCOL,
@@ -117,7 +118,7 @@ from orcest.workflow_contract.v1.verification import (
     verification_profile_from_effective_policy,
 )
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 _NEW_ATTEMPT_TERMINAL_FACT_COLUMNS = {
     "expected_deadline_ms": "INTEGER",
     "controller_now_ms": "INTEGER",
@@ -1697,6 +1698,57 @@ class HumanResolutionOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagementCommandResult:
+    """Stored acceptance of one authenticated Run command (workflow-lifecycle.md
+    "Authenticated Run commands"): the immutable public management-result
+    envelope plus its authentication/audit binding, keyed globally by
+    ``command_id``.
+    """
+
+    command_id: str
+    run_id: str
+    kind: str
+    authenticated_principal_id: str
+    expected_last_transition_sequence: int
+    request_digest: str
+    authorization_context_digest: str
+    result_transition_sequence: int
+    response_http_status: int
+    response_json: str
+    response_digest: str
+    committed_at_ms: int
+    human_resolution_id: str | None = None
+    replayed: bool = False
+
+    def public_response_json(self) -> str:
+        """Canonical public body with the transport ``replayed`` projection applied."""
+        body = json.loads(self.response_json)
+        if not isinstance(body, dict):
+            raise RunStoreError("stored management command response is not a JSON object")
+        body["replayed"] = self.replayed
+        return canonical_json_text(body)
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementCommandDenialRecord:
+    """One audited, non-mutating rejection of an attempted Run command --
+    unauthorized, unknown-kind, malformed, or fenced -- for the closed
+    ``POST /api/v1/runs/{run_id}/commands`` surface. Never implies a
+    Transition or Human Resolution was created.
+    """
+
+    denial_id: str
+    code: str
+    message: str
+    http_status: int
+    denied_at_ms: int
+    run_id: str | None = None
+    command_id: str | None = None
+    kind: str | None = None
+    authenticated_principal_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CapacityReportResult:
     capacity_report_id: str
     pool_manager_id: str
@@ -2022,6 +2074,12 @@ def _require_git_commit_ref(value: Mapping[str, Any], *, field: str) -> GitCommi
 def _require_positive_int(value: int, *, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _require_nonneg_int(value: int, *, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
     return value
 
 
@@ -3103,6 +3161,39 @@ def _row_to_human_resolution(row: sqlite3.Row) -> "HumanResolutionRecord":
         ownership_deterministic_ref=row["ownership_deterministic_ref"],
         ownership_change_request_external_id=row["ownership_change_request_external_id"],
         ownership_run_marker=row["ownership_run_marker"],
+    )
+
+
+def _row_to_management_command(row: sqlite3.Row, *, replayed: bool) -> ManagementCommandResult:
+    return ManagementCommandResult(
+        command_id=row["command_id"],
+        run_id=row["run_id"],
+        kind=row["kind"],
+        authenticated_principal_id=row["authenticated_principal_id"],
+        expected_last_transition_sequence=row["expected_last_transition_sequence"],
+        request_digest=row["request_digest"],
+        authorization_context_digest=row["authorization_context_digest"],
+        result_transition_sequence=row["result_transition_sequence"],
+        response_http_status=row["response_http_status"],
+        response_json=row["response_json"],
+        response_digest=row["response_digest"],
+        committed_at_ms=row["committed_at_ms"],
+        human_resolution_id=row["human_resolution_id"],
+        replayed=replayed,
+    )
+
+
+def _row_to_management_command_denial(row: sqlite3.Row) -> ManagementCommandDenialRecord:
+    return ManagementCommandDenialRecord(
+        denial_id=row["denial_id"],
+        code=row["code"],
+        message=row["message"],
+        http_status=row["http_status"],
+        denied_at_ms=row["denied_at_ms"],
+        run_id=row["run_id"],
+        command_id=row["command_id"],
+        kind=row["kind"],
+        authenticated_principal_id=row["authenticated_principal_id"],
     )
 
 
@@ -6120,6 +6211,48 @@ CREATE TABLE IF NOT EXISTS secret_version_fanouts (
   created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
   PRIMARY KEY (secret_id, version)
 );
+
+CREATE TABLE IF NOT EXISTS management_commands (
+  command_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  kind TEXT NOT NULL CHECK (
+    kind IN ({_sql_in(_enum_values("management_command.kind"))})
+  ),
+  expected_last_transition_sequence INTEGER NOT NULL CHECK (
+    expected_last_transition_sequence >= 0
+  ),
+  payload_json TEXT NOT NULL,
+  authenticated_principal_id TEXT NOT NULL,
+  authorization_context_digest TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  result_transition_sequence INTEGER NOT NULL CHECK (result_transition_sequence > 0),
+  human_resolution_id TEXT,
+  response_http_status INTEGER NOT NULL CHECK (response_http_status BETWEEN 100 AND 599),
+  response_json TEXT NOT NULL,
+  response_digest TEXT NOT NULL,
+  committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms >= 0),
+  CHECK (
+    (kind = 'RESOLVE_HUMAN_BOUNDARY' AND human_resolution_id IS NOT NULL)
+    OR (kind = 'CANCEL' AND human_resolution_id IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_management_commands_run ON management_commands(run_id);
+
+CREATE TABLE IF NOT EXISTS management_command_denials (
+  denial_id TEXT PRIMARY KEY,
+  run_id TEXT,
+  command_id TEXT,
+  kind TEXT,
+  authenticated_principal_id TEXT,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  http_status INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+  denied_at_ms INTEGER NOT NULL CHECK (denied_at_ms >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_management_command_denials_run
+ON management_command_denials(run_id);
 """
 
 _V8_TO_V9 = f"""
@@ -6841,6 +6974,7 @@ _V18_TO_V19 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS review_receipts"
 # CREATE TABLE/INDEX IF NOT EXISTS statement after it -- harmless on tables
 # that already exist in their final shape.
 _V19_TO_V20 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS publications") :]
+_V20_TO_V21 = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS management_commands") :]
 
 # Appended after whichever script actually put forge_observation_schedules into
 # its final shape (a plain CREATE TABLE for a fresh/pre-v5 database, or the
@@ -7015,7 +7149,29 @@ class RunStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
+        if current not in {
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+        }:
             raise SchemaVersionError(
                 f"unsupported workflow.db schema version {current}; "
                 f"supported version is {SCHEMA_VERSION}"
@@ -7482,8 +7638,7 @@ class RunStore:
                         _now_ms(),
                     ),
                 )
-            else:
-                assert current == 19
+            elif current == 19:
                 self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V19_TO_V20)
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
@@ -7491,6 +7646,18 @@ class RunStore:
                     (
                         SCHEMA_VERSION,
                         "workflow-control-v1-publication-creation",
+                        _now_ms(),
+                    ),
+                )
+            else:
+                assert current == 20
+                self.conn.executescript("BEGIN EXCLUSIVE;\n" + _V20_TO_V21)
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_ms) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        "workflow-control-v1-management-commands",
                         _now_ms(),
                     ),
                 )
@@ -20777,6 +20944,37 @@ class RunStore:
         with different content is an integrity conflict; a fresh acceptance
         requires ``human_boundary_id`` still be this Run's current boundary.
         """
+        with self.transaction():
+            return self._submit_human_resolution_locked(
+                human_resolution_id=human_resolution_id,
+                human_boundary_id=human_boundary_id,
+                run_id=run_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                authenticated_principal_id=authenticated_principal_id,
+                resolution_kind=resolution_kind,
+                resolution=resolution,
+                accepted_at_ms=accepted_at_ms,
+            )
+
+    def _submit_human_resolution_locked(
+        self,
+        *,
+        human_resolution_id: str,
+        human_boundary_id: str,
+        run_id: str,
+        source_kind: str,
+        source_id: str,
+        authenticated_principal_id: str,
+        resolution_kind: str,
+        resolution: Mapping[str, Any],
+        accepted_at_ms: int | None = None,
+    ) -> HumanResolutionOutcome:
+        """Body of :meth:`submit_human_resolution`; caller must already hold
+        this store's writer transaction (see e.g. ``submit_management_command``,
+        which commits a Human Resolution and its authenticated Management
+        Command envelope as one atomic unit).
+        """
         from orcest.workflow_reducer.human_boundary import (
             SECRET_STORE_VERIFIER_PRINCIPAL_ID,
             resolution_source_kinds,
@@ -20828,193 +21026,432 @@ class RunStore:
         now = _now_ms() if accepted_at_ms is None else accepted_at_ms
         resolution_payload = dict(resolution)
 
-        with self.transaction():
-            existing = self.conn.execute(
-                "SELECT * FROM human_resolutions WHERE source_kind = ? AND idempotency_key = ?",
-                (source_kind, source_id),
-            ).fetchone()
+        existing = self.conn.execute(
+            "SELECT * FROM human_resolutions WHERE source_kind = ? AND idempotency_key = ?",
+            (source_kind, source_id),
+        ).fetchone()
 
-            boundary = self.get_human_boundary(human_boundary_id)
-            if boundary is None:
-                raise RunStoreError(f"human boundary {human_boundary_id!r} was not found")
-            if boundary.run_id != run_id:
-                raise ValueError("human boundary does not belong to this run")
+        boundary = self.get_human_boundary(human_boundary_id)
+        if boundary is None:
+            raise RunStoreError(f"human boundary {human_boundary_id!r} was not found")
+        if boundary.run_id != run_id:
+            raise ValueError("human boundary does not belong to this run")
 
-            if existing is not None:
-                record = _row_to_human_resolution(existing)
-                if not (
-                    record.human_resolution_id == human_resolution_id
-                    and record.human_boundary_id == human_boundary_id
-                    and record.run_id == run_id
-                    and record.authenticated_principal_id == authenticated_principal_id
-                    and record.resolution_kind == resolution_kind
-                    and record.resolution == resolution_payload
-                ):
-                    raise IdempotencyConflictError(
-                        "human resolution source identity was reused with different content"
-                    )
-            else:
-                run_row = self.conn.execute(
-                    "SELECT human_boundary_id FROM runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                if run_row is None:
-                    raise RunStoreError(f"run {run_id!r} was not found")
-                if run_row["human_boundary_id"] != human_boundary_id:
-                    raise RunStoreError(
-                        f"human boundary {human_boundary_id!r} is not current for run "
-                        f"{run_id!r}; the boundary was already resolved or superseded"
-                    )
-                if resolution_kind not in boundary.required_resolution_kinds:
-                    raise ValueError(
-                        f"{resolution_kind} is not permitted by boundary reason "
-                        f"{boundary.reason!r} (allowed: {list(boundary.required_resolution_kinds)})"
-                    )
-                if resolution_kind == "PUBLICATION_OWNERSHIP_RESOLVED":
-                    expected = {
-                        "project_id": boundary.ownership_project_id,
-                        "deterministic_ref": boundary.ownership_deterministic_ref,
-                        "change_request_external_id": (
-                            boundary.ownership_change_request_external_id
-                        ),
-                        "run_marker": boundary.ownership_run_marker,
-                    }
-                    for key, expected_value in expected.items():
-                        if resolution_payload[key] != expected_value:
-                            raise ValueError(
-                                f"PUBLICATION_OWNERSHIP_RESOLVED.{key} must equal the "
-                                "current boundary's copied ownership binding"
-                            )
-                if resolution_kind == "SECRET_OR_PERMISSION_PROVIDED" and source_kind == (
-                    "SECRET_VERSION"
-                ):
-                    secret_id, version_str = source_id.split(":")
-                    secret_version = self.get_secret_version(secret_id, int(version_str))
-                    if secret_version is None:
-                        raise ValueError(f"secret version {source_id!r} was not found")
-                    current = self.get_secret_current_version(secret_id)
-                    if current is None or current.current_version != int(version_str):
-                        raise ValueError(f"secret version {source_id!r} is not the current version")
-                    if resolution_payload["secret_version_key"] != source_id:
-                        raise ValueError("resolution.secret_version_key must equal source_id")
-                    if (
-                        resolution_payload["creation_receipt_id"]
-                        != secret_version.creation_receipt_id
-                    ):
-                        raise ValueError(
-                            "resolution.creation_receipt_id must match the Secret "
-                            "Version's creation Receipt"
-                        )
-
-                resolution_preimage = {
-                    "human_boundary_id": human_boundary_id,
-                    "run_id": run_id,
-                    "source_kind": source_kind,
-                    "source_id": source_id,
-                    "authenticated_principal_id": authenticated_principal_id,
-                    "resolution_kind": resolution_kind,
-                    "resolution": resolution_payload,
-                    "specification_generation": boundary.specification_generation,
-                    "candidate_id": boundary.candidate_id,
-                    "policy_hash": boundary.policy_hash,
-                    "forge_observation_id": boundary.forge_observation_id,
-                    "publication_id": boundary.publication_id,
-                    "publication_effect_generation": boundary.publication_effect_generation,
-                    "ownership_project_id": boundary.ownership_project_id,
-                    "ownership_deterministic_ref": boundary.ownership_deterministic_ref,
-                    "ownership_change_request_external_id": (
-                        boundary.ownership_change_request_external_id
-                    ),
-                    "ownership_run_marker": boundary.ownership_run_marker,
-                }
-                digest = human_resolution_digest(resolution_preimage)
-                columns = [
-                    "human_resolution_id",
-                    "human_boundary_id",
-                    "run_id",
-                    "idempotency_key",
-                    "source_kind",
-                    "source_id",
-                    "authenticated_principal_id",
-                    "resolution_kind",
-                    "resolution_json",
-                    "specification_generation",
-                    "candidate_id",
-                    "policy_hash",
-                    "forge_observation_id",
-                    "publication_id",
-                    "publication_effect_generation",
-                    "ownership_project_id",
-                    "ownership_deterministic_ref",
-                    "ownership_change_request_external_id",
-                    "ownership_run_marker",
-                    "resolution_digest",
-                    "accepted_at_ms",
-                ]
-                values = (
-                    human_resolution_id,
-                    human_boundary_id,
-                    run_id,
-                    source_id,
-                    source_kind,
-                    source_id,
-                    authenticated_principal_id,
-                    resolution_kind,
-                    canonical_json_text(resolution_payload),
-                    boundary.specification_generation,
-                    boundary.candidate_id,
-                    boundary.policy_hash,
-                    boundary.forge_observation_id,
-                    boundary.publication_id,
-                    boundary.publication_effect_generation,
-                    boundary.ownership_project_id,
-                    boundary.ownership_deterministic_ref,
-                    boundary.ownership_change_request_external_id,
-                    boundary.ownership_run_marker,
-                    digest,
-                    now,
-                )
-                self.conn.execute(
-                    f"INSERT INTO human_resolutions({', '.join(columns)}) "
-                    f"VALUES ({', '.join(['?'] * len(columns))})",
-                    values,
-                )
-
-            created = self.get_human_resolution(human_resolution_id)
-            assert created is not None
-
-            view = load_view(self, run_id)
-            if view is None:
-                raise RunStoreError(f"run {run_id!r} was not found")
-            trigger_facts: dict[str, Any] = {"human_boundary_id": human_boundary_id}
-            if source_kind == "MANAGEMENT_COMMAND":
-                trigger_kind = "MANAGEMENT_COMMAND"
-                trigger_facts["kind"] = "RESOLVE_HUMAN_BOUNDARY"
-            elif source_kind == "SECRET_VERSION":
-                trigger_kind = "SECRET_VERSION"
-                trigger_facts["satisfies_boundary"] = True
-            else:
-                trigger_kind = "STORAGE_RESTORATION"
-                trigger_facts["matches_object"] = True
-
-            applied = apply(
-                self,
-                view,
-                Trigger(kind=trigger_kind, trigger_id=source_id, facts=trigger_facts),
-                run_id=run_id,
-            )
-            if (
-                not applied.replayed
-                and applied.reduction is not None
-                and applied.reduction.reason_code == "HUMAN_RESOLUTION"
+        if existing is not None:
+            record = _row_to_human_resolution(existing)
+            if not (
+                record.human_resolution_id == human_resolution_id
+                and record.human_boundary_id == human_boundary_id
+                and record.run_id == run_id
+                and record.authenticated_principal_id == authenticated_principal_id
+                and record.resolution_kind == resolution_kind
+                and record.resolution == resolution_payload
             ):
-                self._clear_run_human_boundary_pointer(run_id)
-            return HumanResolutionOutcome(human_resolution=created, applied=applied)
+                raise IdempotencyConflictError(
+                    "human resolution source identity was reused with different content"
+                )
+        else:
+            run_row = self.conn.execute(
+                "SELECT human_boundary_id FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise RunStoreError(f"run {run_id!r} was not found")
+            if run_row["human_boundary_id"] != human_boundary_id:
+                raise RunStoreError(
+                    f"human boundary {human_boundary_id!r} is not current for run "
+                    f"{run_id!r}; the boundary was already resolved or superseded"
+                )
+            if resolution_kind not in boundary.required_resolution_kinds:
+                raise ValueError(
+                    f"{resolution_kind} is not permitted by boundary reason "
+                    f"{boundary.reason!r} (allowed: {list(boundary.required_resolution_kinds)})"
+                )
+            if resolution_kind == "PUBLICATION_OWNERSHIP_RESOLVED":
+                expected = {
+                    "project_id": boundary.ownership_project_id,
+                    "deterministic_ref": boundary.ownership_deterministic_ref,
+                    "change_request_external_id": (boundary.ownership_change_request_external_id),
+                    "run_marker": boundary.ownership_run_marker,
+                }
+                for key, expected_value in expected.items():
+                    if resolution_payload[key] != expected_value:
+                        raise ValueError(
+                            f"PUBLICATION_OWNERSHIP_RESOLVED.{key} must equal the "
+                            "current boundary's copied ownership binding"
+                        )
+            if resolution_kind == "SECRET_OR_PERMISSION_PROVIDED" and source_kind == (
+                "SECRET_VERSION"
+            ):
+                secret_id, version_str = source_id.split(":")
+                secret_version = self.get_secret_version(secret_id, int(version_str))
+                if secret_version is None:
+                    raise ValueError(f"secret version {source_id!r} was not found")
+                current = self.get_secret_current_version(secret_id)
+                if current is None or current.current_version != int(version_str):
+                    raise ValueError(f"secret version {source_id!r} is not the current version")
+                if resolution_payload["secret_version_key"] != source_id:
+                    raise ValueError("resolution.secret_version_key must equal source_id")
+                if resolution_payload["creation_receipt_id"] != secret_version.creation_receipt_id:
+                    raise ValueError(
+                        "resolution.creation_receipt_id must match the Secret "
+                        "Version's creation Receipt"
+                    )
+
+            resolution_preimage = {
+                "human_boundary_id": human_boundary_id,
+                "run_id": run_id,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "authenticated_principal_id": authenticated_principal_id,
+                "resolution_kind": resolution_kind,
+                "resolution": resolution_payload,
+                "specification_generation": boundary.specification_generation,
+                "candidate_id": boundary.candidate_id,
+                "policy_hash": boundary.policy_hash,
+                "forge_observation_id": boundary.forge_observation_id,
+                "publication_id": boundary.publication_id,
+                "publication_effect_generation": boundary.publication_effect_generation,
+                "ownership_project_id": boundary.ownership_project_id,
+                "ownership_deterministic_ref": boundary.ownership_deterministic_ref,
+                "ownership_change_request_external_id": (
+                    boundary.ownership_change_request_external_id
+                ),
+                "ownership_run_marker": boundary.ownership_run_marker,
+            }
+            digest = human_resolution_digest(resolution_preimage)
+            columns = [
+                "human_resolution_id",
+                "human_boundary_id",
+                "run_id",
+                "idempotency_key",
+                "source_kind",
+                "source_id",
+                "authenticated_principal_id",
+                "resolution_kind",
+                "resolution_json",
+                "specification_generation",
+                "candidate_id",
+                "policy_hash",
+                "forge_observation_id",
+                "publication_id",
+                "publication_effect_generation",
+                "ownership_project_id",
+                "ownership_deterministic_ref",
+                "ownership_change_request_external_id",
+                "ownership_run_marker",
+                "resolution_digest",
+                "accepted_at_ms",
+            ]
+            values = (
+                human_resolution_id,
+                human_boundary_id,
+                run_id,
+                source_id,
+                source_kind,
+                source_id,
+                authenticated_principal_id,
+                resolution_kind,
+                canonical_json_text(resolution_payload),
+                boundary.specification_generation,
+                boundary.candidate_id,
+                boundary.policy_hash,
+                boundary.forge_observation_id,
+                boundary.publication_id,
+                boundary.publication_effect_generation,
+                boundary.ownership_project_id,
+                boundary.ownership_deterministic_ref,
+                boundary.ownership_change_request_external_id,
+                boundary.ownership_run_marker,
+                digest,
+                now,
+            )
+            self.conn.execute(
+                f"INSERT INTO human_resolutions({', '.join(columns)}) "
+                f"VALUES ({', '.join(['?'] * len(columns))})",
+                values,
+            )
+
+        created = self.get_human_resolution(human_resolution_id)
+        assert created is not None
+
+        view = load_view(self, run_id)
+        if view is None:
+            raise RunStoreError(f"run {run_id!r} was not found")
+        trigger_facts: dict[str, Any] = {"human_boundary_id": human_boundary_id}
+        if source_kind == "MANAGEMENT_COMMAND":
+            trigger_kind = "MANAGEMENT_COMMAND"
+            trigger_facts["kind"] = "RESOLVE_HUMAN_BOUNDARY"
+        elif source_kind == "SECRET_VERSION":
+            trigger_kind = "SECRET_VERSION"
+            trigger_facts["satisfies_boundary"] = True
+        else:
+            trigger_kind = "STORAGE_RESTORATION"
+            trigger_facts["matches_object"] = True
+
+        applied = apply(
+            self,
+            view,
+            Trigger(kind=trigger_kind, trigger_id=source_id, facts=trigger_facts),
+            run_id=run_id,
+        )
+        if (
+            not applied.replayed
+            and applied.reduction is not None
+            and applied.reduction.reason_code == "HUMAN_RESOLUTION"
+        ):
+            self._clear_run_human_boundary_pointer(run_id)
+        return HumanResolutionOutcome(human_resolution=created, applied=applied)
 
     def _clear_run_human_boundary_pointer(self, run_id: str) -> None:
         self.conn.execute(
             "UPDATE runs SET human_boundary_id = NULL, updated_at_ms = ? WHERE run_id = ?",
             (_now_ms(), run_id),
         )
+
+    def _management_command_response(
+        self,
+        *,
+        command_id: str,
+        run_id: str,
+        kind: str,
+        result_transition_sequence: int,
+        human_resolution_id: str | None,
+    ) -> tuple[int, str, str]:
+        outcome = "ACCEPTED"
+        enums.parse_enum("management_command.outcome", outcome)
+        body = {
+            "protocol": MANAGEMENT_COMMAND_RESULT_PROTOCOL,
+            "command_id": command_id,
+            "run_id": run_id,
+            "kind": kind,
+            "outcome": outcome,
+            "result_transition_sequence": result_transition_sequence,
+            "human_resolution_id": human_resolution_id,
+            "replayed": False,
+        }
+        body_json = canonical_json_text(body)
+        digest = response_digest({"http_status": 200, "body": _response_digest_preimage(body)})
+        return 200, body_json, digest
+
+    def get_management_command(self, command_id: str) -> ManagementCommandResult | None:
+        row = self.conn.execute(
+            "SELECT * FROM management_commands WHERE command_id = ?", (command_id,)
+        ).fetchone()
+        return None if row is None else _row_to_management_command(row, replayed=False)
+
+    def submit_management_command(
+        self,
+        *,
+        command_id: str,
+        run_id: str,
+        kind: str,
+        expected_last_transition_sequence: int,
+        payload: Mapping[str, Any],
+        authenticated_principal_id: str,
+        authorization_context_digest: str,
+    ) -> ManagementCommandResult:
+        """Accept one authenticated ``POST /api/v1/runs/{run_id}/commands`` body
+        (workflow-lifecycle.md "Authenticated Run commands").
+
+        ``command_id`` is the global idempotency key: an identical replay
+        (same run, kind, fence, payload, principal, and authorization context)
+        returns the original stored response; a reused id with different
+        content raises :class:`IdempotencyConflictError`. A stale
+        ``expected_last_transition_sequence`` -- including one already moved by
+        a Human Boundary supersession -- raises :class:`CasMismatchError`
+        before any Run mutation. ``CANCEL`` is applied as the closed
+        ``MANAGEMENT_COMMAND``/``CANCEL`` reducer trigger;
+        ``RESOLVE_HUMAN_BOUNDARY`` is applied through
+        :meth:`_submit_human_resolution_locked` so ownership/policy decisions
+        stay reason-bound Human Resolution effects rather than a second,
+        parallel acceptance path. Both commit their Transition and this
+        Command's audit row atomically.
+        """
+        from orcest.workflow_reducer.ledger import apply, load_view
+        from orcest.workflow_reducer.types import Trigger
+
+        require_lowercase_uuid(command_id, field="command_id")
+        require_lowercase_uuid(run_id, field="run_id")
+        enums.parse_enum("management_command.kind", kind)
+        _require_nonneg_int(
+            expected_last_transition_sequence, field="expected_last_transition_sequence"
+        )
+        _require_digest(authorization_context_digest, field="authorization_context_digest")
+        if not authenticated_principal_id.strip():
+            raise ValueError("authenticated_principal_id is required")
+        payload_mapping = dict(payload)
+        req_digest = request_digest(
+            {
+                "command_id": command_id,
+                "run_id": run_id,
+                "kind": kind,
+                "expected_last_transition_sequence": expected_last_transition_sequence,
+                "payload": payload_mapping,
+                "authenticated_principal_id": authenticated_principal_id,
+                "authorization_context_digest": authorization_context_digest,
+            }
+        )
+
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM management_commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] == req_digest:
+                    return _row_to_management_command(existing, replayed=True)
+                raise IdempotencyConflictError(
+                    "command_id was reused with a different command body"
+                )
+
+            view = load_view(self, run_id)
+            if view is None:
+                raise RunStoreError(f"run {run_id!r} was not found")
+            last_transition_sequence = view.next_transition_sequence - 1
+            if last_transition_sequence != expected_last_transition_sequence:
+                raise CasMismatchError(
+                    f"expected_last_transition_sequence {expected_last_transition_sequence} "
+                    f"does not match the Run's current {last_transition_sequence}"
+                )
+
+            human_resolution_id: str | None = None
+            if kind == "CANCEL":
+                if payload_mapping:
+                    raise ValueError("CANCEL does not accept a payload")
+                applied = apply(
+                    self,
+                    view,
+                    Trigger(kind="MANAGEMENT_COMMAND", trigger_id=command_id, facts={"kind": kind}),
+                    run_id=run_id,
+                )
+                result_transition_sequence = applied.transition.transition_sequence
+            else:
+                assert kind == "RESOLVE_HUMAN_BOUNDARY"
+                human_boundary_id = payload_mapping.get("human_boundary_id")
+                resolution_kind = payload_mapping.get("resolution_kind")
+                resolution = payload_mapping.get("resolution")
+                if (
+                    not isinstance(human_boundary_id, str)
+                    or not is_lowercase_uuid(human_boundary_id)
+                    or not isinstance(resolution_kind, str)
+                    or not isinstance(resolution, Mapping)
+                ):
+                    raise ValueError(
+                        "RESOLVE_HUMAN_BOUNDARY payload requires human_boundary_id, "
+                        "resolution_kind, and a resolution object"
+                    )
+                human_resolution_id = str(uuid.uuid4())
+                outcome = self._submit_human_resolution_locked(
+                    human_resolution_id=human_resolution_id,
+                    human_boundary_id=human_boundary_id,
+                    run_id=run_id,
+                    source_kind="MANAGEMENT_COMMAND",
+                    source_id=command_id,
+                    authenticated_principal_id=authenticated_principal_id,
+                    resolution_kind=resolution_kind,
+                    resolution=resolution,
+                )
+                result_transition_sequence = outcome.applied.transition.transition_sequence
+
+            http_status, body_json, resp_digest = self._management_command_response(
+                command_id=command_id,
+                run_id=run_id,
+                kind=kind,
+                result_transition_sequence=result_transition_sequence,
+                human_resolution_id=human_resolution_id,
+            )
+            now = _now_ms()
+            self.conn.execute(
+                "INSERT INTO management_commands(command_id, run_id, kind, "
+                "expected_last_transition_sequence, payload_json, authenticated_principal_id, "
+                "authorization_context_digest, request_digest, result_transition_sequence, "
+                "human_resolution_id, response_http_status, response_json, response_digest, "
+                "committed_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    command_id,
+                    run_id,
+                    kind,
+                    expected_last_transition_sequence,
+                    canonical_json_text(payload_mapping),
+                    authenticated_principal_id,
+                    authorization_context_digest,
+                    req_digest,
+                    result_transition_sequence,
+                    human_resolution_id,
+                    http_status,
+                    body_json,
+                    resp_digest,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM management_commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            assert row is not None
+            return _row_to_management_command(row, replayed=False)
+
+    def record_management_command_denial(
+        self,
+        *,
+        code: str,
+        message: str,
+        http_status: int,
+        run_id: str | None = None,
+        command_id: str | None = None,
+        kind: str | None = None,
+        authenticated_principal_id: str | None = None,
+    ) -> ManagementCommandDenialRecord:
+        """Durably audit one fail-closed rejection of an attempted Run command
+        -- unauthorized, unknown kind, malformed, or fenced -- without
+        creating a Transition, Human Resolution, or accepted Management
+        Command row. Every call is a fresh, independent audit entry: unlike
+        :meth:`submit_management_command`, denials carry no idempotency key
+        because a rejected request never advanced any durable Run state to
+        replay.
+        """
+        if not code.strip():
+            raise ValueError("code is required")
+        if not message.strip():
+            raise ValueError("message is required")
+        if not (100 <= http_status <= 599):
+            raise ValueError("http_status must be a valid HTTP status code")
+        denial_id = str(uuid.uuid4())
+        now = _now_ms()
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO management_command_denials(denial_id, run_id, command_id, kind, "
+                "authenticated_principal_id, code, message, http_status, denied_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    denial_id,
+                    run_id,
+                    command_id,
+                    kind,
+                    authenticated_principal_id,
+                    code,
+                    message,
+                    http_status,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM management_command_denials WHERE denial_id = ?", (denial_id,)
+            ).fetchone()
+            assert row is not None
+            return _row_to_management_command_denial(row)
+
+    def list_management_command_denials(
+        self, *, run_id: str | None = None
+    ) -> list[ManagementCommandDenialRecord]:
+        if run_id is None:
+            rows = self.conn.execute(
+                "SELECT * FROM management_command_denials ORDER BY denied_at_ms"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM management_command_denials WHERE run_id = ? ORDER BY denied_at_ms",
+                (run_id,),
+            ).fetchall()
+        return [_row_to_management_command_denial(row) for row in rows]
 
     def _waiting_run_ids(self, *, wait_reason: str, project_id: str | None = None) -> list[str]:
         """Bytewise-sorted ``run_id``s currently ``WAITING`` for ``wait_reason``.
@@ -23082,6 +23519,63 @@ class RunStore:
         ).fetchone()
         assert row is not None
         return _row_to_projection(row)
+
+    def get_projection_outbox(self, projection_outbox_id: str) -> ProjectionOutboxRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM projection_outbox WHERE projection_outbox_id = ?",
+            (projection_outbox_id,),
+        ).fetchone()
+        return None if row is None else _row_to_projection(row)
+
+    def list_pending_projection_outbox(self, *, limit: int = 100) -> list[ProjectionOutboxRecord]:
+        """Due ``PENDING`` Projection Outbox rows, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM projection_outbox WHERE state = 'PENDING' "
+            "ORDER BY next_delivery_at_ms LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_projection(row) for row in rows]
+
+    def mark_projection_outbox_delivered(self, projection_outbox_id: str) -> None:
+        """Record a successful forge projection mutation. Safe to call again
+        on redelivery/reconciliation -- delivery is a durable observability
+        marker here, never a fence a future rebuild has to respect."""
+        cur = self.conn.execute(
+            "UPDATE projection_outbox SET state = 'DELIVERED', "
+            "delivery_count = delivery_count + 1 WHERE projection_outbox_id = ?",
+            (projection_outbox_id,),
+        )
+        if cur.rowcount != 1:
+            raise RunStoreError(f"projection outbox row {projection_outbox_id!r} was not found")
+
+    def get_latest_projection_outbox_for_run(
+        self, run_id: str, *, kind: str = "RUN_STATUS", target_kind: str = "WORK_ITEM"
+    ) -> ProjectionOutboxRecord | None:
+        """The durable Projection Outbox row with the greatest
+        ``transition_sequence`` for this Run/kind/target -- the SQLite
+        source of truth a rebuild replays after forge projection deletion or
+        drift, independent of that row's own delivery state.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM projection_outbox WHERE run_id = ? AND kind = ? AND target_kind = ? "
+            "ORDER BY transition_sequence DESC LIMIT 1",
+            (run_id, kind, target_kind),
+        ).fetchone()
+        return None if row is None else _row_to_projection(row)
+
+    def list_run_ids_with_projection_outbox(
+        self, *, kind: str = "RUN_STATUS", target_kind: str = "WORK_ITEM"
+    ) -> list[str]:
+        """Bytewise-sorted distinct ``run_id``s that have ever had a durable
+        Projection Outbox row of this kind/target -- the reconciliation
+        sweep's candidate set for rebuilding every forge projection from
+        SQLite alone."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT run_id FROM projection_outbox WHERE kind = ? AND target_kind = ? "
+            "ORDER BY run_id",
+            (kind, target_kind),
+        ).fetchall()
+        return [str(row["run_id"]) for row in rows]
 
     def put_revisioned_object(
         self,
