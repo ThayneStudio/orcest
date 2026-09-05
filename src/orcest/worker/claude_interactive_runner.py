@@ -47,6 +47,24 @@ _MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
 # The composer's bracketed-paste placeholder ("[Pasted text #1 +42 lines]").
 # Its presence after a submission keystroke means the Enter did not land.
 _PASTED_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
+# Static rows Claude Code 2.1.235 paints below the composer. These are terminal
+# chrome, not evidence that a turn started. Keep the allowlist deliberately
+# narrow: an unknown trailing row (especially a dialog instruction) remains
+# ambiguous and can never authorize a bare Enter.
+_COMPOSER_FOOTER_RES = (
+    re.compile(r"^[─━]+$"),
+    re.compile(
+        r"^\? for shortcuts(?:\s+(?:[·|]\s*)?"
+        r"context left until auto-compact:\s*\d{1,3}%)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^context left until auto-compact:\s*\d{1,3}%$", re.IGNORECASE),
+    re.compile(
+        r"^⏵⏵\s+[^\r\n]{1,80}\bpermissions?\b[^\r\n]{0,80}"
+        r"\(shift\+tab to cycle\)$",
+        re.IGNORECASE,
+    ),
+)
 # Total number of submission keystrokes, INCLUDING the initial Enter. A value
 # of 3 permits the initial submission plus two evidence-backed retries. Keep
 # the name and retry log denominator aligned with this total-attempt meaning.
@@ -351,6 +369,12 @@ class ClaudeInteractiveRunner:
         """True when the latest settled composer frame still holds the paste."""
         return self._classify_post_submit_state(text) is _PostSubmitState.EXPLICITLY_STUCK
 
+    @staticmethod
+    def _is_composer_footer_line(line: str) -> bool:
+        """Return whether *line* is known inert chrome below the composer."""
+        unframed = line.strip(" \t│┃║|")
+        return not unframed or any(pattern.fullmatch(unframed) for pattern in _COMPOSER_FOOTER_RES)
+
     def _classify_post_submit_state(self, text: str) -> _PostSubmitState:
         """Classify only the latest settled post-submit terminal evidence.
 
@@ -378,11 +402,11 @@ class ClaudeInteractiveRunner:
         if _MENU_OPTION_RE.match(latest_caret):
             return _PostSubmitState.AMBIGUOUS
 
-        # The caret is explicit current evidence only when no newer meaningful
-        # output follows it. This also covers dialogs that render their selected
-        # row before a footer: unrecognized trailing output must make the state
-        # ambiguous instead of letting a historical placeholder authorize Enter.
-        if any(line.strip(" \t│┃║|") for line in lines[latest_index + 1 :]):
+        # The caret is explicit current evidence only when newer rows are known
+        # inert composer chrome. Unknown trailing output (including dialog
+        # instructions) makes the state ambiguous instead of letting a
+        # historical placeholder authorize Enter.
+        if any(not self._is_composer_footer_line(line) for line in lines[latest_index + 1 :]):
             return _PostSubmitState.AMBIGUOUS
 
         if _PASTED_PLACEHOLDER_RE.search(latest_caret):

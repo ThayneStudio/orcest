@@ -1016,7 +1016,15 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
         is _PostSubmitState.EXPLICITLY_STUCK
     )
     assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
         runner._classify_post_submit_state(frames["stuck_then_cleared"])
+        is _PostSubmitState.EXECUTING
+    )
+    assert (
+        runner._classify_post_submit_state(frames["stuck_then_cleared_with_footer"])
         is _PostSubmitState.EXECUTING
     )
     assert (
@@ -1172,6 +1180,7 @@ while time.time() < drain_deadline:
 # The composer stays stuck on the pasted placeholder: the first Enter did
 # not land.
 print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("? for shortcuts  Context left until auto-compact: 87%", flush=True)
 
 retry = b""
 deadline = time.time() + 5
