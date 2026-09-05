@@ -760,6 +760,26 @@ class TestRedisCliRoutedThroughDockerExec:
         assert "SET orcest:pool:current_template_vmid" in cmd
         assert "9001" in cmd
 
+    def test_set_current_template_vmid_atomically_records_revision(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_vmid
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        set_current_template_vmid("user@host", 9001, revision="a" * 40)
+
+        cmd = ssh.call_args.args[1]
+        assert "MSET" in cmd
+        assert "orcest:pool:template_revision:9001" in cmd
+        assert "orcest:pool:current_template_vmid 9001" in cmd
+        assert "a" * 40 in cmd
+
+    def test_set_template_revision_records_vmid_specific_metadata(self, mocker):
+        from orcest.fleet.orchestrator import set_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        set_template_revision("user@host", 9001, "b" * 40)
+
+        assert "SET orcest:pool:template_revision:9001" in ssh.call_args.args[1]
+
     def test_get_current_template_vmid_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import get_current_template_vmid
 
@@ -1078,6 +1098,34 @@ class TestUploadSource:
         assert ".orcest-revision" in members
         assert files[".orcest-revision"] == f"{revision}\n"
         assert f"BUILD_REVISION = {revision!r}" in files["src/orcest/_build_revision.py"]
+
+    def test_frozen_revision_archive_ignores_mid_deploy_worktree_edit(self, tmp_path):
+        from orcest.fleet.orchestrator import _archive_source_revision
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+        tracked = root / "tracked.txt"
+        tracked.write_text("frozen bytes\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "frozen"], cwd=root, check=True)
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        # Simulate the checkout changing after deployment intent was frozen.
+        tracked.write_text("concurrent edit\n")
+        snapshot = Path(_archive_source_revision(root, revision))
+        try:
+            assert (snapshot / "tracked.txt").read_text() == "frozen bytes\n"
+        finally:
+            __import__("shutil").rmtree(snapshot)
 
     def test_root_lock_not_only_the_source_tree_copy(self, mocker):
         """The lock the Dockerfile COPYs is the one at the context root, not the

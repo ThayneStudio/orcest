@@ -13,6 +13,7 @@ from orcest.fleet.config import (
     PoolConfig,
     ProjectEntry,
     ProxmoxConfig,
+    SourceConfig,
     WorkerProfileConfig,
     _parse_disk_size,
     load_config,
@@ -302,6 +303,7 @@ class TestConfigPersistence:
         original = FleetConfig(
             proxmox=ProxmoxConfig(node="mynode", storage="ceph", api_token_id="root@pam!t"),
             orchestrator=OrchestratorConfig(vm_id=200, host="10.0.0.1", disk_size=40),
+            source=SourceConfig(repository="Org/orcest", ref="refs/heads/master"),
             orgs={"Org": OrgEntry(github_token="ghp_abc", claude_oauth_tokens=["sk_def"])},
             projects=[
                 ProjectEntry(name="proj", repo="Org/proj"),
@@ -316,12 +318,34 @@ class TestConfigPersistence:
         assert loaded.orchestrator.vm_id == 200
         assert loaded.orchestrator.host == "10.0.0.1"
         assert loaded.orchestrator.disk_size == 40
+        assert loaded.source.repository == "Org/orcest"
+        assert loaded.source.ref == "refs/heads/master"
         assert loaded.orgs["Org"].github_token == "ghp_abc"
         assert len(loaded.projects) == 1
         assert loaded.projects[0].name == "proj"
         assert loaded.pool.size == 6
         assert loaded.pool.template_vm_id == 9000
         assert loaded.pool.storage == "nvme-pool"
+
+    def test_new_source_field_preserves_legacy_positional_constructor_order(self):
+        proxmox = ProxmoxConfig(node="legacy")
+        orchestrator = OrchestratorConfig(vm_id=321)
+        orgs = {"Org": OrgEntry()}
+        projects = [ProjectEntry(name="alpha", repo="Org/alpha")]
+        pool = PoolConfig(size=2)
+
+        cfg = FleetConfig(proxmox, orchestrator, orgs, projects, pool)
+
+        assert cfg.orgs is orgs
+        assert cfg.projects is projects
+        assert cfg.pool is pool
+        assert cfg.source == SourceConfig()
+
+    def test_new_template_revision_field_preserves_legacy_positional_constructor_order(self):
+        pool = PoolConfig(2, 9000, [9000, 9009])
+
+        assert pool.template_vmid_range == [9000, 9009]
+        assert pool.template_revision == ""
 
     def test_load_missing_file(self, tmp_path):
         cfg = load_config(tmp_path / "does-not-exist.yaml")
@@ -333,6 +357,30 @@ class TestConfigPersistence:
         path.write_text("")
         cfg = load_config(path)
         assert isinstance(cfg, FleetConfig)
+
+    def test_source_intent_defaults_unconfigured_for_legacy_files(self, tmp_path):
+        path = tmp_path / "legacy.yaml"
+        path.write_text("pool:\n  size: 4\n")
+
+        cfg = load_config(path)
+
+        assert cfg.source == SourceConfig()
+
+    def test_round_trip_immutable_source_sha(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        save_config(FleetConfig(source=SourceConfig(sha="a" * 40)), path)
+
+        assert load_config(path).source.sha == "a" * 40
+
+    @pytest.mark.parametrize("field_name", ["repository", "ref", "sha"])
+    def test_source_fields_must_be_strings_without_echoing_value(self, tmp_path, field_name):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump({"source": {field_name: ["secret-value"]}}))
+
+        with pytest.raises(ValueError, match=f"source.{field_name} must be a string") as exc:
+            load_config(path)
+
+        assert "secret-value" not in str(exc.value)
 
     def test_load_disk_size_string_compat(self, tmp_path):
         """Old configs may store disk_size as '20G' — should parse correctly."""
@@ -353,6 +401,7 @@ class TestConfigPersistence:
             pool=PoolConfig(
                 size=8,
                 template_vm_id=9000,
+                template_revision="c" * 40,
                 storage="ssd-pool",
                 worker_memory=32768,
                 worker_cores=16,
@@ -367,6 +416,7 @@ class TestConfigPersistence:
         loaded = load_config(path)
         assert loaded.pool.size == 8
         assert loaded.pool.template_vm_id == 9000
+        assert loaded.pool.template_revision == "c" * 40
         assert loaded.pool.worker_memory == 32768
         assert loaded.pool.worker_cores == 16
         assert loaded.pool.worker_disk_size == 100

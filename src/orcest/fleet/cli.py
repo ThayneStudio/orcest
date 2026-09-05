@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import functools
+import json
 import re
 import shlex
 import subprocess
@@ -37,6 +38,7 @@ _DEFAULT_CLOUD_IMAGE_URL = (
 _DRAIN_QUIESCE_SECONDS = 5.25
 _COORDINATED_BACKEND_CHANGE_META_KEY = "orcest_coordinated_backend_change"
 _DEFER_PROJECT_START_META_KEY = "orcest_defer_project_start"
+_FROZEN_SOURCE_REVISION_META_KEY = "orcest_frozen_source_revision"
 _CANDIDATE_WORKER_WAIT_SECONDS = 900
 _FLEET_OPERATION_LOCK_PATH = "/run/lock/orcest-fleet-operation.lock"
 _fleet_operation_lock_depth = 0
@@ -574,11 +576,17 @@ def _scp_to_vm(
     )
 
 
-def _install_source_on_worker_template(host: str, user: str, console: Console) -> bool:
+def _install_source_on_worker_template(
+    host: str,
+    user: str,
+    console: Console,
+    *,
+    expected_revision: str | None = None,
+) -> bool:
     """Install the active Orcest source into the worker template venv."""
     from orcest.fleet.orchestrator import create_source_tarball
 
-    tarball_path = create_source_tarball()
+    tarball_path = create_source_tarball(expected_revision=expected_revision)
     remote_tarball = "/tmp/orcest-source.tar.gz"
     try:
         copy = _scp_to_vm(host, user, tarball_path, remote_tarball)
@@ -586,6 +594,11 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
             console.print(f"[red]failed[/red]: {copy.stderr.strip()}")
             return False
 
+        exact_revision_check = (
+            f'test "$revision" = {shlex.quote(expected_revision)}; '
+            if expected_revision is not None
+            else ""
+        )
         install_cmd = (
             "set -e; "
             "sudo rm -rf /tmp/orcest-template-source; "
@@ -598,6 +611,7 @@ def _install_source_on_worker_template(host: str, user: str, console: Console) -
             " -q --no-cache-dir --no-deps /tmp/orcest-template-source; "
             "revision=$(/opt/orcest/venv/bin/orcest revision --short); "
             'case "$revision" in unknown|*-dirty) exit 42;; esac; '
+            f"{exact_revision_check}"
             "printf '%s\\n' \"$revision\" | sudo tee /etc/orcest/source-revision >/dev/null; "
             "sudo chmod 0644 /etc/orcest/source-revision; "
             f"sudo rm -rf {shlex.quote(remote_tarball)} /tmp/orcest-template-source"
@@ -901,6 +915,8 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
 
     console = Console()
     cfg = load_config(config)
+    expected_revision = _freeze_deployment_source(cfg, console)
+    _validate_deploy_source_revision(console, expected_revision=expected_revision)
 
     # Select storage for orchestrator VM disk
     if storage is None and cfg.proxmox.api_token_id and cfg.proxmox.api_token_secret:
@@ -982,7 +998,7 @@ def create_orchestrator(vm_id: int | None, storage: str | None, config: str) -> 
         from orcest.fleet.orchestrator import build_image, upload_source
 
         console.print("  Uploading orcest source...")
-        upload_source(ssh_target)
+        upload_source(ssh_target, expected_revision=expected_revision)
         console.print("  Upload [green]ok[/green]")
 
         console.print("  Building Docker image (this may take a minute)...")
@@ -1264,8 +1280,13 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
 
     ssh_target = cfg.ssh_target()
 
+    expected_revision = ctx.meta.get(_FROZEN_SOURCE_REVISION_META_KEY)
+    if not isinstance(expected_revision, str):
+        expected_revision = _freeze_deployment_source(cfg, console)
+        ctx.meta[_FROZEN_SOURCE_REVISION_META_KEY] = expected_revision
+
     _validate_provider_stream_routing(cfg, console)
-    _validate_deploy_source_revision(console)
+    _validate_deploy_source_revision(console, expected_revision=expected_revision)
 
     # Project configs and workers must change backend as one operation. The
     # authorization bit is set only by this process's coordinated deploy path;
@@ -1284,7 +1305,7 @@ def update(ctx: click.Context, config: str, skip_pool_manager: bool) -> None:
         from orcest.fleet.orchestrator import build_image, upload_source
 
         console.print("  Uploading fresh source...")
-        upload_source(ssh_target)
+        upload_source(ssh_target, expected_revision=expected_revision)
         console.print("  Upload [green]ok[/green]")
 
         console.print("  Rebuilding Docker image...")
@@ -1445,6 +1466,88 @@ def _print_worker_provider_cli_heartbeats(console: Console, ssh_target: str) -> 
     console.print(table)
 
 
+def _print_source_revision_health(
+    console: Console,
+    cfg: FleetConfig,
+    *,
+    report: Any | None = None,
+) -> Any:
+    """Render the canonical desired-source health report without secrets."""
+    from rich.markup import escape
+
+    from orcest.fleet.source_health import collect_source_health
+
+    health = report or collect_source_health(cfg)
+    desired = Table(title="Source Revision Health")
+    desired.add_column("Property", style="cyan")
+    desired.add_column("Value", style="white")
+    desired.add_row(
+        "Repository",
+        escape(health.desired.repository) if health.desired.repository else "[dim]not set[/dim]",
+    )
+    desired.add_row(
+        "Ref",
+        escape(health.desired.ref) if health.desired.ref else "[dim]immutable/unset[/dim]",
+    )
+    desired.add_row(
+        "Resolved SHA",
+        escape(health.desired.revision) if health.desired.revision else "[dim]unknown[/dim]",
+    )
+    desired.add_row("Resolution", escape(health.desired.status))
+    desired.add_row(
+        "Whole-fleet source health",
+        "[green]healthy[/green]" if health.healthy else "[red]non-green[/red]",
+    )
+    console.print(desired)
+
+    if health.runtimes:
+        runtimes = Table(title="Runtime Revisions")
+        runtimes.add_column("Class", style="cyan")
+        runtimes.add_column("Runtime", style="white")
+        runtimes.add_column("Revision", style="magenta")
+        runtimes.add_column("Status", style="white")
+        for runtime in health.runtimes:
+            if runtime.status == "current":
+                status_label = "[green]current[/green]"
+            elif runtime.status == "stale":
+                status_label = "[red]stale[/red]"
+            else:
+                status_label = f"[yellow]{runtime.status}[/yellow]"
+            runtimes.add_row(
+                escape(runtime.runtime_class),
+                escape(runtime.runtime_id),
+                escape(runtime.revision) if runtime.revision else "[dim]unknown[/dim]",
+                status_label,
+            )
+        console.print(runtimes)
+    for diagnostic in health.diagnostics:
+        console.print(f"  [yellow]{escape(diagnostic)}[/yellow]")
+    return health
+
+
+@fleet.command("source-health")
+@click.option(
+    "--config",
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Fleet config path.",
+    show_default=True,
+)
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+def source_health(config: str, json_output: bool) -> None:
+    """Check desired source revision health; exit nonzero unless fully current."""
+    from orcest.fleet.config import load_config
+    from orcest.fleet.source_health import collect_source_health
+
+    cfg = load_config(config)
+    report = collect_source_health(cfg)
+    if json_output:
+        click.echo(json.dumps(report.as_dict(), sort_keys=True))
+    else:
+        _print_source_revision_health(Console(), cfg, report=report)
+    if not report.healthy:
+        raise SystemExit(1)
+
+
 @fleet.command()
 @click.option(
     "--config",
@@ -1483,20 +1586,18 @@ def status(config: str) -> None:
 
     console.print(orch_table)
 
+    _print_source_revision_health(console, cfg)
+
     # Orgs
     if cfg.orgs:
         org_table = Table(title="Registered Orgs")
         org_table.add_column("Org", style="cyan")
-        org_table.add_column("GitHub Token", style="green")
-        org_table.add_column("Claude Token", style="yellow")
+        org_table.add_column("GitHub Credential", style="green")
+        org_table.add_column("Claude Credential", style="yellow")
 
         for org_name, org_entry in cfg.orgs.items():
-            gh = f"{org_entry.github_token[:8]}..." if org_entry.github_token else "[dim]none[/dim]"
-            cl = (
-                f"{org_entry.claude_oauth_token[:8]}..."
-                if org_entry.claude_oauth_token
-                else "[dim]none[/dim]"
-            )
+            gh = "[green]configured[/green]" if org_entry.github_token else "[dim]none[/dim]"
+            cl = "[green]configured[/green]" if org_entry.claude_oauth_token else "[dim]none[/dim]"
             org_table.add_row(org_name, gh, cl)
 
         console.print(org_table)
@@ -1504,53 +1605,52 @@ def status(config: str) -> None:
     # Projects
     if not cfg.projects:
         console.print("\n[dim]No projects in fleet config.[/dim]")
-        return
+    else:
+        proj_table = Table(title="Projects")
+        proj_table.add_column("Project", style="cyan")
+        proj_table.add_column("Repo", style="white")
+        proj_table.add_column("Stack Status", style="magenta")
 
-    proj_table = Table(title="Projects")
-    proj_table.add_column("Project", style="cyan")
-    proj_table.add_column("Repo", style="white")
-    proj_table.add_column("Stack Status", style="magenta")
+        for project in cfg.projects:
+            if not validate_project_name(project.name):
+                # Skip projects with invalid names rather than aborting the
+                # entire status display.  This can happen if the config file
+                # was hand-edited with an invalid name.
+                proj_table.add_row(
+                    project.name,
+                    project.repo,
+                    "[red]invalid name[/red]",
+                )
+                continue
+            stack_status = "[dim]unknown[/dim]"
+            if cfg.orchestrator.host:
+                ssh_target = cfg.ssh_target()
+                result = subprocess.run(
+                    [
+                        "ssh",
+                        *_SSH_OPTS,
+                        ssh_target,
+                        f"cd /opt/orcest && docker compose"
+                        f" -p orcest-{project.name}"
+                        f" ps --format json 2>/dev/null",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    stack_status = "[green]running[/green]"
+                elif result.returncode == 0:
+                    stack_status = "[yellow]stopped[/yellow]"
+                else:
+                    stack_status = "[red]error[/red]"
 
-    for project in cfg.projects:
-        if not validate_project_name(project.name):
-            # Skip projects with invalid names rather than aborting the
-            # entire status display.  This can happen if the config file
-            # was hand-edited with an invalid name.
             proj_table.add_row(
                 project.name,
                 project.repo,
-                "[red]invalid name[/red]",
+                stack_status,
             )
-            continue
-        stack_status = "[dim]unknown[/dim]"
-        if cfg.orchestrator.host:
-            ssh_target = cfg.ssh_target()
-            result = subprocess.run(
-                [
-                    "ssh",
-                    *_SSH_OPTS,
-                    ssh_target,
-                    f"cd /opt/orcest && docker compose"
-                    f" -p orcest-{project.name}"
-                    f" ps --format json 2>/dev/null",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                stack_status = "[green]running[/green]"
-            elif result.returncode == 0:
-                stack_status = "[yellow]stopped[/yellow]"
-            else:
-                stack_status = "[red]error[/red]"
 
-        proj_table.add_row(
-            project.name,
-            project.repo,
-            stack_status,
-        )
-
-    console.print(proj_table)
+        console.print(proj_table)
 
     # Pool info
     pool_table = Table(title="Worker Pool")
@@ -1835,6 +1935,8 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
 
     console = Console()
     cfg = load_config(config)
+    expected_revision = _freeze_deployment_source(cfg, console)
+    _validate_deploy_source_revision(console, expected_revision=expected_revision)
 
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
         console.print("[red]Proxmox API credentials not configured.[/red]")
@@ -1890,6 +1992,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         storage=storage,
         snippet_storage=snippet_storage,
         console=console,
+        expected_revision=expected_revision,
     )
 
     # Save template_vm_id and prompt for worker VM ID range.
@@ -1898,6 +2001,7 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
     # pool-manager container refuses to start. Offer a valid default and never
     # persist a value that would not load back.
     cfg.pool.template_vm_id = vm_id
+    cfg.pool.template_revision = expected_revision
     template_rng = cfg.pool.template_range()
     default_start = template_rng[1] + 1 if template_rng is not None else vm_id + 1
     previous_start = cfg.pool.vm_id_start
@@ -1926,6 +2030,17 @@ def create_template(vm_id: int | None, image_url: str, storage: str | None, conf
         break
     save_config(cfg, config)
 
+    if cfg.orchestrator.host:
+        try:
+            from orcest.fleet.orchestrator import set_template_revision
+
+            set_template_revision(cfg.ssh_target(), vm_id, expected_revision)
+        except Exception as exc:
+            console.print(
+                "[yellow]Warning: template revision was saved locally, but Redis "
+                f"metadata could not be updated: {type(exc).__name__}.[/yellow]"
+            )
+
     console.print(f"\n[bold]Worker template created (VM {vm_id}).[/bold]")
     console.print(f"  Saved template_vm_id={vm_id}, vm_id_start={vm_id_start} to fleet config.")
 
@@ -1939,6 +2054,7 @@ def _create_template_at_vmid(
     storage: str,
     snippet_storage: str,
     console: Console,
+    expected_revision: str | None = None,
 ) -> None:
     """Bake a worker template at *vm_id*: download image, provision, convert.
 
@@ -2054,7 +2170,12 @@ def _create_template_at_vmid(
     # for orchestrator deploys. Pool clones do not fetch GitHub at boot; they
     # inherit this verified template install.
     console.print("  Installing current orcest source into template...", end=" ")
-    if not _install_source_on_worker_template(vm_ip, cfg.orchestrator.user, console):
+    if not _install_source_on_worker_template(
+        vm_ip,
+        cfg.orchestrator.user,
+        console,
+        expected_revision=expected_revision,
+    ):
         console.print("[red]Source install failed. Template creation aborted.[/red]")
         _cleanup_vm()
         sys.exit(1)
@@ -2352,8 +2473,9 @@ def _allocate_template_vmid(
     help="Fleet config path.",
     show_default=True,
 )
+@click.pass_context
 @_serialized_fleet_operation
-def rebake(image_url: str, storage: str | None, config: str) -> None:
+def rebake(ctx: click.Context, image_url: str, storage: str | None, config: str) -> None:
     """Bake a new worker template and atomically swap the active pointer.
 
     Allocates the next free VMID from ``pool.template_vmid_range``, builds
@@ -2373,6 +2495,12 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
 
     console = Console()
     cfg = load_config(config)
+
+    expected_revision = ctx.meta.get(_FROZEN_SOURCE_REVISION_META_KEY)
+    if not isinstance(expected_revision, str):
+        expected_revision = _freeze_deployment_source(cfg, console)
+        ctx.meta[_FROZEN_SOURCE_REVISION_META_KEY] = expected_revision
+    _validate_deploy_source_revision(console, expected_revision=expected_revision)
 
     if not cfg.proxmox.api_token_id or not cfg.proxmox.api_token_secret:
         console.print("[red]Proxmox API credentials not configured.[/red]")
@@ -2403,16 +2531,25 @@ def rebake(image_url: str, storage: str | None, config: str) -> None:
         storage=storage,
         snippet_storage=snippet_storage,
         console=console,
+        expected_revision=expected_revision,
     )
 
     # Atomic swap: pool manager picks up the new VMID on its next cycle.
     console.print("\n  Swapping active template pointer...", end=" ")
     try:
-        set_current_template_vmid(cfg.ssh_target(), new_vmid)
+        set_current_template_vmid(
+            cfg.ssh_target(),
+            new_vmid,
+            revision=expected_revision,
+        )
         console.print("[green]ok[/green]")
     except Exception as exc:
         console.print(f"[red]failed[/red]: {exc}")
-        redis_set_cmd = f"{_REDIS_CLI_PREFIX} SET orcest:pool:current_template_vmid {new_vmid}"
+        redis_set_cmd = (
+            f"{_REDIS_CLI_PREFIX} MSET "
+            f"orcest:pool:template_revision:{new_vmid} {expected_revision} "
+            f"orcest:pool:current_template_vmid {new_vmid}"
+        )
         console.print(
             "  [yellow]New template VM "
             f"{new_vmid}[/yellow] was built successfully but the pointer swap failed.\n"
@@ -3269,11 +3406,18 @@ def deploy(
     """
     console = Console()
 
+    from orcest.fleet.config import load_config
+
+    cfg = load_config(config)
+    frozen_revision = _freeze_deployment_source(cfg, console)
+    ctx.meta[_FROZEN_SOURCE_REVISION_META_KEY] = frozen_revision
+
     _preflight_deploy_config(
         config,
         console,
         rebuild_template=rebuild_template,
         drain_active=drain_active,
+        expected_revision=frozen_revision,
     )
     _preflight_backend_transition(
         config,
@@ -3288,10 +3432,8 @@ def deploy(
         ctx.meta[_COORDINATED_BACKEND_CHANGE_META_KEY] = True
     ctx.meta[_DEFER_PROJECT_START_META_KEY] = True
     try:
-        from orcest.fleet.config import load_config
         from orcest.fleet.orchestrator import restart_stack, stop_stack
 
-        cfg = load_config(config)
         ssh_target = cfg.ssh_target()
 
         # Step 1: Fence publishers before creating a workerless interval.
@@ -3344,13 +3486,11 @@ def deploy(
         step += 1
         console.print(f"\n[bold]Step {step}/{total}: Starting fleet[/bold]\n")
         ctx.invoke(start, config=config)
-        from orcest.fleet.orchestrator import _resolve_deploy_revision
-
         try:
             _wait_for_candidate_workers(
                 cfg,
                 console,
-                expected_revision=_resolve_deploy_revision() if rebuild_template else None,
+                expected_revision=frozen_revision if rebuild_template else None,
             )
         except (Exception, SystemExit):
             # Attestation failed after Step 1 stopped every project publisher.
@@ -3405,8 +3545,28 @@ def deploy(
     finally:
         ctx.meta.pop(_COORDINATED_BACKEND_CHANGE_META_KEY, None)
         ctx.meta.pop(_DEFER_PROJECT_START_META_KEY, None)
+        ctx.meta.pop(_FROZEN_SOURCE_REVISION_META_KEY, None)
 
-    console.print("\n[bold green]Deploy complete.[/bold green]")
+    from orcest.fleet.source_health import DesiredRevision, collect_source_health
+
+    source_configured = bool(cfg.source.repository or cfg.source.ref or cfg.source.sha)
+    frozen_desired = DesiredRevision(
+        configured=source_configured,
+        repository=cfg.source.repository or None,
+        ref=cfg.source.ref or None,
+        revision=frozen_revision if source_configured else None,
+        status="resolved" if source_configured else "desired revision unconfigured",
+    )
+    source_report = collect_source_health(cfg, desired=frozen_desired)
+    console.print()
+    _print_source_revision_health(console, cfg, report=source_report)
+    if source_report.healthy:
+        console.print("\n[bold green]Deploy complete; whole-fleet source is current.[/bold green]")
+    else:
+        console.print(
+            "\n[bold yellow]Deploy complete with partial/degraded source "
+            "revision health.[/bold yellow]"
+        )
 
 
 def _wait_for_candidate_workers(
@@ -3562,14 +3722,47 @@ def _validate_provider_stream_routing(cfg: FleetConfig, console: Console) -> Non
     raise SystemExit(1)
 
 
-def _validate_deploy_source_revision(console: Console) -> None:
-    """Reject unattested source before any remote update mutation."""
+def _freeze_deployment_source(cfg: FleetConfig, console: Console) -> str:
+    """Resolve configured deployment intent exactly once before mutation."""
+    from orcest.fleet.orchestrator import _resolve_deploy_revision
+    from orcest.fleet.source_health import resolve_desired_revision
+
+    desired = resolve_desired_revision(cfg.source)
+    if desired.resolved:
+        assert desired.revision is not None
+        return desired.revision
+    if not desired.configured:
+        # Compatibility for configurations created before explicit source
+        # intent existed.  Their health is deliberately non-green, while
+        # existing update/rebake workflows retain the old clean-checkout gate.
+        legacy_revision = _resolve_deploy_revision()
+        return legacy_revision
+    console.print(
+        f"[red]Could not freeze desired source revision before deployment:[/red] {desired.status}."
+    )
+    raise SystemExit(1)
+
+
+def _validate_deploy_source_revision(
+    console: Console,
+    *,
+    expected_revision: str | None = None,
+) -> None:
+    """Reject dirty, unknown, or clean-but-stale source before mutation."""
     from orcest.fleet.orchestrator import _resolve_deploy_revision
     from orcest.revision import revision_is_attested
 
     deploy_revision = _resolve_deploy_revision()
-    if revision_is_attested(deploy_revision):
+    if revision_is_attested(deploy_revision) and (
+        expected_revision is None or deploy_revision == expected_revision
+    ):
         return
+    if revision_is_attested(deploy_revision) and expected_revision is not None:
+        console.print(
+            "[red]Deployment source checkout is clean but stale:[/red] "
+            f"desired {expected_revision}, local {deploy_revision}."
+        )
+        raise SystemExit(1)
     console.print(
         "[red]Deployment source revision is "
         f"{deploy_revision!r}; commit every source file before updating.[/red]"
@@ -3647,6 +3840,7 @@ def _preflight_deploy_config(
     *,
     rebuild_template: bool,
     drain_active: bool,
+    expected_revision: str | None = None,
 ) -> None:
     """Validate every static deploy prerequisite before stopping the fleet."""
     from orcest.fleet.config import load_config
@@ -3679,6 +3873,11 @@ def _preflight_deploy_config(
         problems.append(
             f"deployment source revision is {deploy_revision!r}; commit every source file "
             "before deploying"
+        )
+    elif expected_revision is not None and deploy_revision != expected_revision:
+        problems.append(
+            "deployment source checkout is clean but stale: "
+            f"desired {expected_revision}, local {deploy_revision}"
         )
 
     try:
