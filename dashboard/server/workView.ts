@@ -268,7 +268,8 @@ export function projectWork(
     observedAt: observed,
     startedAt: started,
     completedAt: numeric(f.completed_at),
-    stale: !observed || now - observed > 180,
+    // A verified merge is durable delivery evidence, not a live source poll.
+    stale: outcome !== "merged" && (!observed || now - observed > 180),
     outcome,
     needsHuman,
     blockers,
@@ -358,7 +359,8 @@ export async function fetchWorkView(
       item.headSha = child.headSha || item.headSha;
       item.outcome = child.outcome;
       item.completedAt = child.completedAt;
-      item.stale = item.stale || child.stale;
+      item.stale =
+        child.outcome === "merged" ? false : item.stale || child.stale;
       item.needsHuman =
         child.outcome === "merged"
           ? false
@@ -461,7 +463,7 @@ export async function fetchWorkView(
       "Work observations are not available yet. Update the orchestrator to enable the fleet feed.",
     );
   if (
-    items.some((w) => w.stale) ||
+    visible.some((w) => w.stale) ||
     projects.some(
       (p) => !numeric(p.observed_at) || now - Number(p.observed_at) > 180,
     )

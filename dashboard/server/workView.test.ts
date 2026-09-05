@@ -206,6 +206,77 @@ describe("work lifecycle projection", () => {
       ),
     ).toMatchObject({ stage: "unknown" });
   });
+  it("does not age verified merge evidence into stale live work", () => {
+    expect(
+      projectWork(
+        fields({ outcome: "merged", completed_at: "1000" }),
+        null,
+        message,
+        2000,
+      ),
+    ).toMatchObject({
+      stage: "done",
+      stale: false,
+      observedAt: 1000,
+      completedAt: 1000,
+    });
+    expect(
+      projectWork(
+        fields({ started_at: "900", action: "skip_pending" }),
+        null,
+        message,
+        2000,
+      ),
+    ).toMatchObject({ stage: "in_progress", stale: true });
+  });
+  it("keeps coverage complete for an old verified handoff while still detecting stale active work and project polls", async () => {
+    store.clear();
+    const now = String(Date.now() / 1000);
+    const project = { repo: "org/repo", observed_at: now, accounts: "[]" };
+    store.set("project-a:dashboard:project", project);
+    store.set(
+      "project-a:dashboard:work:issue:org/repo:12",
+      fields({ related_pr: "15" }),
+    );
+    store.set(
+      "project-a:dashboard:work:pr:org/repo:15",
+      fields({
+        kind: "pr",
+        number: "15",
+        outcome: "merged",
+        completed_at: "1000",
+      }),
+    );
+    const delivered = await fetchWorkView(message);
+    expect(delivered.items).toHaveLength(1);
+    expect(delivered.items[0]).toMatchObject({
+      number: 12,
+      stage: "done",
+      stale: false,
+    });
+    expect(delivered.coverage).toBe("complete");
+    expect(delivered.notices).toEqual([]);
+
+    store.set(
+      "project-a:dashboard:work:issue:org/repo:16",
+      fields({ number: "16" }),
+    );
+    const staleWork = await fetchWorkView(message);
+    expect(staleWork.coverage).toBe("partial");
+    expect(staleWork.items.find((w) => w.number === 16)?.stale).toBe(true);
+
+    // Closed, undelivered resources are excluded from the active board.
+    store.set(
+      "project-a:dashboard:work:issue:org/repo:16",
+      fields({ number: "16", outcome: "closed" }),
+    );
+    expect((await fetchWorkView(message)).coverage).toBe("complete");
+    store.set("project-a:dashboard:project", {
+      ...project,
+      observed_at: "1000",
+    });
+    expect((await fetchWorkView(message)).coverage).toBe("partial");
+  });
   it("uses only explicit verified publication links to consolidate issue and merged PR", async () => {
     store.clear();
     const now = String(Date.now() / 1000);
