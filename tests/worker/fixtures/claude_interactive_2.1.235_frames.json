@@ -7,12 +7,16 @@
   },
   "captured_inert_footer_rows": [
     "horizontal separator",
+    "? for shortcuts / context status",
+    "box border",
     "bypass permissions on (shift+tab to cycle) / agents / effort status",
     "paste again to expand"
   ],
   "frames": {
     "explicitly_stuck": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]",
     "explicitly_stuck_with_footer": "\u001b[2K\r\u276f\u00a0[Pasted text #1 +42 lines]\r\r\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\r\n\u001b[3G\u23f5\u23f5\u001b[6Gbypass\u001b[13Gpermissions\u001b[25Gon\u001b[28G(shift+tab\u001b[39Gto\u001b[42Gcycle)\u001b[49G\u00b7\u001b[51G\u2190\u001b[53Gfor\u001b[57Gagents\u001b[103G\u25cf\u001b[105Ghigh\u001b[110G\u00b7\u001b[112G/effort",
+    "explicitly_stuck_with_shortcuts_context_footer": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\r\r\n\u2502 ? for shortcuts \u00b7 87% until auto-compact",
+    "explicitly_stuck_with_box_border_footer": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\r\r\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
     "explicitly_stuck_with_multiline_paste_hint": "\u001b[2K\r\u276f\u00a0[Pasted text #1 +14 lines]\r\u001b[2C\u001b[2B\u001b[27mpaste \u001b[10Ggain to expa\u001b[23Gd\u001b[25G\u001b[K\r\r\n\u001b[28C\u001b[3A",
     "stuck_then_cleared": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\u001b[2K\r\u2502 \u276f ",
     "stuck_then_cleared_with_footer": "\u001b[2K\r\u276f\u00a0[Pasted text #1 +42 lines]\r\r\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\r\n\u001b[3G\u23f5\u23f5\u001b[6Gbypass\u001b[13Gpermissions\u001b[25Gon\u001b[28G(shift+tab\u001b[39Gto\u001b[42Gcycle)\u001b[49G\u00b7\u001b[51G\u2190\u001b[53Gfor\u001b[57Gagents\u001b[103G\u25cf\u001b[105Ghigh\u001b[110G\u00b7\u001b[112G/effort\u001b[2K\r\u276f\u00a0 \r\r\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\r\n\u001b[3G\u23f5\u23f5\u001b[6Gbypass\u001b[13Gpermissions\u001b[25Gon\u001b[28G(shift+tab\u001b[39Gto\u001b[42Gcycle)\u001b[49G\u00b7\u001b[51G\u2190\u001b[53Gfor\u001b[57Gagents\u001b[103G\u25cf\u001b[105Ghigh\u001b[110G\u00b7\u001b[112G/effort",

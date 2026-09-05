@@ -53,7 +53,7 @@ _PASTED_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
 # representation of only the captured inert rows. Unknown trailing rows
 # (especially dialog instructions) remain ambiguous and never authorize Enter.
 _COMPOSER_FOOTER_COMPACT_RES = (
-    re.compile(r"^[─━]+$"),
+    re.compile(r"^[\u2500-\u257f]+$"),
     re.compile(r"^\?forshortcuts(?:[·|]?\d{1,3}%(?:untilauto-compact|contextused))?$"),
     re.compile(r"^\d{1,3}%(?:untilauto-compact|contextused)$"),
     # Multiline bracketed paste help. The second spelling is the exact raw-PTY

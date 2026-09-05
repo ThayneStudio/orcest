@@ -1013,6 +1013,8 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
     }
     assert capture["captured_inert_footer_rows"] == [
         "horizontal separator",
+        "? for shortcuts / context status",
+        "box border",
         "bypass permissions on (shift+tab to cycle) / agents / effort status",
         "paste again to expand",
     ]
@@ -1022,6 +1024,14 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
     )
     assert (
         runner._classify_post_submit_state(frames["explicitly_stuck_with_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_shortcuts_context_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_box_border_footer"])
         is _PostSubmitState.EXPLICITLY_STUCK
     )
     assert (
