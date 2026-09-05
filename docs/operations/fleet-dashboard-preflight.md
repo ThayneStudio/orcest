@@ -139,3 +139,22 @@ typechecking and production build, 324 affected Python tests (one skipped), lint
 and observation-writer typechecking. The isolated Redis end-to-end check passed
 sign-in, dependency/queue/execution state, live output, CI waiting, verified merge,
 and sign-out. The revised release still requires its own CI and staging evidence.
+
+Revision `bb17e085a9168e345eab2dc813703f8a50d1117d` was subsequently packaged and
+passed all four project configuration comparisons and the pool configuration
+check using the actual installed image. Its separate dashboard on loopback port
+8082 passed exact-revision readiness, sign-in, authenticated read-only fleet data,
+and sign-out revocation (four workers, one pool; work observations still unavailable
+from old production writers). Its source archive SHA-256 is
+`e9c463216371de3a6d78615388b98d7d0df9e479db219314dfcf5d93b3a7952b`.
+
+Further review added explicit `DASHBOARD_TRUSTED_PROXIES` support for client
+rate-limit isolation behind verified proxy hops, and redaction of refreshed
+runner credentials in worker escalation text. Refreshed credentials belong to
+the runner result, not the Task; they are passed explicitly to the redactor.
+The Task redactor now shares the model's canonical secret-field list. Validation
+passed 795 dashboard tests, typechecking, build, isolated Redis E2E, 170 affected
+Python tests (one skipped), and an additional worker-path redaction regression.
+These changes supersede `bb17e08` as the rollout source. Neither staged dashboard
+has replaced the production dashboard. Actual ingress proxy trust must be
+configured from the deployed connection path; do not broadly trust Docker clients.

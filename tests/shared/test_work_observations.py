@@ -88,10 +88,12 @@ def test_worker_blocker_survives_poll_until_acknowledged_or_restarted(fake_redis
     r = fake_redis_client
     key = view.work_key("org/repo", "issue", 12)
     view.observe(r, "org/repo", "issue", issue())
-    view.human_reason(r, task(), "Access denied SECRET")
+    view.human_reason(
+        r, task(), "Access denied SECRET ROTATED", credential_update="ROTATED"
+    )
     view.observe(r, "org/repo", "issue", issue())
     assert r.hgetall(key)["worker_needs_human"] == "1"
-    assert r.hgetall(key)["human_reason"] == "Access denied [REDACTED]"
+    assert r.hgetall(key)["human_reason"] == "Access denied [REDACTED] [REDACTED]"
     view.observe(r, "org/repo", "issue", issue(action="skip_labeled"))
     assert r.hgetall(key)["needs_human"] == "1"
     assert r.hgetall(key)["worker_needs_human"] == "0"

@@ -2620,7 +2620,12 @@ def _execute_task(
         duration = int(time.monotonic() - start)
 
         if runner_result.needs_human:
-            work_view.human_reason(event_redis, task, runner_result.needs_human_reason)
+            work_view.human_reason(
+                event_redis,
+                task,
+                runner_result.needs_human_reason,
+                credential_update=runner_result.credential_update or "",
+            )
             # A worker-reported human-decision blocker is never a success: the
             # PR was not resolved. Force FAILED (even if the CLI exited 0) so
             # the orchestrator surfaces the signal instead of silently

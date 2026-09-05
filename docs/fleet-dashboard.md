@@ -29,6 +29,14 @@ Legacy links have their token removed from browser history immediately. Work
 requests wait for cookie bootstrap and retain in-memory token authentication
 when that bootstrap fails.
 
+Behind a reverse proxy, set `DASHBOARD_TRUSTED_PROXIES` to the comma-separated
+addresses or CIDRs of the actual proxy hops. Express then derives the rate-limit
+client from the first untrusted hop in `X-Forwarded-For`. The proxy must append
+the connecting client's address or overwrite untrusted forwarded headers. Do not
+trust all addresses or a network containing direct clients. With no trusted
+proxies configured, forwarded client addresses are ignored and clients sharing a
+proxy share its sign-in limit. Verify the real ingress path before deployment.
+
 `/api/health`, `/api/ready`, and sign-in assets remain public. Fleet data, detail,
 output, the application, and diagnostic APIs require authentication. With no
 configured token, data access fails closed. Keep `DASHBOARD_ALLOWED_ORIGINS` and

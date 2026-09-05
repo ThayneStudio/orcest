@@ -78,6 +78,15 @@ function sameOrigin(req: IncomingMessage): boolean {
   }
 }
 export function installSignIn(app: Express): void {
+  // Express walks X-Forwarded-For from the socket toward the client and stops
+  // at the first untrusted hop. Never trust an arbitrary client-supplied header.
+  app.set(
+    "trust proxy",
+    (process.env.DASHBOARD_TRUSTED_PROXIES || "")
+      .split(",")
+      .map((address) => address.trim())
+      .filter(Boolean),
+  );
   app.get("/sign-in", (_req, res) =>
     res
       .type("html")
@@ -105,7 +114,7 @@ export function installSignIn(app: Express): void {
     const now = Date.now();
     for (const [key, entry] of failures)
       if (entry.expires <= now) failures.delete(key);
-    const ip = req.socket.remoteAddress || "unknown";
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
     const entry = failures.get(ip) || { count: 0, expires: now + 60000 };
     if (entry.count >= 10 || (!failures.has(ip) && failures.size >= 1000)) {
       res

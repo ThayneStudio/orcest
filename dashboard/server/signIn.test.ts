@@ -94,4 +94,35 @@ it("signs in without leaking the token, protects HTTP and sockets, and revokes b
   const limited = await login("another-token");
   expect(limited.status).toBe(429);
   expect(limited.headers.get("retry-after")).toBe("60");
+  expect(
+    (await login("another-token", { "X-Forwarded-For": "198.51.100.99" }))
+      .status,
+  ).toBe(429);
+});
+it("isolates client limits behind an explicitly trusted proxy and ignores spoofed earlier hops", async () => {
+  vi.stubEnv("DASHBOARD_TOKEN", "proxy-test-token");
+  vi.stubEnv("DASHBOARD_TRUSTED_PROXIES", "127.0.0.1");
+  instance = createDashboardServer({
+    port: 0,
+    deps: { redisQuit: async () => {}, logInfo: () => {}, logError: () => {} },
+  });
+  instance.server.listen(0, "127.0.0.1");
+  await once(instance.server, "listening");
+  const base = `http://127.0.0.1:${(instance.server.address() as AddressInfo).port}`;
+  const login = (token: string, forwarded: string) =>
+    fetch(base + "/api/auth/login", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Forwarded-For": forwarded,
+      },
+      body: JSON.stringify({ token }),
+    });
+  for (let i = 0; i < 10; i++)
+    expect((await login("wrong", "198.51.100.1")).status).toBe(401);
+  expect((await login("proxy-test-token", "198.51.100.1")).status).toBe(429);
+  expect((await login("proxy-test-token", "198.51.100.2")).status).toBe(200);
+  expect(
+    (await login("proxy-test-token", "198.51.100.2, 198.51.100.1")).status,
+  ).toBe(429);
 });

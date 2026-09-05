@@ -14,6 +14,7 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any, cast
 
+from orcest.shared.models import REDACTED_FIELDS
 from orcest.shared.redis_client import RedisClient
 
 log = logging.getLogger(__name__)
@@ -152,9 +153,12 @@ def attempt_finished(redis: RedisClient, task: Any, status: str) -> None:
 
 
 @best_effort
-def human_reason(redis: RedisClient, task: Any, reason: str) -> None:
-    for field in ("token", "credential", "claude_token"):
-        secret = getattr(task, field, "")
+def human_reason(
+    redis: RedisClient, task: Any, reason: str, *, credential_update: str = ""
+) -> None:
+    secrets = [getattr(task, field, "") for field in REDACTED_FIELDS]
+    secrets.append(credential_update)
+    for secret in secrets:
         if isinstance(secret, str) and secret:
             reason = reason.replace(secret, "[REDACTED]")
     redis.hset_mapping(
