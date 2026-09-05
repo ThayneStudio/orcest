@@ -116,6 +116,21 @@ class OrchestratorConfig:
 
 
 @dataclass
+class SourceConfig:
+    """Operator-declared Orcest source intent.
+
+    A moving Git ref is declared with both ``repository`` and ``ref``.  An
+    immutable deployment can instead set ``sha`` to a full commit identifier.
+    Empty fields preserve compatibility with fleets created before source
+    intent was recorded; source health reports those fleets as unconfigured.
+    """
+
+    repository: str = ""
+    ref: str = ""
+    sha: str = ""
+
+
+@dataclass
 class OrgEntry:
     """An organisation registered with the fleet."""
 
@@ -262,6 +277,11 @@ class PoolConfig:
     # against. Defaults to Ubuntu's UEC Image Automatic Signing Key
     # (cdimage@ubuntu.com) -- the same key provision/create-vm.sh pins.
     expected_image_gpg_key: str = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+    # Source revision baked into the legacy ``template_vm_id``. Blue/green
+    # templates store revision metadata in Redis by VMID; this field preserves
+    # provenance when create-template runs before an orchestrator/Redis exists.
+    # Appended to preserve existing positional PoolConfig constructor calls.
+    template_revision: str = ""
 
     def __post_init__(self) -> None:
         (
@@ -452,6 +472,8 @@ class FleetConfig:
     # across `fleet update` instead of relying on fragile hand edits.
     monitor_ingest_url: str | None = None
     monitor_write_token: str = ""
+    # Appended to preserve existing positional FleetConfig constructor calls.
+    source: SourceConfig = field(default_factory=SourceConfig)
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -557,6 +579,19 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
         disk_size=_parse_disk_size(orch.get("disk_size", 20)),
     )
 
+    source_raw = data.get("source") or {}
+    if not isinstance(source_raw, dict):
+        raise ValueError("source must be a mapping")
+    source_values: dict[str, str] = {}
+    for field_name in ("repository", "ref", "sha"):
+        value = source_raw.get(field_name, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError(f"source.{field_name} must be a string")
+        source_values[field_name] = value.strip()
+    source = SourceConfig(**source_values)
+
     orgs: dict[str, OrgEntry] = {}
     for name, entry in (data.get("orgs") or {}).items():
         # Support both list (claude_oauth_tokens) and single string (claude_oauth_token)
@@ -649,6 +684,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     pool = PoolConfig(
         size=pl.get("size", 4),
         template_vm_id=pl.get("template_vm_id", 0),
+        template_revision=str(pl.get("template_revision", "") or ""),
         template_vmid_range=template_range_list,
         vm_id_start=pl.get("vm_id_start", 0),
         vm_id_end=pl.get("vm_id_end", 0),
@@ -707,6 +743,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> FleetConfig:
     return FleetConfig(
         proxmox=proxmox,
         orchestrator=orchestrator,
+        source=source,
         orgs=orgs,
         projects=projects,
         pool=pool,
@@ -740,6 +777,11 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
             "cores": config.orchestrator.cores,
             "disk_size": config.orchestrator.disk_size,
         },
+        "source": {
+            "repository": config.source.repository,
+            "ref": config.source.ref,
+            "sha": config.source.sha,
+        },
         "orgs": {
             name: {
                 "github_token": org.github_token,
@@ -758,6 +800,7 @@ def save_config(config: FleetConfig, path: str | Path = DEFAULT_CONFIG_PATH) -> 
         "pool": {
             "size": config.pool.size,
             "template_vm_id": config.pool.template_vm_id,
+            "template_revision": config.pool.template_revision,
             "template_vmid_range": list(config.pool.template_vmid_range),
             "vm_id_start": config.pool.vm_id_start,
             "vm_id_end": config.pool.vm_id_end,

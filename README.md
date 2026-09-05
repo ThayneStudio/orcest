@@ -472,6 +472,23 @@ Proxmox host at `/etc/orcest/config.yaml` (see
 `src/orcest/fleet/config.py`). `orcest fleet` subcommands are invoked
 from the Proxmox host and reach the orchestrator over SSH.
 
+Declare which Orcest source revision the fleet is expected to run. Moving
+policy uses a non-secret repository and a fully-qualified Git ref:
+
+```yaml
+source:
+  repository: https://github.com/ThayneStudio/orcest.git
+  ref: refs/heads/master
+  sha: ""
+```
+
+For an immutable deployment, leave `repository` and `ref` empty and set `sha`
+to one full 40- or 64-hex commit identifier instead. Do not set both `ref` and
+`sha`, and do not put credentials in `repository`. A legacy config with no
+`source` block still loads, but `fleet status` and `fleet source-health` report
+`desired revision unconfigured`; whole-fleet source health is intentionally
+non-green until policy is explicit.
+
 ## Credential planes
 
 Claude Code OAuth tokens (`CLAUDE_CODE_OAUTH_TOKEN`) are the supported
@@ -521,6 +538,7 @@ All subcommands live under `orcest fleet` (`src/orcest/fleet/cli.py`):
 | `deploy [--rebuild-template] [--drain-active]`                   | Coordinated fleet deploy: `stop` → `update` → optional pointer-safe `rebake` → `start`; it does not update the host CLI. |
 | `pool-status`                                                    | Show pool config, the active template VMID (Redis pointer), and idle/active VM counts.                     |
 | `status`                                                         | Show orchestrator host reachability, orgs, per-project stack status, and pool summary.                     |
+| `source-health [--json]`                                         | Read-only desired/deployed revision comparison for orchestrators, pool manager, active template, and live workers; exits nonzero unless every runtime is current. |
 | `rebake [--image-url …]`                                         | Bake a fresh template at the next free VMID from `pool.template_vmid_range` and atomically swap the Redis pointer. |
 | `destroy-template <vm-id>`                                       | Destroy a non-active template VM. Refuses if it is the active pointer target or has live clones.           |
 | `gc-templates [--dry-run] [--yes]`                               | Destroy orcest worker templates in the template VMID range that are no longer active and have no live clones. Only VMs that are actually templates named `orcest-worker-*` are eligible; anything else sharing the range is listed and skipped. Prompts before destroying unless `--yes`. |
@@ -572,6 +590,12 @@ Notes:
   is a no-lost-work maintenance cutover, not a zero-worker-downtime rollout. It
   does **not** install a new host CLI; update layer 1 separately before invoking
   it when `src/orcest/fleet/*` changed.
+- A deploy resolves the declared moving ref once, before any remote mutation,
+  rejects a dirty or clean-but-stale local checkout, and packages tracked bytes
+  from that frozen Git object. An orchestrator-only or rolling deploy may
+  complete while retained templates or workers are old; the final source
+  report calls that state partial/degraded rather than healthy. Use
+  `orcest fleet source-health --json` as the nonzero automation gate.
 - During `deploy --rebuild-template`, the pool manager stays stopped
   until the new template pointer has been swapped, so fresh clones use
   the rebaked template.
