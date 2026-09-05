@@ -8,6 +8,7 @@
   "frames": {
     "explicitly_stuck": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]",
     "stuck_then_cleared": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\u001b[2K\r\u2502 \u276f ",
+    "stuck_then_unrecognized": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\nWorking\u2026",
     "executing": "\u001b[38;5;153m\u2736 Metamorphosing\u2026 (esc to interrupt)\u001b[39m",
     "unknown_menu": "A future prompt changed in a new CLI release\n\u276f 1. Accept the default\n  2. Cancel\nEnter to confirm / Esc to cancel",
     "unrecognized": "Working\u2026"

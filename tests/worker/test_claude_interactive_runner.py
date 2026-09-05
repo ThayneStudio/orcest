@@ -1019,6 +1019,10 @@ def test_pinned_claude_frames_document_post_submit_states() -> None:
         runner._classify_post_submit_state(frames["stuck_then_cleared"])
         is _PostSubmitState.EXECUTING
     )
+    assert (
+        runner._classify_post_submit_state(frames["stuck_then_unrecognized"])
+        is _PostSubmitState.AMBIGUOUS
+    )
     assert runner._classify_post_submit_state(frames["executing"]) is _PostSubmitState.EXECUTING
     assert runner._classify_post_submit_state(frames["unknown_menu"]) is _PostSubmitState.AMBIGUOUS
     assert runner._classify_post_submit_state(frames["unrecognized"]) is _PostSubmitState.AMBIGUOUS
@@ -1392,6 +1396,92 @@ time.sleep(10)
 
     assert result.success is True
     assert result.summary == "latest composer frame was clear"
+    assert len(submit_calls) == 1
+
+
+def test_run_stuck_frame_followed_by_unrecognized_output_sends_no_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """Newer unrecognized output makes an old stuck composer ambiguous."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("Working…", flush=True)
+
+unexpected = b""
+deadline = time.time() + 1.2
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_UNRECOGNIZED_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(3)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("newer output made the old placeholder ambiguous\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "newer output made the old placeholder ambiguous"
     assert len(submit_calls) == 1
 
 

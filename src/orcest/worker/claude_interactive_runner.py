@@ -378,11 +378,11 @@ class ClaudeInteractiveRunner:
         if _MENU_OPTION_RE.match(latest_caret):
             return _PostSubmitState.AMBIGUOUS
 
-        # Some dialogs render the selected row before their footer. If a future
-        # menu does not number that row, the footer must still prevent us from
-        # treating its caret as the main composer and sending an unsafe Enter.
-        trailing_normalized = re.sub(r"\s+", "", "".join(lines[latest_index + 1 :])).lower()
-        if "entertoconfirm" in trailing_normalized:
+        # The caret is explicit current evidence only when no newer meaningful
+        # output follows it. This also covers dialogs that render their selected
+        # row before a footer: unrecognized trailing output must make the state
+        # ambiguous instead of letting a historical placeholder authorize Enter.
+        if any(line.strip(" \t│┃║|") for line in lines[latest_index + 1 :]):
             return _PostSubmitState.AMBIGUOUS
 
         if _PASTED_PLACEHOLDER_RE.search(latest_caret):
