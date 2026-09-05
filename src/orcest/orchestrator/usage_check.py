@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -45,7 +46,11 @@ def get_token_usage_state(token: str) -> dict[str, dict[str, object]] | None:
         return None
 
 
-def get_token_reset_time(token: str) -> datetime | None:
+def get_token_reset_time(
+    token: str,
+    *,
+    observe: Callable[[dict[str, object]], None] | None = None,
+) -> datetime | None:
     """Query the Anthropic OAuth usage endpoint for a token's reset time.
 
     Returns the ``resets_at`` timestamp from whichever usage window
@@ -59,6 +64,18 @@ def get_token_reset_time(token: str) -> datetime | None:
     data = _query_usage_endpoint(token)
     if data is None:
         return None
+
+    if observe is not None:
+        try:
+            observe(
+                {
+                    key: _extract_usage_window(value)
+                    for key, value in data.items()
+                    if key in {"five_hour", "seven_day"}
+                }
+            )
+        except Exception:
+            logger.warning("Unable to retain dashboard quota observation")
 
     try:
         # Find the window(s) that are near their limit

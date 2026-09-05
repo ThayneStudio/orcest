@@ -10,6 +10,8 @@ import {
   healthCheck,
   quitRedis,
 } from "./redis.js";
+import { fetchWorkView, installWorkRoutes } from "./workView.js";
+import { installSignIn, bindSessionSocket } from "./signIn.js";
 import { authCookieHeader, isAuthorized } from "./auth.js";
 import { buildDashboardMessage } from "./message.js";
 import {
@@ -363,6 +365,8 @@ export function createDashboardServer(
     }
   });
 
+  installSignIn(app);
+
   // --- Auth middleware for API routes ---
 
   app.use("/api", (req, res, next) => {
@@ -408,6 +412,9 @@ export function createDashboardServer(
     }
   });
 
+  const workView = createCoalescedFetch(async () => fetchWorkView(await restSnapshot()), 2000);
+  installWorkRoutes(app, workView);
+
   // --- Static files (Vite build output) ---
   // Auth check applies to static assets and the SPA fallback as well.
 
@@ -415,6 +422,7 @@ export function createDashboardServer(
     const cookie = authCookieHeader(req);
     if (cookie) res.setHeader("Set-Cookie", cookie);
     if (!isAuthorized(req)) {
+      if (req.accepts(["html", "json"]) === "html" && String(req.headers.accept || "").includes("text/html")) { res.redirect(303, "/sign-in"); return; }
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -477,10 +485,12 @@ export function createDashboardServer(
 
     if (decision.target === "snapshot") {
       snapshotWss.handleUpgrade(req, socket, head, (ws) => {
+        bindSessionSocket(req, ws);
         snapshotWss.emit("connection", ws, req);
       });
     } else if (decision.target === "task-output") {
       taskOutputWss.handleUpgrade(req, socket, head, (ws) => {
+        bindSessionSocket(req, ws);
         taskOutputWss.emit("connection", ws, req);
       });
     } else {

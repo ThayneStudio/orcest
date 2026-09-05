@@ -5,14 +5,17 @@ import { Window } from "happy-dom";
 
 const distDir = path.resolve(process.env.DASHBOARD_DIST_DIR || "dist");
 const indexPath = path.join(distDir, "index.html");
-const timeoutMs = Number.parseInt(process.env.DASHBOARD_BUNDLE_RUNTIME_TIMEOUT_MS || "2000", 10);
-const expectedTexts = (process.env.DASHBOARD_BUNDLE_RUNTIME_EXPECTED_TEXT || [
-  "Orcest Dashboard",
-  "Overview",
-  "Kanban",
-  "Dead Letters",
-  "Recent Worker Output",
-].join("\n")).split(/\n+/).map((text) => text.trim()).filter(Boolean);
+const timeoutMs = Number.parseInt(
+  process.env.DASHBOARD_BUNDLE_RUNTIME_TIMEOUT_MS || "2000",
+  10,
+);
+const expectedTexts = (
+  process.env.DASHBOARD_BUNDLE_RUNTIME_EXPECTED_TEXT ||
+  ["Orcest fleet", "Upcoming", "In progress", "Done", "Sign out"].join("\n")
+)
+  .split(/\n+/)
+  .map((text) => text.trim())
+  .filter(Boolean);
 
 if (!existsSync(indexPath)) {
   throw new Error(`dashboard bundle runtime check could not find ${indexPath}`);
@@ -21,11 +24,15 @@ if (!existsSync(indexPath)) {
 const html = readFileSync(indexPath, "utf8");
 const jsPath = [...html.matchAll(/<script\b[^>]*src="([^"]+\.js)"/gi)][0]?.[1];
 if (!jsPath) {
-  throw new Error("dashboard bundle runtime check could not find a JS asset in dist/index.html");
+  throw new Error(
+    "dashboard bundle runtime check could not find a JS asset in dist/index.html",
+  );
 }
 
 const window = new Window({
-  url: process.env.DASHBOARD_BUNDLE_RUNTIME_URL || "http://127.0.0.1:8080/?token=bundle-runtime-smoke",
+  url:
+    process.env.DASHBOARD_BUNDLE_RUNTIME_URL ||
+    "http://127.0.0.1:8080/?token=bundle-runtime-smoke",
 });
 window.document.write(html);
 window.document.close();
@@ -101,7 +108,32 @@ Object.assign(globalThis, {
   requestAnimationFrame: window.requestAnimationFrame.bind(window),
   cancelAnimationFrame: window.cancelAnimationFrame.bind(window),
   WebSocket: SmokeWebSocket,
-  fetch: async () => ({ ok: true }),
+  fetch: async () => ({
+    ok: true,
+    json: async () => ({
+      version: 1,
+      pools: [],
+      fetchedAt: Date.now() / 1000,
+      items: [],
+      total: 0,
+      nextOffset: null,
+      projects: [],
+      accounts: [],
+      workers: [],
+      coverage: "complete",
+      notices: [],
+      counts: {
+        running: 0,
+        queued: 0,
+        waiting: 0,
+        needsHuman: 0,
+        upcoming: 0,
+        in_progress: 0,
+        done: 0,
+        unknown: 0,
+      },
+    }),
+  }),
 });
 window.WebSocket = SmokeWebSocket;
 window.fetch = globalThis.fetch;
@@ -119,20 +151,26 @@ await import(pathToFileURL(path.join(distDir, jsPath.replace(/^\//, ""))).href);
 const startedAt = Date.now();
 while (Date.now() - startedAt < timeoutMs) {
   if (errors.length > 0) {
-    throw new Error(`dashboard bundle runtime error: ${errors.map(String).join("\n")}`);
+    throw new Error(
+      `dashboard bundle runtime error: ${errors.map(String).join("\n")}`,
+    );
   }
 
   const bodyText = window.document.body.textContent || "";
   const missingText = expectedTexts.filter((text) => !bodyText.includes(text));
   if (missingText.length === 0) {
-    console.log(`Dashboard bundle runtime verified with ${socketUrls.length} snapshot websocket(s)`);
+    console.log(
+      `Dashboard bundle runtime verified with ${socketUrls.length} snapshot websocket(s)`,
+    );
     process.exit(0);
   }
 
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
-const bodyText = (window.document.body.textContent || "").replace(/\s+/g, " ").trim();
+const bodyText = (window.document.body.textContent || "")
+  .replace(/\s+/g, " ")
+  .trim();
 throw new Error(
   [
     `dashboard bundle runtime check timed out after ${timeoutMs}ms`,

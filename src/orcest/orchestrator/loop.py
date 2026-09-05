@@ -71,6 +71,7 @@ from orcest.orchestrator.task_publisher import (
 )
 from orcest.orchestrator.trace_archiver import TraceArchiver
 from orcest.orchestrator.usage_check import get_token_reset_time
+from orcest.shared import work_observations as work_view
 from orcest.shared.config import (
     IssueDeliveryVerifierConfig,
     LabelConfig,
@@ -1083,7 +1084,10 @@ def _mark_usage_exhausted_token(
         logger.info("Rate limit resets at %s (from stream-json)", cooldown_until.isoformat())
     elif entry and is_claude_provider(prov) and entry.credential:
         try:
-            cooldown_until = get_token_reset_time(entry.credential)
+            cooldown_until = get_token_reset_time(
+                entry.credential,
+                observe=lambda data: token_pool.record_usage(entry.account_key(), data),
+            )
         except Exception as e:
             logger.warning("Failed to query token reset time: %s", e)
     marked = token_pool.mark_exhausted(result.task_id, cooldown_until=cooldown_until)
@@ -2214,6 +2218,8 @@ def _poll_project(
             if res is None and token_pool is not None:
                 token_pool.task_completed(task_id)
                 _clear_task_provider_account(project_redis, task_id, logger)
+            if res is not None:
+                work_view.queued(project_redis, res)
             return res
         except Exception:
             if token_pool is not None:
@@ -2224,6 +2230,12 @@ def _poll_project(
             if selection.capacity_reservation is not None:
                 selection.capacity_reservation.release()
 
+    work_view.project_observation(
+        project_redis,
+        repo,
+        config.polling.interval,
+        token_pool,
+    )
     labels = config.labels
 
     legacy_exclusion_predicate: Callable[..., bool] | None = None
@@ -2258,6 +2270,9 @@ def _poll_project(
         legacy_exclusion_predicate=legacy_exclusion_predicate,
         legacy_exclusion_unavailable=legacy_exclusion_unavailable,
     )
+
+    for observed_pr in pr_states:
+        work_view.observe(project_redis, repo, "pr", observed_pr)
 
     # Sort: merges first (quick wins), then fixes/followups oldest-first
     # (lowest PR number = longest waiting). Skips don't matter but sort
@@ -2333,6 +2348,7 @@ def _poll_project(
                     head_sha=pr_state.head_sha,
                 )
                 merged += 1
+                work_view.merged(project_redis, repo, pr_state.number)
             except Exception as e:
                 err_msg = _exception_message_with_stderr(e)
                 logger.error(
@@ -3002,6 +3018,9 @@ def _poll_project(
         except Exception as e:
             logger.error(f"Issue discovery failed: {e}", exc_info=True)
 
+    for observed_issue in issue_states:
+        work_view.observe(project_redis, repo, "issue", observed_issue)
+
     # Act on issues
     for issue_state in issue_states:
         if issue_state.action == IssueAction.ENQUEUE_IMPLEMENT:
@@ -3078,6 +3097,10 @@ def _poll_project(
                 f"Issue #{issue_state.number}: unhandled action {issue_state.action!r}, skipping"
             )
 
+    seen_work = {work_view.work_key(repo, "pr", s.number) for s in pr_states}
+    seen_work.update(work_view.work_key(repo, "issue", s.number) for s in issue_states)
+    if not issue_streams_all_backed_up or force_issue_discovery:
+        work_view.reconcile_missing(project_redis, repo, token, seen_work)
     return enqueued, merged, len(pr_states), len(issue_states)
 
 

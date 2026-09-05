@@ -1071,7 +1071,9 @@ class TestDashboardAuthFailsClosed:
         # Fail closed on an unset token.
         assert "if (!token) return false" in text
         # The constant-time comparison must be preserved.
-        assert "timingSafeEqual" in text
+        assert 'from "./token.js"' in text
+        token_text = (self._repo_root() / "dashboard" / "server" / "token.ts").read_text()
+        assert "timingSafeEqual" in token_text
         # auth.ts must NOT import index.ts (which has the server.listen side
         # effect) — that is the whole point of extracting it.
         assert "./index" not in text

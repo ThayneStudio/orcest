@@ -1931,6 +1931,31 @@ class TestRunWorker:
         assert published.credential_update == rotated
         assert published.credential_update_minted_at == 1_700_000_000_000_000.0
 
+    def test_human_blocker_observation_redacts_rotated_credential(
+        self, mocker, worker_config, sample_task
+    ):
+        mock_redis = self._build_mock_redis()
+        mocks = self._setup_run_worker(mocker, worker_config, mock_redis)
+        rotated = '{"refresh_token":"private-new-token"}'
+        result = _success_runner_result()
+        result.needs_human = True
+        result.needs_human_reason = f"Access failed: {rotated}"
+        result.credential_update = rotated
+        mocks["runner"].run.return_value = result
+        self._configure_one_iteration(mock_redis, sample_task, mocks["signal_handlers"])
+        handoff = mocker.patch("orcest.worker.loop._handoff_result_until_terminal")
+        handoff.return_value.terminal = True
+        handoff.return_value.publish_outcome = ResultPublishOutcome.PUBLISHED
+
+        run_worker(worker_config)
+
+        reasons = [
+            call.args[1]["human_reason"]
+            for call in mock_redis.hset_mapping.call_args_list
+            if "human_reason" in call.args[1]
+        ]
+        assert reasons == ["Access failed: [REDACTED]"]
+
     def test_worker_skips_locked_task(self, mocker, worker_config, sample_task):
         """When the lock is already held, the runner is NOT called and the
         task is ACKed only after a transient result is durable.

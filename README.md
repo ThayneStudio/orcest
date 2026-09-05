@@ -1,11 +1,13 @@
 # Orcest
 
-Autonomous CI/CD orchestration. A single orchestrator watches GitHub, runs
-heuristics, and hands work to a managed fleet of ephemeral worker VMs that
-invoke coding agents — Claude, Grok, or Codex — against the target repo.
+Lightweight coordination for autonomous coding agents. Orcest discovers work,
+observes dependencies and delivery checks, and hands eligible tasks to ephemeral
+worker VMs running Claude, Grok, or Codex. GitHub currently supplies issue, PR, and
+CI evidence; Orcest observes that process instead of becoming a CI/CD engine.
 
-GitHub is the dashboard. Redis is coordination state. There are no
-long-lived scripts.
+The [product vision](docs/vision.md) records the long-term direction. The
+[fleet dashboard runbook](docs/fleet-dashboard.md) covers live observations,
+sign-in, validation, and rollout.
 
 ---
 
@@ -16,9 +18,8 @@ Grok, Codex) running on a managed fleet of VMs. It replaces the older
 Ralph system: instead of long-lived scripts, a single orchestrator
 watches GitHub, decides what is actionable, and hands tasks to ephemeral,
 repo-agnostic workers that clone the target repo and run an agent CLI
-against it. GitHub itself is the dashboard — labels, comments, and PR
-state are the source of truth; Redis is purely coordination state
-(queues, locks, retry counters).
+against it. Labels, comments, and PR state remain source evidence. Redis holds
+coordination state and a read-only dashboard projection of those observations.
 
 ## Architecture
 
@@ -41,9 +42,10 @@ actionable (see [`docs/orchestrator-state-machine.md`](docs/orchestrator-state-m
 - **Redis** — task distribution via streams, distributed locks via
   `SET NX EX`, pending markers tied to PR head SHAs, attempt counters,
   per-provider exhaustion keys, and operational memory.
-- **GitHub as dashboard** — labels (`orcest:ready`,
-  `orcest:needs-human`), PR/issue comments for status, and `orcest status`
-  for a Rich/Textual TUI of queue and worker health.
+- **Visibility** — the fleet dashboard shows work lifecycle, reasons for waiting,
+  agent output, configured provider accounts, and VM capacity. GitHub labels
+  (`orcest:ready`, `orcest:needs-human`) and PR/issue comments remain inspectable
+  source evidence; `orcest status` supplies terminal diagnostics.
 - **Snapshot validation** — every task carries the PR head SHA plus a
   decision reason (`ci_failure`, `changes_requested`,
   `merge_conflict_rebase`, ...). Workers cheap-validate before running;
