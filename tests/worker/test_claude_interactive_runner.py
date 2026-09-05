@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import time
+from pathlib import Path
 
+from orcest.shared.provider_versions import PROVIDER_CLI_DESIRED_VERSIONS
 from orcest.worker.claude_interactive_runner import (
+    _SUBMISSION_ATTEMPT_LIMIT,
     ClaudeInteractiveRunner,
     _is_interactive_usage_exhausted,
+    _PostSubmitState,
     _PtyOutputDecoder,
 )
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _interactive_frames() -> dict:
+    return json.loads((FIXTURES / "claude_interactive_2.1.235_frames.json").read_text())
+
+
+def _record_submit_keystrokes(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    original_submit = ClaudeInteractiveRunner._send_submit_keystroke
+
+    def counting_submit(self, *args, **kwargs):
+        calls.append(1)
+        return original_submit(self, *args, **kwargs)
+
+    monkeypatch.setattr(ClaudeInteractiveRunner, "_send_submit_keystroke", counting_submit)
+    return calls
 
 
 def test_build_argv_uses_interactive_claude_without_print_flags() -> None:
@@ -977,6 +1000,114 @@ def test_looks_like_activity_state_detects_esc_to_interrupt() -> None:
     assert runner._looks_like_activity_state("❯ ") is False
 
 
+def test_pinned_claude_frames_document_post_submit_states() -> None:
+    """Keep accepted evidence tied to the deployed interactive TUI version."""
+    capture = _interactive_frames()
+    frames = capture["frames"]
+    runner = ClaudeInteractiveRunner()
+
+    assert capture["cli_version"] == PROVIDER_CLI_DESIRED_VERSIONS["claude"]
+    assert capture["accepted_execution_signals"] == {
+        "activity": "esc to interrupt",
+        "composer_cleared": ("latest settled non-menu composer has no pasted-text placeholder"),
+    }
+    assert capture["captured_inert_footer_rows"] == [
+        "horizontal separator",
+        "? for shortcuts / context status",
+        "bypass permissions on (shift+tab to cycle) / agents / effort status",
+        "paste again to expand",
+    ]
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_shortcuts_context_footer"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["explicitly_stuck_with_multiline_paste_hint"])
+        is _PostSubmitState.EXPLICITLY_STUCK
+    )
+    assert (
+        runner._classify_post_submit_state(frames["stuck_then_cleared"])
+        is _PostSubmitState.EXECUTING
+    )
+    assert (
+        runner._classify_post_submit_state(frames["stuck_then_cleared_with_footer"])
+        is _PostSubmitState.EXECUTING
+    )
+    assert (
+        runner._classify_post_submit_state(frames["stuck_then_unrecognized"])
+        is _PostSubmitState.AMBIGUOUS
+    )
+    assert runner._classify_post_submit_state(frames["executing"]) is _PostSubmitState.EXECUTING
+    assert runner._classify_post_submit_state(frames["unknown_menu"]) is _PostSubmitState.AMBIGUOUS
+    assert runner._classify_post_submit_state(frames["unrecognized"]) is _PostSubmitState.AMBIGUOUS
+
+
+def test_post_submit_footer_allowlist_rejects_dialog_lookalikes() -> None:
+    """Known chrome cannot hide a newer unknown instruction or menu row."""
+    runner = ClaudeInteractiveRunner()
+    placeholder = "❯ [Pasted text #1 +12 lines]\n"
+
+    lookalikes = (
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · Enter to confirm",
+        "● high · /effort · Enter to confirm",
+        "paste again to expand or press Enter to confirm",
+        "? for shortcuts · 87% until auto-compact · Accept default",
+        "────────────────\nEnter to confirm / Esc to cancel",
+    )
+
+    for trailing_row in lookalikes:
+        assert (
+            runner._classify_post_submit_state(placeholder + trailing_row)
+            is _PostSubmitState.AMBIGUOUS
+        )
+
+
+def test_post_submit_box_borders_do_not_make_historical_placeholder_current() -> None:
+    """A dialog border is newer unknown evidence, never inert composer chrome."""
+    runner = ClaudeInteractiveRunner()
+
+    box_borders = (
+        "╭────────────────╮",
+        "╰────────────────╯",
+        "┌────────────────┐",
+        "└────────────────┘",
+        "╭────────────────╮\n╰────────────────╯",
+    )
+
+    for box_border in box_borders:
+        assert (
+            runner._classify_post_submit_state(
+                "\x1b[2K\r│ ❯ [Pasted text #1 +12 lines]\r\n" + box_border
+            )
+            is _PostSubmitState.AMBIGUOUS
+        )
+
+
+def test_post_submit_blank_modal_rows_do_not_make_historical_placeholder_current() -> None:
+    """Vertical framing cannot collapse a modal row into an inert blank line."""
+    runner = ClaudeInteractiveRunner()
+    placeholder = "\x1b[2K\r│ ❯ [Pasted text #1 +12 lines]\r\n"
+
+    for modal_row in ("│", "│   │", "┃   ┃", "║   ║", "|   |", "│││"):
+        assert (
+            runner._classify_post_submit_state(placeholder + modal_row)
+            is _PostSubmitState.AMBIGUOUS
+        )
+
+    # Source rows containing only whitespace remain inert, and framing around
+    # an actually captured footer row is still removed before matching it.
+    assert runner._is_composer_footer_line(" \t\u00a0") is True
+    assert runner._is_composer_footer_line("│ ? for shortcuts · 87% until auto-compact │") is True
+
+
 def test_looks_like_pending_paste_composer_detects_placeholder() -> None:
     runner = ClaudeInteractiveRunner()
 
@@ -1119,8 +1250,21 @@ while time.time() < drain_deadline:
     os.read(0, 65536)
 
 # The composer stays stuck on the pasted placeholder: the first Enter did
-# not land.
+# not land. These are the compacted shapes from the raw 2.1.235 120-column
+# composer footer and multiline-paste hint, including absolute-column CSI.
 print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
+print(
+    "\\x1b[27mpaste \\x1b[10Ggain to expa\\x1b[23Gd\\x1b[25G\\x1b[K",
+    flush=True,
+)
 
 retry = b""
 deadline = time.time() + 5
@@ -1174,17 +1318,598 @@ raise SystemExit(0)
     assert result.summary == "recovered by later enter"
 
 
-def test_run_permanently_stuck_composer_fails_fast(tmp_path, monkeypatch) -> None:
-    """A composer that never clears must fail within the short pre-execution
-    deadline, not the full task timeout.
-    """
+def test_run_requires_fresh_stuck_evidence_before_each_retry(tmp_path, monkeypatch) -> None:
+    """One placeholder authorizes one retry; later silence authorizes nothing."""
     monkeypatch.setattr(
         "orcest.worker.claude_interactive_runner._PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS",
-        1.0,
+        0.5,
     )
     monkeypatch.setattr(
         "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
-        0.2,
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+retry = b""
+deadline = time.time() + 5
+while time.time() < deadline and b"\\r" not in retry:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        retry += os.read(0, 65536)
+if b"\\r" not in retry or retry.strip(b"\\r"):
+    raise SystemExit(2)
+
+# After that evidence-backed retry, render nothing. A historical placeholder
+# must not authorize another Enter.
+unexpected = b""
+deadline = time.time() + 1.2
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_AMBIGUOUS_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(3)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(4)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("one evidence frame authorized one retry\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "one evidence frame authorized one retry"
+    assert len(submit_calls) == 2
+
+
+def test_run_fresh_stuck_epoch_after_ambiguity_gets_new_recovery_window(
+    tmp_path, monkeypatch
+) -> None:
+    """An expired earlier stuck window cannot kill a later fresh stuck epoch."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS",
+        0.75,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+def read_enter():
+    received = b""
+    deadline = time.time() + 3
+    while time.time() < deadline and b"\\r" not in received:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if readable:
+            received += os.read(0, 65536)
+    return received
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+first_retry = read_enter()
+if b"\\r" not in first_retry or first_retry.strip(b"\\r"):
+    raise SystemExit(2)
+
+# Leave the explicit-stuck state and remain ambiguous past its old short
+# deadline. No recovery input is safe during this interval.
+print("Working…", flush=True)
+unexpected = b""
+deadline = time.time() + 1.0
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_AMBIGUOUS_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(3)
+
+# A newly rendered placeholder is a new explicit-stuck epoch. It receives a
+# fresh short deadline and can authorize the final budgeted Enter.
+print("❯ [Pasted text #2 +12 lines]", flush=True)
+second_retry = read_enter()
+if b"\\r" not in second_retry or second_retry.strip(b"\\r"):
+    raise SystemExit(4)
+print("\\x1b[2K\\r│ ❯ ", flush=True)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(5)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("fresh stuck epoch recovered after ambiguity\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "fresh stuck epoch recovered after ambiguity"
+    assert len(submit_calls) == _SUBMISSION_ATTEMPT_LIMIT == 3
+
+
+def test_run_stuck_frame_cleared_before_settle_sends_no_retry(tmp_path, monkeypatch) -> None:
+    """The latest repaint wins over a historical placeholder frame."""
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
+time.sleep(0.2)
+print("\\x1b[2K\\r│ ❯ ", flush=True)
+print("─" * 120, flush=True)
+print(
+    "\\x1b[3G⏵⏵\\x1b[6Gbypass\\x1b[13Gpermissions\\x1b[25Gon"
+    "\\x1b[28G(shift+tab\\x1b[39Gto\\x1b[42Gcycle)\\x1b[49G·"
+    "\\x1b[51G←\\x1b[53Gfor\\x1b[57Gagents\\x1b[103G●"
+    "\\x1b[105Ghigh\\x1b[110G·\\x1b[112G/effort",
+    flush=True,
+)
+
+unexpected = b""
+deadline = time.time() + 1.2
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_CLEARED_COMPOSER_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(3)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("latest composer frame was clear\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "latest composer frame was clear"
+    assert len(submit_calls) == 1
+
+
+def test_run_stuck_frame_followed_by_unrecognized_output_sends_no_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """Newer unrecognized output makes an old stuck composer ambiguous."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+print("Working…", flush=True)
+
+unexpected = b""
+deadline = time.time() + 1.2
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_UNRECOGNIZED_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(3)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("newer output made the old placeholder ambiguous\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "newer output made the old placeholder ambiguous"
+    assert len(submit_calls) == 1
+
+
+def test_run_box_borders_after_historical_placeholder_send_no_retry(tmp_path, monkeypatch) -> None:
+    """A settled dialog border after an old placeholder cannot authorize Enter."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+# Keep the initial submission Enter out of the post-render observation window.
+drain_deadline = time.time() + 0.5
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+# Reproduce the append-only transcript shape that triggered the regression:
+# an old pending-paste row followed by newer top, empty body, and bottom rows.
+print("\\x1b[2K\\r│ ❯ [Pasted text #1 +12 lines]", flush=True)
+print("\\x1b[2K\\r╭────────────────────────────────╮", flush=True)
+print("\\x1b[2K\\r│                                │", flush=True)
+print("\\x1b[2K\\r╰────────────────────────────────╯", flush=True)
+
+# Stay quiet longer than the default three 0.25-second settle ticks. If box
+# borders are mistakenly allowlisted, the runner sends an unsafe bare Enter.
+unexpected = b""
+deadline = time.time() + 1.3
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_BOX_DIALOG_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+# Start a fresh append-only frame whose only newer row is an empty modal body.
+# This independently covers vertical framing: the previous box borders precede
+# this newest caret and therefore cannot determine its classification.
+print("\\x1b[2K\\r│ ❯ [Pasted text #2 +12 lines]", flush=True)
+print("\\x1b[2K\\r│                                │", flush=True)
+unexpected = b""
+deadline = time.time() + 1.3
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_BLANK_MODAL_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(3)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(4)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("box-bordered dialog left untouched\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=7,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "box-bordered dialog left untouched"
+    assert len(submit_calls) == 1
+
+
+def test_run_unknown_post_submit_menu_receives_no_bare_enter(tmp_path, monkeypatch) -> None:
+    """An unrecognized menu is ambiguous, never a submission-retry target."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+print(
+    "A future prompt changed in a new CLI release\\n"
+    "❯ 1. Accept the default\\n"
+    "  2. Cancel\\n"
+    "Enter to confirm / Esc to cancel",
+    flush=True,
+)
+
+unexpected = b""
+deadline = time.time() + 1.2
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_MENU_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(2)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(3)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("unknown menu left untouched\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "unknown menu left untouched"
+    assert len(submit_calls) == 1
+
+
+def test_run_permanently_stuck_composer_fails_fast(tmp_path, monkeypatch) -> None:
+    """Fresh stuck evidence spends the documented total-attempt budget."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS",
+        1.5,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
     )
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
@@ -1214,7 +1939,40 @@ while time.time() < deadline:
     if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
         break
 
+# Drain the initial Enter, which is written separately from the paste.
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+def read_enter():
+    deadline = time.time() + 5
+    received = b""
+    while time.time() < deadline:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if not readable:
+            continue
+        received += os.read(0, 65536)
+        if b"\\r" in received:
+            return received
+    return received
+
+# There are three TOTAL submission attempts: the initial Enter and two
+# evidence-backed retries. Render fresh stuck evidence before each retry.
 print("❯ [Pasted text #1 +12 lines]", flush=True)
+first_retry = read_enter()
+if b"\\r" not in first_retry or first_retry.strip(b"\\r"):
+    raise SystemExit(2)
+print("❯ [Pasted text #2 +12 lines]", flush=True)
+second_retry = read_enter()
+if b"\\r" not in second_retry or second_retry.strip(b"\\r"):
+    raise SystemExit(3)
+
+# Fresh evidence after the final allowed attempt keeps the explicit-stuck
+# deadline applicable, but no fourth Enter may be sent.
+print("❯ [Pasted text #3 +12 lines]", flush=True)
 time.sleep(30)
 """,
         encoding="utf-8",
@@ -1225,6 +1983,7 @@ time.sleep(30)
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+    submit_calls = _record_submit_keystrokes(monkeypatch)
 
     started = time.monotonic()
     result = runner.run(
@@ -1241,12 +2000,11 @@ time.sleep(30)
     assert (
         result.summary == "Timed out confirming interactive Claude accepted the prompt submission"
     )
+    assert len(submit_calls) == _SUBMISSION_ATTEMPT_LIMIT == 3
 
 
 def test_run_stops_recovery_once_activity_begins(tmp_path, monkeypatch) -> None:
-    """Once Claude shows activity, no further Enter or repaste may be sent,
-    even if activity is delayed enough that a bounded retry already fired.
-    """
+    """Silence before activity is ambiguous and must not trigger another Enter."""
     monkeypatch.setattr(
         "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
         0.5,
@@ -1280,8 +2038,8 @@ while time.time() < deadline:
     if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
         break
 
-# Stay silent long enough for the bounded retry to fire before revealing
-# activity, discarding whatever arrives during the silence.
+# Stay silent beyond the retry-settle interval before revealing activity. The
+# runner must not treat silence as proof that the initial Enter failed.
 silent_deadline = time.time() + 2.0
 while time.time() < silent_deadline:
     readable, _, _ = select.select([0], [], [], 0.1)
@@ -1326,6 +2084,7 @@ raise SystemExit(0)
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     runner = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0)
+    submit_calls = _record_submit_keystrokes(monkeypatch)
 
     result = runner.run(
         "say hello",
@@ -1337,6 +2096,7 @@ raise SystemExit(0)
 
     assert result.success is True
     assert result.summary == "delayed activity confirmed"
+    assert len(submit_calls) == 1
 
 
 def test_run_does_not_send_prompt_into_a_partially_rendered_menu(tmp_path, monkeypatch) -> None:
