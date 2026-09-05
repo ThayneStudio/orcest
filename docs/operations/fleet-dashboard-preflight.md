@@ -158,3 +158,20 @@ Python tests (one skipped), and an additional worker-path redaction regression.
 These changes supersede `bb17e08` as the rollout source. Neither staged dashboard
 has replaced the production dashboard. Actual ingress proxy trust must be
 configured from the deployed connection path; do not broadly trust Docker clients.
+
+The final runtime changes at `ed909d4ef9392f690fe3c900e76a8639c7757898` received
+an approving review. Both images were built and exact-revision staging readiness,
+sign-in, authenticated fleet reads, and sign-out passed on loopback port 8083.
+All four installed-runtime configuration comparisons and pool routing passed.
+The full Linux integration job passed. CI found only test-file formatting in
+the preceding candidate; the follow-up formats that test and records this
+evidence without changing runtime source. The full `make lint-check` passes
+after correction. Final CI must still finish before rollout.
+
+Read-only health reports remain at
+`/tmp/orcest-dashboard-release-ed909d4/evidence` on the orchestrator host. They
+confirm zero task work, zero active VMs, four idle VMs, and no private credential
+recovery state. Result pending counts remain 1 / 0 / 10 / 1 for Orcest / Transit /
+Asemly / BBR, respectively. All four production orchestrators and the production
+dashboard retain their original image IDs and start times with zero restarts.
+The two superseded validation containers were removed; their images were kept.

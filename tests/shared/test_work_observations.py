@@ -88,9 +88,7 @@ def test_worker_blocker_survives_poll_until_acknowledged_or_restarted(fake_redis
     r = fake_redis_client
     key = view.work_key("org/repo", "issue", 12)
     view.observe(r, "org/repo", "issue", issue())
-    view.human_reason(
-        r, task(), "Access denied SECRET ROTATED", credential_update="ROTATED"
-    )
+    view.human_reason(r, task(), "Access denied SECRET ROTATED", credential_update="ROTATED")
     view.observe(r, "org/repo", "issue", issue())
     assert r.hgetall(key)["worker_needs_human"] == "1"
     assert r.hgetall(key)["human_reason"] == "Access denied [REDACTED] [REDACTED]"
@@ -112,9 +110,7 @@ def test_discovery_gap_preserves_queue_evidence_and_clears_on_rediscovery(
     key = view.work_key("org/repo", "issue", 12)
     view.observe(r, "org/repo", "issue", issue())
     view.queued(r, task())
-    monkeypatch.setattr(
-        "orcest.orchestrator.gh.get_issue", Mock(return_value={"state": "OPEN"})
-    )
+    monkeypatch.setattr("orcest.orchestrator.gh.get_issue", Mock(return_value={"state": "OPEN"}))
     view.reconcile_missing(r, "org/repo", "secret", set())
     assert r.hgetall(key)["action"] == "skip_queued"
     assert r.hgetall(key)["discovery_missing"] == "1"
