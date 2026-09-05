@@ -262,7 +262,11 @@ def _authorize_command_shape(
 
 
 def _authorization_context_digest(
-    *, principal_id: str, authorized_command_kinds: Any, authorized_project_ids: Any
+    *,
+    principal_id: str,
+    authorized_command_kinds: Any,
+    authorized_project_ids: Any,
+    authorized_resolution_kinds: Any,
 ) -> str:
     from orcest.workflow_contract.v1.digest import request_digest
 
@@ -271,6 +275,7 @@ def _authorization_context_digest(
             "principal_id": principal_id,
             "authorized_command_kinds": sorted(authorized_command_kinds),
             "authorized_project_ids": sorted(authorized_project_ids),
+            "authorized_resolution_kinds": sorted(authorized_resolution_kinds),
         }
     )
 
@@ -313,6 +318,7 @@ def submit_run_command(
         principal_id=principal.principal_id,
         authorized_command_kinds=principal.authorized_command_kinds,
         authorized_project_ids=principal.authorized_project_ids,
+        authorized_resolution_kinds=principal.authorized_resolution_kinds,
     )
 
     try:
