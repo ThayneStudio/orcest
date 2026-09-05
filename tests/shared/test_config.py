@@ -111,6 +111,28 @@ def test_load_orchestrator_config_max_transient_failures_from_yaml(tmp_path: Pat
     assert config.max_transient_failures == 7
 
 
+def test_load_orchestrator_config_workflow_state_root(tmp_path: Path):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text(
+        "github:\n  repo: acme/widgets\nworkflow_state_root: /var/lib/orcest/workflow\n"
+    )
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.workflow_state_root == "/var/lib/orcest/workflow"
+
+
+def test_load_orchestrator_config_blank_workflow_state_root_disables_lookup(
+    tmp_path: Path,
+):
+    cfg_file = tmp_path / "orcest.yaml"
+    cfg_file.write_text('github:\n  repo: acme/widgets\nworkflow_state_root: ""\n')
+
+    config = load_orchestrator_config(cfg_file)
+
+    assert config.workflow_state_root is None
+
+
 def test_load_orchestrator_config_max_transient_failures_env_override(tmp_path: Path, monkeypatch):
     cfg_file = tmp_path / "orcest.yaml"
     cfg_file.write_text("github:\n  repo: acme/widgets\nmax_transient_failures: 7\n")

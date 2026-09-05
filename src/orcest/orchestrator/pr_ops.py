@@ -9,6 +9,7 @@ main loop acts on these recommendations.
 import hashlib
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -28,6 +29,7 @@ from orcest.shared.coordination import (
     make_pr_lock_key,
 )
 from orcest.shared.redis_client import RedisClient
+from orcest.workflow_contract.v1.publication import is_legacy_marker_reserved
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,10 @@ class PRAction(str, Enum):
     RETRIGGER_STALE_CHECKS = "retrigger_stale_checks"  # Pending checks stuck; re-trigger
     SKIP_USAGE_COOLDOWN = "skip_usage_cooldown"  # USAGE_EXHAUSTED cooldown active; retry later
     SKIP_BACKOFF = "skip_backoff"  # Transient failure backoff is active
+    SKIP_V1_OWNED = "skip_v1_owned"  # Reserved for the workflow-control v1 engine
+    # The v1 ownership snapshot could not be read, so fail closed without
+    # pretending that an ownership association was actually observed.
+    SKIP_V1_LOOKUP_UNAVAILABLE = "skip_v1_lookup_unavailable"
 
 
 @dataclass
@@ -557,19 +563,22 @@ def discover_actionable_prs(
     max_attempts: int = 3,
     max_total_attempts: int = 50,
     stale_pending_timeout_seconds: int = 7200,
+    legacy_exclusion_predicate: Callable[..., bool] | None = None,
+    legacy_exclusion_unavailable: bool = False,
 ) -> list[PRState]:
     """Discover PRs that need action.
 
     Filter cascade (ordered by cost, cheapest first):
-    1. Skip draft PRs (single boolean field, cheapest check)
-    2. Skip PRs with the terminal `orcest:needs-human` label
-    3. Skip PRs with active Redis locks (worker in progress)
-    4. Skip PRs with a pending task already queued
-    5. Skip PRs that exceeded total cross-SHA attempt limit
-    6. Route PRs with merge conflicts to ENQUEUE_REBASE.
-    7. Skip PRs whose retry budget is exhausted for the current SHA.
-    8. Fetch CI status; skip if checks are still pending or absent.
-    9. Route by CI + review state: failures -> fix, changes requested -> fix,
+    1. Exclude PRs reserved for the workflow-control v1 engine.
+    2. Skip draft PRs (single boolean field, cheapest check)
+    3. Skip PRs with the terminal `orcest:needs-human` label
+    4. Skip PRs with active Redis locks (worker in progress)
+    5. Skip PRs with a pending task already queued
+    6. Skip PRs that exceeded total cross-SHA attempt limit
+    7. Route PRs with merge conflicts to ENQUEUE_REBASE.
+    8. Skip PRs whose retry budget is exhausted for the current SHA.
+    9. Fetch CI status; skip if checks are still pending or absent.
+    10. Route by CI + review state: failures -> fix, changes requested -> fix,
        approved + unresolved threads -> followup, approved + clean -> merge
     """
     prs = gh.list_open_prs(repo, token)
@@ -582,6 +591,56 @@ def discover_actionable_prs(
         base_branch: str = pr_data.get("baseRefName", "main")
         head_sha: str = pr_data.get("headRefOid", "")
         pr_labels: list[str] = [lbl.get("name", "") for lbl in (pr_data.get("labels") or [])]
+
+        marker_reserved = is_legacy_marker_reserved(pr_data.get("body") or "")
+        association_reserved = False
+        lookup_unavailable = legacy_exclusion_unavailable
+        if not lookup_unavailable and legacy_exclusion_predicate is not None:
+            try:
+                association_reserved = legacy_exclusion_predicate(
+                    change_request_external_id=str(number),
+                    deterministic_ref=f"refs/heads/{branch}",
+                )
+            except Exception:
+                # A failed ownership read is not evidence that the v1 engine
+                # owns the object. Fail closed, but preserve the distinction
+                # so health/metrics can report the outage accurately.
+                logger.error(
+                    "PR #%d: workflow-control v1 ownership lookup failed; excluding",
+                    number,
+                    exc_info=True,
+                )
+                lookup_unavailable = True
+        if marker_reserved or association_reserved:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_V1_OWNED,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
+        if lookup_unavailable:
+            results.append(
+                PRState(
+                    number=number,
+                    title=title,
+                    branch=branch,
+                    head_sha=head_sha,
+                    action=PRAction.SKIP_V1_LOOKUP_UNAVAILABLE,
+                    ci_failures=[],
+                    review_threads=[],
+                    labels=pr_labels,
+                    base_branch=base_branch,
+                )
+            )
+            continue
 
         if not head_sha:
             logger.warning(

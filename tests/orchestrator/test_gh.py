@@ -1122,6 +1122,7 @@ def test_list_open_prs_default_limit(mocker):
     assert "first=100" in args_passed
     query_arg = next(arg for arg in args_passed if arg.startswith("query="))
     assert "orderBy: {field: CREATED_AT, direction: ASC}" in query_arg
+    assert "body" in query_arg
 
 
 def test_list_open_prs_paginates_past_100_and_preserves_shape(mocker):

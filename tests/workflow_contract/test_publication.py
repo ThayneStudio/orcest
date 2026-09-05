@@ -83,6 +83,15 @@ def test_classify_member_ownership_incomplete_on_missing_evidence() -> None:
     assert defects == ("HEAD_UNPROVEN",)
 
 
+def test_classify_member_ownership_evidence_flag_cannot_be_overridden_by_defaults() -> None:
+    status, defects = classify_member_ownership(
+        proof_kind="EXACT_CREATE_RESPONSE",
+        evidence_complete=False,
+    )
+    assert status == "INCOMPLETE"
+    assert defects == ("HEAD_UNPROVEN",)
+
+
 def test_classify_member_ownership_no_proof_kind_is_incomplete() -> None:
     status, defects = classify_member_ownership(proof_kind=None, evidence_complete=True)
     assert status == "INCOMPLETE"

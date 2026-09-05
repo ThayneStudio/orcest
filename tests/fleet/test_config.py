@@ -828,3 +828,12 @@ class TestMaxTaskDurationDefault:
 
         assert loaded.monitor_ingest_url == "http://monitor:9091/ingest/v1/events"
         assert loaded.monitor_write_token == "write-secret"
+
+    def test_round_trip_workflow_state_host_path(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(workflow_state_host_path="/srv/orcest/workflow")
+
+        save_config(original, path)
+        loaded = load_config(path)
+
+        assert loaded.workflow_state_host_path == "/srv/orcest/workflow"

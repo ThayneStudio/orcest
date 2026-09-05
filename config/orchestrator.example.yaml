@@ -64,6 +64,10 @@ providers:
 # monitor_ingest_url: "http://monitor:9091/ingest/v1/events"
 # monitor_write_token_env: "MONITOR_WRITE_TOKEN"
 
+# Workflow-control v1 ownership fence. Point this at the v1 state directory
+# whenever the legacy orchestrator and v1 controller can see the same PRs.
+# workflow_state_root: "/var/lib/orcest/workflow"
+
 # Durable issue-delivery verification. enabled:false restores immediate
 # orcest:ready removal only for newly consumed completed issue results. It does
 # not process or clear existing verification jobs/dispatch barriers; drain first

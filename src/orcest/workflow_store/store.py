@@ -1289,11 +1289,10 @@ class ChangeRequestSearchMemberRecord:
 @dataclass(frozen=True, slots=True)
 class ChangeRequestSearchMemberInput:
     """Caller input for one member of a complete Change Request Search
-    (domain-model.md "Change Request Search Member"). ``ownership_status``
-    and ``ownership_defect_codes`` are the caller's already-computed
-    classification (``orcest.workflow_contract.v1.publication.
-    classify_member_ownership``); this input carries the raw evidence
-    ``record_change_request_search_result`` persists and digests."""
+    (domain-model.md "Change Request Search Member"). The input carries the
+    raw evidence ``record_change_request_search_result`` persists and digests;
+    a claimed ``POSITIVE`` classification is admitted only after the store
+    mechanically verifies every authority/ref/marker/commit/effect binding."""
 
     member_class: str
     change_request_external_id: str
@@ -1316,6 +1315,117 @@ class ChangeRequestSearchMemberInput:
     proof_observed_head: Mapping[str, Any] | None = None
     head_evidence_observation_id: str | None = None
     external_reliance: Mapping[str, Any] = field(default_factory=dict)
+
+
+def change_request_search_observation_fact(
+    *,
+    publication_id: str,
+    effect_generation: int,
+    run_marker: str,
+    deterministic_ref: str,
+    external_revision: str,
+    members: Sequence[ChangeRequestSearchMemberInput],
+) -> dict[str, Any]:
+    """Build the canonical adapter fact consumed by search-result admission."""
+    live_inputs = [member for member in members if member.member_class == "LIVE"]
+    terminal_inputs = [member for member in members if member.member_class == "TERMINAL"]
+    ordered_inputs = [(member, ordinal) for ordinal, member in enumerate(live_inputs)] + [
+        (member, ordinal) for ordinal, member in enumerate(terminal_inputs)
+    ]
+    fact_members: list[dict[str, Any]] = []
+    live_digest_entries: list[dict[str, Any]] = []
+    terminal_digest_entries: list[dict[str, Any]] = []
+    for member, ordinal in ordered_inputs:
+        observed_head = _require_git_commit_ref(member.observed_head, field="observed_head")
+        merge_commit = (
+            _require_git_commit_ref(member.merge_commit, field="merge_commit")
+            if member.merge_commit is not None
+            else None
+        )
+        proof_desired = (
+            _require_git_commit_ref(
+                member.proof_desired_commit, field="proof_desired_commit"
+            ).as_json()
+            if member.proof_desired_commit is not None
+            else None
+        )
+        proof_head = (
+            _require_git_commit_ref(
+                member.proof_observed_head, field="proof_observed_head"
+            ).as_json()
+            if member.proof_observed_head is not None
+            else None
+        )
+        ownership_proof_digest = change_request_search_member_ownership_proof_digest(
+            {
+                "ownership_status": member.ownership_status,
+                "proof_kind": member.proof_kind,
+                "ownership_defect_codes": list(member.ownership_defect_codes),
+                "proof_publication_effect_generation": (member.proof_publication_effect_generation),
+                "proof_create_checkpoint_id": member.proof_create_checkpoint_id,
+                "proof_create_request_idempotency_key": (
+                    member.proof_create_request_idempotency_key
+                ),
+                "creator_installation_or_account_ref": (member.creator_installation_or_account_ref),
+                "proof_deterministic_ref": member.proof_deterministic_ref,
+                "proof_run_marker": member.proof_run_marker,
+                "proof_desired_commit": proof_desired,
+                "proof_observed_head": proof_head,
+                "head_evidence_observation_id": member.head_evidence_observation_id,
+            }
+        )
+        external_reliance_digest = change_request_search_member_external_reliance_digest(
+            dict(member.external_reliance)
+        )
+        member_digest = change_request_search_member_digest(
+            {
+                "member_class": member.member_class,
+                "change_request_external_id": member.change_request_external_id,
+                "observed_head": observed_head.as_json(),
+                "terminal_state": member.terminal_state,
+                "merge_commit": merge_commit.as_json() if merge_commit is not None else None,
+                "source_ref": member.source_ref,
+                "run_marker": member.run_marker,
+                "observed_body_revision": member.observed_body_revision,
+                "ownership_status": member.ownership_status,
+                "ownership_proof_digest": ownership_proof_digest,
+                "external_reliance_digest": external_reliance_digest,
+            }
+        )
+        entry = {
+            "change_request_external_id": member.change_request_external_id,
+            "ownership_proof_digest": ownership_proof_digest,
+            "member_digest": member_digest,
+        }
+        (live_digest_entries if member.member_class == "LIVE" else terminal_digest_entries).append(
+            entry
+        )
+        fact_members.append(
+            {
+                "member_class": member.member_class,
+                "member_ordinal": ordinal,
+                "change_request_external_id": member.change_request_external_id,
+                "observed_head": json.loads(observed_head.as_json()),
+                "member_digest": member_digest,
+            }
+        )
+    duplicate_set_digest = change_request_search_set_digest(
+        {
+            "search_revision": external_revision,
+            "live": live_digest_entries,
+            "terminal": terminal_digest_entries,
+        }
+    )
+    live_cardinality = "ZERO" if not live_inputs else "ONE" if len(live_inputs) == 1 else "MULTIPLE"
+    return {
+        "publication_id": publication_id,
+        "effect_generation": effect_generation,
+        "run_marker": run_marker,
+        "deterministic_ref": deterministic_ref,
+        "live_cardinality": live_cardinality,
+        "duplicate_set_digest": duplicate_set_digest,
+        "members": fact_members,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -2083,7 +2193,7 @@ def _require_nonneg_int(value: int, *, field: str) -> int:
     return value
 
 
-def _require_nonempty_text(value: str, *, field: str) -> str:
+def _require_nonempty_text(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
     return value
@@ -2219,6 +2329,7 @@ def _validate_checkpoint_matrix(
     status: str,
     request_idempotency_key: str | None,
     forge_observation_id: str | None,
+    observed_external_revision: str | None,
 ) -> None:
     statuses = _PUBLICATION_CHECKPOINT_MATRIX.get(suboperation_kind)
     if statuses is None or status not in statuses:
@@ -2235,6 +2346,10 @@ def _validate_checkpoint_matrix(
         raise ValueError(f"{suboperation_kind}/{status} requires forge_observation_id")
     if observation_rule == "F" and forge_observation_id is not None:
         raise ValueError(f"{suboperation_kind}/{status} forbids forge_observation_id")
+    if observation_rule == "R" and observed_external_revision is None:
+        raise ValueError(f"{suboperation_kind}/{status} requires observed_external_revision")
+    if observation_rule == "F" and observed_external_revision is not None:
+        raise ValueError(f"{suboperation_kind}/{status} forbids observed_external_revision")
 
 
 _CAPACITY_SCOPE_ORDER = {"WORKER_SESSION": 0, "WORKER_PROFILE": 1, "CAPACITY_POOL": 2}
@@ -3883,6 +3998,121 @@ def open_read_only(db_path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+@dataclass(frozen=True)
+class LegacyChangeRequestExclusionSnapshot:
+    """Repository-scoped v1 ownership keys for one legacy polling cycle."""
+
+    change_request_external_ids: frozenset[str]
+    deterministic_refs: frozenset[str]
+
+    def excludes(
+        self,
+        *,
+        change_request_external_id: str | None = None,
+        deterministic_ref: str | None = None,
+    ) -> bool:
+        if change_request_external_id is None and deterministic_ref is None:
+            raise ValueError(
+                "at least one of change_request_external_id or deterministic_ref is required"
+            )
+        return (
+            change_request_external_id is not None
+            and change_request_external_id in self.change_request_external_ids
+        ) or (deterministic_ref is not None and deterministic_ref in self.deterministic_refs)
+
+
+def load_legacy_change_request_exclusion_snapshot(
+    state_root: Path | str,
+    *,
+    repository_locator: str,
+) -> LegacyChangeRequestExclusionSnapshot:
+    """Load all live v1 ownership keys for exactly one repository.
+
+    The legacy orchestrator calls this once per repository poll so an outage is
+    reported once and every PR in that snapshot is classified consistently.
+    """
+    if not repository_locator.strip():
+        raise ValueError("repository_locator must not be empty")
+    db_path = Path(state_root) / "workflow.db"
+    conn = open_read_only(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT p.change_request_external_id, p.deterministic_branch "
+            "FROM publications p "
+            "JOIN runs ON runs.run_id = p.run_id "
+            "JOIN projects project ON project.project_id = runs.project_id "
+            "LEFT JOIN terminal_duplicate_cleanup_reservations r "
+            "ON r.terminal_duplicate_cleanup_reservation_id = "
+            "p.terminal_duplicate_cleanup_reservation_id "
+            "WHERE project.repository_locator = ? COLLATE NOCASE "
+            "AND (runs.state NOT IN ('MERGED', 'CLOSED', 'CANCELLED') "
+            "OR r.state = 'ACTIVE')",
+            (repository_locator,),
+        ).fetchall()
+        return LegacyChangeRequestExclusionSnapshot(
+            change_request_external_ids=frozenset(
+                row["change_request_external_id"]
+                for row in rows
+                if row["change_request_external_id"] is not None
+            ),
+            deterministic_refs=frozenset(row["deterministic_branch"] for row in rows),
+        )
+    finally:
+        conn.close()
+
+
+def is_change_request_excluded_from_legacy_database(
+    state_root: Path | str,
+    *,
+    change_request_external_id: str | None = None,
+    deterministic_ref: str | None = None,
+    repository_locator: str | None = None,
+) -> bool:
+    """Read the v1 ownership fence without acquiring the controller lock.
+
+    The legacy orchestrator is a separate process and must not instantiate a
+    second ``RunStore`` writer merely to filter its GitHub snapshot.
+    """
+    if change_request_external_id is None and deterministic_ref is None:
+        raise ValueError(
+            "at least one of change_request_external_id or deterministic_ref is required"
+        )
+    if repository_locator is not None:
+        return load_legacy_change_request_exclusion_snapshot(
+            state_root, repository_locator=repository_locator
+        ).excludes(
+            change_request_external_id=change_request_external_id,
+            deterministic_ref=deterministic_ref,
+        )
+    conditions: list[str] = []
+    params: list[str] = []
+    if change_request_external_id is not None:
+        conditions.append("p.change_request_external_id = ?")
+        params.append(change_request_external_id)
+    if deterministic_ref is not None:
+        conditions.append("p.deterministic_branch = ?")
+        params.append(deterministic_ref)
+    db_path = Path(state_root) / "workflow.db"
+    conn = open_read_only(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT runs.state AS run_state, r.state AS reservation_state "
+            "FROM publications p JOIN runs ON runs.run_id = p.run_id "
+            "LEFT JOIN terminal_duplicate_cleanup_reservations r "
+            "ON r.terminal_duplicate_cleanup_reservation_id = "
+            "p.terminal_duplicate_cleanup_reservation_id "
+            f"WHERE ({' OR '.join(conditions)})",
+            tuple(params),
+        ).fetchall()
+        return any(
+            row["run_state"] not in ("MERGED", "CLOSED", "CANCELLED")
+            or row["reservation_state"] == "ACTIVE"
+            for row in rows
+        )
+    finally:
+        conn.close()
 
 
 _SCHEMA = f"""
@@ -10654,6 +10884,70 @@ class RunStore:
                 initial_state=initial_state,
             )
 
+    def _validate_forge_observation_schedule_authority(
+        self,
+        *,
+        project_id: str,
+        forge_instance_id: str,
+        target_kind: str,
+        target_id: str,
+        run_id: str | None,
+        publication_id: str | None,
+        terminal_duplicate_cleanup_reservation_id: str | None,
+    ) -> None:
+        """Reject schedules whose copied scope does not resolve to one authority graph."""
+        _require_nonempty_text(target_id, field="target_id")
+        project = self.conn.execute(
+            "SELECT forge_instance_id FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        if project is None:
+            raise RunStoreError(f"project {project_id!r} was not found")
+        if project["forge_instance_id"] != forge_instance_id:
+            raise ValueError("schedule Forge Instance does not own the Project")
+
+        if target_kind == "PROJECT":
+            if target_id != project_id:
+                raise ValueError("PROJECT schedule target_id must equal project_id")
+            return
+
+        if target_kind == "WORK_ITEM":
+            if run_id is not None:
+                run = self.conn.execute(
+                    "SELECT project_id, work_item_key FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if (
+                    run is None
+                    or run["project_id"] != project_id
+                    or run["work_item_key"] != target_id
+                ):
+                    raise ValueError("WORK_ITEM schedule does not match its Run and Project")
+            return
+
+        if target_kind != "PUBLICATION":
+            raise ValueError(f"unsupported Forge Observation target_kind {target_kind!r}")
+        publication = self.conn.execute(
+            "SELECT p.run_id, r.project_id FROM publications p "
+            "JOIN runs r ON r.run_id = p.run_id WHERE p.publication_id = ?",
+            (publication_id,),
+        ).fetchone()
+        if (
+            publication is None
+            or target_id != publication_id
+            or run_id != publication["run_id"]
+            or project_id != publication["project_id"]
+        ):
+            raise ValueError(
+                "PUBLICATION schedule does not match its Publication, Run, and Project"
+            )
+        if terminal_duplicate_cleanup_reservation_id is not None:
+            reservation = self.conn.execute(
+                "SELECT publication_id FROM terminal_duplicate_cleanup_reservations "
+                "WHERE terminal_duplicate_cleanup_reservation_id = ?",
+                (terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            if reservation is None or reservation["publication_id"] != publication_id:
+                raise ValueError("cleanup-scoped schedule does not match its Publication")
+
     def _create_or_reuse_forge_observation_schedule(
         self,
         *,
@@ -10686,6 +10980,15 @@ class RunStore:
             raise ValueError("a Forge Observation Schedule cannot be created already CLOSED")
         if minimum_interval_ms <= 0:
             raise ValueError("minimum_interval_ms must be positive")
+        self._validate_forge_observation_schedule_authority(
+            project_id=project_id,
+            forge_instance_id=forge_instance_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            run_id=run_id,
+            publication_id=publication_id,
+            terminal_duplicate_cleanup_reservation_id=terminal_duplicate_cleanup_reservation_id,
+        )
         existing = self.get_forge_observation_schedule_by_identity(
             project_id=project_id,
             schedule_kind=schedule_kind,
@@ -10818,6 +11121,112 @@ class RunStore:
             (outbox_id,),
         )
 
+    def _validate_forge_observation_request_authority(
+        self,
+        *,
+        schedule: ForgeObservationScheduleRecord,
+        credential_purpose: str,
+        credential_secret_id: str,
+        credential_secret_version: int,
+        controller_activity_id: str | None,
+        effect_generation: int | None,
+        controller_operation_digest: str | None,
+        terminal_duplicate_cleanup_action_id: str | None,
+        terminal_cleanup_operation_digest: str | None,
+    ) -> None:
+        """Bind request credentials and operation fields to durable target authority."""
+        project = self.conn.execute(
+            "SELECT forge_instance_id, source_read_secret_id FROM projects WHERE project_id = ?",
+            (schedule.project_id,),
+        ).fetchone()
+        if project is None or project["forge_instance_id"] != schedule.forge_instance_id:
+            raise ValueError("Forge request Schedule is not owned by its Project authority")
+
+        if schedule.target_kind != "PUBLICATION":
+            if any(
+                value is not None
+                for value in (
+                    controller_activity_id,
+                    effect_generation,
+                    controller_operation_digest,
+                    terminal_duplicate_cleanup_action_id,
+                    terminal_cleanup_operation_digest,
+                )
+            ):
+                raise ValueError("non-PUBLICATION Forge request forbids Publication bindings")
+            secret = self.conn.execute(
+                "SELECT purpose, current_version FROM secret_current_versions WHERE secret_id = ?",
+                (project["source_read_secret_id"],),
+            ).fetchone()
+            if (
+                credential_purpose != "PROJECT_SOURCE_READ"
+                or credential_secret_id != project["source_read_secret_id"]
+                or secret is None
+                or secret["purpose"] != "SOURCE_READ"
+                or credential_secret_version != secret["current_version"]
+            ):
+                raise ValueError(
+                    "Forge request does not use the Project's current source credential"
+                )
+            return
+
+        if effect_generation is None:
+            raise ValueError("PUBLICATION Forge request requires effect_generation")
+        effect = self.conn.execute(
+            "SELECT pe.*, p.run_id, r.project_id FROM publication_effects pe "
+            "JOIN publications p ON p.publication_id = pe.publication_id "
+            "JOIN runs r ON r.run_id = p.run_id "
+            "WHERE pe.publication_id = ? AND pe.effect_generation = ?",
+            (schedule.publication_id, effect_generation),
+        ).fetchone()
+        if (
+            effect is None
+            or schedule.target_id != schedule.publication_id
+            or schedule.run_id != effect["run_id"]
+            or schedule.project_id != effect["project_id"]
+        ):
+            raise ValueError("Forge request does not resolve to its Publication Effect")
+        if (
+            credential_purpose != "PUBLICATION"
+            or credential_secret_id != effect["publication_secret_id"]
+            or credential_secret_version != effect["publication_secret_version"]
+        ):
+            raise ValueError("Forge request does not use the Publication Effect credential")
+
+        if terminal_duplicate_cleanup_action_id is None:
+            if terminal_cleanup_operation_digest is not None:
+                raise ValueError("cleanup operation digest requires a cleanup Action")
+            if (
+                controller_activity_id != effect["activity_id"]
+                or controller_operation_digest != effect["operation_digest"]
+            ):
+                raise ValueError("Forge request does not match its Publication Effect operation")
+            return
+
+        if schedule.terminal_duplicate_cleanup_reservation_id is None:
+            raise ValueError("cleanup Action requires a cleanup-scoped Forge Schedule")
+        if controller_activity_id is not None or controller_operation_digest is not None:
+            raise ValueError("cleanup Action request forbids controller Activity bindings")
+        action = self.conn.execute(
+            "SELECT a.operation_digest, a.terminal_duplicate_cleanup_reservation_id, "
+            "r.publication_id, r.effect_generation "
+            "FROM terminal_duplicate_cleanup_actions a "
+            "JOIN terminal_duplicate_cleanup_reservations r "
+            "ON r.terminal_duplicate_cleanup_reservation_id = "
+            "a.terminal_duplicate_cleanup_reservation_id "
+            "WHERE a.terminal_duplicate_cleanup_action_id = ?",
+            (terminal_duplicate_cleanup_action_id,),
+        ).fetchone()
+        if (
+            action is None
+            or action["terminal_duplicate_cleanup_reservation_id"]
+            != schedule.terminal_duplicate_cleanup_reservation_id
+            or action["publication_id"] != schedule.publication_id
+            or action["effect_generation"] != effect_generation
+            or action["operation_digest"] != terminal_cleanup_operation_digest
+        ):
+            raise ValueError("Forge request does not match its cleanup Action operation")
+
     def create_due_forge_observation_request(
         self,
         *,
@@ -10870,6 +11279,17 @@ class RunStore:
             schedule = _row_to_forge_observation_schedule(row)
             if schedule.state != "ACTIVE":
                 return None
+            self._validate_forge_observation_request_authority(
+                schedule=schedule,
+                credential_purpose=credential_purpose,
+                credential_secret_id=credential_secret_id,
+                credential_secret_version=credential_secret_version,
+                controller_activity_id=controller_activity_id,
+                effect_generation=effect_generation,
+                controller_operation_digest=controller_operation_digest,
+                terminal_duplicate_cleanup_action_id=terminal_duplicate_cleanup_action_id,
+                terminal_cleanup_operation_digest=terminal_cleanup_operation_digest,
+            )
             pending = self.conn.execute(
                 "SELECT * FROM forge_observation_requests "
                 "WHERE forge_observation_schedule_id = ? AND state = 'PENDING'",
@@ -10895,6 +11315,36 @@ class RunStore:
                 expected_discovery_set_digest = schedule.last_discovery_set_digest
                 expected_prior_observation_sequence = None
                 expected_external_revision = None
+            elif (
+                expected_prior_observation_sequence is not None
+                or expected_external_revision is not None
+            ):
+                latest_observation = self.conn.execute(
+                    "SELECT observation_sequence, external_revision "
+                    "FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+                    "AND target_id = ? ORDER BY observation_sequence DESC LIMIT 1",
+                    (schedule.project_id, schedule.target_kind, schedule.target_id),
+                ).fetchone()
+                actual_sequence = (
+                    None
+                    if latest_observation is None
+                    else latest_observation["observation_sequence"]
+                )
+                actual_external_revision = (
+                    None if latest_observation is None else latest_observation["external_revision"]
+                )
+                if (
+                    expected_prior_observation_sequence is not None
+                    and expected_prior_observation_sequence != actual_sequence
+                ):
+                    raise CasMismatchError(
+                        "expected prior Forge observation sequence is no longer current"
+                    )
+                if (
+                    expected_external_revision is not None
+                    and expected_external_revision != actual_external_revision
+                ):
+                    raise CasMismatchError("expected Forge external revision is no longer current")
             digest = request_digest(
                 {
                     "protocol_version": protocol_version,
@@ -11160,6 +11610,12 @@ class RunStore:
         target_id: str,
         run_id: str | None,
         publication_id: str | None,
+        publication_effect_generation: int | None,
+        controller_activity_id: str | None,
+        controller_operation_digest: str | None,
+        terminal_duplicate_cleanup_reservation_id: str | None,
+        terminal_duplicate_cleanup_action_id: str | None,
+        terminal_cleanup_operation_digest: str | None,
         created_by_forge_observation_request_id: str | None,
         credential_purpose: str | None,
         credential_secret_id: str | None,
@@ -11197,6 +11653,31 @@ class RunStore:
                     raise IdempotencyConflictError(
                         "adapter_event_id was replayed with a different observation payload"
                     )
+                replay_bindings = {
+                    "run_id": run_id,
+                    "publication_id": publication_id,
+                    "publication_effect_generation": publication_effect_generation,
+                    "controller_activity_id": controller_activity_id,
+                    "controller_operation_digest": controller_operation_digest,
+                    "terminal_duplicate_cleanup_reservation_id": (
+                        terminal_duplicate_cleanup_reservation_id
+                    ),
+                    "terminal_duplicate_cleanup_action_id": (terminal_duplicate_cleanup_action_id),
+                    "terminal_cleanup_operation_digest": terminal_cleanup_operation_digest,
+                    "credential_purpose": credential_purpose,
+                    "credential_secret_id": credential_secret_id,
+                    "credential_secret_version": credential_secret_version,
+                }
+                mismatched = [
+                    field
+                    for field, expected in replay_bindings.items()
+                    if existing[field] != expected
+                ]
+                if mismatched:
+                    raise IdempotencyConflictError(
+                        "adapter_event_id was replayed under different immutable bindings: "
+                        + ", ".join(sorted(mismatched))
+                    )
                 return existing["forge_observation_id"], existing["payload_digest"]
         else:
             latest = self.conn.execute(
@@ -11209,6 +11690,14 @@ class RunStore:
                 and latest["payload_digest"] == payload_digest
                 and latest["run_id"] == run_id
                 and latest["publication_id"] == publication_id
+                and latest["publication_effect_generation"] == publication_effect_generation
+                and latest["controller_activity_id"] == controller_activity_id
+                and latest["controller_operation_digest"] == controller_operation_digest
+                and latest["terminal_duplicate_cleanup_reservation_id"]
+                == terminal_duplicate_cleanup_reservation_id
+                and latest["terminal_duplicate_cleanup_action_id"]
+                == terminal_duplicate_cleanup_action_id
+                and latest["terminal_cleanup_operation_digest"] == terminal_cleanup_operation_digest
                 and latest["credential_purpose"] == credential_purpose
                 and latest["credential_secret_id"] == credential_secret_id
                 and latest["credential_secret_version"] == credential_secret_version
@@ -11232,8 +11721,7 @@ class RunStore:
             "terminal_cleanup_operation_digest, kind, external_revision, adapter_event_id, "
             "actor_principal_id, actor_authorization_digest, fact_json, payload_digest, "
             "observation_sequence, observed_at_ms) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 forge_observation_id,
                 project_id,
@@ -11245,6 +11733,12 @@ class RunStore:
                 credential_purpose,
                 credential_secret_id,
                 credential_secret_version,
+                publication_effect_generation,
+                controller_activity_id,
+                controller_operation_digest,
+                terminal_duplicate_cleanup_reservation_id,
+                terminal_duplicate_cleanup_action_id,
+                terminal_cleanup_operation_digest,
                 obs.kind,
                 obs.external_revision,
                 obs.adapter_event_id,
@@ -11335,6 +11829,18 @@ class RunStore:
                         target_id=request.target_id,
                         run_id=request.run_id,
                         publication_id=request.publication_id,
+                        publication_effect_generation=request.effect_generation,
+                        controller_activity_id=request.controller_activity_id,
+                        controller_operation_digest=request.controller_operation_digest,
+                        terminal_duplicate_cleanup_reservation_id=(
+                            request.terminal_duplicate_cleanup_reservation_id
+                        ),
+                        terminal_duplicate_cleanup_action_id=(
+                            request.terminal_duplicate_cleanup_action_id
+                        ),
+                        terminal_cleanup_operation_digest=(
+                            request.terminal_cleanup_operation_digest
+                        ),
                         created_by_forge_observation_request_id=forge_observation_request_id,
                         credential_purpose=request.credential_purpose,
                         credential_secret_id=request.credential_secret_id,
@@ -11551,6 +12057,12 @@ class RunStore:
                 target_id=target_id,
                 run_id=None,
                 publication_id=None,
+                publication_effect_generation=None,
+                controller_activity_id=None,
+                controller_operation_digest=None,
+                terminal_duplicate_cleanup_reservation_id=None,
+                terminal_duplicate_cleanup_action_id=None,
+                terminal_cleanup_operation_digest=None,
                 created_by_forge_observation_request_id=forge_observation_request_id,
                 credential_purpose=request.credential_purpose,
                 credential_secret_id=request.credential_secret_id,
@@ -14385,6 +14897,43 @@ class RunStore:
     # all later "workflow v1" leaves (docs/superpowers/plans/
     # 2026-08-30-workflow-control-v1-github-issues.md, V1-26).
 
+    def _supersede_publication_effect_in_tx(
+        self,
+        *,
+        publication_id: str,
+        effect_generation: int,
+        activity_id: str,
+        now: int,
+    ) -> None:
+        """Fence one Publication Effect and every not-yet-delivered work item.
+
+        The caller holds the writer transaction.  Observation Requests carry
+        the immutable Effect generation too, so leaving one pending would make
+        the shared Schedule hand the old request back to a replacement Effect.
+        """
+        self.conn.execute(
+            "UPDATE publication_effects SET superseded = 1 "
+            "WHERE publication_id = ? AND effect_generation = ? AND superseded = 0",
+            (publication_id, effect_generation),
+        )
+        self.conn.execute(
+            "UPDATE activities SET state = 'SUPERSEDED', updated_at_ms = ? "
+            "WHERE activity_id = ? AND state IN ('PLANNED', 'READY', 'ACTIVE')",
+            (now, activity_id),
+        )
+        pending_requests = self.conn.execute(
+            "SELECT * FROM forge_observation_requests WHERE publication_id = ? "
+            "AND effect_generation = ? AND state = 'PENDING'",
+            (publication_id, effect_generation),
+        ).fetchall()
+        for request_row in pending_requests:
+            self._supersede_pending_request_before_io(request_row)
+        self.conn.execute(
+            "UPDATE outbox SET state = 'SUPERSEDED' "
+            "WHERE source_kind = 'ACTIVITY' AND source_id = ? AND state = 'PENDING'",
+            (activity_id,),
+        )
+
     def plan_publish_effect(
         self,
         *,
@@ -14450,7 +14999,6 @@ class RunStore:
                     or activity.policy_hash != policy_hash
                     or activity.kind != "PUBLISH"
                     or activity.execution_class != "CONTROLLER"
-                    or activity.state != "ACTIVE"
                     or activity.candidate_id != candidate_id
                     or activity.forge_observation_id is not None
                     or activity.change_request_head_observation_id is not None
@@ -14495,6 +15043,7 @@ class RunStore:
                         "mode": "INITIAL",
                         "candidate_id": candidate_id,
                         "desired_commit": desired.as_json(),
+                        "expected_remote_commit": effect.expected_remote_commit,
                         "publication_secret_id": publication_secret_id,
                         "publication_secret_version": publication_secret_version,
                         "base_ref": base_ref,
@@ -14518,14 +15067,17 @@ class RunStore:
                     or effect.mode != "INITIAL"
                     or effect.candidate_id != candidate_id
                     or effect.desired_commit_json != desired.as_json()
-                    or effect.expected_remote_commit is not None
                     or effect.publication_secret_id != publication_secret_id
                     or effect.publication_secret_version != publication_secret_version
                     or effect.base_ref != base_ref
                     or effect.base_commit_json != base.as_json()
                     or effect.base_movement_policy != base_movement_policy
                     or effect.operation_digest != expected_operation_digest
-                    or effect.superseded
+                    or (
+                        effect.effect_generation
+                        != _row_to_publication(publication_row).effect_generation
+                        and not effect.superseded
+                    )
                     or effect.created_transition_sequence != created_transition_sequence
                     or outbox.outbox_id != outbox_id
                     or outbox.source_kind != "ACTIVITY"
@@ -14550,6 +15102,7 @@ class RunStore:
             existing_publication_row = self.conn.execute(
                 "SELECT * FROM publications WHERE run_id = ?", (run_id,)
             ).fetchone()
+            expected_remote_commit: str | None = None
             if existing_publication_row is None:
                 effect_generation = 1
                 self.conn.execute(
@@ -14578,11 +15131,65 @@ class RunStore:
                         f"run {run_id!r} already has publication "
                         f"{existing_publication.publication_id!r}"
                     )
+                if existing_publication.state in ("ACTIVE", "CLOSED"):
+                    raise RunStoreError(
+                        f"an INITIAL publication effect cannot replan a publication in "
+                        f"state {existing_publication.state!r}"
+                    )
+                if existing_publication.deterministic_branch != deterministic_branch:
+                    raise RunStoreError(
+                        "a publication replan cannot change its deterministic branch"
+                    )
+                if existing_publication.run_marker != run_marker:
+                    raise RunStoreError("a publication replan cannot change its run marker")
                 effect_generation = existing_publication.effect_generation + 1
+                previous_effect_row = self.conn.execute(
+                    "SELECT * FROM publication_effects WHERE publication_id = ? "
+                    "AND effect_generation = ?",
+                    (publication_id, existing_publication.effect_generation),
+                ).fetchone()
+                if previous_effect_row is None:
+                    raise RunStoreError("publication replan is missing its current effect")
+                previous_effect = _row_to_publication_effect(previous_effect_row)
+                ref_mutation = self.conn.execute(
+                    "SELECT status FROM publication_effect_checkpoints "
+                    "WHERE publication_id = ? AND effect_generation = ? "
+                    "AND suboperation_kind IN ('REF_CREATE', 'REF_UPDATE') "
+                    "AND status IN ('REQUEST_READY', 'OBSERVED_SATISFIED') "
+                    "ORDER BY checkpoint_sequence DESC LIMIT 1",
+                    (publication_id, existing_publication.effect_generation),
+                ).fetchone()
+                prior_desired_oid = previous_effect.desired_commit["oid"]
+                owned_provisional_ref = ref_mutation is not None and (
+                    ref_mutation["status"] == "OBSERVED_SATISFIED"
+                    or existing_publication.observed_remote_commit == prior_desired_oid
+                )
+                if owned_provisional_ref:
+                    expected_remote_commit = prior_desired_oid
+                elif existing_publication.change_request_external_id is not None:
+                    # The exact-object association proves the previous
+                    # Effect's desired head.  A different earlier REF_READ is
+                    # stale/foreign evidence and must never become overwrite
+                    # authority for the replacement Effect.
+                    expected_remote_commit = prior_desired_oid
+                self._supersede_publication_effect_in_tx(
+                    publication_id=publication_id,
+                    effect_generation=existing_publication.effect_generation,
+                    activity_id=previous_effect.activity_id,
+                    now=now,
+                )
                 self.conn.execute(
                     "UPDATE publications SET candidate_id = ?, approved_commit_json = ?, "
-                    "effect_generation = ?, updated_at_ms = ? WHERE publication_id = ?",
-                    (candidate_id, desired.as_json(), effect_generation, now, publication_id),
+                    "effect_generation = ?, expected_remote_commit = ?, state = 'PLANNED', "
+                    "updated_at_ms = ? WHERE publication_id = ?",
+                    (
+                        candidate_id,
+                        desired.as_json(),
+                        effect_generation,
+                        expected_remote_commit,
+                        now,
+                        publication_id,
+                    ),
                 )
 
             operation_digest = publication_effect_operation_digest(
@@ -14592,6 +15199,7 @@ class RunStore:
                     "mode": "INITIAL",
                     "candidate_id": candidate_id,
                     "desired_commit": desired.as_json(),
+                    "expected_remote_commit": expected_remote_commit,
                     "publication_secret_id": publication_secret_id,
                     "publication_secret_version": publication_secret_version,
                     "base_ref": base_ref,
@@ -14634,13 +15242,14 @@ class RunStore:
                 "publication_secret_version, base_ref, base_commit_json, "
                 "base_movement_policy, operation_digest, superseded, "
                 "created_transition_sequence, created_at_ms) "
-                "VALUES (?, ?, ?, 'INITIAL', ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                "VALUES (?, ?, ?, 'INITIAL', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 (
                     publication_id,
                     effect_generation,
                     activity_id,
                     candidate_id,
                     desired.as_json(),
+                    expected_remote_commit,
                     publication_secret_id,
                     publication_secret_version,
                     base_ref,
@@ -14724,6 +15333,531 @@ class RunStore:
         ).fetchall()
         return tuple(_row_to_publication_effect_checkpoint(row) for row in rows)
 
+    def _require_completed_forge_observation_provenance(
+        self,
+        *,
+        forge_observation_id: str,
+        require_fresh: bool,
+    ) -> tuple[sqlite3.Row, ForgeObservationRequestRecord, ForgeObservationScheduleRecord]:
+        """Resolve an Observation through a completed Request result and authority Schedule."""
+        observation = self.conn.execute(
+            "SELECT * FROM forge_observations WHERE forge_observation_id = ?",
+            (forge_observation_id,),
+        ).fetchone()
+        if observation is None:
+            raise RunStoreError(f"forge observation {forge_observation_id!r} was not found")
+
+        if require_fresh:
+            request_rows = self.conn.execute(
+                "SELECT fr.* FROM forge_observation_request_results rr "
+                "JOIN forge_observation_requests fr "
+                "ON fr.forge_observation_request_id = rr.forge_observation_request_id "
+                "JOIN forge_observation_schedules fs "
+                "ON fs.forge_observation_schedule_id = fr.forge_observation_schedule_id "
+                "WHERE rr.forge_observation_id = ? AND fr.state = 'COMPLETED' "
+                "AND fs.last_request_id = fr.forge_observation_request_id "
+                "ORDER BY fr.completed_at_ms DESC, fr.request_sequence DESC",
+                (forge_observation_id,),
+            ).fetchall()
+        else:
+            request_rows = self.conn.execute(
+                "SELECT fr.* FROM forge_observation_request_results rr "
+                "JOIN forge_observation_requests fr "
+                "ON fr.forge_observation_request_id = rr.forge_observation_request_id "
+                "WHERE rr.forge_observation_id = ? AND fr.state = 'COMPLETED' "
+                "AND fr.forge_observation_request_id = ?",
+                (forge_observation_id, observation["created_by_forge_observation_request_id"]),
+            ).fetchall()
+        if not request_rows:
+            qualifier = "current " if require_fresh else ""
+            raise RunStoreError(
+                f"forge observation is not a result of a completed {qualifier}Forge request"
+            )
+
+        request_kind_for_observation = {
+            "BASE_HEAD": "BASE_HEAD_POLL",
+            "REF_ABSENT": "REF_POLL",
+            "REF_HEAD": "REF_POLL",
+            "CHANGE_REQUEST_ABSENT": "CHANGE_REQUEST_SEARCH",
+            "CHANGE_REQUEST_DISCOVERED": "CHANGE_REQUEST_SEARCH",
+            "CHANGE_REQUEST_SEARCH_RESULT": "COMPLETE_MARKER_SEARCH",
+            "CHANGE_REQUEST_HEAD": "CHANGE_REQUEST_POLL",
+            "CHANGE_REQUEST_MARKER": "CHANGE_REQUEST_POLL",
+            "CHANGE_REQUEST_MERGED": "CHANGE_REQUEST_POLL",
+            "CHANGE_REQUEST_CLOSED": "CHANGE_REQUEST_POLL",
+        }.get(observation["kind"])
+        selected: tuple[ForgeObservationRequestRecord, ForgeObservationScheduleRecord] | None = None
+        for request_row in request_rows:
+            request = _row_to_forge_observation_request(request_row)
+            if request.request_kind != request_kind_for_observation:
+                continue
+            schedule_row = self.conn.execute(
+                "SELECT * FROM forge_observation_schedules WHERE forge_observation_schedule_id = ?",
+                (request.forge_observation_schedule_id,),
+            ).fetchone()
+            assert schedule_row is not None
+            selected = request, _row_to_forge_observation_schedule(schedule_row)
+            break
+        if selected is None:
+            raise RunStoreError("forge observation kind is incompatible with its completed request")
+        request, schedule = selected
+
+        copied_bindings = {
+            "project_id": request.project_id,
+            "target_kind": request.target_kind,
+            "target_id": request.target_id,
+            "run_id": request.run_id,
+            "publication_id": request.publication_id,
+            "publication_effect_generation": request.effect_generation,
+            "controller_activity_id": request.controller_activity_id,
+            "controller_operation_digest": request.controller_operation_digest,
+            "terminal_duplicate_cleanup_reservation_id": (
+                request.terminal_duplicate_cleanup_reservation_id
+            ),
+            "terminal_duplicate_cleanup_action_id": (request.terminal_duplicate_cleanup_action_id),
+            "terminal_cleanup_operation_digest": request.terminal_cleanup_operation_digest,
+            "credential_purpose": request.credential_purpose,
+            "credential_secret_id": request.credential_secret_id,
+            "credential_secret_version": request.credential_secret_version,
+        }
+        mismatched = [
+            field for field, expected in copied_bindings.items() if observation[field] != expected
+        ]
+        schedule_bindings = (
+            ("request_kind", request.request_kind, schedule.schedule_kind),
+            ("project_id", request.project_id, schedule.project_id),
+            ("forge_instance_id", request.forge_instance_id, schedule.forge_instance_id),
+            ("target_kind", request.target_kind, schedule.target_kind),
+            ("target_id", request.target_id, schedule.target_id),
+            ("run_id", request.run_id, schedule.run_id),
+            ("publication_id", request.publication_id, schedule.publication_id),
+            (
+                "terminal_duplicate_cleanup_reservation_id",
+                request.terminal_duplicate_cleanup_reservation_id,
+                schedule.terminal_duplicate_cleanup_reservation_id,
+            ),
+        )
+        mismatched.extend(
+            f"schedule.{field}"
+            for field, actual, expected in schedule_bindings
+            if actual != expected
+        )
+        if mismatched:
+            raise RunStoreError(
+                "forge observation provenance binding mismatch: "
+                + ", ".join(sorted(set(mismatched)))
+            )
+
+        expected_schedule_digest = forge_observation_schedule_digest(
+            _forge_observation_schedule_digest_fields(
+                schedule_kind=schedule.schedule_kind,
+                project_id=schedule.project_id,
+                forge_instance_id=schedule.forge_instance_id,
+                target_kind=schedule.target_kind,
+                target_id=schedule.target_id,
+                run_id=schedule.run_id,
+                publication_id=schedule.publication_id,
+                terminal_duplicate_cleanup_reservation_id=(
+                    schedule.terminal_duplicate_cleanup_reservation_id
+                ),
+                minimum_interval_ms=schedule.minimum_interval_ms,
+            )
+        )
+        if schedule.schedule_digest != expected_schedule_digest:
+            raise RunStoreError("Forge observation Schedule digest is not canonical")
+        expected_request_digest = request_digest(
+            {
+                "protocol_version": request.protocol_version,
+                "forge_observation_schedule_id": request.forge_observation_schedule_id,
+                "schedule_revision": request.schedule_revision,
+                "request_sequence": request.request_sequence,
+                "request_kind": request.request_kind,
+                "project_id": request.project_id,
+                "forge_instance_id": request.forge_instance_id,
+                "target_kind": request.target_kind,
+                "target_id": request.target_id,
+                "run_id": request.run_id,
+                "publication_id": request.publication_id,
+                "terminal_duplicate_cleanup_reservation_id": (
+                    request.terminal_duplicate_cleanup_reservation_id
+                ),
+                "created_under_controller_mode_revision": (
+                    request.created_under_controller_mode_revision
+                ),
+                "created_under_controller_mode": request.created_under_controller_mode,
+                "credential_purpose": request.credential_purpose,
+                "credential_secret_id": request.credential_secret_id,
+                "credential_secret_version": request.credential_secret_version,
+                "controller_activity_id": request.controller_activity_id,
+                "effect_generation": request.effect_generation,
+                "controller_operation_digest": request.controller_operation_digest,
+                "terminal_duplicate_cleanup_action_id": (
+                    request.terminal_duplicate_cleanup_action_id
+                ),
+                "terminal_cleanup_operation_digest": (request.terminal_cleanup_operation_digest),
+                "expected_prior_observation_sequence": (
+                    request.expected_prior_observation_sequence
+                ),
+                "expected_external_revision": request.expected_external_revision,
+                "expected_discovery_search_revision": (request.expected_discovery_search_revision),
+                "expected_discovery_set_digest": request.expected_discovery_set_digest,
+            }
+        )
+        if (
+            request.request_idempotency_key != request.forge_observation_request_id
+            or request.request_digest != expected_request_digest
+        ):
+            raise RunStoreError("Forge observation Request digest is not canonical")
+        expected_observation_digest = forge_observation_payload_digest(
+            {
+                "kind": observation["kind"],
+                "target_kind": observation["target_kind"],
+                "target_id": observation["target_id"],
+                "external_revision": observation["external_revision"],
+                "fact": json.loads(observation["fact_json"]),
+            }
+        )
+        if observation["payload_digest"] != expected_observation_digest:
+            raise RunStoreError("Forge observation payload digest is not canonical")
+        self._validate_forge_observation_schedule_authority(
+            project_id=schedule.project_id,
+            forge_instance_id=schedule.forge_instance_id,
+            target_kind=schedule.target_kind,
+            target_id=schedule.target_id,
+            run_id=schedule.run_id,
+            publication_id=schedule.publication_id,
+            terminal_duplicate_cleanup_reservation_id=(
+                schedule.terminal_duplicate_cleanup_reservation_id
+            ),
+        )
+        self._validate_forge_observation_request_authority(
+            schedule=schedule,
+            credential_purpose=request.credential_purpose,
+            credential_secret_id=request.credential_secret_id,
+            credential_secret_version=request.credential_secret_version,
+            controller_activity_id=request.controller_activity_id,
+            effect_generation=request.effect_generation,
+            controller_operation_digest=request.controller_operation_digest,
+            terminal_duplicate_cleanup_action_id=request.terminal_duplicate_cleanup_action_id,
+            terminal_cleanup_operation_digest=request.terminal_cleanup_operation_digest,
+        )
+
+        result_ids = tuple(
+            row["forge_observation_id"]
+            for row in self.conn.execute(
+                "SELECT forge_observation_id FROM forge_observation_request_results "
+                "WHERE forge_observation_request_id = ? ORDER BY observation_ordinal",
+                (request.forge_observation_request_id,),
+            )
+        )
+        if request.result_observation_ids_digest != forge_observation_result_membership_digest(
+            result_ids
+        ):
+            raise RunStoreError("Forge request result membership digest does not match its rows")
+        if require_fresh:
+            newer = self.conn.execute(
+                "SELECT 1 FROM forge_observations WHERE project_id = ? AND target_kind = ? "
+                "AND target_id = ? AND observation_sequence > ? LIMIT 1",
+                (
+                    observation["project_id"],
+                    observation["target_kind"],
+                    observation["target_id"],
+                    observation["observation_sequence"],
+                ),
+            ).fetchone()
+            if newer is not None:
+                raise RunStoreError("forge observation is stale relative to a newer target fact")
+        return observation, request, schedule
+
+    def _require_bound_publication_observation(
+        self,
+        *,
+        forge_observation_id: str,
+        publication_id: str,
+        effect_generation: int,
+        expected_kinds: Sequence[str],
+        observed_external_revision: str,
+        require_fresh: bool = True,
+    ) -> sqlite3.Row:
+        """Return an authenticated Observation bound to one immutable Effect.
+
+        Publication lifecycle writes must never accept a UUID-shaped assertion
+        from their caller.  The Observation has to be the durable result of a
+        Publication-scoped Forge request carrying the same Activity and
+        operation digest as the immutable Effect.
+        """
+        row, _request, _schedule = self._require_completed_forge_observation_provenance(
+            forge_observation_id=forge_observation_id,
+            require_fresh=require_fresh,
+        )
+        authority = self.conn.execute(
+            "SELECT pe.activity_id AS expected_activity_id, "
+            "pe.operation_digest AS expected_operation_digest, "
+            "pe.publication_secret_id AS expected_credential_secret_id, "
+            "pe.publication_secret_version AS expected_credential_secret_version, "
+            "r.project_id AS expected_project_id, "
+            "p.run_id AS expected_run_id "
+            "FROM publication_effects pe "
+            "JOIN publications p ON p.publication_id = pe.publication_id "
+            "JOIN runs r ON r.run_id = p.run_id "
+            "WHERE pe.publication_id = ? AND pe.effect_generation = ?",
+            (publication_id, effect_generation),
+        ).fetchone()
+        if authority is None:
+            raise RunStoreError(
+                f"forge observation {forge_observation_id!r} was not found for "
+                f"publication effect ({publication_id!r}, {effect_generation!r})"
+            )
+        expected = {
+            "project_id": authority["expected_project_id"],
+            "target_kind": "PUBLICATION",
+            "target_id": publication_id,
+            "run_id": authority["expected_run_id"],
+            "publication_id": publication_id,
+            "publication_effect_generation": effect_generation,
+            "controller_activity_id": authority["expected_activity_id"],
+            "controller_operation_digest": authority["expected_operation_digest"],
+            "credential_purpose": "PUBLICATION",
+            "credential_secret_id": authority["expected_credential_secret_id"],
+            "credential_secret_version": authority["expected_credential_secret_version"],
+            "external_revision": observed_external_revision,
+        }
+        mismatched = [field for field, value in expected.items() if row[field] != value]
+        if row["kind"] not in expected_kinds:
+            mismatched.append("kind")
+        if row["created_by_forge_observation_request_id"] is None:
+            mismatched.append("created_by_forge_observation_request_id")
+        if mismatched:
+            raise RunStoreError(
+                "forge observation is not bound to the exact publication effect: "
+                + ", ".join(sorted(set(mismatched)))
+            )
+        return row
+
+    def _validate_publication_checkpoint_observation_fact(
+        self,
+        *,
+        observation: sqlite3.Row,
+        publication: PublicationRecord,
+        effect: PublicationEffectRecord,
+        suboperation_kind: str,
+        status: str,
+    ) -> None:
+        """Derive checkpoint truth from the adapter fact, never from status alone."""
+        fact = json.loads(observation["fact_json"])
+        if not isinstance(fact, dict):
+            raise ValueError("Publication checkpoint observation fact must be an object")
+
+        def head_json(*names: str) -> str:
+            value = next((fact[name] for name in names if name in fact), None)
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{suboperation_kind} observation requires {'/'.join(names)}")
+            return _require_git_commit_ref(
+                value, field=f"{suboperation_kind}.observed_head"
+            ).as_json()
+
+        if suboperation_kind in ("BASE_READ_PRE", "BASE_READ_POST"):
+            if fact.get("base_ref") != effect.base_ref:
+                raise ValueError(f"{suboperation_kind} observation does not match base_ref")
+            if fact.get("base_movement_policy") != effect.base_movement_policy:
+                raise ValueError(
+                    f"{suboperation_kind} observation does not match base_movement_policy"
+                )
+            observed_head = head_json("observed_head", "base_commit")
+            base_matches = observed_head == effect.base_commit_json
+            if status == "OBSERVED_SATISFIED" and not base_matches:
+                raise ValueError(f"{suboperation_kind} cannot claim satisfied for a moved base")
+            if status == "BASE_MISMATCH" and base_matches:
+                raise ValueError(f"{suboperation_kind} cannot claim mismatch for the pinned base")
+            return
+
+        if fact.get("deterministic_ref") != publication.deterministic_branch:
+            raise ValueError(f"{suboperation_kind} observation does not match deterministic_ref")
+
+        if suboperation_kind == "REF_READ":
+            if status == "OBSERVED_ABSENT":
+                if fact.get("nonexistence_token") != observation["external_revision"]:
+                    raise ValueError("REF_READ absence fact does not match its external revision")
+            elif head_json("observed_head") != effect.desired_commit_json:
+                raise ValueError("REF_READ cannot claim satisfied for a foreign head")
+            return
+
+        if suboperation_kind in ("REF_CREATE", "REF_UPDATE"):
+            observed_head = head_json("observed_head")
+            desired_matches = observed_head == effect.desired_commit_json
+            if status == "OBSERVED_SATISFIED" and not desired_matches:
+                raise ValueError(f"{suboperation_kind} did not observe the desired commit")
+            if status == "CAS_MISMATCH" and desired_matches:
+                raise ValueError(f"{suboperation_kind} CAS mismatch requires a different head")
+            return
+
+        if suboperation_kind in ("CHANGE_REQUEST_SEARCH", "CHANGE_REQUEST_CREATE"):
+            if fact.get("run_marker") != publication.run_marker:
+                raise ValueError(f"{suboperation_kind} observation does not match run_marker")
+            if status == "OBSERVED_ABSENT":
+                if fact.get("nonexistence_token") != observation["external_revision"]:
+                    raise ValueError(
+                        "Change Request absence fact does not match its external revision"
+                    )
+                return
+            _require_nonempty_text(
+                fact.get("change_request_external_id"),
+                field=f"{suboperation_kind}.change_request_external_id",
+            )
+            if head_json("observed_head") != effect.desired_commit_json:
+                raise ValueError(f"{suboperation_kind} observation does not prove the desired head")
+            return
+
+        raise RunStoreError(
+            f"unsupported Publication checkpoint observation fact for {suboperation_kind!r}"
+        )
+
+    def _validate_publication_checkpoint_order(
+        self,
+        *,
+        publication_id: str,
+        effect_generation: int,
+        suboperation_kind: str,
+        status: str,
+        request_idempotency_key: str | None,
+        allow_terminal_complete: bool,
+    ) -> None:
+        """Enforce the INITIAL Publication Effect's closed phase graph."""
+        effect = self.conn.execute(
+            "SELECT mode FROM publication_effects WHERE publication_id = ? "
+            "AND effect_generation = ?",
+            (publication_id, effect_generation),
+        ).fetchone()
+        assert effect is not None
+        checkpoints = self.conn.execute(
+            "SELECT suboperation_kind, status, request_idempotency_key "
+            "FROM publication_effect_checkpoints "
+            "WHERE publication_id = ? AND effect_generation = ? ORDER BY checkpoint_sequence",
+            (publication_id, effect_generation),
+        ).fetchall()
+        kinds = [row["suboperation_kind"] for row in checkpoints]
+        if "COMPLETE" in kinds:
+            raise RunStoreError("a completed publication effect accepts no later checkpoint")
+        if any(row["status"] == "BASE_MISMATCH" for row in checkpoints):
+            raise RunStoreError("a base-mismatched publication effect accepts no later checkpoint")
+
+        if (
+            suboperation_kind in ("REF_CREATE", "REF_UPDATE", "CHANGE_REQUEST_CREATE")
+            and status != "REQUEST_READY"
+            and request_idempotency_key is not None
+            and not any(
+                row["suboperation_kind"] == suboperation_kind
+                and row["status"] == "REQUEST_READY"
+                and row["request_idempotency_key"] == request_idempotency_key
+                for row in checkpoints
+            )
+        ):
+            raise RunStoreError(
+                f"{suboperation_kind}/{status} requires a prior same-key REQUEST_READY"
+            )
+
+        if effect["mode"] == "UPDATE":
+            allowed = {
+                None: {"REF_READ", "REF_UPDATE"},
+                "REF_READ": {"REF_READ", "REF_UPDATE", "COMPLETE"},
+                "REF_UPDATE": {"REF_READ", "REF_UPDATE", "COMPLETE"},
+            }
+            previous = kinds[-1] if kinds else None
+            if suboperation_kind not in allowed.get(previous, set()):
+                raise RunStoreError(
+                    f"invalid UPDATE publication checkpoint order: {previous!r} -> "
+                    f"{suboperation_kind!r}"
+                )
+            return
+
+        if not checkpoints:
+            if suboperation_kind != "BASE_READ_PRE":
+                raise RunStoreError("INITIAL publication effects must start with BASE_READ_PRE")
+            return
+
+        if suboperation_kind == "BASE_READ_PRE":
+            if any(kind != "BASE_READ_PRE" for kind in kinds):
+                raise RunStoreError("BASE_READ_PRE cannot follow a later publication phase")
+            return
+
+        if not any(
+            row["suboperation_kind"] == "BASE_READ_PRE" and row["status"] == "OBSERVED_SATISFIED"
+            for row in checkpoints
+        ):
+            raise RunStoreError("publication effect requires a satisfied BASE_READ_PRE")
+
+        if suboperation_kind == "REF_READ":
+            if any(kind in ("COMPLETE_MARKER_SEARCH", "BASE_READ_POST") for kind in kinds):
+                raise RunStoreError("REF_READ cannot regress from the Change Request phase")
+            return
+
+        if "REF_READ" not in kinds:
+            raise RunStoreError(f"{suboperation_kind} requires a prior REF_READ")
+
+        if suboperation_kind in ("REF_CREATE", "REF_UPDATE"):
+            if any(kind in ("COMPLETE_MARKER_SEARCH", "BASE_READ_POST") for kind in kinds):
+                raise RunStoreError(
+                    f"{suboperation_kind} cannot regress from the Change Request phase"
+                )
+            return
+
+        if suboperation_kind == "COMPLETE_MARKER_SEARCH":
+            if "BASE_READ_POST" in kinds:
+                raise RunStoreError("COMPLETE_MARKER_SEARCH cannot follow BASE_READ_POST")
+            return
+
+        if "COMPLETE_MARKER_SEARCH" not in kinds:
+            raise RunStoreError(f"{suboperation_kind} requires a complete marker search")
+
+        if suboperation_kind == "CHANGE_REQUEST_SEARCH":
+            if "BASE_READ_POST" in kinds:
+                raise RunStoreError("CHANGE_REQUEST_SEARCH cannot follow BASE_READ_POST")
+            return
+
+        if suboperation_kind == "CHANGE_REQUEST_CREATE":
+            latest_search = next(
+                (
+                    row
+                    for row in reversed(checkpoints)
+                    if row["suboperation_kind"] == "CHANGE_REQUEST_SEARCH"
+                ),
+                None,
+            )
+            if latest_search is None or latest_search["status"] != "OBSERVED_ABSENT":
+                raise RunStoreError(
+                    "CHANGE_REQUEST_CREATE requires a prior absent Change Request search"
+                )
+            if "BASE_READ_POST" in kinds:
+                raise RunStoreError("CHANGE_REQUEST_CREATE cannot follow BASE_READ_POST")
+            return
+
+        if suboperation_kind == "BASE_READ_POST":
+            publication = self.conn.execute(
+                "SELECT state FROM publications WHERE publication_id = ?",
+                (publication_id,),
+            ).fetchone()
+            assert publication is not None
+            if publication["state"] != "CHANGE_REQUEST_OBSERVED":
+                raise RunStoreError("BASE_READ_POST requires a freshly linked Change Request")
+            return
+
+        if suboperation_kind == "COMPLETE":
+            if allow_terminal_complete:
+                if kinds[-1] != "COMPLETE_MARKER_SEARCH":
+                    raise RunStoreError(
+                        "terminal COMPLETE must immediately follow its complete marker search"
+                    )
+                return
+            if not any(
+                row["suboperation_kind"] == "BASE_READ_POST"
+                and row["status"] == "OBSERVED_SATISFIED"
+                for row in checkpoints
+            ):
+                raise RunStoreError("COMPLETE requires a satisfied BASE_READ_POST")
+            return
+
+        raise RunStoreError(f"unsupported Publication checkpoint phase {suboperation_kind!r}")
+
     def _insert_publication_effect_checkpoint_row(
         self,
         *,
@@ -14736,6 +15870,7 @@ class RunStore:
         forge_observation_id: str | None,
         observed_external_revision: str | None,
         now: int,
+        allow_terminal_complete: bool = False,
     ) -> PublicationEffectCheckpointRecord:
         """Insert one checkpoint row. Caller holds the transaction."""
         require_lowercase_uuid(
@@ -14748,6 +15883,7 @@ class RunStore:
             status=status,
             request_idempotency_key=request_idempotency_key,
             forge_observation_id=forge_observation_id,
+            observed_external_revision=observed_external_revision,
         )
         existing = self.conn.execute(
             "SELECT * FROM publication_effect_checkpoints "
@@ -14789,6 +15925,70 @@ class RunStore:
                         "publication effect request checkpoint was replayed with different content"
                     ),
                 )
+        if forge_observation_id is not None:
+            cross_phase = self.conn.execute(
+                "SELECT * FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND forge_observation_id = ? AND suboperation_kind != ? "
+                "ORDER BY checkpoint_sequence LIMIT 1",
+                (
+                    publication_id,
+                    effect_generation,
+                    forge_observation_id,
+                    suboperation_kind,
+                ),
+            ).fetchone()
+            terminal_search_completion = (
+                allow_terminal_complete
+                and suboperation_kind == "COMPLETE"
+                and cross_phase is not None
+                and cross_phase["suboperation_kind"] == "COMPLETE_MARKER_SEARCH"
+            )
+            update_completion = False
+            if cross_phase is not None and suboperation_kind == "COMPLETE":
+                effect_mode = self.conn.execute(
+                    "SELECT mode FROM publication_effects WHERE publication_id = ? "
+                    "AND effect_generation = ?",
+                    (publication_id, effect_generation),
+                ).fetchone()
+                update_completion = (
+                    effect_mode is not None
+                    and effect_mode["mode"] == "UPDATE"
+                    and cross_phase["suboperation_kind"] in ("REF_READ", "REF_UPDATE")
+                    and cross_phase["status"] == "OBSERVED_SATISFIED"
+                )
+            if cross_phase is not None and not (terminal_search_completion or update_completion):
+                raise RunStoreError(
+                    "a Forge observation cannot satisfy multiple Publication phases"
+                )
+            existing_observation = self.conn.execute(
+                "SELECT * FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND suboperation_kind = ? AND forge_observation_id = ?",
+                (publication_id, effect_generation, suboperation_kind, forge_observation_id),
+            ).fetchone()
+            if existing_observation is not None:
+                return self._publication_effect_checkpoint_replay_record(
+                    existing_observation,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    suboperation_kind=suboperation_kind,
+                    status=status,
+                    request_idempotency_key=request_idempotency_key,
+                    forge_observation_id=forge_observation_id,
+                    observed_external_revision=observed_external_revision,
+                    conflict_message=(
+                        "forge observation was reused by a different publication checkpoint"
+                    ),
+                )
+        self._validate_publication_checkpoint_order(
+            publication_id=publication_id,
+            effect_generation=effect_generation,
+            suboperation_kind=suboperation_kind,
+            status=status,
+            request_idempotency_key=request_idempotency_key,
+            allow_terminal_complete=allow_terminal_complete,
+        )
         next_sequence = self.conn.execute(
             "SELECT COALESCE(MAX(checkpoint_sequence), 0) + 1 FROM publication_effect_checkpoints "
             "WHERE publication_id = ? AND effect_generation = ?",
@@ -14908,6 +16108,13 @@ class RunStore:
                 f"{suboperation_kind} must be recorded via record_change_request_search_result "
                 "or complete_publication_effect"
             )
+        _validate_checkpoint_matrix(
+            suboperation_kind=suboperation_kind,
+            status=status,
+            request_idempotency_key=request_idempotency_key,
+            forge_observation_id=forge_observation_id,
+            observed_external_revision=observed_external_revision,
+        )
         require_lowercase_uuid(publication_id, field="publication_id")
         now = _now_ms() if now_ms is None else now_ms
         with self.transaction():
@@ -14926,7 +16133,45 @@ class RunStore:
             if publication_row is None:
                 raise RunStoreError(f"publication {publication_id!r} was not found")
             publication = _row_to_publication(publication_row)
+            effect = _row_to_publication_effect(effect_row)
             is_current = effect_generation == publication.effect_generation
+
+            if forge_observation_id is not None:
+                assert observed_external_revision is not None
+                prior_consumption = self.conn.execute(
+                    "SELECT 1 FROM publication_effect_checkpoints "
+                    "WHERE publication_id = ? AND effect_generation = ? "
+                    "AND forge_observation_id = ? LIMIT 1",
+                    (publication_id, effect_generation, forge_observation_id),
+                ).fetchone()
+                expected_kinds = {
+                    "BASE_READ_PRE": ("BASE_HEAD",),
+                    "REF_READ": ("REF_ABSENT" if status == "OBSERVED_ABSENT" else "REF_HEAD",),
+                    "REF_CREATE": ("REF_HEAD",),
+                    "REF_UPDATE": ("REF_HEAD",),
+                    "CHANGE_REQUEST_SEARCH": (
+                        "CHANGE_REQUEST_ABSENT"
+                        if status == "OBSERVED_ABSENT"
+                        else "CHANGE_REQUEST_DISCOVERED",
+                    ),
+                    "CHANGE_REQUEST_CREATE": ("CHANGE_REQUEST_DISCOVERED",),
+                    "BASE_READ_POST": ("BASE_HEAD",),
+                }[suboperation_kind]
+                observation = self._require_bound_publication_observation(
+                    forge_observation_id=forge_observation_id,
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    expected_kinds=expected_kinds,
+                    observed_external_revision=observed_external_revision,
+                    require_fresh=prior_consumption is None,
+                )
+                self._validate_publication_checkpoint_observation_fact(
+                    observation=observation,
+                    publication=publication,
+                    effect=effect,
+                    suboperation_kind=suboperation_kind,
+                    status=status,
+                )
 
             checkpoint = self._insert_publication_effect_checkpoint_row(
                 publication_effect_checkpoint_id=publication_effect_checkpoint_id,
@@ -14940,17 +16185,34 @@ class RunStore:
                 now=now,
             )
 
-            if (
+            if is_current and status == "BASE_MISMATCH":
+                self._supersede_publication_effect_in_tx(
+                    publication_id=publication_id,
+                    effect_generation=effect_generation,
+                    activity_id=effect_row["activity_id"],
+                    now=now,
+                )
+                self.conn.execute(
+                    "UPDATE publications SET last_observation_id = ?, updated_at_ms = ? "
+                    "WHERE publication_id = ?",
+                    (forge_observation_id, now, publication_id),
+                )
+            elif (
                 is_current
                 and suboperation_kind == "REF_READ"
                 and status in ("OBSERVED_ABSENT", "OBSERVED_SATISFIED")
-                and publication.state == "PLANNED"
             ):
                 self.conn.execute(
-                    "UPDATE publications SET state = 'BRANCH_OBSERVED', "
+                    "UPDATE publications SET state = CASE WHEN state = 'PLANNED' "
+                    "THEN 'BRANCH_OBSERVED' ELSE state END, "
                     "observed_remote_commit = ?, last_observation_id = ?, updated_at_ms = ? "
                     "WHERE publication_id = ?",
-                    (observed_external_revision, forge_observation_id, now, publication_id),
+                    (
+                        observed_external_revision if status == "OBSERVED_SATISFIED" else None,
+                        forge_observation_id,
+                        now,
+                        publication_id,
+                    ),
                 )
             if (
                 is_current
@@ -14978,6 +16240,175 @@ class RunStore:
                     self._mark_outbox_superseded(stale_outbox["outbox_id"])
         return checkpoint
 
+    def _validate_positive_search_member(
+        self,
+        *,
+        member: ChangeRequestSearchMemberInput,
+        publication: PublicationRecord,
+        effect: PublicationEffectRecord,
+        project_id: str,
+        current_search_observation_id: str,
+    ) -> None:
+        """Validate the complete POSITIVE ownership tagged union."""
+        project = self.conn.execute(
+            "SELECT installation_or_account_ref FROM projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if project is None:
+            raise RunStoreError(f"project {project_id!r} was not found")
+        required = {
+            "proof_publication_effect_generation": member.proof_publication_effect_generation,
+            "creator_installation_or_account_ref": member.creator_installation_or_account_ref,
+            "proof_deterministic_ref": member.proof_deterministic_ref,
+            "proof_run_marker": member.proof_run_marker,
+            "proof_desired_commit": member.proof_desired_commit,
+            "proof_observed_head": member.proof_observed_head,
+            "head_evidence_observation_id": member.head_evidence_observation_id,
+        }
+        missing = [field for field, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                "POSITIVE member has incomplete ownership proof: " + ", ".join(missing)
+            )
+        proof_desired = _require_git_commit_ref(
+            member.proof_desired_commit or {}, field="proof_desired_commit"
+        ).as_json()
+        proof_head = _require_git_commit_ref(
+            member.proof_observed_head or {}, field="proof_observed_head"
+        ).as_json()
+        observed_head = _require_git_commit_ref(
+            member.observed_head, field="observed_head"
+        ).as_json()
+        mismatched: list[str] = []
+        expected_pairs = (
+            (
+                "proof_publication_effect_generation",
+                member.proof_publication_effect_generation,
+                effect.effect_generation,
+            ),
+            (
+                "creator_installation_or_account_ref",
+                member.creator_installation_or_account_ref,
+                project["installation_or_account_ref"],
+            ),
+            ("source_ref", member.source_ref, publication.deterministic_branch),
+            ("run_marker", member.run_marker, publication.run_marker),
+            (
+                "proof_deterministic_ref",
+                member.proof_deterministic_ref,
+                publication.deterministic_branch,
+            ),
+            ("proof_run_marker", member.proof_run_marker, publication.run_marker),
+            ("proof_desired_commit", proof_desired, effect.desired_commit_json),
+            ("proof_observed_head", proof_head, observed_head),
+            ("desired_head", observed_head, effect.desired_commit_json),
+        )
+        mismatched.extend(name for name, actual, expected in expected_pairs if actual != expected)
+
+        if member.proof_kind == "LIVE_ASSOCIATION":
+            if (
+                member.proof_create_checkpoint_id is not None
+                or member.proof_create_request_idempotency_key is not None
+                or publication.change_request_external_id != member.change_request_external_id
+                or member.head_evidence_observation_id != current_search_observation_id
+            ):
+                mismatched.append("LIVE_ASSOCIATION")
+        elif member.proof_kind in ("EXACT_CREATE_RESPONSE", "AMBIGUOUS_CREATE_RECONCILED"):
+            if (
+                member.proof_create_checkpoint_id is None
+                or member.proof_create_request_idempotency_key is None
+            ):
+                mismatched.append("create_provenance")
+            else:
+                expected_status = (
+                    "OBSERVED_SATISFIED"
+                    if member.proof_kind == "EXACT_CREATE_RESPONSE"
+                    else "AMBIGUOUS"
+                )
+                checkpoint = self.conn.execute(
+                    "SELECT * FROM publication_effect_checkpoints "
+                    "WHERE publication_effect_checkpoint_id = ?",
+                    (member.proof_create_checkpoint_id,),
+                ).fetchone()
+                if (
+                    checkpoint is None
+                    or checkpoint["publication_id"] != publication.publication_id
+                    or checkpoint["effect_generation"] != effect.effect_generation
+                    or checkpoint["suboperation_kind"] != "CHANGE_REQUEST_CREATE"
+                    or checkpoint["status"] != expected_status
+                    or checkpoint["request_idempotency_key"]
+                    != member.proof_create_request_idempotency_key
+                ):
+                    mismatched.append("create_provenance")
+                else:
+                    request_ready = self.conn.execute(
+                        "SELECT 1 FROM publication_effect_checkpoints "
+                        "WHERE publication_id = ? AND effect_generation = ? "
+                        "AND suboperation_kind = 'CHANGE_REQUEST_CREATE' "
+                        "AND status = 'REQUEST_READY' AND request_idempotency_key = ? "
+                        "AND checkpoint_sequence < ? LIMIT 1",
+                        (
+                            publication.publication_id,
+                            effect.effect_generation,
+                            member.proof_create_request_idempotency_key,
+                            checkpoint["checkpoint_sequence"],
+                        ),
+                    ).fetchone()
+                    if request_ready is None:
+                        mismatched.append("create_request_provenance")
+                    if member.proof_kind == "EXACT_CREATE_RESPONSE":
+                        if (
+                            checkpoint["forge_observation_id"] is None
+                            or member.head_evidence_observation_id
+                            != checkpoint["forge_observation_id"]
+                        ):
+                            mismatched.append("exact_create_response")
+                    elif member.head_evidence_observation_id != current_search_observation_id:
+                        mismatched.append("ambiguous_create_reconciliation")
+        else:
+            mismatched.append("proof_kind")
+
+        assert member.head_evidence_observation_id is not None
+        head_observation_row = self.conn.execute(
+            "SELECT external_revision FROM forge_observations WHERE forge_observation_id = ?",
+            (member.head_evidence_observation_id,),
+        ).fetchone()
+        if head_observation_row is None:
+            mismatched.append("head_evidence_observation_id")
+        else:
+            expected_head_kinds = (
+                ("CHANGE_REQUEST_DISCOVERED",)
+                if member.proof_kind == "EXACT_CREATE_RESPONSE"
+                else ("CHANGE_REQUEST_SEARCH_RESULT",)
+            )
+            head_observation = self._require_bound_publication_observation(
+                forge_observation_id=member.head_evidence_observation_id,
+                publication_id=publication.publication_id,
+                effect_generation=effect.effect_generation,
+                expected_kinds=expected_head_kinds,
+                observed_external_revision=head_observation_row["external_revision"],
+                require_fresh=False,
+            )
+            fact = json.loads(head_observation["fact_json"])
+            fact_members = fact.get("members", []) if isinstance(fact, dict) else []
+            candidates = [fact] if isinstance(fact, dict) else []
+            if isinstance(fact_members, list):
+                candidates.extend(item for item in fact_members if isinstance(item, dict))
+            exact_fact = next(
+                (
+                    item
+                    for item in candidates
+                    if item.get("change_request_external_id") == member.change_request_external_id
+                ),
+                None,
+            )
+            if exact_fact is None or exact_fact.get("observed_head") != json.loads(observed_head):
+                mismatched.append("head_evidence.fact")
+        if mismatched:
+            raise ValueError(
+                "POSITIVE member ownership proof mismatch: " + ", ".join(sorted(set(mismatched)))
+            )
+
     def record_change_request_search_result(
         self,
         *,
@@ -14991,7 +16422,7 @@ class RunStore:
         deterministic_ref: str,
         external_revision: str,
         members: Sequence[ChangeRequestSearchMemberInput],
-        fresh_exact_object_confirmed: bool = False,
+        fresh_exact_object_confirmed: bool | None = None,
         terminal_publication_effect_checkpoint_id: str | None = None,
         terminal_duplicate_cleanup_reservation_id: str | None = None,
         now_ms: int | None = None,
@@ -15005,10 +16436,9 @@ class RunStore:
           the Publication (``CLOSED``) and appends the ``COMPLETE`` checkpoint
           in this same transaction (a positive merged selection also creates
           the Terminal Duplicate Cleanup Reservation for every live member).
-        - ``ONE_LIVE``: requires ``fresh_exact_object_confirmed=True`` (the
-          search result alone is never sufficient linkage evidence -- "fresh
-          proof before linkage", domain-model.md 2155) and advances the
-          Publication to ``CHANGE_REQUEST_OBSERVED``; the ``COMPLETE``
+        - ``ONE_LIVE``: requires a durable, exact head-evidence Observation
+          in the selected member's mechanically validated ownership proof and
+          advances the Publication to ``CHANGE_REQUEST_OBSERVED``; the ``COMPLETE``
           checkpoint follows separately via ``complete_publication_effect``
           once ``BASE_READ_POST`` also proves satisfied.
         - ``MULTIPLE_LIVE`` / ``ZERO_LIVE_NO_TERMINAL`` / ``INCOMPLETE_BACKOFF``
@@ -15045,21 +16475,36 @@ class RunStore:
         live_members_for_reservation: list[tuple[str, str, str, bool]] = []
 
         for member_input, ordinal in ordered_inputs:
+            enums.parse_enum("change_request_search_member.member_class", member_input.member_class)
+            enums.parse_enum(
+                "change_request_search_member.ownership_status", member_input.ownership_status
+            )
             if member_input.member_class == "TERMINAL" and member_input.terminal_state is None:
                 raise ValueError("TERMINAL member requires terminal_state")
             if member_input.member_class == "LIVE" and member_input.terminal_state is not None:
                 raise ValueError("LIVE member forbids terminal_state")
+            if member_input.terminal_state is not None:
+                enums.parse_enum(
+                    "change_request_search_member.terminal_state", member_input.terminal_state
+                )
             if member_input.ownership_status == "POSITIVE":
                 if member_input.proof_kind is None:
                     raise ValueError("POSITIVE member requires proof_kind")
+                enums.parse_enum("change_request_search_member.proof_kind", member_input.proof_kind)
                 if member_input.ownership_defect_codes:
                     raise ValueError("POSITIVE member forbids ownership_defect_codes")
             else:
+                if member_input.proof_kind is not None:
+                    raise ValueError("non-POSITIVE member forbids proof_kind")
                 if not member_input.ownership_defect_codes:
                     raise ValueError("non-POSITIVE member requires ownership_defect_codes")
                 if member_input.creator_installation_or_account_ref is not None:
                     raise ValueError(
                         "creator_installation_or_account_ref is only valid for POSITIVE members"
+                    )
+                for defect_code in member_input.ownership_defect_codes:
+                    enums.parse_enum(
+                        "change_request_search_member.ownership_defect_code", defect_code
                     )
             observed_head = _require_git_commit_ref(
                 member_input.observed_head, field="observed_head"
@@ -15212,7 +16657,69 @@ class RunStore:
             if publication_row is None:
                 raise RunStoreError(f"publication {publication_id!r} was not found")
             publication = _row_to_publication(publication_row)
+            effect = _row_to_publication_effect(effect_row)
             is_current = effect_generation == publication.effect_generation
+            run_row = self.conn.execute(
+                "SELECT project_id FROM runs WHERE run_id = ?", (publication.run_id,)
+            ).fetchone()
+            assert run_row is not None
+            if project_id != run_row["project_id"]:
+                raise ValueError("search result project_id does not match the Publication Run")
+            if run_marker != publication.run_marker:
+                raise ValueError("search result run_marker does not match the Publication")
+            if deterministic_ref != publication.deterministic_branch:
+                raise ValueError("search result deterministic_ref does not match the Publication")
+            replay_identity = self.conn.execute(
+                "SELECT * FROM change_request_search_results "
+                "WHERE change_request_search_result_id = ? OR forge_observation_id = ?",
+                (change_request_search_result_id, forge_observation_id),
+            ).fetchone()
+            if replay_identity is not None and (
+                replay_identity["change_request_search_result_id"]
+                != change_request_search_result_id
+                or replay_identity["forge_observation_id"] != forge_observation_id
+                or replay_identity["publication_id"] != publication_id
+                or replay_identity["project_id"] != project_id
+                or replay_identity["run_marker"] != run_marker
+                or replay_identity["deterministic_ref"] != deterministic_ref
+                or replay_identity["external_revision"] != external_revision
+                or replay_identity["live_cardinality"] != live_cardinality
+                or replay_identity["duplicate_set_digest"] != duplicate_set_digest
+                or replay_identity["publication_effect_generation"] != effect_generation
+            ):
+                raise IdempotencyConflictError(
+                    "change request search result id was reused with different content"
+                )
+            search_observation = self._require_bound_publication_observation(
+                forge_observation_id=forge_observation_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                expected_kinds=("CHANGE_REQUEST_SEARCH_RESULT",),
+                observed_external_revision=external_revision,
+                require_fresh=replay_identity is None,
+            )
+            expected_observation_fact = change_request_search_observation_fact(
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                run_marker=run_marker,
+                deterministic_ref=deterministic_ref,
+                external_revision=external_revision,
+                members=members,
+            )
+            if json.loads(search_observation["fact_json"]) != expected_observation_fact:
+                raise ValueError(
+                    "CHANGE_REQUEST_SEARCH_RESULT observation payload does not match "
+                    "the normalized result and member digests"
+                )
+            for member_input in members:
+                if member_input.ownership_status == "POSITIVE":
+                    self._validate_positive_search_member(
+                        member=member_input,
+                        publication=publication,
+                        effect=effect,
+                        project_id=project_id,
+                        current_search_observation_id=forge_observation_id,
+                    )
 
             existing_result = self.conn.execute(
                 "SELECT * FROM change_request_search_results "
@@ -15360,21 +16867,18 @@ class RunStore:
                 )
 
                 if outcome.outcome == "ONE_LIVE":
-                    if not fresh_exact_object_confirmed:
-                        raise ValueError(
-                            "ONE-live linkage requires a fresh exact-object observation "
-                            "before commit (domain-model.md 2155)"
-                        )
                     if publication.change_request_external_id is None:
                         self.conn.execute(
                             "UPDATE publications SET state = 'CHANGE_REQUEST_OBSERVED', "
                             "change_request_external_id = ?, "
+                            "observed_remote_commit = ?, "
                             "initial_link_search_revision = ?, initial_link_set_digest = ?, "
                             "initial_link_cardinality = 'ONE', "
                             "initial_link_retained_external_id = ?, updated_at_ms = ? "
                             "WHERE publication_id = ?",
                             (
                                 outcome.selected_external_id,
+                                effect.desired_commit["oid"],
                                 external_revision,
                                 duplicate_set_digest,
                                 outcome.selected_external_id,
@@ -15385,6 +16889,15 @@ class RunStore:
                     elif publication.change_request_external_id != outcome.selected_external_id:
                         raise RunStoreError(
                             "publication already has a different live change request association"
+                        )
+                    else:
+                        # A replacement INITIAL Effect must freshly reconcile
+                        # the permanent association before its post-base read.
+                        self.conn.execute(
+                            "UPDATE publications SET state = 'CHANGE_REQUEST_OBSERVED', "
+                            "observed_remote_commit = ?, updated_at_ms = ? "
+                            "WHERE publication_id = ?",
+                            (effect.desired_commit["oid"], now, publication_id),
                         )
                 elif outcome.outcome in ("ZERO_LIVE_CLOSED_TERMINAL", "MERGED_TERMINAL"):
                     if terminal_publication_effect_checkpoint_id is None:
@@ -15407,6 +16920,7 @@ class RunStore:
                         forge_observation_id=forge_observation_id,
                         observed_external_revision=external_revision,
                         now=now,
+                        allow_terminal_complete=True,
                     )
                     change_request_external_id = outcome.selected_external_id
                     self.conn.execute(
@@ -15430,6 +16944,11 @@ class RunStore:
                             now,
                             publication_id,
                         ),
+                    )
+                    self.conn.execute(
+                        "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                        "WHERE activity_id = ? AND state = 'ACTIVE'",
+                        (now, effect_row["activity_id"]),
                     )
                     if outcome.outcome == "MERGED_TERMINAL" and live_members_for_reservation:
                         if terminal_duplicate_cleanup_reservation_id is None:
@@ -15638,7 +17157,7 @@ class RunStore:
         now = _now_ms() if now_ms is None else now_ms
         with self.transaction():
             effect_row = self.conn.execute(
-                "SELECT 1 FROM publication_effects WHERE publication_id = ? "
+                "SELECT * FROM publication_effects WHERE publication_id = ? "
                 "AND effect_generation = ?",
                 (publication_id, effect_generation),
             ).fetchone()
@@ -15652,7 +17171,33 @@ class RunStore:
             if publication_row is None:
                 raise RunStoreError(f"publication {publication_id!r} was not found")
             publication = _row_to_publication(publication_row)
+            effect = _row_to_publication_effect(effect_row)
             is_current = effect_generation == publication.effect_generation
+            prior_complete = self.conn.execute(
+                "SELECT 1 FROM publication_effect_checkpoints "
+                "WHERE publication_id = ? AND effect_generation = ? "
+                "AND suboperation_kind = 'COMPLETE' AND forge_observation_id = ? LIMIT 1",
+                (publication_id, effect_generation, forge_observation_id),
+            ).fetchone()
+            completion_observation = self._require_bound_publication_observation(
+                forge_observation_id=forge_observation_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                expected_kinds=("CHANGE_REQUEST_HEAD",),
+                observed_external_revision=observed_external_revision,
+                require_fresh=prior_complete is None,
+            )
+            completion_fact = json.loads(completion_observation["fact_json"])
+            if (
+                not isinstance(completion_fact, dict)
+                or completion_fact.get("change_request_external_id")
+                != publication.change_request_external_id
+                or completion_fact.get("observed_head") != effect.desired_commit
+                or observed_external_revision != effect.desired_commit["oid"]
+            ):
+                raise ValueError(
+                    "COMPLETE observation does not prove the linked Change Request's exact head"
+                )
             if not is_current:
                 return self._insert_publication_effect_checkpoint_row(
                     publication_effect_checkpoint_id=publication_effect_checkpoint_id,
@@ -15717,6 +17262,11 @@ class RunStore:
                 "UPDATE publications SET state = 'ACTIVE', observed_remote_commit = ?, "
                 "last_observation_id = ?, updated_at_ms = ? WHERE publication_id = ?",
                 (observed_external_revision, forge_observation_id, now, publication_id),
+            )
+            self.conn.execute(
+                "UPDATE activities SET state = 'SUCCEEDED', updated_at_ms = ? "
+                "WHERE activity_id = ? AND state = 'ACTIVE'",
+                (now, effect_row["activity_id"]),
             )
         return checkpoint
 
@@ -16112,6 +17662,19 @@ class RunStore:
             if member_row is None:
                 raise RunStoreError("reservation has no member at next_member_ordinal")
             member = _row_to_terminal_duplicate_cleanup_member(member_row)
+            source_member = self.conn.execute(
+                "SELECT c.* FROM change_request_search_members c "
+                "JOIN change_request_search_results s "
+                "ON s.change_request_search_result_id = c.change_request_search_result_id "
+                "WHERE s.forge_observation_id = ? AND c.member_class = 'LIVE' "
+                "AND c.change_request_external_id = ?",
+                (
+                    reservation.selecting_search_observation_id,
+                    member.change_request_external_id,
+                ),
+            ).fetchone()
+            if source_member is None:
+                raise RunStoreError("cleanup member is not bound to its selecting search member")
             operation_digest = terminal_duplicate_cleanup_action_digest(
                 {
                     "terminal_duplicate_cleanup_reservation_id": (
@@ -16120,6 +17683,13 @@ class RunStore:
                     "member_ordinal": member.member_ordinal,
                     "change_request_external_id": member.change_request_external_id,
                     "planned_action": member.planned_action,
+                    "expected_head": json.loads(source_member["observed_head_json"]),
+                    "expected_body_revision": source_member["observed_body_revision"],
+                    "expected_marker_set_digest": source_member["marker_set_digest"],
+                    "ownership_proof_digest": source_member["ownership_proof_digest"],
+                    "external_reliance_digest": source_member["external_reliance_digest"],
+                    "source_member_digest": source_member["member_digest"],
+                    "operation_idempotency_key": terminal_duplicate_cleanup_action_id,
                 }
             )
             stored_outbox_id: str | None = None
@@ -16137,6 +17707,10 @@ class RunStore:
                         ),
                         "change_request_external_id": member.change_request_external_id,
                         "planned_action": member.planned_action,
+                        "expected_head": json.loads(source_member["observed_head_json"]),
+                        "expected_body_revision": source_member["observed_body_revision"],
+                        "expected_marker_set_digest": source_member["marker_set_digest"],
+                        "operation_idempotency_key": terminal_duplicate_cleanup_action_id,
                     },
                     next_delivery_at_ms=now,
                     publication_id=reservation.publication_id,
@@ -16235,6 +17809,119 @@ class RunStore:
                 raise ValueError(
                     f"{action.planned_action} requires an exact close-proof forge_observation_id"
                 )
+            reservation_row = self.conn.execute(
+                "SELECT r.*, p.run_id FROM terminal_duplicate_cleanup_reservations r "
+                "JOIN publications p ON p.publication_id = r.publication_id "
+                "WHERE r.terminal_duplicate_cleanup_reservation_id = ?",
+                (action.terminal_duplicate_cleanup_reservation_id,),
+            ).fetchone()
+            assert reservation_row is not None
+            source_member = self.conn.execute(
+                "SELECT c.* FROM change_request_search_members c "
+                "JOIN change_request_search_results s "
+                "ON s.change_request_search_result_id = c.change_request_search_result_id "
+                "WHERE s.forge_observation_id = ? AND c.member_class = 'LIVE' "
+                "AND c.change_request_external_id = ?",
+                (
+                    reservation_row["selecting_search_observation_id"],
+                    action.change_request_external_id,
+                ),
+            ).fetchone()
+            if source_member is None:
+                raise RunStoreError("cleanup action lost its selecting search evidence")
+            expected_operation_digest = terminal_duplicate_cleanup_action_digest(
+                {
+                    "terminal_duplicate_cleanup_reservation_id": (
+                        action.terminal_duplicate_cleanup_reservation_id
+                    ),
+                    "member_ordinal": action.member_ordinal,
+                    "change_request_external_id": action.change_request_external_id,
+                    "planned_action": action.planned_action,
+                    "expected_head": json.loads(source_member["observed_head_json"]),
+                    "expected_body_revision": source_member["observed_body_revision"],
+                    "expected_marker_set_digest": source_member["marker_set_digest"],
+                    "ownership_proof_digest": source_member["ownership_proof_digest"],
+                    "external_reliance_digest": source_member["external_reliance_digest"],
+                    "source_member_digest": source_member["member_digest"],
+                    "operation_idempotency_key": terminal_duplicate_cleanup_action_id,
+                }
+            )
+            if action.operation_digest != expected_operation_digest:
+                raise RunStoreError(
+                    "cleanup action input digest does not match its frozen CAS proof"
+                )
+            if action.planned_action == "RECORD_ONLY":
+                if forge_observation_id is not None:
+                    raise ValueError("RECORD_ONLY forbids forge_observation_id")
+            else:
+                assert forge_observation_id is not None
+                observation, _request, _schedule = (
+                    self._require_completed_forge_observation_provenance(
+                        forge_observation_id=forge_observation_id,
+                        require_fresh=True,
+                    )
+                )
+                authority = self.conn.execute(
+                    "SELECT r.project_id AS expected_project_id, "
+                    "pe.publication_secret_id AS expected_credential_secret_id, "
+                    "pe.publication_secret_version AS expected_credential_secret_version "
+                    "FROM runs r JOIN publication_effects pe ON pe.publication_id = ? "
+                    "AND pe.effect_generation = ? WHERE r.run_id = ?",
+                    (
+                        reservation_row["publication_id"],
+                        reservation_row["effect_generation"],
+                        reservation_row["run_id"],
+                    ),
+                ).fetchone()
+                assert authority is not None
+                expected_observation_fields = {
+                    "project_id": authority["expected_project_id"],
+                    "target_kind": "PUBLICATION",
+                    "target_id": reservation_row["publication_id"],
+                    "run_id": reservation_row["run_id"],
+                    "publication_id": reservation_row["publication_id"],
+                    "publication_effect_generation": reservation_row["effect_generation"],
+                    "controller_activity_id": None,
+                    "controller_operation_digest": None,
+                    "credential_purpose": "PUBLICATION",
+                    "credential_secret_id": authority["expected_credential_secret_id"],
+                    "credential_secret_version": authority["expected_credential_secret_version"],
+                    "terminal_duplicate_cleanup_reservation_id": (
+                        action.terminal_duplicate_cleanup_reservation_id
+                    ),
+                    "terminal_duplicate_cleanup_action_id": (terminal_duplicate_cleanup_action_id),
+                    "terminal_cleanup_operation_digest": action.operation_digest,
+                }
+                mismatched = [
+                    field
+                    for field, expected in expected_observation_fields.items()
+                    if observation[field] != expected
+                ]
+                expected_kind = (
+                    "CHANGE_REQUEST_CLOSED"
+                    if action.planned_action == "CLOSE"
+                    else "CHANGE_REQUEST_MARKER"
+                )
+                if observation["kind"] != expected_kind:
+                    mismatched.append("kind")
+                if observation["created_by_forge_observation_request_id"] is None:
+                    mismatched.append("created_by_forge_observation_request_id")
+                expected_fact = {
+                    "terminal_duplicate_cleanup_action_id": terminal_duplicate_cleanup_action_id,
+                    "change_request_external_id": action.change_request_external_id,
+                    "planned_action": action.planned_action,
+                    "expected_head": json.loads(source_member["observed_head_json"]),
+                    "expected_body_revision": source_member["observed_body_revision"],
+                    "expected_marker_set_digest": source_member["marker_set_digest"],
+                    "outcome": outcome,
+                }
+                if json.loads(observation["fact_json"]) != expected_fact:
+                    mismatched.append("fact")
+                if mismatched:
+                    raise RunStoreError(
+                        "cleanup observation is not the exact action/CAS result: "
+                        + ", ".join(sorted(set(mismatched)))
+                    )
             self.conn.execute(
                 "UPDATE terminal_duplicate_cleanup_actions SET state = 'COMPLETED', "
                 "outcome = ?, forge_observation_id = ?, completed_at_ms = ? "
@@ -16822,6 +18509,24 @@ class RunStore:
             if satisfied is None:
                 raise RunStoreError(
                     "COMPLETE requires a prior REF_READ/REF_UPDATE OBSERVED_SATISFIED checkpoint"
+                )
+            completion_observation = self._require_bound_publication_observation(
+                forge_observation_id=forge_observation_id,
+                publication_id=publication_id,
+                effect_generation=effect_generation,
+                expected_kinds=("REF_HEAD",),
+                observed_external_revision=observed_external_revision,
+            )
+            completion_fact = json.loads(completion_observation["fact_json"])
+            if (
+                not isinstance(completion_fact, dict)
+                or completion_fact.get("deterministic_ref") != publication.deterministic_branch
+                or completion_fact.get("observed_head") != effect.desired_commit
+                or observed_external_revision != effect.desired_commit["oid"]
+            ):
+                raise ValueError(
+                    "UPDATE COMPLETE observation does not prove the deterministic ref's "
+                    "exact desired head"
                 )
             checkpoint = self._insert_publication_effect_checkpoint_row(
                 publication_effect_checkpoint_id=publication_effect_checkpoint_id,
@@ -17476,6 +19181,7 @@ class RunStore:
         *,
         change_request_external_id: str | None = None,
         deterministic_ref: str | None = None,
+        repository_locator: str | None = None,
     ) -> bool:
         """The association-based half of the unconditional legacy-engine
         exclusion (domain-model.md 4692-4695, forge-integration.md 410-413):
@@ -17491,10 +19197,9 @@ class RunStore:
         is_legacy_marker_reserved`` (the marker-based half, evaluated over
         the candidate Change Request's own body text) for the complete
         predicate -- either half alone is sufficient to exclude. The legacy
-        selector (``src/orcest/orchestrator/pr_ops.py``) is a separate
-        package with no dependency on this store today; wiring this query
-        into that selector is a distinct integration task this leaf leaves
-        for whoever undertakes it, not implemented here.
+        selector (``src/orcest/orchestrator/pr_ops.py``) combines both halves,
+        using the read-only database adapter above when ``workflow_state_root``
+        is configured.
         """
         if change_request_external_id is None and deterministic_ref is None:
             raise ValueError(
@@ -17510,14 +19215,23 @@ class RunStore:
         if deterministic_ref is not None:
             conditions.append("p.deterministic_branch = ?")
             params.append(deterministic_ref)
+        repository_join = ""
+        repository_condition = ""
+        if repository_locator is not None:
+            if not repository_locator.strip():
+                raise ValueError("repository_locator must not be empty")
+            repository_join = "JOIN projects project ON project.project_id = runs.project_id "
+            repository_condition = "AND project.repository_locator = ? COLLATE NOCASE"
+            params.append(repository_locator)
         rows = self.conn.execute(
             "SELECT runs.state AS run_state, r.state AS reservation_state "
             "FROM publications p "
             "JOIN runs ON runs.run_id = p.run_id "
+            f"{repository_join}"
             "LEFT JOIN terminal_duplicate_cleanup_reservations r "
             "ON r.terminal_duplicate_cleanup_reservation_id = "
             "p.terminal_duplicate_cleanup_reservation_id "
-            f"WHERE ({' OR '.join(conditions)})",
+            f"WHERE ({' OR '.join(conditions)}) {repository_condition}",
             tuple(params),
         ).fetchall()
         return any(
