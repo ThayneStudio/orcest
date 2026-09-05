@@ -10,6 +10,10 @@ from click.testing import CliRunner
 from rich.console import Console
 
 from orcest.cli import _dead_letters_command, _status_once, _validate_ssh_input, main
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 @pytest.fixture
@@ -416,8 +420,72 @@ def test_status_host_with_port(mocker, runner, fake_redis_client):
 
 
 def test_status_once_normal(fake_redis_client):
-    """_status_once runs without error on an empty Redis."""
-    _status_once(fake_redis_client)
+    """Empty result health remains visible instead of disappearing as no work."""
+    buf = io.StringIO()
+    with patch(
+        "orcest.cli.Console",
+        return_value=Console(file=buf, highlight=False, width=120),
+    ):
+        _status_once(fake_redis_client)
+
+    output = buf.getvalue()
+    assert "Result Stream Health" in output
+    for metric, value in (
+        ("Stream", "test:results"),
+        ("Retained XLEN", "0"),
+        ("Pending", "0"),
+        ("Lag", "0"),
+        ("Max deliveries", "0"),
+        ("Pending inspected", "0/0"),
+        ("Live/registered consumers", "0/0"),
+    ):
+        assert re.search(rf"{re.escape(metric)}\s+│\s+{re.escape(value)}", output)
+
+
+def test_status_once_always_renders_complete_fresh_result_metrics(fake_redis_client):
+    fake_redis_client.ensure_consumer_group("results", "orchestrator")
+    fake_redis_client.xadd("results", {"task_id": "acked"})
+    fake_redis_client.xadd("results", {"task_id": "pending"})
+    fake_redis_client.xadd("results", {"task_id": "lagged"})
+    entries = fake_redis_client.xreadgroup(
+        "orchestrator", "orchestrator-main", "results", count=2, block_ms=None
+    )
+    fake_redis_client.xack("results", "orchestrator", entries[0][0])
+    fake_redis_client.set_ex(
+        result_consumer_heartbeat_key(),
+        "1",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
+    buf = io.StringIO()
+    with patch(
+        "orcest.cli.Console",
+        return_value=Console(file=buf, highlight=False, width=240),
+    ):
+        _status_once(fake_redis_client)
+
+    output = buf.getvalue()
+    assert "Result Stream Health" in output
+    for metric in (
+        "Retained XLEN",
+        "Pending",
+        "Lag",
+        "Oldest pending idle",
+        "Max deliveries",
+        "Pending inspected",
+        "Live/registered consumers",
+        "Newest consumer heartbeat age",
+    ):
+        assert metric in output
+    for metric, value in (
+        ("Stream", "test:results"),
+        ("Retained XLEN", "3"),
+        ("Pending", "1"),
+        ("Lag", "1"),
+        ("Max deliveries", "1"),
+        ("Pending inspected", "1/1"),
+        ("Live/registered consumers", "1/1"),
+    ):
+        assert re.search(rf"{re.escape(metric)}\s+│\s+{re.escape(value)}", output)
 
 
 def test_status_once_wrongtype_tasks_key_does_not_raise(fake_redis_client):
@@ -481,6 +549,11 @@ def test_status_once_warns_for_stale_results_without_result_body(fake_redis_clie
         },
     )
     fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+    fake_redis_client.set_ex(
+        result_consumer_heartbeat_key(),
+        "1",
+        ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    )
     mocker.patch.object(
         fake_redis_client.client,
         "xpending_range",

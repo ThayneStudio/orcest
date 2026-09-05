@@ -27,7 +27,11 @@ from orcest.shared.provider_stream_health import (
     StreamHealthState,
     stream_health_snapshot_key,
 )
-from orcest.shared.result_stream_health import RESULT_PENDING_STALE_IDLE_SECONDS
+from orcest.shared.result_stream_health import (
+    RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+    RESULT_PENDING_STALE_IDLE_SECONDS,
+    result_consumer_heartbeat_key,
+)
 
 
 def test_empty_redis_returns_valid_snapshot(fake_redis_client):
@@ -254,6 +258,7 @@ def test_disconnected_redis(fake_redis_client, mocker):
 
     assert snap.redis_ok is False
     assert snap.queue_depths == {}
+    assert snap.result_stream_health.inspection_error == ("test:results: inspection unavailable")
 
 
 def test_connection_lost_during_fetch(fake_redis_client, mocker):
@@ -268,6 +273,7 @@ def test_connection_lost_during_fetch(fake_redis_client, mocker):
 
     assert snap.redis_ok is False
     assert snap.queue_depths == {}
+    assert snap.result_stream_health.inspection_error == ("test:results: inspection unavailable")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1014,122 @@ class TestDashboardStreamHealthRendering:
                 assert repr(stream) in str(banner.visual)
                 assert r"\[" not in str(banner.visual)
                 assert r"\\[" not in banner.content
+
+        _run_async(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Tests for always-visible result-stream health (issue #796)
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardResultHealthRendering:
+    @staticmethod
+    def _metrics(table):
+        rows = [table.get_row_at(index) for index in range(table.row_count)]
+        return {
+            getattr(metric, "plain", str(metric)): getattr(value, "plain", str(value))
+            for metric, value in rows
+        }
+
+    def test_empty_result_metrics_are_always_visible(self, fake_redis_client):
+        from textual.widgets import DataTable
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                table = app.query_one("#result-health-table", DataTable)
+                assert self._metrics(table) == {
+                    "Stream": "test:results",
+                    "Retained XLEN": "0",
+                    "Pending": "0",
+                    "Lag": "0",
+                    "Oldest pending idle": "--",
+                    "Max deliveries": "0",
+                    "Pending inspected": "0/0",
+                    "Live/registered consumers": "0/0",
+                    "Newest consumer heartbeat age": "--",
+                }
+
+        _run_async(scenario())
+
+    def test_fresh_pending_and_lag_metrics_are_visible(self, fake_redis_client):
+        from textual.widgets import DataTable, Static
+
+        fake_redis_client.ensure_consumer_group("results", "orchestrator")
+        fake_redis_client.xadd("results", {"task_id": "acked"})
+        fake_redis_client.xadd("results", {"task_id": "pending"})
+        fake_redis_client.xadd("results", {"task_id": "lagged"})
+        entries = fake_redis_client.xreadgroup(
+            "orchestrator", "orchestrator-main", "results", count=2, block_ms=None
+        )
+        fake_redis_client.xack("results", "orchestrator", entries[0][0])
+        fake_redis_client.set_ex(
+            result_consumer_heartbeat_key(),
+            "1",
+            ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+        )
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                table = app.query_one("#result-health-table", DataTable)
+                metrics = self._metrics(table)
+                assert metrics["Stream"] == "test:results"
+                assert metrics["Retained XLEN"] == "3"
+                assert metrics["Pending"] == "1"
+                assert metrics["Lag"] == "1"
+                assert metrics["Oldest pending idle"].endswith("s")
+                assert metrics["Max deliveries"] == "1"
+                assert metrics["Pending inspected"] == "1/1"
+                assert metrics["Live/registered consumers"] == "1/1"
+                banner = app.query_one("#result-health-banner", Static)
+                assert "visible" not in banner.classes
+
+        _run_async(scenario())
+
+    def test_stale_result_metrics_remain_visible_with_warning(self, fake_redis_client, mocker):
+        from textual.widgets import DataTable, Static
+
+        fake_redis_client.ensure_consumer_group("results", "orchestrator")
+        fake_redis_client.xadd("results", {"task_id": "pending"})
+        fake_redis_client.xreadgroup("orchestrator", "orchestrator-main", "results", block_ms=None)
+        fake_redis_client.set_ex(
+            result_consumer_heartbeat_key(),
+            "1",
+            ttl=RESULT_CONSUMER_HEARTBEAT_TTL_SECONDS,
+        )
+        mocker.patch.object(
+            fake_redis_client.client,
+            "xpending_range",
+            return_value=[
+                {
+                    "message_id": "1-0",
+                    "consumer": "orchestrator-main",
+                    "time_since_delivered": RESULT_PENDING_STALE_IDLE_SECONDS * 1000,
+                    "times_delivered": 1,
+                }
+            ],
+        )
+
+        async def scenario():
+            app = _build_dashboard_app(fake_redis_client)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                table = app.query_one("#result-health-table", DataTable)
+                metrics = self._metrics(table)
+                assert metrics["Stream"] == "test:results"
+                assert metrics["Retained XLEN"] == "1"
+                assert metrics["Pending"] == "1"
+                assert metrics["Lag"] == "0"
+                assert metrics["Oldest pending idle"] == (f"{RESULT_PENDING_STALE_IDLE_SECONDS}s")
+                assert metrics["Max deliveries"] == "1"
+                assert metrics["Pending inspected"] == "1/1"
+                banner = app.query_one("#result-health-banner", Static)
+                assert "visible" in banner.classes
+                assert "STALE result handling" in banner.content
 
         _run_async(scenario())
 

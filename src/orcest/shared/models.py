@@ -16,6 +16,9 @@ CONSUMER_GROUP = "workers"
 
 # Redis stream / key name constants
 DEAD_LETTER_STREAM = "dead-letter"
+RESULTS_STREAM = "results"
+RESULTS_GROUP = "orchestrator"
+RESULTS_CONSUMER_NAME = "orchestrator-main"
 
 # Wire-protocol prefix used by workers to signal a transient failure.
 # The orchestrator parses this to decide whether to retry or label for human review.

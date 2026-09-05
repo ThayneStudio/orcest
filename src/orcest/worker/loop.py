@@ -50,6 +50,7 @@ from orcest.shared.logging import setup_logging
 from orcest.shared.models import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
+    RESULTS_STREAM,
     TRANSIENT_SUMMARY_PREFIX,
     ResultStatus,
     Task,
@@ -79,7 +80,6 @@ from orcest.worker.runner import (
 )
 from orcest.worker.workspace import Workspace, WorkspaceError
 
-RESULTS_STREAM = "results"
 HEARTBEAT_INTERVAL = 60  # seconds; heartbeat refresh cadence
 LOCK_TTL = 3 * HEARTBEAT_INTERVAL  # 180 s — crash orphaned-lock expires within 3 × heartbeat
 WORKER_LIVENESS_TTL = 150  # Covers two 60s task-heartbeat refresh intervals plus jitter.
