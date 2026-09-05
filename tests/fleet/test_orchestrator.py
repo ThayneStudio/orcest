@@ -1513,17 +1513,45 @@ class TestRedisStackEnvFile:
 
         ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
         ensure_pool_manager("user@host")
-        cmd = ssh.call_args[0][1]
-        assert f"--env-file {REDIS_ENV_PATH}" in cmd
-        assert "docker-compose.pool.yml" in cmd
-        assert "run --rm --no-deps --entrypoint sh pool-manager" in cmd
-        assert "test -r /home/orcest/app/config/fleet.yaml" in cmd
-        assert "test -r /home/orcest/.ssh" in cmd
-        assert "test -x /home/orcest/.ssh" in cmd
-        assert "test -f /home/orcest/.ssh/id_ed25519" in cmd
-        assert "test -r /home/orcest/.ssh/id_ed25519" in cmd
-        assert "up -d --force-recreate pool-manager" in cmd
-        assert "RestartCount" in cmd
+        assert ssh.call_count == 2
+        preflight_cmd = ssh.call_args_list[0][0][1]
+        startup_cmd = ssh.call_args_list[1][0][1]
+        assert f"--env-file {REDIS_ENV_PATH}" in preflight_cmd
+        assert "docker-compose.pool.yml" in preflight_cmd
+        assert "run --rm --no-deps --entrypoint sh pool-manager" in preflight_cmd
+        assert "test -r /home/orcest/app/config/fleet.yaml" in preflight_cmd
+        assert "test -r /home/orcest/.ssh" in preflight_cmd
+        assert "test -x /home/orcest/.ssh" in preflight_cmd
+        assert "test -f /home/orcest/.ssh/id_ed25519" in preflight_cmd
+        assert "test -r /home/orcest/.ssh/id_ed25519" in preflight_cmd
+        assert "command -v ssh" in preflight_cmd
+        assert "ssh -V" in preflight_cmd
+        assert "up -d --force-recreate pool-manager" not in preflight_cmd
+        assert f"--env-file {REDIS_ENV_PATH}" in startup_cmd
+        assert "up -d --force-recreate pool-manager" in startup_cmd
+        assert "RestartCount" in startup_cmd
+
+    @pytest.mark.parametrize(
+        "diagnostic",
+        [
+            "pool-manager prerequisite failed: ssh client executable not found",
+            "pool-manager prerequisite failed: ssh client executable is unusable",
+        ],
+    )
+    def test_pool_manager_ssh_preflight_failure_prevents_startup(self, mocker, diagnostic):
+        from orcest.fleet.orchestrator import ensure_pool_manager
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr=diagnostic),
+        )
+
+        with pytest.raises(RuntimeError, match="ssh client executable") as exc_info:
+            ensure_pool_manager("user@host")
+
+        assert diagnostic in str(exc_info.value)
+        assert ssh.call_count == 1
+        assert "up -d --force-recreate pool-manager" not in ssh.call_args[0][1]
 
     def test_deploy_stack_passes_redis_env_file(self, mocker):
         """The per-project orchestrator stack needs the redis password too. Its
