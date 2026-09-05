@@ -35,6 +35,11 @@ from orcest.shared.models import Task, TaskType
 from orcest.shared.redis_client import RedisClient
 
 
+class _RejectedCapacityReservation:
+    def refresh(self) -> bool:
+        return False
+
+
 def _make_pr_state(
     number: int = 42,
     title: str = "Fix the widget",
@@ -60,6 +65,29 @@ def _setup_gh_defaults(gh_mock):
     gh_mock.get_pr_diff.return_value = "diff --git a/foo.py b/foo.py\n+pass"
     gh_mock.get_unresolved_review_threads.return_value = []
     gh_mock.post_comment.return_value = None
+
+
+def test_expired_capacity_claim_defers_before_pending_or_attempt_mutation(
+    fake_redis_client,
+) -> None:
+    pr_state = _make_pr_state(number=808)
+
+    task = publish_rebase_task(
+        pr_state=pr_state,
+        repo="test-org/test-repo",
+        token="fake-token",
+        redis=fake_redis_client,
+        default_runner="codex",
+        provider="codex",
+        credential="redacted-credential",
+        task_id="capacity-expired",
+        capacity_reservation=_RejectedCapacityReservation(),
+    )
+
+    assert task is None
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 808, "abc123") == 0
+    assert fake_redis_client.get("pending:pr:test-org/test-repo:808") is None
+    assert fake_redis_client.xlen("tasks:codex") == 0
 
 
 def test_publish_creates_task(gh_mock, fake_redis_client):

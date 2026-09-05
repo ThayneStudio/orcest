@@ -814,6 +814,18 @@ class RedisClient:
         result: int = self._client.zadd(self._prefixed(key), mapping)  # type: ignore[assignment]
         return result
 
+    def zadd_expiring(self, key: str, mapping: dict[str, float], ttl: int) -> int:
+        """Atomically ZADD members and refresh the containing key's TTL."""
+        if not mapping:
+            return 0
+        if ttl < 1:
+            raise ValueError(f"ttl must be positive, got {ttl}")
+        with self._client.pipeline(transaction=True) as pipe:
+            pipe.zadd(self._prefixed(key), mapping)
+            pipe.expire(self._prefixed(key), ttl)
+            results = pipe.execute()
+        return int(results[0])
+
     def zrangebyscore(
         self,
         key: str,
@@ -837,6 +849,18 @@ class RedisClient:
         if not members:
             return 0
         result: int = self._client.zrem(self._prefixed(key), *members)  # type: ignore[assignment]
+        return result
+
+    def zremrangebyscore(
+        self,
+        key: str,
+        min_score: float | str,
+        max_score: float | str,
+    ) -> int:
+        """ZREMRANGEBYSCORE key min max."""
+        result: int = self._client.zremrangebyscore(  # type: ignore[assignment]
+            self._prefixed(key), min_score, max_score
+        )
         return result
 
     def zscore(self, key: str, member: str) -> float | None:
@@ -897,12 +921,64 @@ class RedisClient:
         result: list[dict[str, Any]] = self._client.xinfo_consumers(self._prefixed(stream), group)  # type: ignore[assignment]
         return result
 
+    def xgroup_pending_snapshot(
+        self,
+        stream: str,
+        group: str,
+        *,
+        pending_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        """Atomically read XINFO GROUPS, bounded XPENDING details, and XLEN."""
+        if pending_limit < 1:
+            raise ValueError(f"pending_limit must be positive, got {pending_limit}")
+        fq_stream = self._prefixed(stream)
+        with self._client.pipeline(transaction=True) as pipe:
+            pipe.xinfo_groups(fq_stream)
+            pipe.xpending_range(
+                fq_stream,
+                group,
+                min="-",
+                max="+",
+                count=pending_limit,
+            )
+            pipe.xlen(fq_stream)
+            raw = cast(list[Any], pipe.execute())
+        if len(raw) != 3:
+            raise TypeError("stream capacity transaction returned malformed response count")
+        return (
+            cast(list[dict[str, Any]], raw[0]),
+            cast(list[dict[str, Any]], raw[1]),
+            int(raw[2]),
+        )
+
     def scan_iter(self, match: str) -> list[str]:
         """SCAN with match pattern. Returns list of unprefixed keys."""
         return [
             k.removeprefix(self._prefix)
             for k in self._client.scan_iter(match=self._prefixed(match))
         ]
+
+    def scan_page(
+        self,
+        cursor: int = 0,
+        *,
+        match: str = "*",
+        count: int = 100,
+    ) -> tuple[int, list[str]]:
+        """Return one bounded SCAN page with unprefixed key names."""
+        if count < 1:
+            raise ValueError(f"count must be positive, got {count}")
+        next_cursor, keys = cast(
+            Any,
+            self._client.scan(
+                cursor=cursor,
+                match=self._prefixed(match),
+                count=count,
+            ),
+        )
+        if not isinstance(keys, (list, tuple)):
+            raise TypeError(f"SCAN returned malformed keys payload: {type(keys).__name__}")
+        return int(next_cursor), [str(key).removeprefix(self._prefix) for key in keys]
 
     def xlen(self, stream: str) -> int:
         """XLEN stream."""

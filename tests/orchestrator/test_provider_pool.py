@@ -666,3 +666,30 @@ def test_seed_credential_override_ignores_unknown_key():
     pool = ProviderPool([entry])
     pool.seed_credential_override("identity-from-removed-config", "x", minted_at=1.0)
     assert pool.effective_credential(entry) == "orig"
+
+
+def test_capacity_selected_backend_round_robins_eligible_accounts():
+    first = ProviderEntry("codex", "account-first")
+    second = ProviderEntry("codex", "account-second")
+    other_backend = ProviderEntry("grok", "account-other")
+    pool = ProviderPool([first, other_backend, second])
+
+    assert [pool.next_entry_from([first, second]) for _ in range(4)] == [
+        first,
+        second,
+        first,
+        second,
+    ]
+
+
+def test_capacity_selected_backend_filters_quota_cooled_account_first():
+    cooled = ProviderEntry("codex", "account-cooled")
+    healthy = ProviderEntry("codex", "account-healthy")
+    pool = ProviderPool([cooled, healthy])
+    pool.register_task("exhausted-task", cooled)
+    pool.mark_exhausted(
+        "exhausted-task",
+        resets_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert pool.next_entry_from([cooled, healthy]) == healthy
