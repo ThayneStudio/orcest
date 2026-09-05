@@ -68,6 +68,8 @@ ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
 VERIFICATION_RECEIPT_PROTOCOL = "orcest.verification-receipt/1"
 REVIEW_RECEIPT_PROTOCOL = "orcest.review-receipt/1"
 ADJUDICATION_RECEIPT_PROTOCOL = "orcest.adjudication-receipt/1"
+MANAGEMENT_COMMAND_PROTOCOL = "orcest.management/1"
+MANAGEMENT_COMMAND_RESULT_PROTOCOL = "orcest.management-result/1"
 
 __all__ = [
     "ATTEMPT_CLAIM_PROTOCOL",
@@ -101,6 +103,8 @@ __all__ = [
     "VERIFICATION_RECEIPT_PROTOCOL",
     "REVIEW_RECEIPT_PROTOCOL",
     "ADJUDICATION_RECEIPT_PROTOCOL",
+    "MANAGEMENT_COMMAND_PROTOCOL",
+    "MANAGEMENT_COMMAND_RESULT_PROTOCOL",
 ]
 
 
