@@ -11,7 +11,6 @@ matrix for those three cleanup kinds, monitoring Schedule creation, and the
 
 from __future__ import annotations
 
-import time
 import uuid
 from pathlib import Path
 
@@ -29,6 +28,7 @@ from orcest.workflow_store import (
     RunStore,
     RunStoreError,
 )
+from tests.workflow_store import test_publications as publication_helpers
 
 pytestmark = pytest.mark.unit
 
@@ -49,6 +49,7 @@ CHECKPOINT_ID_5 = "77777777-7777-4777-8777-777777777775"
 SEARCH_RESULT_ID = "88888888-8888-4888-8888-888888888888"
 FORGE_OBS_ID = "99999999-9999-4999-8999-999999999999"
 HEAD_OBS_ID = "99999999-9999-4999-8999-999999999998"
+PROJECT_ID = "12345678-1234-4234-8234-123456789011"
 
 DESIRED_COMMIT = {"object_format": "sha1", "oid": "a" * 40}
 BASE_COMMIT = {"object_format": "sha1", "oid": "b" * 40}
@@ -59,7 +60,7 @@ def _uid() -> str:
     return str(uuid.uuid4())
 
 
-def _create_run(store: RunStore, run_id: str = RUN_ID, project_id: str = "project-a") -> None:
+def _create_run(store: RunStore, run_id: str = RUN_ID, project_id: str = PROJECT_ID) -> None:
     store.create_run(
         run_id=run_id,
         project_id=project_id,
@@ -117,32 +118,35 @@ def _activate_publication(store: RunStore) -> None:
     ``DESIRED_COMMIT`` -- mirrors test_publications.py's
     test_complete_publication_effect_sets_active."""
     _plan_effect(store)
-    store.record_change_request_search_result(
+    publication_helpers._record_search(
+        store,
         change_request_search_result_id=SEARCH_RESULT_ID,
         forge_observation_id=FORGE_OBS_ID,
         publication_effect_checkpoint_id=CHECKPOINT_ID_1,
         publication_id=PUBLICATION_ID,
         effect_generation=1,
-        project_id="project-a",
+        project_id=PROJECT_ID,
         run_marker=render_run_marker(run_id=RUN_ID, publication_id=PUBLICATION_ID),
         deterministic_ref=deterministic_publication_ref(RUN_ID),
         external_revision="search-rev-1",
         members=(_member(),),
         fresh_exact_object_confirmed=True,
     )
-    store.record_publication_effect_checkpoint(
+    publication_helpers._checkpoint(
+        store,
         publication_effect_checkpoint_id=CHECKPOINT_ID_2,
         publication_id=PUBLICATION_ID,
         effect_generation=1,
         suboperation_kind="BASE_READ_POST",
         status="OBSERVED_SATISFIED",
-        forge_observation_id=FORGE_OBS_ID,
+        forge_observation_id=_uid(),
     )
-    store.complete_publication_effect(
+    publication_helpers._complete_publication(
+        store,
         publication_effect_checkpoint_id=CHECKPOINT_ID_3,
         publication_id=PUBLICATION_ID,
         effect_generation=1,
-        forge_observation_id=FORGE_OBS_ID,
+        forge_observation_id=_uid(),
         observed_external_revision=DESIRED_COMMIT["oid"],
     )
 
@@ -150,6 +154,7 @@ def _activate_publication(store: RunStore) -> None:
 @pytest.fixture
 def store(tmp_path: Path) -> RunStore:
     with RunStore(tmp_path, verify_local_filesystem=False) as s:
+        publication_helpers._seed_project(s)
         _create_run(s)
         yield s
 
@@ -179,6 +184,44 @@ def _plan_update_effect(store: RunStore, **overrides: object) -> tuple:
     )
     params.update(overrides)
     return store.plan_publish_update_effect(**params)  # type: ignore[arg-type]
+
+
+def _record_ref_update_checkpoint(
+    store: RunStore,
+    *,
+    effect_generation: int,
+    status: str,
+    checkpoint_id: str = CHECKPOINT_ID_4,
+) -> str:
+    request_key = request_digest(
+        {"kind": "REF_UPDATE", "generation": effect_generation, "checkpoint": checkpoint_id}
+    )
+    publication_helpers._checkpoint(
+        store,
+        publication_id=PUBLICATION_ID,
+        effect_generation=effect_generation,
+        suboperation_kind="REF_UPDATE",
+        status="REQUEST_READY",
+        request_idempotency_key=request_key,
+    )
+    effect = store.get_publication_effect(PUBLICATION_ID, effect_generation)
+    assert effect is not None
+    observed_external_revision = (
+        effect.desired_commit["oid"] if status == "OBSERVED_SATISFIED" else "d" * 40
+    )
+    observation_id = _uid()
+    publication_helpers._checkpoint(
+        store,
+        publication_effect_checkpoint_id=checkpoint_id,
+        publication_id=PUBLICATION_ID,
+        effect_generation=effect_generation,
+        suboperation_kind="REF_UPDATE",
+        status=status,
+        request_idempotency_key=request_key,
+        forge_observation_id=observation_id,
+        observed_external_revision=observed_external_revision,
+    )
+    return observation_id
 
 
 # -- plan_publish_update_effect ---------------------------------------------
@@ -279,14 +322,7 @@ def test_plan_publish_update_effect_requires_linked_publication(store: RunStore)
 def test_ref_update_cas_mismatch_supersedes_update_effect(store: RunStore) -> None:
     _activate_publication(store)
     _plan_update_effect(store)
-    store.record_publication_effect_checkpoint(
-        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
-        publication_id=PUBLICATION_ID,
-        effect_generation=2,
-        suboperation_kind="REF_UPDATE",
-        status="CAS_MISMATCH",
-        forge_observation_id=FORGE_OBS_ID,
-    )
+    _record_ref_update_checkpoint(store, effect_generation=2, status="CAS_MISMATCH")
     effect = store.get_publication_effect(PUBLICATION_ID, 2)
     assert effect is not None
     assert effect.superseded is True
@@ -300,20 +336,24 @@ def test_ref_update_cas_mismatch_supersedes_update_effect(store: RunStore) -> No
 def test_ref_read_cas_mismatch_does_not_affect_stale_generation(store: RunStore) -> None:
     _activate_publication(store)
     _plan_update_effect(store)
+    _plan_update_effect(
+        store,
+        activity_id="33333333-3333-4333-8333-333333333335",
+        activity_ordinal=3,
+        candidate_id="55555555-5555-4555-8555-555555555557",
+        idempotency_key=request_digest({"kind": "PR_REMEDIATE", "gen": 3}),
+        outbox_id="44444444-4444-4444-8444-444444444446",
+        created_transition_sequence=3,
+        semantic_input={"publication_id": PUBLICATION_ID, "gen": 3},
+        semantic_input_digest=request_digest({"publication_id": PUBLICATION_ID, "gen": 3}),
+    )
     # A CAS_MISMATCH recorded against a superseded (non-current) generation
     # must not resurrect it as superseded-again (already is) nor touch the
     # current generation's outbox.
-    store.record_publication_effect_checkpoint(
-        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
-        publication_id=PUBLICATION_ID,
-        effect_generation=1,
-        suboperation_kind="REF_UPDATE",
-        status="CAS_MISMATCH",
-        forge_observation_id=FORGE_OBS_ID,
-    )
+    _record_ref_update_checkpoint(store, effect_generation=2, status="CAS_MISMATCH")
     current_outbox = store.conn.execute(
         "SELECT state FROM outbox WHERE publication_id = ? AND effect_generation = ?",
-        (PUBLICATION_ID, 2),
+        (PUBLICATION_ID, 3),
     ).fetchone()
     assert current_outbox["state"] == "PENDING"
 
@@ -337,19 +377,14 @@ def test_complete_publication_update_effect_requires_ref_update_satisfied(store:
 def test_complete_publication_update_effect_updates_observed_commit(store: RunStore) -> None:
     _activate_publication(store)
     _plan_update_effect(store)
-    store.record_publication_effect_checkpoint(
-        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
-        publication_id=PUBLICATION_ID,
-        effect_generation=2,
-        suboperation_kind="REF_UPDATE",
-        status="OBSERVED_SATISFIED",
-        forge_observation_id=FORGE_OBS_ID,
+    observation_id = _record_ref_update_checkpoint(
+        store, effect_generation=2, status="OBSERVED_SATISFIED"
     )
     checkpoint = store.complete_publication_update_effect(
         publication_effect_checkpoint_id=CHECKPOINT_ID_5,
         publication_id=PUBLICATION_ID,
         effect_generation=2,
-        forge_observation_id=FORGE_OBS_ID,
+        forge_observation_id=observation_id,
         observed_external_revision=REMEDIATED_COMMIT["oid"],
     )
     assert checkpoint.status == "COMPLETED"
@@ -375,19 +410,14 @@ def test_complete_publication_update_effect_stale_generation_is_audit_only(store
         semantic_input={"publication_id": PUBLICATION_ID, "gen": 3},
         semantic_input_digest=request_digest({"publication_id": PUBLICATION_ID, "gen": 3}),
     )
-    store.record_publication_effect_checkpoint(
-        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
-        publication_id=PUBLICATION_ID,
-        effect_generation=2,
-        suboperation_kind="REF_UPDATE",
-        status="OBSERVED_SATISFIED",
-        forge_observation_id=FORGE_OBS_ID,
+    observation_id = _record_ref_update_checkpoint(
+        store, effect_generation=2, status="OBSERVED_SATISFIED"
     )
     store.complete_publication_update_effect(
         publication_effect_checkpoint_id=CHECKPOINT_ID_5,
         publication_id=PUBLICATION_ID,
         effect_generation=2,
-        forge_observation_id=FORGE_OBS_ID,
+        forge_observation_id=observation_id,
         observed_external_revision=REMEDIATED_COMMIT["oid"],
     )
     publication = store.get_publication(PUBLICATION_ID)
@@ -401,13 +431,8 @@ def test_complete_publication_update_effect_closed_publication_is_audit_only(
 ) -> None:
     _activate_publication(store)
     _plan_update_effect(store)
-    store.record_publication_effect_checkpoint(
-        publication_effect_checkpoint_id=CHECKPOINT_ID_4,
-        publication_id=PUBLICATION_ID,
-        effect_generation=2,
-        suboperation_kind="REF_UPDATE",
-        status="OBSERVED_SATISFIED",
-        forge_observation_id=FORGE_OBS_ID,
+    observation_id = _record_ref_update_checkpoint(
+        store, effect_generation=2, status="OBSERVED_SATISFIED"
     )
     close_activity, _outbox = store.plan_close_publication_activity(
         activity_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -432,7 +457,7 @@ def test_complete_publication_update_effect_closed_publication_is_audit_only(
         publication_effect_checkpoint_id=CHECKPOINT_ID_5,
         publication_id=PUBLICATION_ID,
         effect_generation=2,
-        forge_observation_id=FORGE_OBS_ID,
+        forge_observation_id=observation_id,
         observed_external_revision=REMEDIATED_COMMIT["oid"],
     )
 
@@ -968,52 +993,8 @@ class _Project:
 
 
 def _seed_project(store: RunStore) -> _Project:
-    now = int(time.time() * 1000)
-
-    def _secret(purpose: str) -> str:
-        secret_id = _uid()
-        store.conn.execute(
-            "INSERT INTO secret_current_versions(secret_id, purpose, owner_scope_kind, "
-            "owner_scope_id, provider_account_ref, current_version, last_operation_id, "
-            "created_at_ms, updated_at_ms) VALUES (?, ?, 'PROJECT', ?, NULL, 1, ?, ?, ?)",
-            (secret_id, purpose, _uid(), _uid(), now, now),
-        )
-        return secret_id
-
-    forge_api_secret = _secret("FORGE_API")
-    source_read_secret = _secret("SOURCE_READ")
-    publication_secret = _secret("PUBLICATION")
-
-    forge_instance_id = _uid()
-    store.conn.execute(
-        "INSERT INTO forge_instances(forge_instance_id, adapter_kind, canonical_origin, "
-        "credential_secret_id, registration_provenance_version, created_at_ms) "
-        "VALUES (?, 'GITHUB', ?, ?, 1, ?)",
-        (forge_instance_id, f"github.com/{_uid()}", forge_api_secret, now),
-    )
-
-    project_id = _uid()
-    store.conn.execute(
-        "INSERT INTO projects(project_id, forge_instance_id, installation_or_account_ref, "
-        "repository_external_id, repository_locator, default_ref, trusted_base_policy_ref, "
-        "budget_policy_ref, budget_reset_window_ref, source_read_secret_id, "
-        "publication_secret_id, registration_source_read_secret_version, "
-        "registration_publication_secret_version, registration_revision, "
-        "registration_operation_id, work_item_discovery_schedule_id, registration_state) "
-        "VALUES (?, ?, 'inst', ?, 'org/repo', 'main', 'default', 'default', 'default', "
-        "?, ?, 1, 1, 1, ?, ?, 'ACTIVE')",
-        (
-            project_id,
-            forge_instance_id,
-            _uid(),
-            source_read_secret,
-            publication_secret,
-            _uid(),
-            _uid(),
-        ),
-    )
-    store.conn.commit()
-    return _Project(project_id, forge_instance_id)
+    publication_helpers._seed_project(store)
+    return _Project(PROJECT_ID, publication_helpers.FORGE_INSTANCE_ID)
 
 
 def test_ensure_publication_monitoring_schedules_requires_active(tmp_path: Path) -> None:

@@ -9,6 +9,10 @@ services:
         ORCEST_GID: ${ORCEST_GID:-1000}
     volumes:
       - ${ORCEST_CONFIG_DIR:-./config}:/home/orcest/app/config:ro
+      # Workflow-Control v1 ownership database. The legacy orchestrator only
+      # performs query-only reads and fails closed when the configured store
+      # is unavailable.
+      - ${ORCEST_WORKFLOW_STATE_HOST_PATH:-/dev/null}:/var/lib/orcest/workflow:ro
       # Verbatim per-task trace archive. When ORCEST_TRACE_HOST_PATH is unset
       # (default), this falls back to /dev/null — the in-container archiver
       # probes writability at startup, sees it fail, and self-disables. When

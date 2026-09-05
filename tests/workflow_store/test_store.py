@@ -1769,20 +1769,25 @@ def _write_v5_shaped_database(db_path: Path) -> None:
         now = 1_700_000_000_000
         secret_id = "aaaaaaaa-0000-4000-8000-000000000001"
         publication_secret_id = "aaaaaaaa-0000-4000-8000-000000000009"
-        for sid in (secret_id, publication_secret_id):
+        forge_api_secret_id = "aaaaaaaa-0000-4000-8000-000000000010"
+        for sid, purpose in (
+            (forge_api_secret_id, "FORGE_API"),
+            (secret_id, "SOURCE_READ"),
+            (publication_secret_id, "PUBLICATION"),
+        ):
             store.conn.execute(
                 "INSERT INTO secret_current_versions(secret_id, purpose, owner_scope_kind, "
                 "owner_scope_id, provider_account_ref, current_version, last_operation_id, "
-                "created_at_ms, updated_at_ms) VALUES (?, 'FORGE_API', 'PROJECT', 'scope', NULL, "
+                "created_at_ms, updated_at_ms) VALUES (?, ?, 'PROJECT', 'scope', NULL, "
                 "1, ?, ?, ?)",
-                (sid, "aaaaaaaa-0000-4000-8000-000000000002", now, now),
+                (sid, purpose, "aaaaaaaa-0000-4000-8000-000000000002", now, now),
             )
         forge_instance_id = "aaaaaaaa-0000-4000-8000-000000000003"
         store.conn.execute(
             "INSERT INTO forge_instances(forge_instance_id, adapter_kind, canonical_origin, "
             "credential_secret_id, registration_provenance_version, created_at_ms) "
             "VALUES (?, 'GITHUB', 'github.com/legacy', ?, 1, ?)",
-            (forge_instance_id, secret_id, now),
+            (forge_instance_id, forge_api_secret_id, now),
         )
         project_id = "aaaaaaaa-0000-4000-8000-000000000004"
         schedule_id = "aaaaaaaa-0000-4000-8000-000000000005"

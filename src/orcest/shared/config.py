@@ -159,6 +159,9 @@ class OrchestratorConfig:
     # to pre-archive). Storage backend (NFS, local disk, etc.) is opaque to
     # orcest — operator mounts whatever they want at this path.
     trace_archive_path: str | None = None
+    # Optional workflow-control v1 state root.  When set, the legacy PR
+    # selector consults workflow.db read-only and excludes v1-owned refs/IDs.
+    workflow_state_root: str | None = None
     # Monitor ingest wiring for the EventRelay (orcest.orchestrator.event_relay).
     # None disables the relay (default; matches trace_archive_path's pattern).
     monitor_ingest_url: str | None = None
@@ -960,6 +963,14 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     else:
         trace_archive_path = _safe_str(trace_archive_raw, "trace_archive_path").strip()
 
+    workflow_state_root_raw = raw.get("workflow_state_root")
+    if workflow_state_root_raw is None:
+        workflow_state_root: str | None = None
+    else:
+        workflow_state_root = (
+            _safe_str(workflow_state_root_raw, "workflow_state_root").strip() or None
+        )
+
     # Optional monitor ingest URL for the EventRelay. YAML null or absent →
     # relay disabled, same pattern as trace_archive_path above.
     monitor_ingest_raw = raw.get("monitor_ingest_url")
@@ -1014,6 +1025,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         task_key_prefix=task_key_prefix,
         providers=top_providers,
         trace_archive_path=trace_archive_path,
+        workflow_state_root=workflow_state_root,
         monitor_ingest_url=monitor_ingest_url,
         monitor_write_token_env=monitor_write_token_env,
         pressure_min_tasks=pressure_min_tasks,

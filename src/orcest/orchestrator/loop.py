@@ -94,6 +94,7 @@ from orcest.shared.models import (
 )
 from orcest.shared.providers import ProviderEntry
 from orcest.shared.redis_client import RedisClient, is_redis_oom_error
+from orcest.workflow_store import load_legacy_change_request_exclusion_snapshot
 
 RESULTS_STREAM = "results"
 RESULTS_GROUP = "orchestrator"
@@ -2158,6 +2159,26 @@ def _poll_project(
 
     labels = config.labels
 
+    legacy_exclusion_predicate: Callable[..., bool] | None = None
+    legacy_exclusion_unavailable = False
+    workflow_state_root = config.workflow_state_root
+    if workflow_state_root is not None:
+        try:
+            legacy_exclusion_snapshot = load_legacy_change_request_exclusion_snapshot(
+                workflow_state_root,
+                repository_locator=repo,
+            )
+        except Exception:
+            legacy_exclusion_unavailable = True
+            logger.error(
+                "workflow-control v1 ownership snapshot for %s is unavailable; "
+                "excluding unmarked PRs for this poll",
+                repo,
+                exc_info=True,
+            )
+        else:
+            legacy_exclusion_predicate = legacy_exclusion_snapshot.excludes
+
     # Discover PRs needing action
     pr_states = discover_actionable_prs(
         repo=repo,
@@ -2167,6 +2188,8 @@ def _poll_project(
         max_attempts=config.max_attempts,
         max_total_attempts=config.max_total_attempts,
         stale_pending_timeout_seconds=config.stale_pending_timeout_seconds,
+        legacy_exclusion_predicate=legacy_exclusion_predicate,
+        legacy_exclusion_unavailable=legacy_exclusion_unavailable,
     )
 
     # Sort: merges first (quick wins), then fixes/followups oldest-first
@@ -2848,6 +2871,13 @@ def _poll_project(
                 )
         elif pr_state.action == PRAction.SKIP_BACKOFF:
             logger.info("PR #%d: in backoff cooldown, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_V1_OWNED:
+            logger.debug("PR #%d: reserved for workflow-control v1, skipping", pr_state.number)
+        elif pr_state.action == PRAction.SKIP_V1_LOOKUP_UNAVAILABLE:
+            logger.debug(
+                "PR #%d: workflow-control v1 ownership lookup unavailable; fail-closed skip",
+                pr_state.number,
+            )
         elif pr_state.action == PRAction.SKIP_DRAFT:
             logger.debug("PR #%d: draft, skipping", pr_state.number)
         elif pr_state.action == PRAction.SKIP_PENDING:

@@ -141,8 +141,14 @@ def classify_member_ownership(
         "EFFECT_GENERATION_MISMATCH": not effect_generation_ok,
     }
     defects = tuple(code for code in _OWNERSHIP_DEFECT_CODES_FOR_MISMATCH if checks[code])
-    if not defects:
+    if not defects and evidence_complete:
         return "POSITIVE", ()
+    if not defects:
+        # A caller that has not completed the proof cannot obtain POSITIVE by
+        # merely accepting every comparison default.  HEAD_UNPROVEN is the
+        # closed-taxonomy defect for evidence that has not established the
+        # immutable object/head binding yet.
+        return "INCOMPLETE", ("HEAD_UNPROVEN",)
     if evidence_complete:
         return "INCOMPATIBLE", defects
     return "INCOMPLETE", defects

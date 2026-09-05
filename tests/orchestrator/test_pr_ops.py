@@ -41,6 +41,7 @@ from orcest.shared.coordination import (
     set_backoff_cooldown,
     set_pending_task,
 )
+from orcest.workflow_contract.v1.publication import render_run_marker
 
 REPO = "test-org/test-repo"
 
@@ -56,6 +57,7 @@ def _make_pr_data(
     mergeable: str = "MERGEABLE",
     base_branch: str = "main",
     merge_state_status: str = "CLEAN",
+    body: str = "",
 ) -> dict:
     """Build a PR dict matching the shape returned by gh.list_open_prs."""
     return {
@@ -69,7 +71,72 @@ def _make_pr_data(
         "reviewDecision": review_decision,
         "mergeable": mergeable,
         "mergeStateStatus": merge_state_status,
+        "body": body,
     }
+
+
+def test_skip_pr_reserved_by_v1_run_marker(gh_mock, fake_redis_client, label_config):
+    marker = render_run_marker(
+        run_id="11111111-1111-4111-8111-111111111111",
+        publication_id="22222222-2222-4222-8222-222222222222",
+    )
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10, body=marker)]
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+    )
+
+    assert results[0].action == PRAction.SKIP_V1_OWNED
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_skip_pr_reserved_by_v1_association(gh_mock, fake_redis_client, label_config):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10, branch="orcest/run/owned")]
+    seen: list[dict[str, str | None]] = []
+
+    def is_v1_owned(**identities: str | None) -> bool:
+        seen.append(identities)
+        return True
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_exclusion_predicate=is_v1_owned,
+    )
+
+    assert seen == [
+        {
+            "change_request_external_id": "10",
+            "deterministic_ref": "refs/heads/orcest/run/owned",
+        }
+    ]
+    assert results[0].action == PRAction.SKIP_V1_OWNED
+    gh_mock.get_ci_status.assert_not_called()
+
+
+def test_v1_association_lookup_failure_excludes_for_current_poll(
+    gh_mock, fake_redis_client, label_config
+):
+    gh_mock.list_open_prs.return_value = [_make_pr_data(number=10)]
+
+    def unavailable(**_identities: str | None) -> bool:
+        raise OSError("workflow store unavailable")
+
+    results = discover_actionable_prs(
+        repo=REPO,
+        token="fake-token",
+        redis=fake_redis_client,
+        label_config=label_config,
+        legacy_exclusion_predicate=unavailable,
+    )
+
+    assert results[0].action == PRAction.SKIP_V1_LOOKUP_UNAVAILABLE
+    gh_mock.get_ci_status.assert_not_called()
 
 
 def test_skip_labeled_pr(gh_mock, fake_redis_client, label_config):

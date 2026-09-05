@@ -181,6 +181,7 @@ class TestGenerateEnvFile:
         assert "ORCEST_REDIS_KEY_PREFIX='myproj'" in env
         assert "ORCEST_IMAGE='orcest:latest'" in env
         assert "ORCEST_CONFIG_DIR='/opt/orcest/projects/myproj/config'" in env
+        assert "ORCEST_WORKFLOW_STATE_HOST_PATH" not in env
 
     def test_project_name_in_config_dir(self):
         env = generate_env_file(
@@ -270,6 +271,25 @@ class TestGenerateEnvFile:
 
         assert "MONITOR_WRITE_TOKEN='monitor-secret'" in env
 
+    def test_generate_env_file_emits_workflow_state_mount(self):
+        env = generate_env_file(
+            github_token="t",
+            key_prefix="p",
+            project_name="p",
+            workflow_state_host_path="/var/lib/orcest-v1",
+        )
+
+        assert "ORCEST_WORKFLOW_STATE_HOST_PATH='/var/lib/orcest-v1'" in env
+
+    def test_generate_env_file_rejects_relative_workflow_state_mount(self):
+        with pytest.raises(ValueError, match="workflow_state_host_path must be an absolute path"):
+            generate_env_file(
+                github_token="t",
+                key_prefix="p",
+                project_name="p",
+                workflow_state_host_path="relative/state",
+            )
+
     def test_generate_env_file_rejects_single_quote_in_redis_password(self):
         """C1: the password is single-quoted in .env, so a single quote must be
         rejected (mirrors the github_token/key_prefix injection guards)."""
@@ -316,6 +336,7 @@ class TestGenerateOrchestratorConfig:
         assert data["redis"]["port"] == 6379
         assert data["redis"]["key_prefix"] == "myproj"
         assert data["github"]["repo"] == "Org/repo"
+        assert "workflow_state_root" not in data
 
     def test_key_prefix_matches_project(self):
         """The key_prefix in the config matches what was passed."""
@@ -333,6 +354,17 @@ class TestGenerateOrchestratorConfig:
 
         assert data["monitor_ingest_url"] == "http://monitor:9091/ingest/v1/events"
         assert data["monitor_write_token_env"] == "MONITOR_WRITE_TOKEN"
+
+    def test_emits_workflow_state_root(self):
+        data = yaml.safe_load(
+            generate_orchestrator_config(
+                repo="O/r",
+                key_prefix="p",
+                workflow_state_enabled=True,
+            )
+        )
+
+        assert data["workflow_state_root"] == "/var/lib/orcest/workflow"
 
     def test_no_providers_block_without_extra_providers(self):
         """Default: no providers: block (claude comes from legacy synthesis)."""
@@ -1389,6 +1421,17 @@ class TestRedisStackEnvFile:
 
         assert "CODEX_API_KEY" in compose
         assert "OPENAI_API_KEY" in compose
+
+    @pytest.mark.parametrize(
+        "compose_path",
+        ["docker-compose.yml", "src/orcest/fleet/deploy/docker-compose.yml"],
+    )
+    def test_orchestrator_compose_mounts_workflow_state_read_only(self, compose_path):
+        compose = Path(compose_path).read_text()
+
+        assert (
+            "${ORCEST_WORKFLOW_STATE_HOST_PATH:-/dev/null}:/var/lib/orcest/workflow:ro"
+        ) in compose
 
 
 class TestRedisCliAuthenticates:

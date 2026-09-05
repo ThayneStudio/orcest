@@ -158,6 +158,42 @@ def test_schedule_kind_target_kind_matrix_is_enforced(run_store: RunStore) -> No
         )
 
 
+def test_schedule_forge_must_own_project(run_store: RunStore) -> None:
+    project = _seed_project(run_store)
+    other_project = _seed_project(run_store)
+
+    with pytest.raises(ValueError, match="does not own the Project"):
+        run_store.create_forge_observation_schedule(
+            forge_observation_schedule_id=_uid(),
+            schedule_kind="WORK_ITEM_POLL",
+            project_id=project.project_id,
+            forge_instance_id=other_project.forge_instance_id,
+            target_kind="WORK_ITEM",
+            target_id="issue-1",
+            minimum_interval_ms=1,
+            next_due_at_ms=0,
+        )
+
+
+def test_due_request_requires_current_project_source_credential(run_store: RunStore) -> None:
+    project = _seed_project(run_store)
+    other_project = _seed_project(run_store)
+    schedule = _work_item_poll_schedule(run_store, project)
+
+    with pytest.raises(ValueError, match="current source credential"):
+        run_store.create_due_forge_observation_request(
+            forge_observation_request_id=_uid(),
+            forge_observation_schedule_id=schedule.forge_observation_schedule_id,
+            now_ms=_now_ms(),
+            controller_mode="RUNNING",
+            controller_mode_revision=1,
+            credential_purpose="PROJECT_SOURCE_READ",
+            credential_secret_id=other_project.source_read_secret_id,
+            credential_secret_version=1,
+            outbox_id=_uid(),
+        )
+
+
 def test_create_due_request_is_idempotent_while_pending(run_store: RunStore) -> None:
     project = _seed_project(run_store)
     schedule = _work_item_poll_schedule(run_store, project)
@@ -359,6 +395,92 @@ def test_adapter_event_id_replay_is_idempotent_and_conflict_is_rejected(
                     adapter_event_id="delivery-1",
                 )
             ],
+        )
+
+
+def test_adapter_event_id_replay_rejects_changed_credential_binding(
+    run_store: RunStore,
+) -> None:
+    project = _seed_project(run_store)
+    schedule = _work_item_poll_schedule(run_store, project)
+    request = _due_request(run_store, project, schedule.forge_observation_schedule_id)
+    assert request is not None
+    run_store.record_forge_observation_request_attempt(request.forge_observation_request_id)
+    run_store.complete_forge_observation_request(
+        forge_observation_request_id=request.forge_observation_request_id,
+        observations=[
+            ForgeObservationInput(
+                kind="WORK_ITEM_SNAPSHOT",
+                external_revision="rev-1",
+                fact={"state": "OPEN"},
+                adapter_event_id="delivery-credential-rotation",
+            )
+        ],
+    )
+
+    run_store.conn.execute(
+        "UPDATE secret_current_versions SET current_version = 2 WHERE secret_id = ?",
+        (project.source_read_secret_id,),
+    )
+    request2 = run_store.create_due_forge_observation_request(
+        forge_observation_request_id=_uid(),
+        forge_observation_schedule_id=schedule.forge_observation_schedule_id,
+        now_ms=_now_ms() + 10,
+        controller_mode="RUNNING",
+        controller_mode_revision=1,
+        credential_purpose="PROJECT_SOURCE_READ",
+        credential_secret_id=project.source_read_secret_id,
+        credential_secret_version=2,
+        outbox_id=_uid(),
+    )
+    assert request2 is not None
+    run_store.record_forge_observation_request_attempt(request2.forge_observation_request_id)
+    with pytest.raises(IdempotencyConflictError, match="credential_secret_version"):
+        run_store.complete_forge_observation_request(
+            forge_observation_request_id=request2.forge_observation_request_id,
+            observations=[
+                ForgeObservationInput(
+                    kind="WORK_ITEM_SNAPSHOT",
+                    external_revision="rev-1",
+                    fact={"state": "OPEN"},
+                    adapter_event_id="delivery-credential-rotation",
+                )
+            ],
+        )
+
+
+def test_due_request_rejects_stale_expected_observation_fence(run_store: RunStore) -> None:
+    project = _seed_project(run_store)
+    schedule = _work_item_poll_schedule(run_store, project)
+    request = _due_request(run_store, project, schedule.forge_observation_schedule_id)
+    assert request is not None
+    run_store.record_forge_observation_request_attempt(request.forge_observation_request_id)
+    completion = run_store.complete_forge_observation_request(
+        forge_observation_request_id=request.forge_observation_request_id,
+        observations=[
+            ForgeObservationInput(
+                kind="WORK_ITEM_SNAPSHOT",
+                external_revision="rev-1",
+                fact={"state": "OPEN"},
+            )
+        ],
+    )
+    observation = run_store.get_forge_observation(completion.observation_ids[0])
+    assert observation is not None
+
+    with pytest.raises(CasMismatchError, match="sequence is no longer current"):
+        run_store.create_due_forge_observation_request(
+            forge_observation_request_id=_uid(),
+            forge_observation_schedule_id=schedule.forge_observation_schedule_id,
+            now_ms=_now_ms() + 10,
+            controller_mode="RUNNING",
+            controller_mode_revision=1,
+            credential_purpose="PROJECT_SOURCE_READ",
+            credential_secret_id=project.source_read_secret_id,
+            credential_secret_version=1,
+            expected_prior_observation_sequence=observation.observation_sequence + 1,
+            expected_external_revision=observation.external_revision,
+            outbox_id=_uid(),
         )
 
 

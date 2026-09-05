@@ -185,6 +185,7 @@ def _write_project_files_from_config(
         claude_tokens=org.claude_oauth_tokens,
         provider_credentials=getattr(org, "provider_credentials", None),
         trace_archive_host_path=cfg.trace_archive_host_path,
+        workflow_state_host_path=cfg.workflow_state_host_path,
         redis_password=redis_password,
         monitor_write_token=cfg.monitor_write_token,
     )
@@ -194,6 +195,7 @@ def _write_project_files_from_config(
         extra_providers=list((getattr(org, "provider_credentials", None) or {}).keys()),
         default_runner=cfg.pool.default_task_backend(),
         trace_archive_enabled=bool(cfg.trace_archive_host_path),
+        workflow_state_enabled=bool(cfg.workflow_state_host_path),
         monitor_ingest_url=cfg.monitor_ingest_url,
     )
     write_project_files(ssh_target, project.name, env_content, config_yaml)
