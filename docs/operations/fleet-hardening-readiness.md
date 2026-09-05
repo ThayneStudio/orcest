@@ -19,12 +19,12 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 
 | Gate | Evidence required | Current state |
 | --- | --- | --- |
-| Review findings | Every comment fixed or explicitly explained; review of final candidate | Original PR fixes implemented; candidate review pending |
-| Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate image validation pending |
+| Review findings | Every comment fixed or explicitly explained; review of final candidate | Original PR fixes implemented and dispositions recorded; candidate review pending |
+| Supported runtime | Supported LTS Node, consistent build/deploy pins, type checks and image smoke | Node 24.20.0 passes local checks; candidate container smoke in progress |
 | Dependency security | Audit locked dependencies; no unexplained high/critical findings | Updated lockfile reports zero npm advisories on 2026-09-05 |
 | Data correctness | Expiration, partial discovery, stale observations, completion evidence, account/worker distinction | Dashboard regression suite passes; live candidate validation pending |
 | Session/output behavior | Expiry, logout, token rotation, reconnect, bounded connections and output queues | Existing tests cover these boundaries; local process rehearsal passed |
-| Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed concurrency run pending |
+| Queue recovery | Crash before ACK, durable pending state, replay, ownership safety under concurrency | Existing unit and real-Redis tests identified; local process rehearsal passed; managed Redis integration/concurrency: 12 passed |
 | External outages | GitHub/Redis failures pause safely and recover without lost outcomes or repeated effects | Unit result-replay coverage passes; local process rehearsal passed |
 | Restore and rollback | Restore data into an isolated instance; verify candidate rollback with exact artifacts | Local isolated restore rehearsal passed; prior rollout evidence must be checked for applicability |
 | Sustained operation | 24 hours of timestamped measurements with representative work and no unexplained failure | Not started |
@@ -48,7 +48,7 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 | Scenario | Existing executable evidence | What it does not prove |
 | --- | --- | --- |
 | Result publication/ACK interruptions | `tests/worker/test_loop.py`, `tests/orchestrator/test_loop.py` | Most use mocked calls or fakeredis rather than killing VMs |
-| Shared provider capacity and expired leases | `tests/integration/test_provider_capacity_routing.py` | Needs execution under the invocation-owned Redis harness |
+| Shared provider capacity and expired leases | `tests/integration/test_provider_capacity_routing.py` | Executed under the invocation-owned Redis harness; 12 integration/stress scenarios passed |
 | Replacement consumer recovery | `tests/integration/test_mixed_provider_streams.py` | Exercises Redis clients, not complete VM replacement |
 | Concurrent claims/locks | `tests/stress/test_concurrent_workers.py` | Simulated worker threads, not paid agent runs |
 | Real subprocess liveness | `tests/worker/test_runner_watchdog_integration.py` | Synthetic provider scripts, not provider service availability |
@@ -57,7 +57,8 @@ its store tests do not prove recovery of the currently deployed legacy queue.
 Local validation after the initial review fixes: 804 dashboard tests passed;
 type checks, production build, bundle smoke and Python-writer/Redis/dashboard
 end-to-end flow passed. Focused coordinator/worker recovery unit suite: 402
-passed, one skipped, one integration test deselected. Node 24 and the dependency
+passed, one skipped, one integration test deselected. The skip is an obsolete dead-letter lock-order
+test tracked by issue #398; current terminal handoff and failed-handoff tests run. Node 24 and the dependency
 updates also passed the dashboard suite, type checks, build and Redis E2E.
 
 The dependency update moves off Node 20, which is end-of-life according to the
@@ -98,4 +99,8 @@ Do not report the goal complete while required work or observation remains.
 
 The local process rehearsal passed all five checks on 2026-09-05. The watchdog
 subprocess suite timed out on macOS, where Linux `/proc` sampling is unavailable;
-that run was stopped and is not counted as passing. Validate it on Linux.
+that run was stopped and is not counted as passing. The isolated Linux run passed all nine scenarios.
+
+The first Node 24 container smoke caught a read-only `navigator` global in the
+browser smoke helper. The helper now installs its fixture with `defineProperty`;
+the Node 24 bundle smoke passes. No production browser code changed for this fix.
