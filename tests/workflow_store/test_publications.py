@@ -2634,16 +2634,18 @@ def test_decide_ref_cas_used_end_to_end_with_publish_effect(store: RunStore) -> 
 
 def test_legacy_exclusion_requires_at_least_one_predicate(store: RunStore) -> None:
     with pytest.raises(ValueError, match="at least one of"):
-        store.is_change_request_excluded_from_legacy_engine()
+        store.is_change_request_excluded_from_legacy_engine(repository_locator="test-org/test-repo")
 
 
 def test_legacy_exclusion_true_while_run_is_live(store: RunStore) -> None:
     _plan_effect(store)
     assert store.is_change_request_excluded_from_legacy_engine(
-        deterministic_ref=deterministic_publication_ref(RUN_ID)
+        repository_locator="test-org/test-repo",
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
     )
     assert is_change_request_excluded_from_legacy_database(
         store.state_root,
+        repository_locator="test-org/test-repo",
         deterministic_ref=deterministic_publication_ref(RUN_ID),
     )
 
@@ -2651,7 +2653,7 @@ def test_legacy_exclusion_true_while_run_is_live(store: RunStore) -> None:
 def test_legacy_exclusion_false_for_unknown_ref(store: RunStore) -> None:
     _plan_effect(store)
     assert not store.is_change_request_excluded_from_legacy_engine(
-        deterministic_ref="refs/heads/orcest/run/unrelated"
+        repository_locator="test-org/test-repo", deterministic_ref="refs/heads/orcest/run/unrelated"
     )
 
 
@@ -2720,5 +2722,6 @@ def test_legacy_exclusion_aggregates_all_matching_publications(store: RunStore) 
         outbox_id="44444444-4444-4444-8444-444444444445",
     )
     assert store.is_change_request_excluded_from_legacy_engine(
-        deterministic_ref=deterministic_publication_ref(RUN_ID)
+        repository_locator="test-org/test-repo",
+        deterministic_ref=deterministic_publication_ref(RUN_ID),
     )

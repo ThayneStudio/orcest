@@ -4066,9 +4066,9 @@ def load_legacy_change_request_exclusion_snapshot(
 def is_change_request_excluded_from_legacy_database(
     state_root: Path | str,
     *,
+    repository_locator: str,
     change_request_external_id: str | None = None,
     deterministic_ref: str | None = None,
-    repository_locator: str | None = None,
 ) -> bool:
     """Read the v1 ownership fence without acquiring the controller lock.
 
@@ -4079,40 +4079,12 @@ def is_change_request_excluded_from_legacy_database(
         raise ValueError(
             "at least one of change_request_external_id or deterministic_ref is required"
         )
-    if repository_locator is not None:
-        return load_legacy_change_request_exclusion_snapshot(
-            state_root, repository_locator=repository_locator
-        ).excludes(
-            change_request_external_id=change_request_external_id,
-            deterministic_ref=deterministic_ref,
-        )
-    conditions: list[str] = []
-    params: list[str] = []
-    if change_request_external_id is not None:
-        conditions.append("p.change_request_external_id = ?")
-        params.append(change_request_external_id)
-    if deterministic_ref is not None:
-        conditions.append("p.deterministic_branch = ?")
-        params.append(deterministic_ref)
-    db_path = Path(state_root) / "workflow.db"
-    conn = open_read_only(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT runs.state AS run_state, r.state AS reservation_state "
-            "FROM publications p JOIN runs ON runs.run_id = p.run_id "
-            "LEFT JOIN terminal_duplicate_cleanup_reservations r "
-            "ON r.terminal_duplicate_cleanup_reservation_id = "
-            "p.terminal_duplicate_cleanup_reservation_id "
-            f"WHERE ({' OR '.join(conditions)})",
-            tuple(params),
-        ).fetchall()
-        return any(
-            row["run_state"] not in ("MERGED", "CLOSED", "CANCELLED")
-            or row["reservation_state"] == "ACTIVE"
-            for row in rows
-        )
-    finally:
-        conn.close()
+    return load_legacy_change_request_exclusion_snapshot(
+        state_root, repository_locator=repository_locator
+    ).excludes(
+        change_request_external_id=change_request_external_id,
+        deterministic_ref=deterministic_ref,
+    )
 
 
 _SCHEMA = f"""
@@ -19179,9 +19151,9 @@ class RunStore:
     def is_change_request_excluded_from_legacy_engine(
         self,
         *,
+        repository_locator: str,
         change_request_external_id: str | None = None,
         deterministic_ref: str | None = None,
-        repository_locator: str | None = None,
     ) -> bool:
         """The association-based half of the unconditional legacy-engine
         exclusion (domain-model.md 4692-4695, forge-integration.md 410-413):
@@ -19215,23 +19187,19 @@ class RunStore:
         if deterministic_ref is not None:
             conditions.append("p.deterministic_branch = ?")
             params.append(deterministic_ref)
-        repository_join = ""
-        repository_condition = ""
-        if repository_locator is not None:
-            if not repository_locator.strip():
-                raise ValueError("repository_locator must not be empty")
-            repository_join = "JOIN projects project ON project.project_id = runs.project_id "
-            repository_condition = "AND project.repository_locator = ? COLLATE NOCASE"
-            params.append(repository_locator)
+        if not repository_locator.strip():
+            raise ValueError("repository_locator must not be empty")
+        params.append(repository_locator)
         rows = self.conn.execute(
             "SELECT runs.state AS run_state, r.state AS reservation_state "
             "FROM publications p "
             "JOIN runs ON runs.run_id = p.run_id "
-            f"{repository_join}"
+            "JOIN projects project ON project.project_id = runs.project_id "
             "LEFT JOIN terminal_duplicate_cleanup_reservations r "
             "ON r.terminal_duplicate_cleanup_reservation_id = "
             "p.terminal_duplicate_cleanup_reservation_id "
-            f"WHERE ({' OR '.join(conditions)}) {repository_condition}",
+            f"WHERE ({' OR '.join(conditions)}) "
+            "AND project.repository_locator = ? COLLATE NOCASE",
             tuple(params),
         ).fetchall()
         return any(
