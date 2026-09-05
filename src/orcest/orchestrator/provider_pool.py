@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from orcest.shared.models import is_claude_provider
@@ -76,6 +77,8 @@ class ProviderPool:
 
         self._entries: list[ProviderEntry] = list(seen.values())  # order preserved for RR
         self._counter: int = 0
+        self._account_subset_counters: dict[tuple[str, ...], int] = {}
+        self._account_variant_counters: dict[tuple[str, ...], int] = {}
         # Cooldowns are keyed by ACCOUNT (provider + credential hash), NOT by
         # identity(): rate limits are per-account, so benching an account benches
         # every model-entry that shares its credential. See ProviderEntry.account_key.
@@ -190,6 +193,44 @@ class ProviderPool:
                 if entry.account_key() not in self._cooldowns:
                     return entry
             return None
+
+    def next_entry_from(self, candidates: Iterable[ProviderEntry]) -> ProviderEntry | None:
+        """Round-robin across an eligible subset without changing quota semantics.
+
+        Capacity routing groups credentials by their actual worker backend and
+        calls this only after selecting that backend.  Keeping the account
+        rotation here preserves the pool's cooldown lock and ensures multiple
+        credentials do not masquerade as multiple workers in the capacity
+        calculation.
+        """
+        requested = {entry.identity() for entry in candidates}
+        if not requested:
+            return None
+        with self._lock:
+            self._prune_cooldowns()
+            eligible = [
+                entry
+                for entry in self._entries
+                if entry.identity() in requested and entry.account_key() not in self._cooldowns
+            ]
+            if not eligible:
+                return None
+            entries_by_account: dict[str, list[ProviderEntry]] = {}
+            for entry in eligible:
+                entries_by_account.setdefault(entry.account_key(), []).append(entry)
+
+            # Rate limits and cooldowns are account-scoped, so accounts—not
+            # model/alias entries—receive equal turns. Entries within the
+            # chosen account rotate independently in stable pool order.
+            account_key = tuple(entries_by_account)
+            account_counter = self._account_subset_counters.get(account_key, 0)
+            self._account_subset_counters[account_key] = account_counter + 1
+            selected_account = account_key[account_counter % len(account_key)]
+            variants = entries_by_account[selected_account]
+            variant_key = (selected_account, *(entry.identity() for entry in variants))
+            variant_counter = self._account_variant_counters.get(variant_key, 0)
+            self._account_variant_counters[variant_key] = variant_counter + 1
+            return variants[variant_counter % len(variants)]
 
     # ------------------------------------------------------------------
     # Primary (lean) registration / exhaustion API

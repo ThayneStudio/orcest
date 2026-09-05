@@ -8,6 +8,7 @@ posting comments when tasks are queued.
 import json
 import logging
 import re
+from typing import Protocol
 from weakref import WeakKeyDictionary
 
 from orcest.orchestrator import gh
@@ -84,6 +85,12 @@ _LOG_ERROR_RE = re.compile(
 # RunnerConfig defaults.  Functions that have a live RunnerConfig available
 # should receive the TTL explicitly; this constant is used only as a fallback.
 _DEFAULT_PENDING_TASK_TTL: int = compute_pending_task_ttl(RunnerConfig())
+
+
+class PublicationCapacityReservation(Protocol):
+    """Minimal capacity-claim contract checked at the mutation boundary."""
+
+    def refresh(self) -> bool: ...
 
 
 def _resolve_task_provider(provider: str | None, default_runner: str) -> str:
@@ -478,6 +485,7 @@ def _publish_and_notify(
     logger: logging.Logger | None = None,
     proactive: bool = False,
     task_redis: RedisClient | None = None,
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility.
 
@@ -499,6 +507,16 @@ def _publish_and_notify(
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
+
+    # Context collection may involve bounded GitHub retries. Revalidate the
+    # shared claim immediately before mutating pending/attempt state.
+    if capacity_reservation is not None and not capacity_reservation.refresh():
+        _log.info(
+            "Capacity reservation expired before publishing task %s for PR #%d; deferring",
+            task.id,
+            pr_state.number,
+        )
+        return False
 
     # Claim the pending-task slot atomically (SET NX EX). If another task
     # is already pending for this PR, skip publish to avoid duplicates.
@@ -596,6 +614,7 @@ def publish_fix_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> Task | None:
     """Create and publish a fix task for a PR.
 
@@ -705,6 +724,7 @@ def publish_fix_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
     )
 
     return task if published else None
@@ -728,6 +748,7 @@ def publish_followup_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> Task | None:
     """Create and publish a triage-followups task for a PR.
 
@@ -793,6 +814,7 @@ def publish_followup_task(
         pending_task_ttl=pending_task_ttl,
         logger=logger,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
     )
 
     return task if published else None
@@ -818,6 +840,7 @@ def publish_rebase_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> Task | None:
     """Create and publish a rebase task for a PR.
 
@@ -872,6 +895,7 @@ def publish_rebase_task(
         logger=logger,
         proactive=proactive,
         task_redis=task_redis,
+        capacity_reservation=capacity_reservation,
     )
 
     return task if published else None
@@ -895,6 +919,7 @@ def publish_issue_task(
     # task_id for register-before-publish hardened failure handling (Task 5 wiring)
     task_id: str | None = None,
     provider_account: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> Task | None:
     """Create and publish an implementation task for a GitHub issue.
 
@@ -965,6 +990,7 @@ def publish_issue_task(
         prompt_input_hash=prompt_hash,
         expected_head_owner=head_owner,
         expected_branch=expected_branch,
+        capacity_reservation=capacity_reservation,
     )
 
     return task if published else None
@@ -983,6 +1009,7 @@ def _publish_issue_and_notify(
     prompt_input_hash: str = "",
     expected_head_owner: str = "",
     expected_branch: str = "",
+    capacity_reservation: PublicationCapacityReservation | None = None,
 ) -> bool:
     """Publish a task to Redis and update GitHub visibility on the issue.
 
@@ -996,6 +1023,14 @@ def _publish_issue_and_notify(
     """
     task_type = task.type
     _log = logger or logging.getLogger(__name__)
+
+    if capacity_reservation is not None and not capacity_reservation.refresh():
+        _log.info(
+            "Capacity reservation expired before publishing task %s for issue #%d; deferring",
+            task.id,
+            issue_state.number,
+        )
+        return False
 
     try:
         reservation = reserve_issue_publication(
