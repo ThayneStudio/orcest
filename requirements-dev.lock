@@ -30,6 +30,10 @@ click==8.3.1
     #   uvicorn
 coverage==7.16.0
     # via pytest-cov
+cryptography==41.0.7
+    # via
+    #   -c requirements.lock
+    #   orcest (pyproject.toml)
 fakeredis==2.37.1
     # via orcest (pyproject.toml)
 fastapi==0.141.1

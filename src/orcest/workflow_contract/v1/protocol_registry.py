@@ -68,6 +68,9 @@ ATTEMPT_LIVENESS_RESULT_PROTOCOL = "orcest.attempt-liveness-result/1"
 VERIFICATION_RECEIPT_PROTOCOL = "orcest.verification-receipt/1"
 REVIEW_RECEIPT_PROTOCOL = "orcest.review-receipt/1"
 ADJUDICATION_RECEIPT_PROTOCOL = "orcest.adjudication-receipt/1"
+STORAGE_MANAGEMENT_PROTOCOL = "orcest.storage-management/1"
+STORAGE_RESTORATION_ACCEPTED_PROTOCOL = "orcest.storage-restoration-accepted/1"
+STORAGE_RESTORATION_RESULT_PROTOCOL = "orcest.storage-restoration-result/1"
 MANAGEMENT_COMMAND_PROTOCOL = "orcest.management/1"
 MANAGEMENT_COMMAND_RESULT_PROTOCOL = "orcest.management-result/1"
 
@@ -1027,8 +1030,81 @@ register_envelope(
     },
     protocol_field="protocol",
 )
-register_envelope("orcest.storage-restoration-result/1", {})
-register_envelope("orcest.storage-management/1", {})
+
+
+def _storage_management_invariant(value: Mapping[str, Any]) -> None:
+    object_kind = value.get("object_kind")
+    if object_kind == "SECRET_VERSION":
+        _require(value.get("secret_id") is not None, "SECRET_VERSION requires secret_id")
+        _require(value.get("secret_version") is not None, "SECRET_VERSION requires secret_version")
+        _require(value.get("expected_digest") is None, "SECRET_VERSION must not carry a digest")
+        _require(value.get("media_kind") is None, "SECRET_VERSION must not carry media_kind")
+    else:
+        _require(value.get("secret_id") is None, f"{object_kind} must not carry secret_id")
+        _require(
+            value.get("secret_version") is None, f"{object_kind} must not carry secret_version"
+        )
+        _require(
+            value.get("expected_digest") is not None, f"{object_kind} requires expected_digest"
+        )
+        if object_kind == "WORKFLOW_BLOB":
+            _require(value.get("media_kind") is not None, "WORKFLOW_BLOB requires media_kind")
+        else:
+            _require(value.get("media_kind") is None, f"{object_kind} must not carry media_kind")
+
+
+register_envelope(
+    STORAGE_MANAGEMENT_PROTOCOL,
+    {
+        "operation_id": Field(validator=_is_uuid),
+        "object_kind": Field(enum=_enum_values(enums.StorageRestorationFactObjectKind)),
+        "byte_length": Field(validator=_is_positive_int),
+        "expected_digest": Field(required=False, nullable=True, validator=_is_digest),
+        "media_kind": Field(
+            required=False,
+            nullable=True,
+            enum=_enum_values(enums.get_enum("workflow_blob.media_kind")),
+        ),
+        "secret_id": Field(required=False, nullable=True, validator=_is_uuid),
+        "secret_version": Field(required=False, nullable=True, validator=_is_positive_int),
+    },
+    protocol_field="protocol",
+    object_validator=_storage_management_invariant,
+)
+
+
+def _storage_restoration_result_invariant(value: Mapping[str, Any]) -> None:
+    state = value.get("state")
+    if state == "RESTORED":
+        _require(
+            value.get("storage_restoration_fact_id") is not None,
+            "RESTORED requires storage_restoration_fact_id",
+        )
+        _require(value.get("rejection_code") is None, "RESTORED must not carry rejection_code")
+    elif state == "REJECTED":
+        _require(value.get("rejection_code") is not None, "REJECTED requires rejection_code")
+        _require(
+            value.get("storage_restoration_fact_id") is None,
+            "REJECTED must not carry storage_restoration_fact_id",
+        )
+
+
+register_envelope(
+    STORAGE_RESTORATION_RESULT_PROTOCOL,
+    {
+        "operation_id": Field(validator=_is_uuid),
+        "state": Field(enum=frozenset({"RESTORED", "REJECTED"})),
+        "object_kind": Field(enum=_enum_values(enums.StorageRestorationFactObjectKind)),
+        "storage_restoration_fact_id": Field(required=False, nullable=True, validator=_is_uuid),
+        "rejection_code": Field(
+            required=False,
+            nullable=True,
+            enum=_enum_values(enums.StorageRestorationOperationRejectionCode),
+        ),
+    },
+    protocol_field="protocol",
+    object_validator=_storage_restoration_result_invariant,
+)
 register_envelope(
     "orcest.management-result/1",
     {

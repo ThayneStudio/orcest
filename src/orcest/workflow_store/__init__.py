@@ -114,6 +114,13 @@ from orcest.workflow_store.store import (
     WriterLockError,
     open_read_only,
 )
+from orcest.workflow_store.v1.backup import (
+    BackupBarrierTimeoutError,
+    BackupManifestEntry,
+    BackupModeTransitionError,
+    BackupResult,
+    create_backup,
+)
 from orcest.workflow_store.v1.blobs import WorkflowBlobRecord, WorkflowBlobStore
 from orcest.workflow_store.v1.candidates import CandidateObjectRecord, CandidateObjectStore
 from orcest.workflow_store.v1.credential_rotation import (
@@ -135,6 +142,11 @@ from orcest.workflow_store.v1.offer_projection import (
     offer_stream_key,
     reconstruct_open_offers,
 )
+from orcest.workflow_store.v1.retention import (
+    collect_orphan_candidate_objects,
+    collect_terminal_storage_restoration_staging,
+    purge_quarantine_directory,
+)
 from orcest.workflow_store.v1.secret_provision import (
     SecretProvisionReplayConflictError,
     provision_or_adopt_secret,
@@ -145,6 +157,12 @@ from orcest.workflow_store.v1.secrets import (
     SecretStagingHandle,
     SecretStore,
     SecretVersionHandle,
+)
+from orcest.workflow_store.v1.startup_recovery import (
+    DeadlineSweepResult,
+    StartupRecoveryReport,
+    run_startup_recovery,
+    sweep_due_deadlines,
 )
 
 __all__ = [
@@ -276,4 +294,16 @@ __all__ = [
     "reconcile_pending_secret_provision_operation",
     "CredentialRotationReplayConflictError",
     "apply_credential_rotation",
+    "BackupBarrierTimeoutError",
+    "BackupManifestEntry",
+    "BackupModeTransitionError",
+    "BackupResult",
+    "create_backup",
+    "DeadlineSweepResult",
+    "StartupRecoveryReport",
+    "run_startup_recovery",
+    "sweep_due_deadlines",
+    "collect_orphan_candidate_objects",
+    "collect_terminal_storage_restoration_staging",
+    "purge_quarantine_directory",
 ]
