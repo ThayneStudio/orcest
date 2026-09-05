@@ -775,6 +775,137 @@ class TestRedisCliRoutedThroughDockerExec:
         assert "docker exec orcest-redis-redis-1" in cmd
         assert "GET orcest:pool:current_template_vmid" in cmd
 
+    def test_set_current_template_revision_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        set_current_template_revision("user@host", "a" * 40)
+        cmd = ssh.call_args[0][1]
+        assert "docker exec orcest-redis-redis-1" in cmd
+        assert "SET orcest:pool:current_template_revision" in cmd
+        assert "a" * 40 in cmd
+
+    def test_set_current_template_revision_rejects_dirty(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        with pytest.raises(ValueError, match="non-attested"):
+            set_current_template_revision("user@host", "a" * 40 + "-dirty")
+        ssh.assert_not_called()
+
+    def test_set_current_template_revision_rejects_unknown(self, mocker):
+        from orcest.fleet.orchestrator import set_current_template_revision
+
+        ssh = mocker.patch("orcest.fleet.orchestrator._ssh", side_effect=self._ok)
+        with pytest.raises(ValueError, match="non-attested"):
+            set_current_template_revision("user@host", "unknown")
+        ssh.assert_not_called()
+
+    def test_get_current_template_revision_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_current_template_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        result = get_current_template_revision("user@host")
+        assert result == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker exec orcest-redis-redis-1" in cmd
+        assert "GET orcest:pool:current_template_revision" in cmd
+
+    def test_get_current_template_revision_returns_none_when_unset(self, mocker):
+        from orcest.fleet.orchestrator import get_current_template_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        )
+        assert get_current_template_revision("user@host") is None
+
+    def test_get_draining_worker_ids_uses_docker_exec(self, mocker):
+        from orcest.fleet.orchestrator import get_draining_worker_ids
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="orcest-worker-300\norcest-worker-301\n", stderr=""
+            ),
+        )
+        result = get_draining_worker_ids("user@host")
+        assert result == {"orcest-worker-300", "orcest-worker-301"}
+        cmd = ssh.call_args[0][1]
+        assert "SMEMBERS orcest:pool:draining" in cmd
+
+    def test_get_container_revision_reads_oci_label(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        result = get_container_revision("user@host", "orcest-alpha", "orchestrator")
+        assert result == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-alpha ps -q orchestrator" in cmd
+        assert "org.opencontainers.image.revision" in cmd
+
+    def test_get_container_revision_returns_none_when_container_absent(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),
+        )
+        assert get_container_revision("user@host", "orcest-alpha", "orchestrator") is None
+
+    def test_get_container_revision_returns_none_for_unknown_label(self, mocker):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="unknown\n", stderr=""
+            ),
+        )
+        assert get_container_revision("user@host", "orcest-alpha", "orchestrator") is None
+
+    def test_get_container_revision_rejects_unsafe_project_name(self):
+        from orcest.fleet.orchestrator import get_container_revision
+
+        with pytest.raises(ValueError, match="compose project"):
+            get_container_revision("user@host", "orcest; rm -rf /", "orchestrator")
+
+    def test_get_project_orchestrator_revision_uses_project_prefix(self, mocker):
+        from orcest.fleet.orchestrator import get_project_orchestrator_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        assert get_project_orchestrator_revision("user@host", "alpha") == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-alpha ps -q orchestrator" in cmd
+
+    def test_get_pool_manager_revision_uses_pool_project(self, mocker):
+        from orcest.fleet.orchestrator import get_pool_manager_revision
+
+        ssh = mocker.patch(
+            "orcest.fleet.orchestrator._ssh",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{'a' * 40}\n", stderr=""
+            ),
+        )
+        assert get_pool_manager_revision("user@host") == "a" * 40
+        cmd = ssh.call_args[0][1]
+        assert "docker compose -p orcest-pool ps -q pool-manager" in cmd
+
     def test_get_pool_redis_members_uses_docker_exec(self, mocker):
         from orcest.fleet.orchestrator import get_pool_redis_members
 

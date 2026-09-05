@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from orcest.fleet.config import (
+    DesiredSourceConfig,
     FleetConfig,
     OrchestratorConfig,
     OrgEntry,
@@ -323,10 +324,63 @@ class TestConfigPersistence:
         assert loaded.pool.template_vm_id == 9000
         assert loaded.pool.storage == "nvme-pool"
 
+    def test_round_trip_desired_source_ref(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = FleetConfig(
+            desired_source=DesiredSourceConfig(
+                repo="https://github.com/ThayneStudio/orcest.git",
+                ref="refs/heads/master",
+            )
+        )
+        save_config(original, path)
+        loaded = load_config(path)
+        assert loaded.desired_source.repo == "https://github.com/ThayneStudio/orcest.git"
+        assert loaded.desired_source.ref == "refs/heads/master"
+        assert loaded.desired_source.sha == ""
+        assert loaded.desired_source.is_configured is True
+
+    def test_round_trip_desired_source_sha(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        sha = "a" * 40
+        original = FleetConfig(
+            desired_source=DesiredSourceConfig(repo="org/orcest", sha=sha),
+        )
+        save_config(original, path)
+        loaded = load_config(path)
+        assert loaded.desired_source.sha == sha
+        assert loaded.desired_source.ref == ""
+
+    def test_unconfigured_desired_source_not_persisted(self, tmp_path):
+        """An unset desired_source must not be written back at all."""
+        path = tmp_path / "config.yaml"
+        save_config(FleetConfig(), path)
+        raw = yaml.safe_load(path.read_text())
+        assert "desired_source" not in raw
+
+    def test_desired_source_defaults_unconfigured(self):
+        assert DesiredSourceConfig().is_configured is False
+
+    def test_desired_source_rejects_both_ref_and_sha(self):
+        with pytest.raises(ValueError, match="only one of ref or sha"):
+            DesiredSourceConfig(repo="org/orcest", ref="refs/heads/master", sha="a" * 40)
+
+    def test_desired_source_requires_repo_with_ref(self):
+        with pytest.raises(ValueError, match="repo is required"):
+            DesiredSourceConfig(ref="refs/heads/master")
+
+    def test_desired_source_requires_repo_with_sha(self):
+        with pytest.raises(ValueError, match="repo is required"):
+            DesiredSourceConfig(sha="a" * 40)
+
+    def test_desired_source_rejects_short_sha(self):
+        with pytest.raises(ValueError, match="full 40-character"):
+            DesiredSourceConfig(repo="org/orcest", sha="abc123")
+
     def test_load_missing_file(self, tmp_path):
         cfg = load_config(tmp_path / "does-not-exist.yaml")
         assert isinstance(cfg, FleetConfig)
         assert cfg.projects == []
+        assert cfg.desired_source.is_configured is False
 
     def test_load_empty_file(self, tmp_path):
         path = tmp_path / "empty.yaml"
