@@ -655,8 +655,21 @@ def ensure_pool_manager(
         " -c 'test -r /home/orcest/app/config/fleet.yaml &&"
         " test -r /home/orcest/.ssh && test -x /home/orcest/.ssh &&"
         " test -f /home/orcest/.ssh/id_ed25519 &&"
-        " test -r /home/orcest/.ssh/id_ed25519' &&"
-        f" FLEET_CONFIG={quoted_path} docker compose"
+        " test -r /home/orcest/.ssh/id_ed25519 &&"
+        " (command -v ssh >/dev/null 2>&1 ||"
+        ' { echo "pool-manager prerequisite failed: ssh client executable not found" >&2;'
+        " exit 1; }) &&"
+        " (ssh -V >/dev/null 2>&1 ||"
+        ' { echo "pool-manager prerequisite failed: ssh client executable is unusable" >&2;'
+        " exit 1; })'",
+    )
+    if result.returncode != 0:
+        logger.error("Pool manager failed: %s", result.stderr.strip())
+        raise RuntimeError(f"Failed to start pool manager: {result.stderr.strip()}")
+
+    result = _ssh(
+        ssh_target,
+        f"cd /opt/orcest && FLEET_CONFIG={quoted_path} docker compose"
         f" --env-file {REDIS_ENV_PATH} -f docker-compose.pool.yml -p orcest-pool"
         " up -d --force-recreate pool-manager && sleep 2 &&"
         f" cid=$(FLEET_CONFIG={quoted_path} docker compose"
