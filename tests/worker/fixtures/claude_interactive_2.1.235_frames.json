@@ -1,0 +1,15 @@
+{
+  "source": "Redacted terminal frame shapes from the 2026-09-04 fleet audit",
+  "cli_version": "2.1.235",
+  "accepted_execution_signals": {
+    "activity": "esc to interrupt",
+    "composer_cleared": "latest settled non-menu composer has no pasted-text placeholder"
+  },
+  "frames": {
+    "explicitly_stuck": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]",
+    "stuck_then_cleared": "\u001b[2K\r\u2502 \u276f [Pasted text #1 +42 lines]\u001b[2K\r\u2502 \u276f ",
+    "executing": "\u001b[38;5;153m\u2736 Metamorphosing\u2026 (esc to interrupt)\u001b[39m",
+    "unknown_menu": "A future prompt changed in a new CLI release\n\u276f 1. Accept the default\n  2. Cancel\nEnter to confirm / Esc to cancel",
+    "unrecognized": "Working\u2026"
+  }
+}

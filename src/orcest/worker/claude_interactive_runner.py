@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 from orcest.worker._runner_base import _build_env, _check_needs_human, _kill_process_tree
@@ -46,9 +47,10 @@ _MENU_OPTION_RE = re.compile(r"❯\s*\d+\s*\.")
 # The composer's bracketed-paste placeholder ("[Pasted text #1 +42 lines]").
 # Its presence after a submission keystroke means the Enter did not land.
 _PASTED_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
-# Bounded number of Enter-only resubmission attempts after the initial
-# submit keystroke, before giving up on confirming the prompt was accepted.
-_SUBMISSION_RETRY_LIMIT = 3
+# Total number of submission keystrokes, INCLUDING the initial Enter. A value
+# of 3 permits the initial submission plus two evidence-backed retries. Keep
+# the name and retry log denominator aligned with this total-attempt meaning.
+_SUBMISSION_ATTEMPT_LIMIT = 3
 # Minimum quiet time between submission keystrokes so a still-rendering TUI
 # frame is never mistaken for a stuck composer.
 _SUBMISSION_RETRY_SETTLE_SECONDS = 2.0
@@ -62,6 +64,14 @@ _USAGE_ERROR_LINE_RE = re.compile(
     r"billing limit|token limit)",
     re.IGNORECASE,
 )
+
+
+class _PostSubmitState(str, Enum):
+    """What settled terminal evidence says about the submitted prompt."""
+
+    EXECUTING = "executing"
+    EXPLICITLY_STUCK = "explicitly_stuck"
+    AMBIGUOUS = "ambiguous"
 
 
 class _PtyOutputDecoder:
@@ -338,14 +348,50 @@ class ClaudeInteractiveRunner:
         return "esctointerrupt" in normalized
 
     def _looks_like_pending_paste_composer(self, text: str) -> bool:
-        """True while the composer still shows the bracketed-paste placeholder."""
+        """True when the latest settled composer frame still holds the paste."""
+        return self._classify_post_submit_state(text) is _PostSubmitState.EXPLICITLY_STUCK
+
+    def _classify_post_submit_state(self, text: str) -> _PostSubmitState:
+        """Classify only the latest settled post-submit terminal evidence.
+
+        The interactive runner cannot infer execution from silence. Recovery is
+        therefore allowed only for an explicit pending-paste placeholder in the
+        latest composer frame. A numbered selection row is a menu, and all
+        unrecognized output remains ambiguous so a bare Enter cannot accept an
+        unknown dialog. Claude Code 2.1.235's accepted activity marker is
+        documented by the redacted transcript fixture in the worker tests.
+        """
+        if self._looks_like_activity_state(text):
+            return _PostSubmitState.EXECUTING
+
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text)).replace("\r", "\n")
+        lines = stripped.splitlines()
         caret_lines = [
-            unframed
-            for line in stripped.splitlines()
+            (index, unframed)
+            for index, line in enumerate(lines)
             if (unframed := line.lstrip(" \t│┃║|")).startswith("❯")
         ]
-        return any(_PASTED_PLACEHOLDER_RE.search(line) for line in caret_lines)
+        if not caret_lines:
+            return _PostSubmitState.AMBIGUOUS
+
+        latest_index, latest_caret = caret_lines[-1]
+        if _MENU_OPTION_RE.match(latest_caret):
+            return _PostSubmitState.AMBIGUOUS
+
+        # Some dialogs render the selected row before their footer. If a future
+        # menu does not number that row, the footer must still prevent us from
+        # treating its caret as the main composer and sending an unsafe Enter.
+        trailing_normalized = re.sub(r"\s+", "", "".join(lines[latest_index + 1 :])).lower()
+        if "entertoconfirm" in trailing_normalized:
+            return _PostSubmitState.AMBIGUOUS
+
+        if _PASTED_PLACEHOLDER_RE.search(latest_caret):
+            return _PostSubmitState.EXPLICITLY_STUCK
+
+        # A latest, settled, non-menu composer without the paste placeholder
+        # means the submitted text was consumed. Treat that as accepted without
+        # sending another keystroke.
+        return _PostSubmitState.EXECUTING
 
     def _looks_like_workspace_trust_prompt(self, text: str) -> bool:
         stripped = _CONTROL_RE.sub("", _ANSI_RE.sub("", text))
@@ -557,7 +603,8 @@ class ClaudeInteractiveRunner:
                 submission_attempts = 0
                 last_submission_at = 0.0
                 paste_output_index = 0
-                pre_execution_deadline: float | None = None
+                post_submit_state = _PostSubmitState.AMBIGUOUS
+                explicit_stuck_deadline: float | None = None
                 setup_output_index = 0
                 quiet_ticks = 0
                 prompt_resends = 0
@@ -613,15 +660,38 @@ class ClaudeInteractiveRunner:
                         )
 
                     if (
-                        pre_execution_deadline is not None
+                        explicit_stuck_deadline is not None
                         and not submission_confirmed
-                        and now >= pre_execution_deadline
+                        and post_submit_state is _PostSubmitState.EXPLICITLY_STUCK
+                        and now >= explicit_stuck_deadline
                     ):
-                        # Bytes were written but Claude never positively
-                        # confirmed the submission (composer stayed stuck on
-                        # the pasted placeholder). Fail fast instead of
-                        # burning the full task timeout on a session that
-                        # never started work.
+                        # Give a just-arrived activity/clear frame one final
+                        # non-blocking read before killing the process. The
+                        # short deadline is valid only while the latest evidence
+                        # still explicitly shows the pending paste.
+                        self._drain_available_output(
+                            master_fd,
+                            terminal_output,
+                            on_output,
+                            logger,
+                            decoder,
+                        )
+                        post_submit_state = self._classify_post_submit_state(
+                            "".join(terminal_output[paste_output_index:])
+                        )
+                        if post_submit_state is _PostSubmitState.EXECUTING:
+                            submission_confirmed = True
+                            if logger:
+                                logger.info(
+                                    "Prompt submission confirmed at explicit-stuck deadline"
+                                )
+                            continue
+                        if post_submit_state is not _PostSubmitState.EXPLICITLY_STUCK:
+                            # Silence or unrecognized output is ambiguous. It
+                            # neither proves the prompt is stuck nor authorizes
+                            # a fail-fast retry of work that may have started.
+                            continue
+
                         _kill_process_tree(proc)  # type: ignore[arg-type]
                         self._drain_available_output(
                             master_fd,
@@ -696,55 +766,55 @@ class ClaudeInteractiveRunner:
                             paste_output_index = len(terminal_output)
                             submission_attempts = 1
                             last_submission_at = time.monotonic()
-                            pre_execution_deadline = min(
-                                time.monotonic() + _PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS,
-                                attempt_deadline,
-                            )
+                            post_submit_state = _PostSubmitState.AMBIGUOUS
+                            explicit_stuck_deadline = None
                         elif (
                             prompt_pasted
                             and not submission_confirmed
                             and quiet_ticks >= _COMPOSER_SETTLE_TICKS
                         ):
                             since_paste = "".join(terminal_output[paste_output_index:])
-                            if self._looks_like_activity_state(since_paste):
+                            post_submit_state = self._classify_post_submit_state(since_paste)
+                            if post_submit_state is _PostSubmitState.EXECUTING:
                                 submission_confirmed = True
                                 if logger:
                                     logger.info(
-                                        "Detected Claude activity; prompt submission confirmed"
+                                        "Claude activity or cleared composer confirmed submission"
                                     )
-                            elif self._looks_like_main_input_prompt(
-                                since_paste
-                            ) and not self._looks_like_pending_paste_composer(since_paste):
-                                submission_confirmed = True
-                                if logger:
-                                    logger.info(
-                                        "Composer cleared; treating prompt submission as confirmed"
+                            elif post_submit_state is _PostSubmitState.EXPLICITLY_STUCK:
+                                if explicit_stuck_deadline is None:
+                                    explicit_stuck_deadline = min(
+                                        time.monotonic() + _PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS,
+                                        attempt_deadline,
                                     )
-                            elif (
-                                submission_attempts < _SUBMISSION_RETRY_LIMIT
-                                and time.monotonic() - last_submission_at
-                                >= _SUBMISSION_RETRY_SETTLE_SECONDS
-                            ):
-                                self._send_submit_keystroke(
-                                    master_fd,
-                                    logger,
-                                    abort_event=abort,
-                                    timeout=max(0.0, attempt_deadline - time.monotonic()),
-                                )
-                                submission_attempts += 1
-                                last_submission_at = time.monotonic()
-                                # Rescope "since paste" to output after this
-                                # retry: a placeholder seen before an earlier
-                                # retry must not keep poisoning the composer-
-                                # cleared check once a later render drops it.
-                                paste_output_index = len(terminal_output)
-                                if logger:
-                                    logger.info(
-                                        "Composer still shows pasted placeholder; retrying "
-                                        "submission keystroke (attempt %d/%d)",
-                                        submission_attempts,
-                                        _SUBMISSION_RETRY_LIMIT,
+                                if (
+                                    submission_attempts < _SUBMISSION_ATTEMPT_LIMIT
+                                    and time.monotonic() < explicit_stuck_deadline
+                                    and time.monotonic() - last_submission_at
+                                    >= _SUBMISSION_RETRY_SETTLE_SECONDS
+                                ):
+                                    self._send_submit_keystroke(
+                                        master_fd,
+                                        logger,
+                                        abort_event=abort,
+                                        timeout=max(0.0, attempt_deadline - time.monotonic()),
                                     )
+                                    submission_attempts += 1
+                                    last_submission_at = time.monotonic()
+                                    # Evidence predating this input cannot prove
+                                    # the new submission attempt also failed.
+                                    # Require a newly rendered placeholder before
+                                    # sending another Enter.
+                                    paste_output_index = len(terminal_output)
+                                    post_submit_state = _PostSubmitState.AMBIGUOUS
+                                    if logger:
+                                        logger.info(
+                                            "Composer explicitly retains pasted placeholder; "
+                                            "retrying submission keystroke "
+                                            "(total attempt %d/%d)",
+                                            submission_attempts,
+                                            _SUBMISSION_ATTEMPT_LIMIT,
+                                        )
                         continue
                     quiet_ticks = 0
                     if not self._read_available(
@@ -774,6 +844,7 @@ class ClaudeInteractiveRunner:
                         # satisfies the quiet-tick settle check above, so
                         # activity is also checked here on every new read.
                         submission_confirmed = True
+                        post_submit_state = _PostSubmitState.EXECUTING
                         if logger:
                             logger.info("Detected Claude activity; prompt submission confirmed")
 
@@ -831,10 +902,8 @@ class ClaudeInteractiveRunner:
                         paste_output_index = len(terminal_output)
                         submission_attempts = 1
                         last_submission_at = time.monotonic()
-                        pre_execution_deadline = min(
-                            time.monotonic() + _PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS,
-                            attempt_deadline,
-                        )
+                        post_submit_state = _PostSubmitState.AMBIGUOUS
+                        explicit_stuck_deadline = None
                     if confirmed_setup:
                         # Do not let a setup menu's rendering count as the
                         # later main prompt. Wait for new output after the
@@ -853,7 +922,8 @@ class ClaudeInteractiveRunner:
                             # answered above but never trigger a repaste.
                             prompt_pasted = False
                             submission_attempts = 0
-                            pre_execution_deadline = None
+                            post_submit_state = _PostSubmitState.AMBIGUOUS
+                            explicit_stuck_deadline = None
                             prompt_resends += 1
                             if logger:
                                 logger.info("Setup dialog consumed the task prompt; will resend it")
