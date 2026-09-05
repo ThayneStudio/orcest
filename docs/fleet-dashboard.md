@@ -25,6 +25,9 @@ Sign-in currently uses a shared administrator access token, not individual
 GitHub identities, roles, or OAuth. Incorrect attempts are rate limited per
 connection IP. Existing bearer-token and legacy cookie/query clients remain
 compatible; new sign-in never writes the token to browser storage or a URL.
+Legacy links have their token removed from browser history immediately. Work
+requests wait for cookie bootstrap and retain in-memory token authentication
+when that bootstrap fails.
 
 `/api/health`, `/api/ready`, and sign-in assets remain public. Fleet data, detail,
 output, the application, and diagnostic APIs require authentication. With no
@@ -56,6 +59,10 @@ Merged records remain for 30 days before expiry. A missing observation, lost
 history, closed issue, or failed source request never implies successful delivery.
 Closed-without-merge resources are excluded from the active board rather than
 misreported as delivered. Reopened issues can return to observation.
+An open item missing from a capped discovery window retains its last scheduling
+observation; current queue and matching lock evidence take precedence in the UI.
+A worker's human-intervention signal survives ordinary discovery polls until a
+new attempt, terminal outcome, or source-label acknowledgement supersedes it.
 
 `GET /api/work` returns the fleet view with project/search filters and pagination
 (`offset`, `limit`, max 500 per response). Counts and Fleet inventory cover the

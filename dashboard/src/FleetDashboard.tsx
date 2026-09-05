@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { TaskOutputPanel } from "./components/TaskOutputPanel";
-import { bootstrapDashboardAuthCookie } from "./lib/authToken";
+import {
+  addDashboardToken,
+  bootstrapDashboardAuthCookie,
+} from "./lib/authToken";
 import type { FleetWork, WorkView, WorkAttempt } from "./lib/workTypes";
 import "./fleet.css";
 
@@ -30,9 +33,14 @@ function SourceLink({ work }: { work: FleetWork }) {
   );
 }
 async function read<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(url, { credentials: "same-origin", signal });
+  const target = new URL(url, window.location.origin);
+  addDashboardToken(target.searchParams);
+  const response = await fetch(target.pathname + target.search, {
+    credentials: "same-origin",
+    signal,
+  });
   if (response.status === 401) {
-    window.location.assign("/sign-in");
+    window.location.replace("/sign-in");
     throw new Error("Sign-in required");
   }
   if (!response.ok)
@@ -98,6 +106,7 @@ function WorkCard({ work, open }: { work: FleetWork; open: () => void }) {
   );
 }
 export default function FleetDashboard() {
+  const [authReady, setAuthReady] = useState(false);
   const [view, setView] = useState<"board" | "fleet">("board"),
     [data, setData] = useState<WorkView | null>(null),
     [error, setError] = useState(""),
@@ -115,13 +124,22 @@ export default function FleetDashboard() {
   const dialog = useRef<HTMLDialogElement>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
   useEffect(() => {
-    void bootstrapDashboardAuthCookie().then(() => {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("token");
-      window.history.replaceState(null, "", url);
+    let mounted = true;
+    // Bootstrap captures a legacy link token synchronously. Scrub the browser
+    // URL immediately, and wait for its cookie before starting data requests.
+    const bootstrap = bootstrapDashboardAuthCookie();
+    const url = new URL(window.location.href);
+    url.searchParams.delete("token");
+    window.history.replaceState(null, "", url);
+    void bootstrap.then(() => {
+      if (mounted) setAuthReady(true);
     });
+    return () => {
+      mounted = false;
+    };
   }, []);
   useEffect(() => {
+    if (!authReady) return;
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
@@ -145,7 +163,7 @@ export default function FleetDashboard() {
       abort.abort();
       clearTimeout(timer);
     };
-  }, [project, query, limit]);
+  }, [authReady, project, query, limit]);
   useEffect(() => {
     if (!attention) return;
     const abort = new AbortController();

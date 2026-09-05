@@ -72,9 +72,15 @@ def observe(redis: RedisClient, repo: str, kind: str, state: Any) -> None:
         "branch": getattr(state, "branch", ""),
         "head_sha": getattr(state, "head_sha", ""),
         "needs_human": "1" if action == "skip_labeled" else "0",
+        "discovery_missing": "0",
         "outcome": "",
         "completed_at": "",
     }
+    # A worker can report a blocker before GitHub reflects its label. Keep that
+    # signal independent until the source acknowledges it (then label removal
+    # can resolve it), or a new attempt/terminal outcome supersedes it.
+    if action == "skip_labeled":
+        data["worker_needs_human"] = "0"
     key = work_key(repo, kind, state.number)
     redis.hset_mapping(key, data)
     redis.client.hsetnx(full_key(redis, key), "discovered_at", str(now))
@@ -108,6 +114,7 @@ def attempt_started(
             "kind": task.resource_type,
             "number": str(task.resource_id),
             "prefix": redis.key_prefix,
+            "worker_needs_human": "0",
         },
     )
     redis.hset_mapping(
@@ -153,7 +160,7 @@ def human_reason(redis: RedisClient, task: Any, reason: str) -> None:
     redis.hset_mapping(
         work_key(task.repo, task.resource_type, task.resource_id),
         {
-            "needs_human": "1",
+            "worker_needs_human": "1",
             "human_reason": reason[:2000],
         },
     )
@@ -167,6 +174,7 @@ def merged(redis: RedisClient, repo: str, number: int) -> None:
             "outcome": "merged",
             "completed_at": str(time.time()),
             "needs_human": "0",
+            "worker_needs_human": "0",
         },
     )
 
@@ -221,15 +229,24 @@ def reconcile_missing(redis: RedisClient, repo: str, token: str, seen: set[str])
                 "title": str(source.get("title", item.get("title", "")))[:500],
             }
             if state == "MERGED":
-                fields.update(outcome="merged", completed_at=str(time.time()), needs_human="0")
+                fields.update(
+                    outcome="merged",
+                    completed_at=str(time.time()),
+                    needs_human="0",
+                    worker_needs_human="0",
+                )
             elif state == "CLOSED":
                 fields.update(
                     outcome="closed",
                     completed_at=item.get("completed_at") or str(time.time()),
                     needs_human="0",
+                    worker_needs_human="0",
                 )
             else:
-                fields.update(action="not_in_discovery", outcome="", completed_at="")
+                # Absence from a capped discovery query is not evidence of
+                # de-queuing or stopping. Preserve the last scheduling action;
+                # the projection gives current queue/lock evidence precedence.
+                fields.update(discovery_missing="1", outcome="", completed_at="")
             if state not in {"OPEN", "CLOSED", "MERGED"}:
                 continue
             redis.hset_mapping(key, fields)

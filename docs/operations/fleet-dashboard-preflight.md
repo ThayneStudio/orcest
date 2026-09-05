@@ -125,3 +125,17 @@ Protected backups are retained on the orchestrator host at
 The running production images, worker VMs, pool manager, and dashboard have not
 been replaced. Do not bypass the failed result-handling/quiescence gates to
 complete the broader runtime rollout.
+
+## Review corrections before rollout
+
+The original `4b08e98` staging evidence above is retained for audit, but that
+candidate is superseded by review corrections and must not be rolled out. The
+corrections preserve worker escalation across source polls, distinguish a capped
+discovery gap from queue/lock evidence, and serialize sign-in bootstrap before
+work requests while preserving legacy link authentication on bootstrap failure.
+
+Local validation of the corrections passed 794 dashboard tests, full dashboard
+typechecking and production build, 324 affected Python tests (one skipped), lint,
+and observation-writer typechecking. The isolated Redis end-to-end check passed
+sign-in, dependency/queue/execution state, live output, CI waiting, verified merge,
+and sign-out. The revised release still requires its own CI and staging evidence.

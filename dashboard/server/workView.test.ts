@@ -133,11 +133,64 @@ describe("work lifecycle projection", () => {
       stage: "in_progress",
     });
     expect(
+      projectWork({ ...work, discovery_missing: "1" }, run, active, 1000),
+    ).toMatchObject({
+      activity: "executing",
+      stage: "in_progress",
+    });
+    expect(
       projectWork(work, { ...run, status: "completed" }, message, 1000),
     ).toMatchObject({ stage: "in_progress", outcome: null });
     expect(
       projectWork(fields({ outcome: "merged" }), null, message, 1000),
     ).toMatchObject({ stage: "done" });
+  });
+  it("preserves worker escalation while the source label is absent", () => {
+    expect(
+      projectWork(
+        fields({
+          needs_human: "0",
+          worker_needs_human: "1",
+          human_reason: "Restore repository access",
+        }),
+        null,
+        message,
+        1000,
+      ),
+    ).toMatchObject({
+      needsHuman: true,
+      next: "Restore repository access",
+    });
+  });
+  it("marks discovery gaps without overriding a currently queued task", () => {
+    const gap = fields({ discovery_missing: "1", action: "skip_queued" });
+    expect(projectWork(gap, null, message, 1000)).toMatchObject({
+      activity: "monitoring",
+      reason: "Outside the latest discovery window",
+    });
+    const queued = {
+      ...message,
+      snapshot: {
+        ...message.snapshot,
+        queued_tasks: [
+          {
+            entry_id: "1-0",
+            task_id: "attempt-1",
+            task_type: "issue",
+            prefix: "project-a",
+            repo: "org/repo",
+            resource_type: "issue",
+            resource_id: "12",
+            created_at: null,
+            stream: "tasks",
+          },
+        ],
+      },
+    };
+    expect(projectWork(gap, null, queued, 1000)).toMatchObject({
+      activity: "queued",
+      stage: "upcoming",
+    });
   });
   it("retains stale work and treats unavailable workflow ownership explicitly", () => {
     expect(projectWork(fields(), null, message, 2000)).toMatchObject({

@@ -69,7 +69,8 @@ def test_missing_ready_label_does_not_mean_done_and_closed_issue_can_reopen(
     monkeypatch.setattr("orcest.orchestrator.gh.get_issue", source)
     key = view.work_key("org/repo", "issue", 12)
     view.reconcile_missing(r, "org/repo", "secret", set())
-    assert r.hgetall(key)["action"] == "not_in_discovery"
+    assert r.hgetall(key)["action"] == "skip_dependency"
+    assert r.hgetall(key)["discovery_missing"] == "1"
     assert not r.hgetall(key)["outcome"]
     source.return_value = {"state": "CLOSED"}
     view.reconcile_missing(r, "org/repo", "secret", set())
@@ -81,6 +82,42 @@ def test_missing_ready_label_does_not_mean_done_and_closed_issue_can_reopen(
     old = r.hgetall(key)
     view.reconcile_missing(r, "org/repo", "secret", set())
     assert r.hgetall(key) == old
+
+
+def test_worker_blocker_survives_poll_until_acknowledged_or_restarted(fake_redis_client):
+    r = fake_redis_client
+    key = view.work_key("org/repo", "issue", 12)
+    view.observe(r, "org/repo", "issue", issue())
+    view.human_reason(r, task(), "Access denied SECRET")
+    view.observe(r, "org/repo", "issue", issue())
+    assert r.hgetall(key)["worker_needs_human"] == "1"
+    assert r.hgetall(key)["human_reason"] == "Access denied [REDACTED]"
+    view.observe(r, "org/repo", "issue", issue(action="skip_labeled"))
+    assert r.hgetall(key)["needs_human"] == "1"
+    assert r.hgetall(key)["worker_needs_human"] == "0"
+    view.observe(r, "org/repo", "issue", issue())
+    assert r.hgetall(key)["needs_human"] == "0"
+    view.human_reason(r, task(), "Access denied")
+    view.attempt_started(r, task(), "new-worker")
+    assert r.hgetall(key)["worker_needs_human"] == "0"
+    assert r.hgetall(key)["needs_human"] == "0"
+
+
+def test_discovery_gap_preserves_queue_evidence_and_clears_on_rediscovery(
+    fake_redis_client, monkeypatch
+):
+    r = fake_redis_client
+    key = view.work_key("org/repo", "issue", 12)
+    view.observe(r, "org/repo", "issue", issue())
+    view.queued(r, task())
+    monkeypatch.setattr(
+        "orcest.orchestrator.gh.get_issue", Mock(return_value={"state": "OPEN"})
+    )
+    view.reconcile_missing(r, "org/repo", "secret", set())
+    assert r.hgetall(key)["action"] == "skip_queued"
+    assert r.hgetall(key)["discovery_missing"] == "1"
+    view.observe(r, "org/repo", "issue", issue(action="skip_queued"))
+    assert r.hgetall(key)["discovery_missing"] == "0"
 
 
 def test_verified_publication_is_a_link_not_completion(fake_redis_client):

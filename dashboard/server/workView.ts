@@ -159,6 +159,11 @@ const reasons: Record<string, [string, string, string]> = {
     "Outside current intake",
     "Observe the source item; no task is currently requested.",
   ],
+  discovery_gap: [
+    "monitoring",
+    "Outside the latest discovery window",
+    "Recheck discovery coverage and current task state.",
+  ],
 };
 export function projectWork(
   f: Fields,
@@ -196,6 +201,9 @@ export function projectWork(
     "The orchestrator will evaluate available execution capacity.",
   ];
   const outcome = f.outcome || null;
+  if (f.discovery_missing === "1") {
+    [activity, reason, next] = reasons.discovery_gap;
+  }
   if (inQueue) {
     [activity, reason, next] = reasons.skip_queued;
   }
@@ -243,6 +251,7 @@ export function projectWork(
             : null,
       };
     });
+  const needsHuman = f.needs_human === "1" || f.worker_needs_human === "1";
   return {
     id,
     project: f.repo,
@@ -255,13 +264,13 @@ export function projectWork(
     stage: f.action === "skip_v1_lookup_unavailable" ? "unknown" : stage,
     activity,
     reason,
-    next: f.needs_human === "1" && f.human_reason ? f.human_reason : next,
+    next: needsHuman && f.human_reason ? f.human_reason : next,
     observedAt: observed,
     startedAt: started,
     completedAt: numeric(f.completed_at),
     stale: !observed || now - observed > 180,
     outcome,
-    needsHuman: f.needs_human === "1",
+    needsHuman,
     blockers,
     branch: f.branch || "",
     headSha: f.head_sha || "",

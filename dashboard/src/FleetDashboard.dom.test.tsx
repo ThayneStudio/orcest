@@ -10,9 +10,7 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import FleetDashboard from "./FleetDashboard";
 import type { FleetWork, WorkView } from "./lib/workTypes";
-vi.mock("./lib/authToken", () => ({
-  bootstrapDashboardAuthCookie: async () => {},
-}));
+import { resetDashboardAuthTokenForTesting } from "./lib/authToken";
 vi.mock("./components/TaskOutputPanel", () => ({
   TaskOutputPanel: ({
     params,
@@ -110,6 +108,64 @@ const data: WorkView = {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  resetDashboardAuthTokenForTesting();
+  window.history.replaceState(null, "", "/");
+});
+it("scrubs link credentials immediately and waits for cookie bootstrap before polling", async () => {
+  window.history.replaceState(null, "", "/?token=legacy");
+  let finish!: (value: { ok: boolean }) => void;
+  const bootstrap = new Promise<{ ok: boolean }>((resolve) => {
+    finish = resolve;
+  });
+  const requests = vi.fn(async (input: string) =>
+    input.includes("/api/auth/bootstrap")
+      ? bootstrap
+      : { ok: true, status: 200, json: async () => data },
+  );
+  vi.stubGlobal("fetch", requests);
+  render(<FleetDashboard />);
+  expect(window.location.search).toBe("");
+  expect(requests).toHaveBeenCalledTimes(1);
+  expect(requests.mock.calls[0][0]).toContain(
+    "/api/auth/bootstrap?token=legacy",
+  );
+  finish({ ok: true });
+  await screen.findByRole("button", { name: "Open org/repo #2: Work 2" });
+  expect(
+    requests.mock.calls
+      .filter(([url]) => url.startsWith("/api/work"))
+      .every(([url]) => !url.includes("token=")),
+  ).toBe(true);
+});
+it("retains legacy authentication for work and detail when cookie bootstrap fails", async () => {
+  window.history.replaceState(null, "", "/?token=legacy");
+  const requests = vi.fn(async (input: string) =>
+    input.includes("/api/auth/bootstrap")
+      ? { ok: false, status: 503 }
+      : {
+          ok: true,
+          status: 200,
+          json: async () => (input.includes("/api/work/2") ? current : data),
+        },
+  );
+  vi.stubGlobal("fetch", requests);
+  render(<FleetDashboard />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Open org/repo #2: Work 2" }),
+  );
+  await screen.findByTestId("agent-output");
+  expect(window.location.search).toBe("");
+  const workRequests = requests.mock.calls.filter(([url]) =>
+    url.startsWith("/api/work"),
+  );
+  expect(workRequests.length).toBeGreaterThanOrEqual(2);
+  expect(
+    workRequests.every(
+      ([url]) =>
+        new URL(url, window.location.origin).searchParams.get("token") ===
+        "legacy",
+    ),
+  ).toBe(true);
 });
 it("renders lifecycle columns, opens live and historical context, and separates account capacity from workers", async () => {
   vi.stubGlobal(
