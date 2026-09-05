@@ -18,6 +18,10 @@ certifi==2026.5.20
     #   httpcore
     #   httpx
     #   requests
+cffi==2.1.1
+    # via
+    #   -c requirements.lock
+    #   cryptography
 charset-normalizer==3.4.7
     # via
     #   -c requirements.lock
@@ -105,6 +109,10 @@ proxmoxer==2.3.0
     # via
     #   -c requirements.lock
     #   orcest (pyproject.toml)
+pycparser==3.0
+    # via
+    #   -c requirements.lock
+    #   cffi
 pydantic==2.13.5
     # via fastapi
 pydantic-core==2.46.5
