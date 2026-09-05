@@ -282,7 +282,7 @@ def _run_gh(args: list[str], token: str) -> str:
 def list_open_prs(repo: str, token: str, limit: int = 100) -> list[dict]:
     """List open PRs, sorted oldest first.
 
-    Returns list of dicts with keys: number, title, headRefName,
+    Returns list of dicts with keys: number, title, body, headRefName,
     baseRefName, headRefOid, isDraft, createdAt, labels, reviewDecision,
     mergeable, mergeStateStatus.
 
@@ -310,6 +310,7 @@ query($owner: String!, $repo: String!, $first: Int!, $after: String) {
       nodes {
         number
         title
+        body
         headRefName
         baseRefName
         headRefOid

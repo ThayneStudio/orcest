@@ -214,6 +214,112 @@ def test_poll_cycle_enqueues_tasks(mocker, fake_redis_client, orchestrator_confi
     assert mock_publish.call_args.kwargs["pr_state"] is pr_state
 
 
+def test_poll_cycle_wires_v1_legacy_exclusion_lookup(
+    mocker, fake_redis_client, orchestrator_config, gh_mock
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    lookup = mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+    )
+    lookup.return_value.excludes.return_value = True
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    predicate = discover.call_args.kwargs["legacy_exclusion_predicate"]
+    assert predicate(
+        change_request_external_id="776",
+        deterministic_ref="refs/heads/orcest/run/example",
+    )
+    lookup.assert_called_once_with(
+        "/var/lib/orcest/workflow",
+        repository_locator=orchestrator_config.github.repo,
+    )
+    lookup.return_value.excludes.assert_called_once_with(
+        change_request_external_id="776",
+        deterministic_ref="refs/heads/orcest/run/example",
+    )
+
+
+def test_poll_cycle_marks_v1_lookup_unavailable_once(
+    mocker, fake_redis_client, orchestrator_config, gh_mock, caplog
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    discover = mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[],
+    )
+    lookup = mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+        side_effect=OSError("database unavailable"),
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    _poll_cycle(
+        orchestrator_config,
+        fake_redis_client,
+        fake_redis_client,
+        {},
+        logging.getLogger("test"),
+        3600,
+    )
+
+    lookup.assert_called_once()
+    assert discover.call_args.kwargs["legacy_exclusion_predicate"] is None
+    assert discover.call_args.kwargs["legacy_exclusion_unavailable"] is True
+    assert "ownership snapshot" in caplog.text
+
+
+def test_poll_cycle_handles_v1_lookup_unavailable_action(
+    mocker, fake_redis_client, orchestrator_config, gh_mock, caplog
+):
+    orchestrator_config.workflow_state_root = "/var/lib/orcest/workflow"
+    mocker.patch(
+        "orcest.orchestrator.loop.load_legacy_change_request_exclusion_snapshot",
+        side_effect=OSError("database unavailable"),
+    )
+    mocker.patch(
+        "orcest.orchestrator.loop.discover_actionable_prs",
+        return_value=[
+            PRState(
+                number=776,
+                title="workflow PR",
+                branch="orcest/run/example",
+                head_sha="a" * 40,
+                action=PRAction.SKIP_V1_LOOKUP_UNAVAILABLE,
+                ci_failures=[],
+                review_threads=[],
+                labels=[],
+            )
+        ],
+    )
+    fake_redis_client.ensure_consumer_group(RESULTS_STREAM, RESULTS_GROUP)
+
+    with caplog.at_level(logging.DEBUG):
+        _poll_cycle(
+            orchestrator_config,
+            fake_redis_client,
+            fake_redis_client,
+            {},
+            logging.getLogger("test"),
+            3600,
+        )
+
+    assert "ownership lookup unavailable; fail-closed skip" in caplog.text
+    assert "unhandled action" not in caplog.text
+
+
 def test_poll_cycle_routes_legacy_claude_credentials_to_default_clauder(
     mocker,
     fake_redis_client,

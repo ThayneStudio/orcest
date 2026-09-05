@@ -314,6 +314,12 @@ Top-level keys:
 - **`trace_archive_path`** — absolute path on the orchestrator process
   where verbatim per-task traces are archived. Omit to disable the
   archiver.
+- **`workflow_state_root`** — optional workflow-control v1 state directory.
+  When configured, the legacy PR selector reads `workflow.db` in query-only
+  mode and excludes PRs owned by a live v1 Publication. Docker deployments
+  must also set `ORCEST_WORKFLOW_STATE_HOST_PATH` to the host directory that
+  contains `workflow.db`; fleet-managed deployments set
+  `workflow_state_host_path` in fleet config and generate both settings.
 
 ### Providers
 
@@ -681,6 +687,11 @@ Notes:
   orcest trace --pr <num>          # all traces for a PR
   orcest trace --list              # recent traces
   ```
+- **Workflow-Control v1 ownership fence.** Set the fleet config's
+  `workflow_state_host_path` to the absolute host directory containing the v1
+  `workflow.db`. Fleet generation mounts it read-only at
+  `/var/lib/orcest/workflow` and emits the matching `workflow_state_root` for
+  each legacy orchestrator.
 - **Issue-dependency deferrals** log at INFO from the orchestrator as
   `Issue #<n>: deferred, waiting on open blocker(s): #<a>, #<b>`.
 - **State machine semantics** for what the orchestrator is doing per

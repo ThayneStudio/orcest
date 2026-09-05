@@ -1175,6 +1175,7 @@ def generate_env_file(
     claude_token: str = "",
     provider_credentials: dict[str, list[str]] | None = None,
     trace_archive_host_path: str | None = None,
+    workflow_state_host_path: str | None = None,
     redis_password: str = "",
     monitor_write_token: str = "",
 ) -> str:
@@ -1232,6 +1233,14 @@ def generate_env_file(
         # is the canonical location on the orchestrator VM (already populated
         # by ``upload_fleet_config`` for the pool manager).
         lines.append("ORCEST_FLEET_CONFIG_PATH='/etc/orcest/config.yaml'")
+    if workflow_state_host_path:
+        _validate_env_value(workflow_state_host_path, "workflow_state_host_path")
+        if not workflow_state_host_path.startswith("/"):
+            raise ValueError(
+                "workflow_state_host_path must be an absolute path "
+                f"(got {workflow_state_host_path!r})"
+            )
+        lines.append(f"ORCEST_WORKFLOW_STATE_HOST_PATH='{workflow_state_host_path}'")
 
     # Build a unified map: provider -> list of credentials
     creds: dict[str, list[str]] = {}
@@ -1278,6 +1287,7 @@ def generate_orchestrator_config(
     extra_providers: list[str] | None = None,
     default_runner: str | None = None,
     trace_archive_enabled: bool = False,
+    workflow_state_enabled: bool = False,
     monitor_ingest_url: str | None = None,
 ) -> str:
     """Generate orchestrator.yaml content for a project.
@@ -1315,6 +1325,8 @@ def generate_orchestrator_config(
         # In-container path; the operator bind-mounts whatever filesystem they
         # want at ORCEST_TRACE_HOST_PATH on the host side (see docker-compose.yml).
         config["trace_archive_path"] = "/var/lib/orcest/traces"
+    if workflow_state_enabled:
+        config["workflow_state_root"] = "/var/lib/orcest/workflow"
     if monitor_ingest_url:
         config["monitor_ingest_url"] = monitor_ingest_url
         config["monitor_write_token_env"] = "MONITOR_WRITE_TOKEN"

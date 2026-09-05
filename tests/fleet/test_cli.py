@@ -715,6 +715,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         orchestrator=OrchestratorConfig(host="10.20.0.23", user="orcest"),
         pool=PoolConfig(worker_backend="clauder"),
         trace_archive_host_path="/mnt/orcest/traces",
+        workflow_state_host_path="/mnt/orcest/workflow",
         orgs={
             "Org": OrgEntry(
                 github_token="ghp_fake",
@@ -746,6 +747,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "claude_tokens": ["sk-claude"],
         "provider_credentials": {},
         "trace_archive_host_path": "/mnt/orcest/traces",
+        "workflow_state_host_path": "/mnt/orcest/workflow",
         "redis_password": "redis-pw",
         "monitor_write_token": "",
     }
@@ -755,6 +757,7 @@ def test_update_regenerates_project_files_with_current_pool_backend(runner, cfg_
         "extra_providers": [],
         "default_runner": "clauder",
         "trace_archive_enabled": True,
+        "workflow_state_enabled": True,
         "monitor_ingest_url": None,
     }
     write_files.assert_called_once_with("orcest@10.20.0.23", "alpha", "env", "yaml")
