@@ -37,6 +37,7 @@ from orcest.workflow_store.v1.fs import (
     StorageLock,
     default_free_bytes,
     digest_hex,
+    fsync_dir,
     promote_no_clobber,
     read_exact_file,
     trusted_join,
@@ -137,6 +138,19 @@ class WorkflowBlobStore:
             if reference is not None:
                 reference(verified)
             return verified
+
+    def discard_staged(self, incoming_path: str) -> None:
+        """Discard a staged (not-yet-installed) incoming file by its exact
+        ``incoming/<name>`` relative path. A no-op if it is already gone."""
+        parts = incoming_path.split("/")
+        if len(parts) != 2 or parts[0] != "incoming":
+            raise IntegrityConflictError("Workflow Blob incoming path is invalid")
+        path = trusted_join(self._root, parts[0], parts[1])
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        fsync_dir(path.parent)
 
     def verify(self, blob_digest: str) -> WorkflowBlobRecord:
         """Recompute the domain-separated digest; a readable file is not enough."""

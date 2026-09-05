@@ -45,6 +45,7 @@ import hmac
 import re
 import struct
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from orcest.workflow_contract.v1.canonical import canonical_json_bytes
@@ -54,6 +55,7 @@ __all__ = [
     "is_valid_content_digest",
     "require_valid_content_digest",
     "sha256_hex",
+    "sha256_file_hex",
     "content_digest",
     "domain_digest",
     "generic_domain_digest",
@@ -142,6 +144,16 @@ def require_valid_content_digest(value: object, *, field: str = "digest") -> str
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file_hex(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    """Streaming ``sha256_hex`` of a file's bytes, for backup/restore manifest
+    verification where reading the whole object into memory first is wasteful."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def content_digest(data: bytes) -> str:
@@ -504,6 +516,16 @@ def health_probe_fact_digest(fields: Mapping[str, Any]) -> str:
 def health_probe_run_membership_digest(run_ids: Sequence[str]) -> str:
     """Digest of the frozen bytewise-ordered Health Probe Fact Run membership."""
     return generic_domain_digest("orcest-health-probe-run-membership-v1", list(run_ids))
+
+
+def storage_restoration_fact_digest(fields: Mapping[str, Any]) -> str:
+    """Digest of a Storage Restoration Fact's typed exact-object restoration result."""
+    return generic_domain_digest("orcest-storage-restoration-fact-v1", fields)
+
+
+def storage_restoration_run_membership_digest(run_ids: Sequence[str]) -> str:
+    """Digest of the frozen bytewise-ordered Storage Restoration Fact Run membership."""
+    return generic_domain_digest("orcest-storage-restoration-run-membership-v1", list(run_ids))
 
 
 def worker_loss_report_digest(fields: Mapping[str, Any]) -> str:
