@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-node_image="${DASHBOARD_NODE_IMAGE:-node:20.18.3-slim}"
+node_image="${DASHBOARD_NODE_IMAGE:-node:24.20.0-slim}"
 base_url="${DASHBOARD_BASE_URL:-http://127.0.0.1:8080}"
 env_file="${DASHBOARD_ENV_FILE:-}"
 

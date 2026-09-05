@@ -6,7 +6,7 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-node_version="${DASHBOARD_NODE_VERSION:-20.18.3}"
+node_version="${DASHBOARD_NODE_VERSION:-24.20.0}"
 node_image="${DASHBOARD_NODE_IMAGE:-node:${node_version}-slim}"
 rollback_image="${DASHBOARD_ROLLBACK_IMAGE:-orcest-dashboard:rollback-$$}"
 base_url="${DASHBOARD_BASE_URL:-http://127.0.0.1:8080}"
