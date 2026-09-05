@@ -1322,6 +1322,118 @@ time.sleep(10)
     assert len(submit_calls) == 2
 
 
+def test_run_fresh_stuck_epoch_after_ambiguity_gets_new_recovery_window(
+    tmp_path, monkeypatch
+) -> None:
+    """An expired earlier stuck window cannot kill a later fresh stuck epoch."""
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._PRE_EXECUTION_CONFIRM_DEADLINE_SECONDS",
+        0.75,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._SUBMISSION_RETRY_SETTLE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "orcest.worker.claude_interactive_runner._COMPOSER_SETTLE_TICKS",
+        1,
+    )
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import os
+import re
+import select
+import time
+import tty
+
+tty.setraw(0)
+print("❯ ", flush=True)
+
+buf = b""
+deadline = time.time() + 5
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if not readable:
+        continue
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if b"ORCEST_WORKER_RESULT_CONTRACT" in buf and b".txt" in buf:
+        break
+
+drain_deadline = time.time() + 0.3
+while time.time() < drain_deadline:
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if not readable:
+        break
+    os.read(0, 65536)
+
+def read_enter():
+    received = b""
+    deadline = time.time() + 3
+    while time.time() < deadline and b"\\r" not in received:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if readable:
+            received += os.read(0, 65536)
+    return received
+
+print("❯ [Pasted text #1 +12 lines]", flush=True)
+first_retry = read_enter()
+if b"\\r" not in first_retry or first_retry.strip(b"\\r"):
+    raise SystemExit(2)
+
+# Leave the explicit-stuck state and remain ambiguous past its old short
+# deadline. No recovery input is safe during this interval.
+print("Working…", flush=True)
+unexpected = b""
+deadline = time.time() + 1.0
+while time.time() < deadline:
+    readable, _, _ = select.select([0], [], [], 0.1)
+    if readable:
+        unexpected += os.read(0, 65536)
+if unexpected:
+    print(f"UNEXPECTED_AMBIGUOUS_INPUT={unexpected!r}", flush=True)
+    raise SystemExit(3)
+
+# A newly rendered placeholder is a new explicit-stuck epoch. It receives a
+# fresh short deadline and can authorize the final budgeted Enter.
+print("❯ [Pasted text #2 +12 lines]", flush=True)
+second_retry = read_enter()
+if b"\\r" not in second_retry or second_retry.strip(b"\\r"):
+    raise SystemExit(4)
+print("\\x1b[2K\\r│ ❯ ", flush=True)
+
+decoded = buf.decode("utf-8", errors="replace")
+match = re.search(r"write your final one-line summary to (\\S+?\\.txt)", decoded)
+if not match:
+    raise SystemExit(5)
+with open(match.group(1), "w", encoding="utf-8") as result:
+    result.write("fresh stuck epoch recovered after ambiguity\\n")
+time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    submit_calls = _record_submit_keystrokes(monkeypatch)
+    result = ClaudeInteractiveRunner(max_retries=1, retry_backoff=0).run(
+        "say hello",
+        work_dir,
+        token="github-token",
+        timeout=6,
+        credential="claude-token",
+    )
+
+    assert result.success is True
+    assert result.summary == "fresh stuck epoch recovered after ambiguity"
+    assert len(submit_calls) == _SUBMISSION_ATTEMPT_LIMIT == 3
+
+
 def test_run_stuck_frame_cleared_before_settle_sends_no_retry(tmp_path, monkeypatch) -> None:
     """The latest repaint wins over a historical placeholder frame."""
     fake_claude = tmp_path / "claude"

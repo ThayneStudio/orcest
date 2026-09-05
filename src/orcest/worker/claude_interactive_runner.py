@@ -681,6 +681,7 @@ class ClaudeInteractiveRunner:
                         )
                         if post_submit_state is _PostSubmitState.EXECUTING:
                             submission_confirmed = True
+                            explicit_stuck_deadline = None
                             if logger:
                                 logger.info(
                                     "Prompt submission confirmed at explicit-stuck deadline"
@@ -690,6 +691,7 @@ class ClaudeInteractiveRunner:
                             # Silence or unrecognized output is ambiguous. It
                             # neither proves the prompt is stuck nor authorizes
                             # a fail-fast retry of work that may have started.
+                            explicit_stuck_deadline = None
                             continue
 
                         _kill_process_tree(proc)  # type: ignore[arg-type]
@@ -777,6 +779,7 @@ class ClaudeInteractiveRunner:
                             post_submit_state = self._classify_post_submit_state(since_paste)
                             if post_submit_state is _PostSubmitState.EXECUTING:
                                 submission_confirmed = True
+                                explicit_stuck_deadline = None
                                 if logger:
                                     logger.info(
                                         "Claude activity or cleared composer confirmed submission"
@@ -807,6 +810,7 @@ class ClaudeInteractiveRunner:
                                     # sending another Enter.
                                     paste_output_index = len(terminal_output)
                                     post_submit_state = _PostSubmitState.AMBIGUOUS
+                                    explicit_stuck_deadline = None
                                     if logger:
                                         logger.info(
                                             "Composer explicitly retains pasted placeholder; "
@@ -815,6 +819,12 @@ class ClaudeInteractiveRunner:
                                             submission_attempts,
                                             _SUBMISSION_ATTEMPT_LIMIT,
                                         )
+                            else:
+                                # A short fail-fast window belongs to one
+                                # continuous explicit-stuck epoch. Pause it as
+                                # soon as newer evidence becomes ambiguous; a
+                                # later fresh placeholder starts a fresh window.
+                                explicit_stuck_deadline = None
                         continue
                     quiet_ticks = 0
                     if not self._read_available(
@@ -845,6 +855,7 @@ class ClaudeInteractiveRunner:
                         # activity is also checked here on every new read.
                         submission_confirmed = True
                         post_submit_state = _PostSubmitState.EXECUTING
+                        explicit_stuck_deadline = None
                         if logger:
                             logger.info("Detected Claude activity; prompt submission confirmed")
 
