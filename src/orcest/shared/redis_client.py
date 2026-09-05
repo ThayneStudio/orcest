@@ -88,6 +88,30 @@ return entry_id
 """
 
 
+_ZADD_EXPIRING_IF_VALUE_SCRIPT = r"""
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call("ZADD", KEYS[2], ARGV[2], ARGV[3])
+redis.call("EXPIRE", KEYS[2], ARGV[4])
+return 1
+"""
+
+
+_GET_TTL_BOUNDED_SCRIPT = r"""
+local value = redis.call("GET", KEYS[1])
+if not value then
+    return {false, -2, 0}
+end
+local ttl = redis.call("TTL", KEYS[1])
+local size = string.len(value)
+if size > tonumber(ARGV[1]) then
+    return {false, ttl, size}
+end
+return {value, ttl, size}
+"""
+
+
 class RedisClient:
     """Redis connection with stream helper methods."""
 
@@ -703,6 +727,30 @@ class RedisClient:
         result: int = self._client.ttl(self._prefixed(key))  # type: ignore[assignment]
         return result
 
+    def get_with_ttl_bounded(
+        self,
+        key: str,
+        *,
+        max_bytes: int,
+    ) -> tuple[str | None, int, bool]:
+        """Atomically read a string value and TTL without returning oversized data."""
+        if max_bytes < 1:
+            raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+        raw = self._client.eval(
+            _GET_TTL_BOUNDED_SCRIPT,
+            1,
+            self._prefixed(key),
+            max_bytes,
+        )
+        if not isinstance(raw, list) or len(raw) != 3:
+            raise TypeError("bounded GET/TTL returned a malformed response")
+        value, ttl, size = raw
+        if value is not None and not isinstance(value, str):
+            raise TypeError("bounded GET/TTL returned a malformed value")
+        if type(ttl) is not int or type(size) is not int or size < 0:
+            raise TypeError("bounded GET/TTL returned malformed metadata")
+        return value, ttl, size > max_bytes
+
     def hgetall(self, key: str) -> dict[str, str]:
         """HGETALL key."""
         result: dict[str, str] = self._client.hgetall(self._prefixed(key))  # type: ignore[assignment]
@@ -825,6 +873,30 @@ class RedisClient:
             pipe.expire(self._prefixed(key), ttl)
             results = pipe.execute()
         return int(results[0])
+
+    def zadd_expiring_if_value(
+        self,
+        guard_key: str,
+        expected_value: str,
+        key: str,
+        member: str,
+        score: float,
+        ttl: int,
+    ) -> bool:
+        """Atomically ZADD/EXPIRE only while a guard key has the expected value."""
+        if ttl < 1:
+            raise ValueError(f"ttl must be positive, got {ttl}")
+        result = self._client.eval(
+            _ZADD_EXPIRING_IF_VALUE_SCRIPT,
+            2,
+            self._prefixed(guard_key),
+            self._prefixed(key),
+            expected_value,
+            score,
+            member,
+            ttl,
+        )
+        return result == 1
 
     def zrangebyscore(
         self,

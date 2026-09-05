@@ -693,3 +693,35 @@ def test_capacity_selected_backend_filters_quota_cooled_account_first():
     )
 
     assert pool.next_entry_from([cooled, healthy]) == healthy
+
+
+def test_capacity_selected_backend_round_robins_accounts_not_model_entries():
+    shared = "shared-account"
+    first_model = ProviderEntry("codex", shared, model="model-a")
+    second_model = ProviderEntry("codex", shared, model="model-b")
+    other_account = ProviderEntry("codex", "other-account", model="model-a")
+    pool = ProviderPool([first_model, second_model, other_account])
+
+    assert [pool.next_entry_from([first_model, second_model, other_account]) for _ in range(6)] == [
+        first_model,
+        other_account,
+        second_model,
+        other_account,
+        first_model,
+        other_account,
+    ]
+
+
+def test_capacity_account_round_robin_deduplicates_claude_alias_entries():
+    shared = "shared-claude-account"
+    legacy = ProviderEntry("claude", shared, model="opus")
+    canonical = ProviderEntry("clauder", shared, model="sonnet")
+    other_account = ProviderEntry("clauder", "other-claude-account")
+    pool = ProviderPool([legacy, canonical, other_account])
+
+    assert [pool.next_entry_from([legacy, canonical, other_account]) for _ in range(4)] == [
+        legacy,
+        other_account,
+        canonical,
+        other_account,
+    ]

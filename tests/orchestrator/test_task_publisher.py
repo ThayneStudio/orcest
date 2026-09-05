@@ -23,6 +23,7 @@ from orcest.orchestrator.pr_ops import (
     get_attempt_count,
     get_total_attempt_count,
 )
+from orcest.orchestrator.provider_capacity import CapacityReservation
 from orcest.orchestrator.task_publisher import (
     _render_rebase_prompt,
     publish_fix_task,
@@ -88,6 +89,41 @@ def test_expired_capacity_claim_defers_before_pending_or_attempt_mutation(
     assert get_attempt_count(fake_redis_client, "test-org/test-repo", 808, "abc123") == 0
     assert fake_redis_client.get("pending:pr:test-org/test-repo:808") is None
     assert fake_redis_client.xlen("tasks:codex") == 0
+
+
+def test_capacity_transport_error_defers_without_leaking_exception_text(
+    fake_redis_client,
+    mocker,
+    caplog,
+) -> None:
+    secret = "credential-sentinel-must-not-leak"
+    reservation = CapacityReservation(
+        redis=fake_redis_client,
+        provider="codex",
+        task_id="capacity-transport-error",
+    )
+    mocker.patch(
+        "orcest.orchestrator.provider_capacity.RedisLock.acquire",
+        side_effect=RuntimeError(secret),
+    )
+
+    with caplog.at_level(logging.INFO):
+        task = publish_rebase_task(
+            pr_state=_make_pr_state(number=809),
+            repo="test-org/test-repo",
+            token="fake-token",
+            redis=fake_redis_client,
+            default_runner="codex",
+            provider="codex",
+            credential="redacted-credential",
+            task_id=reservation.task_id,
+            capacity_reservation=reservation,
+        )
+
+    assert task is None
+    assert secret not in caplog.text
+    assert get_attempt_count(fake_redis_client, "test-org/test-repo", 809, "abc123") == 0
+    assert fake_redis_client.get("pending:pr:test-org/test-repo:809") is None
 
 
 def test_publish_creates_task(gh_mock, fake_redis_client):

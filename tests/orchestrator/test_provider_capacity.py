@@ -300,6 +300,60 @@ def test_unattributable_malformed_heartbeat_fails_every_candidate_closed(
     )
 
 
+def test_oversized_heartbeat_payload_fails_capacity_read_closed(
+    fake_redis_client: RedisClient,
+) -> None:
+    _streams(fake_redis_client, "codex")
+    fake_redis_client.set_ex(
+        "workers:heartbeat:oversized",
+        json.dumps({"backend": "codex", "padding": "x" * (16 * 1024)}),
+        ttl=150,
+    )
+
+    assert (
+        reserve_provider_capacity(
+            fake_redis_client,
+            ["codex"],
+            "oversized-heartbeat",
+            logging.getLogger("test"),
+        )
+        is None
+    )
+
+
+def test_heartbeat_key_reuse_observes_one_atomic_generation(
+    fake_redis_client: RedisClient,
+    mocker,
+) -> None:
+    _streams(fake_redis_client, "clauder", "codex")
+    _heartbeat(fake_redis_client, "reused-worker", "clauder")
+    original = fake_redis_client.get_with_ttl_bounded
+    recycled = False
+
+    def recycle_then_read(key: str, *, max_bytes: int):
+        nonlocal recycled
+        if key == "workers:heartbeat:reused-worker" and not recycled:
+            recycled = True
+            _heartbeat(fake_redis_client, "reused-worker", "codex")
+        return original(key, max_bytes=max_bytes)
+
+    mocker.patch.object(
+        fake_redis_client,
+        "get_with_ttl_bounded",
+        side_effect=recycle_then_read,
+    )
+
+    reservation = reserve_provider_capacity(
+        fake_redis_client,
+        ["clauder", "codex"],
+        "reused-heartbeat",
+        logging.getLogger("test"),
+    )
+
+    assert reservation is not None
+    assert reservation.provider == "codex"
+
+
 def test_expired_reservation_is_pruned_and_slot_recovers(
     fake_redis_client: RedisClient,
 ) -> None:
@@ -342,6 +396,30 @@ def test_reservation_revalidation_aborts_when_its_worker_becomes_busy(
     assert fake_redis_client.zcard(reservation.key) == 0
 
 
+def test_lost_selection_lease_cannot_commit_reservation(
+    fake_redis_client: RedisClient,
+    mocker,
+) -> None:
+    _streams(fake_redis_client, "codex")
+    _heartbeat(fake_redis_client, "worker-codex", "codex")
+    commit = mocker.patch.object(
+        fake_redis_client,
+        "zadd_expiring_if_value",
+        return_value=False,
+    )
+
+    reservation = reserve_provider_capacity(
+        fake_redis_client,
+        ["codex"],
+        "stale-selector",
+        logging.getLogger("test"),
+    )
+
+    assert reservation is None
+    commit.assert_called_once()
+    assert fake_redis_client.zcard("providers:capacity:reservations:codex") == 0
+
+
 def test_concurrent_orchestrators_cannot_reserve_one_worker_twice(
     fake_redis_client: RedisClient,
     make_fake_redis_client,
@@ -370,17 +448,27 @@ def test_concurrent_orchestrators_cannot_reserve_one_worker_twice(
     assert sum(result is not None for result in results) == 1
 
 
-def test_capacity_diagnostics_are_secret_free(fake_redis_client: RedisClient) -> None:
+def test_capacity_diagnostics_are_secret_free(
+    fake_redis_client: RedisClient,
+    mocker,
+    caplog,
+) -> None:
     _streams(fake_redis_client, "codex")
     _heartbeat(fake_redis_client, "worker-codex", "codex")
     secret = "credential-super-secret"
-    reservation = reserve_provider_capacity(
+    mocker.patch.object(
         fake_redis_client,
-        ["codex"],
-        "safe-task-id",
-        logging.getLogger("test"),
+        "scan_page",
+        side_effect=RuntimeError(secret),
     )
-    assert reservation is not None
-    snapshots, _unknown = read_provider_loads(fake_redis_client, ["codex"])
-    rendered = repr(snapshots["codex"].to_safe_dict()) + repr(reservation)
-    assert secret not in rendered
+
+    with caplog.at_level(logging.INFO):
+        reservation = reserve_provider_capacity(
+            fake_redis_client,
+            ["codex"],
+            "safe-task-id",
+            logging.getLogger("test.capacity-secret"),
+        )
+
+    assert reservation is None
+    assert secret not in caplog.text

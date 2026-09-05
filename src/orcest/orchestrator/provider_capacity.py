@@ -32,6 +32,7 @@ _SCAN_PAGE_SIZE = 128
 # Current workers write a 150-second TTL.  The upper bound admits rollout
 # jitter while rejecting immortal/obviously stale keys as live capacity.
 _MAX_HEARTBEAT_TTL_SECONDS = 300
+_MAX_HEARTBEAT_PAYLOAD_BYTES = 16 * 1024
 _MAX_PENDING_ENTRIES_PER_STREAM = 2048
 
 
@@ -92,15 +93,16 @@ class CapacityReservation:
         """Extend an unexpired claim, serialized with new selections."""
         if self._released:
             return False
-        lock = RedisLock(
-            self.redis,
-            _CAPACITY_LOCK_KEY,
-            ttl=_CAPACITY_LOCK_TTL_SECONDS,
-            owner=self.task_id,
-        )
-        if not lock.acquire():
-            return False
+        lock: RedisLock | None = None
         try:
+            lock = RedisLock(
+                self.redis,
+                _CAPACITY_LOCK_KEY,
+                ttl=_CAPACITY_LOCK_TTL_SECONDS,
+                owner=self.task_id,
+            )
+            if not lock.acquire():
+                return False
             now = time.time()
             score = self.redis.zscore(self.key, self.task_id)
             if score is None or score <= now:
@@ -123,19 +125,27 @@ class CapacityReservation:
                 self.redis.zrem(self.key, self.task_id)
                 self._released = True
                 return False
-            self.redis.zadd_expiring(
+            # Owner verification and renewal are one Redis operation. A
+            # selector paused past its lock TTL must not resume and renew a
+            # claim after a newer selector has observed the released lock.
+            return self.redis.zadd_expiring_if_value(
+                _CAPACITY_LOCK_KEY,
+                self.task_id,
                 self.key,
-                {self.task_id: now + self.ttl_seconds},
+                self.task_id,
+                now + self.ttl_seconds,
                 self.ttl_seconds * 2,
             )
-            return True
         except Exception:
+            # Capacity failures are fail-closed. Never let transport/auth
+            # exception text escape into outer publication logs.
             return False
         finally:
-            try:
-                lock.release()
-            except Exception:
-                pass
+            if lock is not None and lock.is_held:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
     def release(self) -> None:
         """Best-effort removal after success, failure, or an aborted publish."""
@@ -182,10 +192,14 @@ def _scan_live_workers(redis_client: RedisClient) -> tuple[dict[str, set[str]], 
         worker_id = key.removeprefix(_HEARTBEAT_PREFIX)
         if not worker_id:
             raise CapacityReadError("worker heartbeat identity is empty")
-        raw = redis_client.get(key)
-        ttl = redis_client.ttl(key)
+        raw, ttl, oversized = redis_client.get_with_ttl_bounded(
+            key,
+            max_bytes=_MAX_HEARTBEAT_PAYLOAD_BYTES,
+        )
+        if oversized:
+            raise CapacityReadError("worker heartbeat payload exceeds its bound")
         if raw is None or ttl == -2:
-            # Expired between SCAN and GET: it is no longer live.
+            # Expired between SCAN and the atomic read: it is no longer live.
             continue
         try:
             payload = json.loads(raw)
@@ -328,13 +342,14 @@ def reserve_provider_capacity(
     ordered = list(dict.fromkeys(providers))
     if not ordered or reservation_ttl_seconds < 1:
         return None
-    lock = RedisLock(
-        redis_client,
-        _CAPACITY_LOCK_KEY,
-        ttl=_CAPACITY_LOCK_TTL_SECONDS,
-        owner=task_id,
-    )
+    lock: RedisLock | None = None
     try:
+        lock = RedisLock(
+            redis_client,
+            _CAPACITY_LOCK_KEY,
+            ttl=_CAPACITY_LOCK_TTL_SECONDS,
+            owner=task_id,
+        )
         if not lock.acquire():
             logger.info("Provider capacity selection is busy; deferring task %s", task_id)
             return None
@@ -356,20 +371,25 @@ def reserve_provider_capacity(
         tied = [snapshot for snapshot in eligible if snapshot.load_per_live_worker == minimum]
         sequence = redis_client.incr(_CAPACITY_ROUND_ROBIN_KEY)
         selected = tied[(sequence - 1) % len(tied)]
-        if not lock.refresh():
-            logger.warning("Provider capacity selection lease expired for task %s", task_id)
-            return None
         reservation = CapacityReservation(
             redis=redis_client,
             provider=selected.provider,
             task_id=task_id,
             ttl_seconds=reservation_ttl_seconds,
         )
-        redis_client.zadd_expiring(
+        # Validate the lock owner in the same Redis operation that writes the
+        # reservation. A process paused beyond the lock TTL cannot consume a
+        # slot after a newer selector has acted on the same snapshot.
+        if not redis_client.zadd_expiring_if_value(
+            _CAPACITY_LOCK_KEY,
+            task_id,
             reservation.key,
-            {task_id: time.time() + reservation_ttl_seconds},
+            task_id,
+            time.time() + reservation_ttl_seconds,
             reservation_ttl_seconds * 2,
-        )
+        ):
+            logger.warning("Provider capacity selection lease expired for task %s", task_id)
+            return None
         logger.info(
             "Reserved provider %s capacity for task %s (live=%d busy=%d unread=%d reservations=%d)",
             selected.provider,
@@ -386,7 +406,7 @@ def reserve_provider_capacity(
         logger.warning("Provider capacity selection failed for task %s", task_id)
         return None
     finally:
-        if lock.is_held:
+        if lock is not None and lock.is_held:
             try:
                 lock.release()
             except Exception:

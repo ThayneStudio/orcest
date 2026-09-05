@@ -77,7 +77,8 @@ class ProviderPool:
 
         self._entries: list[ProviderEntry] = list(seen.values())  # order preserved for RR
         self._counter: int = 0
-        self._subset_counters: dict[tuple[str, ...], int] = {}
+        self._account_subset_counters: dict[tuple[str, ...], int] = {}
+        self._account_variant_counters: dict[tuple[str, ...], int] = {}
         # Cooldowns are keyed by ACCOUNT (provider + credential hash), NOT by
         # identity(): rate limits are per-account, so benching an account benches
         # every model-entry that shares its credential. See ProviderEntry.account_key.
@@ -214,10 +215,22 @@ class ProviderPool:
             ]
             if not eligible:
                 return None
-            key = tuple(entry.identity() for entry in eligible)
-            counter = self._subset_counters.get(key, 0)
-            self._subset_counters[key] = counter + 1
-            return eligible[counter % len(eligible)]
+            entries_by_account: dict[str, list[ProviderEntry]] = {}
+            for entry in eligible:
+                entries_by_account.setdefault(entry.account_key(), []).append(entry)
+
+            # Rate limits and cooldowns are account-scoped, so accounts—not
+            # model/alias entries—receive equal turns. Entries within the
+            # chosen account rotate independently in stable pool order.
+            account_key = tuple(entries_by_account)
+            account_counter = self._account_subset_counters.get(account_key, 0)
+            self._account_subset_counters[account_key] = account_counter + 1
+            selected_account = account_key[account_counter % len(account_key)]
+            variants = entries_by_account[selected_account]
+            variant_key = (selected_account, *(entry.identity() for entry in variants))
+            variant_counter = self._account_variant_counters.get(variant_key, 0)
+            self._account_variant_counters[variant_key] = variant_counter + 1
+            return variants[variant_counter % len(variants)]
 
     # ------------------------------------------------------------------
     # Primary (lean) registration / exhaustion API
